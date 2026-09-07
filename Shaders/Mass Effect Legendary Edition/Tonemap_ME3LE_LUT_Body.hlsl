@@ -1,11 +1,11 @@
-// Shared ME3 stage-1 body for four filmic/LUT permutations, selected by TM_HAS_MOTIONBLUR and TM_HAS_GRAIN.
+// Shared ME3LE stage-1 body for four filmic/LUT permutations, selected by TM_HAS_MOTIONBLUR and TM_HAS_GRAIN.
 //   0x36B90B12 = MB              0x49BD5A95 = MB + grain
 //   0x00944C2E = (bare)          0x5AA0BD09 = grain
 // Analytic shader 0x225A8330 remains standalone because its cbuffer and curve differ.
 //
 // Grade and filmic paths are transcribed from 0x00944C2E; motion blur comes from 0x36B90B12. Preserve their
 // register-level structure for comparison with live CSOs.
-// ME3 deltas vs the ME2 body:
+// ME3LE deltas vs the ME2LE body:
 // - The 4096x1 R16_UNORM filmic LUT is the tonemap; input scale 0.0616082214 covers scene-linear to about 16.2.
 // - Channels remain straight RGB, bloom uses a 4x scale, and motion blur weights each tap by velocity.
 // - The smoothstep vignette contains a blue-tinted white point; the slider affects only radial darkening.
@@ -30,7 +30,7 @@
 
 // Texture and sampler registers follow this fixed order:
 //   [depth vel (MB)] scene dof near far bloom lut [noise (grain)] filmic
-// Unlike ME2, motion-blur velocity occupies t2 and shifts later DoF, bloom, and LUT slots by one.
+// Unlike ME2LE, motion-blur velocity occupies t2 and shifts later DoF, bloom, and LUT slots by one.
 #if TM_HAS_MOTIONBLUR
 #define R_DEPTH   t0
 #define R_SCENE   t1
@@ -140,10 +140,10 @@ SamplerState NoiseTextureSampler_s : register(S_NOISE);
 #endif
 SamplerState smpFilmicLUTSampler_s : register(S_FILMIC);
 
-// Native ME3 SDR grade transcribed from the live CSO, evaluated exactly once on the untouched per-channel value
+// Native ME3LE SDR grade transcribed from the live CSO, evaluated exactly once on the untouched per-channel value
 // in every Display Mode: SDR is its output and nothing else, HDR only scales it. Preserve register-level
 // operations; the filmic 1D LUT stays inline in main().
-float3 MELE_ME3_GradeChain(float3 c)
+float3 MELE_ME3LE_GradeChain(float3 c)
 {
    float4 r0, r1;
    r0.xyz = c;
@@ -277,13 +277,13 @@ void main(
    }
 
    // Use one native grade function for both the working value and SDR reference.
-   float3 sdr_gamma = MELE_ME3_GradeChain(r0.xyz);
+   float3 sdr_gamma = MELE_ME3LE_GradeChain(r0.xyz);
 
    // Scalar uncompression preserves native mids/shadows and restores extrapolated HDR highlights. SDR leaves
    // mele_expand at 1.
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) * mele_expand;
 
-   // ME3 tail: smoothstep vignette, optional grain, and native output luma in alpha.
+   // ME3LE tail: smoothstep vignette, optional grain, and native output luma in alpha.
 #define TM_VIGNETTE_TYPE 3
 #define TM_ALPHA_LUMA    1
 #include "Includes/Tonemap_MELE_Output.hlsli"

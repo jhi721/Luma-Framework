@@ -30,11 +30,11 @@
 enum class MEGame
 {
    Unknown = 0,
-   ME1,
-   ME2,
-   ME3,
+   ME1LE,
+   ME2LE,
+   ME3LE,
 };
-static MEGame g_me_game = MEGame::ME1;
+static MEGame g_me_game = MEGame::ME1LE;
 
 static MEGame DetectMEGame()
 {
@@ -44,12 +44,12 @@ static MEGame DetectMEGame()
    for (auto& c : exe)
       c = (char)tolower((unsigned char)c);
    if (exe.find("masseffect3") != std::string::npos)
-      return MEGame::ME3;
+      return MEGame::ME3LE;
    if (exe.find("masseffect2") != std::string::npos)
-      return MEGame::ME2;
+      return MEGame::ME2LE;
    if (exe.find("masseffect1") != std::string::npos)
-      return MEGame::ME1;
-   return MEGame::ME1; // Treat an unknown executable as ME1.
+      return MEGame::ME1LE;
+   return MEGame::ME1LE; // Treat an unknown executable as ME1LE.
 }
 
 // SMAA replaces the shared MiniEngine FXAA resolve on the fp16 gamma post buffer. The prepass and indirect-
@@ -58,7 +58,7 @@ static constexpr uint32_t kFXAAResolveHHash = 0xB53BB634; // Horizontal resolve:
 static constexpr uint32_t kFXAAResolveVHash = 0xF43DBFFD; // Vertical in-place refine: skipped after SMAA.
 
 // Stage-1 tonemap permutations (MB = motion blur, FG = film grain). Slots are stored per permutation because
-// MB binds depth at t0 and pushes everything up one, and ME3 additionally binds velocity at t2. They mirror
+// MB binds depth at t0 and pushes everything up one, and ME3LE additionally binds velocity at t2. They mirror
 // R_SCENE and R_BLOOM in the matching HLSL body with no compile-time cross-check, so a re-captured permutation
 // must move both sides. Unlisted permutations stay vanilla; this table drives only bloom and SMAA depth capture.
 struct TonemapPermDesc
@@ -67,14 +67,14 @@ struct TonemapPermDesc
    uint8_t scene_slot; // 1 on motion-blur permutations, where t0 is depth instead of scene color.
    uint8_t bloom_slot;
 };
-static constexpr TonemapPermDesc kTonemapPermsME1[] = {
+static constexpr TonemapPermDesc kTonemapPermsME1LE[] = {
    {0x151FE4CA, 1, 5}, // MB+FG, LUT grade
    {0x69F03340, 1, 5}, // MB, LUT grade
    {0x109F3B6E, 0, 4}, // FG, LUT grade
    {0x8C8E8CA2, 0, 4}, // LUT grade
    {0xAAE8755A, 0, 4}, // analytic grade (no LUT)
 };
-static constexpr TonemapPermDesc kTonemapPermsME2[] = {
+static constexpr TonemapPermDesc kTonemapPermsME2LE[] = {
    {0x2754F750, 1, 5}, // MB, LUT grade
    {0x1536C5B5, 1, 5}, // MB+FG, LUT grade
    {0x940979D8, 1, 5}, // MB, Filmic+LUT grade
@@ -85,7 +85,7 @@ static constexpr TonemapPermDesc kTonemapPermsME2[] = {
    {0x222186F8, 0, 4}, // Filmic+LUT grade
    {0xEC890842, 0, 4}, // FG, Filmic+LUT grade
 };
-static constexpr TonemapPermDesc kTonemapPermsME3[] = {
+static constexpr TonemapPermDesc kTonemapPermsME3LE[] = {
    {0x36B90B12, 1, 6}, // MB(depth)+Filmic+LUT grade
    {0x49BD5A95, 1, 6}, // MB(depth)+FG, Filmic+LUT grade
    {0x00944C2E, 0, 4}, // Filmic+LUT grade
@@ -93,9 +93,9 @@ static constexpr TonemapPermDesc kTonemapPermsME3[] = {
    {0x225A8330, 0, 4}, // analytic grade (no LUT)
 };
 // Selected once in DllMain.
-static std::span<const TonemapPermDesc> g_tonemap_perms = kTonemapPermsME1;
+static std::span<const TonemapPermDesc> g_tonemap_perms = kTonemapPermsME1LE;
 
-// Everything that differs between the three games. ME2/ME3 share the native HBAO+ radius of 48 uu against ME1's
+// Everything that differs between the three games. ME2LE/ME3LE share the native HBAO+ radius of 48 uu against ME1LE's
 // 30 uu; GTAO visibility power is 1 everywhere, so it stays at its global default instead of living here.
 struct MEGameProfile
 {
@@ -107,12 +107,12 @@ static constexpr MEGameProfile ProfileFor(MEGame game)
 {
    switch (game)
    {
-   case MEGame::ME2:
-      return {kTonemapPermsME2, 0.96f, 1.0f};
-   case MEGame::ME3:
-      return {kTonemapPermsME3, 0.96f, 1.0f};
+   case MEGame::ME2LE:
+      return {kTonemapPermsME2LE, 0.96f, 1.0f};
+   case MEGame::ME3LE:
+      return {kTonemapPermsME3LE, 0.96f, 1.0f};
    default:
-      return {kTonemapPermsME1, 0.f, 1.0f};
+      return {kTonemapPermsME1LE, 0.f, 1.0f};
    }
 }
 // Quarter-resolution bloom bright-pass; cb0.xy = (BloomScale, Threshold).
@@ -408,7 +408,7 @@ public:
       default_luma_global_game_settings.VignetteIntensity = 1.f;
       default_luma_global_game_settings.FilmGrainIntensity = 1.f;
       default_luma_global_game_settings.BloomIntensity = g_bloom_intensity; // Per-game gain lives in g_bloom_scale_ref.
-      default_luma_global_game_settings.BloomThreshold = 1.2f;              // ME1 fallback until live capture succeeds.
+      default_luma_global_game_settings.BloomThreshold = 1.2f;              // ME1LE fallback until live capture succeeds.
       default_luma_global_game_settings.Dithering = 1.f;                    // Output anti-banding.
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;           // Off preserves vanilla SDR video.
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;           // 0=1x, 0.5=2.0625x, 1=3.125x UI white.
@@ -1015,7 +1015,7 @@ public:
             device_data.cb_luma_global_settings_dirty = true;
          }
 
-         // Follow native per-scene cb0.y; use ME1's 1.2 default until the first readback.
+         // Follow native per-scene cb0.y; use ME1LE's 1.2 default until the first readback.
          const float thr = gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : 1.2f;
          if (fabsf(gs.BloomThreshold - thr) > 1e-4f)
          {
@@ -1236,7 +1236,7 @@ public:
 #if DEVELOPMENT
       {
          auto& gd = GetGameDeviceData(device_data);
-         const char* gname = g_me_game == MEGame::ME1 ? "ME1" : (g_me_game == MEGame::ME2 ? "ME2" : "ME3");
+         const char* gname = g_me_game == MEGame::ME1LE ? "ME1LE" : (g_me_game == MEGame::ME2LE ? "ME2LE" : "ME3LE");
          const float eff_thr = gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : 1.2f;
          ImGui::SeparatorText("Bloom DEV readout");
          ImGui::Text("game=%s  bright-pass hits/frame=%d  (0 = capture hook never fired)", gname, gd.bloom_bright_pass_hits);

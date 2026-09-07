@@ -19,7 +19,7 @@ struct LumaGameSettings
    float VignetteIntensity;  // 1 = vanilla. Scales the game's vignette darkening (0 = no vignette).
    float FilmGrainIntensity; // 1 = vanilla. Scales the game's film grain (0 = off).
    float BloomIntensity;     // 1 = vanilla-matched. Scales the Luma fp16 pyramidal bloom (0 = no bloom).
-   float BloomThreshold;     // = native bright-pass cb0.y (per-scene artist dial), captured live; 1.2 = ME1 vanilla default until first readback.
+   float BloomThreshold;     // = native bright-pass cb0.y (per-scene artist dial), captured live; 1.2 = ME1LE vanilla default until first readback.
    float Dithering;          // 0/1 toggle. Animated triangular output dither in HDR and SDR.
    float VideoAutoHDREnable; // 0/1 toggle. 1 = expand Bink movie highlights into HDR, 0 = vanilla SDR videos (no expansion).
    float VideoAutoHDRBoost;  // 0..1. Bink highlight range relative to UI white: 0 = 1x/no-op, 1 = up to 3.125x. Default 0.5.

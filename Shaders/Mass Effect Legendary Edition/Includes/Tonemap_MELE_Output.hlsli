@@ -1,6 +1,6 @@
 // Shared stage-1 output tail, included inside each main() after it defines graded_hdr, sdr_gamma, v0, v1, o0, o1.
-// Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (none / radial-power / ME3 smoothstep), TM_HAS_GRAIN,
-// TM_ALPHA_LUMA (native ME3 output luma to alpha).
+// Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (none / radial-power / ME3LE smoothstep), TM_HAS_GRAIN,
+// TM_ALPHA_LUMA (native ME3LE output luma to alpha).
 #ifndef TM_VIGNETTE_TYPE
 #define TM_VIGNETTE_TYPE 0
 #endif
@@ -36,7 +36,7 @@ float3 vigLinear = 1.0;
    vigLinear = gamma_to_linear(vig, GCT_MIRROR);
 }
 #elif TM_VIGNETTE_TYPE == 3
-// Native ME3 smoothstep vignette; scale only radial darkening, not its blue-tinted white point.
+// Native ME3LE smoothstep vignette; scale only radial darkening, not its blue-tinted white point.
 {
    float2 vc = v0.zw * ScreenUVScaleBias.xy + ScreenUVScaleBias.zw;
    vc = float2(-0.5, -0.5) + vc;
@@ -120,7 +120,7 @@ if (LumaSettings.GameSettings.Dithering > 0.5)
    ApplyDithering(o0.xyz, v1.xy, true, 1.0, DITHERING_BIT_DEPTH, LumaSettings.FrameIndex, true);
 
 #if TM_ALPHA_LUMA
-o0.w = dot(o0.xyz, float3(0.298999995, 0.587000012, 0.114)); // Preserve native ME3 luma alpha, unclamped as native.
+o0.w = dot(o0.xyz, float3(0.298999995, 0.587000012, 0.114)); // Preserve native ME3LE luma alpha, unclamped as native.
 #else
 o0.w = 0;
 #endif

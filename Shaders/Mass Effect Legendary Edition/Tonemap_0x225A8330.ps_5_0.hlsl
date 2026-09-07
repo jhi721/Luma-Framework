@@ -1,6 +1,6 @@
-// ME3 analytic stage-1 permutation used by the galaxy map and some cutscenes. It has no LUT, motion blur, grain,
+// ME3LE analytic stage-1 permutation used by the galaxy map and some cutscenes. It has no LUT, motion blur, grain,
 // or pre-grade tonemap curve: analytic Scene* operates directly on linear scene+bloom, followed by gamma, the
-// ME3 blue-tinted white point, and a clamp. Bindings: t0 scene, t1 DoF, t2/t3 near/far DoF, t4 bloom.
+// ME3LE blue-tinted white point, and a clamp. Bindings: t0 scene, t1 DoF, t2/t3 near/far DoF, t4 bloom.
 //
 // Transcribed from live CSO 0x225A8330. With only an SDR clamp, the reversible max-channel wrap uses an identity
 // 0.18 -> 0.18 anchor before restoring linear HDR highlights.
@@ -53,7 +53,7 @@ Texture2D<float4> BlurredImageSeperateBloom : register(t4);
 // Native analytic SDR grade transcribed from the live CSO, evaluated exactly once on the untouched per-channel
 // value in every Display Mode: SDR is its output and nothing else, HDR only scales it. Preserve its
 // register-level operations.
-float3 MELE_ME3Analytic_GradeChain(float3 c)
+float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 {
    float4 r0;
    r0.xyz = c;
@@ -66,7 +66,7 @@ float3 MELE_ME3Analytic_GradeChain(float3 c)
    r0.w = dot(r0.xyz, SceneScaledLuminanceWeights.xyz);
    r0.xyz = r0.xyz * SceneShadowsAndDesaturation.www + r0.www;
    r0.xyz = GammaOverlayColor.xyz + r0.xyz;
-   // Native SDR gamma curve and ME3 white point.
+   // Native SDR gamma curve and ME3LE white point.
    r0.xyz = MELE_NativeGammaCurve(r0.xyz, GammaColorScaleAndInverse.xyz, GammaColorScaleAndInverse.w, true);
 
    r0.xyz = float3(1.01036298, 1.00000572, 1.16309249) * r0.xyz; // Blue-tinted white point; no radial vignette.
@@ -113,13 +113,13 @@ void main(
       mele_scale = 1.0 / mele_mch;
    }
 
-   float3 sdr_gamma = MELE_ME3Analytic_GradeChain(r0.xyz);
+   float3 sdr_gamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
 
    // Undo compression only where scale < 1, preserving native diffuse/shadow grading and restoring HDR
    // highlights. SDR leaves mele_scale at 1.
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
 
-   // ME3 analytic tail: no vignette or grain; preserve native output luma in alpha.
+   // ME3LE analytic tail: no vignette or grain; preserve native output luma in alpha.
 #define TM_VIGNETTE_TYPE 0
 #define TM_ALPHA_LUMA    1
 #include "Includes/Tonemap_MELE_Output.hlsli"

@@ -1,14 +1,14 @@
 #ifndef LUMA_MELE_TONEMAP_FILMIC
 #define LUMA_MELE_TONEMAP_FILMIC
 
-// Max-channel highlight extrapolation for the native 4096x1 R16_UNORM filmic LUT, shared by the ME2 filmic and
-// all ME3 LUT permutations. RenoDX-style wrap, following Unreal Engine/Luma_UpgradeTonemapLUT.hlsl: match the
+// Max-channel highlight extrapolation for the native 4096x1 R16_UNORM filmic LUT, shared by the ME2LE filmic and
+// all ME3LE LUT permutations. RenoDX-style wrap, following Unreal Engine/Luma_UpgradeTonemapLUT.hlsl: match the
 // filmic value and slope at scene mid-gray, keep the native curve below it, ease highlights toward that tangent,
 // then shoulder-compress reversibly. Only the expansion scalar leaves this function, so the native per-channel
 // value still reaches the grade untouched and the vanilla white blowout survives into HDR.
 //
 // Include after the permutation declares smpFilmicLUT and its sampler. MELE_FILMIC_PRECURVE supplies the domain
-// the LUT is addressed in: ME3 samples scene-linear directly, ME2 pre-applies the native 1-exp2(-1.7x) curve.
+// the LUT is addressed in: ME3LE samples scene-linear directly, ME2LE pre-applies the native 1-exp2(-1.7x) curve.
 #ifndef MELE_FILMIC_PRECURVE
 #define MELE_FILMIC_PRECURVE(x) (x)
 #endif
@@ -24,7 +24,7 @@ float MELE_FilmicMaxChannelExpand(float3 untonemapped)
    float g_hi = smpFilmicLUT.SampleLevel(smpFilmicLUTSampler_s, float2(SC * MELE_FILMIC_PRECURVE(0.20), 0.5), 0).x;
    float slope = (g_hi - g_lo) / 0.04;
    float g_mch = smpFilmicLUT.SampleLevel(smpFilmicLUTSampler_s, float2(SC * MELE_FILMIC_PRECURVE(mele_mch), 0.5), 0).x;
-   // Curve ceiling read through the includer's domain, never a fixed 1.0: ME2's pre-curve saturates at 1, so its
+   // Curve ceiling read through the includer's domain, never a fixed 1.0: ME2LE's pre-curve saturates at 1, so its
    // coordinate stays inside the first 6.16% of the LUT and a 1.0 denominator would starve its expansion by 1.7x
    // to 6.5x. g_mch converges to exactly this ceiling, so progress still reaches 1 with no overshoot. Sample the
    // last texel center rather than u = 1.0 so the game's sampler addressing mode cannot affect the read.

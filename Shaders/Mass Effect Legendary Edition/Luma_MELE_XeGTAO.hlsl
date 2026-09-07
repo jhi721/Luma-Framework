@@ -67,7 +67,7 @@ cbuffer LumaGTAO : register(b11)
 // Compile-time defaults; runtime b11 overrides the exposed controls.
 
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.6 // Native ME1 radius: 30 UE3 units / DepthScale 50; runtime override wins.
+#define EFFECT_RADIUS 0.6 // Native ME1LE radius: 30 UE3 units / DepthScale 50; runtime override wins.
 #endif
 
 #ifndef RADIUS_MULTIPLIER

@@ -1,13 +1,13 @@
-// Shared ME1/ME2 stage-1 body for twelve LUT-graded permutations, selected by TM_HAS_MOTIONBLUR, TM_HAS_GRAIN,
-// TM_HAS_FILMIC and the ME1 vignette overrides. ME1 has no filmic axis; with the axes fixed the two games'
-// non-filmic paths are identical, verified bit-exact against the ME1 bytecode. The analytic shaders 0xAAE8755A
-// (ME1) and 0xCC76075F (ME2) use the shared analytic body instead.
-//   ME2: 0x2754F750 = MB         0x1536C5B5 = MB + grain      0x940979D8 = MB + filmic
-//        0x75BFAFBC = MB + grain + filmic
-//        0xD077D06B = (bare LUT) 0x8E0C0DBB = grain           0x222186F8 = filmic
-//        0xEC890842 = grain + filmic
-//   ME1: 0x151FE4CA = MB + grain 0x69F03340 = MB              0x109F3B6E = grain
-//        0x8C8E8CA2 = (bare LUT)
+// Shared ME1LE/ME2LE stage-1 body for twelve LUT-graded permutations, selected by TM_HAS_MOTIONBLUR, TM_HAS_GRAIN,
+// TM_HAS_FILMIC and the ME1LE vignette overrides. ME1LE has no filmic axis; with the axes fixed the two games'
+// non-filmic paths are identical, verified bit-exact against the ME1LE bytecode. The analytic shaders 0xAAE8755A
+// (ME1LE) and 0xCC76075F (ME2LE) use the shared analytic body instead.
+//   ME2LE: 0x2754F750 = MB         0x1536C5B5 = MB + grain      0x940979D8 = MB + filmic
+//          0x75BFAFBC = MB + grain + filmic
+//          0xD077D06B = (bare LUT) 0x8E0C0DBB = grain           0x222186F8 = filmic
+//          0xEC890842 = grain + filmic
+//   ME1LE: 0x151FE4CA = MB + grain 0x69F03340 = MB              0x109F3B6E = grain
+//          0x8C8E8CA2 = (bare LUT)
 //
 // Non-filmic grading is transcribed from 0x2754F750 and filmic grading from 0x222186F8; their register-level
 // swizzles differ, are each internally rotation-consistent, and must be preserved. The body emits linear
@@ -157,10 +157,10 @@ SamplerState NoiseTextureSampler_s : register(S_NOISE);
 SamplerState smpFilmicLUTSampler_s : register(S_FILMIC);
 #endif
 
-// Native ME1/ME2 SDR grade transcribed from live CSOs, evaluated exactly once on the untouched per-channel value
+// Native ME1LE/ME2LE SDR grade transcribed from live CSOs, evaluated exactly once on the untouched per-channel value
 // in every Display Mode: SDR is its output and nothing else, HDR only scales it. Preserve register-level
 // swizzles; the filmic 1D LUT stays inline in main().
-float3 MELE_ME12_GradeChain(float3 c)
+float3 MELE_ME12LE_GradeChain(float3 c)
 {
    float4 r0, r1, r2;
 #if TM_HAS_FILMIC
@@ -215,7 +215,7 @@ float3 MELE_ME12_GradeChain(float3 c)
 // Included here, not with the headers: MELE_CompositeDOF reads the _Globals fields and DOF textures declared above.
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 #if TM_HAS_FILMIC
-// ME2's filmic LUT is addressed through the native exponential curve, not scene-linear.
+// ME2LE's filmic LUT is addressed through the native exponential curve, not scene-linear.
 #define MELE_FILMIC_PRECURVE(x) (1.0 - exp2(-1.70000005 * (x)))
 #include "Includes/Tonemap_MELE_Filmic.hlsli"
 #endif
@@ -286,7 +286,7 @@ void main(
    r0.zw = cmp(float2(0, 0) < MinMaxBlurClamp.xy);
    r1.w = (int)r0.w | (int)r0.z;
 
-   // Native near/far depth-of-field composite shared with ME1.
+   // Native near/far depth-of-field composite shared with ME1LE.
    if (r1.w != 0)
    {
       r1.xyz = MELE_CompositeDOF(r0.xy, r0.zw, r1.xyz);
@@ -341,7 +341,7 @@ void main(
    r1.xyz = float3(1, 1, 1) + -r1.xyz;
    r0.xyz = r0.xyz * r0.www + r1.xyz;
 
-   // Non-filmic HDR wrap matches the ME1 max-channel path: the native per-channel value reaches the grade
+   // Non-filmic HDR wrap matches the ME1LE max-channel path: the native per-channel value reaches the grade
    // untouched and only the expansion scalar comes from the wrap.
    float mele_scale = 1.0;
    if (LumaSettings.DisplayMode == 1)
@@ -355,9 +355,9 @@ void main(
 
    // Use one native grade function for both the working value and SDR reference. Filmic feeds r1; non-filmic r0.
 #if TM_HAS_FILMIC
-   float3 sdr_gamma = MELE_ME12_GradeChain(r1.xyz);
+   float3 sdr_gamma = MELE_ME12LE_GradeChain(r1.xyz);
 #else
-   float3 sdr_gamma = MELE_ME12_GradeChain(r0.xyz);
+   float3 sdr_gamma = MELE_ME12LE_GradeChain(r0.xyz);
 #endif
 
    // Scalar uncompression commutes with the LUT's channel restoration. Both paths reduce to native output in SDR.
@@ -367,8 +367,8 @@ void main(
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
 #endif
 
-   // Shared tail: radial vignette, optional grain, and zero alpha. Defaults are ME2's power-200 curve and blue
-   // white point; ME1 entry points override both.
+   // Shared tail: radial vignette, optional grain, and zero alpha. Defaults are ME2LE's power-200 curve and blue
+   // white point; ME1LE entry points override both.
 #define TM_VIGNETTE_TYPE 1
 #ifndef TM_VIG_POW
 #define TM_VIG_POW 200.0

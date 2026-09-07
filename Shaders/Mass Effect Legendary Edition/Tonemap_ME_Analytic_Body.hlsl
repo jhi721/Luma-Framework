@@ -1,11 +1,11 @@
-// Shared stage-1 body for ME1/ME2 analytic scene permutations used by the galaxy map, some Mako scenes, and
+// Shared stage-1 body for ME1LE/ME2LE analytic scene permutations used by the galaxy map, some Mako scenes, and
 // cutscenes. These permutations have no LUT, motion blur, or film grain. Bindings: t0 scene, t1 DoF, t2/t3
 // near/far DoF, t4 bloom.
 //
-// ME1 0xAAE8755A and ME2 0xCC76075F share the decompiled scene preparation and grade. Thin entry points select
-// vignette parameters and ME2's post-gamma white point. Preserve register-level swizzles for comparison with the
+// ME1LE 0xAAE8755A and ME2LE 0xCC76075F share the decompiled scene preparation and grade. Thin entry points select
+// vignette parameters and ME2LE's post-gamma white point. Preserve register-level swizzles for comparison with the
 // live CSOs. This body produces linear graded_hdr and native gamma sdr_gamma; the shared tail applies DICE.
-// ME3 analytic shader 0x225A8330 has a different cbuffer layout and no exponential curve.
+// ME3LE analytic shader 0x225A8330 has a different cbuffer layout and no exponential curve.
 
 // clang-format off
 #include "Includes/Common.hlsl"
@@ -43,7 +43,7 @@ Texture2D<float4> BlurredImageSeperateBloom : register(t4);
 
 // Native analytic SDR grade transcribed from the live CSOs, evaluated exactly once on the untouched per-channel
 // value in every Display Mode: SDR is its output and nothing else, HDR only scales it. Keep its register-level
-// swizzles and optional ME2 white point unchanged.
+// swizzles and optional ME2LE white point unchanged.
 float3 MELE_Analytic_GradeChain(float3 c)
 {
    float4 r0, r1, r2;
@@ -78,7 +78,7 @@ float3 MELE_Analytic_GradeChain(float3 c)
    r0.xyz = MELE_NativeGammaCurve(r0.xyz, GammaColorScaleAndInverse.xyz, GammaColorScaleAndInverse.w, false);
 
 #ifdef TM_ANALYTIC_WHITEPOINT
-   r0.xyz = TM_ANALYTIC_WHITEPOINT * r0.xyz; // ME2 blue-tinted white point; ME1 defines none.
+   r0.xyz = TM_ANALYTIC_WHITEPOINT * r0.xyz; // ME2LE blue-tinted white point; ME1LE defines none.
 #endif
    r0.xyz = min(float3(1, 1, 1), r0.xyz);
    return r0.xyz;
@@ -136,6 +136,6 @@ void main(
    // highlights. SDR leaves mele_scale at 1.
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
 
-   // Entry point supplies vignette macros. Analytic ME1/ME2 permutations have no grain and write zero alpha.
+   // Entry point supplies vignette macros. Analytic ME1LE/ME2LE permutations have no grain and write zero alpha.
 #include "Includes/Tonemap_MELE_Output.hlsli"
 }
