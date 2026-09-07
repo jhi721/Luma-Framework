@@ -123,6 +123,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Medal of Honor Airborne", "
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mass Effect", "Source\Games\Mass Effect\Mass Effect.vcxproj", "{A8505E49-DA6F-4C05-ADF0-3480DC27B3FC}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mass Effect 2", "Source\Games\Mass Effect 2\Mass Effect 2.vcxproj", "{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Development-Debug|Win32 = Development-Debug|Win32
@@ -903,6 +905,18 @@ Global
 		{A8505E49-DA6F-4C05-ADF0-3480DC27B3FC}.Test-Release|Win32.ActiveCfg = Test-Release|Win32
 		{A8505E49-DA6F-4C05-ADF0-3480DC27B3FC}.Test-Release|Win32.Build.0 = Test-Release|Win32
 		{A8505E49-DA6F-4C05-ADF0-3480DC27B3FC}.Test-Release|x64.ActiveCfg = Test-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Development-Debug|Win32.ActiveCfg = Development-Debug|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Development-Debug|Win32.Build.0 = Development-Debug|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Development-Debug|x64.ActiveCfg = Development-Debug|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Development-Release|Win32.ActiveCfg = Development-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Development-Release|Win32.Build.0 = Development-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Development-Release|x64.ActiveCfg = Development-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Publishing-Release|Win32.Build.0 = Publishing-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Publishing-Release|x64.ActiveCfg = Publishing-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Test-Release|Win32.ActiveCfg = Test-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Test-Release|Win32.Build.0 = Test-Release|Win32
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}.Test-Release|x64.ActiveCfg = Test-Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -965,6 +979,7 @@ Global
 		{8F4A1D26-93BC-4E07-A5D1-64C2E7B9F310} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{7C3E9A18-4D62-4B85-9E30-1A8F5D2C6B44} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{A8505E49-DA6F-4C05-ADF0-3480DC27B3FC} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {8B799422-BA66-3174-B21F-B9FA07C4B2E3}
