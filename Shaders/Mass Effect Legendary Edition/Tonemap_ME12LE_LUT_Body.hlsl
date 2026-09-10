@@ -425,9 +425,18 @@ void main(
       // Invert the curve the game actually applies, normalized so mid-gray holds still at 1-exp2(-1.7*0.18) = 0.1911
       mele_scale = (MELE_NativeToneCurve(mele_mch) / mele_mch) * (0.18 / MELE_NativeToneCurve(0.18));
 #if MELE_HDR_EXP_LUT
+      // The scene and the bloom are validated HERE, separately, before the exponential runs on either.
+      // The bridge downstream only ever sees their SUM, and a positive bloom hides a bad scene channel
+      // inside it: with C = -0.1 and B = 0.2 the sum is F(-0.1) + 0.2 = 0.074941, which is finite and
+      // non-negative and passes every later check, while the source already left this experiment's
+      // domain. A whole-triple refusal is the answer; the scene is never repaired with max(C, 0).
+      //
       // The extension applies to the scene BEFORE its curve; the bloom is added where vanilla adds it, so this
       // reduces to the native grade input exactly wherever the scene sits at or below the pivot.
-      mele_exp_valid = MELE_ME12LE_ExpGradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear, mele_exp_hdr);
+      if (MELE_IsFiniteNonNegative(mele_scene_linear) && MELE_IsFiniteNonNegative(mele_bloom_linear))
+      {
+         mele_exp_valid = MELE_ME12LE_ExpGradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear, mele_exp_hdr);
+      }
 #endif
    }
    // r0.xyz stays the native per-channel value.

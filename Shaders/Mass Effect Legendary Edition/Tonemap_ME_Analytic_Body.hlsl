@@ -89,25 +89,43 @@ float3 MELE_Analytic_GradeChain(float3 c)
 }
 
 #if MELE_HDR_EXP_ANALYTIC
-// Experimental family 02. A minimal copy of MELE_Analytic_GradeChain with exactly three upper tonal caps lifted
-// and nothing else touched, so the working branch can carry values above the native ceiling. There is no LUT
-// here and no max-channel proxy: the grade is available as a formula, so it is extended as a formula rather
-// than routed through an invented table. The native function above is left untouched and still produces SDR.
+// Experimental family 02. A minimal copy of MELE_Analytic_GradeChain with
+// exactly three upper tonal caps lifted and nothing else touched, so the
+// working branch can carry values above the native ceiling. There is no LUT
+// here and no max-channel proxy: the grade is available as a formula, so it is
+// extended as a formula rather than routed through an invented table. The
+// native function above is left untouched and still produces SDR.
 //
 // Lifted, and only these:
-//   the saturate opening the Scene grade becomes max(0, .). The lower bound must stay - log2 follows it.
-//   MELE_NativeGammaCurve becomes its cap-free twin. clampFloor was already false for this family and no
-//     floor is introduced, because these two permutations feed mul_sat straight into log in the vanilla code.
+//   the saturate opening the Scene grade becomes max(0, .). The lower bound
+//   must stay - log2 follows it. MELE_NativeGammaCurve becomes its cap-free
+//   twin. clampFloor was already false for this family and no
+//     floor is introduced, because these two permutations feed mul_sat straight
+//     into log in the vanilla code.
 //   the closing min(1, rgb) is not applied.
-// Kept: the highlight-desaturation rule and its 1.1 threshold, the ImageAdjustments mix, every Scene* field
-// meaning and the order they are applied in, the RGB desaturation weights, GammaOverlayColor, both halves of
-// GammaColorScaleAndInverse, and the ME2LE encoded white point in the same encoded domain.
+// Kept: the highlight-desaturation rule and its 1.1 threshold, the
+// ImageAdjustments mix, every Scene* field meaning and the order they are
+// applied in, the RGB desaturation weights, GammaOverlayColor, both halves of
+// GammaColorScaleAndInverse, and the ME2LE encoded white point in the same
+// encoded domain.
 //
-// The result is native-encoded and uncapped; the caller decodes it once. Lifting the caps lets SceneMidTones
-// act on values above 1, where a game exponent grows without bound - that is a real limit of the model, not a
-// proof of correctness, so the caller validates the whole triple before using it.
-float3 MELE_Analytic_GradeChainHDR(float3 c)
+// The result is native-encoded and uncapped; the caller decodes it once.
+//
+// WHY THIS ONE IS CHECKED AND THE NATIVE ONE IS NOT. Lifting the caps is what
+// makes the arithmetic reachable: a saturate and a min(1) between every stage
+// cannot produce an infinity, and once they are gone SceneMidTones acting on a
+// value above 1 grows without bound. So the guards belong here and only here -
+// the native chain above keeps its caps and is left alone.
+//
+// The checks are placed BEFORE the operation each one protects, not after the
+// whole grade. Judging the output alone cannot distinguish a value that was
+// always fine from one that overflowed and came back finite, and it cannot see
+// a NaN that a later max() swallowed. A failure of any single channel returns
+// false for the WHOLE triple: switching channels independently would move hue,
+// which is the failure this branch exists to avoid.
+bool MELE_TryAnalyticGradeChainHDR(float3 c, out float3 encoded_hdr)
 {
+   encoded_hdr = float3(0.0, 0.0, 0.0);
    float4 r0, r1, r2;
    r0.xyz = c;
    // Native highlight desaturation.
@@ -127,50 +145,171 @@ float3 MELE_Analytic_GradeChainHDR(float3 c)
    r1.xyz = r0.www * float3(0.600000024, 0.600000024, 0.600000024) + r1.xyz;
    r1.xyz = r1.xyz * float3(0.00658500008, 0.0199180003, 1) + -r0.xyz;
    r0.xyz = r1.xyz * float3(0.200000003, 0.200000003, 0.200000003) + r0.xyz;
-   // Native analytic Scene grade, with only the upper half of the opening saturate removed.
-   r0.xyz = max(float3(0, 0, 0), -SceneShadowsAndDesaturation.xyz + r0.xyz);
-   r0.xyz = SceneInverseHighLights.xyz * r0.xyz;
-   r0.xyz = log2(r0.xyz);
-   r0.xyz = SceneMidTones.xyz * r0.xyz;
-   r0.xyz = exp2(r0.xyz);
-   r0.w = dot(r0.xyz, SceneScaledLuminanceWeights.xyz);
-   r0.xyz = r0.xyz * SceneShadowsAndDesaturation.www + GammaOverlayColor.xyz;
-   r0.xyz = r0.xyz + r0.www;
-   // Same scale and exponent as the native tail, without its cap.
-   r0.xyz = MELE_NativeGammaCurveHDR(r0.xyz, GammaColorScaleAndInverse.xyz, GammaColorScaleAndInverse.w);
-
-#ifdef TM_ANALYTIC_WHITEPOINT
-   r0.xyz = TM_ANALYTIC_WHITEPOINT * r0.xyz; // Still encoded, still the same tint; it may now exceed 1.
-#endif
-   return r0.xyz;
-}
-
-// This family has no grade proxy - the grade is available as a formula and is extended as a formula - so the
-// bridge's early checks never run here and the equivalent ones are written out. Sources first, then the working
-// value that is about to enter log2 and pow, then the decoded result. Nothing is judged only after the fact.
-//
-// The exact zero is NOT rejected. max(0, .) into log2 gives -inf, and exp2(SceneMidTones * -inf) is 0 for any
-// positive exponent: that is the vanilla semantics of these two permutations, transcribed from their bytecode,
-// and a blanket epsilon to dodge the infinity would change the picture rather than protect it. What is rejected
-// is a non-finite or negative source, and a result that ran away - which is exactly what lifting the caps makes
-// possible, since SceneMidTones acting on values above 1 grows without bound.
-//
-// A negative decoded result now selects the legacy triple where it previously reached
-// MELE_NativeColorAtLuminance as a target luminance. That is a deliberate change to the invalid/fallback
-// contract, not to the tonal model: on finite non-negative data this returns what it always returned.
-bool MELE_TryAnalyticGradeHDR(float3 scene_linear, float3 bloom_linear, out float3 work_hdr)
-{
-   work_hdr = float3(0.0, 0.0, 0.0);
-   if (!MELE_IsFiniteNonNegative(scene_linear) || !MELE_IsFiniteNonNegative(bloom_linear))
+   // The artistic head is signed by construction - the desaturation delta and
+   // the adjustment mix both subtract - so this is the finite check, not the
+   // non-negative one.
+   if (!MELE_IsFinite(r0.xyz))
    {
       return false;
    }
-   const float3 work_native = MELE_ExpExtended(scene_linear, MELE_HDR_PIVOT) + bloom_linear;
+
+   // Native analytic Scene grade, with only the upper half of the opening
+   // saturate removed. The shift is kept as its own value so it can be checked
+   // BEFORE the max: a max() over a NaN returns the NaN on some hardware and the
+   // other operand on others, and either way it stops being visible afterwards.
+   const float3 shifted = -SceneShadowsAndDesaturation.xyz + r0.xyz;
+   if (!MELE_IsFinite(shifted))
+   {
+      return false;
+   }
+   r0.xyz =
+       max(float3(0, 0, 0),
+           shifted); // A negative shift is ordinary artist data, not an error.
+   r0.xyz = SceneInverseHighLights.xyz * r0.xyz;
+
+   // The actual base of the logarithm, checked as data rather than inferred from
+   // the sign of the coefficient that produced it: a negative
+   // SceneInverseHighLights against a zero lower bound is still a perfectly good
+   // zero.
+   if (!MELE_IsFiniteNonNegative(r0.xyz))
+   {
+      return false;
+   }
+   // log2(0) is -inf in SM4/5, and exp2(m * -inf) is 0 for any m > 0. That is
+   // the vanilla result for a black channel and it must survive: a blanket
+   // isfinite() on the logarithm would reject it, and an epsilon floor would
+   // change the picture instead of protecting it. What cannot survive is a zero
+   // base with a non-positive exponent - 0 * -inf is a NaN and -m * -inf is +inf
+   // - so that combination is refused here, before the logarithm, rather than
+   // invented into 0^0 = 1.
+   if ((r0.x == 0.0 && SceneMidTones.x <= 0.0) ||
+       (r0.y == 0.0 && SceneMidTones.y <= 0.0) ||
+       (r0.z == 0.0 && SceneMidTones.z <= 0.0))
+   {
+      return false;
+   }
+   r0.xyz = log2(r0.xyz);
+   r0.xyz = SceneMidTones.xyz * r0.xyz;
+   r0.xyz = exp2(r0.xyz);
+   // exp2 never returns a negative, so this rejects only NaN and +inf. An
+   // underflow to exactly zero after a positive base is a legitimate result and
+   // is deliberately accepted.
+   if (!MELE_IsFiniteNonNegative(r0.xyz))
+   {
+      return false;
+   }
+
+   r0.w = dot(r0.xyz, SceneScaledLuminanceWeights.xyz);
+   if (!MELE_IsFinite(r0.w)) // The weights are signed, so the dot is too.
+   {
+      return false;
+   }
+   r0.xyz = r0.xyz * SceneShadowsAndDesaturation.www + GammaOverlayColor.xyz;
+   r0.xyz = r0.xyz + r0.www;
+   if (!MELE_IsFinite(r0.xyz))
+   {
+      return false;
+   }
+
+   // The scale is applied inside MELE_NativeGammaCurveHDR; the product is formed
+   // once here purely to be checked before the encode, and the helper is left
+   // alone rather than resplit around this check. The repeated multiply costs
+   // one instruction in a branch that ships disabled.
+   if (!MELE_IsFinite(GammaColorScaleAndInverse.xyz * r0.xyz))
+   {
+      return false;
+   }
+   // Same scale and exponent as the native tail, without its cap.
+   r0.xyz = MELE_NativeGammaCurveHDR(r0.xyz, GammaColorScaleAndInverse.xyz,
+                                     GammaColorScaleAndInverse.w);
+   // GCT_MIRROR is the odd extension, so a negative encoded value here is signed
+   // data and not a bad pow base. Finiteness is the contract at this point;
+   // non-negativity is the caller's, after the decode.
+   if (!MELE_IsFinite(r0.xyz))
+   {
+      return false;
+   }
+
+#ifdef TM_ANALYTIC_WHITEPOINT
+   r0.xyz = TM_ANALYTIC_WHITEPOINT *
+            r0.xyz; // Still encoded, still the same tint; it may now exceed 1.
+   if (!MELE_IsFinite(r0.xyz))
+   {
+      return false;
+   }
+#endif
+   encoded_hdr = r0.xyz;
+   return true;
+}
+
+// This family has no grade proxy - the grade is available as a formula and is
+// extended as a formula - so the bridge's early checks never run here and the
+// equivalent ones are written out. Sources, then the cbuffer parameters the RGB
+// formula actually reads, then the working value, then the checked chain, then
+// a single decode of its result. Nothing is judged only after the fact, and the
+// grade is never run twice.
+//
+// SIGN IS FREE for every artist dial. A negative shadow lift, a negative
+// luminance weight and a negative overlay offset are all legitimate game data,
+// so they get the finite check and not the non-negative one. Only
+// GammaColorScaleAndInverse.w is required positive, because the tail divides by
+// it; a zero or negative exponent there is refused rather than quietly replaced
+// with 1/2.2. A zero output scale is NOT refused - that is a fade, and fades
+// are normal.
+//
+// The unused .w of SceneMidTones, SceneInverseHighLights,
+// SceneScaledLuminanceWeights and GammaOverlayColor are deliberately not
+// checked: they take no part in the RGB formula and validating them would
+// invent a contract the shader does not have.
+//
+// A negative decoded result selects the legacy triple where it once reached
+// MELE_NativeColorAtLuminance as a target luminance. That is a deliberate
+// change to the invalid/fallback contract, not to the tonal model: on finite,
+// non-negative data with usable parameters this returns exactly what it always
+// returned.
+//
+// Bad parameters are never repaired. Nothing here writes a neutral constant
+// over the game's cbuffer and nothing touches the native SDR path; false only
+// means this HDR branch declines, and the caller keeps its own legacy value. If
+// the legacy value is itself unusable because the cbuffer is corrupt, that is
+// the game's state and not something this branch can fix.
+bool MELE_TryAnalyticGradeHDR(float3 scene_linear, float3 bloom_linear,
+                              out float3 work_hdr)
+{
+   work_hdr = float3(0.0, 0.0, 0.0);
+   if (!MELE_IsFiniteNonNegative(scene_linear) ||
+       !MELE_IsFiniteNonNegative(bloom_linear))
+   {
+      return false;
+   }
+   const float inv_gamma = GammaColorScaleAndInverse.w;
+   const float gamma_exponent =
+       1.0 / inv_gamma; // The reciprocal MELE_NativeGammaCurveHDR hands to
+                        // linear_to_gamma.
+   if (!MELE_IsFinite(SceneShadowsAndDesaturation.xyz) ||
+       !MELE_IsFinite(SceneShadowsAndDesaturation.w) ||
+       !MELE_IsFinite(SceneInverseHighLights.xyz) ||
+       !MELE_IsFinite(SceneMidTones.xyz) ||
+       !MELE_IsFinite(SceneScaledLuminanceWeights.xyz) ||
+       !MELE_IsFinite(GammaOverlayColor.xyz) ||
+       !MELE_IsFinite(GammaColorScaleAndInverse.xyz) ||
+       !MELE_IsFinite(inv_gamma) || inv_gamma <= 0.0 ||
+       !MELE_IsFinite(gamma_exponent) || gamma_exponent <= 0.0)
+   {
+      return false;
+   }
+   const float3 work_native =
+       MELE_ExpExtended(scene_linear, MELE_HDR_PIVOT) + bloom_linear;
    if (!MELE_IsFiniteNonNegative(work_native))
    {
       return false;
    }
-   const float3 candidate = gamma_to_linear(MELE_Analytic_GradeChainHDR(work_native), GCT_MIRROR);
+   float3 encoded;
+   if (!MELE_TryAnalyticGradeChainHDR(work_native, encoded))
+   {
+      return false;
+   }
+   const float3 candidate = gamma_to_linear(encoded, GCT_MIRROR);
    if (!MELE_IsFiniteNonNegative(candidate))
    {
       return false;

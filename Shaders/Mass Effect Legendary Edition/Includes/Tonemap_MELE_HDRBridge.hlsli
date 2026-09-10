@@ -26,6 +26,19 @@ bool MELE_IsFiniteNonNegative(float3 v)
    return !IsAnyNaN_Strict(v) && !any(IsInfinite_Strict(v)) && all(v >= 0.0);
 }
 
+// The signed sibling, for values that have every right to be negative: an artist's shadow lift, a
+// colour-grading weight, an overlay offset, and the intermediate differences those produce. Applying
+// the non-negative predicate to one of those would reject valid game data as corrupt, so the two are
+// deliberately separate and the choice between them is made per value, never by habit.
+bool MELE_IsFinite(float x)
+{
+   return !IsNaN_Strict(x) && !IsInfinite_Strict(x);
+}
+bool MELE_IsFinite(float3 v)
+{
+   return !IsAnyNaN_Strict(v) && !any(IsInfinite_Strict(v));
+}
+
 // The neutral composite transfer between the grade-input domain and the linear domain the caller
 // finally works in. For every MELE family the tail from grade input to linear graded_hdr is
 // MELE_NativeGammaCurve, pow(saturate(scale*c), invGamma), followed by gamma_to_linear(., GCT_MIRROR),
