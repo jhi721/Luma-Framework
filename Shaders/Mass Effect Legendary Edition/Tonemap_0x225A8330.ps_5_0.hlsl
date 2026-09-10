@@ -96,13 +96,13 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 bool MELE_ME3LEAnalytic_GradeHDR(float3 work_linear, out float3 work_hdr)
 {
    work_hdr = float3(0.0, 0.0, 0.0);
-   MELE_BridgeState state;
+   float q;
    float3 proxy;
-   if (!MELE_TryBuildGradeProxy(work_linear, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy))
+   if (!MELE_TryBuildGradeProxy(work_linear, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy))
    {
       return false;
    }
-   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), state, work_hdr);
+   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), q, work_hdr);
 }
 
 // Only ever evaluated after the wrapper above returned true, so work_linear is already known finite and
@@ -164,9 +164,13 @@ void main(
 
    float3 sdr_gamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
 
+   // Decoded once and reused by both the legacy scale below and, when a family is enabled, the NATIVE
+   // composition. fxc already shared this value; the local only stops the source from saying it twice.
+   const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
+
    // Undo compression only where scale < 1, preserving native diffuse/shadow grading and restoring HDR
    // highlights. SDR leaves mele_scale at 1.
-   float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
+   float3 graded_hdr = sdr_linear / min(1.0, mele_scale);
 #if MELE_HDR_ME3_HARDCLIP
    if (LumaSettings.DisplayMode == 1 && mele_hardclip_valid)
    {

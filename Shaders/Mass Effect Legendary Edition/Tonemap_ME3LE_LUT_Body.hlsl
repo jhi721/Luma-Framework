@@ -180,14 +180,14 @@ float3 MELE_ME3LE_GradeChain(float3 c)
 bool MELE_ME3LE_FilmicGradeHDR(float3 work_rgb, out float3 work_hdr)
 {
    work_hdr = float3(0.0, 0.0, 0.0);
-   MELE_BridgeState state;
+   float q;
    float3 proxy_rgb;
-   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy_rgb))
+   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy_rgb))
    {
       return false;
    }
    const float3 graded_linear = gamma_to_linear(MELE_ME3LE_GradeChain(proxy_rgb), GCT_MIRROR);
-   return MELE_TryRestoreGradeRange(graded_linear, state, work_hdr);
+   return MELE_TryRestoreGradeRange(graded_linear, q, work_hdr);
 }
 #endif
 
@@ -316,15 +316,19 @@ void main(
    // Use one native grade function for both the working value and SDR reference.
    float3 sdr_gamma = MELE_ME3LE_GradeChain(r0.xyz);
 
+   // Decoded once and reused by both the legacy scale below and, when a family is enabled, the NATIVE
+   // composition. fxc already shared this value; the local only stops the source from saying it twice.
+   const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
+
    // Scalar uncompression preserves native mids/shadows and restores extrapolated HDR highlights. SDR leaves
    // mele_expand at 1.
-   float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) * mele_expand;
+   float3 graded_hdr = sdr_linear * mele_expand;
 #if MELE_HDR_ME3_FILMIC
    if (LumaSettings.DisplayMode == 1 && mele_filmic_valid)
    {
       // RGB ratios of the real tone LUT plus colour LUT plus native tail, at the working luminance. The white
       // blowout that reference already contains is kept as it is; it is not given back its lost saturation.
-      graded_hdr = MELE_NativeColorAtLuminance(gamma_to_linear(sdr_gamma, GCT_MIRROR), GetLuminance(mele_filmic_hdr, CS_BT709), graded_hdr);
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709), graded_hdr);
    }
 #endif
 

@@ -223,45 +223,34 @@ float3 MELE_ME12LE_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_Filmic.hlsli"
 #if MELE_HDR_ME2_FILMIC
 #include "Includes/Tonemap_MELE_FilmicExtended.hlsli"
-// Experimental family 03. Same bridge as family 01 and the same BRG adapter, because the filmic branch of the
-// grade chain is transcribed BRG-in / RGB-out too: it takes the slice from .x and the strip-x from .y.
-// False means the caller keeps its legacy value for the whole triple; work_hdr must not be read then.
-bool MELE_ME12LE_FilmicGradeHDR(float3 work_rgb, out float3 work_hdr)
-{
-   work_hdr = float3(0.0, 0.0, 0.0);
-   MELE_BridgeState state;
-   float3 proxy_rgb;
-   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy_rgb))
-   {
-      return false;
-   }
-   const float3 graded_linear = gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxy_rgb)), GCT_MIRROR);
-   return MELE_TryRestoreGradeRange(graded_linear, state, work_hdr);
-}
 #endif
 #endif
 
-#if MELE_HDR_EXP_LUT && !TM_HAS_FILMIC
-// Experimental family 01. Defined here, after MELE_ME12LE_GradeChain, so the bridge runs the real game grade and
-// the real 16-slice LUT rather than an approximation of them. The chain is transcribed BRG-in / RGB-out, so the
-// swizzle is applied through the named adapter instead of being inferred from a register name.
+#if (TM_HAS_FILMIC && MELE_HDR_ME2_FILMIC) || (!TM_HAS_FILMIC && MELE_HDR_EXP_LUT)
+// The experimental grade for both families this body serves: 01 on the non-filmic branch and 03 on the filmic
+// one. They differ in what they feed it, never in what it does, so there is one of it.
+//
+// Defined here, after MELE_ME12LE_GradeChain, so the bridge drives the real game grade and the real 16-slice
+// LUT rather than an approximation. The BRG rotation stays inside: both branches of that chain are transcribed
+// BRG-in / RGB-out, which is a property of the chain and not of either caller.
 //
 // r is the exponent of the composite tail from grade input to linear graded_hdr, read from the frame's own
-// cbuffer: MELE_NativeGammaCurve raises to GammaColorScaleAndInverse.w and gamma_to_linear then raises to
-// DefaultGamma. It is never assumed to be 1.
-// The bridge validates work_rgb itself, before any pow, division or LUT read, so a negative or non-finite
-// scene is rejected here rather than laundered by the saturate the grade chain opens with.
-bool MELE_ME12LE_ExpGradeHDR(float3 work_rgb, out float3 work_hdr)
+// cbuffer and never assumed to be 1.
+//
+// False means the caller keeps its legacy value for the whole triple; work_hdr must not be read then. The
+// bridge validates work_rgb before any pow, division or LUT read, so a bad working value is rejected rather
+// than laundered by the saturate the grade chain opens with.
+bool MELE_ME12LE_GradeHDR(float3 work_rgb, out float3 work_hdr)
 {
    work_hdr = float3(0.0, 0.0, 0.0);
-   MELE_BridgeState state;
+   float q;
    float3 proxy_rgb;
-   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy_rgb))
+   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy_rgb))
    {
       return false;
    }
    const float3 graded_linear = gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxy_rgb)), GCT_MIRROR);
-   return MELE_TryRestoreGradeRange(graded_linear, state, work_hdr);
+   return MELE_TryRestoreGradeRange(graded_linear, q, work_hdr);
 }
 #endif
 
@@ -383,7 +372,7 @@ void main(
       mele_filmic_valid = MELE_EvaluateME2FilmicExtended(mele_scene_linear, mele_bloom_linear, MELE_BRG_TO_RGB(r1.xyz), mele_extended_filmic);
       if (mele_filmic_valid)
       {
-         mele_filmic_valid = MELE_ME12LE_FilmicGradeHDR(mele_extended_filmic, mele_filmic_hdr);
+         mele_filmic_valid = MELE_ME12LE_GradeHDR(mele_extended_filmic, mele_filmic_hdr);
       }
 #endif
    }
@@ -435,7 +424,7 @@ void main(
       // reduces to the native grade input exactly wherever the scene sits at or below the pivot.
       if (MELE_IsFiniteNonNegative(mele_scene_linear) && MELE_IsFiniteNonNegative(mele_bloom_linear))
       {
-         mele_exp_valid = MELE_ME12LE_ExpGradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear, mele_exp_hdr);
+         mele_exp_valid = MELE_ME12LE_GradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear, mele_exp_hdr);
       }
 #endif
    }
@@ -449,23 +438,27 @@ void main(
    float3 sdr_gamma = MELE_ME12LE_GradeChain(r0.xyz);
 #endif
 
+   // Decoded once and reused by both the legacy scale below and, when a family is enabled, the NATIVE
+   // composition. fxc already shared this value; the local only stops the source from saying it twice.
+   const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
+
    // Scalar uncompression commutes with the LUT's channel restoration. Both paths reduce to native output in SDR.
 #if TM_HAS_FILMIC
-   float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) * mele_expand;
+   float3 graded_hdr = sdr_linear * mele_expand;
 #if MELE_HDR_ME2_FILMIC
    if (LumaSettings.DisplayMode == 1 && mele_filmic_valid)
    {
-      graded_hdr = MELE_NativeColorAtLuminance(gamma_to_linear(sdr_gamma, GCT_MIRROR), GetLuminance(mele_filmic_hdr, CS_BT709), graded_hdr);
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709), graded_hdr);
    }
 #endif
 #else
-   float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
+   float3 graded_hdr = sdr_linear / min(1.0, mele_scale);
 #if MELE_HDR_EXP_LUT
    if (LumaSettings.DisplayMode == 1 && mele_exp_valid)
    {
       // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
       // Whatever hue the LUT gave the q-proxy belongs to mele_exp_hdr and is deliberately dropped here.
-      graded_hdr = MELE_NativeColorAtLuminance(gamma_to_linear(sdr_gamma, GCT_MIRROR), GetLuminance(mele_exp_hdr, CS_BT709), graded_hdr);
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_exp_hdr, CS_BT709), graded_hdr);
    }
 #endif
 #endif

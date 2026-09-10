@@ -25,18 +25,4 @@ float3 MELE_ExpExtended(float3 x, float pivot)
                  x.z <= pivot ? MELE_NativeToneCurve(x.z) : tangent.z);
 }
 
-// Unbounded twin of MELE_NativeGammaCurve (Includes/Common.hlsl:30) for the analytic families:
-// same scale and same exponent, without the leading saturate that caps the encoded result at 1.
-// Includes/Common.hlsl is shared and is NOT edited; this is a separate function so the SDR
-// reference keeps calling the faithful one. The black floor is deliberately absent because the two
-// analytic ME1LE/ME2LE permutations pass clampFloor = false, and that asymmetry is transcribed
-// from bytecode (Includes/Common.hlsl:25-29), not a rounding of one form to the other.
-//
-// GCT_MIRROR is the odd extension pow(|x|) * sign(x), so a negative working value survives the
-// encode instead of turning into a NaN. The caller still owns the decision to fall back.
-float3 MELE_NativeGammaCurveHDR(float3 c, float3 scale, float invGamma)
-{
-   return linear_to_gamma(scale * c, GCT_MIRROR, 1.0 / invGamma);
-}
-
 #endif // LUMA_MELE_TONEMAP_EXP_EXTENDED
