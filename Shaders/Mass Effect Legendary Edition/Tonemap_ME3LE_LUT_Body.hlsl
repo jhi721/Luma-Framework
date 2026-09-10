@@ -176,12 +176,18 @@ float3 MELE_ME3LE_GradeChain(float3 c)
 // Experimental family 04. Defined after MELE_ME3LE_GradeChain so the bridge drives the real colour LUT and the
 // real native tail. This body is straight RGB throughout - slice from blue, strip-x from red - so no swizzle
 // adapter is applied here; the ME1LE/ME2LE BRG rotation belongs to the other body and must not be copied over.
-float3 MELE_ME3LE_FilmicGradeHDR(float3 work_rgb)
+// False means the caller keeps its legacy value for the whole triple; work_hdr must not be read then.
+bool MELE_ME3LE_FilmicGradeHDR(float3 work_rgb, out float3 work_hdr)
 {
+   work_hdr = float3(0.0, 0.0, 0.0);
+   MELE_BridgeState state;
    float3 proxy_rgb;
-   const MELE_BridgeState state = MELE_BuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, proxy_rgb);
+   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy_rgb))
+   {
+      return false;
+   }
    const float3 graded_linear = gamma_to_linear(MELE_ME3LE_GradeChain(proxy_rgb), GCT_MIRROR);
-   return MELE_RestoreGradeRange(graded_linear, state);
+   return MELE_TryRestoreGradeRange(graded_linear, state, work_hdr);
 }
 #endif
 
@@ -302,7 +308,7 @@ void main(
       mele_filmic_valid = MELE_EvaluateME3FilmicExtended(untonemapped, r0.xyz, mele_extended_filmic);
       if (mele_filmic_valid)
       {
-         mele_filmic_hdr = MELE_ME3LE_FilmicGradeHDR(mele_extended_filmic);
+         mele_filmic_valid = MELE_ME3LE_FilmicGradeHDR(mele_extended_filmic, mele_filmic_hdr);
       }
 #endif
    }

@@ -5,11 +5,26 @@
 
 // Pure math. Prerequisites, which this file deliberately does NOT include:
 //   ../Includes/Color.hlsl    gamma_to_linear, GetLuminance, GCT_MIRROR
-//   ../Includes/Math.hlsl     max3  (arrives through Color.hlsl)
+//   ../Includes/Math.hlsl     max3, IsNaN_Strict, IsInfinite_Strict  (arrive through Color.hlsl)
 //   ../Includes/Reinhard.hlsl ReinhardRange
 // Reinhard.hlsl has no include guard, unlike every other shared header, so including it from here
 // would be a duplicate-namespace error in the two LUT bodies that already include it. Include it in
 // the body, before this file.
+
+// The validity predicate every experimental family shares. Finite AND non-negative, checked with the
+// strict helpers rather than with x != x, which a fast-math build is free to fold away. Non-negative
+// is part of it because every value this experiment guards - a scene sample, a bloom contribution, a
+// tone response, a decoded grade output - is a light quantity with no meaning below zero, and because
+// the nonlinear steps downstream (log2, pow, a LUT coordinate) turn a negative into a NaN several
+// operations after the point where it could still have been reported.
+bool MELE_IsFiniteNonNegative(float x)
+{
+   return !IsNaN_Strict(x) && !IsInfinite_Strict(x) && x >= 0.0;
+}
+bool MELE_IsFiniteNonNegative(float3 v)
+{
+   return !IsAnyNaN_Strict(v) && !any(IsInfinite_Strict(v)) && all(v >= 0.0);
+}
 
 // The neutral composite transfer between the grade-input domain and the linear domain the caller
 // finally works in. For every MELE family the tail from grade input to linear graded_hdr is
@@ -52,22 +67,77 @@ struct MELE_BridgeState
 // shoulder this needs, k + (1-k)(m-k)/((m-k)+(1-k)): identity at and below k, C1 across the seam,
 // asymptotic to 1. It is NOT ReinhardPiecewise, which matches value but not derivative at its seam;
 // do not substitute one for the other on the strength of the shared name.
-MELE_BridgeState MELE_BuildGradeProxy(float3 work_native, float r, out float3 proxy_native)
+//
+// EVERY check runs before the data-dependent pow, division and LUT sampling it protects. An invalid
+// working value has to be reported here and not carried into the grade to be recognised afterwards by
+// the finiteness of whatever came out: the grade opens with a saturate or a min(1) in every
+// permutation, so it launders a bad input into a plausible number the caller can no longer question.
+//
+// On failure both out parameters keep the neutral values written at entry and the caller must use
+// neither: false means take the family's own legacy result for the whole RGB triple.
+bool MELE_TryBuildGradeProxy(float3 work_native, float r, out MELE_BridgeState state, out float3 proxy_native)
 {
-   MELE_BridgeState state;
+   state.q = 1.0;
    state.r = r;
-   const float3 adapted = MELE_BridgeAdapt(work_native, r);
+   proxy_native = work_native;
+
+   const float k = MELE_HDR_BRIDGE_SHOULDER;
+   if (!MELE_IsFiniteNonNegative(work_native) || !MELE_IsFiniteNonNegative(r) || r <= 0.0 || !(k > 0.0 && k < 1.0))
+   {
+      return false;
+   }
+
+   // pow(x, 1) is exp2(log2(x)) on this hardware, not the identity, and r was measured at exactly 1
+   // in every captured frame. This keeps that overwhelmingly common case bit-exact; it is a shortcut
+   // for one value of r, never an assumption that r is 1.
+   const float3 adapted = (r == 1.0) ? work_native : MELE_BridgeAdapt(work_native, r);
+   if (!MELE_IsFiniteNonNegative(adapted))
+   {
+      return false;
+   }
+
    const float m = max3(adapted);
-   state.q = (m <= MELE_HDR_BRIDGE_SHOULDER) ? 1.0 : (Reinhard::ReinhardRange(m.xxx, MELE_HDR_BRIDGE_SHOULDER).x / m);
-   proxy_native = MELE_BridgeUnadapt(adapted * state.q, r);
-   return state;
+   if (m <= k)
+   {
+      return true; // q stays 1 and the proxy stays the working value: no round trip, no roundoff.
+   }
+
+   const float q = Reinhard::ReinhardRange(m.xxx, k).x / m;
+   const float3 compressed = adapted * q;
+   // The shoulder is asymptotic to 1, so the compressed value belongs to a bounded domain. The
+   // tolerance covers roundoff in that shoulder only; a compressed value genuinely above 1 means the
+   // shoulder did not do its job, which is a failure rather than something to clamp quietly.
+   if (!MELE_IsFiniteNonNegative(q) || q <= 0.0 || q > 1.0 || !MELE_IsFiniteNonNegative(compressed) || max3(compressed) > 1.0 + MELE_BRIDGE_PROXY_EPS)
+   {
+      return false;
+   }
+
+   const float3 candidate_proxy = (r == 1.0) ? compressed : MELE_BridgeUnadapt(compressed, r);
+   if (!MELE_IsFiniteNonNegative(candidate_proxy))
+   {
+      return false;
+   }
+   state.q = q;
+   proxy_native = candidate_proxy;
+   return true;
 }
 
 // Undo the compression on the decoded linear grade output. Never invert the curve by re-reading the
 // changed LUT output: the LUT moved the colour, so that read cannot recover the original scale.
-float3 MELE_RestoreGradeRange(float3 graded_linear, MELE_BridgeState state)
+bool MELE_TryRestoreGradeRange(float3 graded_linear, MELE_BridgeState state, out float3 work_hdr)
 {
-   return graded_linear / state.q;
+   work_hdr = graded_linear;
+   if (!MELE_IsFiniteNonNegative(graded_linear) || !MELE_IsFiniteNonNegative(state.q) || state.q <= 0.0)
+   {
+      return false;
+   }
+   const float3 restored = graded_linear / state.q;
+   if (!MELE_IsFiniteNonNegative(restored))
+   {
+      return false;
+   }
+   work_hdr = restored;
+   return true;
 }
 
 // The NATIVE colour mode: RGB ratios from the exact native grade result, luminance from the new
@@ -84,22 +154,26 @@ float3 MELE_RestoreGradeRange(float3 graded_linear, MELE_BridgeState state)
 // controls and the late SDR clamp then do is measured separately and is not promised by this.
 //
 // Guard contract, which is deliberately not one blanket fallback:
+//   the WHOLE reference triple is validated, not only its luminance. A dot product can return a
+//     finite number from channels that are not finite, and a positive one from a reference that has
+//     a negative channel, so checking Y alone accepts colours that cannot be scaled.
 //   exactly black reference or exactly zero target -> black. The grade produced that black and this
 //     is not the place to put light back into it.
 //   near-black but positive reference -> divided normally. The LUT permutations carry clampFloor,
 //     so a vanilla black floors at 1e-4 linear and, the encode and the decode being inverse powers,
 //     arrives back at 1e-4 in luminance, two decades above the guard below. Collapsing that to black
-//     would erase a real part of the native output. Count the guard's trips
-//     rather than widening it.
-//   non-finite or negative luminance on either side -> the caller's legacy value for the WHOLE
-//     triple. Switching channels independently would change hue, which is the failure being avoided.
+//     would erase a real part of the native output. Count the guard's trips rather than widening it.
+//   a non-finite gain or product -> the caller's legacy value for the WHOLE triple. Switching
+//     channels independently would change hue, which is the failure being avoided.
 // A positive target luminance is never clamped to 1, and no path takes colour from the raw scene.
+// On every input the previous implementation accepted - a finite non-negative reference with a
+// positive luminance - this returns exactly what it returned. The added checks reject inputs; they
+// do not reshape an accepted result.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
 float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance, float3 legacy_family_hdr)
 {
-   const float reference_luminance = GetLuminance(native_reference_linear, CS_BT709);
-   if (IsNaN_Strict(reference_luminance) || IsInfinite_Strict(reference_luminance) || IsNaN_Strict(target_luminance) || IsInfinite_Strict(target_luminance) || reference_luminance < 0.0 || target_luminance < 0.0)
+   if (!MELE_IsFiniteNonNegative(native_reference_linear) || !MELE_IsFiniteNonNegative(target_luminance))
    {
       return legacy_family_hdr;
    }
@@ -107,10 +181,17 @@ float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_
    {
       return float3(0.0, 0.0, 0.0);
    }
-   if (reference_luminance < MELE_NATIVE_COLOR_MIN_LUMINANCE)
+   const float reference_luminance = GetLuminance(native_reference_linear, CS_BT709);
+   if (!MELE_IsFiniteNonNegative(reference_luminance) || reference_luminance < MELE_NATIVE_COLOR_MIN_LUMINANCE)
    {
       return legacy_family_hdr;
    }
-   return native_reference_linear * (target_luminance / reference_luminance);
+   const float gain = target_luminance / reference_luminance;
+   const float3 result = native_reference_linear * gain;
+   if (!MELE_IsFiniteNonNegative(gain) || !MELE_IsFiniteNonNegative(result))
+   {
+      return legacy_family_hdr;
+   }
+   return result;
 }
 #endif // LUMA_MELE_TONEMAP_HDR_BRIDGE

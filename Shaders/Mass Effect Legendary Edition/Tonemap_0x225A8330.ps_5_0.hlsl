@@ -90,13 +90,23 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 // G(K(X)) is not K(G(X)). The reference is soft-clipped first and then graded, which is this experiment's
 // choice; building K from the already-graded working value would be a different model and needs its own A/B
 // before it could replace this one.
-float3 MELE_ME3LEAnalytic_GradeHDR(float3 work_linear)
+// False means the caller keeps its legacy value for the whole triple; work_hdr must not be read then. This is
+// the FIRST of the two fallbacks: a failure to build the working HDR at all. The second - a failure of the
+// colour transfer alone, with a valid working HDR - belongs to MELE_ReferenceCombine and returns work_hdr.
+bool MELE_ME3LEAnalytic_GradeHDR(float3 work_linear, out float3 work_hdr)
 {
+   work_hdr = float3(0.0, 0.0, 0.0);
+   MELE_BridgeState state;
    float3 proxy;
-   const MELE_BridgeState state = MELE_BuildGradeProxy(work_linear, GammaColorScaleAndInverse.w * DefaultGamma, proxy);
-   return MELE_RestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), state);
+   if (!MELE_TryBuildGradeProxy(work_linear, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy))
+   {
+      return false;
+   }
+   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), state, work_hdr);
 }
 
+// Only ever evaluated after the wrapper above returned true, so work_linear is already known finite and
+// non-negative and this needs no second copy of that check.
 float3 MELE_ME3LEAnalytic_GradeSoftReference(float3 work_linear)
 {
    const float r = GammaColorScaleAndInverse.w * DefaultGamma;
@@ -136,6 +146,7 @@ void main(
    float mele_scale = 1.0;
 #if MELE_HDR_ME3_HARDCLIP
    float3 mele_hardclip_hdr = 0.0;
+   bool mele_hardclip_valid = false;
 #endif
    if (LumaSettings.DisplayMode == 1)
    {
@@ -143,8 +154,11 @@ void main(
       // A Reinhard anchored 0.18 -> 0.18 reduces to mch + 0.82, lifting mids the clip never touched by +32% at mch 0.5 and +82% at mch 1; the clip inverse also cancels the clip's own kink, keeping the product C1.
       mele_scale = 1.0 / mele_mch;
 #if MELE_HDR_ME3_HARDCLIP
-      mele_hardclip_hdr = MELE_ME3LEAnalytic_GradeHDR(untonemapped);
-      mele_hardclip_hdr = MELE_ReferenceCombine(mele_hardclip_hdr, MELE_ME3LEAnalytic_GradeSoftReference(untonemapped), LumaSettings.GameSettings.ClipHueShift, LumaSettings.GameSettings.ClipBlowout);
+      mele_hardclip_valid = MELE_ME3LEAnalytic_GradeHDR(untonemapped, mele_hardclip_hdr);
+      if (mele_hardclip_valid)
+      {
+         mele_hardclip_hdr = MELE_ReferenceCombine(mele_hardclip_hdr, MELE_ME3LEAnalytic_GradeSoftReference(untonemapped), LumaSettings.GameSettings.ClipHueShift, LumaSettings.GameSettings.ClipBlowout);
+      }
 #endif
    }
 
@@ -154,10 +168,12 @@ void main(
    // highlights. SDR leaves mele_scale at 1.
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
 #if MELE_HDR_ME3_HARDCLIP
-   if (LumaSettings.DisplayMode == 1 && !IsAnyNaN_Strict(mele_hardclip_hdr) && !any(IsInfinite_Strict(mele_hardclip_hdr)))
+   if (LumaSettings.DisplayMode == 1 && mele_hardclip_valid)
    {
-      // Both sliders at zero leave the working HDR untouched, which is the diagnostic view; raising
-      // either one moves it toward the soft reference without ever letting relative chroma grow.
+      // Validity was decided before the grade, not read off the finiteness of its output. Both sliders at zero
+      // leave the working HDR untouched, which is the diagnostic view; raising either one moves it toward the
+      // soft reference without ever letting relative chroma grow, and a transfer that leaves the nonnegative
+      // BT.709 domain returns that same working HDR rather than a clamped colour.
       graded_hdr = mele_hardclip_hdr;
    }
 #endif

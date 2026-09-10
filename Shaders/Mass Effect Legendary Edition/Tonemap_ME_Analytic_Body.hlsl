@@ -144,6 +144,40 @@ float3 MELE_Analytic_GradeChainHDR(float3 c)
 #endif
    return r0.xyz;
 }
+
+// This family has no grade proxy - the grade is available as a formula and is extended as a formula - so the
+// bridge's early checks never run here and the equivalent ones are written out. Sources first, then the working
+// value that is about to enter log2 and pow, then the decoded result. Nothing is judged only after the fact.
+//
+// The exact zero is NOT rejected. max(0, .) into log2 gives -inf, and exp2(SceneMidTones * -inf) is 0 for any
+// positive exponent: that is the vanilla semantics of these two permutations, transcribed from their bytecode,
+// and a blanket epsilon to dodge the infinity would change the picture rather than protect it. What is rejected
+// is a non-finite or negative source, and a result that ran away - which is exactly what lifting the caps makes
+// possible, since SceneMidTones acting on values above 1 grows without bound.
+//
+// A negative decoded result now selects the legacy triple where it previously reached
+// MELE_NativeColorAtLuminance as a target luminance. That is a deliberate change to the invalid/fallback
+// contract, not to the tonal model: on finite non-negative data this returns what it always returned.
+bool MELE_TryAnalyticGradeHDR(float3 scene_linear, float3 bloom_linear, out float3 work_hdr)
+{
+   work_hdr = float3(0.0, 0.0, 0.0);
+   if (!MELE_IsFiniteNonNegative(scene_linear) || !MELE_IsFiniteNonNegative(bloom_linear))
+   {
+      return false;
+   }
+   const float3 work_native = MELE_ExpExtended(scene_linear, MELE_HDR_PIVOT) + bloom_linear;
+   if (!MELE_IsFiniteNonNegative(work_native))
+   {
+      return false;
+   }
+   const float3 candidate = gamma_to_linear(MELE_Analytic_GradeChainHDR(work_native), GCT_MIRROR);
+   if (!MELE_IsFiniteNonNegative(candidate))
+   {
+      return false;
+   }
+   work_hdr = candidate;
+   return true;
+}
 #endif
 
 // Included here, not with the headers: MELE_CompositeDOF reads the _Globals fields and DOF textures declared above.
@@ -191,6 +225,7 @@ void main(
    float mele_scale = 1.0;
 #if MELE_HDR_EXP_ANALYTIC
    float3 mele_analytic_hdr = 0.0;
+   bool mele_analytic_valid = false;
 #endif
    if (LumaSettings.DisplayMode == 1)
    {
@@ -200,7 +235,7 @@ void main(
 #if MELE_HDR_EXP_ANALYTIC
       // Extension on the scene before its curve, bloom added where vanilla adds it, then one decode of the
       // uncapped encoded grade. Below the pivot with an inert grade this reduces to the native result.
-      mele_analytic_hdr = gamma_to_linear(MELE_Analytic_GradeChainHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear), GCT_MIRROR);
+      mele_analytic_valid = MELE_TryAnalyticGradeHDR(mele_scene_linear, mele_bloom_linear, mele_analytic_hdr);
 #endif
    }
 
@@ -213,7 +248,7 @@ void main(
 #if MELE_HDR_EXP_ANALYTIC
    // Lifting the caps lets a game exponent run away, so the whole triple is validated at once. Falling back
    // per channel would move hue, which is the failure this branch exists to avoid.
-   if (LumaSettings.DisplayMode == 1 && !IsAnyNaN_Strict(mele_analytic_hdr) && !any(IsInfinite_Strict(mele_analytic_hdr)))
+   if (LumaSettings.DisplayMode == 1 && mele_analytic_valid)
    {
       // Hue and saturation come from the real bounded grade, never from the uncapped twin and never from the
       // scene; only the luminance is the twin's.

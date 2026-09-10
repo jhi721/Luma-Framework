@@ -26,6 +26,7 @@
 #include <vector>
 #include <unordered_set>
 #include <cmath>
+#include <algorithm> // std::clamp for the experimental clip-transfer config validation.
 #include <array>
 #include <memory>
 #include <optional>
@@ -1305,6 +1306,14 @@ public:
       reshade::get_config_value(nullptr, PROJECT_NAME, "HighlightDechroma", gs.HighlightDechroma);
       reshade::get_config_value(nullptr, PROJECT_NAME, "ClipHueShift", gs.ClipHueShift);
       reshade::get_config_value(nullptr, PROJECT_NAME, "ClipBlowout", gs.ClipBlowout);
+      // The two experimental ME3LE transfer weights are validated here because the slider's 0..1 range
+      // constrains the UI, not the file: a hand-edited or corrupted ReShade.ini would otherwise put a NaN, an
+      // infinity or an out-of-range weight straight into the cbuffer. The shader has a defined answer for an
+      // invalid weight - it falls back to the working HDR for the whole triple - but that is the second line of
+      // defence, not a reason to skip this one. Only these two fields are checked; auditing the rest is a
+      // separate change with its own defaults to agree on.
+      gs.ClipHueShift = std::isfinite(gs.ClipHueShift) ? std::clamp(gs.ClipHueShift, 0.f, 1.f) : default_luma_global_game_settings.ClipHueShift;
+      gs.ClipBlowout = std::isfinite(gs.ClipBlowout) ? std::clamp(gs.ClipBlowout, 0.f, 1.f) : default_luma_global_game_settings.ClipBlowout;
       reshade::get_config_value(nullptr, PROJECT_NAME, "Contrast", gs.Contrast);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VignetteIntensity", gs.VignetteIntensity);
       reshade::get_config_value(nullptr, PROJECT_NAME, "FilmGrainIntensity", gs.FilmGrainIntensity);

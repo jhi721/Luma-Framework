@@ -37,12 +37,28 @@
 #define MELE_HDR_ME3_HARDCLIP 0 // ME3LE analytic hard-clip grade, 0x225A8330 only.
 #endif
 
-// Bench values, not calibration. The bench that pins them is _tools/mele_bridge/bench.py; none of
-// them has been checked against a game frame or a live LUT, so none may be presented as tuned.
+// Bench values, not calibration. The bench that pins them is _tools/mele_bridge/bench.py, which
+// exercises them against the LUTs and cbuffers captured from all three games as well as against
+// synthetic C/B. They are NOT calibrated against finished game frames, so none may be presented as
+// tuned; what has been checked is that the model behaves as specified on real tables.
 #define MELE_HDR_BRIDGE_SHOULDER 0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
 #define MELE_HDR_PIVOT           0.18 // p, scene mid-gray, where the tone-curve continuation starts.
 #define MELE_HDR_PROBE_LO        0.16 // Sampled-fit probes for the filmic families, in scene-x.
 #define MELE_HDR_PROBE_HI        0.20
+
+// Roundoff tolerance on the bridge's bounded-proxy assertion. The rational shoulder is asymptotic to
+// 1, so a compressed max channel can only exceed 1 by arithmetic error; this covers that error and
+// nothing else. It is not a clamp, and widening it to make a failing case pass would hide exactly
+// the condition the check exists to report.
+#define MELE_BRIDGE_PROXY_EPS 1e-4
+
+// Minimum accepted slope of the ME2LE two-stage continuation, in the LUT's own input domain z. It is
+// deliberately NOT the 1e-5 that family 04 uses: that threshold lives in scene-x, and the two domains
+// are related by F' ~= 0.95 at the pivot and by the probe window widths, so carrying the number
+// across would be meaningless. Strictly positive is the requirement. For scale, one R16_UNORM step
+// (1/65535) across the z window F(0.20) - F(0.16) ~= 0.0381 is a slope of 4.0e-4, so any accepted
+// slope below that is quantization-limited; the bench reports that separately instead of rejecting it.
+#define MELE_FILMIC_MIN_SLOPE_Z 0.0
 
 // There is one colour path per family and it is not selectable. Families 01-04 take their RGB ratios from
 // the real graded SDR and only their luminance from the new branch; family 05 takes the soft-clip reference.

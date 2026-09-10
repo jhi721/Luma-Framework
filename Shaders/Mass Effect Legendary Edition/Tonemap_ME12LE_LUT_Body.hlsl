@@ -225,12 +225,18 @@ float3 MELE_ME12LE_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_FilmicExtended.hlsli"
 // Experimental family 03. Same bridge as family 01 and the same BRG adapter, because the filmic branch of the
 // grade chain is transcribed BRG-in / RGB-out too: it takes the slice from .x and the strip-x from .y.
-float3 MELE_ME12LE_FilmicGradeHDR(float3 work_rgb)
+// False means the caller keeps its legacy value for the whole triple; work_hdr must not be read then.
+bool MELE_ME12LE_FilmicGradeHDR(float3 work_rgb, out float3 work_hdr)
 {
+   work_hdr = float3(0.0, 0.0, 0.0);
+   MELE_BridgeState state;
    float3 proxy_rgb;
-   const MELE_BridgeState state = MELE_BuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, proxy_rgb);
+   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy_rgb))
+   {
+      return false;
+   }
    const float3 graded_linear = gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxy_rgb)), GCT_MIRROR);
-   return MELE_RestoreGradeRange(graded_linear, state);
+   return MELE_TryRestoreGradeRange(graded_linear, state, work_hdr);
 }
 #endif
 #endif
@@ -243,12 +249,19 @@ float3 MELE_ME12LE_FilmicGradeHDR(float3 work_rgb)
 // r is the exponent of the composite tail from grade input to linear graded_hdr, read from the frame's own
 // cbuffer: MELE_NativeGammaCurve raises to GammaColorScaleAndInverse.w and gamma_to_linear then raises to
 // DefaultGamma. It is never assumed to be 1.
-float3 MELE_ME12LE_ExpGradeHDR(float3 work_rgb)
+// The bridge validates work_rgb itself, before any pow, division or LUT read, so a negative or non-finite
+// scene is rejected here rather than laundered by the saturate the grade chain opens with.
+bool MELE_ME12LE_ExpGradeHDR(float3 work_rgb, out float3 work_hdr)
 {
+   work_hdr = float3(0.0, 0.0, 0.0);
+   MELE_BridgeState state;
    float3 proxy_rgb;
-   const MELE_BridgeState state = MELE_BuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, proxy_rgb);
+   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, state, proxy_rgb))
+   {
+      return false;
+   }
    const float3 graded_linear = gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxy_rgb)), GCT_MIRROR);
-   return MELE_RestoreGradeRange(graded_linear, state);
+   return MELE_TryRestoreGradeRange(graded_linear, state, work_hdr);
 }
 #endif
 
@@ -370,7 +383,7 @@ void main(
       mele_filmic_valid = MELE_EvaluateME2FilmicExtended(mele_scene_linear, mele_bloom_linear, MELE_BRG_TO_RGB(r1.xyz), mele_extended_filmic);
       if (mele_filmic_valid)
       {
-         mele_filmic_hdr = MELE_ME12LE_FilmicGradeHDR(mele_extended_filmic);
+         mele_filmic_valid = MELE_ME12LE_FilmicGradeHDR(mele_extended_filmic, mele_filmic_hdr);
       }
 #endif
    }
@@ -404,6 +417,7 @@ void main(
    float mele_scale = 1.0;
 #if MELE_HDR_EXP_LUT
    float3 mele_exp_hdr = 0.0;
+   bool mele_exp_valid = false;
 #endif
    if (LumaSettings.DisplayMode == 1)
    {
@@ -413,7 +427,7 @@ void main(
 #if MELE_HDR_EXP_LUT
       // The extension applies to the scene BEFORE its curve; the bloom is added where vanilla adds it, so this
       // reduces to the native grade input exactly wherever the scene sits at or below the pivot.
-      mele_exp_hdr = MELE_ME12LE_ExpGradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear);
+      mele_exp_valid = MELE_ME12LE_ExpGradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear, mele_exp_hdr);
 #endif
    }
    // r0.xyz stays the native per-channel value.
@@ -438,7 +452,7 @@ void main(
 #else
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
 #if MELE_HDR_EXP_LUT
-   if (LumaSettings.DisplayMode == 1)
+   if (LumaSettings.DisplayMode == 1 && mele_exp_valid)
    {
       // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
       // Whatever hue the LUT gave the q-proxy belongs to mele_exp_hdr and is deliberately dropped here.
