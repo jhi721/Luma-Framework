@@ -26,7 +26,6 @@
 #include <vector>
 #include <unordered_set>
 #include <cmath>
-#include <algorithm> // std::clamp for the experimental clip-transfer config validation.
 #include <array>
 #include <memory>
 #include <optional>
@@ -463,8 +462,6 @@ public:
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;           // Off preserves vanilla SDR video.
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;           // 0=1x, 0.5=2.0625x, 1=3.125x UI white.
       default_luma_global_game_settings.VideoOnSwapchain = 0.f;             // Set per Bink draw.
-      default_luma_global_game_settings.ClipHueShift = 0.f;                 // Experimental ME3LE hard-clip emulation, off.
-      default_luma_global_game_settings.ClipBlowout = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
 
@@ -1304,16 +1301,6 @@ public:
       reshade::get_config_value(nullptr, PROJECT_NAME, "Exposure", gs.Exposure);
       reshade::get_config_value(nullptr, PROJECT_NAME, "Saturation", gs.Saturation);
       reshade::get_config_value(nullptr, PROJECT_NAME, "HighlightDechroma", gs.HighlightDechroma);
-      reshade::get_config_value(nullptr, PROJECT_NAME, "ClipHueShift", gs.ClipHueShift);
-      reshade::get_config_value(nullptr, PROJECT_NAME, "ClipBlowout", gs.ClipBlowout);
-      // The two experimental ME3LE transfer weights are validated here because the slider's 0..1 range
-      // constrains the UI, not the file: a hand-edited or corrupted ReShade.ini would otherwise put a NaN, an
-      // infinity or an out-of-range weight straight into the cbuffer. The shader has a defined answer for an
-      // invalid weight - it falls back to the working HDR for the whole triple - but that is the second line of
-      // defence, not a reason to skip this one. Only these two fields are checked; auditing the rest is a
-      // separate change with its own defaults to agree on.
-      gs.ClipHueShift = std::isfinite(gs.ClipHueShift) ? std::clamp(gs.ClipHueShift, 0.f, 1.f) : default_luma_global_game_settings.ClipHueShift;
-      gs.ClipBlowout = std::isfinite(gs.ClipBlowout) ? std::clamp(gs.ClipBlowout, 0.f, 1.f) : default_luma_global_game_settings.ClipBlowout;
       reshade::get_config_value(nullptr, PROJECT_NAME, "Contrast", gs.Contrast);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VignetteIntensity", gs.VignetteIntensity);
       reshade::get_config_value(nullptr, PROJECT_NAME, "FilmGrainIntensity", gs.FilmGrainIntensity);
@@ -1396,31 +1383,6 @@ public:
          {
             device_data.cb_luma_global_settings_dirty = true;
             reshade::set_config_value(nullptr, PROJECT_NAME, "HighlightDechroma", gs.HighlightDechroma);
-         }
-
-         // ME3LE hard-clip emulation. Inert unless MELE_HDR_ME3_HARDCLIP is enabled in Advanced Settings,
-         // and both at zero leave the reconstruction untouched, which is the diagnostic view.
-         if (ImGui::SliderFloat("Clip Hue Shift", &gs.ClipHueShift, 0.f, 1.f))
-            device_data.cb_luma_global_settings_dirty = true;
-         if (ImGui::IsItemDeactivatedAfterEdit())
-            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipHueShift", gs.ClipHueShift);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Experimental, ME3LE only: rotates hue toward the soft-clip reference along the shorter arc (0 = keep the reconstruction's own hue).");
-         if (DrawResetButton<float, false>(gs.ClipHueShift, gd_def.ClipHueShift, "ClipHueShift"))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipHueShift", gs.ClipHueShift);
-         }
-         if (ImGui::SliderFloat("Clip Blowout", &gs.ClipBlowout, 0.f, 1.f))
-            device_data.cb_luma_global_settings_dirty = true;
-         if (ImGui::IsItemDeactivatedAfterEdit())
-            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipBlowout", gs.ClipBlowout);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Experimental, ME3LE only: pulls relative chroma toward the soft-clip reference. It can only reduce chroma, never add it.");
-         if (DrawResetButton<float, false>(gs.ClipBlowout, gd_def.ClipBlowout, "ClipBlowout"))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipBlowout", gs.ClipBlowout);
          }
       }
 

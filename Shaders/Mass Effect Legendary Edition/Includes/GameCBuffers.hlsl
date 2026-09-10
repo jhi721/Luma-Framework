@@ -24,11 +24,6 @@ struct LumaGameSettings
    float VideoAutoHDREnable; // 0/1 toggle. 1 = expand Bink movie highlights into HDR, 0 = vanilla SDR videos (no expansion).
    float VideoAutoHDRBoost;  // 0..1. Bink highlight range relative to UI white: 0 = 1x/no-op, 1 = up to 3.125x. Default 0.5.
    float VideoOnSwapchain;   // Set by C++ per draw: 1 = Bink writes Game-relative linear scRGB, 0 = intermediate gamma buffer.
-   // ME3LE hard-clip emulation, experimental (MELE_HDR_ME3_HARDCLIP). Appended last so every existing
-   // offset is untouched. Distinct from the HighlightsBlowout slider removed on 2026-08-01: that one
-   // moved absolute chroma on every permutation, these two drive one soft reference on one permutation.
-   float ClipHueShift; // 0 = off. Rotates hue toward the soft-clip reference along the shorter arc.
-   float ClipBlowout;  // 0 = off. Pulls relative chroma C/L toward the reference; can only lower it.
 };
 
 // Game-specific per-pass cbuffer data.

@@ -54,15 +54,10 @@
 #define MELE_FILMIC_MIN_SLOPE_X 1e-5
 
 // One colour path per family, not selectable. Families 01-04 take their RGB ratios from the real graded SDR
-// and only their luminance from the new branch; family 05 takes the soft-clip reference. Family 05's two
-// transfer strengths live in the game cbuffer because they are continuous and change per frame.
+// and only their luminance from the new branch; family 05 hands over its working HDR as it is.
 //
 // The guarantee ends at graded_hdr, before the shared output tail. The vignette, DICE, the user
 // saturation/contrast controls and the late SDR clamp all run after it and are judged separately.
-
-// Start of the soft per-channel reference. It is the ceiling of an SDR-like artistic reference, not a
-// display peak, and nothing else in the frame is limited to it.
-#define MELE_HARDCLIP_REFERENCE_START 0.75
 
 // Swizzle adapters for the ME1LE/ME2LE LUT body, whose grade chain is transcribed BRG-in / RGB-out.
 #define MELE_RGB_TO_BRG(v) ((v).zxy)
