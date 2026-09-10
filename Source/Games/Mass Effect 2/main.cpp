@@ -494,6 +494,10 @@ public:
       default_luma_global_game_settings.HighlightDechroma = 0.f;     // off; only the mandatory DICE/gamut desaturation applies
       default_luma_global_game_settings.HighlightsHueStrength = 1.f; // full shift toward the RenoDX synthetic reference; safe at 1.0 thanks to the powerless guard in the shader
       default_luma_global_game_settings.HighlightsHueChroma = 0.f;   // keep the highlight's colour; DICE already whitens at the display peak
+      // Filmic perm only. Full strength by default: the highlight mask and the shader's near-achromatic guard keep
+      // the transfer off everything but genuinely bright colour, so 1.0 is the intended look rather than a maximum.
+      default_luma_global_game_settings.FilmicHueShift = 1.f;
+      default_luma_global_game_settings.FilmicBlowout = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;
       default_luma_global_game_settings.VignetteIntensity = 1.f;
       default_luma_global_game_settings.FilmGrainIntensity = 1.f;
@@ -521,6 +525,16 @@ public:
       reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
       reshade::get_config_value(nullptr, NAME, "HighlightsHueStrength", gs.HighlightsHueStrength);
       reshade::get_config_value(nullptr, NAME, "HighlightsHueChroma", gs.HighlightsHueChroma);
+      // Filmic-only additions. A missing key leaves the default, so existing users keep the strengths at 0. The
+      // shader clamps too, but a NaN reaching the cbuffer would poison the branch before its own guard runs.
+      auto LoadSanitized = [&](const char* key, float& value, float min_value, float max_value)
+      {
+         const float previous = value;
+         reshade::get_config_value(nullptr, NAME, key, value);
+         value = std::isfinite(value) ? std::clamp(value, min_value, max_value) : previous;
+      };
+      LoadSanitized("FilmicHueShift", gs.FilmicHueShift, 0.f, 1.f);
+      LoadSanitized("FilmicBlowout", gs.FilmicBlowout, 0.f, 1.f);
       reshade::get_config_value(nullptr, NAME, "Dithering", gs.Dithering);
       reshade::get_config_value(nullptr, NAME, "VignetteIntensity", gs.VignetteIntensity);
       reshade::get_config_value(nullptr, NAME, "FilmGrainIntensity", gs.FilmGrainIntensity);
@@ -630,6 +644,17 @@ public:
          "Turns blown highlights toward the hue an SDR limiter gives them (fire reads yellow, as in the RenoDX ports).\n1 = full, 0 = the light's real hue. HDR only.", "%.2f");
       Slider("Highlights Whitening", gs.HighlightsHueChroma, default_luma_global_game_settings.HighlightsHueChroma, "HighlightsHueChroma", 0.f, 1.f,
          "Desaturates blown highlights toward the same SDR limiter's saturation.\n0 = keep colour, 1 = full. HDR only.", "%.2f");
+
+      // Filmic permutation only (gameplay); the two controls above are the hard-clip perm's. These ADD to the game's
+      // own look rather than replacing it - at 0 the vanilla curve still shapes every highlight exactly as before.
+      Slider("Filmic Hue Shift", gs.FilmicHueShift, default_luma_global_game_settings.FilmicHueShift, "FilmicHueShift", 0.f, 1.f,
+         "Extra hue shift for bright highlights, toward the color the game's own curve gives a brighter version of\n"
+         "the same light. 0 = off, the vanilla look is unchanged. No effect on Vanilla SDR.",
+         "%.2f");
+      Slider("Filmic Blowout", gs.FilmicBlowout, default_luma_global_game_settings.FilmicBlowout, "FilmicBlowout", 0.f, 1.f,
+         "Extra desaturation for bright highlights, toward that same brighter reference.\n"
+         "0 = off, the vanilla look is unchanged. No effect on Vanilla SDR.",
+         "%.2f");
 
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");

@@ -121,6 +121,9 @@ float3 ME2_NativeToneCurve(float3 scene)
    return t * t;
 }
 
+// Deliberately here and not with the includes at the top: it evaluates the curve above and its analytic slope.
+#include "Includes/FilmicRecovery.hlsl"
+
 // Highlight hue emulation for the unclamped-grade recovery (hard-clip perm only). The unclamped
 // grade keeps a blown source's real channel ratio; no SDR pipeline ever showed that ratio — a per-channel limiter turned
 // the hue toward white (R saturates first, then G) and dropped chroma. `hdr` = unclamped grade, `reference` = the colour
@@ -185,6 +188,85 @@ float3 GradeUE3(float3 curved, bool clampSDR, float3 outputScale)
    return PowUE3(c, GammaColorScaleAndInverse.www);
 }
 
+#if TONEMAP_TYPE >= 1 && ME2_UBER_FILMIC
+// Bit test rather than a comparison: `x != x` is legal for the compiler to fold away under fast math.
+bool ME2_FilmicColorIsFinite(float3 value)
+{
+   return all((asuint(value) & 0x7F800000u) != 0x7F800000u);
+}
+
+// FILMIC-only artistic control, applied AFTER the brightness recovery and before the creative sliders. The recovery
+// is scalar and keeps the vanilla channel ratios; this optionally moves highlights further, toward what the SAME
+// vanilla curve and grade produce for a MORE EXPOSED version of the same scene. That second evaluation is a colour
+// reference only: hue and relative chroma are taken from it, brightness is not, and the main image, its bloom and its
+// recovery gain never see the extra exposure. `scene` is `untonemapped` (post-Exposure, pre-fade), `recovered` the
+// recovery's output.
+float3 ME2_ApplyFilmicHighlightColor(float3 scene, float3 recovered)
+{
+   // How much brighter the colour reference is evaluated, in stops. Fixed, not a user control: it picks WHICH
+   // vanilla colour the two sliders aim at, and they already scale how far the pixel travels toward it.
+   const float referenceEV = 1.0;
+
+   // Padded to float3 only because the finite test is written for a colour; the third lane is unused.
+   const float3 controls = float3(LumaSettings.GameSettings.FilmicHueShift, LumaSettings.GameSettings.FilmicBlowout, 0.0);
+   if (!ME2_FilmicColorIsFinite(controls))
+      return recovered;
+
+   const float hueStrength = saturate(controls.x);
+   const float blowout = saturate(controls.y);
+
+   // Exact off path, taken BEFORE the second grade and the Oklab round trip so both sliders at 0 cost nothing.
+   if (hueStrength <= 0.0 && blowout <= 0.0)
+      return recovered;
+   if (!ME2_FilmicColorIsFinite(scene) || !ME2_FilmicColorIsFinite(recovered))
+      return recovered;
+   // The recovery derives from the CLAMPED grade, so it is non-negative. This wrapper is not a signed-RGB pipeline.
+   if (any(recovered < 0.0))
+      return recovered;
+
+   // Highlight mask on the SOURCE scene, before fade: off at or below 1.0, full at 4.0, two stops of input exposure
+   // in between. Deliberately independent of paper white, display peak and the reference exposure above - that
+   // exposure picks the reference colour, it must not slide the mask.
+   const float maskStart = 1.0;
+   const float maskEnd = 4.0;
+   const float m = max3(scene);
+   if (m <= maskStart)
+      return recovered;
+   const float weight = smoothstep(0.0, 1.0, log2(m / maskStart) / log2(maskEnd / maskStart));
+   if (weight <= 0.0)
+      return recovered;
+
+   // Denominator guards, not the start of an artistic effect.
+   const float epsilonY = 1e-6;
+   const float originalY = GetLuminance(recovered, CS_BT709);
+   if (!(originalY > epsilonY))
+      return recovered;
+
+   // The ONLY place the extra exposure applies.
+   const float3 referenceScene = scene * exp2(referenceEV);
+   if (!ME2_FilmicColorIsFinite(referenceScene))
+      return recovered;
+   const float3 reference = VanillaToLinear(GradeUE3(ME2_NativeToneCurve(referenceScene), true, 1.0));
+   if (!ME2_FilmicColorIsFinite(reference))
+      return recovered;
+   // A BLACK reference is not a whitening signal, unlike a white one - it carries neither hue nor blowout.
+   if (!(GetLuminance(reference, CS_BT709) > epsilonY))
+      return recovered;
+
+   const float3 transferred = EmulateHighlightHue(recovered, reference, hueStrength * weight, blowout * weight);
+   if (!ME2_FilmicColorIsFinite(transferred) || all(transferred == recovered))
+      return recovered;
+   const float transferredY = GetLuminance(transferred, CS_BT709);
+   if (!(transferredY > epsilonY))
+      return recovered;
+
+   // EmulateHighlightHue holds Oklab L, which is not photometric. Restore the linear BT.709 Y the recovery had, with
+   // the same metric on both sides. No saturate: the recovery's output is unmapped HDR and the display map owns the peak.
+   const float3 result = transferred * (originalY / transferredY);
+   return ME2_FilmicColorIsFinite(result) ? result : recovered;
+}
+#endif // TONEMAP_TYPE >= 1 && ME2_UBER_FILMIC
+
 float3 RunME2Uber(float2 blurUV, float2 sceneUV)
 {
    // 1. Scene mix, exactly as vanilla: depth-driven DoF weight, bloom at x4, normalized by the weight sum.
@@ -233,14 +315,10 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    const float3 sdr_ref = VanillaToLinear(GradeUE3(curved, true, 1.0));
 
 #if ME2_UBER_FILMIC
-   // Filmic perm: closed-form curve, so undo exactly what it compressed as a max-channel ratio normalized to hold
-   // mid-gray. min(1, scale) is the shadow guard - expanding below mid-gray lifts black (3x, measured on MELE).
-   const float mch = max(max3(untonemapped), 1e-6);
-   const float scale = (ME2_NativeToneCurve(mch.xxx).x / mch) * (MidGray / ME2_NativeToneCurve(MidGray.xxx).x);
-   // Delay the expansion through the upper mids (MELE's squared-progress shape): the raw inverse brightens diffuse
-   // tones because the Hejl curve bends from the bottom. Both measurement sets are in NOTES.md.
-   const float onset = smoothstep(MidGray, 1.0, mch);
-   const float3 recovered = sdr_ref / lerp(1.0, min(1.0, scale), onset * onset);
+   // Keep the native per-channel filmic + grade as the colour reference: `sdr_ref` already carries the vanilla
+   // channel skew and whitening. Brightness alone is recovered, through a scalar gain taken from the curve's own
+   // tangent above the pivot.
+   const float3 recovered = ME2_RecoverFilmicBrightness(untonemapped, curved, sdr_ref);
 #else
    // Hard-clip permutation: nothing to invert, so the grade run UNCLAMPED is the rebuild — vanilla-exact below the
    // clip and its own analytic continuation above it.
@@ -256,9 +334,15 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
        recovered = EmulateHighlightHue(recovered, hueEmuRef, saturate(LumaSettings.GameSettings.HighlightsHueStrength), saturate(LumaSettings.GameSettings.HighlightsHueChroma));
 #endif
 
-   // NEITHER perm restores hue, deliberately: the FILMIC one rebuilds by a SCALAR ratio and the hard-clip one
+   // NEITHER recovery restores hue, deliberately: the FILMIC one rebuilds by a SCALAR ratio and the hard-clip one
    // carries the unclamped grade's own channel ratio. Evidence in NOTES.md; the display map owns path-to-white.
+   // What follows on the filmic perm is a separate, opt-in artistic pass that leaves the recovered brightness alone
+   // rather than correcting it: at its default strengths of 0 this line is the whole HDR colour.
    float3 hdr = recovered;
+
+#if ME2_UBER_FILMIC
+   hdr = ME2_ApplyFilmicHighlightColor(untonemapped, hdr);
+#endif
 
    // Creative sliders, scene-referred. They stay in THIS pass because the fade below is a cb4 row only it can read,
    // and contrast must precede the fade: fade-first makes (0 - 0.18) * C + 0.18 land on grey instead of black.
