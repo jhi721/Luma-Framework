@@ -9,6 +9,10 @@
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
 #include "../Includes/DICE.hlsl"
+#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the experimental grade proxy.
+#include "Includes/Tonemap_MELE_ExperimentConfig.hlsli" // Experimental HDR selectors; every one defaults to 0.
+#include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
+#include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
 #define cmp -
@@ -77,6 +81,30 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 // Included here, not with the headers: MELE_CompositeDOF reads the _Globals fields and DOF textures declared above.
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
+#if MELE_HDR_ME3_HARDCLIP
+#include "Includes/Tonemap_MELE_ReferenceColor.hlsli"
+// Experimental family 05. Both wrappers call MELE_ME3LEAnalytic_GradeChain unchanged, caps and all: the
+// working branch earns its range by preparing the INPUT, not by stripping the grade. The blue white point and
+// the black floor stay inside that function and are not hoisted into the output tail.
+//
+// G(K(X)) is not K(G(X)). The reference is soft-clipped first and then graded, which is this experiment's
+// choice; building K from the already-graded working value would be a different model and needs its own A/B
+// before it could replace this one.
+float3 MELE_ME3LEAnalytic_GradeHDR(float3 work_linear)
+{
+   float3 proxy;
+   const MELE_BridgeState state = MELE_BuildGradeProxy(work_linear, GammaColorScaleAndInverse.w * DefaultGamma, proxy);
+   return MELE_RestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), state);
+}
+
+float3 MELE_ME3LEAnalytic_GradeSoftReference(float3 work_linear)
+{
+   const float r = GammaColorScaleAndInverse.w * DefaultGamma;
+   const float3 reference_native = MELE_BridgeUnadapt(MELE_SoftClip(MELE_BridgeAdapt(work_linear, r), MELE_HARDCLIP_REFERENCE_START), r);
+   return gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(reference_native), GCT_MIRROR);
+}
+#endif
+
 void main(
     float4 v0 : TEXCOORD0,
     float2 v1 : TEXCOORD1,
@@ -106,11 +134,18 @@ void main(
    r0.xyz = untonemapped;
    // No tonemap curve here, so the raw scene reaches the grade and the saturate its grade opens with is this permutation's vanilla blowout; that is a hard clip, so its inverse is the plain max-channel ratio, identity below the clip and mch above it.
    float mele_scale = 1.0;
+#if MELE_HDR_ME3_HARDCLIP
+   float3 mele_hardclip_hdr = 0.0;
+#endif
    if (LumaSettings.DisplayMode == 1)
    {
       float mele_mch = max(max3(untonemapped), 1e-6);
       // A Reinhard anchored 0.18 -> 0.18 reduces to mch + 0.82, lifting mids the clip never touched by +32% at mch 0.5 and +82% at mch 1; the clip inverse also cancels the clip's own kink, keeping the product C1.
       mele_scale = 1.0 / mele_mch;
+#if MELE_HDR_ME3_HARDCLIP
+      mele_hardclip_hdr = MELE_ME3LEAnalytic_GradeHDR(untonemapped);
+      mele_hardclip_hdr = MELE_ReferenceCombine(mele_hardclip_hdr, MELE_ME3LEAnalytic_GradeSoftReference(untonemapped), LumaSettings.GameSettings.ClipHueShift, LumaSettings.GameSettings.ClipBlowout);
+#endif
    }
 
    float3 sdr_gamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
@@ -118,6 +153,14 @@ void main(
    // Undo compression only where scale < 1, preserving native diffuse/shadow grading and restoring HDR
    // highlights. SDR leaves mele_scale at 1.
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
+#if MELE_HDR_ME3_HARDCLIP
+   if (LumaSettings.DisplayMode == 1 && !IsAnyNaN_Strict(mele_hardclip_hdr) && !any(IsInfinite_Strict(mele_hardclip_hdr)))
+   {
+      // Both sliders at zero leave the working HDR untouched, which is the diagnostic view; raising
+      // either one moves it toward the soft reference without ever letting relative chroma grow.
+      graded_hdr = mele_hardclip_hdr;
+   }
+#endif
 
    // ME3LE analytic tail: no vignette or grain; preserve native output luma in alpha.
 #define TM_VIGNETTE_TYPE 0

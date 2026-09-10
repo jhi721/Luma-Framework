@@ -18,6 +18,9 @@
 #include "../Includes/Color.hlsl"    // Transfer and color helpers.
 #include "../Includes/DICE.hlsl"     // Display-peak tonemap.
 #include "../Includes/Reinhard.hlsl" // ReinhardPiecewise, used by the filmic expand.
+#include "Includes/Tonemap_MELE_ExperimentConfig.hlsli" // Experimental HDR selectors; every one defaults to 0.
+#include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
+#include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
 #ifndef TM_HAS_MOTIONBLUR
@@ -218,6 +221,35 @@ float3 MELE_ME12LE_GradeChain(float3 c)
 // ME2LE's filmic LUT is addressed through the native exponential curve, not scene-linear.
 #define MELE_FILMIC_PRECURVE(x) (1.0 - exp2(-1.70000005 * (x)))
 #include "Includes/Tonemap_MELE_Filmic.hlsli"
+#if MELE_HDR_ME2_FILMIC
+#include "Includes/Tonemap_MELE_FilmicExtended.hlsli"
+// Experimental family 03. Same bridge as family 01 and the same BRG adapter, because the filmic branch of the
+// grade chain is transcribed BRG-in / RGB-out too: it takes the slice from .x and the strip-x from .y.
+float3 MELE_ME12LE_FilmicGradeHDR(float3 work_rgb)
+{
+   float3 proxy_rgb;
+   const MELE_BridgeState state = MELE_BuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, proxy_rgb);
+   const float3 graded_linear = gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxy_rgb)), GCT_MIRROR);
+   return MELE_RestoreGradeRange(graded_linear, state);
+}
+#endif
+#endif
+
+#if MELE_HDR_EXP_LUT && !TM_HAS_FILMIC
+// Experimental family 01. Defined here, after MELE_ME12LE_GradeChain, so the bridge runs the real game grade and
+// the real 16-slice LUT rather than an approximation of them. The chain is transcribed BRG-in / RGB-out, so the
+// swizzle is applied through the named adapter instead of being inferred from a register name.
+//
+// r is the exponent of the composite tail from grade input to linear graded_hdr, read from the frame's own
+// cbuffer: MELE_NativeGammaCurve raises to GammaColorScaleAndInverse.w and gamma_to_linear then raises to
+// DefaultGamma. It is never assumed to be 1.
+float3 MELE_ME12LE_ExpGradeHDR(float3 work_rgb)
+{
+   float3 proxy_rgb;
+   const MELE_BridgeState state = MELE_BuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, proxy_rgb);
+   const float3 graded_linear = gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxy_rgb)), GCT_MIRROR);
+   return MELE_RestoreGradeRange(graded_linear, state);
+}
 #endif
 
 void main(
@@ -302,6 +334,12 @@ void main(
 
    // Linear HDR scene plus bloom in RGB orientation.
    untonemapped = r0.xyz * r0.www + r1.xyz;
+#if MELE_HDR_ME2_FILMIC
+   // Kept separate on purpose: the game evaluates L(F(C) + B), so C and B must not be summed before the
+   // pre-curve. untonemapped stays available for the shipped scalar and for the legacy fallback.
+   const float3 mele_scene_linear = r1.xyz;
+   const float3 mele_bloom_linear = r0.xyz * r0.www;
+#endif
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.xyz;
@@ -318,9 +356,23 @@ void main(
    // The native per-channel filmic value reaches the 16-slice LUT untouched, so the vanilla white blowout survives
    // into HDR: only the expansion scalar comes from the wrap.
    float mele_expand = 1.0;
+#if MELE_HDR_ME2_FILMIC
+   float3 mele_filmic_hdr = 0.0;
+   bool mele_filmic_valid = false;
+#endif
    if (LumaSettings.DisplayMode == 1)
    {
       mele_expand = MELE_FilmicMaxChannelExpand(untonemapped);
+#if MELE_HDR_ME2_FILMIC
+      // The native filmic samples were written BRG by the three assignments above, so rotate once to RGB
+      // before the shared helper sees them, and let the wrapper rotate back for the grade.
+      float3 mele_extended_filmic;
+      mele_filmic_valid = MELE_EvaluateME2FilmicExtended(mele_scene_linear, mele_bloom_linear, MELE_BRG_TO_RGB(r1.xyz), mele_extended_filmic);
+      if (mele_filmic_valid)
+      {
+         mele_filmic_hdr = MELE_ME12LE_FilmicGradeHDR(mele_extended_filmic);
+      }
+#endif
    }
    // r1.xyz stays the native post-filmic value; only the expansion scalar comes from the wrap.
 #else
@@ -334,6 +386,12 @@ void main(
 
    // Linear HDR scene plus bloom in RGB orientation.
    untonemapped = r0.yzx * r0.www + r1.xyz;
+#if MELE_HDR_EXP_LUT
+   // Captured before the curve below rewrites r1. Both are RGB here: the blend above built the bloom in BRG and
+   // the .yzx on the line above rotates it back, while r1 still holds the post-exposure scene in RGB.
+   const float3 mele_scene_linear = r1.xyz;
+   const float3 mele_bloom_linear = r0.yzx * r0.www;
+#endif
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.zxy;
@@ -344,11 +402,19 @@ void main(
    // Non-filmic HDR wrap matches the ME1LE max-channel path: the native per-channel value reaches the grade
    // untouched and only the expansion scalar comes from the wrap.
    float mele_scale = 1.0;
+#if MELE_HDR_EXP_LUT
+   float3 mele_exp_hdr = 0.0;
+#endif
    if (LumaSettings.DisplayMode == 1)
    {
       float mele_mch = max(max3(untonemapped), 1e-6);
       // Invert the curve the game actually applies, normalized so mid-gray holds still at 1-exp2(-1.7*0.18) = 0.1911
       mele_scale = (MELE_NativeToneCurve(mele_mch) / mele_mch) * (0.18 / MELE_NativeToneCurve(0.18));
+#if MELE_HDR_EXP_LUT
+      // The extension applies to the scene BEFORE its curve; the bloom is added where vanilla adds it, so this
+      // reduces to the native grade input exactly wherever the scene sits at or below the pivot.
+      mele_exp_hdr = MELE_ME12LE_ExpGradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear);
+#endif
    }
    // r0.xyz stays the native per-channel value.
 #endif
@@ -363,8 +429,22 @@ void main(
    // Scalar uncompression commutes with the LUT's channel restoration. Both paths reduce to native output in SDR.
 #if TM_HAS_FILMIC
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) * mele_expand;
+#if MELE_HDR_ME2_FILMIC
+   if (LumaSettings.DisplayMode == 1 && mele_filmic_valid)
+   {
+      graded_hdr = MELE_NativeColorAtLuminance(gamma_to_linear(sdr_gamma, GCT_MIRROR), GetLuminance(mele_filmic_hdr, CS_BT709), graded_hdr);
+   }
+#endif
 #else
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
+#if MELE_HDR_EXP_LUT
+   if (LumaSettings.DisplayMode == 1)
+   {
+      // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
+      // Whatever hue the LUT gave the q-proxy belongs to mele_exp_hdr and is deliberately dropped here.
+      graded_hdr = MELE_NativeColorAtLuminance(gamma_to_linear(sdr_gamma, GCT_MIRROR), GetLuminance(mele_exp_hdr, CS_BT709), graded_hdr);
+   }
+#endif
 #endif
 
    // Shared tail: radial vignette, optional grain, and zero alpha. Defaults are ME2LE's power-200 curve and blue

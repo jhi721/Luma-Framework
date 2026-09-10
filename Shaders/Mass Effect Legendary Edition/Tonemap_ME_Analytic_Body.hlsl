@@ -11,6 +11,10 @@
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
 #include "../Includes/DICE.hlsl"
+#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the experimental grade proxy.
+#include "Includes/Tonemap_MELE_ExperimentConfig.hlsli" // Experimental HDR selectors; every one defaults to 0.
+#include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
+#include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
 #define cmp -
@@ -84,6 +88,64 @@ float3 MELE_Analytic_GradeChain(float3 c)
    return r0.xyz;
 }
 
+#if MELE_HDR_EXP_ANALYTIC
+// Experimental family 02. A minimal copy of MELE_Analytic_GradeChain with exactly three upper tonal caps lifted
+// and nothing else touched, so the working branch can carry values above the native ceiling. There is no LUT
+// here and no max-channel proxy: the grade is available as a formula, so it is extended as a formula rather
+// than routed through an invented table. The native function above is left untouched and still produces SDR.
+//
+// Lifted, and only these:
+//   the saturate opening the Scene grade becomes max(0, .). The lower bound must stay - log2 follows it.
+//   MELE_NativeGammaCurve becomes its cap-free twin. clampFloor was already false for this family and no
+//     floor is introduced, because these two permutations feed mul_sat straight into log in the vanilla code.
+//   the closing min(1, rgb) is not applied.
+// Kept: the highlight-desaturation rule and its 1.1 threshold, the ImageAdjustments mix, every Scene* field
+// meaning and the order they are applied in, the RGB desaturation weights, GammaOverlayColor, both halves of
+// GammaColorScaleAndInverse, and the ME2LE encoded white point in the same encoded domain.
+//
+// The result is native-encoded and uncapped; the caller decodes it once. Lifting the caps lets SceneMidTones
+// act on values above 1, where a game exponent grows without bound - that is a real limit of the model, not a
+// proof of correctness, so the caller validates the whole triple before using it.
+float3 MELE_Analytic_GradeChainHDR(float3 c)
+{
+   float4 r0, r1, r2;
+   r0.xyz = c;
+   // Native highlight desaturation.
+   r1.xyz = float3(0.98082906, 0.980000436, 0.993047416) * r0.xyz;
+   r0.w = dot(r0.xyz, float3(0.333000004, 0.333000004, 0.333000004));
+   r0.w = cmp(1.10000002 < r0.w);
+   r1.w = r0.w ? 1.000000 : 0;
+   r2.x = dot(r1.xyz, float3(0.300000012, 0.589999974, 0.109999999));
+   r2.xyz = -r0.xyz * float3(0.98082906, 0.980000436, 0.993047416) + r2.xxx;
+   r1.xyz = r2.xyz * float3(0.5, 0.5, 0.5) + r1.xyz;
+   r0.w = r0.w ? 0 : 1;
+   r0.xyz = r0.www * r0.xyz;
+   r0.xyz = r1.www * r1.xyz + r0.xyz;
+   // Native ImageAdjustments mix.
+   r0.w = dot(r0.xyz, float3(0.300000012, 0.589999974, 0.109999999));
+   r1.xyz = float3(0.400000006, 0.400000006, 0.400000006) * r0.xyz;
+   r1.xyz = r0.www * float3(0.600000024, 0.600000024, 0.600000024) + r1.xyz;
+   r1.xyz = r1.xyz * float3(0.00658500008, 0.0199180003, 1) + -r0.xyz;
+   r0.xyz = r1.xyz * float3(0.200000003, 0.200000003, 0.200000003) + r0.xyz;
+   // Native analytic Scene grade, with only the upper half of the opening saturate removed.
+   r0.xyz = max(float3(0, 0, 0), -SceneShadowsAndDesaturation.xyz + r0.xyz);
+   r0.xyz = SceneInverseHighLights.xyz * r0.xyz;
+   r0.xyz = log2(r0.xyz);
+   r0.xyz = SceneMidTones.xyz * r0.xyz;
+   r0.xyz = exp2(r0.xyz);
+   r0.w = dot(r0.xyz, SceneScaledLuminanceWeights.xyz);
+   r0.xyz = r0.xyz * SceneShadowsAndDesaturation.www + GammaOverlayColor.xyz;
+   r0.xyz = r0.xyz + r0.www;
+   // Same scale and exponent as the native tail, without its cap.
+   r0.xyz = MELE_NativeGammaCurveHDR(r0.xyz, GammaColorScaleAndInverse.xyz, GammaColorScaleAndInverse.w);
+
+#ifdef TM_ANALYTIC_WHITEPOINT
+   r0.xyz = TM_ANALYTIC_WHITEPOINT * r0.xyz; // Still encoded, still the same tint; it may now exceed 1.
+#endif
+   return r0.xyz;
+}
+#endif
+
 // Included here, not with the headers: MELE_CompositeDOF reads the _Globals fields and DOF textures declared above.
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
@@ -113,6 +175,11 @@ void main(
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
    float3 untonemapped = r0.xyz * r0.www + r1.xyz;
+#if MELE_HDR_EXP_ANALYTIC
+   // Captured before the curve below overwrites r1. Straight RGB here, unlike the ME1LE/ME2LE LUT body.
+   const float3 mele_scene_linear = r1.xyz;
+   const float3 mele_bloom_linear = r0.xyz * r0.www;
+#endif
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.xyz;
@@ -122,11 +189,19 @@ void main(
    // The native per-channel value reaches the analytic grade untouched, so the vanilla white blowout survives into
    // HDR: HDR only measures the reversible max-channel ratio that expands the grade output below, taken as the exact inverse of the native exponential curve.
    float mele_scale = 1.0;
+#if MELE_HDR_EXP_ANALYTIC
+   float3 mele_analytic_hdr = 0.0;
+#endif
    if (LumaSettings.DisplayMode == 1)
    {
       float mele_mch = max(max3(untonemapped), 1e-6);
       // Invert the curve the game actually applies, normalized so mid-gray holds still at 1-exp2(-1.7*0.18) = 0.1911
       mele_scale = (MELE_NativeToneCurve(mele_mch) / mele_mch) * (0.18 / MELE_NativeToneCurve(0.18));
+#if MELE_HDR_EXP_ANALYTIC
+      // Extension on the scene before its curve, bloom added where vanilla adds it, then one decode of the
+      // uncapped encoded grade. Below the pivot with an inert grade this reduces to the native result.
+      mele_analytic_hdr = gamma_to_linear(MELE_Analytic_GradeChainHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear), GCT_MIRROR);
+#endif
    }
 
    // Apply the same native grade function to the working value and, below, to the SDR reference.
@@ -135,6 +210,16 @@ void main(
    // Undo compression only where scale < 1, preserving the native diffuse/shadow grade while expanding HDR
    // highlights. SDR leaves mele_scale at 1.
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) / min(1.0, mele_scale);
+#if MELE_HDR_EXP_ANALYTIC
+   // Lifting the caps lets a game exponent run away, so the whole triple is validated at once. Falling back
+   // per channel would move hue, which is the failure this branch exists to avoid.
+   if (LumaSettings.DisplayMode == 1 && !IsAnyNaN_Strict(mele_analytic_hdr) && !any(IsInfinite_Strict(mele_analytic_hdr)))
+   {
+      // Hue and saturation come from the real bounded grade, never from the uncapped twin and never from the
+      // scene; only the luminance is the twin's.
+      graded_hdr = MELE_NativeColorAtLuminance(gamma_to_linear(sdr_gamma, GCT_MIRROR), GetLuminance(mele_analytic_hdr, CS_BT709), graded_hdr);
+   }
+#endif
 
    // Entry point supplies vignette macros. Analytic ME1LE/ME2LE permutations have no grain and write zero alpha.
 #include "Includes/Tonemap_MELE_Output.hlsli"

@@ -15,6 +15,11 @@
 #define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1  // replaces the game's compute FXAA
 #define ENABLE_BLOOM 1 // fp16 pyramidal bloom replaces the game's clamped bloom
+// Stage-1 diagnostics dump for the experimental HDR families. Development-only: it writes raw game
+// resources to disk and stalls on first sight of each permutation.
+#ifndef ENABLE_TONEMAP_DIAGNOSTICS
+#define ENABLE_TONEMAP_DIAGNOSTICS DEVELOPMENT
+#endif
 
 #include "..\..\Core\core.hpp"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
@@ -25,6 +30,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#if ENABLE_TONEMAP_DIAGNOSTICS
+#include <fstream>
+#endif
 
 // Selects the per-game tonemap table used by injected resource-slot handling; replacement stays CSO-hash keyed.
 enum class MEGame
@@ -233,6 +241,15 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    float bloom_threshold_live = -1.f;            // Negative selects the 1.2 fallback.
 #if DEVELOPMENT
    int bloom_bright_pass_hits = 0; // Bright-pass captures this frame.
+
+#if ENABLE_TONEMAP_DIAGNOSTICS
+   // Snapshots already written per stage-1 hash. Several, not one: the first frame a permutation appears
+   // on is often a fade or a loading screen, whose cbuffer does not describe gameplay. Measured on ME1LE
+   // 0x69F03340, first seen with GammaColorScaleAndInverse.xyz at 1e-4, a full fade to black.
+   std::unordered_map<uint32_t, uint32_t> diagnostics_dumped;
+   // Frame index each hash becomes eligible again, so the samples are spread over seconds, not frames.
+   std::unordered_map<uint32_t, uint32_t> diagnostics_next_frame;
+#endif
 #endif
 };
 
@@ -372,6 +389,38 @@ public:
       // Exposes UI Paper White without renormalizing the already combined scene/HUD buffer; type 2 would
       // double-apply the transport ratio.
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('1');
+      // Experimental stage-1 HDR reconstruction, one checkbox per colour family in Advanced Settings so a
+      // family can be A/B-tested against the shipped path without editing a header or rebuilding. Every one
+      // defaults to off and is locked outside DEVELOPMENT: they change the stage-1 contract rather than
+      // refactor it (see the header of Includes/Tonemap_MELE_ExperimentConfig.hlsli) and none ships enabled.
+      //
+      // Only the families that exist in the detected game are registered. A shader whose define is absent
+      // falls back to the header's #ifndef default, so the unregistered ones stay at 0 either way.
+      constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
+      std::vector<ShaderDefineData> experiment_shader_defines;
+      const auto add_family = [&](const char* feature, const char* tooltip)
+      { experiment_shader_defines.push_back({feature, '0', true, kExperimentLocked, tooltip, 1}); };
+      if (g_me_game == MEGame::ME1LE || g_me_game == MEGame::ME2LE)
+      {
+         add_family("MELE_HDR_EXP_LUT",
+            "Exponential curve plus colour LUT: extend the native curve past mid-gray and run the real grade through a max-channel proxy.");
+         add_family("MELE_HDR_EXP_ANALYTIC",
+            "Exponential curve plus analytic grade: same curve extension, with a cap-free copy of the analytic grade instead of a proxy.");
+      }
+      if (g_me_game == MEGame::ME2LE)
+      {
+         add_family("MELE_HDR_ME2_FILMIC",
+            "Filmic LUT path: continue the game's own 1D curve from sampled anchors, keeping scene and bloom separate.");
+      }
+      if (g_me_game == MEGame::ME3LE)
+      {
+         add_family("MELE_HDR_ME3_FILMIC",
+            "Filmic LUT path: continue the game's own 1D curve from sampled anchors on linear scene plus bloom.");
+         add_family("MELE_HDR_ME3_HARDCLIP",
+            "Analytic hard-clip permutation: prepare the grade input instead of scaling an already clipped white.\n"
+            "Its Clip Hue Shift and Clip Blowout sliders do nothing unless this is on.");
+      }
+      shader_defines_data.append_range(experiment_shader_defines);
 
       use_os_reference_white_level = false; // Explicit Scene and UI Paper White controls.
 
@@ -413,6 +462,8 @@ public:
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;           // Off preserves vanilla SDR video.
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;           // 0=1x, 0.5=2.0625x, 1=3.125x UI white.
       default_luma_global_game_settings.VideoOnSwapchain = 0.f;             // Set per Bink draw.
+      default_luma_global_game_settings.ClipHueShift = 0.f;                 // Experimental ME3LE hard-clip emulation, off.
+      default_luma_global_game_settings.ClipBlowout = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
 
@@ -427,6 +478,220 @@ public:
       delete static_cast<MassEffectGameDeviceData*>(device_data.game);
       device_data.game = nullptr;
    }
+
+#if ENABLE_TONEMAP_DIAGNOSTICS
+   // Stage-1 diagnostics dump. Everything the offline bench (_tools/mele_bridge)
+   // cannot know: the live $Globals payload, the real 1D filmic LUT, the real
+   // 16-slice colour LUT, and the sampler state each is read through. Without
+   // these the bench runs on invented grade parameters and synthetic tables, so it
+   // can only prove that the code matches the specified model, never that the
+   // model suits this game.
+   //
+   // Deliberately dumps RAW bytes plus a manifest rather than decoded fields: the
+   // $Globals layout differs per permutation family (ME1LE/ME2LE LUT c4-c6, the
+   // analytic body c4-c10, 0x225A8330 c36+), so any offset table compiled in here
+   // would be a second source of truth that silently drifts from the HLSL. The
+   // Python side reads the packoffsets straight out of the shader source instead.
+   //
+   // Bindings are read before any custom-pass gate, because stage 1 is
+   // hash-replaced and a replaced pass still carries the game's own resources at
+   // this point.
+   //
+   // One dump per hash per session, blocking Map, no ring buffer: this is a
+   // diagnostic build and a one-off stall on first sight of each permutation is
+   // cheaper than the complexity of avoiding it.
+   void DumpTonemapDiagnostics(
+      ID3D11Device* native_device, ID3D11DeviceContext* native_device_context,
+      MassEffectGameDeviceData& gd,
+      const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
+   {
+      uint32_t hash = 0;
+      for (const TonemapPermDesc& candidate : g_tonemap_perms)
+      {
+         if (original_shader_hashes.Contains(candidate.hash,
+                reshade::api::shader_stage::pixel))
+         {
+            hash = candidate.hash;
+            break;
+         }
+      }
+      constexpr uint32_t kSnapshotsPerHash = 8;         // Enough to get past a fade without filling the disk.
+      constexpr uint32_t kFramesBetweenSnapshots = 120; // Roughly two seconds apart at 60 fps.
+      if (hash == 0)
+         return;
+      // Spaced, not consecutive. Eight snapshots taken on back-to-back draws span about a tenth of a
+      // second and can all land inside one fade, which is exactly what the first ME2LE capture did:
+      // 0x2754F750 reported the same 1e-4 output scale eight times over.
+      const uint32_t frame = cb_luma_global_settings.FrameIndex;
+      uint32_t& next_frame = gd.diagnostics_next_frame[hash];
+      if (frame < next_frame)
+         return;
+      uint32_t& taken = gd.diagnostics_dumped[hash];
+      if (taken >= kSnapshotsPerHash)
+         return;
+      next_frame = frame + kFramesBetweenSnapshots;
+      const uint32_t snapshot = taken++;
+
+      std::error_code ec;
+      const std::filesystem::path root =
+         System::GetModulePath().parent_path() / "Luma-MELE-Diagnostics";
+      std::filesystem::create_directories(root, ec);
+      if (ec)
+         return;
+
+      char stem[24];
+      std::snprintf(stem, sizeof(stem), "0x%08X_s%u", hash, snapshot);
+
+      std::ofstream manifest(root / (std::string(stem) + "_manifest.txt"));
+      if (!manifest)
+         return;
+      char hash_text[16];
+      std::snprintf(hash_text, sizeof(hash_text), "0x%08X", hash);
+      manifest << "hash " << hash_text << "\n";
+      manifest << "snapshot " << snapshot << "\n";
+      manifest << "frame " << frame << "\n";
+
+      const auto write_blob = [&root](const std::string& name, const void* data,
+                                 size_t bytes)
+      {
+         std::ofstream out(root / name, std::ios::binary);
+         out.write(static_cast<const char*>(data),
+            static_cast<std::streamsize>(bytes));
+      };
+
+      // $Globals at b0. Raw, with its byte size recorded so a truncated or
+      // unexpectedly sized buffer is visible rather than silently misread.
+      {
+         ComPtr<ID3D11Buffer> cb0;
+         native_device_context->PSGetConstantBuffers(0, 1, cb0.put());
+         if (cb0)
+         {
+            D3D11_BUFFER_DESC bd{};
+            cb0->GetDesc(&bd);
+            D3D11_BUFFER_DESC sd = bd;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sd.MiscFlags = 0;
+            ComPtr<ID3D11Buffer> staging;
+            if (SUCCEEDED(native_device->CreateBuffer(&sd, nullptr, staging.put())))
+            {
+               native_device_context->CopyResource(staging.get(), cb0.get());
+               D3D11_MAPPED_SUBRESOURCE ms{};
+               if (SUCCEEDED(native_device_context->Map(staging.get(), 0,
+                      D3D11_MAP_READ, 0, &ms)))
+               {
+                  write_blob(std::string(stem) + "_cb0.bin", ms.pData, bd.ByteWidth);
+                  native_device_context->Unmap(staging.get(), 0);
+                  manifest << "cb0 bytes " << bd.ByteWidth << " float4s "
+                           << (bd.ByteWidth / 16) << " file " << stem << "_cb0.bin\n";
+               }
+            }
+         }
+      }
+
+      // Every bound pixel-stage SRV. Small textures are dumped whole; large ones
+      // are scene, bloom, depth and velocity and only their descriptions are
+      // recorded. Enumerating rather than indexing a slot table means this cannot
+      // drift from the permutation map, and it reports what is actually bound.
+      constexpr UINT kMaxSlots = 16;
+      constexpr UINT kMaxDumpTexels =
+         1u
+         << 16; // A 4096x1 curve or a 256x16 strip fits; a frame buffer does not.
+      ComPtr<ID3D11ShaderResourceView> srvs[kMaxSlots];
+      ID3D11ShaderResourceView* raw_srvs[kMaxSlots] = {};
+      native_device_context->PSGetShaderResources(0, kMaxSlots, raw_srvs);
+      for (UINT slot = 0; slot < kMaxSlots; ++slot)
+      {
+         srvs[slot] = raw_srvs[slot]; // Adopt so the AddRef from
+                                      // PSGetShaderResources is released.
+         if (raw_srvs[slot])
+            raw_srvs[slot]->Release();
+         if (!srvs[slot])
+            continue;
+
+         ComPtr<ID3D11Resource> resource;
+         srvs[slot]->GetResource(resource.put());
+         ComPtr<ID3D11Texture2D> tex;
+         if (!resource || FAILED(resource->QueryInterface(IID_PPV_ARGS(tex.put()))))
+            continue;
+
+         D3D11_TEXTURE2D_DESC td{};
+         tex->GetDesc(&td);
+         manifest << "t" << slot << " " << td.Width << "x" << td.Height << " mips "
+                  << td.MipLevels << " arr " << td.ArraySize << " dxgi "
+                  << static_cast<uint32_t>(td.Format);
+
+         if (static_cast<uint64_t>(td.Width) * td.Height > kMaxDumpTexels)
+         {
+            manifest << " skipped (too large)\n";
+            continue;
+         }
+
+         D3D11_TEXTURE2D_DESC sd = td;
+         sd.Usage = D3D11_USAGE_STAGING;
+         sd.BindFlags = 0;
+         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+         sd.MiscFlags = 0;
+         sd.MipLevels = 1;
+         sd.ArraySize = 1;
+         sd.SampleDesc = {1, 0};
+         ComPtr<ID3D11Texture2D> staging;
+         if (FAILED(native_device->CreateTexture2D(&sd, nullptr, staging.put())))
+         {
+            manifest << " staging failed\n";
+            continue;
+         }
+         native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0,
+            tex.get(), 0, nullptr);
+         D3D11_MAPPED_SUBRESOURCE ms{};
+         if (FAILED(native_device_context->Map(staging.get(), 0, D3D11_MAP_READ, 0,
+                &ms)))
+         {
+            manifest << " map failed\n";
+            continue;
+         }
+         // The whole mapped slice at once. DepthPitch is its true size, which matters for
+         // block-compressed formats: those have Height/4 rows of blocks, so walking Height
+         // rows at RowPitch reads past the end of the mapping. ME3LE binds a 256x256 BC1
+         // texture beside its LUTs and hit exactly that.
+         char name[64];
+         std::snprintf(name, sizeof(name), "%s_t%u.bin", stem, slot);
+         {
+            std::ofstream out(root / name, std::ios::binary);
+            out.write(static_cast<const char*>(ms.pData),
+               static_cast<std::streamsize>(ms.DepthPitch));
+         }
+         native_device_context->Unmap(staging.get(), 0);
+         manifest << " pitch " << ms.RowPitch << " bytes " << ms.DepthPitch << " file " << name << "\n";
+      }
+
+      // Sampler state matters for the probe reads: address mode decides what a
+      // coordinate past the last texel returns, and the filter decides whether the
+      // shipped per-pixel Sample and the experimental SampleLevel see the same
+      // value. Both are assumptions the offline model currently cannot check.
+      ID3D11SamplerState* raw_samplers[kMaxSlots] = {};
+      native_device_context->PSGetSamplers(0, kMaxSlots, raw_samplers);
+      for (UINT slot = 0; slot < kMaxSlots; ++slot)
+      {
+         if (!raw_samplers[slot])
+            continue;
+         D3D11_SAMPLER_DESC sad{};
+         raw_samplers[slot]->GetDesc(&sad);
+         manifest << "s" << slot << " filter " << static_cast<uint32_t>(sad.Filter)
+                  << " addr " << static_cast<uint32_t>(sad.AddressU) << ","
+                  << static_cast<uint32_t>(sad.AddressV) << " mip " << sad.MinLOD
+                  << ".." << sad.MaxLOD << " bias " << sad.MipLODBias << "\n";
+         raw_samplers[slot]->Release();
+      }
+
+      // The live user settings that scale the captured signals; without them the
+      // dump cannot be reproduced.
+      manifest << "exposure " << cb_luma_global_settings.GameSettings.Exposure << "\n";
+      manifest << "bloom_scale_live " << gd.bloom_scale_live
+               << " bloom_threshold_live " << gd.bloom_threshold_live << "\n";
+   }
+#endif
 
    // Capture bright-pass cb0 into a staging ring and map the oldest entry with DO_NOT_WAIT, so the readback
    // never stalls. OnPresent turns the live artist-authored BloomScale into the effective intensity.
@@ -958,6 +1223,11 @@ public:
       if (g_hide_ui && !is_custom_pass && gd.scene_post_done_this_frame)
          return DrawOrDispatchOverrideType::Replaced;
 
+#if ENABLE_TONEMAP_DIAGNOSTICS
+      // First, so the dump records the game's own bindings before any injection replaces them.
+      DumpTonemapDiagnostics(native_device, native_device_context, gd, original_shader_hashes);
+#endif
+
       CaptureBloomScale(native_device, native_device_context, gd, original_shader_hashes);
 
       TagVideoTarget(native_device_context, device_data, original_shader_hashes);
@@ -1033,6 +1303,8 @@ public:
       reshade::get_config_value(nullptr, PROJECT_NAME, "Exposure", gs.Exposure);
       reshade::get_config_value(nullptr, PROJECT_NAME, "Saturation", gs.Saturation);
       reshade::get_config_value(nullptr, PROJECT_NAME, "HighlightDechroma", gs.HighlightDechroma);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "ClipHueShift", gs.ClipHueShift);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "ClipBlowout", gs.ClipBlowout);
       reshade::get_config_value(nullptr, PROJECT_NAME, "Contrast", gs.Contrast);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VignetteIntensity", gs.VignetteIntensity);
       reshade::get_config_value(nullptr, PROJECT_NAME, "FilmGrainIntensity", gs.FilmGrainIntensity);
@@ -1115,6 +1387,31 @@ public:
          {
             device_data.cb_luma_global_settings_dirty = true;
             reshade::set_config_value(nullptr, PROJECT_NAME, "HighlightDechroma", gs.HighlightDechroma);
+         }
+
+         // ME3LE hard-clip emulation. Inert unless MELE_HDR_ME3_HARDCLIP is enabled in Advanced Settings,
+         // and both at zero leave the reconstruction untouched, which is the diagnostic view.
+         if (ImGui::SliderFloat("Clip Hue Shift", &gs.ClipHueShift, 0.f, 1.f))
+            device_data.cb_luma_global_settings_dirty = true;
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipHueShift", gs.ClipHueShift);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Experimental, ME3LE only: rotates hue toward the soft-clip reference along the shorter arc (0 = keep the reconstruction's own hue).");
+         if (DrawResetButton<float, false>(gs.ClipHueShift, gd_def.ClipHueShift, "ClipHueShift"))
+         {
+            device_data.cb_luma_global_settings_dirty = true;
+            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipHueShift", gs.ClipHueShift);
+         }
+         if (ImGui::SliderFloat("Clip Blowout", &gs.ClipBlowout, 0.f, 1.f))
+            device_data.cb_luma_global_settings_dirty = true;
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipBlowout", gs.ClipBlowout);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Experimental, ME3LE only: pulls relative chroma toward the soft-clip reference. It can only reduce chroma, never add it.");
+         if (DrawResetButton<float, false>(gs.ClipBlowout, gd_def.ClipBlowout, "ClipBlowout"))
+         {
+            device_data.cb_luma_global_settings_dirty = true;
+            reshade::set_config_value(nullptr, PROJECT_NAME, "ClipBlowout", gs.ClipBlowout);
          }
       }
 

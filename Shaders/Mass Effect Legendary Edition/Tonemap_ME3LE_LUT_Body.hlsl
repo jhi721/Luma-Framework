@@ -16,6 +16,9 @@
 #include "../Includes/Color.hlsl"    // Transfer and color helpers.
 #include "../Includes/DICE.hlsl"     // Display-peak tonemap.
 #include "../Includes/Reinhard.hlsl" // Reversible max-channel compression.
+#include "Includes/Tonemap_MELE_ExperimentConfig.hlsli" // Experimental HDR selectors; every one defaults to 0.
+#include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
+#include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
 #ifndef TM_HAS_MOTIONBLUR
@@ -168,6 +171,20 @@ float3 MELE_ME3LE_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_Filmic.hlsli"
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
+#if MELE_HDR_ME3_FILMIC
+#include "Includes/Tonemap_MELE_FilmicExtended.hlsli"
+// Experimental family 04. Defined after MELE_ME3LE_GradeChain so the bridge drives the real colour LUT and the
+// real native tail. This body is straight RGB throughout - slice from blue, strip-x from red - so no swizzle
+// adapter is applied here; the ME1LE/ME2LE BRG rotation belongs to the other body and must not be copied over.
+float3 MELE_ME3LE_FilmicGradeHDR(float3 work_rgb)
+{
+   float3 proxy_rgb;
+   const MELE_BridgeState state = MELE_BuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, proxy_rgb);
+   const float3 graded_linear = gamma_to_linear(MELE_ME3LE_GradeChain(proxy_rgb), GCT_MIRROR);
+   return MELE_RestoreGradeRange(graded_linear, state);
+}
+#endif
+
 void main(
     float4 v0 : TEXCOORD0,
     float2 v1 : TEXCOORD1,
@@ -271,9 +288,23 @@ void main(
    // The native per-channel filmic value reaches the grade untouched, so the vanilla white blowout survives into
    // HDR: only the hue-preserving expansion scalar comes from the wrap.
    float mele_expand = 1.0; // Post-grade uncompression; 1 in the native range.
+#if MELE_HDR_ME3_FILMIC
+   float3 mele_filmic_hdr = 0.0;
+   bool mele_filmic_valid = false;
+#endif
    if (LumaSettings.DisplayMode == 1)
    {
       mele_expand = MELE_FilmicMaxChannelExpand(untonemapped);
+#if MELE_HDR_ME3_FILMIC
+      // untonemapped is the combined scene+bloom, which is correct HERE: this family has no pre-curve, so the
+      // LUT genuinely sees C+B. Do not carry the ME2LE L(F(C)+B) split into this body.
+      float3 mele_extended_filmic;
+      mele_filmic_valid = MELE_EvaluateME3FilmicExtended(untonemapped, r0.xyz, mele_extended_filmic);
+      if (mele_filmic_valid)
+      {
+         mele_filmic_hdr = MELE_ME3LE_FilmicGradeHDR(mele_extended_filmic);
+      }
+#endif
    }
 
    // Use one native grade function for both the working value and SDR reference.
@@ -282,6 +313,14 @@ void main(
    // Scalar uncompression preserves native mids/shadows and restores extrapolated HDR highlights. SDR leaves
    // mele_expand at 1.
    float3 graded_hdr = gamma_to_linear(sdr_gamma, GCT_MIRROR) * mele_expand;
+#if MELE_HDR_ME3_FILMIC
+   if (LumaSettings.DisplayMode == 1 && mele_filmic_valid)
+   {
+      // RGB ratios of the real tone LUT plus colour LUT plus native tail, at the working luminance. The white
+      // blowout that reference already contains is kept as it is; it is not given back its lost saturation.
+      graded_hdr = MELE_NativeColorAtLuminance(gamma_to_linear(sdr_gamma, GCT_MIRROR), GetLuminance(mele_filmic_hdr, CS_BT709), graded_hdr);
+   }
+#endif
 
    // ME3LE tail: smoothstep vignette, optional grain, and native output luma in alpha.
 #define TM_VIGNETTE_TYPE 3
