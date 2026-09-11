@@ -88,17 +88,17 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 // function and are not hoisted into the output tail.
 //
 // False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the
-// whole triple and work_hdr must not be read then.
-bool MELE_TryME3LEAnalytic_GradeHDR(float3 work_linear, out float3 work_hdr)
+// whole triple and workHDR must not be read then.
+bool MELE_TryME3LEAnalytic_GradeHDR(float3 workLinear, out float3 workHDR)
 {
-   work_hdr = float3(0.0, 0.0, 0.0);
+   workHDR = float3(0.0, 0.0, 0.0);
    float q;
    float3 proxy;
-   if (!MELE_TryBuildGradeProxy(work_linear, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy))
+   if (!MELE_TryBuildGradeProxy(workLinear, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy))
    {
       return false;
    }
-   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), q, work_hdr);
+   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), q, workHDR);
 }
 
 void main(
@@ -131,35 +131,35 @@ void main(
    // No tonemap curve here, so the raw scene reaches the grade and the saturate its grade opens with is this
    // permutation's vanilla blowout. Family 05 answers that by preparing the grade input, so nothing here
    // measures the clip.
-   float3 work_hdr = 0.0;
-   bool work_valid = false;
+   float3 workHDR = 0.0;
+   bool workValid = false;
    if (LumaSettings.DisplayMode == 1)
    {
-      work_valid = MELE_TryME3LEAnalytic_GradeHDR(untonemapped, work_hdr);
+      workValid = MELE_TryME3LEAnalytic_GradeHDR(untonemapped, workHDR);
    }
 
-   float3 sdr_gamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
+   float3 sdrGamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
 
    // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
-   // sdr_gamma again for the native SDR path; reusing this local changes fxc scheduling in two
+   // sdrGamma again for the native SDR path; reusing this local changes fxc scheduling in two
    // Publishing permutations. See Tonemap_MELE_Output.hlsli.
-   const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
+   const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction
    // keeps it for the whole triple rather than reaching for a different HDR model; there is none.
-   float3 graded_hdr = sdr_linear;
-   if (LumaSettings.DisplayMode == 1 && work_valid)
+   float3 gradedHDR = sdrLinear;
+   if (LumaSettings.DisplayMode == 1 && workValid)
    {
       // Validity was decided before the grade, not read off the finiteness of its output.
       //
-      // Family 05's range comes from the reversible grade bridge. sdr_linear - the exact decoded vanilla
+      // Family 05's range comes from the reversible grade bridge. sdrLinear - the exact decoded vanilla
       // hard-clipped SDR result, already computed above - is used ONLY as a hue reference, following
       // RenoDX hard-clip hue-emulation practice. The HDR target keeps its own perceptual lightness and
       // chroma magnitude. DICE remains the final display mapper.
       //
       // A broken hue transfer does not discard the reconstruction: MELE_HueReferenceOKLab returns its
       // target untouched, so the working HDR value survives an optional correction failing.
-      graded_hdr = MELE_HueReferenceOKLab(work_hdr, sdr_linear, MELE_HARDCLIP_HUE_STRENGTH);
+      gradedHDR = MELE_HueReferenceOKLab(workHDR, sdrLinear, MELE_HARDCLIP_HUE_STRENGTH);
    }
 
    // ME3LE analytic tail: no vignette or grain; preserve native output luma in alpha.

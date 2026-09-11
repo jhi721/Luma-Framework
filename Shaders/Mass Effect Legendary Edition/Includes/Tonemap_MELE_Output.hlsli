@@ -1,5 +1,5 @@
-// Shared stage-1 output tail, included inside each main() after it defines graded_hdr, sdr_gamma, v0, v1, o0, o1.
-// The bodies also hold the decoded sdr_linear, but this tail decodes sdr_gamma again on purpose: consuming their
+// Shared stage-1 output tail, included inside each main() after it defines gradedHDR, sdrGamma, v0, v1, o0, o1.
+// The bodies also hold the decoded sdrLinear, but this tail decodes sdrGamma again on purpose: consuming their
 // local instead reschedules the vanilla curve on 0x2754F750 and 0x69F03340 in Publishing, turning r0*w + (1 - e)
 // into (r0*w - e) + 1 at the same instruction count. Float32 addition is not associative and that line is native
 // transcription, so the duplicate decode stays. Measured, not assumed.
@@ -21,7 +21,7 @@
 const float paperWhite = MELE_GetGamePaperWhiteScale();
 const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
 
-float3 sdr_lin = gamma_to_linear(sdr_gamma, GCT_MIRROR);
+float3 sdrLin = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
 // Native vignette, hoisted ahead of the tonemap and expressed in linear so DICE absorbs its blue-tinted white
 // point instead of the frame leaving stage 1 above Scene Peak. linear_to_gamma is a signed pure pow, so this is
@@ -37,9 +37,9 @@ float3 vigLinear = 1.0;
    vd = exp2(3.25 * log2(vd));
    vd = 1.0 - vd;
    vd = exp2(TM_VIG_POW * log2(max(vd, 9.99999975e-05)));
-   const float3 white_point = TM_VIG_FLOOR + 1.0; // Floor plus center value.
+   const float3 whitePoint = TM_VIG_FLOOR + 1.0; // Floor plus center value.
    float3 vig = TM_VIG_FLOOR + vd;
-   vig = white_point * lerp(1.0, vig / white_point, LumaSettings.GameSettings.VignetteIntensity);
+   vig = whitePoint * lerp(1.0, vig / whitePoint, LumaSettings.GameSettings.VignetteIntensity);
    vigLinear = gamma_to_linear(vig, GCT_MIRROR);
 }
 #elif TM_VIGNETTE_TYPE == 3
@@ -51,8 +51,8 @@ float3 vigLinear = 1.0;
    float vd = dot(vc, vc);
    vd = saturate(4.0 * (vd - 0.0500000007));
    float vs = (3.0 - 2.0 * vd) * vd * vd; // smoothstep(0, 1, vd).
-   const float3 white_point = float3(1.01036298, 1.00000572, 1.16309249);
-   float3 vig = white_point - vs * LumaSettings.GameSettings.VignetteIntensity;
+   const float3 whitePoint = float3(1.01036298, 1.00000572, 1.16309249);
+   float3 vig = whitePoint - vs * LumaSettings.GameSettings.VignetteIntensity;
    vigLinear = gamma_to_linear(vig, GCT_MIRROR);
 }
 #endif
@@ -60,13 +60,13 @@ float3 vigLinear = 1.0;
 float3 postProcessedColor;
 if (LumaSettings.DisplayMode == 1) // HDR
 {
-   // graded_hdr arrives as paper-white-relative linear HDR; DICE owns peak rolloff and gamut from here.
-   float3 vignetted_hdr = graded_hdr * vigLinear;
+   // gradedHDR arrives as paper-white-relative linear HDR; DICE owns peak rolloff and gamut from here.
+   float3 vignettedHDR = gradedHDR * vigLinear;
 
    // DICE works in absolute-nit ratios, so its cap lands at the display peak. Type 2 also runs
    // CorrectOutOfRangeColor. Grain, dither, and RCAS can still push the result ~2% past Scene Peak; accepted.
    DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   float3 display_mapped = DICETonemap(vignetted_hdr * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
+   float3 displayMapped = DICETonemap(vignettedHDR * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
 
    // User HDR grade in Game-Paper-White-relative linear RGB; defaults are no-ops.
    const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
@@ -75,19 +75,19 @@ if (LumaSettings.DisplayMode == 1) // HDR
       float dcExp = lerp(1.0, 0.05, highlightDechroma);
       // peakWhite is 80-nit-relative, so convert it before dividing a Game-Paper-White-relative value by it.
       const float relativePeak = peakWhite / max(paperWhite, 1e-6);
-      float dcWeight = saturate(pow(saturate(GetLuminance(display_mapped) / relativePeak), dcExp));
-      display_mapped = Saturation(display_mapped, 1.0 - dcWeight);
+      float dcWeight = saturate(pow(saturate(GetLuminance(displayMapped) / relativePeak), dcExp));
+      displayMapped = Saturation(displayMapped, 1.0 - dcWeight);
    }
-   display_mapped = Saturation(display_mapped, LumaSettings.GameSettings.Saturation);
+   displayMapped = Saturation(displayMapped, LumaSettings.GameSettings.Saturation);
    const float midGray = 0.18; // Game-Paper-White-relative mid-gray.
-   display_mapped = (display_mapped - midGray) * LumaSettings.GameSettings.Contrast + midGray;
+   displayMapped = (displayMapped - midGray) * LumaSettings.GameSettings.Contrast + midGray;
 
-   postProcessedColor = display_mapped;
+   postProcessedColor = displayMapped;
 }
-else // SDR still uses the scRGB swapchain; sdr_lin is the exact native grade.
+else // SDR still uses the scRGB swapchain; sdrLin is the exact native grade.
 {
    // No tonemap sits between here and the encode, so the linear vignette equals the vanilla gamma multiply.
-   postProcessedColor = sdr_lin * vigLinear;
+   postProcessedColor = sdrLin * vigLinear;
 }
 
 postProcessedColor = IsNaN_Strict(postProcessedColor) ? 0.0 : postProcessedColor; // Replace NaN with zero.
@@ -112,12 +112,12 @@ o0.xyz = max(0.0, o0.xyz); // Grain may make shadows negative; retain HDR headro
 
 // linear_to_gamma is a pure pow, so dividing by R in linear equals dividing by gamma(R) in the encoded domain.
 // Used by the metering below and by the native SDR clamp at the end of this tail.
-const float r_encoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
+const float rEncoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
 
 // Native eye adaptation meters the final gamma scene after vignette, grain, and SDR clamp, HUD not yet present.
 // Cancelling transport with gamma(x / R) * gamma(R) = gamma(x) keeps both Paper White controls out of exposure.
 {
-   float3 metered = saturate(o0.xyz * r_encoded);
+   float3 metered = saturate(o0.xyz * rEncoded);
    float adaptLuma = dot(metered, float3(0.212670997, 0.715160012, 0.0721689984));
    o1 = 0.25 * log2(adaptLuma * 15 + 1);
 }
@@ -138,5 +138,5 @@ o0.w = 0;
 // White control moves it. HDR keeps its headroom.
 if (LumaSettings.DisplayMode != 1)
 {
-   o0.xyz = min(o0.xyz, 1.0 / max(r_encoded, 1e-4));
+   o0.xyz = min(o0.xyz, 1.0 / max(rEncoded, 1e-4));
 }

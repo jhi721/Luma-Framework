@@ -156,9 +156,9 @@ float3 MELE_ME3LE_GradeChain(float3 c)
    r1.x = r1.w * 0.0625 + (0.05859375 * r0.x);
    r1.y = 0.9375 * r0.y;
    r1.xyzw = float4(0.001953125, 0.03125, 0.064453125, 0.03125) + r1.xyxy;
-   float3 lut_a = ColorGradingLUT.Sample(ColorGradingLUTSampler_s, r1.xy).xyz;
-   float3 lut_b = ColorGradingLUT.Sample(ColorGradingLUTSampler_s, r1.zw).xyz;
-   r0.xyz = r0.zzz * (lut_b - lut_a) + lut_a;
+   float3 lutA = ColorGradingLUT.Sample(ColorGradingLUTSampler_s, r1.xy).xyz;
+   float3 lutB = ColorGradingLUT.Sample(ColorGradingLUTSampler_s, r1.zw).xyz;
+   r0.xyz = r0.zzz * (lutB - lutA) + lutA;
    // Native GammaOverlayColor and SDR gamma curve.
    r0.xyz = GammaOverlayColor.xyz + r0.xyz;
    r0.xyz = MELE_NativeGammaCurve(r0.xyz, GammaColorScaleAndInverse.xyz, GammaColorScaleAndInverse.w, true);
@@ -174,18 +174,18 @@ float3 MELE_ME3LE_GradeChain(float3 c)
 // real native tail. This body is straight RGB throughout - slice from blue, strip-x from red - so no swizzle
 // adapter is applied here; the ME1LE/ME2LE BRG rotation belongs to the other body and must not be copied over.
 // False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the whole
-// triple and work_hdr must not be read then.
-bool MELE_TryME3LE_FilmicGradeHDR(float3 work_rgb, out float3 work_hdr)
+// triple and workHDR must not be read then.
+bool MELE_TryME3LE_FilmicGradeHDR(float3 workRGB, out float3 workHDR)
 {
-   work_hdr = float3(0.0, 0.0, 0.0);
+   workHDR = float3(0.0, 0.0, 0.0);
    float q;
-   float3 proxy_rgb;
-   if (!MELE_TryBuildGradeProxy(work_rgb, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy_rgb))
+   float3 proxyRGB;
+   if (!MELE_TryBuildGradeProxy(workRGB, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))
    {
       return false;
    }
-   const float3 graded_linear = gamma_to_linear(MELE_ME3LE_GradeChain(proxy_rgb), GCT_MIRROR);
-   return MELE_TryRestoreGradeRange(graded_linear, q, work_hdr);
+   const float3 gradedLinear = gamma_to_linear(MELE_ME3LE_GradeChain(proxyRGB), GCT_MIRROR);
+   return MELE_TryRestoreGradeRange(gradedLinear, q, workHDR);
 }
 
 void main(
@@ -290,36 +290,36 @@ void main(
    r0.z = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.zz).x;
    // The native per-channel filmic value reaches the grade untouched - that is this body's SDR output. Family
    // 04 does not touch it; it continues the tone LUT itself and grades that second value.
-   float3 work_hdr = 0.0;
-   bool work_valid = false;
+   float3 workHDR = 0.0;
+   bool workValid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // untonemapped is the combined scene+bloom, which is correct HERE: this family has no pre-curve, so the
       // LUT genuinely sees C+B. Do not carry the ME2LE L(F(C)+B) split into this body.
-      float3 extended_filmic;
-      work_valid = MELE_TryEvaluateME3FilmicExtended(untonemapped, r0.xyz, extended_filmic);
-      if (work_valid)
+      float3 extendedFilmic;
+      workValid = MELE_TryEvaluateME3FilmicExtended(untonemapped, r0.xyz, extendedFilmic);
+      if (workValid)
       {
-         work_valid = MELE_TryME3LE_FilmicGradeHDR(extended_filmic, work_hdr);
+         workValid = MELE_TryME3LE_FilmicGradeHDR(extendedFilmic, workHDR);
       }
    }
 
    // Use one native grade function for both the working value and SDR reference.
-   float3 sdr_gamma = MELE_ME3LE_GradeChain(r0.xyz);
+   float3 sdrGamma = MELE_ME3LE_GradeChain(r0.xyz);
 
    // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
-   // sdr_gamma again for the native SDR path; reusing this local changes fxc scheduling in two
+   // sdrGamma again for the native SDR path; reusing this local changes fxc scheduling in two
    // Publishing permutations. See Tonemap_MELE_Output.hlsli.
-   const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
+   const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
    // it for the whole triple rather than reaching for a different HDR model; there is none.
-   float3 graded_hdr = sdr_linear;
-   if (LumaSettings.DisplayMode == 1 && work_valid)
+   float3 gradedHDR = sdrLinear;
+   if (LumaSettings.DisplayMode == 1 && workValid)
    {
       // RGB ratios of the real tone LUT plus colour LUT plus native tail, at the working luminance. The white
       // blowout that reference already contains is kept as it is; it is not given back its lost saturation.
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(work_hdr, CS_BT709));
+      gradedHDR = MELE_NativeColorAtLuminance(sdrLinear, GetLuminance(workHDR, CS_BT709));
    }
 
    // ME3LE tail: smoothstep vignette, optional grain, and native output luma in alpha.

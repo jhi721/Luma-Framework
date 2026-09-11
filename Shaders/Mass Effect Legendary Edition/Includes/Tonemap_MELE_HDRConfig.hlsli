@@ -66,7 +66,7 @@
 // One colour path per family, not selectable. Families 01-04 take their RGB ratios from the real graded SDR
 // and only their luminance from the new branch; family 05 keeps its working HDR and moves only its hue.
 //
-// The guarantee ends at graded_hdr, before the shared output tail. The vignette, DICE, the user
+// The guarantee ends at gradedHDR, before the shared output tail. The vignette, DICE, the user
 // saturation/contrast controls and the late SDR clamp all run after it and are judged separately.
 
 // Swizzle adapters for the ME1LE/ME2LE LUT body, whose grade chain is transcribed BRG-in / RGB-out.

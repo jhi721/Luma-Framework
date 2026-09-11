@@ -9,6 +9,10 @@
 // permutation declares smpFilmicLUT and its sampler. The includes above carry guards, so a body that
 // already pulled them in pays nothing.
 //
+// The fit's probe and pivot names stay snake_case where everything else here is camelCase: z_lo, z_hi and
+// pivot_z are formula subscripts, printed the same way in the derivations beside them. Shaders/Includes/
+// ACES.hlsl and Reinhard.hlsl keep their source style for the same reason.
+//
 // Nothing here invents a curve. Every anchor is a real read of the bound LUT, so a different shipped
 // table gives a different continuation; the constants are probe positions, not curve coefficients.
 
@@ -64,10 +68,10 @@ MELE_FilmicFit MELE_BuildFilmicFitZ(float z_lo, float pivot_z, float z_hi, float
 //
 // Below the pivot the caller's already-sampled native value is reused rather than re-probed, so that
 // region is the native result and not an approximation of it.
-bool MELE_TryEvaluateME3FilmicExtended(float3 scene_with_bloom, float3 native_filmic_rgb, out float3 extended_filmic_rgb)
+bool MELE_TryEvaluateME3FilmicExtended(float3 sceneWithBloom, float3 nativeFilmicRGB, out float3 extendedFilmicRGB)
 {
-   extended_filmic_rgb = native_filmic_rgb;
-   if (!MELE_IsFiniteNonNegative(scene_with_bloom) || !MELE_IsFiniteNonNegative(native_filmic_rgb))
+   extendedFilmicRGB = nativeFilmicRGB;
+   if (!MELE_IsFiniteNonNegative(sceneWithBloom) || !MELE_IsFiniteNonNegative(nativeFilmicRGB))
    {
       return false;
    }
@@ -76,15 +80,15 @@ bool MELE_TryEvaluateME3FilmicExtended(float3 scene_with_bloom, float3 native_fi
    {
       return false;
    }
-   const float3 continued = fit.pivot_value + fit.slope * (scene_with_bloom - fit.pivot_z);
-   const float3 result = float3(scene_with_bloom.x <= fit.pivot_z ? native_filmic_rgb.x : continued.x,
-                                scene_with_bloom.y <= fit.pivot_z ? native_filmic_rgb.y : continued.y,
-                                scene_with_bloom.z <= fit.pivot_z ? native_filmic_rgb.z : continued.z);
+   const float3 continued = fit.pivot_value + fit.slope * (sceneWithBloom - fit.pivot_z);
+   const float3 result = float3(sceneWithBloom.x <= fit.pivot_z ? nativeFilmicRGB.x : continued.x,
+                                sceneWithBloom.y <= fit.pivot_z ? nativeFilmicRGB.y : continued.y,
+                                sceneWithBloom.z <= fit.pivot_z ? nativeFilmicRGB.z : continued.z);
    if (!MELE_IsFiniteNonNegative(result))
    {
       return false;
    }
-   extended_filmic_rgb = result;
+   extendedFilmicRGB = result;
    return true;
 }
 
@@ -119,10 +123,10 @@ MELE_FilmicFit MELE_BuildME2StagedFit()
 // where float32 rounding defeats that (slope * (C - p) underflowing to zero within about a thousand
 // ULP of the pivot) a fresh read at z returns exactly the native sample anyway - measured over the
 // full ULP neighbourhood and a 200k random float32 sample on the shipped table.
-bool MELE_TryEvaluateME2FilmicExtended(float3 scene_before_precurve, float3 native_bloom_contribution, float3 native_filmic_rgb, out float3 extended_filmic_rgb)
+bool MELE_TryEvaluateME2FilmicExtended(float3 sceneBeforePrecurve, float3 nativeBloomContribution, float3 nativeFilmicRGB, out float3 extendedFilmicRGB)
 {
-   extended_filmic_rgb = native_filmic_rgb;
-   if (!MELE_IsFiniteNonNegative(scene_before_precurve) || !MELE_IsFiniteNonNegative(native_bloom_contribution) || !MELE_IsFiniteNonNegative(native_filmic_rgb))
+   extendedFilmicRGB = nativeFilmicRGB;
+   if (!MELE_IsFiniteNonNegative(sceneBeforePrecurve) || !MELE_IsFiniteNonNegative(nativeBloomContribution) || !MELE_IsFiniteNonNegative(nativeFilmicRGB))
    {
       return false;
    }
@@ -131,20 +135,20 @@ bool MELE_TryEvaluateME2FilmicExtended(float3 scene_before_precurve, float3 nati
    {
       return false;
    }
-   const float3 z = MELE_ExpExtended(scene_before_precurve, MELE_HDR_PIVOT) + native_bloom_contribution;
+   const float3 z = MELE_ExpExtended(sceneBeforePrecurve, MELE_HDR_PIVOT) + nativeBloomContribution;
    if (!MELE_IsFiniteNonNegative(z))
    {
       return false;
    }
    const float3 continued = fit.pivot_value + fit.slope * (z - fit.pivot_z);
-   const float3 tone = float3(z.x > fit.pivot_z ? continued.x : native_filmic_rgb.x,
-                              z.y > fit.pivot_z ? continued.y : native_filmic_rgb.y,
-                              z.z > fit.pivot_z ? continued.z : native_filmic_rgb.z);
+   const float3 tone = float3(z.x > fit.pivot_z ? continued.x : nativeFilmicRGB.x,
+                              z.y > fit.pivot_z ? continued.y : nativeFilmicRGB.y,
+                              z.z > fit.pivot_z ? continued.z : nativeFilmicRGB.z);
    if (!MELE_IsFiniteNonNegative(tone))
    {
       return false;
    }
-   extended_filmic_rgb = tone;
+   extendedFilmicRGB = tone;
    return true;
 }
 

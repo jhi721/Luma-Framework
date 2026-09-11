@@ -29,6 +29,10 @@
 // that actually broke.
 //
 // DICE, further down the shared output tail, stays the one and only display mapper.
+//
+// The OKLab locals below stay snake_case where the rest of this game's HDR code is camelCase: they are a
+// line-by-line port and keeping the source spelling keeps the two diffable, exactly as Shaders/Includes/
+// ACES.hlsl and Reinhard.hlsl do.
 float3 MELE_HueReferenceOKLab(float3 target, float3 reference, float strength)
 {
    if (strength == 0.0)

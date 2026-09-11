@@ -37,7 +37,7 @@ bool MELE_IsFiniteNonNegative(float3 v)
 }
 
 // The composite transfer between the grade-input domain and the linear domain the caller works in.
-// For every MELE family the tail from grade input to linear graded_hdr is MELE_NativeGammaCurve
+// For every MELE family the tail from grade input to linear gradedHDR is MELE_NativeGammaCurve
 // followed by gamma_to_linear(., GCT_MIRROR), which with an identity colour grade composes to
 // (scale*c)^r for r = GammaColorScaleAndInverse.w * DefaultGamma.
 //
@@ -76,13 +76,13 @@ float3 MELE_BridgeUnadapt(float3 v, float r)
 // On failure both out parameters keep the neutral values written at entry and the caller must use
 // neither: false means the HDR reconstruction declined and the caller retains the exact
 // native SDR reference for the whole RGB triple.
-bool MELE_TryBuildGradeProxy(float3 work_native, float r, out float q, out float3 proxy_native)
+bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3 proxyNative)
 {
    q = 1.0;
-   proxy_native = work_native;
+   proxyNative = workNative;
 
    const float k = MELE_HDR_BRIDGE_SHOULDER;
-   if (!MELE_IsFiniteNonNegative(work_native) || !MELE_IsFiniteNonNegative(r) || r <= 0.0 || !(k > 0.0 && k < 1.0))
+   if (!MELE_IsFiniteNonNegative(workNative) || !MELE_IsFiniteNonNegative(r) || r <= 0.0 || !(k > 0.0 && k < 1.0))
    {
       return false;
    }
@@ -90,7 +90,7 @@ bool MELE_TryBuildGradeProxy(float3 work_native, float r, out float q, out float
    // pow(x, 1) is exp2(log2(x)) on this hardware, not the identity, and r was measured at exactly 1
    // in every captured frame. This keeps that common case bit-exact; it is a shortcut for one value
    // of r, never an assumption that r is 1.
-   const float3 adapted = (r == 1.0) ? work_native : MELE_BridgeAdapt(work_native, r);
+   const float3 adapted = (r == 1.0) ? workNative : MELE_BridgeAdapt(workNative, r);
    if (!MELE_IsFiniteNonNegative(adapted))
    {
       return false;
@@ -112,31 +112,31 @@ bool MELE_TryBuildGradeProxy(float3 work_native, float r, out float q, out float
       return false;
    }
 
-   const float3 candidate_proxy = (r == 1.0) ? compressed : MELE_BridgeUnadapt(compressed, r);
-   if (!MELE_IsFiniteNonNegative(candidate_proxy))
+   const float3 candidateProxy = (r == 1.0) ? compressed : MELE_BridgeUnadapt(compressed, r);
+   if (!MELE_IsFiniteNonNegative(candidateProxy))
    {
       return false;
    }
    q = scale;
-   proxy_native = candidate_proxy;
+   proxyNative = candidateProxy;
    return true;
 }
 
 // Undo the compression on the decoded linear grade output. Never invert the curve by re-reading the
 // changed LUT output: the LUT moved the colour, so that read cannot recover the original scale.
-bool MELE_TryRestoreGradeRange(float3 graded_linear, float q, out float3 work_hdr)
+bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 {
-   work_hdr = graded_linear;
-   if (!MELE_IsFiniteNonNegative(graded_linear) || !MELE_IsFiniteNonNegative(q) || q <= 0.0)
+   workHDR = gradedLinear;
+   if (!MELE_IsFiniteNonNegative(gradedLinear) || !MELE_IsFiniteNonNegative(q) || q <= 0.0)
    {
       return false;
    }
-   const float3 restored = graded_linear / q;
+   const float3 restored = gradedLinear / q;
    if (!MELE_IsFiniteNonNegative(restored))
    {
       return false;
    }
-   work_hdr = restored;
+   workHDR = restored;
    return true;
 }
 
@@ -172,26 +172,26 @@ bool MELE_TryRestoreGradeRange(float3 graded_linear, float q, out float3 work_hd
 // in MELE_IsFiniteNonNegative above. Do not re-attempt it without re-measuring.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
-float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance)
+float3 MELE_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetLuminance)
 {
-   if (!MELE_IsFiniteNonNegative(native_reference_linear) || !MELE_IsFiniteNonNegative(target_luminance))
+   if (!MELE_IsFiniteNonNegative(nativeReferenceLinear) || !MELE_IsFiniteNonNegative(targetLuminance))
    {
-      return native_reference_linear;
+      return nativeReferenceLinear;
    }
-   if (target_luminance == 0.0 || all(native_reference_linear == 0.0))
+   if (targetLuminance == 0.0 || all(nativeReferenceLinear == 0.0))
    {
       return float3(0.0, 0.0, 0.0); // The grade produced that black.
    }
-   const float reference_luminance = GetLuminance(native_reference_linear, CS_BT709);
-   if (!MELE_IsFiniteNonNegative(reference_luminance) || reference_luminance < MELE_NATIVE_COLOR_MIN_LUMINANCE)
+   const float referenceLuminance = GetLuminance(nativeReferenceLinear, CS_BT709);
+   if (!MELE_IsFiniteNonNegative(referenceLuminance) || referenceLuminance < MELE_NATIVE_COLOR_MIN_LUMINANCE)
    {
-      return native_reference_linear;
+      return nativeReferenceLinear;
    }
-   const float gain = target_luminance / reference_luminance;
-   const float3 result = native_reference_linear * gain;
+   const float gain = targetLuminance / referenceLuminance;
+   const float3 result = nativeReferenceLinear * gain;
    if (!MELE_IsFiniteNonNegative(gain) || !MELE_IsFiniteNonNegative(result))
    {
-      return native_reference_linear;
+      return nativeReferenceLinear;
    }
    return result;
 }

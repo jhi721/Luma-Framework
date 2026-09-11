@@ -4,7 +4,7 @@
 //
 // ME1LE 0xAAE8755A and ME2LE 0xCC76075F share the decompiled scene preparation and grade. Thin entry points select
 // vignette parameters and ME2LE's post-gamma white point. Preserve register-level swizzles for comparison with the
-// live CSOs. This body produces linear graded_hdr and native gamma sdr_gamma; the shared tail applies DICE.
+// live CSOs. This body produces linear gradedHDR and native gamma sdrGamma; the shared tail applies DICE.
 // ME3LE analytic shader 0x225A8330 has a different cbuffer layout and no exponential curve.
 
 // clang-format off
@@ -122,9 +122,9 @@ float3 MELE_Analytic_GradeChain(float3 c)
 // a NaN that a later max() swallowed. A failure of any single channel returns
 // false for the WHOLE triple: switching channels independently would move hue,
 // which is the failure this branch exists to avoid.
-bool MELE_TryAnalyticGradeChainHDR(float3 c, float gamma_exponent, out float3 encoded_hdr)
+bool MELE_TryAnalyticGradeChainHDR(float3 c, float gammaExponent, out float3 encodedHDR)
 {
-   encoded_hdr = float3(0.0, 0.0, 0.0);
+   encodedHDR = float3(0.0, 0.0, 0.0);
    float4 r0, r1, r2;
    r0.xyz = c;
    // Native highlight desaturation.
@@ -213,12 +213,12 @@ bool MELE_TryAnalyticGradeChainHDR(float3 c, float gamma_exponent, out float3 en
    // Same scale and exponent as the native tail, without its cap. The scaled value is formed once,
    // checked, then encoded: the caller already turned invGamma into the exponent linear_to_gamma
    // takes, so neither the multiply nor the reciprocal is repeated here.
-   const float3 gamma_input = GammaColorScaleAndInverse.xyz * r0.xyz;
-   if (!MELE_IsFinite(gamma_input))
+   const float3 gammaInput = GammaColorScaleAndInverse.xyz * r0.xyz;
+   if (!MELE_IsFinite(gammaInput))
    {
       return false;
    }
-   r0.xyz = linear_to_gamma(gamma_input, GCT_MIRROR, gamma_exponent);
+   r0.xyz = linear_to_gamma(gammaInput, GCT_MIRROR, gammaExponent);
    // GCT_MIRROR is the odd extension, so a negative encoded value here is signed
    // data and not a bad pow base. Finiteness is the contract at this point;
    // non-negativity is the caller's, after the decode.
@@ -235,7 +235,7 @@ bool MELE_TryAnalyticGradeChainHDR(float3 c, float gamma_exponent, out float3 en
       return false;
    }
 #endif
-   encoded_hdr = r0.xyz;
+   encodedHDR = r0.xyz;
    return true;
 }
 
@@ -270,16 +270,16 @@ bool MELE_TryAnalyticGradeChainHDR(float3 c, float gamma_exponent, out float3 en
 // native SDR reference. If that reference is itself unusable because the
 // cbuffer is corrupt, that is the game's state and not something this branch
 // can fix.
-bool MELE_TryAnalyticGradeHDR(float3 scene_linear, float3 bloom_linear,
-                              out float3 work_hdr)
+bool MELE_TryAnalyticGradeHDR(float3 sceneLinear, float3 bloomLinear,
+                              out float3 workHDR)
 {
-   work_hdr = float3(0.0, 0.0, 0.0);
-   if (!MELE_IsFiniteNonNegative(scene_linear) ||
-       !MELE_IsFiniteNonNegative(bloom_linear))
+   workHDR = float3(0.0, 0.0, 0.0);
+   if (!MELE_IsFiniteNonNegative(sceneLinear) ||
+       !MELE_IsFiniteNonNegative(bloomLinear))
    {
       return false;
    }
-   const float inv_gamma = GammaColorScaleAndInverse.w;
+   const float invGamma = GammaColorScaleAndInverse.w;
    if (!MELE_IsFinite(SceneShadowsAndDesaturation.xyz) ||
        !MELE_IsFinite(SceneShadowsAndDesaturation.w) ||
        !MELE_IsFinite(SceneInverseHighLights.xyz) ||
@@ -287,25 +287,25 @@ bool MELE_TryAnalyticGradeHDR(float3 scene_linear, float3 bloom_linear,
        !MELE_IsFinite(SceneScaledLuminanceWeights.xyz) ||
        !MELE_IsFinite(GammaOverlayColor.xyz) ||
        !MELE_IsFinite(GammaColorScaleAndInverse.xyz) ||
-       !MELE_IsFinite(inv_gamma) || inv_gamma <= 0.0)
+       !MELE_IsFinite(invGamma) || invGamma <= 0.0)
    {
       return false;
    }
    // Formed only once its denominator is known good, then checked in turn: a tiny invGamma overflows
    // the reciprocal even though the denominator itself is perfectly finite.
-   const float gamma_exponent = 1.0 / inv_gamma;
-   if (!MELE_IsFinite(gamma_exponent) || gamma_exponent <= 0.0)
+   const float gammaExponent = 1.0 / invGamma;
+   if (!MELE_IsFinite(gammaExponent) || gammaExponent <= 0.0)
    {
       return false;
    }
-   const float3 work_native =
-       MELE_ExpExtended(scene_linear, MELE_HDR_PIVOT) + bloom_linear;
-   if (!MELE_IsFiniteNonNegative(work_native))
+   const float3 workNative =
+       MELE_ExpExtended(sceneLinear, MELE_HDR_PIVOT) + bloomLinear;
+   if (!MELE_IsFiniteNonNegative(workNative))
    {
       return false;
    }
    float3 encoded;
-   if (!MELE_TryAnalyticGradeChainHDR(work_native, gamma_exponent, encoded))
+   if (!MELE_TryAnalyticGradeChainHDR(workNative, gammaExponent, encoded))
    {
       return false;
    }
@@ -314,7 +314,7 @@ bool MELE_TryAnalyticGradeHDR(float3 scene_linear, float3 bloom_linear,
    {
       return false;
    }
-   work_hdr = candidate;
+   workHDR = candidate;
    return true;
 }
 
@@ -347,8 +347,8 @@ void main(
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
    // Captured before the curve below overwrites r1. Straight RGB here, unlike the ME1LE/ME2LE LUT body.
-   const float3 scene_linear = r1.xyz;
-   const float3 bloom_linear = r0.xyz * r0.www;
+   const float3 sceneLinear = r1.xyz;
+   const float3 bloomLinear = r0.xyz * r0.www;
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.xyz;
@@ -357,33 +357,33 @@ void main(
    r0.xyz = r0.xyz * r0.www + r1.xyz;
    // The native per-channel value still reaches the analytic grade untouched - that is this body's SDR output.
    // Family 02 does not touch it; it builds a second, uncapped working value from the scene instead.
-   float3 work_hdr = 0.0;
-   bool work_valid = false;
+   float3 workHDR = 0.0;
+   bool workValid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // Extension on the scene before its curve, bloom added where vanilla adds it, then one decode of the
       // uncapped encoded grade. Below the pivot with an inert grade this reduces to the native result.
-      work_valid = MELE_TryAnalyticGradeHDR(scene_linear, bloom_linear, work_hdr);
+      workValid = MELE_TryAnalyticGradeHDR(sceneLinear, bloomLinear, workHDR);
    }
 
    // Apply the same native grade function to the working value and, below, to the SDR reference.
-   float3 sdr_gamma = MELE_Analytic_GradeChain(r0.xyz);
+   float3 sdrGamma = MELE_Analytic_GradeChain(r0.xyz);
 
    // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
-   // sdr_gamma again for the native SDR path; reusing this local changes fxc scheduling in two
+   // sdrGamma again for the native SDR path; reusing this local changes fxc scheduling in two
    // Publishing permutations. See Tonemap_MELE_Output.hlsli.
-   const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
+   const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
    // it for the whole triple rather than reaching for a different HDR model; there is none.
-   float3 graded_hdr = sdr_linear;
+   float3 gradedHDR = sdrLinear;
    // Lifting the caps lets a game exponent run away, so the whole triple is validated at once. Falling back
    // per channel would move hue, which is the failure this branch exists to avoid.
-   if (LumaSettings.DisplayMode == 1 && work_valid)
+   if (LumaSettings.DisplayMode == 1 && workValid)
    {
       // Hue and saturation come from the real bounded grade, never from the uncapped twin and never from the
       // scene; only the luminance is the twin's.
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(work_hdr, CS_BT709));
+      gradedHDR = MELE_NativeColorAtLuminance(sdrLinear, GetLuminance(workHDR, CS_BT709));
    }
 
    // Entry point supplies vignette macros. Analytic ME1LE/ME2LE permutations have no grain and write zero alpha.
