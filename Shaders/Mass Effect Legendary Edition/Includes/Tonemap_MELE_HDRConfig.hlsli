@@ -18,10 +18,11 @@
 // had already flattened. Where a model declines, the caller keeps the exact native SDR result; it
 // never falls back to a different reconstruction, because there is no longer one to fall back to.
 //
-// Porting a model to ANOTHER game is a separate decision with its own evidence. The prior in
-// Shaders/Borderlands 2 and The Pre-Sequel/Luma_BL2TPS_Tonemap.hlsl stands: the same wrap was tried and
-// rejected there, on the same kind of asymptotic curve ME1LE and ME2LE have. MELE's frames do not
-// transfer to BL2's.
+// Porting a model to ANOTHER game is a separate decision with its own evidence. Families 01-04 were
+// ported once, to Shaders/Borderlands 2 and The Pre-Sequel/Luma_BL2TPS_Tonemap.hlsl, where they are now
+// the only HDR path; that port re-measured BL2's own vanilla curve first rather than carrying these
+// frames over, and it drops the domain adapter because it compresses and restores in the same linear
+// domain. The earlier rejection of a max-channel wrap there is history, not a standing prior.
 
 // Bench values: exercised against the captured LUTs and cbuffers, and carried unchanged through the
 // 2026-09-11 A/B that chose these families. That A/B judged the families as a whole, so it validates
