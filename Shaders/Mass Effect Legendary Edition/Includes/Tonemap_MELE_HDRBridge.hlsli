@@ -74,7 +74,8 @@ float3 MELE_BridgeUnadapt(float3 v, float r)
 // opens with a saturate or a min(1), which launders a bad input into a plausible number.
 //
 // On failure both out parameters keep the neutral values written at entry and the caller must use
-// neither: false means take the family's own legacy result for the whole RGB triple.
+// neither: false means the HDR reconstruction declined and the caller retains the exact
+// native SDR reference for the whole RGB triple.
 bool MELE_TryBuildGradeProxy(float3 work_native, float r, out float q, out float3 proxy_native)
 {
    q = 1.0;
@@ -157,16 +158,16 @@ bool MELE_TryRestoreGradeRange(float3 graded_linear, float q, out float3 work_hd
 //   near-black but positive reference -> divided normally. The LUT permutations carry clampFloor, so
 //     a vanilla black arrives here at 1e-4 in luminance, two decades above the guard. Collapsing that
 //     to black would erase a real part of the native output; count the guard's trips, do not widen it.
-//   a non-finite gain or product -> the caller's legacy value for the WHOLE triple. Switching
+//   a non-finite gain or product -> the caller's decline value for the WHOLE triple. Switching
 //     channels independently would change hue, which is the failure being avoided.
 // A positive target luminance is never clamped to 1, and no path takes colour from the raw scene.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
-float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance, float3 legacy_family_hdr)
+float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance, float3 decline_value)
 {
    if (!MELE_IsFiniteNonNegative(native_reference_linear) || !MELE_IsFiniteNonNegative(target_luminance))
    {
-      return legacy_family_hdr;
+      return decline_value;
    }
    if (target_luminance == 0.0 || all(native_reference_linear == 0.0))
    {
@@ -175,13 +176,13 @@ float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_
    const float reference_luminance = GetLuminance(native_reference_linear, CS_BT709);
    if (!MELE_IsFiniteNonNegative(reference_luminance) || reference_luminance < MELE_NATIVE_COLOR_MIN_LUMINANCE)
    {
-      return legacy_family_hdr;
+      return decline_value;
    }
    const float gain = target_luminance / reference_luminance;
    const float3 result = native_reference_linear * gain;
    if (!MELE_IsFiniteNonNegative(gain) || !MELE_IsFiniteNonNegative(result))
    {
-      return legacy_family_hdr;
+      return decline_value;
    }
    return result;
 }

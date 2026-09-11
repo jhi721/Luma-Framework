@@ -2,8 +2,9 @@
 // or pre-grade tonemap curve: analytic Scene* operates directly on linear scene+bloom, followed by gamma, the
 // ME3LE blue-tinted white point, and a clamp. Bindings: t0 scene, t1 DoF, t2/t3 near/far DoF, t4 bloom.
 //
-// Transcribed from live CSO 0x225A8330. With only an SDR clamp, the reversible max-channel wrap uses an identity
-// 0.18 -> 0.18 anchor before restoring linear HDR highlights.
+// Transcribed from live CSO 0x225A8330. Its only tone limit is that final clamp, so family 05 recovers range by
+// running the grade on a bounded proxy and restoring the scale afterwards, then takes hue alone from the exact
+// native hard-clipped result.
 
 // clang-format off
 #include "Includes/Common.hlsl"
@@ -81,13 +82,13 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 // Included here, not with the headers: MELE_CompositeDOF reads the _Globals fields and DOF textures declared above.
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
-#if MELE_HDR_ME3_HARDCLIP
 #include "Includes/Tonemap_MELE_HueReference.hlsli"
-// Experimental family 05. The grade chain is called unchanged, caps and all: this branch earns its range by
-// preparing the INPUT, not by stripping the grade. The blue white point and the black floor stay inside that
+// Family 05. The grade chain is called unchanged, caps and all: this path earns its range by preparing
+// the INPUT, not by stripping the grade. The blue white point and the black floor stay inside that
 // function and are not hoisted into the output tail.
 //
-// False means the caller keeps its legacy value for the whole triple; work_hdr must not be read then.
+// False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the
+// whole triple and work_hdr must not be read then.
 bool MELE_ME3LEAnalytic_GradeHDR(float3 work_linear, out float3 work_hdr)
 {
    work_hdr = float3(0.0, 0.0, 0.0);
@@ -99,7 +100,6 @@ bool MELE_ME3LEAnalytic_GradeHDR(float3 work_linear, out float3 work_hdr)
    }
    return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), q, work_hdr);
 }
-#endif
 
 void main(
     float4 v0 : TEXCOORD0,
@@ -128,32 +128,25 @@ void main(
 
    float3 untonemapped = r0.xyz * r0.www + r1.xyz;
    r0.xyz = untonemapped;
-   // No tonemap curve here, so the raw scene reaches the grade and the saturate its grade opens with is this permutation's vanilla blowout; that is a hard clip, so its inverse is the plain max-channel ratio, identity below the clip and mch above it.
-   float mele_scale = 1.0;
-#if MELE_HDR_ME3_HARDCLIP
+   // No tonemap curve here, so the raw scene reaches the grade and the saturate its grade opens with is this
+   // permutation's vanilla blowout. Family 05 answers that by preparing the grade input, so nothing here
+   // measures the clip.
    float3 mele_hardclip_hdr = 0.0;
    bool mele_hardclip_valid = false;
-#endif
    if (LumaSettings.DisplayMode == 1)
    {
-      float mele_mch = max(max3(untonemapped), 1e-6);
-      // A Reinhard anchored 0.18 -> 0.18 reduces to mch + 0.82, lifting mids the clip never touched by +32% at mch 0.5 and +82% at mch 1; the clip inverse also cancels the clip's own kink, keeping the product C1.
-      mele_scale = 1.0 / mele_mch;
-#if MELE_HDR_ME3_HARDCLIP
       mele_hardclip_valid = MELE_ME3LEAnalytic_GradeHDR(untonemapped, mele_hardclip_hdr);
-#endif
    }
 
    float3 sdr_gamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
 
-   // Decoded once and reused by both the legacy scale below and, when a family is enabled, the NATIVE
-   // composition. fxc already shared this value; the local only stops the source from saying it twice.
+   // Decoded once and used twice: it is both this permutation's SDR output and, in HDR, the hue reference
+   // below. fxc already shared this value; the local only stops the source from saying it twice.
    const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
 
-   // Undo compression only where scale < 1, preserving native diffuse/shadow grading and restoring HDR
-   // highlights. SDR leaves mele_scale at 1.
-   float3 graded_hdr = sdr_linear / min(1.0, mele_scale);
-#if MELE_HDR_ME3_HARDCLIP
+   // The exact native SDR result is the starting value and the only fallback. A declined reconstruction
+   // keeps it for the whole triple rather than reaching for a different HDR model; there is none.
+   float3 graded_hdr = sdr_linear;
    if (LumaSettings.DisplayMode == 1 && mele_hardclip_valid)
    {
       // Validity was decided before the grade, not read off the finiteness of its output.
@@ -162,9 +155,11 @@ void main(
       // hard-clipped SDR result, already computed above - is used ONLY as a hue reference, following
       // RenoDX hard-clip hue-emulation practice. The HDR target keeps its own perceptual lightness and
       // chroma magnitude. DICE remains the final display mapper.
+      //
+      // A broken hue transfer does not discard the reconstruction: MELE_HueReferenceOKLab returns its
+      // target untouched, so the working HDR value survives an optional correction failing.
       graded_hdr = MELE_HueReferenceOKLab(mele_hardclip_hdr, sdr_linear, MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH);
    }
-#endif
 
    // ME3LE analytic tail: no vignette or grain; preserve native output luma in alpha.
 #define TM_VIGNETTE_TYPE 0

@@ -398,42 +398,6 @@ public:
       // Exposes UI Paper White without renormalizing the already combined scene/HUD buffer; type 2 would
       // double-apply the transport ratio.
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('1');
-      // Stage-1 HDR reconstruction, one checkbox per colour family in Advanced Settings so a family can be
-      // A/B-tested against the legacy path without editing a header or rebuilding. All five ship ENABLED
-      // after the 2026-09-11 in-game A/B across the three games; the checkbox now turns the legacy path
-      // back on rather than the new one. It stays locked outside DEVELOPMENT because these decide the
-      // stage-1 contract, not a user preference.
-      //
-      // The default here must track the #ifndef default in Includes/Tonemap_MELE_ExperimentConfig.hlsli.
-      // A registered define is always passed to the compiler, so a stale '0' here would silently override
-      // the header for every family the detected game registers, while the families it does not register
-      // would follow the header. That split is the failure mode this comment exists to prevent.
-      constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
-      std::vector<ShaderDefineData> experiment_shader_defines;
-      const auto add_family = [&](const char* feature, const char* tooltip)
-      { experiment_shader_defines.push_back({feature, '1', true, kExperimentLocked, tooltip, 1}); };
-      if (g_me_game == MEGame::ME1LE || g_me_game == MEGame::ME2LE)
-      {
-         add_family("MELE_HDR_EXP_LUT",
-            "Exponential curve plus colour LUT: extend the native curve past mid-gray and run the real grade through a max-channel proxy.");
-         add_family("MELE_HDR_EXP_ANALYTIC",
-            "Exponential curve plus analytic grade: same curve extension, with a cap-free copy of the analytic grade instead of a proxy.");
-      }
-      if (g_me_game == MEGame::ME2LE)
-      {
-         add_family("MELE_HDR_ME2_FILMIC",
-            "Filmic LUT path: continue the game's own 1D curve from sampled anchors, keeping scene and bloom separate.");
-      }
-      if (g_me_game == MEGame::ME3LE)
-      {
-         add_family("MELE_HDR_ME3_FILMIC",
-            "Filmic LUT path: continue the game's own 1D curve from sampled anchors on linear scene plus bloom.");
-         add_family("MELE_HDR_ME3_HARDCLIP",
-            "Analytic hard-clip permutation: prepare the grade input instead of scaling an already clipped white,\n"
-            "then take hue alone from the native hard-clipped SDR.");
-      }
-      shader_defines_data.append_range(experiment_shader_defines);
-
       use_os_reference_white_level = false; // Explicit Scene and UI Paper White controls.
 
       // Native post passes use b0-b3; inject Luma cbuffers at the high slots.

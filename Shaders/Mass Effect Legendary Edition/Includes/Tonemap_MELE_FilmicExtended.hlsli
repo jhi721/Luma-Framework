@@ -9,10 +9,6 @@
 // permutation declares smpFilmicLUT and its sampler. The includes above carry guards, so a body that
 // already pulled them in pays nothing.
 //
-// The shipped MELE_FilmicMaxChannelExpand is untouched and remains the flag-0 path: it produces one
-// max-channel scalar and leaves the native per-channel value alone. This file is the experimental
-// branch. The duplication between the two is deliberate.
-//
 // Nothing here invents a curve. Every anchor is a real read of the bound LUT, so a different shipped
 // table gives a different continuation; the constants are probe positions, not curve coefficients.
 
@@ -29,7 +25,7 @@ struct MELE_FilmicFit
    float pivot_z;     // Where the continuation starts, in the LUT's own domain.
    float pivot_value; // The last native value before it takes over.
    float slope;       // Secant across the probe window, per unit of that domain.
-   bool valid;        // False routes the caller's whole RGB triple back to its legacy value.
+   bool valid;        // False declines the reconstruction; the caller keeps the native SDR reference.
 };
 
 // The one piece of arithmetic the two families genuinely share: three reads and a secant between the

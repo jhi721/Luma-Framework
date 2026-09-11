@@ -1,44 +1,30 @@
 #ifndef LUMA_MELE_TONEMAP_EXPERIMENT_CONFIG
 #define LUMA_MELE_TONEMAP_EXPERIMENT_CONFIG
 
-// Compile-time selectors for the stage-1 HDR reconstruction, one per colour family. Every one now
-// defaults to 1: an in-game A/B across ME1LE, ME2LE and ME3LE on 2026-09-11 found the reconstruction
-// these families produce clearly better than the legacy path, with more detail retained in highlights.
-// That verdict is what promoted them; they were added at 0 and carried no evidence until then.
+// Constants of the stage-1 HDR reconstruction, one model per colour family:
 //
-// HOW THIS DIFFERS FROM THE LEGACY PATH. The legacy reconstruction lets the native per-channel value
-// reach the grade untouched and only expands the graded output by a max-channel scalar, so the grade
-// never sees anything the vanilla clip did not already flatten. A family here prepares the grade INPUT
-// instead - a compressed proxy, or a continued tone curve - and divides the scale back out afterwards.
-// That is a change of contract rather than a refactor, which is why it took runtime frames to settle.
+//   01  ME1LE/ME2LE exponential curve + colour LUT          8 permutations
+//   02  ME1LE/ME2LE exponential curve + analytic grade      2 permutations
+//   03  ME2LE pre-curve + 1D filmic LUT + colour LUT        4 permutations
+//   04  ME3LE 1D filmic LUT from linear scene+bloom + LUT   4 permutations
+//   05  ME3LE analytic hard-clip grade                      0x225A8330 only
 //
-// Setting one back to 0 restores the legacy path for its permutations exactly, and that state is still
-// gated: forcing all five to 0 must reproduce the pre-experiment capture in _tools/mele_bridge/baseline
-// byte for byte. Keep that escape hatch compiling; it is the only way to A/B this again.
+// There is no selector here and no second reconstruction to select. An in-game A/B across the three
+// games on 2026-09-11 chose these five, they shipped enabled, and the max-channel path they replaced
+// was deleted afterwards. Git history is how that path is read now.
 //
-// Enabling a family in ANOTHER game is still a separate decision with its own evidence. The prior in
+// WHAT THESE MODELS DO. They prepare the grade INPUT - a compressed proxy, or a tone curve continued
+// past mid-gray - and divide the scale back out afterwards, so the grade sees range the vanilla clip
+// had already flattened. Where a model declines, the caller keeps the exact native SDR result; it
+// never falls back to a different reconstruction, because there is no longer one to fall back to.
+//
+// Porting a model to ANOTHER game is a separate decision with its own evidence. The prior in
 // Shaders/Borderlands 2 and The Pre-Sequel/Luma_BL2TPS_Tonemap.hlsl stands: the same wrap was tried and
 // rejected there, on the same kind of asymptotic curve ME1LE and ME2LE have. MELE's frames do not
 // transfer to BL2's.
 
-#ifndef MELE_HDR_EXP_LUT
-#define MELE_HDR_EXP_LUT 1 // ME1LE/ME2LE exponential curve + colour LUT, 8 permutations.
-#endif
-#ifndef MELE_HDR_EXP_ANALYTIC
-#define MELE_HDR_EXP_ANALYTIC 1 // ME1LE/ME2LE exponential curve + analytic grade, 2 permutations.
-#endif
-#ifndef MELE_HDR_ME2_FILMIC
-#define MELE_HDR_ME2_FILMIC 1 // ME2LE pre-curve + 1D filmic LUT + colour LUT, 4 permutations.
-#endif
-#ifndef MELE_HDR_ME3_FILMIC
-#define MELE_HDR_ME3_FILMIC 1 // ME3LE 1D filmic LUT from linear scene+bloom + colour LUT, 4 permutations.
-#endif
-#ifndef MELE_HDR_ME3_HARDCLIP
-#define MELE_HDR_ME3_HARDCLIP 1 // ME3LE analytic hard-clip grade, 0x225A8330 only.
-#endif
-
 // Bench values: exercised against the captured LUTs and cbuffers, and carried unchanged through the
-// 2026-09-11 A/B that promoted these families. That A/B judged the families as a whole, so it validates
+// 2026-09-11 A/B that chose these families. That A/B judged the families as a whole, so it validates
 // this set as a working combination and not any one number individually - none of them may be presented
 // as individually tuned, and changing one still needs its own frames.
 #define MELE_HDR_BRIDGE_SHOULDER 0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
