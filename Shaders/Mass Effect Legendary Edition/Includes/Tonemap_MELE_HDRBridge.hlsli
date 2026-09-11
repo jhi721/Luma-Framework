@@ -11,7 +11,7 @@
 // would be a duplicate-namespace error in the bodies that already include it. Include it in the body,
 // before this file.
 
-// Two predicates, not one. Every value this experiment guards is either a light quantity that has no
+// Two predicates, not one. Every value this reconstruction guards is either a light quantity that has no
 // meaning below zero, or an artist dial whose sign is free - a shadow lift, a luminance weight, an
 // overlay offset, and the signed differences those produce. Applying the non-negative form to one of
 // those would reject valid game data as corrupt, so the choice is made per value.
@@ -158,23 +158,23 @@ bool MELE_TryRestoreGradeRange(float3 graded_linear, float q, out float3 work_hd
 //   near-black but positive reference -> divided normally. The LUT permutations carry clampFloor, so
 //     a vanilla black arrives here at 1e-4 in luminance, two decades above the guard. Collapsing that
 //     to black would erase a real part of the native output; count the guard's trips, do not widen it.
-//   a non-finite gain or product -> the caller's decline value for the WHOLE triple. Switching
-//     channels independently would change hue, which is the failure being avoided.
+//   a non-finite gain or product -> the reference itself for the WHOLE triple. Switching channels
+//     independently would change hue, which is the failure being avoided.
 // A positive target luminance is never clamped to 1, and no path takes colour from the raw scene.
 //
-// decline_value is what the caller wants when the projection cannot be made, and every caller passes
-// its own sdr_linear. A bool + out-parameter form would put that policy where it belongs, at the call
-// site, and it was written and measured: fxc costs 3 to 4 extra instructions per permutation for it,
-// on all nineteen, because it stops folding the fallback into the select it already emits. Measured,
-// not assumed - see the same trade in MELE_IsFiniteNonNegative above. Do not re-attempt it without
-// re-measuring.
+// Declining returns the reference unscaled, which is the exact native SDR result the caller already
+// holds - there is no second HDR model to fall back to and no fallback for a caller to choose. A
+// bool + out-parameter form would move that decision to the call site, and it was written and
+// measured: fxc costs 3 to 4 extra instructions per permutation for it, on all nineteen, because it
+// stops folding the fallback into the select it already emits. Measured, not assumed - see the same
+// trade in MELE_IsFiniteNonNegative above. Do not re-attempt it without re-measuring.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
-float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance, float3 decline_value)
+float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance)
 {
    if (!MELE_IsFiniteNonNegative(native_reference_linear) || !MELE_IsFiniteNonNegative(target_luminance))
    {
-      return decline_value;
+      return native_reference_linear;
    }
    if (target_luminance == 0.0 || all(native_reference_linear == 0.0))
    {
@@ -183,13 +183,13 @@ float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_
    const float reference_luminance = GetLuminance(native_reference_linear, CS_BT709);
    if (!MELE_IsFiniteNonNegative(reference_luminance) || reference_luminance < MELE_NATIVE_COLOR_MIN_LUMINANCE)
    {
-      return decline_value;
+      return native_reference_linear;
    }
    const float gain = target_luminance / reference_luminance;
    const float3 result = native_reference_linear * gain;
    if (!MELE_IsFiniteNonNegative(gain) || !MELE_IsFiniteNonNegative(result))
    {
-      return decline_value;
+      return native_reference_linear;
    }
    return result;
 }

@@ -16,8 +16,8 @@
 #include "../Includes/Color.hlsl"    // Transfer and color helpers.
 #include "../Includes/DICE.hlsl"     // Display-peak tonemap.
 #include "../Includes/Reinhard.hlsl" // Reversible compression, used by the grade proxy.
-#include "Includes/Tonemap_MELE_HDRConfig.hlsli"     // HDR reconstruction constants.
-#include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
+#include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
+#include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
 #ifndef TM_HAS_MOTIONBLUR
@@ -143,8 +143,8 @@ SamplerState NoiseTextureSampler_s : register(S_NOISE);
 SamplerState smpFilmicLUTSampler_s : register(S_FILMIC);
 
 // Native ME3LE SDR grade transcribed from the live CSO, evaluated exactly once on the untouched per-channel value
-// in every Display Mode: SDR is its output and nothing else, HDR only scales it. Preserve register-level
-// operations; the filmic 1D LUT stays inline in main().
+// in every Display Mode. SDR uses this result directly. HDR keeps its RGB ratios and replaces only its
+// luminance with the reconstruction's. Preserve register-level operations; the filmic 1D LUT stays inline in main().
 float3 MELE_ME3LE_GradeChain(float3 c)
 {
    float4 r0, r1;
@@ -307,9 +307,9 @@ void main(
    // Use one native grade function for both the working value and SDR reference.
    float3 sdr_gamma = MELE_ME3LE_GradeChain(r0.xyz);
 
-   // Decoded once and used twice: it is this body's SDR output and, in HDR, the colour reference the
-   // reconstruction is projected onto. fxc already shared this value; the local only stops the source from
-   // saying it twice.
+   // Decoded once and used twice here: it is this body's SDR output and, in HDR, the colour reference
+   // the reconstruction is projected onto. The shared output tail decodes sdr_gamma a third time on
+   // purpose - see the note at the top of Tonemap_MELE_Output.hlsli.
    const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
@@ -319,7 +319,7 @@ void main(
    {
       // RGB ratios of the real tone LUT plus colour LUT plus native tail, at the working luminance. The white
       // blowout that reference already contains is kept as it is; it is not given back its lost saturation.
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709), sdr_linear);
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709));
    }
 
    // ME3LE tail: smoothstep vignette, optional grain, and native output luma in alpha.

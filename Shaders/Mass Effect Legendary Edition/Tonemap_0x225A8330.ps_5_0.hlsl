@@ -11,8 +11,8 @@
 #include "../Includes/Color.hlsl"
 #include "../Includes/DICE.hlsl"
 #include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
-#include "Includes/Tonemap_MELE_HDRConfig.hlsli"     // HDR reconstruction constants.
-#include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
+#include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
+#include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
 #define cmp -
@@ -55,8 +55,9 @@ Texture2D<float4> DOFBlurredFar : register(t3);
 Texture2D<float4> BlurredImageSeperateBloom : register(t4);
 
 // Native analytic SDR grade transcribed from the live CSO, evaluated exactly once on the untouched per-channel
-// value in every Display Mode: SDR is its output and nothing else, HDR only scales it. Preserve its
-// register-level operations.
+// value in every Display Mode. SDR uses this result directly. HDR decodes the same exact hard-clipped result
+// and uses it only as the hue reference; its range comes from the working grade-bridge path instead. Preserve
+// its register-level operations.
 float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 {
    float4 r0;
@@ -139,8 +140,9 @@ void main(
 
    float3 sdr_gamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
 
-   // Decoded once and used twice: it is both this permutation's SDR output and, in HDR, the hue reference
-   // below. fxc already shared this value; the local only stops the source from saying it twice.
+   // Decoded once and used twice here: it is both this permutation's SDR output and, in HDR, the hue
+   // reference below. The shared output tail decodes sdr_gamma a third time on purpose - see the note
+   // at the top of Tonemap_MELE_Output.hlsli.
    const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction

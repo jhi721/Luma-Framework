@@ -1,4 +1,8 @@
 // Shared stage-1 output tail, included inside each main() after it defines graded_hdr, sdr_gamma, v0, v1, o0, o1.
+// The bodies also hold the decoded sdr_linear, but this tail decodes sdr_gamma again on purpose: consuming their
+// local instead reschedules the vanilla curve on 0x2754F750 and 0x69F03340 in Publishing, turning r0*w + (1 - e)
+// into (r0*w - e) + 1 at the same instruction count. Float32 addition is not associative and that line is native
+// transcription, so the duplicate decode stays. Measured, not assumed.
 // Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (none / radial-power / ME3LE smoothstep), TM_HAS_GRAIN,
 // TM_ALPHA_LUMA (native ME3LE output luma to alpha).
 #ifndef TM_VIGNETTE_TYPE
@@ -11,7 +15,10 @@
 #define TM_ALPHA_LUMA 0
 #endif
 
-const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
+// A unit conversion, not an application of Game Paper White: the HDR branch below multiplies into
+// absolute-nit ratios for DICE and divides straight back out. The two passes that actually apply this
+// scale to an outgoing frame are Output_0x0765601C and Video_0x7B5C59DF, and this is not a third.
+const float paperWhite = MELE_GetGamePaperWhiteScale();
 const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
 
 float3 sdr_lin = gamma_to_linear(sdr_gamma, GCT_MIRROR);

@@ -17,10 +17,10 @@
 #include "Includes/Common.hlsl"      // Defines game settings; keep first.
 #include "../Includes/Color.hlsl"    // Transfer and color helpers.
 #include "../Includes/DICE.hlsl"     // Display-peak tonemap.
-#include "../Includes/Reinhard.hlsl" // ReinhardPiecewise, used by the filmic expand.
-#include "Includes/Tonemap_MELE_HDRConfig.hlsli"     // HDR reconstruction constants.
-#include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
-#include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
+#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
+#include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
+#include "Includes/Tonemap_MELE_ExpExtended.hlsli" // Tangent continuation of the native curve.
+#include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
 #ifndef TM_HAS_MOTIONBLUR
@@ -161,8 +161,8 @@ SamplerState smpFilmicLUTSampler_s : register(S_FILMIC);
 #endif
 
 // Native ME1LE/ME2LE SDR grade transcribed from live CSOs, evaluated exactly once on the untouched per-channel value
-// in every Display Mode: SDR is its output and nothing else, HDR only scales it. Preserve register-level
-// swizzles; the filmic 1D LUT stays inline in main().
+// in every Display Mode. SDR uses this result directly. HDR keeps its RGB ratios and replaces only its
+// luminance with the reconstruction's. Preserve register-level swizzles; the filmic 1D LUT stays inline in main().
 float3 MELE_ME12LE_GradeChain(float3 c)
 {
    float4 r0, r1, r2;
@@ -321,14 +321,11 @@ void main(
 
    // Scene-referred exposure before SDR and HDR tonemapping.
    r1.xyz = r1.xyz * LumaSettings.GameSettings.Exposure;
-   float3 untonemapped;
 
 #if TM_HAS_FILMIC
    // Filmic path from 0x222186F8: bloom, exponential curve, then per-channel 4096x1 LUT.
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
-   // Linear HDR scene plus bloom in RGB orientation.
-   untonemapped = r0.xyz * r0.www + r1.xyz;
    // Kept separate on purpose: the game evaluates L(F(C) + B), so C and B must not be summed before the
    // pre-curve.
    const float3 mele_scene_linear = r1.xyz;
@@ -371,8 +368,6 @@ void main(
    r0.w = exp2(r0.w);
    r0.w = saturate(BloomTintAndScreenBlendThreshold.w * r0.w);
 
-   // Linear HDR scene plus bloom in RGB orientation.
-   untonemapped = r0.yzx * r0.www + r1.xyz;
    // Captured before the curve below rewrites r1. Both are RGB here: the blend above built the bloom in BRG and
    // the .yzx on the line above rotates it back, while r1 still holds the post-exposure scene in RGB.
    const float3 mele_scene_linear = r1.xyz;
@@ -413,9 +408,9 @@ void main(
    float3 sdr_gamma = MELE_ME12LE_GradeChain(r0.xyz);
 #endif
 
-   // Decoded once and used twice: it is this body's SDR output and, in HDR, the colour reference the
-   // reconstruction is projected onto. fxc already shared this value; the local only stops the source from
-   // saying it twice.
+   // Decoded once and used twice here: it is this body's SDR output and, in HDR, the colour reference
+   // the reconstruction is projected onto. The shared output tail decodes sdr_gamma a third time on
+   // purpose - see the note at the top of Tonemap_MELE_Output.hlsli.
    const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
@@ -425,14 +420,14 @@ void main(
 #if TM_HAS_FILMIC
    if (LumaSettings.DisplayMode == 1 && mele_filmic_valid)
    {
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709), sdr_linear);
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709));
    }
 #else
    if (LumaSettings.DisplayMode == 1 && mele_exp_valid)
    {
       // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
       // Whatever hue the LUT gave the q-proxy belongs to mele_exp_hdr and is deliberately dropped here.
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_exp_hdr, CS_BT709), sdr_linear);
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_exp_hdr, CS_BT709));
    }
 #endif
 

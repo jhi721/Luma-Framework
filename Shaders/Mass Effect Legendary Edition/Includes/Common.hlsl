@@ -39,7 +39,8 @@ float3 MELE_NativeGammaCurve(float3 c, float3 scale, float invGamma, bool clampF
    return exp2(c);
 }
 
-// Native per-channel tone curve from the stage-1 decompiles, asymptotic to 1; the non-filmic and analytic HDR wraps invert it exactly to measure the max-channel compression.
+// Native per-channel tone curve from the stage-1 decompiles, asymptotic to 1. It stays the exact native branch
+// below the HDR continuation pivot, and it also supplies the domain the ME2 staged filmic fit probes in.
 float MELE_NativeToneCurve(float x)
 {
    return 1.0 - exp2(-1.70000005 * x);
