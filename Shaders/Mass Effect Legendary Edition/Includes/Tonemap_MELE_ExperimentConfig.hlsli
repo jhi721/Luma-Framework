@@ -53,8 +53,23 @@
 #define MELE_FILMIC_MIN_SLOPE_Z 0.0
 #define MELE_FILMIC_MIN_SLOPE_X 1e-5
 
+// Strength of family 05's hue-only transfer toward the native hard-clipped SDR. A calibration value, not
+// a property of the algorithm; runtime A/B decides whether it survives.
+//
+// At 1.0 the blend IS the donor's ab, so the result takes the donor's hue outright. That is the point,
+// and it has one measured consequence worth knowing before judging a frame: a hard clip drives the
+// brightest colours to white, and a white donor's OKLab ab is not zero but matrix round-off, about
+// 3.7e-8. At exactly 1.0 the renormalization scales that round-off back up to the target's full chroma,
+// so the hue of a fully blown highlight is arbitrary rather than preserved - measured at +41.3 deg to
+// +89.9 deg on one stimulus. Any value below 1 leaves the target a share of its own ab and the direction
+// survives. No donor-chroma threshold is added to paper over this: that would be a new artistic rule,
+// and the honest fix if a frame shows it is to lower this number.
+#ifndef MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH
+#define MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH 1.0
+#endif
+
 // One colour path per family, not selectable. Families 01-04 take their RGB ratios from the real graded SDR
-// and only their luminance from the new branch; family 05 hands over its working HDR as it is.
+// and only their luminance from the new branch; family 05 keeps its working HDR and moves only its hue.
 //
 // The guarantee ends at graded_hdr, before the shared output tail. The vignette, DICE, the user
 // saturation/contrast controls and the late SDR clamp all run after it and are judged separately.

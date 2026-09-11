@@ -82,6 +82,7 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
 #if MELE_HDR_ME3_HARDCLIP
+#include "Includes/Tonemap_MELE_HueReference.hlsli"
 // Experimental family 05. The grade chain is called unchanged, caps and all: this branch earns its range by
 // preparing the INPUT, not by stripping the grade. The blue white point and the black floor stay inside that
 // function and are not hoisted into the output tail.
@@ -156,7 +157,12 @@ void main(
    if (LumaSettings.DisplayMode == 1 && mele_hardclip_valid)
    {
       // Validity was decided before the grade, not read off the finiteness of its output.
-      graded_hdr = mele_hardclip_hdr;
+      //
+      // Family 05's range comes from the reversible grade bridge. sdr_linear - the exact decoded vanilla
+      // hard-clipped SDR result, already computed above - is used ONLY as a hue reference, following
+      // RenoDX hard-clip hue-emulation practice. The HDR target keeps its own perceptual lightness and
+      // chroma magnitude. DICE remains the final display mapper.
+      graded_hdr = MELE_HueReferenceOKLab(mele_hardclip_hdr, sdr_linear, MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH);
    }
 #endif
 
