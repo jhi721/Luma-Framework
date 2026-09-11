@@ -1135,6 +1135,24 @@ public:
          if (scene_srv)
             gd.srv_scene_depth = scene_srv;
 
+         // THE SOLE WRITER of the effective BloomIntensity - the UI only touches the raw slider. BOTH composites in
+         // the tonemap read this one field, so it has to be written on every tonemap draw and not only while the
+         // pyramid is running: gated on g_luma_bloom_enable it froze at the pyramid's pre-scaled value the moment the
+         // toggle went off, which left the game's own bloom running at kBloomPyramidToNativeEnergy strength and made
+         // it look like the bloom had vanished.
+         //
+         // The slider scales the Luma pyramid only, and is disabled in the UI while that is off. With it off the
+         // vanilla composite therefore gets a flat 1, the strength the game's artists authored.
+         {
+            auto& gs = cb_luma_global_settings.GameSettings;
+            const float effective_intensity = g_luma_bloom_enable ? (g_bloom_intensity * kBloomPyramidToNativeEnergy) : 1.f;
+            if (fabsf(gs.BloomIntensity - effective_intensity) > 1e-6f)
+            {
+               gs.BloomIntensity = effective_intensity;
+               device_data.cb_luma_global_settings_dirty = true;
+            }
+         }
+
 #if ENABLE_BLOOM
          // Pyramidal bloom from the fp16 scene (tonemap t0), bound at PS t5 (BL2) / t8 (TPS); it ignores native bloom
          // t1, so no doubling. The graphics state stack restores the tonemap's RT/PS/SRVs afterwards.
@@ -1145,14 +1163,6 @@ public:
             {
                auto& gs = cb_luma_global_settings.GameSettings;
 
-               // THE SOLE WRITER of the effective BloomIntensity - the UI only touches the raw slider. The gain
-               // applies only while the pyramid is the active bloom; the vanilla branch shares this field.
-               const float effective_intensity = g_luma_bloom_enable ? (g_bloom_intensity * kBloomPyramidToNativeEnergy) : g_bloom_intensity;
-               if (fabsf(gs.BloomIntensity - effective_intensity) > 1e-6f)
-               {
-                  gs.BloomIntensity = effective_intensity;
-                  device_data.cb_luma_global_settings_dirty = true;
-               }
                // Never-captured means the bright-pass hash did not match (new dgVoodoo build, or the pass is not
                // byte-shared after all). The fallback looks plausible, so say it once.
                if (gd.bloom_threshold_live < 0.f && !gd.bloom_threshold_warned && gd.frame_counter > 600)
@@ -1373,18 +1383,21 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
 
-      // Scales whichever bloom is active: the injected Luma one when enabled, the game's own otherwise.
+      // Scales the injected Luma bloom only. With the pyramid off the game's own bloom runs at the strength its
+      // artists authored, so there is nothing here to turn - hence disabled rather than silently inert.
+      ImGui::BeginDisabled(!g_luma_bloom_enable);
       if (ImGui::SliderFloat("Bloom Intensity", &g_bloom_intensity, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", g_bloom_intensity);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Luma bloom strength (1 = vanilla strength, 0 = none). Needs Luma Bloom Enable.");
       if (DrawResetButton<float, false>(g_bloom_intensity, 1.f, "BloomIntensity"))
       {
          device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", g_bloom_intensity);
       }
+      ImGui::EndDisabled();
 
       ImGui::SeparatorText("Effects");
       if (ImGui::SliderFloat("Vignette Intensity", &gs.VignetteIntensity, 0.f, 1.f))

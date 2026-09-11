@@ -351,7 +351,8 @@ float4 RunTonemap(float4 v5, float4 v6)
    }
    else
    {
-      // Vanilla bloom (screen-blend gated by luminance, t1). BloomIntensity scales it (1 = vanilla).
+      // Vanilla bloom (screen-blend gated by luminance, t1). BloomIntensity is pinned to 1 on this branch - the
+      // slider scales the Luma pyramid only, and main.cpp disables it while that is off - so this is vanilla.
       r0.w = dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999));
       r0.w = r0.w * -3;
       r0.w = exp2(r0.w);
