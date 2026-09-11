@@ -8,7 +8,7 @@
 // exponential families. Below the pivot this IS MELE_NativeToneCurve, bit for bit; above it the
 // curve is replaced by its own tangent so the working value keeps rising instead of saturating.
 //
-//   F(x)  = 1 - exp2(-a*x),  a = 1.70000005          (Includes/Common.hlsl:44, unchanged)
+//   F(x)  = 1 - exp2(-a*x),  a = 1.70000005          (MELE_NativeToneCurve, unchanged)
 //   F'(p) = a * ln2 * exp2(-a*p)
 //   E(x)  = F(x)                     for x <= p
 //         = F(p) + F'(p) * (x - p)   for x >  p

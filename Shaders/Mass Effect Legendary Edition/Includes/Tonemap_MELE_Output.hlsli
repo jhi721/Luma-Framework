@@ -61,28 +61,28 @@ float3 postProcessedColor;
 if (LumaSettings.DisplayMode == 1) // HDR
 {
    // graded_hdr arrives as paper-white-relative linear HDR; DICE owns peak rolloff and gamut from here.
-   float3 recovered = graded_hdr * vigLinear;
+   float3 vignetted_hdr = graded_hdr * vigLinear;
 
    // DICE works in absolute-nit ratios, so its cap lands at the display peak. Type 2 also runs
    // CorrectOutOfRangeColor. Grain, dither, and RCAS can still push the result ~2% past Scene Peak; accepted.
    DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
+   float3 display_mapped = DICETonemap(vignetted_hdr * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
 
    // User HDR grade in Game-Paper-White-relative linear RGB; defaults are no-ops.
    const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
    if (highlightDechroma > 0.0)
    {
       float dcExp = lerp(1.0, 0.05, highlightDechroma);
-      // hdr is Game-Paper-White-relative while peakWhite is 80-nit-relative, so convert the peak before dividing.
+      // peakWhite is 80-nit-relative, so convert it before dividing a Game-Paper-White-relative value by it.
       const float relativePeak = peakWhite / max(paperWhite, 1e-6);
-      float dcWeight = saturate(pow(saturate(GetLuminance(hdr) / relativePeak), dcExp));
-      hdr = Saturation(hdr, 1.0 - dcWeight);
+      float dcWeight = saturate(pow(saturate(GetLuminance(display_mapped) / relativePeak), dcExp));
+      display_mapped = Saturation(display_mapped, 1.0 - dcWeight);
    }
-   hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
+   display_mapped = Saturation(display_mapped, LumaSettings.GameSettings.Saturation);
    const float midGray = 0.18; // Game-Paper-White-relative mid-gray.
-   hdr = (hdr - midGray) * LumaSettings.GameSettings.Contrast + midGray;
+   display_mapped = (display_mapped - midGray) * LumaSettings.GameSettings.Contrast + midGray;
 
-   postProcessedColor = hdr;
+   postProcessedColor = display_mapped;
 }
 else // SDR still uses the scRGB swapchain; sdr_lin is the exact native grade.
 {
@@ -112,12 +112,12 @@ o0.xyz = max(0.0, o0.xyz); // Grain may make shadows negative; retain HDR headro
 
 // linear_to_gamma is a pure pow, so dividing by R in linear equals dividing by gamma(R) in the encoded domain.
 // Used by the metering below and by the native SDR clamp at the end of this tail.
-const float pw_norm = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
+const float r_encoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
 
 // Native eye adaptation meters the final gamma scene after vignette, grain, and SDR clamp, HUD not yet present.
 // Cancelling transport with gamma(x / R) * gamma(R) = gamma(x) keeps both Paper White controls out of exposure.
 {
-   float3 metered = saturate(o0.xyz * pw_norm);
+   float3 metered = saturate(o0.xyz * r_encoded);
    float adaptLuma = dot(metered, float3(0.212670997, 0.715160012, 0.0721689984));
    o1 = 0.25 * log2(adaptLuma * 15 + 1);
 }
@@ -138,5 +138,5 @@ o0.w = 0;
 // White control moves it. HDR keeps its headroom.
 if (LumaSettings.DisplayMode != 1)
 {
-   o0.xyz = min(o0.xyz, 1.0 / max(pw_norm, 1e-4));
+   o0.xyz = min(o0.xyz, 1.0 / max(r_encoded, 1e-4));
 }

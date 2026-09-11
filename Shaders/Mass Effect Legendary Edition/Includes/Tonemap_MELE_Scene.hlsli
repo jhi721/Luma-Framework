@@ -69,9 +69,10 @@ float3 MELE_CompositeDOF(float2 uv, float2 blurEnable, float3 scene)
 }
 
 // Native bloom screen blend, straight-RGB form used by the ME2LE filmic, ME3LE, and analytic permutations. Tinted
-// bloom and screen-blend weight come out separately because the filmic path composites twice: into the linear
-// scene and into the native per-channel curve. The ME1LE/ME2LE non-filmic path carries an internal BRG rotation on
-// these same operations and is deliberately not routed through here.
+// bloom and screen-blend weight come out separately because their product is needed as a value of its own, not
+// only folded into the native per-channel curve: families 02 and 03 must keep the scene and the bloom apart,
+// because the game adds the bloom between two tone stages. The ME1LE/ME2LE non-filmic path carries an internal
+// BRG rotation on these same operations and is deliberately not routed through here.
 float3 MELE_BloomScreenBlend(float2 uv, float3 scene, out float weight)
 {
    float4 r0;

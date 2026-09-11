@@ -13,7 +13,8 @@ float MELE_GetUIPaperWhiteRelativeToGame()
 
 // Absolute scRGB scale G = Game Paper White / 80. Under EARLY_DISPLAY_ENCODING 1 the game owns it, so exactly two
 // passes apply it: stage 2 and direct-to-swapchain Bink. Core's Display Composition divides it back out under the
-// same define, so the two agree whether or not that pass runs.
+// same define, so the two agree whether or not that pass runs. The stage-1 output tail calls this too, but only
+// to convert into the absolute-nit domain DICE works in and straight back out; it applies nothing.
 float MELE_GetGamePaperWhiteScale()
 {
    return LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;

@@ -234,7 +234,7 @@ float3 MELE_ME12LE_GradeChain(float3 c)
 // False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the whole
 // triple and work_hdr must not be read then. The bridge validates work_rgb before any pow, division or LUT
 // read, so a bad working value is rejected rather than laundered by the saturate the grade chain opens with.
-bool MELE_ME12LE_GradeHDR(float3 work_rgb, out float3 work_hdr)
+bool MELE_TryME12LE_GradeHDR(float3 work_rgb, out float3 work_hdr)
 {
    work_hdr = float3(0.0, 0.0, 0.0);
    float q;
@@ -328,8 +328,8 @@ void main(
 
    // Kept separate on purpose: the game evaluates L(F(C) + B), so C and B must not be summed before the
    // pre-curve.
-   const float3 mele_scene_linear = r1.xyz;
-   const float3 mele_bloom_linear = r0.xyz * r0.www;
+   const float3 scene_linear = r1.xyz;
+   const float3 bloom_linear = r0.xyz * r0.www;
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.xyz;
@@ -345,17 +345,17 @@ void main(
    r1.xyz = saturate(r1.xyz);
    // The native per-channel filmic value reaches the 16-slice LUT untouched - that is this branch's SDR output.
    // Family 03 does not touch it; it continues both tone stages and grades that second value.
-   float3 mele_filmic_hdr = 0.0;
-   bool mele_filmic_valid = false;
+   float3 work_hdr = 0.0;
+   bool work_valid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // The native filmic samples were written BRG by the three assignments above, so rotate once to RGB
       // before the shared helper sees them, and let the wrapper rotate back for the grade.
-      float3 mele_extended_filmic;
-      mele_filmic_valid = MELE_EvaluateME2FilmicExtended(mele_scene_linear, mele_bloom_linear, MELE_BRG_TO_RGB(r1.xyz), mele_extended_filmic);
-      if (mele_filmic_valid)
+      float3 extended_filmic;
+      work_valid = MELE_TryEvaluateME2FilmicExtended(scene_linear, bloom_linear, MELE_BRG_TO_RGB(r1.xyz), extended_filmic);
+      if (work_valid)
       {
-         mele_filmic_valid = MELE_ME12LE_GradeHDR(mele_extended_filmic, mele_filmic_hdr);
+         work_valid = MELE_TryME12LE_GradeHDR(extended_filmic, work_hdr);
       }
    }
    // r1.xyz stays the native post-filmic value.
@@ -370,8 +370,8 @@ void main(
 
    // Captured before the curve below rewrites r1. Both are RGB here: the blend above built the bloom in BRG and
    // the .yzx on the line above rotates it back, while r1 still holds the post-exposure scene in RGB.
-   const float3 mele_scene_linear = r1.xyz;
-   const float3 mele_bloom_linear = r0.yzx * r0.www;
+   const float3 scene_linear = r1.xyz;
+   const float3 bloom_linear = r0.yzx * r0.www;
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.zxy;
@@ -381,8 +381,8 @@ void main(
 
    // The native per-channel value still reaches the grade untouched - that is this branch's SDR output.
    // Family 01 does not touch it; it continues the curve on the scene and grades that second value.
-   float3 mele_exp_hdr = 0.0;
-   bool mele_exp_valid = false;
+   float3 work_hdr = 0.0;
+   bool work_valid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // The scene and the bloom are validated HERE, separately, before the exponential runs on either.
@@ -393,9 +393,9 @@ void main(
       //
       // The extension applies to the scene BEFORE its curve; the bloom is added where vanilla adds it, so this
       // reduces to the native grade input exactly wherever the scene sits at or below the pivot.
-      if (MELE_IsFiniteNonNegative(mele_scene_linear) && MELE_IsFiniteNonNegative(mele_bloom_linear))
+      if (MELE_IsFiniteNonNegative(scene_linear) && MELE_IsFiniteNonNegative(bloom_linear))
       {
-         mele_exp_valid = MELE_ME12LE_GradeHDR(MELE_ExpExtended(mele_scene_linear, MELE_HDR_PIVOT) + mele_bloom_linear, mele_exp_hdr);
+         work_valid = MELE_TryME12LE_GradeHDR(MELE_ExpExtended(scene_linear, MELE_HDR_PIVOT) + bloom_linear, work_hdr);
       }
    }
    // r0.xyz stays the native per-channel value.
@@ -408,28 +408,22 @@ void main(
    float3 sdr_gamma = MELE_ME12LE_GradeChain(r0.xyz);
 #endif
 
-   // Decoded once and used twice here: it is this body's SDR output and, in HDR, the colour reference
-   // the reconstruction is projected onto. The shared output tail decodes sdr_gamma a third time on
-   // purpose - see the note at the top of Tonemap_MELE_Output.hlsli.
+   // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
+   // sdr_gamma again for the native SDR path; reusing this local changes fxc scheduling in two
+   // Publishing permutations. See Tonemap_MELE_Output.hlsli.
    const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
    // it for the whole triple rather than reaching for a different HDR model; there is none. Both branches
    // reduce to it in SDR, where neither runs.
    float3 graded_hdr = sdr_linear;
-#if TM_HAS_FILMIC
-   if (LumaSettings.DisplayMode == 1 && mele_filmic_valid)
+   // One projection for both branches: they differ in what fills work_hdr, never in what is done with it.
+   // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
+   // Whatever hue the LUT gave the q-proxy belongs to work_hdr and is deliberately dropped here.
+   if (LumaSettings.DisplayMode == 1 && work_valid)
    {
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709));
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(work_hdr, CS_BT709));
    }
-#else
-   if (LumaSettings.DisplayMode == 1 && mele_exp_valid)
-   {
-      // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
-      // Whatever hue the LUT gave the q-proxy belongs to mele_exp_hdr and is deliberately dropped here.
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_exp_hdr, CS_BT709));
-   }
-#endif
 
    // Shared tail: radial vignette, optional grain, and zero alpha. Defaults are ME2LE's power-200 curve and blue
    // white point; ME1LE entry points override both.

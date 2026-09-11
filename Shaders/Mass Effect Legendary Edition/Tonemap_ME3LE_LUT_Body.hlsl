@@ -175,7 +175,7 @@ float3 MELE_ME3LE_GradeChain(float3 c)
 // adapter is applied here; the ME1LE/ME2LE BRG rotation belongs to the other body and must not be copied over.
 // False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the whole
 // triple and work_hdr must not be read then.
-bool MELE_ME3LE_FilmicGradeHDR(float3 work_rgb, out float3 work_hdr)
+bool MELE_TryME3LE_FilmicGradeHDR(float3 work_rgb, out float3 work_hdr)
 {
    work_hdr = float3(0.0, 0.0, 0.0);
    float q;
@@ -290,36 +290,36 @@ void main(
    r0.z = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.zz).x;
    // The native per-channel filmic value reaches the grade untouched - that is this body's SDR output. Family
    // 04 does not touch it; it continues the tone LUT itself and grades that second value.
-   float3 mele_filmic_hdr = 0.0;
-   bool mele_filmic_valid = false;
+   float3 work_hdr = 0.0;
+   bool work_valid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // untonemapped is the combined scene+bloom, which is correct HERE: this family has no pre-curve, so the
       // LUT genuinely sees C+B. Do not carry the ME2LE L(F(C)+B) split into this body.
-      float3 mele_extended_filmic;
-      mele_filmic_valid = MELE_EvaluateME3FilmicExtended(untonemapped, r0.xyz, mele_extended_filmic);
-      if (mele_filmic_valid)
+      float3 extended_filmic;
+      work_valid = MELE_TryEvaluateME3FilmicExtended(untonemapped, r0.xyz, extended_filmic);
+      if (work_valid)
       {
-         mele_filmic_valid = MELE_ME3LE_FilmicGradeHDR(mele_extended_filmic, mele_filmic_hdr);
+         work_valid = MELE_TryME3LE_FilmicGradeHDR(extended_filmic, work_hdr);
       }
    }
 
    // Use one native grade function for both the working value and SDR reference.
    float3 sdr_gamma = MELE_ME3LE_GradeChain(r0.xyz);
 
-   // Decoded once and used twice here: it is this body's SDR output and, in HDR, the colour reference
-   // the reconstruction is projected onto. The shared output tail decodes sdr_gamma a third time on
-   // purpose - see the note at the top of Tonemap_MELE_Output.hlsli.
+   // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
+   // sdr_gamma again for the native SDR path; reusing this local changes fxc scheduling in two
+   // Publishing permutations. See Tonemap_MELE_Output.hlsli.
    const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
    // it for the whole triple rather than reaching for a different HDR model; there is none.
    float3 graded_hdr = sdr_linear;
-   if (LumaSettings.DisplayMode == 1 && mele_filmic_valid)
+   if (LumaSettings.DisplayMode == 1 && work_valid)
    {
       // RGB ratios of the real tone LUT plus colour LUT plus native tail, at the working luminance. The white
       // blowout that reference already contains is kept as it is; it is not given back its lost saturation.
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_filmic_hdr, CS_BT709));
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(work_hdr, CS_BT709));
    }
 
    // ME3LE tail: smoothstep vignette, optional grain, and native output luma in alpha.

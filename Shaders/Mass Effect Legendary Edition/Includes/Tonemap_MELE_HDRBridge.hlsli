@@ -165,9 +165,11 @@ bool MELE_TryRestoreGradeRange(float3 graded_linear, float q, out float3 work_hd
 // Declining returns the reference unscaled, which is the exact native SDR result the caller already
 // holds - there is no second HDR model to fall back to and no fallback for a caller to choose. A
 // bool + out-parameter form would move that decision to the call site, and it was written and
-// measured: fxc costs 3 to 4 extra instructions per permutation for it, on all nineteen, because it
-// stops folding the fallback into the select it already emits. Measured, not assumed - see the same
-// trade in MELE_IsFiniteNonNegative above. Do not re-attempt it without re-measuring.
+// measured: fxc costs 3 to 4 extra instructions on every permutation that uses this helper, because
+// it stops folding the fallback into the select it already emits. That is the eighteen of families
+// 01-04, +4 on sixteen of them and +3 on the two analytic ones; 0x225A8330 takes its colour from the
+// hue donor instead, never calls this, and did not move. Measured, not assumed - see the same trade
+// in MELE_IsFiniteNonNegative above. Do not re-attempt it without re-measuring.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
 float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance)

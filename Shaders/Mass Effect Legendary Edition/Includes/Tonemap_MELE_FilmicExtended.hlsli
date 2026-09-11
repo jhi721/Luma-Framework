@@ -59,12 +59,12 @@ MELE_FilmicFit MELE_BuildFilmicFitZ(float z_lo, float pivot_z, float z_hi, float
 
 // ME3LE, family 04. This LUT is addressed with scene-linear scene+bloom directly - the domain z IS
 // scene-x here - so the probe positions go in unchanged and one scalar fit serves all three channels.
-// Reading through MELE_FilmicLookupZ rather than the shipped precurve macro also keeps this evaluator
+// Reading the table through MELE_FilmicLookupZ, in its own input domain, also keeps this evaluator
 // correct no matter which body includes it.
 //
 // Below the pivot the caller's already-sampled native value is reused rather than re-probed, so that
 // region is the native result and not an approximation of it.
-bool MELE_EvaluateME3FilmicExtended(float3 scene_with_bloom, float3 native_filmic_rgb, out float3 extended_filmic_rgb)
+bool MELE_TryEvaluateME3FilmicExtended(float3 scene_with_bloom, float3 native_filmic_rgb, out float3 extended_filmic_rgb)
 {
    extended_filmic_rgb = native_filmic_rgb;
    if (!MELE_IsFiniteNonNegative(scene_with_bloom) || !MELE_IsFiniteNonNegative(native_filmic_rgb))
@@ -119,7 +119,7 @@ MELE_FilmicFit MELE_BuildME2StagedFit()
 // where float32 rounding defeats that (slope * (C - p) underflowing to zero within about a thousand
 // ULP of the pivot) a fresh read at z returns exactly the native sample anyway - measured over the
 // full ULP neighbourhood and a 200k random float32 sample on the shipped table.
-bool MELE_EvaluateME2FilmicExtended(float3 scene_before_precurve, float3 native_bloom_contribution, float3 native_filmic_rgb, out float3 extended_filmic_rgb)
+bool MELE_TryEvaluateME2FilmicExtended(float3 scene_before_precurve, float3 native_bloom_contribution, float3 native_filmic_rgb, out float3 extended_filmic_rgb)
 {
    extended_filmic_rgb = native_filmic_rgb;
    if (!MELE_IsFiniteNonNegative(scene_before_precurve) || !MELE_IsFiniteNonNegative(native_bloom_contribution) || !MELE_IsFiniteNonNegative(native_filmic_rgb))

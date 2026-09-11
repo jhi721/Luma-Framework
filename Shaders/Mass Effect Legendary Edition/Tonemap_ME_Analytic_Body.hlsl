@@ -347,8 +347,8 @@ void main(
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
    // Captured before the curve below overwrites r1. Straight RGB here, unlike the ME1LE/ME2LE LUT body.
-   const float3 mele_scene_linear = r1.xyz;
-   const float3 mele_bloom_linear = r0.xyz * r0.www;
+   const float3 scene_linear = r1.xyz;
+   const float3 bloom_linear = r0.xyz * r0.www;
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.xyz;
@@ -357,21 +357,21 @@ void main(
    r0.xyz = r0.xyz * r0.www + r1.xyz;
    // The native per-channel value still reaches the analytic grade untouched - that is this body's SDR output.
    // Family 02 does not touch it; it builds a second, uncapped working value from the scene instead.
-   float3 mele_analytic_hdr = 0.0;
-   bool mele_analytic_valid = false;
+   float3 work_hdr = 0.0;
+   bool work_valid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // Extension on the scene before its curve, bloom added where vanilla adds it, then one decode of the
       // uncapped encoded grade. Below the pivot with an inert grade this reduces to the native result.
-      mele_analytic_valid = MELE_TryAnalyticGradeHDR(mele_scene_linear, mele_bloom_linear, mele_analytic_hdr);
+      work_valid = MELE_TryAnalyticGradeHDR(scene_linear, bloom_linear, work_hdr);
    }
 
    // Apply the same native grade function to the working value and, below, to the SDR reference.
    float3 sdr_gamma = MELE_Analytic_GradeChain(r0.xyz);
 
-   // Decoded once and used twice here: it is this body's SDR output and, in HDR, the colour reference
-   // the reconstruction is projected onto. The shared output tail decodes sdr_gamma a third time on
-   // purpose - see the note at the top of Tonemap_MELE_Output.hlsli.
+   // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
+   // sdr_gamma again for the native SDR path; reusing this local changes fxc scheduling in two
+   // Publishing permutations. See Tonemap_MELE_Output.hlsli.
    const float3 sdr_linear = gamma_to_linear(sdr_gamma, GCT_MIRROR);
 
    // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
@@ -379,11 +379,11 @@ void main(
    float3 graded_hdr = sdr_linear;
    // Lifting the caps lets a game exponent run away, so the whole triple is validated at once. Falling back
    // per channel would move hue, which is the failure this branch exists to avoid.
-   if (LumaSettings.DisplayMode == 1 && mele_analytic_valid)
+   if (LumaSettings.DisplayMode == 1 && work_valid)
    {
       // Hue and saturation come from the real bounded grade, never from the uncapped twin and never from the
       // scene; only the luminance is the twin's.
-      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(mele_analytic_hdr, CS_BT709));
+      graded_hdr = MELE_NativeColorAtLuminance(sdr_linear, GetLuminance(work_hdr, CS_BT709));
    }
 
    // Entry point supplies vignette macros. Analytic ME1LE/ME2LE permutations have no grain and write zero alpha.
