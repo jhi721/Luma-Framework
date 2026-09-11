@@ -7,12 +7,12 @@
 //
 // Sub-native borderless is best-effort: the game allocates desktop-sized targets but renders a top-left
 // sub-rectangle through cb2 DynamicScale, so injected in-place passes process the full allocation.
+//
+// No DLSS or DLAA: UE3 LE exposes only an 8-bit SoftEdge mask, not usable motion vectors, so the source
+// precision caps what any temporal upscaler could do here regardless of integration effort.
 
 #define DISABLE_AUTO_DEBUGGER 1 // The DEVELOPMENT attach prompt is hidden by fullscreen and blocks the loader.
 
-#define ENABLE_NGX 0 // UE3 LE exposes only an 8-bit SoftEdge mask, not usable motion vectors for DLSS/DLAA.
-#define ENABLE_FIDELITY_SK 0
-#define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1  // replaces the game's compute FXAA
 #define ENABLE_BLOOM 1 // fp16 pyramidal bloom replaces the game's clamped bloom
 // Stage-1 diagnostics dump for the experimental HDR families. Development-only: it writes raw game
@@ -391,7 +391,6 @@ public:
       auto& early_display_encoding = GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH); // Inert unless the above is 1.
       early_display_encoding.SetDefaultValue(native_hdr);
       early_display_encoding.SetValueFixed(true);
-      GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('0');
       // The stage-1/stage-2 chain already carries gamma 2.2, so 1 would apply the sRGB mismatch a second time and
       // crush shadows. On the native-SDR topology Core still corrects sRGB against 2.2 on its own, through the
       // display-mode term of its composition pass.
