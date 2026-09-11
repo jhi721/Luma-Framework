@@ -453,6 +453,23 @@ public:
       GetShaderDefineData(GAMUT_MAPPING_TYPE_HASH).SetDefaultValue('1'); // gamut-map wild colors in composition
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
+      // A/B for the stage-1 HDR reconstruction (Luma_BL2TPS_Tonemap.hlsl). Off keeps the shipping max-channel
+      // curve_scale recovery; on runs the MELE-style split instead, where the native grade keeps the whole colour
+      // and a separate continuation of the measured curve supplies only the luminance. Both read the same
+      // post-vignette scene, so flipping this compares the two methods on one frame. Fixed at '0' outside
+      // DEVELOPMENT: it changes the image rather than refactoring it, and it does not ship enabled.
+      constexpr bool kReconstructionLocked = DEVELOPMENT ? false : true;
+      std::vector<ShaderDefineData> hdr_shader_defines = {
+         {"BL2TPS_HDR_WORKING_RECONSTRUCTION", '0', true, kReconstructionLocked,
+            "HDR: MELE-style luminance reconstruction\n"
+            "Runs an unbounded continuation of the measured native curve through a reversible copy of the real\n"
+            "color grading LUT and transfers only its luminance onto the exact native graded color.\n"
+            "Off - the shipping recovery, which divides the graded color by the compression the curve applied to\n"
+            "the brightest channel.",
+            1},
+      };
+      shader_defines_data.append_range(hdr_shader_defines);
+
       // Manual Scene + UI Paper White sliders instead of the OS HDR reference level. Core gates the separate
       // "UI Paper White" slider on UI_DRAW_TYPE >= 1 && !use_os_reference_white_level. UI default 203 nits (BT.2408).
       use_os_reference_white_level = false;

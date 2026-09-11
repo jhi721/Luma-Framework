@@ -5,6 +5,7 @@
 // every LumaSettings.GameSettings.* reference fails to compile (invalid subscript).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings (grade sliders) + shared Common (Color/Math/Settings) — keep FIRST
 #include "../Includes/DICE.hlsl"
+#include "../Includes/Reinhard.hlsl" // ReinhardRange for the HDR working-branch proxy; no include guard, keep it last
 // clang-format on
 
 // Borderlands 2 + The Pre-Sequel — uber post-process / tonemap SHARED IMPLEMENTATION (UE3, via dgVoodoo D3D9->11).
@@ -91,6 +92,210 @@ float VanillaCurveLinear(float c)
    float b = (c > Z) ? t : g;
    return pow(saturate(b + K * (t - b)), 2.2);
 }
+
+// ====================== MELE-style HDR luminance reconstruction (experiment) ======================
+// A/B against the shipping curve_scale recovery further down: 0 keeps it, 1 runs this instead.
+// Registered as a DEVELOPMENT-only checkbox in main.cpp, so a shipped build always compiles the 0
+// side and nothing below reaches it.
+//
+// The contract: the exact native ImageAdjustments + LUT output stays the COMPLETE colour reference.
+// A separate unbounded continuation of the measured native response is passed through a reversible
+// bounded copy of the real LUT, and only that luminance is transferred back onto the exact native
+// graded RGB ratios before DICE. It is NOT an inverse tonemap of the SDR result, and the native
+// scene branch is never compressed - it sees the same values it sees with this off.
+#ifndef BL2TPS_HDR_WORKING_RECONSTRUCTION
+#define BL2TPS_HDR_WORKING_RECONSTRUCTION 0
+#endif
+
+#if BL2TPS_HDR_WORKING_RECONSTRUCTION
+
+#define BL2TPS_HDR_BRIDGE_SHOULDER        0.75
+#define BL2TPS_HDR_PROXY_EPS              1e-4
+#define BL2TPS_NATIVE_COLOR_MIN_LUMINANCE 1e-6
+
+// Every value this reconstruction guards is a light quantity with no meaning below zero, so one
+// predicate covers all of them, and for THAT predicate two ordered comparisons are exact:
+// !IsNaN_Strict(x) && !IsInfinite_Strict(x) && x >= 0 is the same set as 0 <= x <= FLT_MAX. NaN
+// fails both comparisons (DXBC ge/le are ordered), +INF fails the upper one, -INF and negatives fail
+// the lower one. This is not the x != x idiom Math.hlsl warns about and works around with bit tests -
+// fxc cannot fold a comparison against a constant - and it costs 2 instructions per channel where
+// IsNaN_Strict alone costs 6. Measured on 0xD00AA2A7, against 270 instructions with the feature off:
+// the bit-test form built this shader at 551, this one at 421.
+bool BL2TPS_IsFiniteNonNegative(float x)
+{
+   return x >= 0.0 && x <= FLT_MAX;
+}
+bool BL2TPS_IsFiniteNonNegative(float3 v)
+{
+   return all(v >= 0.0) && all(v <= FLT_MAX);
+}
+
+// The native 16-slice trilinear LUT read, reproduced for the working branch. NOT a generic LUT
+// sampler: it is the block in RunTonemap transcribed against its own compiled listing, and two of
+// its constants are traps.
+//
+// Routing, decoded from the ImageAdjustments output (it reaches the native block as (B, B, R, G),
+// and as (gB, gG, gR, gB) after fxc's own register allocation): the slice index comes from BLUE, the
+// within-slice U from RED, V from GREEN. The table is 256x16, so 0.05859375 = 0.9375/16,
+// 0.0625 = 1/16, 0.001953125 = 0.5/256, 0.03125 = 0.5/16, and 0.064453125 is one slice along U.
+//
+// TRAP 1: the slice index is floored from b * 14.9998999, but the lerp weight is b * 15 minus that
+//         floor. Two different constants for what reads as one scale; folding them to 15 moves the
+//         weight on every pixel.
+// TRAP 2: the weight is taken from b itself, not from the already-scaled b * 14.9998999.
+//
+// The native block is deliberately NOT routed through this helper - provenance of the verbatim
+// register transcription is worth more than removing the duplication. Equivalence is held offline
+// instead: _tools/bl2tps_bridge/lutcheck.py compares the four derived coordinates (u_lo, u_hi, v,
+// weight) of both forms on exact float32 equality over 1.14M inputs. A deterministic sampler handed
+// identical coordinates returns identical colours for ANY table, which is a stronger statement than
+// comparing sampled values from one.
+float3 BL2TPS_SampleColorGradeGamma(float3 gammaRGB)
+{
+   const float sliceScaled = gammaRGB.b * 14.9998999;
+   const float sliceLo = sliceScaled - frac(sliceScaled);
+   const float weight = gammaRGB.b * 15.0 - sliceLo;
+   const float u = sliceLo * 0.0625 + gammaRGB.r * 0.05859375;
+   const float v = gammaRGB.g * 0.9375 + 0.03125;
+   const float3 lo = t3.Sample(s3_s, float2(u + 0.001953125, v)).rgb;
+   const float3 hi = t3.Sample(s3_s, float2(u + 0.064453125, v)).rgb;
+   return weight * (hi - lo) + lo;
+}
+
+// The working value: the measured native response continued past its own shoulder, then graded.
+//
+// Below Z the native curve is (W*c)^(1/2.2) in gamma, which linearises to exactly W*c - a pure gain,
+// not an approximation of one. Continuing THAT branch over the whole positive range gives E(c) = W*c.
+// The anchor the shipping path uses sits under the join at every exposure (min(0.18, Z*0.99) is
+// 0.18 < Z while W < 1.382, and Z*0.99 < Z after), so this is the response the game itself applies
+// to everything below mid-gray, with the Reinhard shoulder and the clip at scene 14 simply absent.
+// No asymptote, no invented curve, no second tonemapper: DICE alone owns the display mapping.
+//
+// Valid only for K == 0, which is every constant set captured so far. A non-zero K mixes the toe in
+// and W*c stops being the native response, so this declines and the caller keeps the shipping
+// recovery, which handles K itself. Tested with the same ImageAdjustments3.x == 0.0 the anchor below
+// already uses - one test for one constant, rather than two thresholds that can disagree.
+//
+// On false workHDR must not be consumed.
+bool BL2TPS_TryBuildWorkingHDR(float3 curveInput, out float3 workHDR)
+{
+   workHDR = curveInput;
+
+   const float W = ImageAdjustments2.w;
+   if (!BL2TPS_IsFiniteNonNegative(curveInput) || !BL2TPS_IsFiniteNonNegative(W) || W <= 0.0 || ImageAdjustments3.x != 0.0)
+   {
+      return false;
+   }
+
+   const float3 workLinear = curveInput * W;
+   if (!BL2TPS_IsFiniteNonNegative(workLinear))
+   {
+      return false;
+   }
+
+   // Max-channel proxy: ONE scalar for all three channels, so the limiter cannot move an RGB ratio.
+   // The per-channel character stays owned by the working curve and by the native reference.
+   // ReinhardRange with In_Peak <= 0 compresses from infinity, which is the shifted rational shoulder
+   // this needs: identity at and below k, C1 across the seam, asymptotic to 1.
+   //
+   // q belongs to the LINEAR working domain and is removed in it. The gamma encode below only
+   // converts into the LUT's domain and the decode converts straight back, so the pair is an exact
+   // inverse and a plain divide undoes the compression. (MELE's bridge carries a domain adapter
+   // because it compresses in the grade-INPUT domain and divides in the linear output one, leaving a
+   // q^(r-1) residue without it. Both ends are the same domain here, so an adapter would be dead.)
+   const float k = BL2TPS_HDR_BRIDGE_SHOULDER;
+   const float m = max3(workLinear);
+   float q = 1.0;
+   if (m > k)
+   {
+      q = Reinhard::ReinhardRange(m.xxx, k).x / m;
+   }
+
+   // Every check runs BEFORE the pow, the division and the LUT read it protects. An invalid working
+   // value cannot be recognised from the output: the encode saturates and the LUT read launders a bad
+   // input into a plausible colour. A compressed value genuinely above 1 means the shoulder did not
+   // do its job, which is a failure rather than something to clamp quietly.
+   const float3 proxyLinear = workLinear * q;
+   if (!BL2TPS_IsFiniteNonNegative(q) || q <= 0.0 || q > 1.0 || !BL2TPS_IsFiniteNonNegative(proxyLinear) || max3(proxyLinear) > 1.0 + BL2TPS_HDR_PROXY_EPS)
+   {
+      return false;
+   }
+
+   // saturate() because the native block's own LUT input is saturated. The shoulder is asymptotic to
+   // 1 and leaves at most ~4.5e-5 of gamma overshoot on the max channel, but any overshoot at all
+   // walks the U coordinate into the next slice's data.
+   //
+   // Going in, proxyLinear is non-negative by the guard right above, so GCT_MIRROR's sign round trip
+   // would be dead weight - for x >= 0 it returns the same value.
+   //
+   // Coming back, the max(0) is not swallowing a fault. The lerp weight reaches 1 + (n + 1) * 6.7e-6
+   // just under slice boundary n, because the floor is taken from b * 14.9998999 while the weight is
+   // b * 15, so the trilinear read extrapolates a hair past the upper slice and a channel whose upper
+   // sample is darker can land about 1e-4 below zero. The native block does exactly the same and its
+   // own tail clamps it the same way. Without this the guard below would decline the entire
+   // reconstruction on a near-black pixel and flicker back to the shipping path. GCT_MIRROR keeps the
+   // value signed rather than raising a NaN, so the max can see it.
+   const float3 proxyGamma = saturate(linear_to_gamma(proxyLinear, GCT_NONE));
+   const float3 gradedLinear = max(0.0, gamma_to_linear(BL2TPS_SampleColorGradeGamma(proxyGamma), GCT_MIRROR));
+   if (!BL2TPS_IsFiniteNonNegative(gradedLinear))
+   {
+      return false;
+   }
+
+   // Never invert by re-reading the changed LUT output: the LUT moved the colour, so that read cannot
+   // recover the original scale.
+   const float3 restored = gradedLinear / q;
+   if (!BL2TPS_IsFiniteNonNegative(restored))
+   {
+      return false;
+   }
+   workHDR = restored;
+   return true;
+}
+
+// RGB ratios from the exact native grade result, luminance from the working value. Y is the same
+// linear BT.709 luminance on both sides, so on a finite positive reference the reference's channel
+// ratios survive exactly: the per-channel shift, the LUT tint and the whitening the native chain
+// produced are kept, not undone. A coloured reference stays coloured, equal channels stay equal, and
+// a channel the grade zeroed is not refilled. Of the working value only Y is used; its own hue and
+// chroma are deliberately discarded.
+//
+// Guard contract, deliberately not one blanket fallback:
+//   the WHOLE reference triple is validated, not only its luminance: a dot product returns a finite
+//     number from non-finite channels, and a positive one from a reference with a negative channel.
+//   exactly black reference or exactly zero target -> black. The grade produced that black.
+//   a non-finite gain or product -> the reference itself for the WHOLE triple. Switching channels
+//     independently would change hue, which is the failure being avoided.
+// A positive target luminance is never clamped to 1, and no path takes colour from the raw scene.
+//
+// Value-returning on purpose. A bool + out-parameter form was written and measured in MELE and cost
+// fxc 3 to 4 extra instructions on every permutation, because it stops folding the fallback into the
+// select it already emits. Do not re-attempt it without re-measuring.
+float3 BL2TPS_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetLuminance)
+{
+   if (!BL2TPS_IsFiniteNonNegative(nativeReferenceLinear) || !BL2TPS_IsFiniteNonNegative(targetLuminance))
+   {
+      return nativeReferenceLinear;
+   }
+   if (targetLuminance == 0.0 || all(nativeReferenceLinear == 0.0))
+   {
+      return float3(0.0, 0.0, 0.0); // The grade produced that black.
+   }
+   const float referenceLuminance = GetLuminance(nativeReferenceLinear, CS_BT709);
+   if (!BL2TPS_IsFiniteNonNegative(referenceLuminance) || referenceLuminance < BL2TPS_NATIVE_COLOR_MIN_LUMINANCE)
+   {
+      return nativeReferenceLinear;
+   }
+   const float gain = targetLuminance / referenceLuminance;
+   const float3 result = nativeReferenceLinear * gain;
+   if (!BL2TPS_IsFiniteNonNegative(gain) || !BL2TPS_IsFiniteNonNegative(result))
+   {
+      return nativeReferenceLinear;
+   }
+   return result;
+}
+
+#endif // BL2TPS_HDR_WORKING_RECONSTRUCTION
 
 // The tonemap grade. v5 = TEXCOORD0 (DOF radial/kernel coords in .zw), v6 = TEXCOORD1 (scene UV .xy, half-res DOF
 // UV .zw) — the only interpolators the body uses. Returns the final gamma-space color (o0.a is always 0).
@@ -242,6 +447,16 @@ float4 RunTonemap(float4 v5, float4 v6)
       // min(): only ever expand. Just above the branch join the game's own ~1.4% step pushes curve_scale over 1 - a
       // vanilla artefact to keep. Below the join curve_scale is exactly 1 and HDR is bit-for-bit vanilla.
       float3 recovered = sdr_lin / min(1.0, max(curve_scale, 1e-6));
+
+#if BL2TPS_HDR_WORKING_RECONSTRUCTION
+      // Same input as curve_scale above, the composited post-vignette scene, so the two methods are
+      // compared on identical data. On decline curve_scale stands, which is why it is still computed.
+      float3 workHDR;
+      if (BL2TPS_TryBuildWorkingHDR(curve_input, workHDR))
+      {
+         recovered = BL2TPS_NativeColorAtLuminance(sdr_lin, GetLuminance(workHDR, CS_BT709));
+      }
+#endif
 
       // Display rolloff to the user's peak/paper-white nits. DICE by-luminance keeps hue; the *_CORRECT_CHANNELS_BEYOND_
       // PEAK_WHITE type also gamut-maps a single channel riding past peak. Feed linear BT.709 directly: DICE converts to
