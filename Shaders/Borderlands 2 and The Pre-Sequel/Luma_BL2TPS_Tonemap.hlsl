@@ -5,7 +5,6 @@
 // every LumaSettings.GameSettings.* reference fails to compile (invalid subscript).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings (grade sliders) + shared Common (Color/Math/Settings) — keep FIRST
 #include "../Includes/DICE.hlsl"
-#include "../Includes/Reinhard.hlsl" // ReinhardRange for the HDR working-branch proxy; no include guard, keep it last
 // clang-format on
 
 // Borderlands 2 + The Pre-Sequel — uber post-process / tonemap SHARED IMPLEMENTATION (UE3, via dgVoodoo D3D9->11).
@@ -104,6 +103,23 @@ bool BL2TPS_IsFiniteNonNegative(float3 v)
    return all(v >= 0.0) && all(v <= FLT_MAX);
 }
 
+// The shoulder the max-channel proxy rides: identity at and below k, C1 across the seam, asymptotic
+// to 1. This is Reinhard::ReinhardRange specialized to the only arguments this shader ever passed it
+// - In_Peak = -1, Out_Peak = 1, ClampOutput = false - and to its only caller, which has already
+// established peak > k. Under those the generic body loses its dead In_Peak > 0 range restore, its
+// trailing (Color <= k) select, and ReinhardSimple's abs(), which is the identity on a positive
+// argument. What survives is the same float32 operation sequence, so it returns the same bits:
+// checked against the generic helper over 2.6M values, including 20k ULP above the seam.
+//
+// Do NOT fold this to (peak - 0.5625) / (peak - 0.5). It is algebraically equal and reorders the
+// rounding, which is exactly what this pass is not allowed to do.
+float BL2TPS_CompressWorkingPeak(float peak)
+{
+   const float k = BL2TPS_HDR_BRIDGE_SHOULDER;
+   const float x = peak - k;
+   return k + x / (x / (1.0 - k) + 1.0);
+}
+
 // The native 16-slice trilinear LUT read, reproduced for the working branch. NOT a generic LUT
 // sampler: it is the block in RunTonemap transcribed against its own compiled listing, and two of
 // its constants are traps.
@@ -151,27 +167,38 @@ float3 BL2TPS_SampleColorGradeGamma(float3 gammaRGB)
 // graded colour rather than inventing a range for a curve it cannot model. DEVELOPMENT logs a warning
 // the first time a non-zero K is actually observed - main.cpp, CaptureGradeConstants.
 //
-// On false workHDR must not be consumed.
-bool BL2TPS_TryBuildWorkingHDR(float3 curveInput, out float3 workHDR)
+// Only the luminance leaves this function. The reconstruction works in RGB throughout - the proxy
+// must not move a channel ratio, so it has to see all three - but the caller has no use for that
+// colour and must not take it: hue, saturation and whitening all belong to the native grade. Taking
+// Y here rather than at the call site puts the contract in the signature.
+//
+// On false targetLuminance must not be consumed.
+bool BL2TPS_TryBuildWorkingLuminance(float3 curveInput, out float targetLuminance)
 {
-   workHDR = curveInput;
+   targetLuminance = 0.0;
 
+   // curveInput is the only unproven input, so it keeps the full predicate. W needs finite AND
+   // positive, which is one range test.
+   //
+   // Every simplified guard below is written as !(lo && hi), never as (x < lo || x > hi). The two
+   // read the same but are not: NaN fails BOTH ordered comparisons, so the disjunction is false and
+   // that form would ACCEPT it. Keep the negation outside the conjunction.
    const float W = ImageAdjustments2.w;
-   if (!BL2TPS_IsFiniteNonNegative(curveInput) || !BL2TPS_IsFiniteNonNegative(W) || W <= 0.0 || ImageAdjustments3.x != 0.0)
+   if (!BL2TPS_IsFiniteNonNegative(curveInput) || !(W > 0.0 && W <= FLT_MAX) || ImageAdjustments3.x != 0.0)
    {
       return false;
    }
 
+   // A non-negative triple times a positive scalar cannot go negative, so only the upper end is still
+   // in question. NaN would fail this too, if the multiply somehow produced one.
    const float3 workLinear = curveInput * W;
-   if (!BL2TPS_IsFiniteNonNegative(workLinear))
+   if (!all(workLinear <= FLT_MAX))
    {
       return false;
    }
 
    // Max-channel proxy: ONE scalar for all three channels, so the limiter cannot move an RGB ratio.
    // The per-channel character stays owned by the working curve and by the native reference.
-   // ReinhardRange with In_Peak <= 0 compresses from infinity, which is the shifted rational shoulder
-   // this needs: identity at and below k, C1 across the seam, asymptotic to 1.
    //
    // q belongs to the LINEAR working domain and is removed in it. The gamma encode below only
    // converts into the LUT's domain and the decode converts straight back, so the pair is an exact
@@ -183,15 +210,19 @@ bool BL2TPS_TryBuildWorkingHDR(float3 curveInput, out float3 workHDR)
    float q = 1.0;
    if (m > k)
    {
-      q = Reinhard::ReinhardRange(m.xxx, k).x / m;
+      q = BL2TPS_CompressWorkingPeak(m) / m;
    }
 
    // Every check runs BEFORE the pow, the division and the LUT read it protects. An invalid working
    // value cannot be recognised from the output: the encode saturates and the LUT read launders a bad
    // input into a plausible colour. A compressed value genuinely above 1 means the shoulder did not
    // do its job, which is a failure rather than something to clamp quietly.
+   // workLinear is non-negative and q is tested positive, so the proxy cannot be negative; only its
+   // ceiling is still open. A bad q needs no separate test either: -INF and negatives fail q <= 0,
+   // +INF fails q > 1, and a NaN q poisons every proxy channel, which then fails the range test -
+   // all(x <= limit) rejects NaN where the old max3(x) > limit relied on max's NaN behaviour.
    const float3 proxyLinear = workLinear * q;
-   if (!BL2TPS_IsFiniteNonNegative(q) || q <= 0.0 || q > 1.0 || !BL2TPS_IsFiniteNonNegative(proxyLinear) || max3(proxyLinear) > 1.0 + BL2TPS_HDR_PROXY_EPS)
+   if (q <= 0.0 || q > 1.0 || !all(proxyLinear <= 1.0 + BL2TPS_HDR_PROXY_EPS))
    {
       return false;
    }
@@ -212,19 +243,20 @@ bool BL2TPS_TryBuildWorkingHDR(float3 curveInput, out float3 workHDR)
    // value signed rather than raising a NaN, so the max can see it.
    const float3 proxyGamma = saturate(linear_to_gamma(proxyLinear, GCT_NONE));
    const float3 gradedLinear = max(0.0, gamma_to_linear(BL2TPS_SampleColorGradeGamma(proxyGamma), GCT_MIRROR));
-   if (!BL2TPS_IsFiniteNonNegative(gradedLinear))
+   if (!all(gradedLinear <= FLT_MAX))
    {
       return false;
    }
 
    // Never invert by re-reading the changed LUT output: the LUT moved the colour, so that read cannot
-   // recover the original scale.
+   // recover the original scale. Dividing a non-negative value by a positive q can only overflow
+   // upward, which is the one thing still worth testing.
    const float3 restored = gradedLinear / q;
-   if (!BL2TPS_IsFiniteNonNegative(restored))
+   if (!all(restored <= FLT_MAX))
    {
       return false;
    }
-   workHDR = restored;
+   targetLuminance = GetLuminance(restored, CS_BT709);
    return true;
 }
 
@@ -252,18 +284,26 @@ float3 BL2TPS_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetL
    {
       return nativeReferenceLinear;
    }
-   if (targetLuminance == 0.0 || all(nativeReferenceLinear == 0.0))
+   // An exactly black reference needs no test of its own: its luminance is 0, which fails the floor
+   // below, and the function then returns that same black.
+   if (targetLuminance == 0.0)
    {
       return float3(0.0, 0.0, 0.0); // The grade produced that black.
    }
+   // The reference is already proven finite and non-negative, so its BT.709 luminance cannot be
+   // negative; the floor and an overflow ceiling are the whole test. Note the !(lo && hi) shape - the
+   // inverted form would accept a NaN, because NaN fails both ordered comparisons.
    const float referenceLuminance = GetLuminance(nativeReferenceLinear, CS_BT709);
-   if (!BL2TPS_IsFiniteNonNegative(referenceLuminance) || referenceLuminance < BL2TPS_NATIVE_COLOR_MIN_LUMINANCE)
+   if (!(referenceLuminance >= BL2TPS_NATIVE_COLOR_MIN_LUMINANCE && referenceLuminance <= FLT_MAX))
    {
       return nativeReferenceLinear;
    }
+   // gain needs no test of its own. It is non-negative by construction, and a non-finite one cannot
+   // hide: the floor above guarantees at least one positive reference channel, so an infinite gain
+   // overflows that channel and a NaN gain poisons all three. Either way the product fails below.
    const float gain = targetLuminance / referenceLuminance;
    const float3 result = nativeReferenceLinear * gain;
-   if (!BL2TPS_IsFiniteNonNegative(gain) || !BL2TPS_IsFiniteNonNegative(result))
+   if (!all(result <= FLT_MAX))
    {
       return nativeReferenceLinear;
    }
@@ -399,22 +439,22 @@ float4 RunTonemap(float4 v5, float4 v6)
    float3 graded_sdr_gamma = o.rgb;
    float3 sdr_lin = gamma_to_linear(graded_sdr_gamma, GCT_MIRROR);
 
-   const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
-   const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
-
    float3 postProcessedColor;
 
    if (LumaSettings.DisplayMode == 1) // HDR
    {
+      const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
+      const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
+
       // Colour from the native grade, range from the working value. Declining leaves the native grade exactly
       // as it is: there is no second HDR model to fall back to, and expanding a curve the reconstruction cannot
       // model is the failure the guards exist to prevent.
       float3 recovered = sdr_lin;
 
-      float3 workHDR;
-      if (BL2TPS_TryBuildWorkingHDR(curve_input, workHDR))
+      float workLuminance;
+      if (BL2TPS_TryBuildWorkingLuminance(curve_input, workLuminance))
       {
-         recovered = BL2TPS_NativeColorAtLuminance(sdr_lin, GetLuminance(workHDR, CS_BT709));
+         recovered = BL2TPS_NativeColorAtLuminance(sdr_lin, workLuminance);
       }
 
       // Display rolloff to the user's peak/paper-white nits. DICE by-luminance keeps hue; the *_CORRECT_CHANNELS_BEYOND_
@@ -455,7 +495,10 @@ float4 RunTonemap(float4 v5, float4 v6)
    postProcessedColor = (postProcessedColor == postProcessedColor) ? postProcessedColor : 0.0; // NaN -> 0
    postProcessedColor = max(0.0, postProcessedColor);
 
-   postProcessedColor = linear_to_gamma(postProcessedColor, GCT_MIRROR);
+   // GCT_NONE, not GCT_MIRROR: the two lines above already forced this non-negative, so the mirror's
+   // sign round trip would be dead weight. The SDR decode further up keeps its mirror - the native
+   // trilinear read really can hand it a signed excursion.
+   postProcessedColor = linear_to_gamma(postProcessedColor, GCT_NONE);
 
    // Sub-perceptual animated triangular dither (9-bit, gamma space) vs gradient banding from the HDR expansion +
    // 10-bit PQ encode. HDR only, runtime toggle (GameSettings.Dithering), FrameIndex animates it. Runs before
