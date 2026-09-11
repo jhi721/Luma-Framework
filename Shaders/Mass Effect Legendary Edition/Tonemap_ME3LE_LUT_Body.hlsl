@@ -15,9 +15,8 @@
 #include "Includes/Common.hlsl"      // Defines game settings; keep first.
 #include "../Includes/Color.hlsl"    // Transfer and color helpers.
 #include "../Includes/DICE.hlsl"     // Display-peak tonemap.
-#include "../Includes/Reinhard.hlsl" // Reversible max-channel compression.
-#include "Includes/Tonemap_MELE_ExperimentConfig.hlsli" // Experimental HDR selectors; every one defaults to 0.
-#include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
+#include "../Includes/Reinhard.hlsl" // Reversible compression, used by the grade proxy.
+#include "Includes/Tonemap_MELE_HDRConfig.hlsli"     // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 

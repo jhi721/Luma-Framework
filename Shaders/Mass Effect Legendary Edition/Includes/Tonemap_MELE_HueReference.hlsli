@@ -1,10 +1,10 @@
 #ifndef LUMA_MELE_TONEMAP_HUE_REFERENCE
 #define LUMA_MELE_TONEMAP_HUE_REFERENCE
 
-#include "../../Includes/ACES.hlsl"  // BT709 <-> AP1 matrices for the gamut clamp.
-#include "../../Includes/Oklab.hlsl" // Same include root as this folder's Common.hlsl, not the body's.
-#include "Tonemap_MELE_ExperimentConfig.hlsli"
+#include "../../Includes/ACES.hlsl"     // BT709 <-> AP1 matrices for the gamut clamp.
+#include "../../Includes/Oklab.hlsl"    // Same include root as this folder's Common.hlsl, not the body's.
 #include "Tonemap_MELE_HDRBridge.hlsli" // MELE_IsFinite; needs ../Includes/Reinhard.hlsl before it.
+#include "Tonemap_MELE_HDRConfig.hlsli" // MELE_HARDCLIP_HUE_STRENGTH.
 
 // Hue-only transfer for family 05, adapted from renodx::color::correct::HueOKLab
 // (renodx/src/shaders/colorcorrect.hlsl) with RenoDX's AP1-positive clamp

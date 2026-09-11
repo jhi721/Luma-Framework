@@ -10,9 +10,8 @@
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
 #include "../Includes/DICE.hlsl"
-#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the experimental grade proxy.
-#include "Includes/Tonemap_MELE_ExperimentConfig.hlsli" // Experimental HDR selectors; every one defaults to 0.
-#include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
+#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
+#include "Includes/Tonemap_MELE_HDRConfig.hlsli"     // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
@@ -158,7 +157,7 @@ void main(
       //
       // A broken hue transfer does not discard the reconstruction: MELE_HueReferenceOKLab returns its
       // target untouched, so the working HDR value survives an optional correction failing.
-      graded_hdr = MELE_HueReferenceOKLab(mele_hardclip_hdr, sdr_linear, MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH);
+      graded_hdr = MELE_HueReferenceOKLab(mele_hardclip_hdr, sdr_linear, MELE_HARDCLIP_HUE_STRENGTH);
    }
 
    // ME3LE analytic tail: no vignette or grain; preserve native output luma in alpha.

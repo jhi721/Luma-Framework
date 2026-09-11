@@ -1,5 +1,5 @@
-#ifndef LUMA_MELE_TONEMAP_EXPERIMENT_CONFIG
-#define LUMA_MELE_TONEMAP_EXPERIMENT_CONFIG
+#ifndef LUMA_MELE_TONEMAP_HDR_CONFIG
+#define LUMA_MELE_TONEMAP_HDR_CONFIG
 
 // Constants of the stage-1 HDR reconstruction, one model per colour family:
 //
@@ -59,8 +59,8 @@
 // above that round-off, so the direction survives and the degenerate case cannot be reached from a
 // neutral donor. No donor-chroma threshold is added to paper over it: that would be a new artistic
 // rule, and lowering this number is the honest control.
-#ifndef MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH
-#define MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH 0.75
+#ifndef MELE_HARDCLIP_HUE_STRENGTH
+#define MELE_HARDCLIP_HUE_STRENGTH 0.75
 #endif
 
 // One colour path per family, not selectable. Families 01-04 take their RGB ratios from the real graded SDR
@@ -73,4 +73,4 @@
 #define MELE_RGB_TO_BRG(v) ((v).zxy)
 #define MELE_BRG_TO_RGB(v) ((v).yzx)
 
-#endif // LUMA_MELE_TONEMAP_EXPERIMENT_CONFIG
+#endif // LUMA_MELE_TONEMAP_HDR_CONFIG

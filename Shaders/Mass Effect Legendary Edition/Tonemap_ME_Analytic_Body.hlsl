@@ -11,8 +11,8 @@
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
 #include "../Includes/DICE.hlsl"
-#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the experimental grade proxy.
-#include "Includes/Tonemap_MELE_ExperimentConfig.hlsli" // Experimental HDR selectors; every one defaults to 0.
+#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
+#include "Includes/Tonemap_MELE_HDRConfig.hlsli"     // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_ExpExtended.hlsli"      // Tangent continuation of the native curve.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"        // Max-channel grade proxy; needs Reinhard above.
 // clang-format on

@@ -1,7 +1,7 @@
 #ifndef LUMA_MELE_TONEMAP_HDR_BRIDGE
 #define LUMA_MELE_TONEMAP_HDR_BRIDGE
 
-#include "Tonemap_MELE_ExperimentConfig.hlsli"
+#include "Tonemap_MELE_HDRConfig.hlsli"
 
 // Pure math. Prerequisites, which this file deliberately does NOT include:
 //   ../Includes/Color.hlsl    gamma_to_linear, GetLuminance, GCT_MIRROR
@@ -161,6 +161,13 @@ bool MELE_TryRestoreGradeRange(float3 graded_linear, float q, out float3 work_hd
 //   a non-finite gain or product -> the caller's decline value for the WHOLE triple. Switching
 //     channels independently would change hue, which is the failure being avoided.
 // A positive target luminance is never clamped to 1, and no path takes colour from the raw scene.
+//
+// decline_value is what the caller wants when the projection cannot be made, and every caller passes
+// its own sdr_linear. A bool + out-parameter form would put that policy where it belongs, at the call
+// site, and it was written and measured: fxc costs 3 to 4 extra instructions per permutation for it,
+// on all nineteen, because it stops folding the fallback into the select it already emits. Measured,
+// not assumed - see the same trade in MELE_IsFiniteNonNegative above. Do not re-attempt it without
+// re-measuring.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
 float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_luminance, float3 decline_value)
@@ -171,7 +178,7 @@ float3 MELE_NativeColorAtLuminance(float3 native_reference_linear, float target_
    }
    if (target_luminance == 0.0 || all(native_reference_linear == 0.0))
    {
-      return float3(0.0, 0.0, 0.0);
+      return float3(0.0, 0.0, 0.0); // The grade produced that black.
    }
    const float reference_luminance = GetLuminance(native_reference_linear, CS_BT709);
    if (!MELE_IsFiniteNonNegative(reference_luminance) || reference_luminance < MELE_NATIVE_COLOR_MIN_LUMINANCE)

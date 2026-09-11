@@ -15,7 +15,7 @@
 
 #define ENABLE_SMAA 1  // replaces the game's compute FXAA
 #define ENABLE_BLOOM 1 // fp16 pyramidal bloom replaces the game's clamped bloom
-// Stage-1 diagnostics dump for the experimental HDR families. Development-only: it writes raw game
+// Stage-1 diagnostics dump for the HDR reconstruction. Development-only: it writes raw game
 // resources to disk and stalls on first sight of each permutation.
 #ifndef ENABLE_TONEMAP_DIAGNOSTICS
 #define ENABLE_TONEMAP_DIAGNOSTICS DEVELOPMENT
@@ -75,35 +75,34 @@ struct TonemapPermDesc
    uint8_t scene_slot; // 1 on motion-blur permutations, where t0 is depth instead of scene color.
    uint8_t bloom_slot;
    const char* name;       // Short descriptor for the DEVELOPMENT stage-1 readout.
-   const char* experiment; // Experimental family whose define covers this permutation.
+   const char* hdr_family; // Which HDR reconstruction this permutation is drawn with.
 };
-// `experiment` is a SECOND place that records which family owns which hash; the first is the #if in the
-// shader body. They must agree, and _tools/mele_bridge/fxc_gate.sh --matrix proves it by showing exactly
-// which listings each define changes: 8 + 2 + 4 + 4 + 1 = the 19 stage-1 tonemaps.
+// The families partition the 19 stage-1 tonemaps 8 + 2 + 4 + 4 + 1, and which one a permutation gets
+// follows from the body it shares: this column names it for the readout rather than selecting it.
 static constexpr TonemapPermDesc kTonemapPermsME1LE[] = {
-   {0x151FE4CA, 1, 5, "MB + grain, LUT grade", "MELE_HDR_EXP_LUT"},
-   {0x69F03340, 1, 5, "MB, LUT grade", "MELE_HDR_EXP_LUT"},
-   {0x109F3B6E, 0, 4, "grain, LUT grade", "MELE_HDR_EXP_LUT"},
-   {0x8C8E8CA2, 0, 4, "LUT grade", "MELE_HDR_EXP_LUT"},
-   {0xAAE8755A, 0, 4, "analytic grade (no LUT)", "MELE_HDR_EXP_ANALYTIC"},
+   {0x151FE4CA, 1, 5, "MB + grain, LUT grade", "HDR family 01 - exponential + LUT"},
+   {0x69F03340, 1, 5, "MB, LUT grade", "HDR family 01 - exponential + LUT"},
+   {0x109F3B6E, 0, 4, "grain, LUT grade", "HDR family 01 - exponential + LUT"},
+   {0x8C8E8CA2, 0, 4, "LUT grade", "HDR family 01 - exponential + LUT"},
+   {0xAAE8755A, 0, 4, "analytic grade (no LUT)", "HDR family 02 - exponential + analytic"},
 };
 static constexpr TonemapPermDesc kTonemapPermsME2LE[] = {
-   {0x2754F750, 1, 5, "MB, LUT grade", "MELE_HDR_EXP_LUT"},
-   {0x1536C5B5, 1, 5, "MB + grain, LUT grade", "MELE_HDR_EXP_LUT"},
-   {0x940979D8, 1, 5, "MB, filmic + LUT grade", "MELE_HDR_ME2_FILMIC"},
-   {0x75BFAFBC, 1, 5, "MB + grain, filmic + LUT grade", "MELE_HDR_ME2_FILMIC"},
-   {0xCC76075F, 0, 4, "analytic grade (no LUT)", "MELE_HDR_EXP_ANALYTIC"},
-   {0xD077D06B, 0, 4, "LUT grade", "MELE_HDR_EXP_LUT"},
-   {0x8E0C0DBB, 0, 4, "grain, LUT grade", "MELE_HDR_EXP_LUT"},
-   {0x222186F8, 0, 4, "filmic + LUT grade", "MELE_HDR_ME2_FILMIC"},
-   {0xEC890842, 0, 4, "grain, filmic + LUT grade", "MELE_HDR_ME2_FILMIC"},
+   {0x2754F750, 1, 5, "MB, LUT grade", "HDR family 01 - exponential + LUT"},
+   {0x1536C5B5, 1, 5, "MB + grain, LUT grade", "HDR family 01 - exponential + LUT"},
+   {0x940979D8, 1, 5, "MB, filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
+   {0x75BFAFBC, 1, 5, "MB + grain, filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
+   {0xCC76075F, 0, 4, "analytic grade (no LUT)", "HDR family 02 - exponential + analytic"},
+   {0xD077D06B, 0, 4, "LUT grade", "HDR family 01 - exponential + LUT"},
+   {0x8E0C0DBB, 0, 4, "grain, LUT grade", "HDR family 01 - exponential + LUT"},
+   {0x222186F8, 0, 4, "filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
+   {0xEC890842, 0, 4, "grain, filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
 };
 static constexpr TonemapPermDesc kTonemapPermsME3LE[] = {
-   {0x36B90B12, 1, 6, "MB(depth), filmic + LUT grade", "MELE_HDR_ME3_FILMIC"},
-   {0x49BD5A95, 1, 6, "MB(depth) + grain, filmic + LUT grade", "MELE_HDR_ME3_FILMIC"},
-   {0x00944C2E, 0, 4, "filmic + LUT grade", "MELE_HDR_ME3_FILMIC"},
-   {0x5AA0BD09, 0, 4, "grain, filmic + LUT grade", "MELE_HDR_ME3_FILMIC"},
-   {0x225A8330, 0, 4, "analytic grade (no LUT)", "MELE_HDR_ME3_HARDCLIP"},
+   {0x36B90B12, 1, 6, "MB(depth), filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
+   {0x49BD5A95, 1, 6, "MB(depth) + grain, filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
+   {0x00944C2E, 0, 4, "filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
+   {0x5AA0BD09, 0, 4, "grain, filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
+   {0x225A8330, 0, 4, "analytic grade (no LUT)", "HDR family 05 - analytic hard clip"},
 };
 // Selected once in DllMain.
 static std::span<const TonemapPermDesc> g_tonemap_perms = kTonemapPermsME1LE;
@@ -642,7 +641,7 @@ public:
 
       // Sampler state matters for the probe reads: address mode decides what a
       // coordinate past the last texel returns, and the filter decides whether the
-      // shipped per-pixel Sample and the experimental SampleLevel see the same
+      // per-pixel Sample and the fit's SampleLevel see the same
       // value. Both are assumptions the offline model currently cannot check.
       ID3D11SamplerState* raw_samplers[kMaxSlots] = {};
       native_device_context->PSGetSamplers(0, kMaxSlots, raw_samplers);
@@ -1496,9 +1495,9 @@ public:
          else
          {
             ImGui::Text("perm 0x%08X  %s", gd.stage1_perm->hash, gd.stage1_perm->name);
-            ImGui::Text("covered by %s  (draws this frame: %d)", gd.stage1_perm->experiment, gd.stage1_draws);
+            ImGui::Text("%s  (draws this frame: %d)", gd.stage1_perm->hdr_family, gd.stage1_draws);
             if (ImGui::IsItemHovered())
-               ImGui::SetTooltip("The experimental family whose checkbox affects THIS permutation. Enabling any other family leaves this draw on the shipped path.");
+               ImGui::SetTooltip("The HDR reconstruction THIS permutation is drawn with. A frame reporting two draws switched permutation mid-frame and may be using two.");
          }
 
          ImGui::SeparatorText("Bloom DEV readout");

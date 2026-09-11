@@ -2,8 +2,8 @@
 #define LUMA_MELE_TONEMAP_FILMIC_EXTENDED
 
 #include "Tonemap_MELE_ExpExtended.hlsli" // MELE_ExpExtended; needs MELE_NativeToneCurve from Includes/Common.hlsl.
-#include "Tonemap_MELE_ExperimentConfig.hlsli"
-#include "Tonemap_MELE_HDRBridge.hlsli" // MELE_IsFiniteNonNegative; needs ../Includes/Reinhard.hlsl before it.
+#include "Tonemap_MELE_HDRBridge.hlsli"   // MELE_IsFiniteNonNegative; needs ../Includes/Reinhard.hlsl before it.
+#include "Tonemap_MELE_HDRConfig.hlsli"   // Pivot, probes and the fit slope floors.
 
 // Sampled continuation of the game's own 1D filmic LUT, for the two filmic families. Include AFTER the
 // permutation declares smpFilmicLUT and its sampler. The includes above carry guards, so a body that
