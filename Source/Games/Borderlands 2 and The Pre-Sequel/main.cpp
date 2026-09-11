@@ -453,23 +453,6 @@ public:
       GetShaderDefineData(GAMUT_MAPPING_TYPE_HASH).SetDefaultValue('1'); // gamut-map wild colors in composition
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
-      // A/B for the stage-1 HDR reconstruction (Luma_BL2TPS_Tonemap.hlsl). Off keeps the shipping max-channel
-      // curve_scale recovery; on runs the MELE-style split instead, where the native grade keeps the whole colour
-      // and a separate continuation of the measured curve supplies only the luminance. Both read the same
-      // post-vignette scene, so flipping this compares the two methods on one frame. Fixed at '0' outside
-      // DEVELOPMENT: it changes the image rather than refactoring it, and it does not ship enabled.
-      constexpr bool kReconstructionLocked = DEVELOPMENT ? false : true;
-      std::vector<ShaderDefineData> hdr_shader_defines = {
-         {"BL2TPS_HDR_WORKING_RECONSTRUCTION", '0', true, kReconstructionLocked,
-            "HDR: MELE-style luminance reconstruction\n"
-            "Runs an unbounded continuation of the measured native curve through a reversible copy of the real\n"
-            "color grading LUT and transfers only its luminance onto the exact native graded color.\n"
-            "Off - the shipping recovery, which divides the graded color by the compression the curve applied to\n"
-            "the brightest channel.",
-            1},
-      };
-      shader_defines_data.append_range(hdr_shader_defines);
-
       // Manual Scene + UI Paper White sliders instead of the OS HDR reference level. Core gates the separate
       // "UI Paper White" slider on UI_DRAW_TYPE >= 1 && !use_os_reference_white_level. UI default 203 nits (BT.2408).
       use_os_reference_white_level = false;
@@ -1063,8 +1046,8 @@ public:
    }
 
    // The tonemap's own constants off cb4: rows 15..22 are DX9 c7..c14 (ImageAdjustments1..3, HalfResMaskRect,
-   // DOFKernelSize, vignette). Raw values only, the curve is solved in the shader (VanillaCurveLinear). cb4[16].rgb
-   // is the per-area bloom tint the bloom A/B mirrors.
+   // DOFKernelSize, vignette). Raw values only; the curve itself lives in the shader, which continues it for HDR
+   // (BL2TPS_TryBuildWorkingHDR). cb4[16].rgb is the per-area bloom tint the bloom A/B mirrors.
    static void CaptureGradeConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData& gd)
    {
       constexpr uint32_t kFirstRow = 15;
@@ -1090,6 +1073,18 @@ public:
          ia2[0], ia2[1], ia2[2], ia2[3], ia3[0],
          rows[6 * 4 + 0], rows[6 * 4 + 1], rows[6 * 4 + 2], rows[6 * 4 + 3],
          rows[7 * 4 + 0], rows[7 * 4 + 1], rows[7 * 4 + 2], rows[7 * 4 + 3]));
+
+      // The HDR working continuation models the K = 0 curve only (BL2TPS_TryBuildWorkingHDR in
+      // Luma_BL2TPS_Tonemap.hlsl); on anything else it declines and the native graded colour is presented as-is.
+      // K has never been observed non-zero, so say so loudly if it ever is. This sits after the de-dup above and
+      // inherits it: one line per distinct curve, never per frame. Known limit - past 64 distinct sets that guard
+      // returns early, so this stops reporting too.
+      if (ia3[0] != 0.f)
+      {
+         LogGradeLine(std::format("[BL-HDR] WARNING: non-zero ImageAdjustments K={:.5f}; the HDR working continuation does not "
+                                  "model this curve, so HDR falls back to the native graded range for it.",
+            ia3[0]));
+      }
    }
 
 #endif // DEVELOPMENT

@@ -17,12 +17,15 @@
 // VERBATIM (register-level) from the readable DX9 BL2 tonemap (tonemap_0x54ED86A0.ps_3_0),
 // constants remapped DX9 cN -> cb4[N+8].
 //
-// HDR = MELE's scheme (Shaders/Mass Effect Legendary Edition/Tonemap_ME_Analytic_Body.hlsl) with this game's curve:
-// grade and LUT get the NATIVE scene, then the graded colour is divided by the compression the vanilla curve applied
-// to the pixel's brightest channel (curve_scale), then DICE. One scalar per pixel keeps every channel ratio, so the
-// game's own highlight whitening survives; SDR leaves curve_scale = 1 and is bit-for-bit vanilla. Not a
-// compress->grade->expand wrap: the curve is an asymptotic Reinhard (see VanillaCurveLinear), there was nothing to
-// protect, and the wrap cost up to 26 deg of hue where vanilla never clipped.
+// HDR follows the MELE 01-04 split (Shaders/Mass Effect Legendary Edition/Tonemap_ME_Analytic_Body.hlsl). The
+// exact native ImageAdjustments + ColorGradingLUT result is the COMPLETE colour reference, including the game's
+// per-channel hue, saturation, tint and its own highlight whitening. A separate unbounded continuation of the
+// measured K=0 response (W*c in linear light) passes through a reversible bounded copy of the real LUT to obtain
+// HDR luminance, and ONLY that luminance is projected onto the native graded RGB ratios. DICE performs the only
+// final display rolloff. SDR computes none of it and stays bit-for-bit vanilla.
+//
+// This is NOT inverse tonemapping, NOT hue restoration from the raw scene, and NOT MELE family 05's hard-clip
+// treatment: no path anywhere takes chroma from the working value.
 // The per-channel ImageAdjustments curve below MUST keep the original's swizzles (r0.zzxy / r3.z,w,xy) — a
 // "cleaner" rewrite swaps channels and casts the whole image green.
 
@@ -76,38 +79,9 @@ cbuffer cb4 : register(b4)
 #define VignetteSettings                 cb4[21] // c13
 #define VignetteColor                    cb4[22] // c14
 
-// The vanilla tone curve for ONE channel in LINEAR light; mirrors the per-channel ImageAdjustments block in
-// RunTonemap, keep them in sync. Measured in-game (52 constant sets): an analytic Reinhard with its white point at
-// scene 14, driven by the live exposure W - A = 0.22/W, Y = 1 + A/14 (so T(14) = 1), Z ~ 0.2512/W, K = 0 everywhere
-// seen. c <= Z: (W*c)^(1/2.2), a pure gain once linearised; c > Z: Y*c/(c+A), so saturate() bites only at scene >= 14.
-float VanillaCurveLinear(float c)
-{
-   const float A = ImageAdjustments2.x;
-   const float Y = ImageAdjustments2.y;
-   const float Z = ImageAdjustments2.z;
-   const float W = ImageAdjustments2.w;
-   const float K = ImageAdjustments3.x;
-   float g = pow(max(c, 0.0) * W, 1.0 / 2.2);
-   float t = Y * c / (c + A);
-   float b = (c > Z) ? t : g;
-   return pow(saturate(b + K * (t - b)), 2.2);
-}
-
-// ====================== MELE-style HDR luminance reconstruction (experiment) ======================
-// A/B against the shipping curve_scale recovery further down: 0 keeps it, 1 runs this instead.
-// Registered as a DEVELOPMENT-only checkbox in main.cpp, so a shipped build always compiles the 0
-// side and nothing below reaches it.
-//
-// The contract: the exact native ImageAdjustments + LUT output stays the COMPLETE colour reference.
-// A separate unbounded continuation of the measured native response is passed through a reversible
-// bounded copy of the real LUT, and only that luminance is transferred back onto the exact native
-// graded RGB ratios before DICE. It is NOT an inverse tonemap of the SDR result, and the native
-// scene branch is never compressed - it sees the same values it sees with this off.
-#ifndef BL2TPS_HDR_WORKING_RECONSTRUCTION
-#define BL2TPS_HDR_WORKING_RECONSTRUCTION 0
-#endif
-
-#if BL2TPS_HDR_WORKING_RECONSTRUCTION
+// ====================== HDR luminance reconstruction ======================
+// The native branch in RunTonemap owns the colour; everything here owns the range. See the file
+// header for the contract - only Y crosses from the working value to the output.
 
 #define BL2TPS_HDR_BRIDGE_SHOULDER        0.75
 #define BL2TPS_HDR_PROXY_EPS              1e-4
@@ -164,17 +138,18 @@ float3 BL2TPS_SampleColorGradeGamma(float3 gammaRGB)
 
 // The working value: the measured native response continued past its own shoulder, then graded.
 //
-// Below Z the native curve is (W*c)^(1/2.2) in gamma, which linearises to exactly W*c - a pure gain,
-// not an approximation of one. Continuing THAT branch over the whole positive range gives E(c) = W*c.
-// The anchor the shipping path uses sits under the join at every exposure (min(0.18, Z*0.99) is
-// 0.18 < Z while W < 1.382, and Z*0.99 < Z after), so this is the response the game itself applies
-// to everything below mid-gray, with the Reinhard shoulder and the clip at scene 14 simply absent.
-// No asymptote, no invented curve, no second tonemapper: DICE alone owns the display mapping.
+// Measured in-game over 52 constant sets, the native per-channel curve is an analytic Reinhard with
+// its white point at scene 14, driven by the live exposure W: A = 0.22/W, Y = 1 + A/14 (so T(14) = 1),
+// Z ~ 0.2512/W, K = 0 everywhere seen. Below Z it is (W*c)^(1/2.2) in gamma, which linearises to
+// exactly W*c - a pure gain, not an approximation of one. Continuing THAT branch over the whole
+// positive range gives E(c) = W*c: the response the game itself applies to everything below mid-gray,
+// with the Reinhard shoulder and the clip at scene >= 14 simply absent. No asymptote, no invented
+// curve, no second tonemapper - DICE alone owns the display mapping.
 //
 // Valid only for K == 0, which is every constant set captured so far. A non-zero K mixes the toe in
-// and W*c stops being the native response, so this declines and the caller keeps the shipping
-// recovery, which handles K itself. Tested with the same ImageAdjustments3.x == 0.0 the anchor below
-// already uses - one test for one constant, rather than two thresholds that can disagree.
+// and W*c stops being the native response, so this declines and the caller keeps the exact native
+// graded colour rather than inventing a range for a curve it cannot model. DEVELOPMENT logs a warning
+// the first time a non-zero K is actually observed - main.cpp, CaptureGradeConstants.
 //
 // On false workHDR must not be consumed.
 bool BL2TPS_TryBuildWorkingHDR(float3 curveInput, out float3 workHDR)
@@ -295,8 +270,6 @@ float3 BL2TPS_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetL
    return result;
 }
 
-#endif // BL2TPS_HDR_WORKING_RECONSTRUCTION
-
 // The tonemap grade. v5 = TEXCOORD0 (DOF radial/kernel coords in .zw), v6 = TEXCOORD1 (scene UV .xy, half-res DOF
 // UV .zw) — the only interpolators the body uses. Returns the final gamma-space color (o0.a is always 0).
 float4 RunTonemap(float4 v5, float4 v6)
@@ -359,7 +332,8 @@ float4 RunTonemap(float4 v5, float4 v6)
    // User Exposure (scene-referred, pre-grade; 1 = vanilla). Applies to both SDR and HDR — the grade below tracks it.
    hdr_color *= LumaSettings.GameSettings.Exposure;
 
-   // The grade runs on the NATIVE scene like vanilla; HDR recovery is one scalar AFTER it (curve_scale), as in MELE.
+   // The grade runs on the NATIVE scene like vanilla; the HDR reconstruction is a separate branch off this same
+   // value, and it changes only the luminance of the graded result. As in MELE.
    r0.xyz = hdr_color;
 
    // --- vignette (verbatim) ---
@@ -379,23 +353,10 @@ float4 RunTonemap(float4 v5, float4 v6)
    // User Vignette Intensity: lerp between the pre-vignette color and the vignetted result (1 = vanilla, 0 = none).
    r0.xyz = lerp(vignette_color, r0.xyz, LumaSettings.GameSettings.VignetteIntensity);
 
-   // Compression the vanilla curve is about to apply to this pixel's brightest channel, relative to an anchor it
-   // leaves alone. Taken post-vignette because that IS the curve's input, and UNCLIPPED, so a channel pinned by the
-   // curve's own saturate comes back proportional to the real light. Deliberately ONE scalar: it keeps every channel
-   // ratio, so the game's own highlight whitening survives (MELE's AGENTS.md forbids blending it per channel). Anchor
-   // = 18% grey as in MELE, but clamped under the branch join, which slides below 0.18 once W passes 1.382 - a fixed
-   // 0.18 would breathe the whole frame by up to 2.2% with adaptation.
-   const float3 curve_input = r0.xyz; // pre-curve, post-vignette: the physical colour, unskewed
-   float curve_scale = 1.0;
-   if (LumaSettings.DisplayMode == 1)
-   {
-      // Under the join the curve is a pure gain, so the anchor's compression is exactly W unless a non-zero K (never
-      // observed, read live anyway) mixes the toe in. Z tracks 1/W, so anchor*W <= 0.25 and saturate never reaches it.
-      const float anchor = max(1e-4, min(0.18, ImageAdjustments2.z * 0.99));
-      const float anchor_compression = (ImageAdjustments3.x == 0.0) ? ImageAdjustments2.w : (VanillaCurveLinear(anchor) / anchor);
-      float mch = max3(curve_input);
-      curve_scale = (mch > 1e-6 && anchor_compression > 1e-6) ? ((VanillaCurveLinear(mch) / mch) / anchor_compression) : 1.0;
-   }
+   // The curve's own input: post-vignette, pre-curve and UNCLIPPED - the physical colour before the native
+   // per-channel curve compresses it. The HDR reconstruction continues the curve from here, and the native
+   // branch below runs on this same value, unchanged.
+   const float3 curve_input = r0.xyz;
 
    // --- ImageAdjustments per-channel curve (verbatim; keep swizzles exactly) ---
    r1 = r0.zzxy + -ImageAdjustments2.z;
@@ -431,9 +392,10 @@ float4 RunTonemap(float4 v5, float4 v6)
    r0.yzw = (-r1.xxyz + r2.xxyz).yzw;
    o.xyz = r0.x * r0.yzw + r1.xyz;
 
-   // ====================== Luma HDR output (vanilla curve inverse) ======================
-   // o.rgb is the graded look in gamma space, produced from the NATIVE scene. HDR divides it by curve_scale, the
-   // exact inverse of what the vanilla curve compressed; the grade itself is untouched. SDR never computes it.
+   // ====================== Luma HDR output ======================
+   // o.rgb is the graded look in gamma space, produced from the NATIVE scene, and it is the COMPLETE colour
+   // reference: hue, saturation, per-channel tint, the LUT's grading and the game's own highlight whitening all
+   // live in it. HDR replaces its luminance and nothing else. SDR presents it untouched.
    float3 graded_sdr_gamma = o.rgb;
    float3 sdr_lin = gamma_to_linear(graded_sdr_gamma, GCT_MIRROR);
 
@@ -444,19 +406,16 @@ float4 RunTonemap(float4 v5, float4 v6)
 
    if (LumaSettings.DisplayMode == 1) // HDR
    {
-      // min(): only ever expand. Just above the branch join the game's own ~1.4% step pushes curve_scale over 1 - a
-      // vanilla artefact to keep. Below the join curve_scale is exactly 1 and HDR is bit-for-bit vanilla.
-      float3 recovered = sdr_lin / min(1.0, max(curve_scale, 1e-6));
+      // Colour from the native grade, range from the working value. Declining leaves the native grade exactly
+      // as it is: there is no second HDR model to fall back to, and expanding a curve the reconstruction cannot
+      // model is the failure the guards exist to prevent.
+      float3 recovered = sdr_lin;
 
-#if BL2TPS_HDR_WORKING_RECONSTRUCTION
-      // Same input as curve_scale above, the composited post-vignette scene, so the two methods are
-      // compared on identical data. On decline curve_scale stands, which is why it is still computed.
       float3 workHDR;
       if (BL2TPS_TryBuildWorkingHDR(curve_input, workHDR))
       {
          recovered = BL2TPS_NativeColorAtLuminance(sdr_lin, GetLuminance(workHDR, CS_BT709));
       }
-#endif
 
       // Display rolloff to the user's peak/paper-white nits. DICE by-luminance keeps hue; the *_CORRECT_CHANNELS_BEYOND_
       // PEAK_WHITE type also gamut-maps a single channel riding past peak. Feed linear BT.709 directly: DICE converts to
@@ -481,7 +440,7 @@ float4 RunTonemap(float4 v5, float4 v6)
 
       postProcessedColor = hdr;
    }
-   else // SDR (still presented through the scRGB swapchain) — sdr_lin is the vanilla grade (curve_scale stayed 1)
+   else // SDR (still presented through the scRGB swapchain) — sdr_lin is the vanilla grade, untouched
    {
       postProcessedColor = sdr_lin;
    }
