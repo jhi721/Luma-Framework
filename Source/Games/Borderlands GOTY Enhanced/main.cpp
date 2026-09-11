@@ -38,6 +38,17 @@ static constexpr uint32_t kAOBlurHash = 0x4E1BEE34;         // bilateral blur ->
 static bool g_smaa_enable = true;
 static float g_rcas_sharpness = 0.f; // RCAS sharpen on SMAA output (0 = off). Conservative — ink outlines already AA'd; higher haloes.
 static bool g_hide_ui = false;       // hide the game's HUD (skips swapchain-targeting UI draws) — for clean screenshots
+// SMAA predication on geometry. The signal is plane-deviation edge-ness built from the scene depth, not the depth
+// itself (see Luma_BL_DepthExtract.hlsl); the tolerance is the only free parameter and is a fraction of view
+// depth, so MoH Airborne's calibrated 0.02 carries over unchanged.
+static bool g_smaa_predication = true;
+static float g_smaa_pred_tolerance = 0.02f;
+#if DEVELOPMENT
+// Calibration aids for the tolerance: what predication does is an ABSENCE of smearing, which the eye reads badly
+// and worse in motion, so judge the mask itself rather than the frame.
+static bool g_smaa_pred_debug = false;   // show the predication mask instead of the antialiased frame
+static bool g_smaa_pred_measure = false; // one-shot: read the mask back and log its distribution (UI button)
+#endif
 
 // Ambient Occlusion: XeGTAO replaces the native HBAO+ (default ON = supersede it). Persisted as "XeGTAOEnable".
 static bool g_gtao_enable = true;
@@ -267,8 +278,35 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    bool logged_no_fp16 = false; // warned once: swapchain not fp16 (HDR upgrade absent) -> SMAA skipped
 #endif
 
-   // Scene depth (D24S8, viewed r24_unorm_x8_uint) captured from the cel-shading pass, fed to SMAA predication.
+   // Scene depth (D24S8, viewed r24_unorm_x8_uint) captured from the cel-shading pass, linearized into the
+   // predication signal below.
    ComPtr<ID3D11ShaderResourceView> srv_depth;
+
+   // The game's cb2 (CSOffsetConstants), kept by reference from the AO chain, where the engine has it live. The
+   // predication extract reads MinZ_MaxZRatioCS out of it; SMAA runs at the FXAA resolve, where the slot holds
+   // something else, so the buffer has to be carried rather than read in place. Contents are the game's, so this
+   // stays correct as the camera moves; only a frame with no AO chain at all leaves it unset.
+   ComPtr<ID3D11Buffer> cb_game_offsets;
+
+   // SMAA predication: plane-deviation edge-ness (R16F) built from srv_depth by the BL Depth Extract CS.
+   ComPtr<ID3D11Buffer> cb_pred;
+   float pred_tolerance = -1.f;
+   ComPtr<ID3D11Texture2D> tex_pred;
+   ComPtr<ID3D11UnorderedAccessView> uav_pred;
+   ComPtr<ID3D11ShaderResourceView> srv_pred;
+   uint32_t pred_w = 0, pred_h = 0;
+#if DEVELOPMENT
+   // Staging copy for the one-shot mask readback (see LogPredicationStats), allocated on first use.
+   struct TextureCapture
+   {
+      ComPtr<ID3D11Texture2D> staging;
+      UINT width = 0;
+      UINT height = 0;
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      bool copy_pending = false;
+   };
+   TextureCapture pred_measure;
+#endif
 
    // SMAA metrics CB (b1) = (1/w, 1/h, w, h) + (predication scale,0,0,0), recreated on resolution or predication-state change.
    ComPtr<ID3D11Buffer> cb_smaa_metrics;
@@ -340,8 +378,9 @@ class BorderlandsGoty final : public Game
       return SUCCEEDED(device->CreateBuffer(&bd, &sd, out.put()));
    }
 
-   // Create a DEFAULT-usage RGBA16F 2D texture (1 mip, 1 sample) of w×h with the given bind flags. Resets `out`.
-   static bool CreateDefaultRGBA16FTex(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, ComPtr<ID3D11Texture2D>& out)
+   // Create a DEFAULT-usage 2D texture (1 mip, 1 sample) of w×h with the given bind flags, fp16 unless another
+   // format is asked for. Resets `out`.
+   static bool CreateDefaultTex(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, ComPtr<ID3D11Texture2D>& out, DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT)
    {
       out.reset();
       D3D11_TEXTURE2D_DESC td = {};
@@ -349,12 +388,114 @@ class BorderlandsGoty final : public Game
       td.Height = h;
       td.MipLevels = 1;
       td.ArraySize = 1;
-      td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      td.Format = format;
       td.SampleDesc.Count = 1;
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = bind_flags;
       return SUCCEEDED(device->CreateTexture2D(&td, nullptr, out.put()));
    }
+
+#if DEVELOPMENT
+   // One-shot readback of the predication mask, so g_smaa_pred_tolerance is calibrated from numbers rather than
+   // from screenshots. A mean would be useless here: on a well-tuned frame the mask is 0 nearly everywhere and any
+   // average drowns in that, so this reports COVERAGE at the level SMAA actually compares against (0.5) plus the
+   // shape either side of it. Every texel is read, not a stride - a 1px silhouette is precisely the signal a
+   // subsample would step over. Copies on the frame the button is pressed and maps on a later one (non-blocking),
+   // so the press never stalls the render thread.
+   static void LogPredicationStats(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, BorderlandsGotyGameDeviceData& gd)
+   {
+      auto& capture = gd.pred_measure;
+      if (!gd.tex_pred || (!g_smaa_pred_measure && !capture.copy_pending))
+         return;
+
+      D3D11_TEXTURE2D_DESC td = {};
+      gd.tex_pred->GetDesc(&td);
+      if (capture.width != td.Width || capture.height != td.Height || capture.format != td.Format)
+      {
+         D3D11_TEXTURE2D_DESC sd = td;
+         sd.Usage = D3D11_USAGE_STAGING;
+         sd.BindFlags = 0;
+         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+         sd.MiscFlags = 0;
+         capture.staging.reset();
+         capture.copy_pending = false;
+         if (FAILED(native_device->CreateTexture2D(&sd, nullptr, capture.staging.put())) || !capture.staging)
+         {
+            capture.width = 0;
+            return;
+         }
+         capture.width = td.Width;
+         capture.height = td.Height;
+         capture.format = td.Format;
+      }
+
+      if (!capture.copy_pending)
+      {
+         g_smaa_pred_measure = false;
+         native_device_context->CopyResource(capture.staging.get(), gd.tex_pred.get());
+         capture.copy_pending = true;
+         return;
+      }
+
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(native_device_context->Map(capture.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) || mapped.pData == nullptr)
+         return; // still in flight, retry next frame
+
+      constexpr uint32_t kBins = 256;
+      uint64_t histogram[kBins] = {};
+      uint64_t total = 0;
+      uint64_t non_finite = 0;
+      for (UINT y = 0; y < capture.height; y++)
+      {
+         const uint16_t* row = (const uint16_t*)((const uint8_t*)mapped.pData + (size_t)y * mapped.RowPitch);
+         for (UINT x = 0; x < capture.width; x++)
+         {
+            const float v = DirectX::PackedVector::XMConvertHalfToFloat(row[x]);
+            // The range test, not a clamp: a NaN fails BOTH ordered comparisons, so the clamped form would fall
+            // through to (uint32_t)NaN and index far outside this stack array. The extract CS saturates, so a NaN
+            // here means it met one upstream; count them rather than bin them, a silent 0 would read as flat.
+            if (!(v >= 0.f && v <= 1.f))
+            {
+               non_finite++;
+               total++;
+               continue;
+            }
+            histogram[(uint32_t)(v * (float)(kBins - 1))]++;
+            total++;
+         }
+      }
+      native_device_context->Unmap(capture.staging.get(), 0);
+      capture.copy_pending = false;
+
+      auto fraction_above = [&](float level)
+      {
+         uint64_t hits = 0;
+         for (uint32_t b = (uint32_t)(level * (float)(kBins - 1)) + 1u; b < kBins; b++)
+            hits += histogram[b];
+         return 100.0 * (double)hits / (double)total;
+      };
+      auto percentile = [&](double p)
+      {
+         const uint64_t target = (uint64_t)(p * (double)total);
+         uint64_t running = 0;
+         for (uint32_t b = 0; b < kBins; b++)
+         {
+            running += histogram[b];
+            if (running >= target)
+               return (float)b / (float)(kBins - 1);
+         }
+         return 1.f;
+      };
+
+      char line[512];
+      snprintf(line, sizeof(line),
+         "[BL-Pred] tol=%.4f | FIRES(>0.5)=%.3f%% | >0.1=%.3f%% >0.25=%.3f%% >0.75=%.3f%% >0.9=%.3f%% | flat(bin0)=%.2f%% | p50=%.3f p90=%.3f p99=%.3f p999=%.3f | nonfinite=%llu | %ux%u",
+         g_smaa_pred_tolerance, fraction_above(0.5f), fraction_above(0.1f), fraction_above(0.25f), fraction_above(0.75f), fraction_above(0.9f),
+         100.0 * (double)histogram[0] / (double)total, percentile(0.5), percentile(0.9), percentile(0.99), percentile(0.999),
+         (unsigned long long)non_finite, capture.width, capture.height);
+      reshade::log::message(reshade::log::level::info, line);
+   }
+#endif
 
 public:
    void OnInit(bool async) override
@@ -381,6 +522,9 @@ public:
          ShaderDefinition("Luma_SMAA_LinearTosRGB_CS", reshade::api::pipeline_subobject_type::compute_shader));
 
       // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA).
+      // Depth-extract CS for SMAA predication: hardware d24 -> R16F plane-deviation edge-ness.
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL Depth Extract CS"),
+         ShaderDefinition("Luma_BL_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("BL Sharpen PS"),
          ShaderDefinition{"Luma_BL_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 
@@ -430,6 +574,16 @@ public:
       {
          auto& gd = GetGameDeviceData(device_data);
          gd.srv_depth.reset();
+         gd.cb_game_offsets.reset();
+         gd.cb_pred.reset();
+         gd.uav_pred.reset();
+         gd.srv_pred.reset();
+         gd.tex_pred.reset();
+#if DEVELOPMENT
+         gd.pred_measure.staging.reset();
+         gd.pred_measure.width = 0;
+         gd.pred_measure.copy_pending = false;
+#endif
          gd.cb_smaa_metrics.reset();
          gd.srv_input.reset();
          gd.tex_input.reset();
@@ -503,6 +657,19 @@ public:
          {
             gd.srv_depth = srv_d;
          }
+      }
+
+      // Keep a reference to the game's cb2 (CSOffsetConstants) from the AO chain, where the engine has it bound
+      // with the current projection. Deliberately NOT gated on g_gtao_enable: the predication extract needs
+      // MinZ_MaxZRatioCS whether or not we take the AO chain over, and this is the one point in the frame where
+      // the slot is known to hold it. Never cleared - a frame whose AO chain does not run keeps the last one,
+      // which is the same projection unless the camera changed, and the alternative is losing predication.
+      if (is_immediate && original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
+      {
+         ComPtr<ID3D11Buffer> cb2;
+         native_device_context->CSGetConstantBuffers(2, 1, cb2.put());
+         if (cb2)
+            gd.cb_game_offsets = cb2;
       }
 
       // XeGTAO replaces the game's native HBAO+ (chain order: deinterleave x2 -> normals 0xB2B47225 ->
@@ -770,15 +937,40 @@ public:
          // Predication depth is valid only if captured this frame AND it matches the color dimensions (a resolution
          // change can leave a different-size depth). When invalid we pass a null predication texture and a scale of
          // 1.0 so SMAA uses the plain ULTRA threshold rather than the doubled predicated baseline.
-         bool depth_ok = false;
-         if (gd.srv_depth)
+         bool pred_ok = g_smaa_predication && gd.srv_depth && gd.cb_game_offsets && device_data.native_compute_shaders[CompileTimeStringHash("BL Depth Extract CS")].get() != nullptr;
+         if (pred_ok)
          {
+            // The extract CS maps texels 1:1, so a depth buffer of a different size would read a sub-rect and
+            // misalign the mask against the colour grid.
             uint4 dinfo{};
             DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
             GetResourceInfo(gd.srv_depth.get(), dinfo, dfmt);
-            depth_ok = (dinfo.x == w && dinfo.y == h);
+            pred_ok = (dinfo.x == w && dinfo.y == h);
          }
-         const float pred_scale = depth_ok ? 2.f : 1.f;
+         if (pred_ok)
+         {
+            if (!gd.cb_pred || gd.pred_tolerance != g_smaa_pred_tolerance)
+            {
+               const float pp[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
+               if (CreateImmutableCB(native_device, pp, sizeof(pp), gd.cb_pred))
+                  gd.pred_tolerance = g_smaa_pred_tolerance;
+            }
+            if (!gd.tex_pred || gd.pred_w != w || gd.pred_h != h)
+            {
+               gd.uav_pred.reset();
+               gd.srv_pred.reset();
+               gd.tex_pred.reset();
+               if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_pred, DXGI_FORMAT_R16_FLOAT))
+               {
+                  native_device->CreateUnorderedAccessView(gd.tex_pred.get(), nullptr, gd.uav_pred.put());
+                  native_device->CreateShaderResourceView(gd.tex_pred.get(), nullptr, gd.srv_pred.put());
+                  gd.pred_w = w;
+                  gd.pred_h = h;
+               }
+            }
+            pred_ok = gd.cb_pred && gd.uav_pred && gd.srv_pred;
+         }
+         const float pred_scale = pred_ok ? 2.f : 1.f;
 
          // Shader-readiness gate (async loader / dev live-reload). If anything is missing, fall through to native FXAA.
          const bool smaa_ready =
@@ -825,7 +1017,7 @@ public:
             gd.tex_smaa_out_rtv.reset();
             gd.tex_smaa_out_srv.reset();
             gd.tex_smaa_out.reset();
-            if (CreateDefaultRGBA16FTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd.tex_smaa_out))
+            if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd.tex_smaa_out))
             {
                native_device->CreateRenderTargetView(gd.tex_smaa_out.get(), nullptr, gd.tex_smaa_out_rtv.put());
                native_device->CreateShaderResourceView(gd.tex_smaa_out.get(), nullptr, gd.tex_smaa_out_srv.put());
@@ -849,9 +1041,9 @@ public:
             gd.uav_gam.reset();
             gd.srv_gam.reset();
             gd.tex_gam.reset();
-            if (CreateDefaultRGBA16FTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input) &&
-                CreateDefaultRGBA16FTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_lin) &&
-                CreateDefaultRGBA16FTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_gam))
+            if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input) &&
+                CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_lin) &&
+                CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_gam))
             {
                native_device->CreateShaderResourceView(gd.tex_input.get(), nullptr, gd.srv_input.put());
                native_device->CreateUnorderedAccessView(gd.tex_lin.get(), nullptr, gd.uav_lin.put());
@@ -882,8 +1074,50 @@ public:
             native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("SMAA Linear To sRGB CS")].get(), nullptr, 0);
             native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 
+            // Predication extract: hardware d24 -> plane-deviation edge-ness in R16F, under the same state stack.
+            // Restoring it before DrawSMAA is what makes both results readable: an SRV of a resource still bound
+            // as a UAV reads as null.
+            if (pred_ok)
+            {
+               ID3D11ShaderResourceView* pred_srv = gd.srv_depth.get();
+               ID3D11UnorderedAccessView* pred_uav = gd.uav_pred.get();
+               ID3D11Buffer* pred_cbs[1] = {gd.cb_pred.get()};
+               ID3D11Buffer* game_cb[1] = {gd.cb_game_offsets.get()};
+               native_device_context->CSSetUnorderedAccessViews(0, 1, &pred_uav, nullptr);
+               native_device_context->CSSetShaderResources(0, 1, &pred_srv);
+               native_device_context->CSSetConstantBuffers(0, 1, pred_cbs);
+               native_device_context->CSSetConstantBuffers(2, 1, game_cb); // CSOffsetConstants: MinZ_MaxZRatioCS
+               native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL Depth Extract CS")].get(), nullptr, 0);
+               native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            }
+
             linearize_cs_state.Restore(native_device_context);
          }
+
+#if DEVELOPMENT
+         // Both calibration aids read the mask the extract CS just wrote. The numeric one runs first so it still
+         // reports while the debug view is on (that path returns early).
+         if (pred_ok)
+            LogPredicationStats(native_device, native_device_context, gd);
+
+         if (pred_ok && g_smaa_pred_debug)
+         {
+            auto* debug_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
+            auto* debug_ps = device_data.native_pixel_shaders[CompileTimeStringHash("Copy PS")].get();
+            if (debug_vs != nullptr && debug_ps != nullptr)
+            {
+               // The mask is single-channel, so the core copy lands it in RED - unmistakably a debug view. It
+               // REPLACES the antialiased frame, reusing the same temp-then-copy route the real path takes.
+               DrawStateStack<DrawStateStackType::FullGraphics> debug_state;
+               debug_state.Cache(native_device_context, device_data.uav_max_count);
+               DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
+                  debug_vs, debug_ps, gd.srv_pred.get(), gd.tex_smaa_out_rtv.get(), w, h, false);
+               debug_state.Restore(native_device_context);
+               native_device_context->CopyResource(color_res.get(), gd.tex_smaa_out.get());
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+         }
+#endif
 
          // --- SMAA (3 passes) into the temp RTV, then copy into the swapchain target. ---
          // Bind metrics at VS+PS b1 (DrawSMAA restores VS/PS/SRVs/RTs but NOT cbuffer slots).
@@ -898,7 +1132,7 @@ public:
          // pred_scale=1.0 baked into the metrics CB make SMAA run as plain ULTRA instead of degraded predication.
          DrawSMAA(native_device, native_device_context, device_data,
             gd.tex_smaa_out_rtv.get(), gd.srv_lin.get() /*color (linear)*/, gd.srv_gam.get() /*color gamma*/,
-            depth_ok ? gd.srv_depth.get() : nullptr /*predication*/);
+            pred_ok ? gd.srv_pred.get() : nullptr /*predication (plane-deviation edge-ness)*/);
 
          // --- Optional RCAS sharpen on the (linear scRGB) SMAA output, then copy into the swapchain target. ---
          // SMAA output -> RCAS -> tex_rcas_out -> color_res. If sharpening is off or anything isn't ready, copy the
@@ -925,7 +1159,7 @@ public:
             {
                gd.tex_rcas_out_rtv.reset();
                gd.tex_rcas_out.reset();
-               if (CreateDefaultRGBA16FTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd.tex_rcas_out))
+               if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd.tex_rcas_out))
                {
                   native_device->CreateRenderTargetView(gd.tex_rcas_out.get(), nullptr, gd.tex_rcas_out_rtv.put());
                   gd.rcas_out_w = w;
@@ -1007,6 +1241,9 @@ public:
    {
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
+      // Predication has no shipping UI (see DrawImGuiSettings), but stays overridable from the ini.
+      reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
+      reshade::get_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       reshade::get_config_value(nullptr, NAME, "XeGTAOEnable", g_gtao_enable);
       // Grade sliders (cb_luma_global_settings_dirty is already true at init -> uploaded on first frame).
       reshade::get_config_value(nullptr, NAME, "Exposure", cb_luma_global_settings.GameSettings.Exposure);
@@ -1033,6 +1270,25 @@ public:
          reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Sharpening applied on top of SMAA (0 = off).");
+#if DEVELOPMENT
+      // Predication is not a preference: it only relaxes the edge threshold back to base ULTRA on geometry and
+      // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight.
+      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
+         reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps texture noise from being antialiased while still catching real silhouettes.");
+      if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
+         reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
+      ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
+      if (ImGui::Button("Measure Predication"))
+         g_smaa_pred_measure = true;
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Read the mask back and log its distribution to ReShade.log.\nStand still, set a tolerance, press; repeat per value and compare the lines.\nFIRES(>0.5) is the share of the frame that regains base sensitivity.");
+#endif
       ImGui::EndDisabled();
 
       // --- HDR grade (read in Luma_BL_Tonemap.hlsl via LumaSettings.GameSettings; HDR tonemap path only) ---

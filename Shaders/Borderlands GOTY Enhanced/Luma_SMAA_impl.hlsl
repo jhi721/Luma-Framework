@@ -19,8 +19,16 @@ cbuffer SmaaMetricsCB : register(b1)
 
 #define SMAA_RT_METRICS SmaaRtMetrics
 #define SMAA_PRESET_ULTRA
-#define SMAA_PREDICATION 1
+#define SMAA_PREDICATION       1
 #define SMAA_PREDICATION_SCALE SmaaPredication.x
+// Predication budget:
+//  - flat threshold  = SCALE * SMAA_THRESHOLD           = 2.0 * 0.05       = 0.10 (rejects texture colour noise)
+//  - silhouette thr  = SCALE * SMAA_THRESHOLD * (1-STR) = 2.0 * 0.05 * 0.5 = 0.05 (= plain ULTRA base; predication
+//    only relaxes geometric edges back to base sensitivity, never below).
+// THRESHOLD is 0.5 because Luma_BL_DepthExtract.hlsl feeds a unitless edge-ness in [0,1], not a depth: the
+// half-way point simply means "the extract called this a silhouette". Calibrate its tolerance, not this number.
+#define SMAA_PREDICATION_STRENGTH  0.5
+#define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAA_CUSTOM_SL
 SamplerState LinearSampler : register(s0);
 SamplerState PointSampler : register(s1);
