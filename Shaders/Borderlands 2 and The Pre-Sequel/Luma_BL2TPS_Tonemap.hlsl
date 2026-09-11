@@ -21,7 +21,10 @@
 // per-channel hue, saturation, tint and its own highlight whitening. A separate unbounded continuation of the
 // measured K=0 response (W*c in linear light) passes through a reversible bounded copy of the real LUT to obtain
 // HDR luminance, and ONLY that luminance is projected onto the native graded RGB ratios. DICE performs the only
-// final display rolloff. SDR computes none of it and stays bit-for-bit vanilla.
+// final display rolloff. SDR executes none of the reconstruction; the native ImageAdjustments + LUT
+// arithmetic and the SDR output branch are unchanged by it. (That is not the same as claiming the SDR
+// image is vanilla: the user Exposure, Bloom and Vignette controls above still act on the scene, and
+// Luma's pyramidal bloom is on by default.)
 //
 // This is NOT inverse tonemapping, NOT hue restoration from the raw scene, and NOT MELE family 05's hard-clip
 // treatment: no path anywhere takes chroma from the working value.
@@ -92,8 +95,8 @@ cbuffer cb4 : register(b4)
 // fails both comparisons (DXBC ge/le are ordered), +INF fails the upper one, -INF and negatives fail
 // the lower one. This is not the x != x idiom Math.hlsl warns about and works around with bit tests -
 // fxc cannot fold a comparison against a constant - and it costs 2 instructions per channel where
-// IsNaN_Strict alone costs 6. Measured on 0xD00AA2A7, against 270 instructions with the feature off:
-// the bit-test form built this shader at 551, this one at 421.
+// IsNaN_Strict alone costs 6. Measured, not assumed: building 0xD00AA2A7 with the bit-test helpers
+// instead costs it 130 more instructions. Do not "tidy" these back to Math.hlsl without re-measuring.
 bool BL2TPS_IsFiniteNonNegative(float x)
 {
    return x >= 0.0 && x <= FLT_MAX;
@@ -136,10 +139,10 @@ float BL2TPS_CompressWorkingPeak(float peak)
 //
 // The native block is deliberately NOT routed through this helper - provenance of the verbatim
 // register transcription is worth more than removing the duplication. Equivalence is held offline
-// instead: _tools/bl2tps_bridge/lutcheck.py compares the four derived coordinates (u_lo, u_hi, v,
-// weight) of both forms on exact float32 equality over 1.14M inputs. A deterministic sampler handed
-// identical coordinates returns identical colours for ANY table, which is a stronger statement than
-// comparing sampled values from one.
+// instead: the four derived coordinates (the two slice U's, V and the lerp weight) of both forms were
+// compared on exact float32 equality over 1.14M inputs. A deterministic sampler handed identical
+// coordinates returns identical colours for ANY table, which is a stronger statement than comparing
+// sampled values from one.
 float3 BL2TPS_SampleColorGradeGamma(float3 gammaRGB)
 {
    const float sliceScaled = gammaRGB.b * 14.9998999;
@@ -320,7 +323,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    // --- DOF composite (verbatim) ---
    // t4.a is the in-focus weight (1 = sharp subject, 0.25 = max-blurred background); summed with a radial falloff it
    // picks between the half-res blurred buffer (stored pre-divided by 4) and the sharp scene.
-   float3 hdr_color;
+   float3 hdrColor;
    r0.y = DOFKernelSize.w + v5.w;
    r0.x = v5.z;
    r0.xy = r0.xy * 2 + -1;
@@ -333,7 +336,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    r0.x = saturate(r0.x + r1.w);
    r2 = float4(1, 1, 0, 0) * v6.xyxx;
    r2 = t0.SampleLevel(s0_s, r2.xy, 0);
-   hdr_color = lerp(r1.xyz * 4, r2.rgb, r0.x);
+   hdrColor = lerp(r1.xyz * 4, r2.rgb, r0.x);
 
    // --- bloom ---
    if (LumaSettings.GameSettings.LumaBloomEnable > 0.5)
@@ -344,40 +347,40 @@ float4 RunTonemap(float4 v5, float4 v6)
       // (saturate(exp2(-3*luma) * .w)) is deliberately skipped: an 8-bit approximation that cancels the glow of the
       // brightest sources, the one thing this bloom exists to fix.
       float3 lumaBloom = t5.SampleLevel(s1_s, v6.xy, 0).rgb;
-      hdr_color += lumaBloom * (BloomTintAndScreenBlendThreshold.xyz * (4.0 * LumaSettings.GameSettings.BloomIntensity));
+      hdrColor += lumaBloom * (BloomTintAndScreenBlendThreshold.xyz * (4.0 * LumaSettings.GameSettings.BloomIntensity));
    }
    else
    {
       // Vanilla bloom (screen-blend gated by luminance, t1). BloomIntensity scales it (1 = vanilla).
-      r0.w = dot(hdr_color, float3(0.300000012, 0.589999974, 0.109999999));
+      r0.w = dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999));
       r0.w = r0.w * -3;
       r0.w = exp2(r0.w);
       r0.w = saturate(r0.w * BloomTintAndScreenBlendThreshold.w);
       r1 = t1.Sample(s1_s, v5.zw);
       r1.xyz = r1.xyz * BloomTintAndScreenBlendThreshold.xyz;
       r1.xyz = r1.xyz * 4;
-      hdr_color += r1.xyz * r0.w * LumaSettings.GameSettings.BloomIntensity;
+      hdrColor += r1.xyz * r0.w * LumaSettings.GameSettings.BloomIntensity;
    }
 
 #if TM_HAS_LIGHTSHAFT
    // Light shafts / god rays (TPS only), verbatim from tps_tonemap_0xF8997849: an inverse-luminance gate (adds only
    // into darker pixels), additive x4 colour, and a per-pixel attenuation in .a where shafts occlude.
    {
-      float lsGate = saturate(exp2(dot(hdr_color, float3(0.300000012, 0.589999974, 0.109999999)) * -3.0));
+      float lsGate = saturate(exp2(dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999)) * -3.0));
       float4 ls = t_lightshaft.Sample(s0_s, v5.zw);
-      hdr_color = hdr_color * ls.w + (ls.xyz * 4.0) * lsGate;
+      hdrColor = hdrColor * ls.w + (ls.xyz * 4.0) * lsGate;
    }
 #endif
 
    // User Exposure (scene-referred, pre-grade; 1 = vanilla). Applies to both SDR and HDR — the grade below tracks it.
-   hdr_color *= LumaSettings.GameSettings.Exposure;
+   hdrColor *= LumaSettings.GameSettings.Exposure;
 
    // The grade runs on the NATIVE scene like vanilla; the HDR reconstruction is a separate branch off this same
    // value, and it changes only the luminance of the graded result. As in MELE.
-   r0.xyz = hdr_color;
+   r0.xyz = hdrColor;
 
    // --- vignette (verbatim) ---
-   float3 vignette_color = r0.rgb;
+   float3 vignetteColor = r0.rgb;
    r1.xyz = r0.xyz * VignetteColor.xyz;
    r2.xyz = r0.xyz * -VignetteColor.xyz + r0.xyz;
    r1.xyz = v6.y * r2.xyz + r1.xyz;
@@ -391,12 +394,12 @@ float4 RunTonemap(float4 v5, float4 v6)
    r0.w = r2.y + -VignetteSettings.x;
    r0.xyz = (r0.w >= 0) ? r0.xyz : r1.xyz;
    // User Vignette Intensity: lerp between the pre-vignette color and the vignetted result (1 = vanilla, 0 = none).
-   r0.xyz = lerp(vignette_color, r0.xyz, LumaSettings.GameSettings.VignetteIntensity);
+   r0.xyz = lerp(vignetteColor, r0.xyz, LumaSettings.GameSettings.VignetteIntensity);
 
    // The curve's own input: post-vignette, pre-curve and UNCLIPPED - the physical colour before the native
    // per-channel curve compresses it. The HDR reconstruction continues the curve from here, and the native
    // branch below runs on this same value, unchanged.
-   const float3 curve_input = r0.xyz;
+   const float3 curveInput = r0.xyz;
 
    // --- ImageAdjustments per-channel curve (verbatim; keep swizzles exactly) ---
    r1 = r0.zzxy + -ImageAdjustments2.z;
@@ -436,8 +439,8 @@ float4 RunTonemap(float4 v5, float4 v6)
    // o.rgb is the graded look in gamma space, produced from the NATIVE scene, and it is the COMPLETE colour
    // reference: hue, saturation, per-channel tint, the LUT's grading and the game's own highlight whitening all
    // live in it. HDR replaces its luminance and nothing else. SDR presents it untouched.
-   float3 graded_sdr_gamma = o.rgb;
-   float3 sdr_lin = gamma_to_linear(graded_sdr_gamma, GCT_MIRROR);
+   float3 gradedSdrGamma = o.rgb;
+   float3 sdrLinear = gamma_to_linear(gradedSdrGamma, GCT_MIRROR);
 
    float3 postProcessedColor;
 
@@ -449,12 +452,12 @@ float4 RunTonemap(float4 v5, float4 v6)
       // Colour from the native grade, range from the working value. Declining leaves the native grade exactly
       // as it is: there is no second HDR model to fall back to, and expanding a curve the reconstruction cannot
       // model is the failure the guards exist to prevent.
-      float3 recovered = sdr_lin;
+      float3 recovered = sdrLinear;
 
       float workLuminance;
-      if (BL2TPS_TryBuildWorkingLuminance(curve_input, workLuminance))
+      if (BL2TPS_TryBuildWorkingLuminance(curveInput, workLuminance))
       {
-         recovered = BL2TPS_NativeColorAtLuminance(sdr_lin, workLuminance);
+         recovered = BL2TPS_NativeColorAtLuminance(sdrLinear, workLuminance);
       }
 
       // Display rolloff to the user's peak/paper-white nits. DICE by-luminance keeps hue; the *_CORRECT_CHANNELS_BEYOND_
@@ -473,16 +476,16 @@ float4 RunTonemap(float4 v5, float4 v6)
          float dcWeight = saturate(pow(saturate(GetLuminance(hdr) / peakWhite), dcExp));
          hdr = Saturation(hdr, 1.0 - dcWeight);
       }
-      hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation); // user Saturation (Oklab; 1 = vanilla)
+      // Color.hlsl's Saturation() is lerp(GetLuminance(c, CS_BT709), c, s) - a BT.709-luminance lerp, not Oklab.
+      hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation); // user Saturation (1 = vanilla)
       // user Contrast: slope around 18% mid-gray (linear, 1.0 = paper white). Excursions caught by the NaN/clamp tail.
-      const float midGray = 0.18;
-      hdr = (hdr - midGray) * LumaSettings.GameSettings.Contrast + midGray;
+      hdr = (hdr - MidGray) * LumaSettings.GameSettings.Contrast + MidGray; // MidGray = 0.18, Color.hlsl
 
       postProcessedColor = hdr;
    }
-   else // SDR (still presented through the scRGB swapchain) — sdr_lin is the vanilla grade, untouched
+   else // SDR (still presented through the scRGB swapchain) — sdrLinear is the vanilla grade, untouched
    {
-      postProcessedColor = sdr_lin;
+      postProcessedColor = sdrLinear;
    }
 
 #if UI_DRAW_TYPE >= 2
