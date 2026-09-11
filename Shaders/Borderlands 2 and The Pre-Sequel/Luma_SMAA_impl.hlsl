@@ -4,7 +4,9 @@
 // and the PS appends no HDR tail (Display Composition does paper-white + scRGB). Predication = scene-color .a depth,
 // null texture + scale 1.0 as the fallback.
 
-#include "../Includes/Common.hlsl"
+// No Luma include: this file references nothing from Common and carries no conditionals, and
+// ../Includes/SMAA.hlsl below is self-contained. Verified byte-identical across all six entry points
+// in both the Development and Publishing define sets.
 
 // (1/W, 1/H, W, H) at output resolution — filled by the mod (see main.cpp RunPostTonemapSMAA).
 cbuffer SmaaMetricsCB : register(b1)
