@@ -398,17 +398,20 @@ public:
       // Exposes UI Paper White without renormalizing the already combined scene/HUD buffer; type 2 would
       // double-apply the transport ratio.
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('1');
-      // Experimental stage-1 HDR reconstruction, one checkbox per colour family in Advanced Settings so a
-      // family can be A/B-tested against the shipped path without editing a header or rebuilding. Every one
-      // defaults to off and is locked outside DEVELOPMENT: they change the stage-1 contract rather than
-      // refactor it (see the header of Includes/Tonemap_MELE_ExperimentConfig.hlsli) and none ships enabled.
+      // Stage-1 HDR reconstruction, one checkbox per colour family in Advanced Settings so a family can be
+      // A/B-tested against the legacy path without editing a header or rebuilding. All five ship ENABLED
+      // after the 2026-09-11 in-game A/B across the three games; the checkbox now turns the legacy path
+      // back on rather than the new one. It stays locked outside DEVELOPMENT because these decide the
+      // stage-1 contract, not a user preference.
       //
-      // Only the families that exist in the detected game are registered. A shader whose define is absent
-      // falls back to the header's #ifndef default, so the unregistered ones stay at 0 either way.
+      // The default here must track the #ifndef default in Includes/Tonemap_MELE_ExperimentConfig.hlsli.
+      // A registered define is always passed to the compiler, so a stale '0' here would silently override
+      // the header for every family the detected game registers, while the families it does not register
+      // would follow the header. That split is the failure mode this comment exists to prevent.
       constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
       std::vector<ShaderDefineData> experiment_shader_defines;
       const auto add_family = [&](const char* feature, const char* tooltip)
-      { experiment_shader_defines.push_back({feature, '0', true, kExperimentLocked, tooltip, 1}); };
+      { experiment_shader_defines.push_back({feature, '1', true, kExperimentLocked, tooltip, 1}); };
       if (g_me_game == MEGame::ME1LE || g_me_game == MEGame::ME2LE)
       {
          add_family("MELE_HDR_EXP_LUT",
@@ -426,8 +429,8 @@ public:
          add_family("MELE_HDR_ME3_FILMIC",
             "Filmic LUT path: continue the game's own 1D curve from sampled anchors on linear scene plus bloom.");
          add_family("MELE_HDR_ME3_HARDCLIP",
-            "Analytic hard-clip permutation: prepare the grade input instead of scaling an already clipped white.\n"
-            "Its Clip Hue Shift and Clip Blowout sliders do nothing unless this is on.");
+            "Analytic hard-clip permutation: prepare the grade input instead of scaling an already clipped white,\n"
+            "then take hue alone from the native hard-clipped SDR.");
       }
       shader_defines_data.append_range(experiment_shader_defines);
 

@@ -1,38 +1,46 @@
 #ifndef LUMA_MELE_TONEMAP_EXPERIMENT_CONFIG
 #define LUMA_MELE_TONEMAP_EXPERIMENT_CONFIG
 
-// Compile-time selectors for the experimental stage-1 HDR reconstruction, one per colour family.
-// Every one defaults to 0, which is the shipped reconstruction: with all five at 0 the preprocessor
-// removes every line this experiment adds, so all 42 fxc listings stay byte-identical to the
-// pre-change capture. That identity is the gate, not an expectation; see _tools/mele_bridge.
+// Compile-time selectors for the stage-1 HDR reconstruction, one per colour family. Every one now
+// defaults to 1: an in-game A/B across ME1LE, ME2LE and ME3LE on 2026-09-11 found the reconstruction
+// these families produce clearly better than the legacy path, with more detail retained in highlights.
+// That verdict is what promoted them; they were added at 0 and carried no evidence until then.
 //
-// HOW THIS DIFFERS FROM THE SHIPPED PATH. The shipped reconstruction lets the native per-channel value
-// reach the grade untouched and only expands the graded output by a max-channel scalar. An enabled family
-// here does the opposite: it feeds the grade a compressed proxy and divides the scale back out. That is a
-// real change of contract, not a refactor, and it is why every selector defaults to off.
+// HOW THIS DIFFERS FROM THE LEGACY PATH. The legacy reconstruction lets the native per-channel value
+// reach the grade untouched and only expands the graded output by a max-channel scalar, so the grade
+// never sees anything the vanilla clip did not already flatten. A family here prepares the grade INPUT
+// instead - a compressed proxy, or a continued tone curve - and divides the scale back out afterwards.
+// That is a change of contract rather than a refactor, which is why it took runtime frames to settle.
 //
-// Before enabling anything, read the prior in Shaders/Borderlands 2 and The Pre-Sequel/Luma_BL2TPS_Tonemap.hlsl:
-// the same wrap was tried and rejected there, on the same kind of asymptotic curve that ME1LE and ME2LE have.
-// Flipping a selector on for a release is a separate change from adding it and needs runtime A/B frames.
+// Setting one back to 0 restores the legacy path for its permutations exactly, and that state is still
+// gated: forcing all five to 0 must reproduce the pre-experiment capture in _tools/mele_bridge/baseline
+// byte for byte. Keep that escape hatch compiling; it is the only way to A/B this again.
+//
+// Enabling a family in ANOTHER game is still a separate decision with its own evidence. The prior in
+// Shaders/Borderlands 2 and The Pre-Sequel/Luma_BL2TPS_Tonemap.hlsl stands: the same wrap was tried and
+// rejected there, on the same kind of asymptotic curve ME1LE and ME2LE have. MELE's frames do not
+// transfer to BL2's.
 
 #ifndef MELE_HDR_EXP_LUT
-#define MELE_HDR_EXP_LUT 0 // ME1LE/ME2LE exponential curve + colour LUT, 8 permutations.
+#define MELE_HDR_EXP_LUT 1 // ME1LE/ME2LE exponential curve + colour LUT, 8 permutations.
 #endif
 #ifndef MELE_HDR_EXP_ANALYTIC
-#define MELE_HDR_EXP_ANALYTIC 0 // ME1LE/ME2LE exponential curve + analytic grade, 2 permutations.
+#define MELE_HDR_EXP_ANALYTIC 1 // ME1LE/ME2LE exponential curve + analytic grade, 2 permutations.
 #endif
 #ifndef MELE_HDR_ME2_FILMIC
-#define MELE_HDR_ME2_FILMIC 0 // ME2LE pre-curve + 1D filmic LUT + colour LUT, 4 permutations.
+#define MELE_HDR_ME2_FILMIC 1 // ME2LE pre-curve + 1D filmic LUT + colour LUT, 4 permutations.
 #endif
 #ifndef MELE_HDR_ME3_FILMIC
-#define MELE_HDR_ME3_FILMIC 0 // ME3LE 1D filmic LUT from linear scene+bloom + colour LUT, 4 permutations.
+#define MELE_HDR_ME3_FILMIC 1 // ME3LE 1D filmic LUT from linear scene+bloom + colour LUT, 4 permutations.
 #endif
 #ifndef MELE_HDR_ME3_HARDCLIP
-#define MELE_HDR_ME3_HARDCLIP 0 // ME3LE analytic hard-clip grade, 0x225A8330 only.
+#define MELE_HDR_ME3_HARDCLIP 1 // ME3LE analytic hard-clip grade, 0x225A8330 only.
 #endif
 
-// Bench values, not calibration: exercised against the captured LUTs and cbuffers, never against finished
-// game frames, so none of them may be presented as tuned.
+// Bench values: exercised against the captured LUTs and cbuffers, and carried unchanged through the
+// 2026-09-11 A/B that promoted these families. That A/B judged the families as a whole, so it validates
+// this set as a working combination and not any one number individually - none of them may be presented
+// as individually tuned, and changing one still needs its own frames.
 #define MELE_HDR_BRIDGE_SHOULDER 0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
 #define MELE_HDR_PIVOT           0.18 // p, scene mid-gray, where the tone-curve continuation starts.
 #define MELE_HDR_PROBE_LO        0.16 // Sampled-fit probes for the filmic families, in scene-x.
@@ -54,18 +62,19 @@
 #define MELE_FILMIC_MIN_SLOPE_X 1e-5
 
 // Strength of family 05's hue-only transfer toward the native hard-clipped SDR. A calibration value, not
-// a property of the algorithm; runtime A/B decides whether it survives.
+// a property of the algorithm. The family was promoted by the 2026-09-11 A/B; this number was set back
+// to 0.75 afterwards, so it is the one part of family 05 that A/B did not run at its shipped value.
 //
-// At 1.0 the blend IS the donor's ab, so the result takes the donor's hue outright. That is the point,
-// and it has one measured consequence worth knowing before judging a frame: a hard clip drives the
-// brightest colours to white, and a white donor's OKLab ab is not zero but matrix round-off, about
-// 3.7e-8. At exactly 1.0 the renormalization scales that round-off back up to the target's full chroma,
-// so the hue of a fully blown highlight is arbitrary rather than preserved - measured at +41.3 deg to
-// +89.9 deg on one stimulus. Any value below 1 leaves the target a share of its own ab and the direction
-// survives. No donor-chroma threshold is added to paper over this: that would be a new artistic rule,
-// and the honest fix if a frame shows it is to lower this number.
+// Why not 1.0: at exactly 1.0 the blend IS the donor's ab, so the target keeps none of its own. A hard
+// clip drives the brightest colours to white, and a white donor's OKLab ab is not zero but matrix
+// round-off, about 3.7e-8; the renormalization then scales that round-off back up to the target's full
+// chroma, and the hue of a fully blown highlight becomes arbitrary rather than preserved - measured at
+// +41.3 deg to +89.9 deg on one stimulus. At 0.75 the target keeps 0.25 of its own ab, which is far
+// above that round-off, so the direction survives and the degenerate case cannot be reached from a
+// neutral donor. No donor-chroma threshold is added to paper over it: that would be a new artistic
+// rule, and lowering this number is the honest control.
 #ifndef MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH
-#define MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH 1.0
+#define MELE_HDR_ME3_HARDCLIP_HUE_STRENGTH 0.75
 #endif
 
 // One colour path per family, not selectable. Families 01-04 take their RGB ratios from the real graded SDR
