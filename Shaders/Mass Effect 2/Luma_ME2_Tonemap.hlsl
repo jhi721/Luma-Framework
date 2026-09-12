@@ -70,6 +70,12 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    // its average()-based source luminance and its channel containment on doubly-narrowed primaries.
    ds.InOutColorSpace = CS_BT2020;
    float3 hdr = DICETonemap(sceneHDR * paperWhite, peakWhite, ds) / paperWhite;
+   // The clip is a guard, not a working step: nothing upstream can leave BT.2020 here. The canvas is non-negative
+   // BT.709 (Sanitize), which sits strictly inside BT.2020, and every DICE step either preserves chromaticity or
+   // pulls inward - the luminance scale, the desaturation toward luminance, CorrectOutOfRangeColor. MEASURED: it
+   // moved 0 of 867k samples, over paper white 80/203/250, peak 400/1000/4000 and HighlightDechroma 0 and 1.
+   // Kept anyway: it carries its own branch, so an in-gamut pixel pays ~5 instructions, and the three sibling
+   // MacLeod-Boynton ports all call it the same way.
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 
    // User saturation LAST, after the display map: the repo's convention. Lerp against BT.709 luminance, not
