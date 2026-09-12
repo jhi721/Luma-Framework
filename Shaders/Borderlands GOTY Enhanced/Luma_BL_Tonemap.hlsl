@@ -141,6 +141,11 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // in-range rolloff. DesaturationVsDarkeningRatio 1.0
    // (default) = contain by desaturating, not darkening (darkening flattens detail).
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+   // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The colour is already
+   // BT.2020 here and is converted back below, so the default CS_BT709 would make it convert a SECOND time and
+   // run its shoulder trigger (an RGB average), its compression and its channel containment on doubly-narrowed
+   // primaries. Neutrals cancel out; saturated highlights do not.
+   ds.InOutColorSpace = CS_BT2020;
    float3 hdr = DICETonemap(extendedBT2020 * paperWhite, peakWhite, ds) / paperWhite;
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 
