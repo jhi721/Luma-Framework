@@ -16,7 +16,7 @@ struct LumaGameSettings
 {
    float Exposure;           // scene multiplier before the game grade (1 = vanilla). SDR + HDR
    float Saturation;         // Oklab saturation (1 = vanilla). HDR display path only
-   float HighlightDechroma;  // bright sources fade to white approaching peak (0 = off). HDR display path only
+   float HighlightDechroma;  // 0 = off. DICE highlight desaturation: sources above a third of peak fade toward white, mid-tones untouched. HDR display path only
    float Dithering;          // 1 = animated triangular output dither (HDR, anti-banding)
    float VideoAutoHDREnable; // 0/1. 1 = light PumboAutoHDR on pre-rendered videos (HDR only); 0 = flat SDR at paper white
    float VideoAutoHDRBoost;  // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off
@@ -27,7 +27,7 @@ struct LumaGameSettings
    // FinalGrade_0xDE5CF9CD.ps_5_0.hlsl.
    float HighlightsHueChroma;   // 0.4 shipped
    float HighlightsHueStrength; // 0.8 shipped
-   float Contrast;              // 1 = vanilla. Slope contrast around 18% mid-gray on the final HDR color. HDR display path only
+   float Contrast;              // 1 = vanilla. Multiplicative contrast around 18% mid-gray, applied before the display map. HDR display path only
    float BloomIntensity;        // 1 = vanilla, 0 = none. Scales the engine's glow where it enters the screen blend (SDR + HDR)
    float ColorGradingIntensity; // 1 = vanilla, 0 = no tint. Fades the vanilla highlight/shadow tint lerps out of the grade (SDR + HDR)
 };

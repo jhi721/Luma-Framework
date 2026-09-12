@@ -310,28 +310,30 @@ void main(
             lin = RestoreHueAndChrominance(lin, hueRef, saturate(LumaSettings.GameSettings.HighlightsHueStrength), saturate(LumaSettings.GameSettings.HighlightsHueChroma));
          }
 
-         DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-         float3 hdr = DICETonemap(lin * paperWhite, peakWhite, settings) / paperWhite;
-
-         const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
-         if (highlightDechroma > 0.0)
-         {
-            float dcExp = lerp(1.0, 0.05, highlightDechroma);
-            float dcWeight = saturate(pow(saturate(GetLuminance(hdr) / peakWhite), dcExp));
-            hdr = Saturation(hdr, 1.0 - dcWeight);
-         }
-         hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
-
-         // User contrast: slope around 18% mid-gray (linear, 1.0 = paper white), after DICE and saturation.
-         // Gated so the shipped 1.0 stays bit-exact rather than paying a subtract/multiply/add round trip.
-         // KNOWN, ACCEPTED: the pivot means black does not stay black below 1.0 — a fully faded frame lands on
-         // 0.18 * (1 - Contrast), so cutscene fade-to-blacks read dark grey. The fade is applied upstream in
-         // the tonemap pass, so it cannot be reordered after the pivot.
+         // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the
+         // slider would escape the peak it just established, and nothing downstream re-contains it.
+         // Multiplicative around mid-gray, the repo's form (RenoDX_Contrast); 0.18 is mid-gray here too,
+         // display-referred with 1.0 = paper white (code 0.5). Gated so the shipped 1.0 stays bit-exact. The pow
+         // is spelled out with a floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than
+         // pow(0, 0) = NaN. Black stays black at every setting (0^C = 0), so the upstream fade-to-black no longer
+         // lands on 0.18 * (1 - Contrast) as the old additive pivot did.
          [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
          {
             const float midGray = 0.18;
-            hdr = (hdr - midGray) * LumaSettings.GameSettings.Contrast + midGray;
+            lin = exp2(LumaSettings.GameSettings.Contrast * log2(max(lin / midGray, 1e-30))) * midGray;
          }
+
+         DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+         // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
+         // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
+         // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
+         // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
+         // flattens it for every pixel above the shoulder.
+         settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
+         float3 hdr = DICETonemap(lin * paperWhite, peakWhite, settings) / paperWhite;
+
+         // User saturation LAST, after the display map: the repo's convention.
+         hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
 
          postProcessedColor = hdr;
       }
