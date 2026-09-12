@@ -1225,7 +1225,6 @@ public:
                   "\nRenoDX (HDR tonemap method)"
                   "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
-                  "\nLilium (gamut clip)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS)"
                   "\ndgVoodoo2 (DirectX 9 -> 11 wrapper, required)");
