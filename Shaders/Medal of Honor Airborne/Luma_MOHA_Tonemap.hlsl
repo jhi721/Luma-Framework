@@ -208,12 +208,13 @@ float3 RunMOHATonemap(float2 blurUV, float2 sceneUV)
    const float sceneWeight = saturate(1.0 - blurAmount);
 
    float4 blurred = ApplyDgvMask(BlurredImage.Sample(BlurredImageSampler_s, blurUV), DgvMaskT1, DgvFillT1);
-   // Stored pre-divided by 4, hence the x4; vanilla's unorm view also capped it at 4.0, a cap the fp16 upgrade lifted.
-   // NEVER scaled by BloomIntensity: DoF and bloom are SUMMED, and in the sniper scope this term IS the frame.
-   const float3 bloom = blurred.xyz * 4.0;
+   // The engine's combined DoF blur + native bloom target, stored pre-divided by 4, hence the x4; vanilla's unorm view
+   // also capped it at 4.0, a cap the fp16 upgrade lifted. NEVER scale this by BloomIntensity: DoF and bloom are SUMMED
+   // in it, and in the sniper scope this term IS the frame.
+   const float3 blurContribution = blurred.xyz * 4.0;
    const float weightSum = blurred.w * 4.0 + sceneWeight;
 
-   float3 untonemapped = scene.xyz * sceneWeight + bloom;
+   float3 untonemapped = scene.xyz * sceneWeight + blurContribution;
    untonemapped *= (abs(weightSum) > 0.0) ? rcp(weightSum) : FLT_MAX; // rcp guard, as the original does
 
    // AFTER the normalisation: the weight sum belongs to the DoF composite, and dividing the glow by it would
@@ -241,11 +242,12 @@ float3 RunMOHATonemap(float2 blurUV, float2 sceneUV)
 #define GcOverlayColor PsConstants[13] // .xyz OverlayColor, .w its blend weight (this pass's fade)
 #define GcInverseGamma PsConstants[14] // .x inverse display gamma (1/DisplayGamma, 0.4545 at the ini default 2.2)
 
-// The grade with the overlay held OUT (it is the fade; FinishMOHA re-applies it after the display map).
-float3 GradeGC(float3 scene, bool clampSDR)
+// The extended grade: overlay (the fade) held OUT, FinishMOHA re-applies it after the display map; the vanilla
+// saturate() as a lower-only max(0), so highlights keep their real channel ratio. Everything else verbatim.
+float3 GradeGCExtended(float3 scene)
 {
    float3 c = scene * GcColorScale.xyz;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mad_sat in the original
+   c = max(0.0, c); // mad_sat in the original
    return PowUE3(c, GcInverseGamma.xxx);
 }
 
@@ -268,5 +270,5 @@ float3 RunMOHAGammaCorrection(float2 sceneUV)
    // The original ends in a branch on PsConstants[8].x selecting a colour-grading LUT blend. That LUT is never bound,
    // so dgVoodoo folded its six sample stages to the constant (0,0,0,1). Only the direct path is reproduced.
    float3 sdrVanillaGamma = GradeGCVanilla(untonemapped);
-   return FinishMOHA(untonemapped, sdrVanillaGamma, GradeGC(untonemapped, false), 1.0, GcOverlayColor, sceneUV);
+   return FinishMOHA(untonemapped, sdrVanillaGamma, GradeGCExtended(untonemapped), 1.0, GcOverlayColor, sceneUV);
 }
