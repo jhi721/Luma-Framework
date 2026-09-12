@@ -500,24 +500,33 @@ class BorderlandsGoty final : public Game
 public:
    void OnInit(bool async) override
    {
-      // A/B for the HDR reconstruction source (Luma_BL_Tonemap.hlsl). Off keeps the shipping
-      // UpgradeToneMap bridge, which adds the luminance a neutral SDR tonemap clipped back on top of the
-      // clamped grade; on drops the grade's two upper saturate()s instead, so the game's own analytic
-      // grade continues past SDR white on its own. Both read the same scene mix, so flipping this
-      // compares the two methods on one frame. Fixed at '0' outside DEVELOPMENT: it changes the image
-      // rather than refactoring it, and it does not ship enabled.
-      constexpr bool kReconstructionLocked = DEVELOPMENT ? false : true;
+      // A/Bs for the HDR tonemap (Luma_BL_Tonemap.hlsl), each a compile-time switch that changes the image
+      // rather than refactoring it, so each is fixed at '0' outside DEVELOPMENT and none ships enabled.
+      // Reconstruction: off keeps the shipping UpgradeToneMap bridge, which adds the luminance a neutral
+      // SDR tonemap clipped back on top of the clamped grade; on drops the grade's two upper saturate()s
+      // instead, so the game's own analytic grade continues past SDR white on its own. Hue reference:
+      // off locks the post-DICE hue to that unclipped extended grade; on locks it to the same value run
+      // through RenoDX BL1's soft per-channel Reinhard, so bright saturated sources lean the way the
+      // vanilla clip leaned them without its whitening. Both read the same scene mix, so flipping either
+      // compares the two methods on one frame.
+      constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
 
       // Game-specific HDR toggles consumed by the replaced tonemap shaders (Luma_BL_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: recover highlights + DICE display map"},
          {"XE_GTAO_QUALITY", '3', true, false, "Ambient Occlusion (XeGTAO) quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
-         {"BL_HDR_RECONSTRUCTION", '0', true, kReconstructionLocked,
+         {"BL_HDR_RECONSTRUCTION", '0', true, kExperimentLocked,
             "HDR: extend the game's own grade instead of rebuilding highlights\n"
             "Drops only the two upper saturate() clamps from the vanilla grade, so the same analytic\n"
             "function continues past SDR white and feeds DICE directly.\n"
             "Off - the shipping recovery, which adds the luminance a neutral SDR tonemap clipped back on\n"
             "top of the clamped grade.",
+            1},
+         {"BL_HDR_HUE_REFERENCE", '0', true, kExperimentLocked,
+            "HDR: soft hue reference for the post-DICE hue lock\n"
+            "Runs the extended grade through a soft per-channel Reinhard (RenoDX BL1's reference) so bright\n"
+            "saturated sources bend their hue the way the vanilla clip did, without its whitening.\n"
+            "Off - hue locked to the unclipped extended grade itself.",
             1},
       };
       shader_defines_data.append_range(game_shader_defines_data);

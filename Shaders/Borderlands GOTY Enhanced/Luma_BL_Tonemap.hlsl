@@ -55,6 +55,15 @@
 #define BL_HDR_RECONSTRUCTION 0
 #endif
 
+// Hue reference for the post-DICE hue lock (A/B). 0 = the unclipped extended grade itself. 1 = that same
+// value run through a soft per-channel Reinhard (RenoDX BL1's hue/chrominance reference), so the hue
+// bends toward the clip the way the vanilla saturate() bent it, without the clip's whitening — the
+// RenoDX BL1 soft hue-reference adapted to the existing Luma post-DICE hue-restoration architecture.
+// DEVELOPMENT-only checkbox in main.cpp; a shipped build compiles the 0 side.
+#ifndef BL_HDR_HUE_REFERENCE
+#define BL_HDR_HUE_REFERENCE 0
+#endif
+
 // HighlightDechroma is an optional user slider (see step 6 below); default 0 = off (only the mandatory DICE/gamut
 // desaturation applies).
 
@@ -184,6 +193,17 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // chrominance 0.0 — we keep the by-luminance DICE chroma and let gamut mapping (GAMUT_MAPPING_TYPE in the
    // composition) roll chroma to the displayable maximum at each luminance. No hand-tuned desaturation.
    float3 hueRef = gamma_to_linear(GradeUE3(untonemapped, false));
+#if BL_HDR_HUE_REFERENCE
+   // Built in BT.2020 because that is where RenoDX applies it (common.hlsli, ApplyCustomGrading):
+   // ReinhardPiecewise(x, 5, 1.5) is linear below 1.5 and rolls off toward 5 above, per channel, so a
+   // saturated highlight's strong channel compresses before its weak ones and the hue leans the way the
+   // vanilla clip leaned it — softly, and only in the hue: RestoreHueAndChrominance below still takes
+   // its chroma from the DICE result and its lightness from nothing but the target. Reinhard.hlsl's
+   // ReinhardPiecewise is token-identical to RenoDX's; the two ComputeReinhardScale differ only for a
+   // non-zero minimum, and ReinhardPiecewise fixes it at 0. RenoDX applies this before its display map;
+   // Luma applies it after DICE, so this is an adaptation of the donor, not of the pipeline.
+   hueRef = BT2020_To_BT709(Reinhard::ReinhardPiecewise(BT709_To_BT2020(hueRef), 5.0, 1.5));
+#endif
    hdr = RestoreHueAndChrominance(hdr, hueRef, 1.0, 0.0);
 #endif
 
