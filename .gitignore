@@ -46,11 +46,7 @@ Source/Games/**/vcpkg_installed/**
 
 # Compiled, Disassembled and Dumped Shaders
 *.cso
-**/Dump*/**.asm
-**/Dump*/**.spv
-**/Dump*/**.cso
-**/Dump*/**.meta
-**/Dump*/**/*.hlsl
+**/Dump*/**
 
 # Misc
 [Bb]uild/
@@ -59,6 +55,36 @@ Source/Games/**/vcpkg_installed/**
 *.timestamp
 deploy-*.ps1
 *.log
+
+# Local AI tooling / assistant config - not tracked
+.agents/
+.claude/
+.codex/
+.gemini/
+.mcp.json
+.rtk/
+AGENTS.md
+CLAUDE.md
+.github/copilot-instructions.md
+.github/instructions/
+Scripts/sync-agent-skills.ps1
+Scripts/validate-agent-guidance.ps1
+
+# Local docs, notes and reviews - not tracked
+docs/
+NOTES.md
+NOTES_*.md
+*_NOTES.md
+CODE_REVIEW*.md
+*_REVIEW.md
+*_RESEARCH.md
+*_ANALYSIS.md
+*_VALIDATION.md
+
+# Local tools + scratch - not tracked
+_tools/
+_dlaa_calib/
+*.patch
 
 # Forced not ignored (e.g. !./Source/Core/Luma.vcxproj)
 
