@@ -48,9 +48,15 @@
 // DEVELOPMENT A/B for the FILMIC permutation's highlight-colour transfer, the only stage that differs:
 // 0 = the shipped Oklch EmulateHighlightHue, 1 = the canonical MacLeod-Boynton model solved in BT.2020.
 // Target, reference, mask and the exact BT.709 Y restore are identical on both legs, so this isolates the
-// perceptual model. ⚠ At full mask BOTH legs replace the chromaticity entirely with the reference's, so
-// they converge there by construction and the two differ only across the mask ramp; measured in
-// _tools/me2_bridge/me2_filmic_ab.py. Production stays 0 until a runtime pass says otherwise.
+// perceptual model. Where the legs land is decided by how chromatic the TARGET is, not by the mask alone.
+// On a CHROMATIC target at full mask both reduce to the reference's chromaticity at the recovered
+// luminance - Oklch hue + C/L and MB hue + purity are both scale-invariant, and the Y restore fixes the
+// remaining scalar - so they agree to ~1e-6. On a NEAR-NEUTRAL target they diverge, and full mask is where
+// that bites: Oklch fades itself out below C/L 0.02 and hands back the target, while MB's 1e-14 epsilon
+// never fires and it rotates all the way onto the reference hue. ⚠ Those targets are the MAJORITY of
+// full-mask pixels, because the vanilla curve drives bright colour toward white. Measured post-DICE at
+// w = 1: mean 1.27 deg, p95 4.23 deg, max 6.18 deg, up to 0.12 on the max channel.
+// Numbers and the three mask zones: _tools/me2_bridge/me2_filmic_ab.py.
 #ifndef ME2_FILMIC_HUE_MODEL
 #define ME2_FILMIC_HUE_MODEL 0
 #endif
