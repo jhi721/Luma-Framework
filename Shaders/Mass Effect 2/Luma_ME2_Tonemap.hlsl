@@ -45,8 +45,9 @@ float3 Sanitize(float3 c)
 }
 
 #if TONEMAP_TYPE >= 1
-// The display map, and the LAST colour operation of the scene. Called from the MATERIAL pass, after the vignette.
-// Takes/returns LINEAR light, 1.0 = paper white; reads only LumaSettings and NO cb4 row, so it can live in either pass.
+// The display map plus the user saturation: the LAST colour operations of the scene. Called from the MATERIAL pass,
+// after the vignette. Takes/returns LINEAR light, 1.0 = paper white; reads only LumaSettings and NO cb4 row, so it
+// can live in either pass.
 float3 MapME2ToDisplay(float3 sceneHDR)
 {
    // Through the Settings.hlsl accessors, not LumaSettings directly: they carry the HDR_TONEMAP_* overrides and the
@@ -59,6 +60,12 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    // Luminance in PQ (hue-preserving), then CORRECT_CHANNELS_BEYOND_PEAK_WHITE fades over-peak channels to white.
    // Identity below the shoulder (a third of peak), so diffuse content and the upstream sliders are untouched.
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+   // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
+   // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
+   // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
+   // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
+   // flattens it for every pixel above the shoulder.
+   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
 #if TONEMAP_IN_WIDER_GAMUT
    // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. We already converted above
    // and undo it below, so leaving the default CS_BT709 in makes it convert a SECOND time and run its compression,
@@ -70,13 +77,9 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 #endif
 
-   // Perceptual highlight dechroma (optional, 0 = off). Display-referred by construction (it normalizes by peak),
-   // so it cannot move upstream: on unmapped input the weight saturates and the highlights go greyscale.
-   // `hdr` is paper-white-relative while `peakWhite` is 80-nit-relative, hence the paperWhite factor — without it
-   // the effect silently weakened as the user raised Game Paper White. Linear in both the slider and luminance,
-   // so it is continuous at 0 (an exponent-only mapping jumped to a large desaturation on the first slider tick).
-   const float dcWeight = LumaSettings.GameSettings.HighlightDechroma * saturate(GetLuminance(hdr) * paperWhite / peakWhite);
-   return Saturation(hdr, 1.0 - dcWeight);
+   // User saturation LAST, after the display map: the repo's convention. Lerp against BT.709 luminance, not
+   // hue-preserving; 1.0 is a no-op. Scale-linear, so it needs no view of the engine fade the uber re-applies.
+   return Saturation(hdr, LumaSettings.GameSettings.Saturation);
 }
 #endif // TONEMAP_TYPE >= 1
 
@@ -338,13 +341,20 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    hdr = ME2_ApplyFilmicHighlightColor(untonemapped, hdr);
 #endif
 
-   // Creative sliders, scene-referred. They stay in THIS pass because the fade below is a cb4 row only it can read,
-   // and contrast must precede the fade: fade-first makes (0 - 0.18) * C + 0.18 land on grey instead of black.
-   hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
-   // User contrast: slope around mid-gray (linear, 1.0 = paper white). 1.0 = vanilla.
-   hdr = (hdr - MidGray) * LumaSettings.GameSettings.Contrast + MidGray;
+   // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider
+   // would escape the Scene Peak it just established, and nothing downstream re-contains it. Multiplicative around
+   // mid-gray (0.18, 1.0 = paper white), the repo's form (RenoDX_Contrast). It stays in THIS pass because the engine
+   // fade below is a cb4 row only the uber can read, and contrast must precede the fade: after it, a fade k would
+   // land at k^C, a non-linear fade at any C != 1. [branch] on a cbuffer uniform: at the 1.0 default this is a
+   // bit-exact no-op. The pow is spelled out with a floored log2 so Contrast 0 on a black pixel is
+   // 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN; black stays black at every setting (0^C = 0), where the old
+   // additive pivot lifted it to 0.18 * (1 - C). User saturation runs in the material, after the display map.
+   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
+   {
+      hdr = exp2(LumaSettings.GameSettings.Contrast * log2(max(hdr / MidGray, 1e-30))) * MidGray;
+   }
 
-   // Re-apply the engine fade linearly, LAST, after the creative sliders. At rest it is a no-op.
+   // Re-apply the engine fade linearly, LAST, after contrast. At rest it is a no-op.
    // ⚠ This pass leaves UNMAPPED linear HDR (values can reach hundreds); the material maps it. See NOTES.md.
    float3 outColor = hdr * outputScale;
 #else

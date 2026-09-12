@@ -620,7 +620,8 @@ public:
       Slider("Contrast", gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast", 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
       Slider("Saturation", gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation", 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
       Slider("Highlights Desaturation", gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation", 0.f, 1.f,
-         "How soon bright sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+         "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).\n"
+         "Only acts above a third of your Peak Brightness, so mid-tones keep their color whatever this is set to.");
 
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");

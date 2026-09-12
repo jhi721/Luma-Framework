@@ -14,9 +14,10 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;          // scene-referred multiplier applied pre-grade on the uber. 1 = vanilla.
-   float Saturation;        // 1 = vanilla. Lerp against BT.709 luminance on the final HDR colour.
-   float Contrast;          // 1 = vanilla. Slope around 18% mid-gray on the final HDR colour.
-   float HighlightDechroma; // 0 = off (default). Higher makes bright sources fade toward white sooner.
+   float Saturation;        // 1 = vanilla. Lerp against BT.709 luminance, applied LAST, after the display map.
+   float Contrast;          // 1 = vanilla. Multiplicative contrast around 18% mid-gray, applied before the display map.
+   float HighlightDechroma; // 0 = off (default). DICE highlight desaturation: sources above a third of peak fade toward
+                            // white, mid-tones untouched.
    float Dithering;         // 0/1. Animated triangular dither at the material's encode, to break gradient banding.
    // Native look controls. Both scale ONLY the radial/temporal part of a native effect, never its white point: the
    // vignette's centre value (1.010363, 1.000006, 1.163092) is part of the vanilla grade, not a darkening.
