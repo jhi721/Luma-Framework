@@ -21,7 +21,8 @@
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 #include <unordered_set>
 
-// Both replaced, both run every gameplay frame (uber first, gamma correction last). Separate register maps.
+// Both replaced, separate register maps. The gamma correction pass ends every frame; the uber runs first when it
+// runs at all - the engine skips it in elevators and some loading scenes, which UberRanThisFrame carries over.
 static constexpr uint32_t kUberPostHash = 0xAC8341E0;        // HDR grade -> fp16 intermediate
 static constexpr uint32_t kGammaCorrectionHash = 0x17CE0932; // canvas encode, the FINAL pass
 // Engine copy scene B -> A. Not replaced; DEVELOPMENT dumps its gamma row, since a non-1 exponent would move the encode
@@ -578,7 +579,7 @@ class MassEffect final : public Game
 public:
    void OnInit(bool async) override
    {
-      // Game-specific toggles consumed by the replaced pass (Luma_ME1_Tonemap.hlsl).
+      // Game-specific toggles consumed by both replaced passes (Luma_ME1_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map"},
       };
@@ -619,7 +620,8 @@ public:
       GetShaderDefineData(GAMUT_MAPPING_TYPE_HASH).SetDefaultValue('1'); // gamut-map wild colors in composition
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
-      // dgVoodoo binds b0-b5 only (measured), so b12/b13 are free. luma_ui stays off: the game draws its own UI.
+      // dgVoodoo binds b0-b5 only (measured), so b11 (core DrawBloom's own constants) and b12/b13 are free.
+      // luma_ui stays off: the game draws its own UI.
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
       luma_ui_cbuffer_index = -1;
@@ -894,6 +896,8 @@ public:
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
 
       // Hide HUD: cancel post-final draws targeting the same canvas - the render-target test is the load-bearing half.
+      // The UI families are hash-replaced, so is_custom_pass is true for them: an original PS hash (not UINT64_MAX)
+      // is what separates a replaced game draw from one of Luma's own injected passes.
       if (g_hide_ui && is_immediate && (!is_custom_pass || original_shader_hashes.pixel_shaders[0] != UINT64_MAX) && gd.has_drawn_final && gd.canvas_res)
       {
          ComPtr<ID3D11Resource> rt = GetBoundRenderTargetResource(native_device_context);
@@ -909,8 +913,8 @@ public:
 #endif
 
 #if DEVELOPMENT
-      // HUD permutation net. The cxform sweep returns exactly the five replaced families x both builds - complete FOR
-      // WHAT DREW.
+      // HUD permutation net: logs post-final canvas draws whose PS is NOT replaced (Includes/GFxUI.hlsl covers eight
+      // families x both dgVoodoo builds). Complete only FOR WHAT DREW.
       if (is_immediate && !is_custom_pass && gd.has_drawn_final && gd.canvas_res && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
       {
          const uint32_t ps_hash = (uint32_t)original_shader_hashes.pixel_shaders[0];
@@ -1201,7 +1205,8 @@ public:
       }
 #endif
 
-      // --- HDR grade (read in Luma_ME1_Tonemap.hlsl via LumaSettings.GameSettings; HDR tonemap path only) ---
+      // --- Grade (read in Luma_ME1_Tonemap.hlsl via LumaSettings.GameSettings). HDR tonemap path only except
+      // Exposure and the bloom fields, which apply on the vanilla SDR path too. ---
       auto& gs = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
 
