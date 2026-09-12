@@ -54,8 +54,7 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    const float paperWhite = max(GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
    const float peakWhite = max(PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
    // The map runs in a BT.2020 working space and is round-tripped back below: gamut-correct handling of highly
-   // saturated highlights, NOT a display-gamut expansion. The BT.709 alternative was a diagnostic, never a shipped
-   // configuration, and is gone; this path is validated in _tools/me2_bridge/me2_hdr_final_check.py.
+   // saturated highlights, NOT a display-gamut expansion. Validated in _tools/me2_bridge/me2_hdr_final_check.py.
    sceneHDR = BT709_To_BT2020(sceneHDR);
    // Luminance in PQ (hue-preserving), then CORRECT_CHANNELS_BEYOND_PEAK_WHITE fades over-peak channels to white.
    // Identity below the shoulder (a third of peak), so diffuse content and the upstream sliders are untouched.
@@ -193,14 +192,13 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    const float3 sdr_vanilla = GradeUE3(curved, true, outputScale);
 
 #if TONEMAP_TYPE >= 1
-   // The reference carries no fade (outputScale = 1), decoded to the linear light the vanilla canvas displays.
-   const float3 sdr_ref = VanillaToLinear(GradeUE3(curved, true, 1.0));
-
 #if ME2_UBER_FILMIC
-   // Keep the native per-channel filmic + grade as the colour reference: `sdr_ref` already carries the vanilla
-   // channel skew and whitening. Brightness alone is recovered, through a scalar gain taken from the curve's own
-   // tangent above the pivot.
-   const float3 recovered = ME2_RecoverFilmicBrightness(untonemapped, curved, sdr_ref);
+   // Keep the native per-channel filmic + grade as the colour reference: it carries no fade (outputScale = 1),
+   // decoded to the linear light the vanilla canvas displays, so it already holds the vanilla channel skew and
+   // whitening. Brightness alone is recovered, through a scalar gain taken from the curve's own tangent above the
+   // pivot.
+   const float3 sdr_ref = VanillaToLinear(GradeUE3(curved, true, 1.0));
+   float3 recovered = ME2_RecoverFilmicBrightness(untonemapped, curved, sdr_ref);
 #else
    // Hard-clip permutation: nothing to invert, so the grade run UNCLAMPED is the rebuild — vanilla-exact below the
    // clip and its own analytic continuation above it.
@@ -231,7 +229,6 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // Neither permutation runs a colour stage after its reconstruction, deliberately: the FILMIC one rebuilds
    // brightness by a SCALAR ratio, so the vanilla chromaticity survives it untouched, and the hard-clip one has just
    // set its own hue above. Evidence in NOTES.md; the display map owns path-to-white.
-   float3 hdr = recovered;
 
    // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider
    // would escape the Scene Peak it just established, and nothing downstream re-contains it. Multiplicative around
@@ -243,12 +240,12 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // additive pivot lifted it to 0.18 * (1 - C). User saturation runs in the material, after the display map.
    [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
    {
-      hdr = exp2(LumaSettings.GameSettings.Contrast * log2(max(hdr / MidGray, 1e-30))) * MidGray;
+      recovered = exp2(LumaSettings.GameSettings.Contrast * log2(max(recovered / MidGray, 1e-30))) * MidGray;
    }
 
    // Re-apply the engine fade linearly, LAST, after contrast. At rest it is a no-op.
    // ⚠ This pass leaves UNMAPPED linear HDR (values can reach hundreds); the material maps it. See NOTES.md.
-   float3 outColor = hdr * outputScale;
+   float3 outColor = recovered * outputScale;
 #else
    float3 outColor = sdr_vanilla; // vanilla display-encoded value
 #endif

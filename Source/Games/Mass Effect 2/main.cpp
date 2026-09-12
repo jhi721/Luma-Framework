@@ -102,6 +102,14 @@ static float g_bloom_sigmas[] = {1.5f, 2.f, 2.f, 2.f, 1.f, 0.5f};
 static bool g_luma_bloom_enable = true;
 #endif
 
+#if DEVELOPMENT
+// The uber grade rows the DEV diagnostic captures: SceneShadowsAndDesaturation .. GammaOverlayColor. File scope so
+// the readback, the change test and the log lines can name them without qualifying, and ahead of the device data
+// because a member array is sized from the count.
+static constexpr uint32_t kGradeFirstRow = 11;
+static constexpr uint32_t kGradeRowCount = 6;
+#endif
+
 struct MassEffect2GameDeviceData final : public GameDeviceData
 {
    bool has_drawn_uber = false;
@@ -128,9 +136,9 @@ struct MassEffect2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> srv_scene;
 #endif
 
-#if ENABLE_BLOOM || DEVELOPMENT
    // Deferred constant-buffer readback (ME1/MoHA/MELE shape): copy at the draw, map the copy made a few frames
-   // earlier with a non-blocking Map, because the synchronous form would stall the GPU every frame.
+   // earlier with a non-blocking Map, because the synchronous form would stall the GPU every frame. Unguarded like
+   // ME1's and MoHA's: the cost is in the members below, not in the type.
    struct DeferredCBRing
    {
       static constexpr uint32_t kSlots = 3;
@@ -141,16 +149,17 @@ struct MassEffect2GameDeviceData final : public GameDeviceData
       // done, so the non-blocking Map would fail forever. The gather draws more than once per frame in some scenes.
       bool advanced_this_frame = false;
    };
-#endif
 
 #if DEVELOPMENT
-   // The uber's grade rows, logged so the per-volume constants can be written down (NOTES.md keeps them unmeasured).
-   // Diagnostics only: nothing reads these back into a shader, so this whole block is absent from a shipping build.
-   static constexpr uint32_t kGradeFirstRow = 11; // SceneShadowsAndDesaturation .. GammaOverlayColor
-   static constexpr uint32_t kGradeRowCount = 6;
+   // The uber's grade rows, logged so the per-volume constants can be written down. Diagnostics only: nothing reads
+   // these back into a shader, so this whole block is absent from a shipping build. `logged` is the last SET the log
+   // printed - it lives here, not in a function static, so it dies with the device it describes: dgVoodoo tears the
+   // device down on every resolution change, and a surviving baseline would silence the new device's first grade.
    DeferredCBRing grade_cb_ring;
    float grade_rows[kGradeRowCount][4] = {};
    bool grade_valid = false;
+   float grade_logged[kGradeRowCount][4] = {};
+   bool grade_logged_any = false;
 #endif
 
 #if ENABLE_BLOOM
@@ -315,7 +324,6 @@ class MassEffect2Game final : public Game
    }
 #endif // ENABLE_SMAA
 
-#if ENABLE_BLOOM || DEVELOPMENT
    // `row_count` consecutive cbuffer rows from the copy made kSlots frames ago, all out of the SAME mapped slot, so
    // a multi-row read stays one capture and one Map. False when there is nothing to read yet: fresh ring, failed
    // allocation, or a slot still in flight.
@@ -369,7 +377,6 @@ class MassEffect2Game final : public Game
       native_device_context->Unmap(oldest, 0);
       return true;
    }
-#endif // ENABLE_BLOOM || DEVELOPMENT
 
 #if ENABLE_BLOOM
    // The engine's BloomScale out of dgVoodoo's b4 mirror at the gather draw, deferred so the Map never stalls. Row and
@@ -408,11 +415,10 @@ class MassEffect2Game final : public Game
    {
       ComPtr<ID3D11Buffer> cb;
       native_device_context->PSGetConstantBuffers(4, 1, cb.put());
-      float rows[MassEffect2GameDeviceData::kGradeRowCount][4];
-      if (!ReadCBRowsDeferred(native_device, native_device_context, cb.get(), gd.grade_cb_ring,
-             MassEffect2GameDeviceData::kGradeFirstRow, MassEffect2GameDeviceData::kGradeRowCount, &rows[0][0]))
+      // Straight into the destination: unlike TrackBloomScale there is nothing to validate before committing, and
+      // ReadCBRowsDeferred writes `out` only once every early-out has passed, so a partial read cannot land here.
+      if (!ReadCBRowsDeferred(native_device, native_device_context, cb.get(), gd.grade_cb_ring, kGradeFirstRow, kGradeRowCount, &gd.grade_rows[0][0]))
          return;
-      std::memcpy(gd.grade_rows, rows, sizeof(rows));
       gd.grade_valid = true;
    }
 #endif
@@ -957,7 +963,10 @@ public:
 #if ENABLE_BLOOM
       // The gather runs before the uber: read its BloomScale here (deferred, no stall). Bloom-only work, so it
       // follows the feature's own switch - GameSettings.BloomScaleLive is read by nothing else.
-      if (g_luma_bloom_enable && is_immediate && IsDofBloomGather(original_shader_hashes))
+      // The once-per-frame ring guard is hoisted into the gate (ME1's shape): the gather draws several times in some
+      // scenes, and without it every later draw pays a PSGetConstantBuffers and a GetDesc only to be turned away
+      // inside ReadCBRowsDeferred.
+      if (g_luma_bloom_enable && is_immediate && !game_device_data.bloom_cb_ring.advanced_this_frame && IsDofBloomGather(original_shader_hashes))
          TrackBloomScale(native_device, native_device_context, game_device_data);
 #endif
 
@@ -1073,18 +1082,16 @@ public:
       // between volumes, so a per-frame test would print every step of a transition.
       if (game_device_data.grade_valid)
       {
-         static float logged[MassEffect2GameDeviceData::kGradeRowCount][4] = {};
-         static bool logged_any = false;
-         bool changed = !logged_any;
-         for (uint32_t r = 0; r < MassEffect2GameDeviceData::kGradeRowCount && !changed; r++)
+         bool changed = !game_device_data.grade_logged_any;
+         for (uint32_t r = 0; r < kGradeRowCount && !changed; r++)
             for (uint32_t c = 0; c < 4; c++)
             {
                // Row 15's .xyz is the engine FADE, not part of the grade's identity: it ramps every frame during a
                // transition, which printed the whole ramp (measured: 159 blocks for 4 grades). Its .w, the display
                // exponent, still counts. Read the live fade with the DevSetting04 probe instead.
-               if (MassEffect2GameDeviceData::kGradeFirstRow + r == 15 && c < 3)
+               if (kGradeFirstRow + r == 15 && c < 3)
                   continue;
-               if (std::abs(logged[r][c] - game_device_data.grade_rows[r][c]) > 1e-4f)
+               if (std::abs(game_device_data.grade_logged[r][c] - game_device_data.grade_rows[r][c]) > 1e-4f)
                {
                   changed = true;
                   break;
@@ -1092,15 +1099,15 @@ public:
             }
          if (changed)
          {
-            std::memcpy(logged, game_device_data.grade_rows, sizeof(logged));
-            logged_any = true;
+            std::memcpy(game_device_data.grade_logged, game_device_data.grade_rows, sizeof(game_device_data.grade_logged));
+            game_device_data.grade_logged_any = true;
             // Row names are the uber's register map (NOTES.md). Row 15 doubles as the engine fade, so a reading
             // where .xyz is not R == G == B is the evidence that the fade is per-channel rather than scalar.
-            static const char* kRowNames[MassEffect2GameDeviceData::kGradeRowCount] = {
+            static const char* kRowNames[kGradeRowCount] = {
                "11 ShadowsAndDesat  ", "12 InverseHighLights", "13 MidTones         ",
                "14 LuminanceWeights ", "15 ColorScaleAndInv ", "16 OverlayColor     "};
             reshade::log::message(reshade::log::level::info, "[Luma] ME2 DIAG: uber grade constants changed");
-            for (uint32_t r = 0; r < MassEffect2GameDeviceData::kGradeRowCount; r++)
+            for (uint32_t r = 0; r < kGradeRowCount; r++)
             {
                char msg[192];
                std::snprintf(msg, sizeof(msg), "[Luma] ME2 DIAG:   cb4[%s] = %.6f, %.6f, %.6f, %.6f", kRowNames[r],
