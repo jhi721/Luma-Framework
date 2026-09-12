@@ -470,8 +470,16 @@ public:
    void OnInit(bool async) override
    {
       // Game-specific toggles consumed by the replaced pass (Luma_MOHA_Tonemap.hlsl).
+      // DEVELOPMENT A/B for the HDR reconstruction (Luma_MOHA_Tonemap.hlsl): a compile-time switch that changes the
+      // image rather than refactoring it, so it is fixed at '0' outside DEVELOPMENT and never ships enabled.
+      constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: recover highlights + DICE display map"},
+         {"MOHA_HDR_RECONSTRUCTION", '0', true, kExperimentLocked,
+            "HDR reconstruction A/B\n"
+            "0 - NeutralSDR + UpgradeToneMap on top of the clamped grade (current)\n"
+            "1 - the game's own grade run unclamped, straight in (BL GOTY production reconstruction)",
+            1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);

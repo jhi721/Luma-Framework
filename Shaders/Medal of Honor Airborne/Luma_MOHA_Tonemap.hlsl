@@ -37,6 +37,13 @@
 #define TONEMAP_IN_WIDER_GAMUT 1
 #endif
 
+// DEVELOPMENT A/B, stage 1: where the HDR range comes from. 0 = NeutralSDR + UpgradeToneMap on top of the clamped
+// grade (current). 1 = the game's own grade run UNCLAMPED, straight in: vanilla-exact below the clip and its own
+// analytic continuation above it (the BL GOTY production reconstruction).
+#ifndef MOHA_HDR_RECONSTRUCTION
+#define MOHA_HDR_RECONSTRUCTION 0
+#endif
+
 // UE3 UberPostProcess grade constants, at the register indices the disassembly reads them from.
 #define DoFParams                 PsConstants[8]  // .x focus distance, .y 1/range, .z falloff exponent
 #define DoFMaxBlur                PsConstants[9]  // .x max blur near, .y max blur far
@@ -107,11 +114,16 @@ float3 GradeUE3(float3 scene, bool clampSDR, float3 outputScale)
 float3 FinishMOHA(float3 untonemapped, float3 sdr_vanilla, float3 sdr_nofade, float3 hue_ref, float3 fadeScale, float4 overlay, float2 sceneUV)
 {
 #if TONEMAP_TYPE >= 1
+#if MOHA_HDR_RECONSTRUCTION == 0
    float3 ungraded_sdr = gamma_to_linear(sdr_nofade); // linear SDR reference (1.0 = white)
 
    // 3. Recover the highlight luminance the SDR tonemap clipped, on top of the graded look.
    float3 neutral_sdr = NeutralSDR(untonemapped);
    float3 recovered = UpgradeToneMap(untonemapped, neutral_sdr, ungraded_sdr);
+#else
+   // 3. The grade run UNCLAMPED (fade held out) is the HDR signal itself: no neutral, no bridge.
+   float3 recovered = gamma_to_linear(hue_ref);
+#endif
 
    // 4. Display rolloff to the user's peak/paper-white nits (DICE, hue-preserving by luminance). Both are floored:
    // DICE divides by them, and a NaN in a unorm target reads back black - it looks exactly like "the 3D disappeared".
