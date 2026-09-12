@@ -97,7 +97,8 @@ void main(
 #if ENABLE_VIDEO_AUTO_HDR
    if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
    {
-      // boost 0 = peak at paper white -> PumboAutoHDR no-ops (off); 1 = full VIDEO_AUTO_HDR_PEAK_NITS.
+      // boost 0 = peak at sRGB white, which makes PumboAutoHDR's own headroom 1 -> identity (off); 1 = full
+      // VIDEO_AUTO_HDR_PEAK_NITS.
       const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
       lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
    }

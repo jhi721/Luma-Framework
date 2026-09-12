@@ -144,8 +144,6 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
    float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 
-   // 7. Highlight dechroma happens inside DICE (ds.HighlightsDesaturation above), so there is no pass here.
-
    // User saturation LAST, after the display map: the repo's convention (shared helper: a lerp against BT.709
    // luminance, NOT hue-preserving). 1.0 = vanilla.
    hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
@@ -181,7 +179,7 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
 #endif
    // Sanitize LAST: the extended grade, the hue stage, encode and dither can each emit NaN, and a NaN in a unorm target reads
    // back black. Also covers cb4[15] (-nan(ind) on a load fade), which vanilla's saturate flushes to 0.
-   outColor = IsNaN_Strict(outColor) ? 0.0 : outColor; // bit test, not "x != x": that form gets optimized away
+   outColor = IsNaN_Strict(outColor) ? 0.0 : outColor; // explicit exponent/mantissa bit test
    outColor = max(0.0, outColor);
 
 #if DEVELOPMENT

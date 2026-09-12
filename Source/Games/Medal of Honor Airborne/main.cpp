@@ -469,7 +469,7 @@ class MedalOfHonorAirborne final : public Game
 public:
    void OnInit(bool async) override
    {
-      // Game-specific toggles consumed by the replaced pass (Luma_MOHA_Tonemap.hlsl).
+      // Game-specific toggles consumed by both replaced final passes (Luma_MOHA_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map"},
       };
@@ -495,7 +495,8 @@ public:
       GetShaderDefineData(GAMUT_MAPPING_TYPE_HASH).SetDefaultValue('1'); // gamut-map wild colors in composition
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
-      // dgVoodoo binds b0-b5 only (measured on every captured draw), so b12/b13 are free for Luma.
+      // dgVoodoo binds b0-b5 only (measured on every captured draw), so b11 (core DrawBloom's own constants)
+      // and b12/b13 are free for Luma.
       // luma_data is used by the Display Composition; luma_ui stays off (UI drawn by the game).
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
@@ -1006,7 +1007,8 @@ public:
       }
 #endif
 
-      // --- HDR grade (read in Luma_MOHA_Tonemap.hlsl via LumaSettings.GameSettings; HDR tonemap path only) ---
+      // --- Grade (read in Luma_MOHA_Tonemap.hlsl via LumaSettings.GameSettings). HDR tonemap path only except
+      // Exposure, which is applied scene-referred on the vanilla SDR path as well. ---
       auto& gs = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
 

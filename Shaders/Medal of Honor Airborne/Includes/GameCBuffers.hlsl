@@ -9,8 +9,9 @@
 // Mirrors c++ name spaces.
 namespace CB
 {
-// User-facing grade controls, drawn in DrawImGuiSettings (main.cpp) and read in Luma_MOHA_Tonemap.hlsl.
-// All apply only on the HDR tonemap path.
+// User-facing grade controls, drawn in DrawImGuiSettings (main.cpp) and read in Luma_MOHA_Tonemap.hlsl unless a
+// field says otherwise. Saturation, HighlightDechroma, Contrast and Dithering act only on the HDR tonemap path
+// (TONEMAP_TYPE >= 1); Exposure and the four bloom fields act on the vanilla SDR path too.
 struct LumaGameSettings
 {
    float Exposure;          // exposure multiplier (1 = vanilla). Applied scene-referred, pre-grade.
