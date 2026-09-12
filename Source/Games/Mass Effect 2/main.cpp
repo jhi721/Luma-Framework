@@ -488,18 +488,8 @@ public:
    {
       // TONEMAP_TYPE 0 (vanilla) is the scaffold default on purpose: it is the reference the HDR work gets compared
       // against, and it keeps a half-finished port from shipping a changed picture.
-      // ME2_HARDCLIP_HUE_SPACE is a DEVELOPMENT A/B: it changes the image rather than refactoring it, so it is
-      // fixed at the production '1' outside DEVELOPMENT and the BT.709 leg never ships. Flip it in the overlay's
-      // Advanced settings and reload shaders to compare in place.
-      constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", /*default value*/ '0', true, false, /*tooltip*/ "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", /*max value*/ 1},
-         {"ME2_HARDCLIP_HUE_SPACE", '1', true, kExperimentLocked,
-            "Hard-clip highlight hue: MacLeod-Boynton working space (HDR only; the menu and early scenes use this permutation)\n"
-            "1 - solved in BT.2020 (production; the space the Borderlands GOTY, Mass Effect 2007 and MoH Airborne ports use)\n"
-            "0 - solved in BT.709, the form shipped in the previous build\n"
-            "Purity is measured against that space's gamut boundary, so the two differ most on saturated green and blue.",
-            1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -551,8 +541,6 @@ public:
       // Until the gather reports. MEASURED on ME2 (DEV log): the engine drives this per zone over a 5x range, so the seed
       // is 1.0, the highest observed, and covers only the frames before the first readback. Readings in NOTES.md.
       default_luma_global_game_settings.BloomScaleLive = 1.f;
-      // 0 = the canonical HueOnly contract the hard-clip permutation ships. Only a DEVELOPMENT build reads it.
-      default_luma_global_game_settings.HardClipHighlightPurity = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
 
@@ -569,9 +557,6 @@ public:
       reshade::get_config_value(nullptr, NAME, "FilmGrainIntensity", gs.FilmGrainIntensity);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
-#if DEVELOPMENT
-      reshade::get_config_value(nullptr, NAME, "HardClipHighlightPurity", gs.HardClipHighlightPurity);
-#endif
 
 #if ENABLE_BLOOM
       reshade::get_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
@@ -672,17 +657,6 @@ public:
       Slider("Highlights Desaturation", gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation", 0.f, 1.f,
          "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).\n"
          "Only acts above a third of your Peak Brightness, so mid-tones keep their color whatever this is set to.");
-#if DEVELOPMENT
-      // Tuning control for the hard-clip permutation's MacLeod-Boynton stage, not a shipped setting: Publishing
-      // compiles the HueOnly wrapper and cannot read this field at all. Promote a chosen value to a constant in the
-      // shader the way the hue strengths were promoted, rather than shipping the slider.
-      Slider("Hard-Clip Highlight Purity", gs.HardClipHighlightPurity, default_luma_global_game_settings.HardClipHighlightPurity, "HardClipHighlightPurity", 0.f, 1.f,
-         "Who owns highlight purity in the hard-clip permutation (menus and early scenes), HDR only.\n"
-         "0 = the color keeps its own purity and the reference only supplies hue (shipped).\n"
-         "1 = adopt the soft Reinhard reference's purity too, which is lower above its shoulder, so highlights wash out.\n"
-         "Separate from Highlights Desaturation: that one runs inside the display map, this one before it.");
-#endif
-
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");
       if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
