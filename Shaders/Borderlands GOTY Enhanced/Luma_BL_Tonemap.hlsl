@@ -14,7 +14,8 @@
 //   5. MacLeod–Boynton hue emulation in BT.2020: the reference's hue direction on the target's own purity
 //      (Hue Shift 100%, Blowout 0 — the RenoDX BL1 contract), before the display map as RenoDX applies it.
 //   6. DICE maps the result to the user's peak / paper white, in BT.2020.                    -> hdr
-//   7. Optional user grading (HighlightDechroma / Saturation / Contrast).
+//   7. Optional user grading: Contrast runs BEFORE the colour stage (step 3b) so the rolloff contains it, the
+//      highlight dechroma inside DICE (step 6), Saturation last.
 //
 // The RenoDX donor and its MacLeod–Boynton emulation are the precedent, ported exactly; DICE is Luma's.
 //
@@ -131,6 +132,17 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // from it.
    float3 extendedLinear = gamma_to_linear(GradeUE3(untonemapped, false));
 
+   // 3b. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
+   // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
+   // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code 0.5).
+   // [branch] on a cbuffer uniform: at the 1.0 default this must be a BIT-EXACT no-op. The pow is spelled out with a
+   // floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
+   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
+   {
+      const float midGray = 0.18;
+      extendedLinear = exp2(LumaSettings.GameSettings.Contrast * log2(max(extendedLinear / midGray, 1e-30))) * midGray;
+   }
+
    const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
    const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
    // The colour stage and the display map run in a BT.2020 working space (round-tripped back to BT.709 below):
@@ -158,6 +170,12 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // in-range rolloff. DesaturationVsDarkeningRatio 1.0
    // (default) = contain by desaturating, not darkening (darkening flattens detail).
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+   // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
+   // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
+   // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
+   // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
+   // flattens it for every pixel above the shoulder.
+   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
    // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The colour is already
    // BT.2020 here and is converted back below, so the default CS_BT709 would make it convert a SECOND time and
    // run its shoulder trigger (an RGB average), its compression and its channel containment on doubly-narrowed
@@ -166,27 +184,11 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 
-   // 7. Perceptual highlight dechroma: bright sources fade toward white as luminance approaches peak (eye/sensor
-   // saturation). Keeps colored mid-highlights, whitens only the brightest (so warm-tinted white lamps read as
-   // neutral white at peak).
-   const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
-   if (highlightDechroma > 0.0)
-   {
-      // Map the slider to an exponent in [1, 0.05]: at the 1.0 max the exponent stays > 0 so mid-tones keep
-      // their color (dcWeight < 1) and only luminance->peak fades to white. An exponent of exactly 0 would make
-      // pow(x,0)=1 everywhere -> Saturation(hdr,0) -> full-frame greyscale, which is not what the slider means.
-      float dcExp = lerp(1.0, 0.05, highlightDechroma);
-      float dcWeight = saturate(pow(saturate(GetLuminance(hdr) / peakWhite), dcExp));
-      hdr = Saturation(hdr, 1.0 - dcWeight);
-   }
+   // 7. Highlight dechroma happens inside DICE (ds.HighlightsDesaturation above), so there is no pass here.
 
-   // User saturation (luminance-relative RGB lerp, shared helper). 1.0 = neutral.
+   // User saturation LAST, after the display map: the repo's convention (luminance-relative RGB lerp, shared helper).
+   // 1.0 = neutral.
    hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
-
-   // User contrast: slope around 18% mid-gray (linear, 1.0 = paper white). 1.0 = vanilla. Excursions are
-   // caught by the NaN/clamp tail; > peak highlights are acceptable for a creative slider.
-   const float midGray = 0.18;
-   hdr = (hdr - midGray) * LumaSettings.GameSettings.Contrast + midGray;
 
    outColor = hdr; // linear, 1.0 = paper white
 #else
