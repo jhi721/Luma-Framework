@@ -1,27 +1,35 @@
-// Borderlands GOTY Enhanced — RenoDX MacLeod–Boynton hue/purity emulation, the production HDR colour stage.
+// MacLeod–Boynton hue/purity model for linear RGB HDR colors.
 //
-// Line-by-line port of the RenoDX Borderlands GOTY Enhanced colour stage at clshortfuse/renodx
-// cd32113a98608e63027d40910cfe296a14dfe228:
-//   src/games/borderlandsgotyenhanced/macleod_boynton.hlsli  constants, MB transforms, ApplyInternal, ApplyBT2020
-//   src/games/borderlandsgotyenhanced/common.hlsli            ApplyHueAndPurityGrading, its hue-emulation block
-//   src/shaders/math.hlsl                                     Invert3x3, DivideSafe
-//   src/shaders/deprecated.hlsl                               SafeDivision
-//   src/shaders/color/rgb.hlsl                                BT.2020/XYZ matrices, WHITE_POINT_D65, xyY -> XYZ
-// Kept verbatim on purpose, unused purity modes included: _tools/bl1_bridge/mb_equiv compiles this file and the
-// RenoDX source side by side under fxc and compares the listings, and nothing is simplified until that passes.
-// Only the hue block of ApplyHueAndPurityGrading is carried; its saturation / dechroma / highlight-saturation
-// tail is the identity at the RenoDX BL1 defaults (1 / 0 / 0) and is omitted. Nothing here depends on Luma includes.
+// Derived from the RenoDX MacLeod–Boynton implementation (clshortfuse/renodx, MIT License, Copyright (c) 2025
+// Carlos Lopez Jr.), commit cd32113a98608e63027d40910cfe296a14dfe228:
+//   src/games/borderlandsgotyenhanced/macleod_boynton.hlsli  constants, MB transforms, the gamut-ray purity solver
+//   src/games/borderlandsgotyenhanced/common.hlsli            ApplyHueAndPurityGrading, its hue/purity emulation
+//   src/shaders/math.hlsl, deprecated.hlsl, color/rgb.hlsl    Invert3x3, DivideSafe, SafeDivision, matrices, xyY
+// The constants, the expressions and their order are RenoDX's; the organisation and the API are Luma's, and the
+// unused purity modes are kept until the specialised entry points have proven what they need.
+// _tools/bl1_bridge/mb_equiv compiles this file, the RenoDX source and the previous BL1 port side by side under
+// fxc and holds their listings byte-identical.
 //
-// The model: RGB -> XYZ -> LMS (CIE 2006), hue as MacLeod–Boynton ratios r = L/(L+M), b = S/(L+M) around the D65
-// white, intensity anchored on T = L + M, and purity as the fraction of the distance from white to the RGB gamut
-// boundary along that ray. The hue emulation takes the reference's ray direction and re-applies the target's
-// own purity on it, so with chrominance_emulation = 0 only the hue direction moves.
+// The model: RGB -> XYZ -> LMS (CIE 2006), hue as MacLeod–Boynton ratios r = L/(L+M), b = S/(L+M) around an
+// adapted white, intensity anchored on T = L + M, purity as the fraction of the distance from white to the RGB
+// gamut boundary along that ray. The hue/purity emulation takes a reference's ray direction and re-applies the
+// target's own purity on it; with chrominance strength 0 only the hue direction moves.
+//
+// This file knows nothing about its caller. It takes a target, a reference, two strengths, a colour space and a
+// white; which reference, how much of it, and where in a pipeline it runs are the caller's policy.
+//
+// Sections: A constants and transforms  B MacLeod–Boynton coordinates  C gamut-ray purity solver
+//           D hue/purity emulation  E colour-space convenience wrappers
 
-#ifndef LUMA_BL1_RENODX_MACLEOD_BOYNTON_HLSL
-#define LUMA_BL1_RENODX_MACLEOD_BOYNTON_HLSL
+#ifndef LUMA_MACLEOD_BOYNTON_HLSL
+#define LUMA_MACLEOD_BOYNTON_HLSL
 
-namespace BL1_RenoDX
+namespace MacLeodBoynton
 {
+// ------------------------------------------------------------------------------------------------------------
+// A. Constants and transforms
+// ------------------------------------------------------------------------------------------------------------
+
 // src/shaders/math.hlsl
 float DivideSafe(float dividend, float divisor, float fallback)
 {
@@ -87,6 +95,16 @@ float3 XYZ_From_xyY(float3 xyY)
    return XYZ;
 }
 
+// The RGB working space the solver runs in: its matrices to and from XYZ. Passed by value; every current
+// caller passes a compile-time constant and fxc folds it, so the abstraction costs nothing at runtime.
+struct RGBColorSpace
+{
+   float3x3 rgbToXYZ;
+   float3x3 xyzToRGB;
+};
+
+static const RGBColorSpace RGB_BT2020 = {BT2020_TO_XYZ_MAT, XYZ_TO_BT2020_MAT};
+
 // src/games/borderlandsgotyenhanced/macleod_boynton.hlsli
 static const float3x3 XYZ_TO_LMS_2006 = float3x3(
     0.185082982238733f, 0.584081279463687f, -0.0240722415044404f,
@@ -105,6 +123,10 @@ static const int MB_PURITY_MODE_SCALE_NEUTWO = 2;
 static const int MB_PURITY_ADJUST_NONE = 0;
 static const int MB_PURITY_ADJUST_CLIP_MAX = 1;
 static const float ONE_MINUS_EPSILON = 1.f - 1e-6f;
+
+// ------------------------------------------------------------------------------------------------------------
+// B. MacLeod–Boynton coordinates
+// ------------------------------------------------------------------------------------------------------------
 
 // Neutwo (x / sqrt(x^2 + 1)) and its inverse.
 // Used to shape purity scaling with a smooth shoulder near gamut edge.
@@ -154,6 +176,10 @@ float2 MB_White_D65()
    return MB_From_LMS(d65_lms);
 }
 
+// ------------------------------------------------------------------------------------------------------------
+// C. Gamut-ray purity solver
+// ------------------------------------------------------------------------------------------------------------
+
 // Half-space constraint for one channel in affine form:
 // rgb(t) = a * t + b, and we require rgb(t) >= 0.
 // Returns interval [lo, hi] where that channel is valid.
@@ -188,7 +214,7 @@ void IntervalLower0(float a, float b, out float lo, out float hi)
    }
 }
 
-struct MBPurityDebug
+struct PurityResult
 {
    float3 rgbOut;
    float3 rgbT0;
@@ -226,11 +252,11 @@ struct MBPurityDebug
 // Important behavior:
 // - Constraint is gamut-only (RGB >= 0), no arbitrary <= 1 clamp.
 // - This allows scene-linear HDR values above 1.0 to pass through naturally.
-MBPurityDebug ApplyInternal(float3 rgb_linear, float purity_value, int purity_input_mode,
-                            float curve_gamma, float2 mb_white_override, float t_min,
-                            int purity_adjust_mode, float3x3 rgb_to_xyz_mat, float3x3 xyz_to_rgb_mat)
+PurityResult SolvePurity(float3 rgb_linear, float purity_value, int purity_input_mode,
+                         float curve_gamma, float2 mb_white_override, float t_min,
+                         int purity_adjust_mode, float3x3 rgb_to_xyz_mat, float3x3 xyz_to_rgb_mat)
 {
-   MBPurityDebug output;
+   PurityResult output;
 
    output.purity01_in = 0.f;
 
@@ -385,29 +411,32 @@ MBPurityDebug ApplyInternal(float3 rgb_linear, float purity_value, int purity_in
    return output;
 }
 
-MBPurityDebug ApplyBT2020(float3 rgb2020_linear, float purity01, float curve_gamma = 1.f,
-                          float2 mb_white_override = float2(-1.f, -1.f), float t_min = 1e-6f,
-                          int purity_adjust_mode = MB_PURITY_ADJUST_NONE)
+// Normalized-purity solve in a given RGB space: purity01 = 0 is the adapted white, 1 the gamut boundary.
+PurityResult ApplyPurity(float3 rgb_linear, float purity01, RGBColorSpace colorSpace, float curve_gamma = 1.f,
+                         float2 mb_white_override = float2(-1.f, -1.f), float t_min = 1e-6f,
+                         int purity_adjust_mode = MB_PURITY_ADJUST_NONE)
 {
-   return ApplyInternal(rgb2020_linear, purity01, MB_PURITY_MODE_NORMALIZED, curve_gamma,
-                        mb_white_override, t_min, purity_adjust_mode, BT2020_TO_XYZ_MAT,
-                        XYZ_TO_BT2020_MAT);
+   return SolvePurity(rgb_linear, purity01, MB_PURITY_MODE_NORMALIZED, curve_gamma,
+                      mb_white_override, t_min, purity_adjust_mode, colorSpace.rgbToXYZ,
+                      colorSpace.xyzToRGB);
 }
 
-// src/games/borderlandsgotyenhanced/common.hlsli, ApplyHueAndPurityGrading: the hue + chrominance emulation
-// block with the RenoDX BL1 defaults written in (curve_gamma 1, D65 white, t_min 1e-7; saturation 1, dechroma 0
-// and highlight_saturation 0 make its purity_scale tail the identity, so that tail is not carried). `lum` is
-// only read by that tail and is not a parameter here.
-float3 ApplyHueEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt2020, float hue_emulation, float chrominance_emulation)
-{
-   const float curve_gamma = 1.f;
-   const float2 mb_white_override = float2(-1.f, -1.f);
-   const float t_min = 1e-7f;
+// ------------------------------------------------------------------------------------------------------------
+// D. Hue/purity emulation
+// ------------------------------------------------------------------------------------------------------------
 
-   float3 color_bt2020 = ungraded_bt2020;
-   if (hue_emulation == 0.f && chrominance_emulation == 0.f)
+// Moves the target's MB hue direction toward the reference's by `hue_strength` while re-applying the target's
+// own purity on the new direction, then optionally moves that purity toward the reference's by
+// `chrominance_strength`. T = L + M of the target is preserved throughout. A white override of (-1, -1)
+// selects D65. This is the hue block of RenoDX's ApplyHueAndPurityGrading; its saturation / dechroma /
+// highlight-saturation tail is not part of the model and is not carried.
+float3 HueAndPurityEmulation(float3 ungraded, float3 reference, float hue_strength, float chrominance_strength,
+                             RGBColorSpace colorSpace, float2 mb_white_override, float t_min)
+{
+   float3 color = ungraded;
+   if (hue_strength == 0.f && chrominance_strength == 0.f)
    {
-      return color_bt2020;
+      return color;
    }
 
    const float kNearWhiteEpsilon = MB_NEAR_WHITE_EPSILON;
@@ -415,27 +444,27 @@ float3 ApplyHueEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt2020, 
                             ? mb_white_override
                             : MB_White_D65();
 
-   float color_purity01 = ApplyBT2020(
-                              color_bt2020, 1.f, 1.f, mb_white_override, t_min)
+   float color_purity01 = ApplyPurity(
+                              color, 1.f, colorSpace, 1.f, mb_white_override, t_min)
                               .purityCur01;
 
    // MB hue + purity emulation (analog of OkLab hue/chrominance section).
-   if (hue_emulation != 0.f || chrominance_emulation != 0.f)
+   if (hue_strength != 0.f || chrominance_strength != 0.f)
    {
-      float reference_purity01 = ApplyBT2020(
-                                     reference_bt2020, 1.f, 1.f, mb_white_override, t_min)
+      float reference_purity01 = ApplyPurity(
+                                     reference, 1.f, colorSpace, 1.f, mb_white_override, t_min)
                                      .purityCur01;
 
       float purity_current = color_purity01;
       float purity_ratio = 1.f;
-      float3 hue_seed_bt2020 = color_bt2020;
+      float3 hue_seed = color;
 
-      if (hue_emulation != 0.f)
+      if (hue_strength != 0.f)
       {
          float3 target_lms = mul(XYZ_TO_LMS_2006,
-                                 mul(BT2020_TO_XYZ_MAT, color_bt2020));
+                                 mul(colorSpace.rgbToXYZ, color));
          float3 reference_lms = mul(XYZ_TO_LMS_2006,
-                                    mul(BT2020_TO_XYZ_MAT, reference_bt2020));
+                                    mul(colorSpace.rgbToXYZ, reference));
 
          float target_t = target_lms.x + target_lms.y;
          if (target_t > t_min)
@@ -460,11 +489,11 @@ float3 ApplyHueEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt2020, 
                   target_unit = reference_unit;
                }
 
-               float2 blended_unit = lerp(target_unit, reference_unit, hue_emulation);
+               float2 blended_unit = lerp(target_unit, reference_unit, hue_strength);
                float blended_len_sq = dot(blended_unit, blended_unit);
                if (blended_len_sq <= kNearWhiteEpsilon)
                {
-                  blended_unit = (hue_emulation >= 0.5f) ? reference_unit : target_unit;
+                  blended_unit = (hue_strength >= 0.5f) ? reference_unit : target_unit;
                   blended_len_sq = dot(blended_unit, blended_unit);
                }
                blended_unit *= rsqrt(max(blended_len_sq, 1e-20f));
@@ -476,13 +505,13 @@ float3 ApplyHueEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt2020, 
                }
                seed_len = max(seed_len, 1e-6f);
 
-               hue_seed_bt2020 = mul(
-                   XYZ_TO_BT2020_MAT,
+               hue_seed = mul(
+                   colorSpace.xyzToRGB,
                    mul(LMS_TO_XYZ_2006,
                        LMS_From_MB_T(white + blended_unit * seed_len, target_t)));
 
-               float purity_post = ApplyBT2020(
-                                       hue_seed_bt2020, 1.f, 1.f, mb_white_override, t_min)
+               float purity_post = ApplyPurity(
+                                       hue_seed, 1.f, colorSpace, 1.f, mb_white_override, t_min)
                                        .purityCur01;
                purity_ratio = SafeDivision(purity_current, purity_post, 1.f);
                purity_current = purity_post;
@@ -490,21 +519,36 @@ float3 ApplyHueEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt2020, 
          }
       }
 
-      if (chrominance_emulation != 0.f)
+      if (chrominance_strength != 0.f)
       {
          float target_purity_ratio = SafeDivision(reference_purity01, purity_current, 1.f);
-         purity_ratio = lerp(purity_ratio, target_purity_ratio, chrominance_emulation);
+         purity_ratio = lerp(purity_ratio, target_purity_ratio, chrominance_strength);
       }
 
       float applied_purity01 = saturate(purity_current * max(purity_ratio, 0.f));
-      color_bt2020 = ApplyBT2020(
-                         hue_seed_bt2020, applied_purity01, curve_gamma, mb_white_override, t_min)
-                         .rgbOut;
+      color = ApplyPurity(
+                  hue_seed, applied_purity01, colorSpace, 1.f, mb_white_override, t_min)
+                  .rgbOut;
       color_purity01 = applied_purity01;
    }
 
-   return color_bt2020;
+   return color;
 }
-} // namespace BL1_RenoDX
 
-#endif // LUMA_BL1_RENODX_MACLEOD_BOYNTON_HLSL
+// ------------------------------------------------------------------------------------------------------------
+// E. Colour-space convenience wrappers (compile-time fixed: BT.2020, D65, the solver's 1e-7 T floor)
+// ------------------------------------------------------------------------------------------------------------
+
+float3 HueAndPurityEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt2020, float hue_strength, float chrominance_strength)
+{
+   return HueAndPurityEmulation(ungraded_bt2020, reference_bt2020, hue_strength, chrominance_strength, RGB_BT2020, float2(-1.f, -1.f), 1e-7f);
+}
+
+// Reference hue direction on the target's own purity and T; nothing of the reference's purity is taken.
+float3 HueOnlyBT2020(float3 ungraded_bt2020, float3 reference_bt2020)
+{
+   return HueAndPurityEmulationBT2020(ungraded_bt2020, reference_bt2020, 1.f, 0.f);
+}
+} // namespace MacLeodBoynton
+
+#endif // LUMA_MACLEOD_BOYNTON_HLSL

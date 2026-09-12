@@ -33,7 +33,7 @@
 #include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise: soft hue reference
-#include "Includes/RenoDX_MacLeodBoynton.hlsl" // BL1_RenoDX::ApplyHueEmulationBT2020
+#include "Includes/MacLeodBoynton.hlsl"      // MacLeodBoynton::HueOnlyBT2020 (RenoDX-derived hue/purity model)
 // clang-format on
 
 // HDR / vanilla. 1 = extended UE3 grade + DICE display map (default). 0 = vanilla clamped SDR reference.
@@ -145,9 +145,10 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
 
    // 5. MacLeod–Boynton hue emulation (the RenoDX BL1 colour stage): the reference's hue direction rebuilt on the
-   // target's own purity and T = L + M anchor. Hue Shift 1.0, Blowout 0 — the RenoDX BL1 defaults — and, as RenoDX
-   // applies it before its display map, before DICE. Nothing is restored after DICE.
-   float3 diceInBT2020 = BL1_RenoDX::ApplyHueEmulationBT2020(extendedBT2020, hueReferenceBT2020, 1.0, 0.0);
+   // target's own purity and T = L + M anchor. BL1 policy, all of it chosen here and none of it inside the model:
+   // hue strength 1.0 and chrominance strength 0 (RenoDX's "Hue Shift 100%, Blowout 0"), and, as RenoDX applies
+   // it before its display map, before DICE. Nothing is restored after DICE.
+   float3 diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
 
    // 6. Display rolloff to the user's peak/paper-white nits (DICE, hue-preserving by luminance).
    // Tonemap luminance in PQ (hue-preserving: rgb scaled by the luminance ratio), then CORRECT_CHANNELS_BEYOND_
