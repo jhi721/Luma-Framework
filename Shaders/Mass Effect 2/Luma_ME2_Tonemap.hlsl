@@ -5,7 +5,7 @@
 // ORDER IS LOAD-BEARING, do not sort: game-local Common.hlsl first, or GameSettings resolves to the empty dummy.
 #include "Includes/Common.hlsl"             // game-local: defines LumaGameSettings before the LumaSettings cbuffer
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip, and Oklab through it
+#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise (hue-shift reference)
 #include "Includes/MacLeodBoynton.hlsl"     // MacLeodBoynton::HueOnlyBT2020. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
@@ -43,22 +43,6 @@
 // measured deltas after the display map are small everywhere except green (saturation) and blue (luminance).
 #ifndef ME2_HARDCLIP_HUE_SPACE
 #define ME2_HARDCLIP_HUE_SPACE 1
-#endif
-
-// DEVELOPMENT A/B for the FILMIC permutation's highlight-colour transfer, the only stage that differs:
-// 0 = the shipped Oklch EmulateHighlightHue, 1 = the canonical MacLeod-Boynton model solved in BT.2020.
-// Target, reference, mask and the exact BT.709 Y restore are identical on both legs, so this isolates the
-// perceptual model. Where the legs land is decided by how chromatic the TARGET is, not by the mask alone.
-// On a CHROMATIC target at full mask both reduce to the reference's chromaticity at the recovered
-// luminance - Oklch hue + C/L and MB hue + purity are both scale-invariant, and the Y restore fixes the
-// remaining scalar - so they agree to ~1e-6. On a NEAR-NEUTRAL target they diverge, and full mask is where
-// that bites: Oklch fades itself out below C/L 0.02 and hands back the target, while MB's 1e-14 epsilon
-// never fires and it rotates all the way onto the reference hue. ⚠ Those targets are the MAJORITY of
-// full-mask pixels, because the vanilla curve drives bright colour toward white. Measured post-DICE at
-// w = 1: mean 1.27 deg, p95 4.23 deg, max 6.18 deg, up to 0.12 on the max channel.
-// Numbers and the three mask zones: _tools/me2_bridge/me2_filmic_ab.py.
-#ifndef ME2_FILMIC_HUE_MODEL
-#define ME2_FILMIC_HUE_MODEL 0
 #endif
 
 #if ME2_HARDCLIP_HUE_SPACE == 0
@@ -160,45 +144,6 @@ float3 ME2_NativeToneCurve(float3 scene)
 // Deliberately here and not with the includes at the top: it evaluates the curve above and its analytic slope.
 #include "Includes/FilmicRecovery.hlsl"
 
-// Highlight hue emulation in Oklch. FILMIC permutation only — the hard-clip one runs the canonical MacLeod-Boynton
-// model instead. It exists because a recovery that is one scalar keeps vanilla's channel ratios exactly, while no SDR
-// pipeline ever showed those ratios: a per-channel limiter turned the hue toward white (R saturates first, then G) and
-// dropped chroma. `hdr` = the recovered colour, `reference` = the colour whose hue is being borrowed, built at the
-// call site, both LINEAR with 1.0 = SDR white. Oklch: rotate the hue
-// along the shortest arc toward the reference's, keep the HDR lightness, and optionally lower saturation toward the
-// reference's (its whitening). Saturation is compared as C/L, so a dimmer reference does not read as extra whitening,
-// and the whole transfer is scale-invariant: Game Paper White cannot move it. Powerless guard: hue is undefined near the
-// achromatic axis, so a near-white reference (a fully clipped source) or target fades the transfer out instead of
-// running away — the reason the shared JzAzBz helper had to be capped at 0.8 against a clipped reference.
-float3 EmulateHighlightHue(float3 hdr, float3 reference, float hueStrength, float whitening)
-{
-   const float3 t = Oklab::linear_srgb_to_oklab(hdr);
-   const float Lt = max(t.x, 1e-4);
-   const float satT = length(t.yz) / Lt;
-   // Saturation (Oklab C/L) below which hue is numerical noise: a clipped (1,1,1) reads ~4e-8, real colour 0.05+.
-   // Hard zero below half the threshold (smoothstep's lower edge). An achromatic TARGET has nothing to rotate and
-   // nothing to whiten: return it bit-exact.
-   const float kPowerless = 0.02;
-   const float confT = smoothstep(0.5 * kPowerless, kPowerless, satT);
-   if (confT <= 0.0)
-      return hdr;
-   const float3 s = Oklab::linear_srgb_to_oklab(reference);
-   const float Ls = max(s.x, 1e-4);
-   const float satS = length(s.yz) / Ls;
-   // The two axes read the reference differently. HUE needs a chromatic reference: a white one carries no hue, so its
-   // direction is noise and confS fades the rotation out. WHITENING must NOT be gated on the reference: a white
-   // reference IS the whitening signal (the limiter blew that pixel to white), so it uses satS directly and a fully
-   // clipped core goes white at HDR lightness, continuously with the rim.
-   const float confS = smoothstep(0.5 * kPowerless, kPowerless, satS);
-   const float hueT = atan2(t.z, t.y);
-   const float hueS = atan2(s.z, s.y);
-   const float delta = atan2(sin(hueS - hueT), cos(hueS - hueT)); // shortest arc, (-pi, pi]
-   const float hue = hueT + hueStrength * confS * confT * delta;
-   const float sat = lerp(satT, min(satT, satS), whitening * confT); // whitening only ever lowers saturation
-   const float chroma = sat * Lt;
-   return max(0.0, Oklab::oklab_to_linear_srgb(float3(t.x, chroma * cos(hue), chroma * sin(hue))));
-}
-
 // The vanilla canvas value decoded to the linear light a 2.2 display shows for it. Unlike ME1 2007 the uber's grade
 // already applied the display exponent (GammaColorScaleAndInverse.w), so this is a plain decode.
 float3 VanillaToLinear(float3 graded)
@@ -224,87 +169,6 @@ float3 GradeUE3(float3 curved, bool clampSDR, float3 outputScale)
    c = clampSDR ? saturate(c) : max(0.0, c); // mul_sat in the original
    return PowUE3(c, GammaColorScaleAndInverse.www);
 }
-
-#if TONEMAP_TYPE >= 1 && ME2_UBER_FILMIC
-// Bit test rather than a comparison: `x != x` is legal for the compiler to fold away under fast math.
-bool ME2_FilmicColorIsFinite(float3 value)
-{
-   return all((asuint(value) & 0x7F800000u) != 0x7F800000u);
-}
-
-// FILMIC-only artistic control, applied AFTER the brightness recovery and before the creative sliders. The recovery
-// is scalar and keeps the vanilla channel ratios; this optionally moves highlights further, toward what the SAME
-// vanilla curve and grade produce for a MORE EXPOSED version of the same scene. That second evaluation is a colour
-// reference only: hue and relative chroma are taken from it, brightness is not, and the main image, its bloom and its
-// recovery gain never see the extra exposure. `scene` is `untonemapped` (post-Exposure, pre-fade), `recovered` the
-// recovery's output.
-float3 ME2_ApplyFilmicHighlightColor(float3 scene, float3 recovered)
-{
-   // Tuned constants, not user controls. `referenceEV` picks WHICH vanilla colour the transfer aims at - the one the
-   // same curve and grade give the scene a stop brighter. The two strengths say how far a pixel travels toward it,
-   // and the mask below plus the helper's near-achromatic guard already keep that off everything but bright colour.
-   const float referenceEV = 1.0;
-   const float hueStrength = 1.0;
-   const float blowout = 1.0;
-
-   if (!ME2_FilmicColorIsFinite(scene) || !ME2_FilmicColorIsFinite(recovered))
-      return recovered;
-   // The recovery derives from the CLAMPED grade, so it is non-negative. This wrapper is not a signed-RGB pipeline.
-   if (any(recovered < 0.0))
-      return recovered;
-
-   // Highlight mask on the SOURCE scene, before fade: off at or below 1.0, full at 4.0, two stops of input exposure
-   // in between. Deliberately independent of paper white, display peak and the reference exposure above - that
-   // exposure picks the reference colour, it must not slide the mask.
-   const float maskStart = 1.0;
-   const float maskEnd = 4.0;
-   const float m = max3(scene);
-   if (m <= maskStart)
-      return recovered;
-   const float weight = smoothstep(0.0, 1.0, log2(m / maskStart) / log2(maskEnd / maskStart));
-   if (weight <= 0.0)
-      return recovered;
-
-   // Denominator guards, not the start of an artistic effect.
-   const float epsilonY = 1e-6;
-   const float originalY = GetLuminance(recovered, CS_BT709);
-   if (!(originalY > epsilonY))
-      return recovered;
-
-   // The ONLY place the extra exposure applies.
-   const float3 referenceScene = scene * exp2(referenceEV);
-   if (!ME2_FilmicColorIsFinite(referenceScene))
-      return recovered;
-   const float3 reference = VanillaToLinear(GradeUE3(ME2_NativeToneCurve(referenceScene), true, 1.0));
-   if (!ME2_FilmicColorIsFinite(reference))
-      return recovered;
-   // A BLACK reference is not a whitening signal, unlike a white one - it carries neither hue nor blowout.
-   if (!(GetLuminance(reference, CS_BT709) > epsilonY))
-      return recovered;
-
-#if ME2_FILMIC_HUE_MODEL
-   // Candidate: the same transfer under the canonical model, solved in BT.2020 like every other
-   // MacLeod-Boynton port here. Hue and chrominance both take the mask weight, which is the closest
-   // equivalent of the Oklch leg's hue/whitening pairing: the +1 EV reference is never MORE pure than the
-   // target on this content (0 of 20000 sampled, me2_filmic_probe.py), so MB's unclamped chrominance moves
-   // the same direction as Oklch's min()-clamped whitening and only the model changes.
-   const float3 transferred = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(
-       BT709_To_BT2020(recovered), BT709_To_BT2020(reference), hueStrength * weight, blowout * weight));
-#else
-   const float3 transferred = EmulateHighlightHue(recovered, reference, hueStrength * weight, blowout * weight);
-#endif
-   if (!ME2_FilmicColorIsFinite(transferred) || all(transferred == recovered))
-      return recovered;
-   const float transferredY = GetLuminance(transferred, CS_BT709);
-   if (!(transferredY > epsilonY))
-      return recovered;
-
-   // EmulateHighlightHue holds Oklab L, which is not photometric. Restore the linear BT.709 Y the recovery had, with
-   // the same metric on both sides. No saturate: the recovery's output is unmapped HDR and the display map owns the peak.
-   const float3 result = transferred * (originalY / transferredY);
-   return ME2_FilmicColorIsFinite(result) ? result : recovered;
-}
-#endif // TONEMAP_TYPE >= 1 && ME2_UBER_FILMIC
 
 float3 RunME2Uber(float2 blurUV, float2 sceneUV)
 {
@@ -401,15 +265,10 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    }
 #endif
 
-   // Neither permutation uses a post-map RestoreHueAndChrominance, deliberately: the FILMIC one rebuilds brightness by
-   // a SCALAR ratio, so vanilla's channel ratios survive it untouched, and the hard-clip one has just set its own hue
-   // above. Evidence in NOTES.md; the display map owns path-to-white.
-   // What follows on the filmic perm is a separate artistic pass over the recovered colour, at tuned constants.
+   // Neither permutation runs a colour stage after its reconstruction, deliberately: the FILMIC one rebuilds
+   // brightness by a SCALAR ratio, so the vanilla chromaticity survives it untouched, and the hard-clip one has just
+   // set its own hue above. Evidence in NOTES.md; the display map owns path-to-white.
    float3 hdr = recovered;
-
-#if ME2_UBER_FILMIC
-   hdr = ME2_ApplyFilmicHighlightColor(untonemapped, hdr);
-#endif
 
    // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider
    // would escape the Scene Peak it just established, and nothing downstream re-contains it. Multiplicative around
