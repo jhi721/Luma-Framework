@@ -501,23 +501,10 @@ class BorderlandsGoty final : public Game
 public:
    void OnInit(bool async) override
    {
-      // A/B for the HDR colour stage (Luma_BL_Tonemap.hlsl): a compile-time switch that changes the image rather
-      // than refactoring it, so it is fixed at '0' outside DEVELOPMENT and does not ship enabled. Off keeps the
-      // production DICE -> JzAzBz hue-only restoration; on runs RenoDX BL1's MacLeod-Boynton hue/purity emulation
-      // before DICE instead, toward the same soft reference. Both read the same extended grade and the same DICE,
-      // so flipping it compares operator and placement on one frame.
-      constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
-
       // Game-specific HDR toggles consumed by the replaced tonemap shaders (Luma_BL_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla clamped reference\n1 - HDR: Extended UE3 grade + DICE"},
          {"XE_GTAO_QUALITY", '3', true, false, "Ambient Occlusion (XeGTAO) quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
-         {"BL_HDR_COLOR_STYLE", '0', true, kExperimentLocked,
-            "HDR: RenoDX MacLeod-Boynton hue emulation before DICE\n"
-            "Takes the soft reference's hue direction in MacLeod-Boynton space, keeps the target's own purity, and\n"
-            "applies it before the display map, as the RenoDX Borderlands GOTY port does (Hue Shift 100%, Blowout 0).\n"
-            "Off - the production path: DICE, then Luma's JzAzBz hue-only restoration toward the same reference.",
-            1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
 
@@ -1473,7 +1460,7 @@ public:
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
                   "\nDICE (HDR tonemapper)"
-                  "\nJzAzBz (hue restoration)"
+                  "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS)",
          "");

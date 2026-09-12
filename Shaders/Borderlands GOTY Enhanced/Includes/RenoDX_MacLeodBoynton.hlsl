@@ -1,4 +1,4 @@
-// Borderlands GOTY Enhanced — RenoDX MacLeod–Boynton hue/purity emulation, ported for the BL_HDR_COLOR_STYLE A/B.
+// Borderlands GOTY Enhanced — RenoDX MacLeod–Boynton hue/purity emulation, the production HDR colour stage.
 //
 // Line-by-line port of the RenoDX Borderlands GOTY Enhanced colour stage at clshortfuse/renodx
 // cd32113a98608e63027d40910cfe296a14dfe228:
