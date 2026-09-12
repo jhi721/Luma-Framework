@@ -32,11 +32,21 @@
 #include "../Includes/ColorGradingLUT.hlsl" // RestoreHueAndChrominance, SimpleGamutClip
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise: soft hue reference
+#include "Includes/RenoDX_MacLeodBoynton.hlsl" // BL1_RenoDX::ApplyHueEmulationBT2020 (BL_HDR_COLOR_STYLE 1)
 // clang-format on
 
 // HDR / vanilla. 1 = extended UE3 grade + DICE display map (default). 0 = vanilla clamped SDR reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
+#endif
+
+// Colour stage (A/B). 0 = production: DICE, then Luma's JzAzBz hue-only restoration toward the soft reference.
+// 1 = RenoDX BL1 style: MacLeod–Boynton hue/purity emulation toward the same soft reference (Hue Shift 1.0,
+// Blowout 0), applied BEFORE DICE as RenoDX applies it before its display map, and no post-DICE restoration.
+// Same reconstruction, same donor, same DICE and gamut clip either way, so the pair isolates operator + placement.
+// DEVELOPMENT-only checkbox in main.cpp; a shipped build compiles the 0 side.
+#ifndef BL_HDR_COLOR_STYLE
+#define BL_HDR_COLOR_STYLE 0
 #endif
 
 // HighlightDechroma is an optional user slider (see step 6 below); default 0 = off (only the mandatory DICE/gamut
@@ -134,6 +144,13 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // The display map runs in a BT.2020 working space (round-tripped back to BT.709 below): gamut-correct
    // handling of highly saturated highlights, not a display-gamut expansion.
    float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
+#if BL_HDR_COLOR_STYLE == 1
+   // RenoDX BL1 colour stage: hue direction from the soft reference, the target's own purity kept (Hue Shift 1.0,
+   // Blowout 0 - the RenoDX BL1 defaults), in BT.2020 before the display map. Nothing is restored after DICE.
+   float3 diceInBT2020 = BL1_RenoDX::ApplyHueEmulationBT2020(extendedBT2020, Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5), 1.0, 0.0);
+#else
+   float3 diceInBT2020 = extendedBT2020;
+#endif
    // Tonemap luminance in PQ (hue-preserving: rgb scaled by the luminance ratio), then CORRECT_CHANNELS_BEYOND_
    // PEAK_WHITE pulls any channel that still exceeds peak back into range by desaturating it toward white. Modern
    // HDR panels clip each rgb channel at peak individually, so an uncorrected saturated highlight (e.g. a bright
@@ -146,9 +163,10 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // run its shoulder trigger (an RGB average), its compression and its channel containment on doubly-narrowed
    // primaries. Neutrals cancel out; saturated highlights do not.
    ds.InOutColorSpace = CS_BT2020;
-   float3 hdr = DICETonemap(extendedBT2020 * paperWhite, peakWhite, ds) / paperWhite;
+   float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 
+#if BL_HDR_COLOR_STYLE == 0
    // 5. Hue restoration toward the soft reference: the extended grade run through ReinhardPiecewise(x, 5, 1.5)
    // per channel in BT.2020, where the RenoDX BL1 port builds it (common.hlsli, ApplyCustomGrading). Linear
    // below 1.5 and rolling toward 5 above, it compresses a saturated highlight's strong channel before its weak
@@ -159,6 +177,7 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    float3 hueRefBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
    float3 hueRef = BT2020_To_BT709(hueRefBT2020);
    hdr = RestoreHueAndChrominance(hdr, hueRef, 1.0, 0.0);
+#endif
 
    // 6. Perceptual highlight dechroma: bright sources fade toward white as luminance approaches peak (eye/sensor
    // saturation). Keeps colored mid-highlights, whitens only the brightest (so warm-tinted white lamps read as
