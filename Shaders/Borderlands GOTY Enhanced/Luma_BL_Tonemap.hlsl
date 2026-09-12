@@ -5,12 +5,19 @@
 // highlight detail the pre-tonemap RGBA16F scene color holds (sun/sky/emissive/specular/FX, ~5-6 stops).
 //
 // Strategy (analytic in-shader TM, no LUT):
-//   1. Reconstruct the scene mix exactly as the game does (scene color + bloom).            -> untonemapped (real HDR)
-//   2. Run the game's own grade (the SDR "artistic intent") UNCHANGED on the saturate path. -> ungraded_sdr (the look)
-//   3. UpgradeToneMap (RenoDX ShortFuse, Tonemap.hlsl): add the highlight luminance the SDR  -> recovered
-//      tonemap clipped back on top of the graded look, hue-matched.
-//   4. DICE display rolloff to the user's peak/paper-white nits.                             -> hdr
-//   5. Restore hue/chroma to the SDR reference so the dev's color intent is preserved.
+//   1. Rebuild the native scene + bloom mix exactly as the game does.                          -> untonemapped
+//   2. Run the exact vanilla clamped grade: the SDR reference (TONEMAP_TYPE 0) and the FXAA luma source.
+//   3. HDR: run the same analytic UE3 grade as an extended function — its SDR upper clamps and 1e-4
+//      floors removed, every parameter and operation otherwise unchanged. It supplies range,
+//      luminance and chroma.                                                                   -> extendedLinear
+//   4. DICE maps the extended result to the user's peak / paper white (BT.2020 working space). -> hdr
+//   5. Restore hue only, toward a soft per-channel ReinhardPiecewise(5, 1.5) reference built from the
+//      same extended grade in BT.2020 — the RenoDX BL1 hue donor, applied here after DICE through
+//      Luma's JzAzBz RestoreHueAndChrominance. Target chroma is kept; blowout is zero.
+//   6. Optional user grading (HighlightDechroma / Saturation / Contrast).
+//
+// Contract: the extended grade supplies range, luminance and chroma; the soft reference supplies the hue
+// direction only. The RenoDX donor precedent is exact; the post-DICE JzAzBz placement is Luma's.
 //
 // Output is stored in GAMMA space (POST_PROCESS_SPACE_TYPE==0, 1.0 = paper white) so the game's gamma-SDR
 // HUD blends on top like vanilla (a linear buffer washes it out). With UI_DRAW_TYPE==2 the scene is also
@@ -26,11 +33,10 @@
 #include "../Includes/Color.hlsl"
 #include "../Includes/ColorGradingLUT.hlsl" // RestoreHueAndChrominance, SimpleGamutClip
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
-#include "../Includes/Reinhard.hlsl"        // ReinhardTonemap / DefaultReinhardSettings (NeutralSDR)
-#include "../Includes/Tonemap.hlsl"         // UpgradeToneMap
+#include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise: soft hue reference
 // clang-format on
 
-// HDR / vanilla. 1 = recover real highlights + DICE display map (default). 0 = vanilla clamped SDR reference.
+// HDR / vanilla. 1 = extended UE3 grade + DICE display map (default). 0 = vanilla clamped SDR reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
 #endif
@@ -41,27 +47,9 @@
 #define TONEMAP_IN_WIDER_GAMUT 1
 #endif
 
-// Restore the SDR reference's hue/chroma onto the HDR result (keeps the dev's color grade intent).
+// Restore hue toward the soft reference on the HDR result (keeps the dev's color intent without the clip's whitening).
 #ifndef ENABLE_HUE_RESTORATION
 #define ENABLE_HUE_RESTORATION 1
-#endif
-
-// HDR reconstruction source (A/B). 0 = the shipping UpgradeToneMap bridge: the luminance a neutral SDR
-// tonemap clipped, added back on top of the clamped grade. 1 = the game's own grade continued past SDR
-// white by dropping only its two upper saturate()s — nothing synthetic, no second tonemapper, which is
-// what the RenoDX port of this game does. Registered as a DEVELOPMENT-only checkbox in main.cpp, so a
-// shipped build always compiles the 0 side.
-#ifndef BL_HDR_RECONSTRUCTION
-#define BL_HDR_RECONSTRUCTION 0
-#endif
-
-// Hue reference for the post-DICE hue lock (A/B). 0 = the unclipped extended grade itself. 1 = that same
-// value run through a soft per-channel Reinhard (RenoDX BL1's hue/chrominance reference), so the hue
-// bends toward the clip the way the vanilla saturate() bent it, without the clip's whitening — the
-// RenoDX BL1 soft hue-reference adapted to the existing Luma post-DICE hue-restoration architecture.
-// DEVELOPMENT-only checkbox in main.cpp; a shipped build compiles the 0 side.
-#ifndef BL_HDR_HUE_REFERENCE
-#define BL_HDR_HUE_REFERENCE 0
 #endif
 
 // HighlightDechroma is an optional user slider (see step 6 below); default 0 = off (only the mandatory DICE/gamut
@@ -92,18 +80,13 @@ SamplerState BlurredImageSampler_s : register(s1);
 Texture2D<float4> SceneColorTexture : register(t0);
 Texture2D<float4> BlurredImage : register(t1);
 
-// Neutral SDR reference for the highlight-recovery delta.
-float3 NeutralSDR(float3 color)
-{
-   ReinhardSettings settings = DefaultReinhardSettings();
-   settings.by_luminance = true;
-   return ReinhardTonemap(color, 100.f, 100.f, settings);
-}
-
 // Grade steps 1-3 (shadows -> highlights -> midtones), lifted verbatim from the decompiled shader. Returns the
 // post-midtones color: the exact point original 0xB030BAA6 takes its FXAA luma from.
-// `clampSDR`: true = vanilla saturate() path; false = unclamped (max 0), keeping highlights' real channel ratio
-// (hue) instead of the per-channel saturate hue shift.
+// `clampSDR`: true = the vanilla SDR path, verbatim: upper saturate() clamps and 1e-4 floors. false = the same
+// grade as an extended HDR function: the upper saturate()s become max(0, ...) and the 1e-4 floors become 0 (so
+// black reaches 0 rather than the SDR floor's 0.0152 in gamma); every parameter, every other operation and the
+// gamma exponent are unchanged, so highlights keep their real channel ratio instead of the per-channel
+// saturate() hue shift.
 float3 GradeUE3_PostMidtones(float3 scene, bool clampSDR)
 {
    float3 c = clampSDR ? saturate(-SceneShadowsAndDesaturation.xyz + scene)
@@ -116,6 +99,7 @@ float3 GradeUE3_PostMidtones(float3 scene, bool clampSDR)
 }
 
 // Tail of the grade: desat + overlay + scale + gamma encode (verbatim from the back half of the original).
+// Same `clampSDR` contract as GradeUE3_PostMidtones.
 float3 GradeUE3_FromPostMidtones(float3 c, bool clampSDR)
 {
    float desat = dot(c, SceneScaledLuminanceWeights.xyz);
@@ -155,18 +139,11 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    outLuma = 0.25 * log2(dot(postMidtones, float3(0.212670997, 0.715160012, 0.0721689984)) * 15.0 + 1.0);
 
 #if TONEMAP_TYPE >= 1
-#if BL_HDR_RECONSTRUCTION
-   // 3. The grade is a closed analytic function whose only destructive steps are its two upper clamps;
-   // with those removed it continues past SDR white by itself, so the highlights never need rebuilding.
-   // Same expression as the hue reference below — fxc computes it once.
-   float3 recovered = gamma_to_linear(GradeUE3(untonemapped, false));
-#else
-   float3 ungraded_sdr = gamma_to_linear(ungraded_sdr_gamma); // linear SDR reference (1.0 = white)
-
-   // 3. Recover the highlight luminance the SDR tonemap clipped, on top of the graded look.
-   float3 neutral_sdr = NeutralSDR(untonemapped);
-   float3 recovered = UpgradeToneMap(untonemapped, neutral_sdr, ungraded_sdr);
-#endif
+   // 3. The same grade as an extended HDR function (see GradeUE3): it continues past SDR white on its own, so
+   // range, luminance and chroma all come from the game's own math. Computed once; the hue reference below is
+   // built from this same value.
+   float3 extendedLinear = gamma_to_linear(GradeUE3(untonemapped, false));
+   float3 recovered = extendedLinear;
 
    // 4. Display rolloff to the user's peak/paper-white nits (DICE, hue-preserving by luminance).
    const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
@@ -186,24 +163,18 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 #endif
 
-   // 5. Lock hue EXACTLY to the un-blown reference (objectively correct: no hue rotation with brightness).
+   // 5. Hue restoration toward the soft reference.
 #if ENABLE_HUE_RESTORATION
-   // Reference = the grade run UNCLAMPED: keeps the real highlight channel ratio (a bright blue stays blue),
-   // unlike the vanilla SDR whose per-channel saturate() shifts the hue at the clip. Hue strength 1.0 (exact),
-   // chrominance 0.0 — we keep the by-luminance DICE chroma and let gamut mapping (GAMUT_MAPPING_TYPE in the
-   // composition) roll chroma to the displayable maximum at each luminance. No hand-tuned desaturation.
-   float3 hueRef = gamma_to_linear(GradeUE3(untonemapped, false));
-#if BL_HDR_HUE_REFERENCE
-   // Built in BT.2020 because that is where RenoDX applies it (common.hlsli, ApplyCustomGrading):
-   // ReinhardPiecewise(x, 5, 1.5) is linear below 1.5 and rolls off toward 5 above, per channel, so a
-   // saturated highlight's strong channel compresses before its weak ones and the hue leans the way the
-   // vanilla clip leaned it — softly, and only in the hue: RestoreHueAndChrominance below still takes
-   // its chroma from the DICE result and its lightness from nothing but the target. Reinhard.hlsl's
-   // ReinhardPiecewise is token-identical to RenoDX's; the two ComputeReinhardScale differ only for a
-   // non-zero minimum, and ReinhardPiecewise fixes it at 0. RenoDX applies this before its display map;
-   // Luma applies it after DICE, so this is an adaptation of the donor, not of the pipeline.
-   hueRef = BT2020_To_BT709(Reinhard::ReinhardPiecewise(BT709_To_BT2020(hueRef), 5.0, 1.5));
-#endif
+   // Reference = the extended grade run through ReinhardPiecewise(x, 5, 1.5) per channel in BT.2020, the
+   // hue/chrominance reference of the RenoDX BL1 port (common.hlsli, ApplyCustomGrading): linear below 1.5,
+   // rolling toward 5 above, so a saturated highlight's strong channel compresses before its weak ones and the
+   // hue leans the way the vanilla clip leaned it — without the clip's whitening. Hue strength 1.0, chrominance
+   // 0.0: only the hue direction is taken; chroma stays the DICE result's and lightness is the target's (JzAzBz),
+   // with gamut mapping (GAMUT_MAPPING_TYPE in the composition) rolling chroma to the displayable maximum.
+   // Reinhard.hlsl's ReinhardPiecewise is token-identical to RenoDX's, and the two ComputeReinhardScale agree at
+   // the x_min = 0 it fixes. RenoDX applies its emulation before its display map in MacLeod–Boynton; Luma applies
+   // the shared operator after DICE — the donor is the precedent, the placement is Luma's.
+   float3 hueRef = BT2020_To_BT709(Reinhard::ReinhardPiecewise(BT709_To_BT2020(extendedLinear), 5.0, 1.5));
    hdr = RestoreHueAndChrominance(hdr, hueRef, 1.0, 0.0);
 #endif
 
@@ -240,7 +211,7 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // Pre-scale so the gamma-SDR HUD (drawn on top) lands at UIPaperWhite after composition rescales by it.
    outColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
 #endif
-   // Sanitize: the scene carries small negative/WCG values; the recovery + hue restore + gamma encode can
+   // Sanitize: the scene carries small negative/WCG values; the extended grade + hue restore + gamma encode can
    // emit NaN or negatives (linear_to_gamma of a negative is NaN). Clamp so no garbage reaches the swapchain.
    outColor = (outColor == outColor) ? outColor : 0.0; // NaN -> 0 (NaN != NaN)
    outColor = max(0.0, outColor);
