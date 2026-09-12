@@ -579,23 +579,8 @@ public:
    void OnInit(bool async) override
    {
       // Game-specific toggles consumed by the replaced pass (Luma_ME1_Tonemap.hlsl).
-      // Two DEVELOPMENT A/Bs for the HDR path: compile-time switches that change the image rather than refactoring it,
-      // so they are fixed at the production '1' outside DEVELOPMENT and the legacy '0' never ships. They are orthogonal;
-      // 0/0 is the exact pre-promotion shader, kept for in-game comparison.
-      constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map"},
-         {"ME1_HDR_RECONSTRUCTION", '1', true, kExperimentLocked,
-            "HDR reconstruction A/B\n"
-            "1 - the game's own grade run unclamped, straight in (production; BL GOTY / MoHA reconstruction)\n"
-            "0 - legacy NeutralSDR + UpgradeToneMap on top of the clamped grade",
-            1},
-         {"ME1_HDR_COLOR_STYLE", '1', true, kExperimentLocked,
-            "HDR colour stage A/B\n"
-            "1 - ReinhardPiecewise(5, 1.5) soft reference -> MacLeod-Boynton hue-only -> DICE, no post-DICE restore\n"
-            "    (production; Hue Shift 100%, Blowout 0)\n"
-            "0 - legacy DICE, then JzAzBz hue-only lock to the unclamped grade",
-            1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
