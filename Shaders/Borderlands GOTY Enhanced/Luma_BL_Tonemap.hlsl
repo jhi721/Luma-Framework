@@ -46,6 +46,15 @@
 #define ENABLE_HUE_RESTORATION 1
 #endif
 
+// HDR reconstruction source (A/B). 0 = the shipping UpgradeToneMap bridge: the luminance a neutral SDR
+// tonemap clipped, added back on top of the clamped grade. 1 = the game's own grade continued past SDR
+// white by dropping only its two upper saturate()s — nothing synthetic, no second tonemapper, which is
+// what the RenoDX port of this game does. Registered as a DEVELOPMENT-only checkbox in main.cpp, so a
+// shipped build always compiles the 0 side.
+#ifndef BL_HDR_RECONSTRUCTION
+#define BL_HDR_RECONSTRUCTION 0
+#endif
+
 // HighlightDechroma is an optional user slider (see step 6 below); default 0 = off (only the mandatory DICE/gamut
 // desaturation applies).
 
@@ -137,11 +146,18 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    outLuma = 0.25 * log2(dot(postMidtones, float3(0.212670997, 0.715160012, 0.0721689984)) * 15.0 + 1.0);
 
 #if TONEMAP_TYPE >= 1
+#if BL_HDR_RECONSTRUCTION
+   // 3. The grade is a closed analytic function whose only destructive steps are its two upper clamps;
+   // with those removed it continues past SDR white by itself, so the highlights never need rebuilding.
+   // Same expression as the hue reference below — fxc computes it once.
+   float3 recovered = gamma_to_linear(GradeUE3(untonemapped, false));
+#else
    float3 ungraded_sdr = gamma_to_linear(ungraded_sdr_gamma); // linear SDR reference (1.0 = white)
 
    // 3. Recover the highlight luminance the SDR tonemap clipped, on top of the graded look.
    float3 neutral_sdr = NeutralSDR(untonemapped);
    float3 recovered = UpgradeToneMap(untonemapped, neutral_sdr, ungraded_sdr);
+#endif
 
    // 4. Display rolloff to the user's peak/paper-white nits (DICE, hue-preserving by luminance).
    const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
