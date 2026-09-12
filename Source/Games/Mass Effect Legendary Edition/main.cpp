@@ -1359,7 +1359,8 @@ public:
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, PROJECT_NAME, "HighlightDechroma", gs.HighlightDechroma);
          if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("How soon bright sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+            ImGui::SetTooltip("How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).\n"
+                              "Only acts above a third of your Peak Brightness, so mid-tones keep their color whatever this is set to.");
          if (DrawResetButton<float, false>(gs.HighlightDechroma, gd_def.HighlightDechroma, "HighlightDechroma"))
          {
             device_data.cb_luma_global_settings_dirty = true;

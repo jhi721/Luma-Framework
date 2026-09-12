@@ -63,24 +63,30 @@ if (LumaSettings.DisplayMode == 1) // HDR
    // gradedHDR arrives as paper-white-relative linear HDR; DICE owns peak rolloff and gamut from here.
    float3 vignettedHDR = gradedHDR * vigLinear;
 
+   // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider
+   // would escape the Scene Peak it just established, and nothing downstream re-contains it. Multiplicative
+   // around mid-gray (0.18, Game-Paper-White-relative), the repo's form (RenoDX_Contrast). [branch] on a cbuffer
+   // uniform: at the 1.0 default this is a bit-exact no-op. The pow is spelled out with a floored log2 so
+   // Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
+   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
+   {
+      const float midGray = 0.18;
+      vignettedHDR = exp2(LumaSettings.GameSettings.Contrast * log2(max(vignettedHDR / midGray, 1e-30))) * midGray;
+   }
+
    // DICE works in absolute-nit ratios, so its cap lands at the display peak. Type 2 also runs
    // CorrectOutOfRangeColor. Grain, dither, and RCAS can still push the result ~2% past Scene Peak; accepted.
    DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+   // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
+   // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
+   // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
+   // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
+   // flattens it for every pixel above the shoulder.
+   settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
    float3 displayMapped = DICETonemap(vignettedHDR * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
 
-   // User HDR grade in Game-Paper-White-relative linear RGB; defaults are no-ops.
-   const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
-   if (highlightDechroma > 0.0)
-   {
-      float dcExp = lerp(1.0, 0.05, highlightDechroma);
-      // peakWhite is 80-nit-relative, so convert it before dividing a Game-Paper-White-relative value by it.
-      const float relativePeak = peakWhite / max(paperWhite, 1e-6);
-      float dcWeight = saturate(pow(saturate(GetLuminance(displayMapped) / relativePeak), dcExp));
-      displayMapped = Saturation(displayMapped, 1.0 - dcWeight);
-   }
+   // User saturation LAST, after the display map, in Game-Paper-White-relative linear RGB; 1.0 is a no-op.
    displayMapped = Saturation(displayMapped, LumaSettings.GameSettings.Saturation);
-   const float midGray = 0.18; // Game-Paper-White-relative mid-gray.
-   displayMapped = (displayMapped - midGray) * LumaSettings.GameSettings.Contrast + midGray;
 
    postProcessedColor = displayMapped;
 }
