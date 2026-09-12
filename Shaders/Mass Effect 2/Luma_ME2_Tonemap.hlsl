@@ -19,12 +19,6 @@
 #define TONEMAP_TYPE 0
 #endif
 
-// Run the display map in a BT.2020 working space (round-tripped back to BT.709). Gamut-correct handling of
-// highly saturated highlights — NOT a display-gamut expansion.
-#ifndef TONEMAP_IN_WIDER_GAMUT
-#define TONEMAP_IN_WIDER_GAMUT 1
-#endif
-
 // Set by the 0xDB1022A7 entry point only: that permutation runs the native filmic curve before the grade.
 #ifndef ME2_UBER_FILMIC
 #define ME2_UBER_FILMIC 0
@@ -59,9 +53,10 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    // devkit white level. Floors stay - outside DEVELOPMENT there is no unset fallback, and DICE divides by both.
    const float paperWhite = max(GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
    const float peakWhite = max(PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
-#if TONEMAP_IN_WIDER_GAMUT
+   // The map runs in a BT.2020 working space and is round-tripped back below: gamut-correct handling of highly
+   // saturated highlights, NOT a display-gamut expansion. The BT.709 alternative was a diagnostic, never a shipped
+   // configuration, and is gone; this path is validated in _tools/me2_bridge/me2_hdr_final_check.py.
    sceneHDR = BT709_To_BT2020(sceneHDR);
-#endif
    // Luminance in PQ (hue-preserving), then CORRECT_CHANNELS_BEYOND_PEAK_WHITE fades over-peak channels to white.
    // Identity below the shoulder (a third of peak), so diffuse content and the upstream sliders are untouched.
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
@@ -71,16 +66,12 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
    // flattens it for every pixel above the shoulder.
    ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-#if TONEMAP_IN_WIDER_GAMUT
    // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. We already converted above
    // and undo it below, so leaving the default CS_BT709 in makes it convert a SECOND time and run its compression,
    // its average()-based source luminance and its channel containment on doubly-narrowed primaries.
    ds.InOutColorSpace = CS_BT2020;
-#endif
    float3 hdr = DICETonemap(sceneHDR * paperWhite, peakWhite, ds) / paperWhite;
-#if TONEMAP_IN_WIDER_GAMUT
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
-#endif
 
    // User saturation LAST, after the display map: the repo's convention. Lerp against BT.709 luminance, not
    // hue-preserving; 1.0 is a no-op. Scale-linear, so it needs no view of the engine fade the uber re-applies.
