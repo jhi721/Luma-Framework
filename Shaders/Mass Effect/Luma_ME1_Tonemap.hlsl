@@ -165,7 +165,8 @@ float3 FinishME1HDR(float3 extendedGradeLinear)
 // vanilla value in SDR. `sceneUV` is TEXCOORD1 (t0), `blurUV` TEXCOORD0 (t1) - the original samples t0 with v6.
 float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
 {
-   // 1. Scene mix, exactly as vanilla: depth-driven DoF weight, bloom at x4, normalized by the weight sum.
+   // 1. Scene mix, exactly as vanilla: depth-driven DoF weight, the combined DoF/native-bloom contribution at x4,
+   // normalized by the weight sum.
    float4 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorTextureSampler_s, sceneUV), DgvMaskT0, DgvFillT0);
 
    const float depth = scene.w; // UE3 packs scene depth in the fp16 alpha
@@ -181,13 +182,14 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
    const float sceneWeight = saturate(1.0 - blurAmount);
 
    float4 blurred = ApplyDgvMask(BlurredImage.Sample(BlurredImageSampler_s, blurUV), DgvMaskT1, DgvFillT1);
-   // Stored pre-divided by 4, hence the x4; vanilla's unorm view also capped it at 4.0, a cap the fp16 upgrade lifted.
-   // NEVER scaled by BloomIntensity: DoF and bloom are SUMMED into this buffer.
-   const float3 bloom = blurred.xyz * 4.0;
+   // The engine's combined DoF blur + native bloom target, stored pre-divided by 4, hence the x4; vanilla's unorm view
+   // also capped it at 4.0, a cap the fp16 upgrade lifted. NEVER scale blurContribution by BloomIntensity: DoF and bloom
+   // are SUMMED into this buffer, so the term carries defocused scene, not only glow.
+   const float3 blurContribution = blurred.xyz * 4.0;
    const float weightSum = blurred.w * 4.0 + sceneWeight;
 
    // The Luma glow goes into the numerator, where the vanilla glow was, so the DoF weight sum divides it too.
-   float3 untonemapped = scene.xyz * sceneWeight + bloom + LumaBloom(sceneUV);
+   float3 untonemapped = scene.xyz * sceneWeight + blurContribution + LumaBloom(sceneUV);
    untonemapped *= (abs(weightSum) > 0.0) ? rcp(weightSum) : FLT_MAX; // rcp guard, as the original does
 
    // Exposure, scene-referred / pre-grade: the SDR reference derives from the same value, so the grade tracks it.
@@ -239,12 +241,13 @@ float3 GradeGCVanilla(float3 scene)
    return PowUE3(saturate(c), GcInverseGamma.xxx);
 }
 
-// The grade with the overlay (this pass's fade) held OUT: clamped = the SDR reference, unclamped (lower-only max(0)) =
-// the extended HDR signal of the gamma-only frames. Unlike the uber grade it carries the display gamma itself.
-float3 GradeGC(float3 scene, bool clampSDR)
+// The gamma-only extended native grade: the overlay (this pass's fade) held OUT and re-applied after the HDR block,
+// the vanilla saturate() as a lower-only max(0) so highlights keep their real channel ratio. GcInverseGamma belongs
+// to this grade, so the caller decodes with a plain gamma_to_linear rather than VanillaToLinear.
+float3 GradeGCExtended(float3 scene)
 {
    float3 c = scene * GcColorScale.xyz;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mad_sat in the original
+   c = max(0.0, c); // mad_sat in the original
    return PowUE3(c, GcInverseGamma.xxx);
 }
 
@@ -265,11 +268,11 @@ float3 RunME1GammaCorrection(float2 sceneUV)
    else
    {
       // Gamma-only frame: the RAW fp16 scene, no DoF, no bloom, no uber grade, so the whole HDR block runs here off
-      // this pass's own extended grade. GradeGC applies GcInverseGamma itself, so the decode is a plain gamma_to_linear
-      // (NOT VanillaToLinear, which would apply the display gamma twice). No Luma bloom: the pyramid is injected at
-      // the uber draw.
+      // this pass's own extended grade. GradeGCExtended applies GcInverseGamma itself, so the decode is a plain
+      // gamma_to_linear (NOT VanillaToLinear, which would apply the display gamma twice). No Luma bloom: the pyramid is
+      // injected at the uber draw.
       float3 untonemapped = scene.xyz * LumaSettings.GameSettings.Exposure;
-      hdr = FinishME1HDR(gamma_to_linear(GradeGC(untonemapped, false)));
+      hdr = FinishME1HDR(gamma_to_linear(GradeGCExtended(untonemapped)));
    }
    // The fade LAST, after the creative sliders. Branched, not lerped: the decode is uniform but fxc hoists it into
    // the preamble, where .w is 0 with no fade - measured 48 -> 42 executed instructions.
