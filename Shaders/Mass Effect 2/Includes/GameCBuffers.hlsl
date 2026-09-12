@@ -37,6 +37,12 @@ struct LumaGameSettings
    float BloomScaleLive;  // not a user setting: the engine's BloomScale (gather cb4[11].x), read back by main.cpp.
                           // The vanilla glow adds BloomScale x blur(bright pass) and the pyramid is
                           // energy-preserving, so this is the gain that makes BloomIntensity 1 mean vanilla.
+   // DEVELOPMENT tuning control, appended after the fields above and never reordered. Read ONLY by the hard-clip
+   // uber permutation, and ONLY under DEVELOPMENT - shipping builds compile the HueOnly wrapper and never touch it,
+   // so a Publishing build is bit-exact whatever this holds.
+   float HardClipHighlightPurity; // MacLeod-Boynton chrominance strength. 0 = the target keeps its own purity (the
+                                  // canonical HueOnly contract, and the shipped look); 1 = adopt the Reinhard
+                                  // reference's purity, which is lower above its shoulder, so highlights wash out.
 };
 
 // Game specific cbuffer (instance/pass) data, uploaded per replaced draw.

@@ -8,7 +8,7 @@
 #include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip, and Oklab through it
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise (hue-shift reference)
-#include "Includes/MacLeodBoynton.hlsl"     // MacLeodBoynton::HueAndPurityEmulation. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
+#include "Includes/MacLeodBoynton.hlsl"     // MacLeodBoynton::HueOnlyBT2020. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
 // clang-format on
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
@@ -35,15 +35,21 @@
 #define ME2_MATERIAL_GRAIN 0
 #endif
 
-// The RGB working space the MacLeod-Boynton model runs in, used by the hard-clip permutation's hue transfer. The
-// three sibling games (BL GOTY, ME1 2007, MoHA) call its BT.2020 wrapper because their hue stage and their display
-// map live in ONE pass. ME2's are split: what this pass writes is the LINEAR BT.709 fp16 canvas the native vignette
-// multiplies and the material later maps, so the model runs in the space the value is actually in. That also keeps
-// the solver's own guarantee worth something - it constrains RGB(t) >= 0 in its working space, so no negative
-// channel can reach the canvas. Note purity in MB is the fraction of the distance from white to the GAMUT BOUNDARY,
-// so the same physical colour reads a different purity here than it would in BT.2020; that is the model's
-// definition, not a divergence from the siblings.
-static const MacLeodBoynton::RGBColorSpace ME2_RGB_BT709 = {BT709_To_XYZ, XYZ_To_BT709}; // ../Includes/Color.hlsl
+// DEVELOPMENT A/B for the working space of the hard-clip permutation's MacLeod-Boynton hue stage. It changes the
+// image rather than refactoring it, so main.cpp fixes it at the production 1 outside DEVELOPMENT and the BT.709
+// form never ships. 1 = solve in BT.2020, the space every other MacLeod-Boynton port in this repo uses.
+// 0 = solve in BT.709, the form shipped in 954074a8, kept for in-game comparison.
+// Purity is the fraction of the distance from white to the GAMUT BOUNDARY, so the boundary changes the answer;
+// measured deltas after the display map are small everywhere except green (saturation) and blue (luminance).
+#ifndef ME2_HARDCLIP_HUE_SPACE
+#define ME2_HARDCLIP_HUE_SPACE 1
+#endif
+
+#if ME2_HARDCLIP_HUE_SPACE == 0
+// Only the BT.709 leg of the A/B needs an explicit descriptor: the canonical helper ships a BT.2020 one and no
+// other. Matrices from ../Includes/Color.hlsl.
+static const MacLeodBoynton::RGBColorSpace ME2_RGB_BT709 = {BT709_To_XYZ, XYZ_To_BT709};
+#endif
 
 // ---------------------------------------- Shared ----------------------------------------
 
@@ -330,19 +336,42 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // Hard-clip permutation: nothing to invert, so the grade run UNCLAMPED is the rebuild — vanilla-exact below the
    // clip and its own analytic continuation above it.
    float3 recovered = VanillaToLinear(GradeUE3(curved, false, 1.0));
+#if ME2_HARDCLIP_HUE_SPACE == 0
    // Hue shift toward a per-channel Reinhard (ceiling 5, shoulder 1.5) of the colour itself, built in BT.2020 — the
    // reference our RenoDX ports ship. Primaries decide which channel turns first, hence the skew magnitude
-   // (fire +31.4 deg in BT.2020 vs +41.8 in 709).
+   // (fire +31.4 deg in BT.2020 vs +41.8 in 709). Hoisted out of the gate, as the BT.709 leg always had it.
    const float3 hueEmuRef = BT2020_To_BT709(Reinhard::ReinhardPiecewise(BT709_To_BT2020(recovered), 5.0, 1.5));
-   // Exact gate: below 1.0 the reference equals `recovered` (the Reinhard shoulder sits at 1.5 and the BT.2020
-   // channels of a BT.709 colour never exceed its max), so the transfer is a provable no-op. It also pays for itself
-   // here - the model below runs three purity solves, so a real branch is worth taking on everything that is not a
-   // highlight. Hue 1 / chrominance 0 is the canonical HueOnly contract: the reference supplies a hue DIRECTION and
-   // nothing else, while the target keeps its own purity and its own T = L + M, so this stage cannot move brightness.
-   // Tuned constants, not user controls; path-to-white stays with DICE at the display peak.
+#endif
+   // Exact gate: below 1.0 the reference equals the target (the Reinhard shoulder sits at 1.5 and the BT.2020
+   // channels of a BT.709 colour never exceed its max), so the transfer is a provable no-op. It also pays for
+   // itself - the model runs three purity solves, so a real branch is worth taking on everything that is not a
+   // highlight. Tuned constants, not user controls; path-to-white stays with DICE at the display peak.
    [branch] if (max3(recovered) > 1.0)
    {
+#if ME2_HARDCLIP_HUE_SPACE
+      // The hue stage alone runs in BT.2020 - the working space every other MacLeod-Boynton port in this repo uses,
+      // and the one the canonical wrapper is built for. Only this island moves: the reconstruction above and
+      // everything below stay BT.709. A HueOnly solve re-applies the TARGET's own purity, and the target is a
+      // BT.709-authored UE3 grade, so the result cannot leave BT.709 and needs no wider transport downstream
+      // (measured: 0 of 20000 sampled highlights left the gamut). The gamut BOUNDARY still changes the answer,
+      // because purity is the fraction of the distance from white to it - that is the whole point of the move.
+      const float3 target2020 = BT709_To_BT2020(recovered);
+      // Same donor trajectory as the BT.709 leg: it was always evaluated here and only converted back to solve.
+      const float3 reference2020 = Reinhard::ReinhardPiecewise(target2020, 5.0, 1.5);
+      // Hue 1 / chrominance 0, the canonical HueOnly contract: the reference supplies a hue DIRECTION and nothing
+      // else, while the target keeps its own purity and its own T = L + M. T is MacLeod-Boynton's intensity anchor,
+      // NOT photometric luminance - BT.709 Y does move here, most of all on saturated blues.
+#if DEVELOPMENT
+      // DEVELOPMENT only: chrominance opened up as a slider so purity ownership can be judged in place. It cannot
+      // be a compile-time constant here, so fxc keeps the chrominance branch alive and the DEV listing grows;
+      // shipping builds take the wrapper below and stay bit-exact. At 0 the two are the same operation.
+      recovered = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(target2020, reference2020, 1.0, LumaSettings.GameSettings.HardClipHighlightPurity));
+#else
+      recovered = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(target2020, reference2020));
+#endif
+#else
       recovered = MacLeodBoynton::HueAndPurityEmulation(recovered, hueEmuRef, 1.0, 0.0, ME2_RGB_BT709, float2(-1.0, -1.0), 1e-7);
+#endif
    }
 #endif
 
