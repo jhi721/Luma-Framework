@@ -24,27 +24,30 @@ float ME2_NativeToneCurveSlope(float scene)
 // white stays neutral, black stays black, and a channel the vanilla grade zeroed gets no light back.
 float3 ME2_RecoverFilmicBrightness(float3 scene, float3 curved, float3 sdrRef)
 {
-   // Source-domain pivot, in the scene light the curve takes as INPUT - not paper white, nits, or a post-grade value.
-   // Not calibrated against a capture. ⚠ It must stay above mid-gray: below it the tangent's intercept
-   // F(p) - p*F'(p) turns negative and the extension crosses zero.
-   const float p = 0.35;
-   const float m = max3(scene);
+   // Tuned HDR-extension onset, in the scene light the curve takes as INPUT - not paper white, nits, or a post-grade
+   // value. A chosen constant, not a property of the curve: its own landmarks (inflection 0.065, the tangent through
+   // the origin 0.145, mid-gray 0.18) each give a brighter extension, and none of them says what brightness the game
+   // meant. Two hard bounds: below 0.145 the tangent's intercept F(p) - p*F'(p) turns negative and the extension
+   // crosses zero; below 0.065 the curve is still convex and the tangent would dip under it. At 0.35, SDR white
+   // recovers 1.35x, scene 4 -> 3.7x, scene 16 -> 13.3x.
+   const float pivot = 0.35;
+   // The source EXCURSION, not luminance: the native curve is per channel, so its hottest channel is the one the
+   // shoulder compresses first - and F is monotone, so max3(F(scene)) == F(max3(scene)) below.
+   const float sourcePeak = max3(scene);
 
-   // Returning before the divide keeps the whole lower range bit-exact vanilla and avoids a division near black.
-   if (m <= p)
+   // Returning here keeps the whole lower range bit-exact vanilla.
+   if (sourcePeak <= pivot)
       return sdrRef;
 
-   const float pivotValue = ME2_NativeToneCurve(p.xxx).x;
-   const float slope = ME2_NativeToneCurveSlope(p);
-   const float extended = pivotValue + slope * (m - p); // the curve continued along its own tangent
+   const float pivotValue = ME2_NativeToneCurve(pivot.xxx).x;
+   const float slope = ME2_NativeToneCurveSlope(pivot);
+   const float extended = pivotValue + slope * (sourcePeak - pivot); // the curve continued along its own tangent
 
-   // F is monotone, so max(F(R), F(G), F(B)) == F(max(R, G, B)): reuse the evaluation the caller already has.
-   const float nativeValue = max(max3(curved), 1e-6);
-   // max(1, ...) is a FLOOR against darkening, not a ceiling. No saturate here or on the result: the display map
-   // owns the roll-off, and clamping to 1 would throw away the highlights this exists to recover.
-   const float gain = max(1.0, extended / nativeValue);
-
-   return sdrRef * gain;
+   // No floors, both proven dead: F(sourcePeak) >= F(pivot) = 0.433 here, so the divide is safe, and F is concave
+   // from its inflection at 0.065 up (F'' < 0, checked to 200), so the tangent sits above the curve and the ratio
+   // is >= 1 by itself - the extension can only brighten. No saturate on the result either: the display map owns
+   // the roll-off.
+   return sdrRef * (extended / max3(curved));
 }
 
 #endif // TONEMAP_TYPE >= 1 && ME2_UBER_FILMIC
