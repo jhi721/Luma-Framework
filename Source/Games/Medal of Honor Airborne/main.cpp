@@ -470,8 +470,9 @@ public:
    void OnInit(bool async) override
    {
       // Game-specific toggles consumed by the replaced pass (Luma_MOHA_Tonemap.hlsl).
-      // DEVELOPMENT A/B for the HDR reconstruction (Luma_MOHA_Tonemap.hlsl): a compile-time switch that changes the
-      // image rather than refactoring it, so it is fixed at '0' outside DEVELOPMENT and never ships enabled.
+      // Two DEVELOPMENT A/Bs for the HDR path (Luma_MOHA_Tonemap.hlsl): compile-time switches that change the image
+      // rather than refactoring it, so they are fixed at '0' outside DEVELOPMENT and never ship enabled. They are
+      // orthogonal; the colour-stage one is meant on top of reconstruction 1 (the BL GOTY production pair).
       constexpr bool kExperimentLocked = DEVELOPMENT ? false : true;
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: recover highlights + DICE display map"},
@@ -479,6 +480,12 @@ public:
             "HDR reconstruction A/B\n"
             "0 - NeutralSDR + UpgradeToneMap on top of the clamped grade (current)\n"
             "1 - the game's own grade run unclamped, straight in (BL GOTY production reconstruction)",
+            1},
+         {"MOHA_HDR_COLOR_STYLE", '0', true, kExperimentLocked,
+            "HDR colour stage A/B\n"
+            "0 - DICE, then JzAzBz hue-only lock to the unclamped grade (current)\n"
+            "1 - ReinhardPiecewise(5, 1.5) soft reference -> MacLeod-Boynton hue-only -> DICE, no post-DICE restore\n"
+            "    (BL GOTY production; Hue Shift 100%, Blowout 0). Meant on top of reconstruction 1.",
             1},
       };
       shader_defines_data.append_range(game_shader_defines_data);

@@ -22,6 +22,7 @@
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // ReinhardTonemap / DefaultReinhardSettings (NeutralSDR)
 #include "../Includes/Tonemap.hlsl"         // UpgradeToneMap
+#include "Includes/MacLeodBoynton.hlsl"     // MacLeodBoynton::HueOnlyBT2020 (byte-identical copy of the BL GOTY production model)
 // clang-format on
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
@@ -42,6 +43,17 @@
 // analytic continuation above it (the BL GOTY production reconstruction).
 #ifndef MOHA_HDR_RECONSTRUCTION
 #define MOHA_HDR_RECONSTRUCTION 0
+#endif
+
+// DEVELOPMENT A/B, stage 2: the HDR colour stage. 0 = DICE, then the JzAzBz hue-only lock to the unclamped grade
+// (current). 1 = the BL GOTY production stage: a soft per-channel ReinhardPiecewise(5, 1.5) reference in BT.2020
+// and MacLeod-Boynton hue-only emulation (Hue Shift 1, Blowout 0) BEFORE DICE, with no post-DICE restoration.
+// Meant on top of reconstruction 1; both combinations compile.
+#ifndef MOHA_HDR_COLOR_STYLE
+#define MOHA_HDR_COLOR_STYLE 0
+#endif
+#if MOHA_HDR_COLOR_STYLE == 1 && !TONEMAP_IN_WIDER_GAMUT
+#error "MOHA_HDR_COLOR_STYLE 1 builds its reference in BT.2020 and needs TONEMAP_IN_WIDER_GAMUT"
 #endif
 
 // UE3 UberPostProcess grade constants, at the register indices the disassembly reads them from.
@@ -131,6 +143,15 @@ float3 FinishMOHA(float3 untonemapped, float3 sdr_vanilla, float3 sdr_nofade, fl
    const float peakWhite = max(LumaSettings.PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
 #if TONEMAP_IN_WIDER_GAMUT
    recovered = BT709_To_BT2020(recovered);
+#if MOHA_HDR_COLOR_STYLE == 1
+   // 3b. BL GOTY colour stage. Soft hue reference: ReinhardPiecewise(x, 5, 1.5) per channel in BT.2020, where the
+   // RenoDX BL1 port builds it. Linear below 1.5 and rolling toward 5 above, it compresses a saturated highlight's
+   // strong channel before its weak ones, so the hue leans the way the vanilla clip leaned it, without the clip's
+   // whitening. MacLeod-Boynton then rebuilds that reference's hue direction on the target's own purity and
+   // T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it. Nothing is
+   // restored after DICE on this path.
+   recovered = MacLeodBoynton::HueOnlyBT2020(recovered, Reinhard::ReinhardPiecewise(recovered, 5.0, 1.5));
+#endif
 #endif
    // Luminance in PQ (hue-preserving), then CORRECT_CHANNELS_BEYOND_PEAK_WHITE desaturates any channel still over
    // peak toward white — panels clip per channel, so an uncorrected saturated highlight clips with a hue shift.
@@ -147,10 +168,12 @@ float3 FinishMOHA(float3 untonemapped, float3 sdr_vanilla, float3 sdr_nofade, fl
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 #endif
 
+#if MOHA_HDR_COLOR_STYLE == 0
    // 5. Lock hue EXACTLY to the un-blown reference (no hue rotation with brightness).
    // Reference = the grade run UNCLAMPED: keeps the real highlight channel ratio (a bright blue stays blue), unlike
    // vanilla whose saturate() shifts hue at the clip. Hue 1.0 exact, chrominance 0.0 (composition gamut-maps).
    hdr = RestoreHueAndChrominance(hdr, gamma_to_linear(hue_ref), 1.0, 0.0);
+#endif
 
    // 6. Perceptual highlight dechroma: bright sources fade toward white as luminance approaches peak. Keeps
    // colored mid-highlights, whitens only the brightest.
