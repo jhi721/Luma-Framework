@@ -518,8 +518,9 @@ public:
       use_os_reference_white_level = false;
 
       // Core auto-registers the 6 SMAA passes. Our tonemap outputs GAMMA, so the two DrawSMAA colour args get
-      // different textures: the snapshot itself for edge detection, and the linearize CS's decode of it for the
-      // neighborhood blend, which this shader then re-encodes (see Luma_BL2TPS_SMAALinearize.hlsl).
+      // different textures: the snapshot itself for edge detection, and the linearize CS's decode of it
+      // (Luma_BL2TPS_SMAALinearize.hlsl) for the neighborhood blend, whose own PS re-encodes the blended result
+      // back to gamma 2.2 (Luma_SMAA_impl.hlsl).
       // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA).
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Sharpen PS"),
          ShaderDefinition{"Luma_BL2TPS_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
@@ -530,14 +531,14 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS SMAA Linearize CS"),
          ShaderDefinition("Luma_BL2TPS_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
 
-      // The game's post passes use cb0..cb5; b12/b13 are free for Luma.
+      // The game's post passes use cb0..cb5, so b11 (core DrawBloom's own constants) and b12/b13 are free for Luma.
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
       // User HDR grade controls (read in Luma_BL2TPS_Tonemap.hlsl via LumaSettings.GameSettings). All
       // default to a vanilla no-op. Exposure/Bloom/Vignette act on both SDR+HDR; Saturation/Dechroma/Contrast HDR-only.
       default_luma_global_game_settings.Exposure = 1.f;           // scene multiplier (1x)
-      default_luma_global_game_settings.Saturation = 1.f;         // Oklab saturation
+      default_luma_global_game_settings.Saturation = 1.f;         // BT.709-luminance lerp (Color.hlsl Saturation)
       default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only mandatory DICE/gamut desat applies
       default_luma_global_game_settings.BloomIntensity = 1.f;     // seed only; OnDrawOrDispatch owns the effective value
       default_luma_global_game_settings.Contrast = 1.f;           // slope around 18% mid-gray
@@ -1211,7 +1212,7 @@ public:
 
    // The tonemap's own constants off cb4: rows 15..22 are DX9 c7..c14 (ImageAdjustments1..3, HalfResMaskRect,
    // DOFKernelSize, vignette). Raw values only; the curve itself lives in the shader, which continues it for HDR
-   // (BL2TPS_TryBuildWorkingHDR). cb4[16].rgb is the per-area bloom tint the bloom A/B mirrors.
+   // (BL2TPS_TryBuildWorkingLuminance). cb4[16].rgb is the per-area bloom tint the bloom A/B mirrors.
    static void CaptureGradeConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData& gd)
    {
       constexpr uint32_t kFirstRow = 15;
@@ -1238,7 +1239,7 @@ public:
          rows[6 * 4 + 0], rows[6 * 4 + 1], rows[6 * 4 + 2], rows[6 * 4 + 3],
          rows[7 * 4 + 0], rows[7 * 4 + 1], rows[7 * 4 + 2], rows[7 * 4 + 3]));
 
-      // The HDR working continuation models the K = 0 curve only (BL2TPS_TryBuildWorkingHDR in
+      // The HDR working continuation models the K = 0 curve only (BL2TPS_TryBuildWorkingLuminance in
       // Luma_BL2TPS_Tonemap.hlsl); on anything else it declines and the native graded colour is presented as-is.
       // K has never been observed non-zero, so say so loudly if it ever is. This sits after the de-dup above and
       // inherits it: one line per distinct curve, never per frame. Known limit - past 64 distinct sets that guard
@@ -1486,7 +1487,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       reshade::get_config_value(nullptr, NAME, "HideUI", g_hide_ui);
 
-      // HDR grade sliders (cb_luma_global_settings_dirty is already true at init -> uploaded on first frame).
+      // Grade sliders (cb_luma_global_settings_dirty is already true at init -> uploaded on first frame).
       auto& gs = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, NAME, "Exposure", gs.Exposure);
       reshade::get_config_value(nullptr, NAME, "Saturation", gs.Saturation);
@@ -1541,7 +1542,8 @@ public:
 #endif
       ImGui::EndDisabled();
 
-      // HDR grade sliders, read in Luma_BL2TPS_Tonemap.hlsl; every default is a vanilla no-op (see OnInit).
+      // Grade sliders, read in Luma_BL2TPS_Tonemap.hlsl; every default is a vanilla no-op, and OnInit says which
+      // of them act in SDR as well.
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& gd_def = default_luma_global_game_settings;
@@ -1680,7 +1682,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Borderlands 2 & The Pre-Sequel\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds native HDR, SMAA anti-aliasing, HDR bloom, depth-of-field, and 16x anisotropic filtering.\n"
+         "It adds native HDR, SMAA anti-aliasing, HDR bloom, and 16x anisotropic filtering.\n"
          "The game's own anti-aliasing can be left at either setting; Luma reduces it to a copy.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Thanks to the Luma team and contributors.\n"
