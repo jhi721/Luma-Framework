@@ -123,6 +123,13 @@ float3 FinishMOHA(float3 untonemapped, float3 sdr_vanilla, float3 sdr_nofade, fl
    // Luminance in PQ (hue-preserving), then CORRECT_CHANNELS_BEYOND_PEAK_WHITE desaturates any channel still over
    // peak toward white — panels clip per channel, so an uncorrected saturated highlight clips with a hue shift.
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+#if TONEMAP_IN_WIDER_GAMUT
+   // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The colour is already
+   // BT.2020 here and is converted back below, so the default CS_BT709 would make it convert a SECOND time and
+   // run its shoulder trigger (an RGB average), its compression and its channel containment on doubly-narrowed
+   // primaries. Neutrals cancel out; saturated highlights do not.
+   ds.InOutColorSpace = CS_BT2020;
+#endif
    float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, ds) / paperWhite;
 #if TONEMAP_IN_WIDER_GAMUT
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
