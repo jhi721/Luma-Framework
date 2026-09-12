@@ -461,26 +461,32 @@ float4 RunTonemap(float4 v5, float4 v6)
          recovered = BL2TPS_NativeColorAtLuminance(sdrLinear, workLuminance);
       }
 
+      // --- User HDR grade (HDR display path only; defaults are vanilla no-ops) ---
+      // Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
+      // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
+      // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code 0.5).
+      // [branch] on a cbuffer uniform: at the 1.0 default this must be a BIT-EXACT no-op. The pow is spelled out with a
+      // floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
+      [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
+      {
+         recovered = exp2(LumaSettings.GameSettings.Contrast * log2(max(recovered / MidGray, 1e-30))) * MidGray; // MidGray = 0.18, Color.hlsl
+      }
+
       // Display rolloff to the user's peak/paper-white nits. DICE by-luminance keeps hue; the *_CORRECT_CHANNELS_BEYOND_
       // PEAK_WHITE type also gamut-maps a single channel riding past peak. Feed linear BT.709 directly: DICE converts to
       // BT.2020 itself, and a manual 709<->2020 round-trip no longer cancels once the per-channel gamut map is in.
       DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+      // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
+      // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
+      // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
+      // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
+      // flattens it for every pixel above the shoulder.
+      settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
       float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, settings) / paperWhite;
 
-      // --- User HDR grade (HDR display path only; defaults are vanilla no-ops) ---
-      // Highlight desaturation: bright sources fade toward white as luminance approaches peak (eye/sensor
-      // saturation). exponent in [1,0.05] keeps mid-tones colored; only luminance->peak whitens.
-      const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
-      if (highlightDechroma > 0.0)
-      {
-         float dcExp = lerp(1.0, 0.05, highlightDechroma);
-         float dcWeight = saturate(pow(saturate(GetLuminance(hdr) / peakWhite), dcExp));
-         hdr = Saturation(hdr, 1.0 - dcWeight);
-      }
-      // Color.hlsl's Saturation() is lerp(GetLuminance(c, CS_BT709), c, s) - a BT.709-luminance lerp, not Oklab.
-      hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation); // user Saturation (1 = vanilla)
-      // user Contrast: slope around 18% mid-gray (linear, 1.0 = paper white). Excursions caught by the NaN/clamp tail.
-      hdr = (hdr - MidGray) * LumaSettings.GameSettings.Contrast + MidGray; // MidGray = 0.18, Color.hlsl
+      // User saturation LAST, after the display map: the repo's convention. Color.hlsl's Saturation() is
+      // lerp(GetLuminance(c, CS_BT709), c, s) - a BT.709-luminance lerp, not Oklab. 1 = vanilla.
+      hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
 
       postProcessedColor = hdr;
    }
