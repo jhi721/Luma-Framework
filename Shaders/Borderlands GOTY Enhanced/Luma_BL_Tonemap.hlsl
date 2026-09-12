@@ -202,8 +202,9 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // Pre-scale so the gamma-SDR HUD (drawn on top) lands at UIPaperWhite after composition rescales by it.
    outColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
 #endif
-   // Sanitize: the scene carries small negative/WCG values; the extended grade + hue restore + gamma encode can
-   // emit NaN or negatives (linear_to_gamma of a negative is NaN). Clamp so no garbage reaches the swapchain.
+   // Sanitize: the scene carries small negative/WCG values; the extended grade, the MacLeod-Boynton hue stage and
+   // the gamma encode can emit NaN or negatives (linear_to_gamma of a negative is NaN). Clamp so no garbage
+   // reaches the swapchain.
    outColor = (outColor == outColor) ? outColor : 0.0; // NaN -> 0 (NaN != NaN)
    outColor = max(0.0, outColor);
 #if POST_PROCESS_SPACE_TYPE == 0

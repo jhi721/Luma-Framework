@@ -1,10 +1,13 @@
 // Borderlands GOTY Enhanced — Luma HDR + SMAA mod (Unreal Engine 3.5, D3D11).
 // - HDR: swapchain -> scRGB fp16; replaced UE3 final-color PS (0xB030BAA6 / 0xFE88487E) runs the game's own grade
-//   as an extended HDR function + DICE display map, hue locked to a soft ReinhardPiecewise reference. Core Display
-//   Composition does the paper-white scale + encode.
+//   as an extended HDR function, takes its hue from a soft ReinhardPiecewise reference through MacLeod-Boynton
+//   emulation, then DICE-maps to the display. The video (0x0E97A4A0) and lens-flare (0x010371F2) passes are
+//   replaced too. Core Display Composition does the paper-white scale + encode.
 //   One HDR mod owns the swapchain -> any other HDR mod must be removed from the game folder.
-// - AA: compute FXAA (3.11 work-queue) -> SMAA (ULTRA + color edge + depth predication) + optional RCAS. Runs on
-//   the HDR-linear scene: sRGB-encoded copy for edge detect, linear copy for blend, CopyResource into swapchain.
+// - AA: compute FXAA (3.11 work-queue) -> SMAA (ULTRA + color edge + depth predication) + optional RCAS. The scene
+//   is stored in GAMMA space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white), so edge detection gets an extra
+//   sRGB-encoded copy and blending takes the stored one; the result is CopyResource'd back into the swapchain.
+// - AO: XeGTAO replaces the native HBAO+ (hash block below). Plus AF16x and a fix for the game's movie RAM leak.
 
 #define GAME_BORDERLANDS_GOTY 1
 
@@ -37,7 +40,7 @@ static constexpr uint32_t kAOBlurHash = 0x4E1BEE34;         // bilateral blur ->
 
 // User-facing settings (persisted via ReShade config; loaded in LoadConfigs, saved on UI change).
 static bool g_smaa_enable = true;
-static float g_rcas_sharpness = 0.f; // RCAS sharpen on SMAA output (0 = off). Conservative — ink outlines already AA'd; higher haloes.
+static float g_rcas_sharpness = 0.f; // RCAS sharpen on SMAA output; default off — the ink outlines are already clean and sharpening haloes them.
 static bool g_hide_ui = false;       // hide the game's HUD (skips swapchain-targeting UI draws) — for clean screenshots
 // SMAA predication on geometry. The signal is plane-deviation edge-ness built from the scene depth, not the depth
 // itself (see Luma_BL_DepthExtract.hlsl); the tolerance is the only free parameter and is a fraction of view
@@ -53,7 +56,7 @@ static bool g_smaa_pred_measure = false; // one-shot: read the mask back and log
 
 // Ambient Occlusion: XeGTAO replaces the native HBAO+ (default ON = supersede it). Persisted as "XeGTAOEnable".
 static bool g_gtao_enable = true;
-// Runtime XeGTAO knobs (LumaGTAO cb b11), DEV calibration sliders. FinalValuePower = primary darkness dial
+// Runtime XeGTAO knobs (LumaGTAO cb b11); their sliders are DEVELOPMENT/TEST only. FinalValuePower = primary darkness dial
 // (calibrate to the vanilla HBAO+ histogram — its PowExponent does not transfer numerically). DepthScale =
 // viewZ divisor (UE3 units, near plane ~10 -> ~meters) so Intel's tuned radius/falloff apply; the dial
 // against broad over-occlusion. RadiusOverride > 0 overrides EFFECT_RADIUS (in scaled units).
@@ -76,7 +79,7 @@ namespace BLMovieLeakFix
 {
    // Build-specific RVAs (frozen remaster). A non-matching build shifts these -> nothing tags ->
    // silent no-op; BUILD_CHECK_FRAME drives a one-shot telemetry warning for that case.
-   constexpr uintptr_t RVA_CREATE_WRAPPER = 0xBFF27; // ret addr after the RHI CreateTexture call
+   constexpr uintptr_t RVA_CREATE_WRAPPER = 0xBFF27; // ret addr in the RHI resource-create wrapper; measured movie-path-only (never hit without the span below)
    constexpr uintptr_t RVA_STREAM_LO = 0x58A000;     // streaming/movie fn span (create call sites)
    constexpr uintptr_t RVA_STREAM_HI = 0x58C000;
    constexpr uint32_t BUILD_CHECK_FRAME = 18000; // ~5 min; movies tag well before this if build matches
@@ -318,7 +321,8 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    uint32_t smaa_core_w = 0, smaa_core_h = 0;
 
    // SMAA scratch (fp16), recreated on resolution change. tex_input = scene-color snapshot (CopyResource'd each
-   // frame); tex_lin/tex_gam = linear + sRGB copies written by the linearize CS each frame.
+   // frame); the linearize CS then writes tex_lin = pass-through copy (SMAA blending) and tex_gam = sRGB-encoded
+   // copy (SMAA edge detection).
    ComPtr<ID3D11Texture2D> tex_input, tex_lin, tex_gam;
    ComPtr<ID3D11ShaderResourceView> srv_input, srv_lin, srv_gam;
    ComPtr<ID3D11UnorderedAccessView> uav_lin, uav_gam;
@@ -501,7 +505,7 @@ class BorderlandsGoty final : public Game
 public:
    void OnInit(bool async) override
    {
-      // Game-specific HDR toggles consumed by the replaced tonemap shaders (Luma_BL_Tonemap.hlsl).
+      // Game-specific defines: TONEMAP_TYPE drives Luma_BL_Tonemap.hlsl, XE_GTAO_QUALITY drives Luma_BL_XeGTAO.hlsl.
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla clamped reference\n1 - HDR: Extended UE3 grade + DICE"},
          {"XE_GTAO_QUALITY", '3', true, false, "Ambient Occlusion (XeGTAO) quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
@@ -522,10 +526,10 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("SMAA Linear To sRGB CS"),
          ShaderDefinition("Luma_SMAA_LinearTosRGB_CS", reshade::api::pipeline_subobject_type::compute_shader));
 
-      // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA).
       // Depth-extract CS for SMAA predication: hardware d24 -> R16F plane-deviation edge-ness.
       native_shaders_definitions.emplace(CompileTimeStringHash("BL Depth Extract CS"),
          ShaderDefinition("Luma_BL_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
+      // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA).
       native_shaders_definitions.emplace(CompileTimeStringHash("BL Sharpen PS"),
          ShaderDefinition{"Luma_BL_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 
@@ -541,7 +545,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS"),
          ShaderDefinition{"Luma_BL_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
 
-      // Game uses CB slots b0-b3, so b12/b13 are free for Luma.
+      // Game uses CB slots b0-b3, so b11 (XeGTAO knobs) and b12/b13 are free for Luma.
       // luma_data is used by the Display Composition; luma_ui stays off (UI drawn by the game).
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
@@ -816,8 +820,10 @@ public:
 
             ComPtr<ID3D11UnorderedAccessView> uav_final;
             native_device_context->CSGetUnorderedAccessViews(0, 1, uav_final.put());
+            // No output bound: unreachable in practice (the bilateral blur always binds its u0). Without a target
+            // there is nothing for either path to write, so leave the native blur running rather than cancel it.
             if (!uav_final)
-               return DrawOrDispatchOverrideType::None; // no output bound (unreachable in practice — the bilateral blur always binds its u0). With no target of our own there's nothing to write either way, so None and Replaced are equivalent here; return None to not cancel the native blur on a state we can't handle.
+               return DrawOrDispatchOverrideType::None;
             if (!gd.srv_gtao_depth || !gd.srv_gtao_normals)
             {
                // Shouldn't happen (chain order is fixed); write "no AO" so a stale buffer can't apply.
@@ -1031,7 +1037,7 @@ public:
 
          // (Re)create the SMAA scratch textures + views on resolution change (cached like tex_smaa_out — avoids
          // ~3x full-res fp16 alloc/free every replaced frame). tex_input = SRV-readable snapshot of the in-place
-         // scene color; tex_lin/tex_gam = linear + sRGB copies the linearize CS writes.
+         // scene color; tex_lin/tex_gam = the pass-through and sRGB-encoded copies the linearize CS writes.
          if (!gd.tex_input || gd.smaa_temps_w != w || gd.smaa_temps_h != h)
          {
             gd.srv_input.reset();
@@ -1069,7 +1075,7 @@ public:
             linearize_cs_state.Cache(native_device_context, device_data.uav_max_count);
 
             ID3D11ShaderResourceView* cs_srv = gd.srv_input.get();
-            ID3D11UnorderedAccessView* cs_uavs[2] = {gd.uav_lin.get(), gd.uav_gam.get()}; // u0 = linear copy, u1 = sRGB
+            ID3D11UnorderedAccessView* cs_uavs[2] = {gd.uav_lin.get(), gd.uav_gam.get()}; // u0 = pass-through copy (blend), u1 = sRGB-encoded (edge detect)
             native_device_context->CSSetShaderResources(0, 1, &cs_srv);
             native_device_context->CSSetUnorderedAccessViews(0, 2, cs_uavs, nullptr);
             native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("SMAA Linear To sRGB CS")].get(), nullptr, 0);
@@ -1132,7 +1138,7 @@ public:
          // Pass depth for predication only when valid (same-size, captured this frame); otherwise null + the
          // pred_scale=1.0 baked into the metrics CB make SMAA run as plain ULTRA instead of degraded predication.
          DrawSMAA(native_device, native_device_context, device_data,
-            gd.tex_smaa_out_rtv.get(), gd.srv_lin.get() /*color (linear)*/, gd.srv_gam.get() /*color gamma*/,
+            gd.tex_smaa_out_rtv.get(), gd.srv_lin.get() /*color (blend)*/, gd.srv_gam.get() /*color gamma (edge detect)*/,
             pred_ok ? gd.srv_pred.get() : nullptr /*predication (plane-deviation edge-ness)*/);
 
          // --- Optional RCAS sharpen on the (linear scRGB) SMAA output, then copy into the swapchain target. ---
@@ -1175,7 +1181,7 @@ public:
          {
             auto* sharpen_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
             auto* sharpen_ps = device_data.native_pixel_shaders[CompileTimeStringHash("BL Sharpen PS")].get();
-            // DrawCustomPixelShader does NOT restore state → wrap in core's DrawStateStack<FullGraphics>.
+            // DrawCustomPixelShader does NOT restore state -> wrap in core's DrawStateStack<FullGraphics>.
             DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
             sharpen_state.Cache(native_device_context, device_data.uav_max_count);
 
@@ -1344,7 +1350,7 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
 #if DEVELOPMENT || TEST
-      // DEV calibration only (drive cb_gtao, recreated on change at the deinterleave hook). Not persisted.
+      // DEVELOPMENT/TEST calibration only (drive cb_gtao, recreated on change at the deinterleave hook). Not persisted.
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f);                 // midtone-shadow contrast dial
       ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 1.f, 200.f);                             // UE3 units -> ~meters; the anti-over-occlusion dial
@@ -1483,16 +1489,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // r10g10b10a2 backbuffer -> r16g16b16a16_float
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-      // Trimmed to a safety minimum: the remaster renders its whole post chain in
-      // fp16 already, and the only low-precision target (r10g10b10a2 backbuffer) is handled by the upgrade above.
-      // The broad r8/b8 set was dead weight (and _srgb->fp16 risks a sampling shift). Keep plausible fp16 intermediates.
+      // Safety minimum: the remaster already renders its whole post chain in fp16, and the one low-precision
+      // target (the r10g10b10a2 backbuffer) is covered by the swapchain upgrade above. r8/b8 formats are left
+      // alone deliberately - nothing downstream needs them, and _srgb -> fp16 risks a sampling shift.
       texture_upgrade_formats = {
          reshade::api::format::r10g10b10a2_unorm,
          reshade::api::format::r10g10b10a2_typeless,
          reshade::api::format::r11g11b10_float, // bloom / lens-flare-style intermediates
       };
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio;
-      force_disable_display_composition = false; // core composition now does the scRGB encode + paper white
+      force_disable_display_composition = false; // core composition does the scRGB encode + paper white
 
       // AF16x: mode 4 upgrades the game's AF samplers to MaxAnisotropy=16 (clarity on oblique surfaces, zero risk).
       // LOD bias offset stays 0 (no TAA in this game; a negative bias would shimmer).

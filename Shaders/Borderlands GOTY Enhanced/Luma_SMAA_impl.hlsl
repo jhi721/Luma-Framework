@@ -1,8 +1,9 @@
 // SMAA implementation for Borderlands GOTY Enhanced (replaces the game's compute FXAA resolve pass).
 // Reference: https://github.com/iryoku/smaa
 // ULTRA preset + color edge detection + depth predication (the game exposes a full-res depth buffer).
-// Input color is scene-referred (linear, scRGB HDR), so edge detection
-// runs on an sRGB-encoded copy (see Luma_SMAA_LinearTosRGB_CS) and blending on the linear copy.
+// Input color is the game's post-process buffer, stored in GAMMA space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper
+// white) and fp16, so highlights run past 1. Luma_SMAA_LinearTosRGB_CS writes two copies of it: edge detection
+// reads the sRGB-encoded one, blending reads the stored one unchanged.
 
 #include "../Includes/Common.hlsl"
 
