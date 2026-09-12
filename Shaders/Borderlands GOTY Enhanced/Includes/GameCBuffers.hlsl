@@ -14,7 +14,7 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;           // exposure multiplier (1 = vanilla). Applied scene-referred, pre-grade.
-   float Saturation;         // 1 = vanilla. Oklab saturation multiplier on the final HDR color.
+   float Saturation;         // 1 = vanilla. Luminance-relative saturation multiplier on the final HDR color.
    float HighlightDechroma;  // 0 = off (default; keep color, only mandatory gamut desat applies); higher = bright sources fade to white sooner. Optional perceptual taste.
    float BloomIntensity;     // 1 = vanilla. Scales the game's bloom contribution in the scene mix.
    float Contrast;           // 1 = vanilla. Slope contrast around 18% mid-gray on the final HDR color.

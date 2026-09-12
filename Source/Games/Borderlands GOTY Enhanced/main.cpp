@@ -1460,7 +1460,7 @@ public:
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
                   "\nDICE (HDR tonemapper)"
-                  "\nOklab (hue/chroma restoration)"
+                  "\nJzAzBz (hue restoration)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS)",
          "");
