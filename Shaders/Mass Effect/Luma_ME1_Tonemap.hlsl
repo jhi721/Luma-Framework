@@ -22,9 +22,10 @@
 // LUMA_GAME_CB_STRUCTS before any shared header pulls Settings.hlsl, or GameSettings resolves to the empty dummy.
 #include "Includes/Common.hlsl"             // game-local: defines LumaGameSettings (grade sliders) before the LumaSettings cbuffer
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
+#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip; RestoreHueAndChrominance (legacy colour stage 0)
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
-#include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise, the soft hue reference
+#include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise, the soft hue reference; ReinhardTonemap (legacy reconstruction 0)
+#include "../Includes/Tonemap.hlsl"         // UpgradeToneMap (legacy reconstruction 0)
 #include "Includes/MacLeodBoynton.hlsl"     // MacLeodBoynton::HueOnlyBT2020. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
 // clang-format on
 
@@ -34,6 +35,22 @@
 // reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
+#endif
+
+// DEVELOPMENT A/B, stage 1: where the HDR range comes from. 1 = the game's own grade run UNCLAMPED, straight in:
+// vanilla-exact below the clip and its own analytic continuation above it (production, the BL GOTY / MoHA
+// reconstruction). 0 = the legacy NeutralSDR + UpgradeToneMap on top of the clamped grade, kept for in-game comparison
+// only; fixed at 1 outside DEVELOPMENT.
+#ifndef ME1_HDR_RECONSTRUCTION
+#define ME1_HDR_RECONSTRUCTION 1
+#endif
+
+// DEVELOPMENT A/B, stage 2: the HDR colour stage. 1 = a soft per-channel ReinhardPiecewise(5, 1.5) reference in
+// BT.2020 and MacLeod-Boynton hue-only emulation (Hue Shift 1, Blowout 0) BEFORE DICE, nothing restored after it
+// (production). 0 = the legacy DICE, then the JzAzBz hue-only lock to the unclamped grade. Orthogonal to stage 1;
+// all four combinations compile, 0/0 is the exact pre-promotion shader.
+#ifndef ME1_HDR_COLOR_STYLE
+#define ME1_HDR_COLOR_STYLE 1
 #endif
 
 // UE3 UberPostProcess grade constants, at the register indices the 0xAC8341E0 disassembly reads them from. This UE3
@@ -64,6 +81,16 @@ float3 LumaBloom(float2 sceneUV)
    const float3 bloom = LumaBloomTexture.SampleLevel(SceneColorTextureSampler_s, sceneUV, 0.0).rgb;
    return max(0.0, bloom) * LumaSettings.GameSettings.BloomScaleLive * LumaSettings.GameSettings.BloomIntensity;
 }
+
+#if ME1_HDR_RECONSTRUCTION == 0
+// Neutral SDR reference for the legacy highlight-recovery delta.
+float3 NeutralSDR(float3 color)
+{
+   ReinhardSettings settings = DefaultReinhardSettings();
+   settings.by_luminance = true;
+   return ReinhardTonemap(color, 100.f, 100.f, settings);
+}
+#endif
 
 // An UberPostProcessBlend grade value (clamped or extended) decoded to the linear light a 2.2 display shows for it.
 // The exponent is split across the two passes: this pass encodes with 1.0, FGammaCorrection with DisplayGamma 1.6
@@ -108,12 +135,19 @@ float3 Sanitize(float3 c)
 // Shared HDR back half: extended grade -> contrast -> BT.2020 -> soft hue reference -> MacLeod-Boynton hue -> display
 // rolloff -> gamut clip -> BT.709 -> saturation. Contrast sits ahead of the rolloff on purpose (see 3), saturation
 // behind it, as in the repo. Takes and returns LINEAR light, 1.0 = paper white, NO engine fade (the caller re-applies
-// it: contrast pivots on mid-gray, so a fade before it would never reach black). `extendedGradeLinear` is the pass's
-// own grade with its upper saturate()s as max(0), decoded to display-linear: vanilla-exact below the clip and its own
-// analytic continuation above it, so range, luminance and chroma all come from the game's math.
-float3 FinishME1HDR(float3 extendedGradeLinear)
+// it: contrast pivots on mid-gray, so a fade before it would never reach black). All three inputs are display-linear
+// over the same scene value: `extendedGradeLinear` is the pass's own grade with its upper saturate()s as max(0),
+// vanilla-exact below the clip and its own analytic continuation above it, so range, luminance and chroma all come
+// from the game's math - THE production signal; `untonemapped` and `sdrGradeLinear` (the clamped grade) feed only the
+// legacy reconstruction 0, and fxc dead-strips them (and their grade calls) on the production build.
+float3 FinishME1HDR(float3 untonemapped, float3 sdrGradeLinear, float3 extendedGradeLinear)
 {
+#if ME1_HDR_RECONSTRUCTION == 0
+   // Legacy: recover the highlight luminance the SDR tonemap clipped, on top of the graded look.
+   float3 color = UpgradeToneMap(untonemapped, NeutralSDR(untonemapped), sdrGradeLinear);
+#else
    float3 color = extendedGradeLinear;
+#endif
 
    // 3. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
    // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
@@ -126,6 +160,11 @@ float3 FinishME1HDR(float3 extendedGradeLinear)
       color = PowUE3(max(0.0, color / midGray), LumaSettings.GameSettings.Contrast.xxx) * midGray;
    }
 
+   // The user's peak/paper white for the display rolloff, both floored: DICE divides by them. Computed ahead of the
+   // colour stage so the legacy 0/0 build keeps its source order (and bytecode).
+   const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
+   const float peakWhite = max(LumaSettings.PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
+
    // 4. Colour stage, in a BT.2020 working space (round-tripped back to BT.709 after the display map: gamut-correct
    // handling of saturated highlights, not a display-gamut expansion). Soft hue reference: ReinhardPiecewise(x, 5, 1.5)
    // per channel, where the RenoDX BL1 port builds it. Linear below 1.5 and rolling toward 5 above, it compresses a
@@ -133,12 +172,14 @@ float3 FinishME1HDR(float3 extendedGradeLinear)
    // without the clip's whitening. MacLeod-Boynton then rebuilds that reference's hue direction on the target's own
    // purity and T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it.
    const float3 extendedBT2020 = BT709_To_BT2020(color);
+#if ME1_HDR_COLOR_STYLE == 1
    const float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
    const float3 diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
+#else
+   const float3 diceInBT2020 = extendedBT2020; // legacy: hue handled AFTER the display map, below
+#endif
 
-   // 5. Display rolloff to the user's peak/paper white (DICE, hue-preserving). Both floored: DICE divides by them.
-   const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
-   const float peakWhite = max(LumaSettings.PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
+   // 5. Display rolloff to the user's peak/paper white (DICE, hue-preserving).
    // CORRECT_CHANNELS_BEYOND_PEAK_WHITE desaturates any channel still over peak: panels clip per channel, so an
    // uncorrected saturated highlight would clip with a hue shift.
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
@@ -154,6 +195,13 @@ float3 FinishME1HDR(float3 extendedGradeLinear)
    ds.InOutColorSpace = CS_BT2020;
    float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
+
+#if ME1_HDR_COLOR_STYLE == 0
+   // Legacy: lock hue to the un-blown reference after the display map: hue 1.0, chrominance 0.0. Unclamped ratio, no
+   // guard - the recorded suspect for the post-load flash (NOTES.md), which is why production moved the hue stage
+   // ahead of DICE.
+   hdr = RestoreHueAndChrominance(hdr, extendedGradeLinear, 1.0, 0.0);
+#endif
 
    // 6. User saturation LAST, after the display map: the repo's convention. Lerp against BT.709 luminance, not
    // hue-preserving.
@@ -202,9 +250,10 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
    const float3 sdr_vanilla = GradeUE3(untonemapped, true, outputScale);
 
 #if TONEMAP_TYPE >= 1
-   // The extended grade carries no fade (outputScale = 1) and is decoded through the DOWNSTREAM display gamma
-   // (VanillaToLinear, not a plain gamma decode): the direct continuation of the full vanilla chain is the HDR signal.
-   float3 hdr = FinishME1HDR(VanillaToLinear(GradeUE3(untonemapped, false, 1.0)));
+   // Both grades carry no fade (outputScale = 1) and are decoded through the DOWNSTREAM display gamma (VanillaToLinear,
+   // not a plain gamma decode): the direct continuation of the full vanilla chain is the HDR signal. The clamped one
+   // exists for the legacy reconstruction only (dead-stripped in production).
+   float3 hdr = FinishME1HDR(untonemapped, VanillaToLinear(GradeUE3(untonemapped, true, 1.0)), VanillaToLinear(GradeUE3(untonemapped, false, 1.0)));
    // Re-apply the engine fade linearly, LAST, after the creative sliders. At rest it is a no-op.
    float3 outColor = hdr * outputScale; // LINEAR, 1.0 = paper white, into the fp16 intermediate
 #else
@@ -269,7 +318,7 @@ float3 RunME1GammaCorrection(float2 sceneUV)
       // (NOT VanillaToLinear, which would apply the display gamma twice). No Luma bloom: the pyramid is injected at
       // the uber draw.
       float3 untonemapped = scene.xyz * LumaSettings.GameSettings.Exposure;
-      hdr = FinishME1HDR(gamma_to_linear(GradeGC(untonemapped, false)));
+      hdr = FinishME1HDR(untonemapped, gamma_to_linear(GradeGC(untonemapped, true)), gamma_to_linear(GradeGC(untonemapped, false)));
    }
    // The fade LAST, after the creative sliders. Branched, not lerped: the decode is uniform but fxc hoists it into
    // the preamble, where .w is 0 with no fade - measured 48 -> 42 executed instructions.
