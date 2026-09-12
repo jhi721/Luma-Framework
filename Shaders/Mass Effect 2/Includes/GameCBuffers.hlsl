@@ -36,14 +36,6 @@ struct LumaGameSettings
    float BloomScaleLive;  // not a user setting: the engine's BloomScale (gather cb4[11].x), read back by main.cpp.
                           // The vanilla glow adds BloomScale x blur(bright pass) and the pyramid is
                           // energy-preserving, so this is the gain that makes BloomIntensity 1 mean vanilla.
-   // Appended after the fields above, never reordered: this struct is a C++/HLSL ABI mirror.
-   float HighlightsHueStrength; // 0..1. How much of the vanilla clip's hue skew blown highlights adopt (1 = vanilla hue). HDR, recovery type 1 only.
-   float HighlightsHueChroma;   // 0..1. How much of the vanilla clip's whitening blown highlights keep (0 = keep colour, 1 = as washed out as vanilla). HDR, recovery type 1 only.
-   // Appended after the fields above, never reordered. FILMIC uber permutation only, and independent of the two
-   // hard-clip controls above: an extra artistic move toward a MORE EXPOSED evaluation of the same vanilla curve and
-   // grade. The reference's extra exposure is fixed in the shader; both at 0 leave the recovery's own colour intact.
-   float FilmicHueShift; // 0..1. Extra hue transfer toward that brighter vanilla reference.
-   float FilmicBlowout;  // 0..1. Extra relative-chroma (Oklab C/L) reduction toward it.
 };
 
 // Game specific cbuffer (instance/pass) data, uploaded per replaced draw.

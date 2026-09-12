@@ -203,21 +203,13 @@ bool ME2_FilmicColorIsFinite(float3 value)
 // recovery's output.
 float3 ME2_ApplyFilmicHighlightColor(float3 scene, float3 recovered)
 {
-   // How much brighter the colour reference is evaluated, in stops. Fixed, not a user control: it picks WHICH
-   // vanilla colour the two sliders aim at, and they already scale how far the pixel travels toward it.
+   // Tuned constants, not user controls. `referenceEV` picks WHICH vanilla colour the transfer aims at - the one the
+   // same curve and grade give the scene a stop brighter. The two strengths say how far a pixel travels toward it,
+   // and the mask below plus the helper's near-achromatic guard already keep that off everything but bright colour.
    const float referenceEV = 1.0;
+   const float hueStrength = 1.0;
+   const float blowout = 1.0;
 
-   // Padded to float3 only because the finite test is written for a colour; the third lane is unused.
-   const float3 controls = float3(LumaSettings.GameSettings.FilmicHueShift, LumaSettings.GameSettings.FilmicBlowout, 0.0);
-   if (!ME2_FilmicColorIsFinite(controls))
-      return recovered;
-
-   const float hueStrength = saturate(controls.x);
-   const float blowout = saturate(controls.y);
-
-   // Exact off path, taken BEFORE the second grade and the Oklab round trip so both sliders at 0 cost nothing.
-   if (hueStrength <= 0.0 && blowout <= 0.0)
-      return recovered;
    if (!ME2_FilmicColorIsFinite(scene) || !ME2_FilmicColorIsFinite(recovered))
       return recovered;
    // The recovery derives from the CLAMPED grade, so it is non-negative. This wrapper is not a signed-RGB pipeline.
@@ -329,9 +321,11 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    const float3 hueEmuRef = BT2020_To_BT709(Reinhard::ReinhardPiecewise(BT709_To_BT2020(recovered), 5.0, 1.5));
    // Exact gate: below 1.0 the reference equals `recovered` (the Reinhard shoulder sits at 1.5 and the BT.2020
    // channels of a BT.709 colour never exceed its max), so the transfer is a provable no-op and the Oklab round trips
-   // run only on real highlights. Sliders at 0 skip it too.
-   [branch] if (max3(recovered) > 1.0 && (LumaSettings.GameSettings.HighlightsHueStrength > 0.0 || LumaSettings.GameSettings.HighlightsHueChroma > 0.0))
-       recovered = EmulateHighlightHue(recovered, hueEmuRef, saturate(LumaSettings.GameSettings.HighlightsHueStrength), saturate(LumaSettings.GameSettings.HighlightsHueChroma));
+   // run only on real highlights.
+   // Tuned constants, not user controls: full hue shift, and no whitening - the powerless guard inside the helper
+   // makes 1.0 safe on the hue axis, while path-to-white is left to DICE at the display peak.
+   [branch] if (max3(recovered) > 1.0)
+       recovered = EmulateHighlightHue(recovered, hueEmuRef, 1.0, 0.0);
 #endif
 
    // NEITHER recovery restores hue, deliberately: the FILMIC one rebuilds by a SCALAR ratio and the hard-clip one
