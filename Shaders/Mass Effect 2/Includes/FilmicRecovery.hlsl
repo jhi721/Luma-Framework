@@ -43,11 +43,17 @@ float3 ME2_RecoverFilmicBrightness(float3 scene, float3 curved, float3 sdrRef)
    const float slope = ME2_NativeToneCurveSlope(pivot);
    const float extended = pivotValue + slope * (sourcePeak - pivot); // the curve continued along its own tangent
 
-   // No floors, both proven dead: F(sourcePeak) >= F(pivot) = 0.433 here, so the divide is safe, and F is concave
-   // from its inflection at 0.065 up (F'' < 0, checked to 200), so the tangent sits above the curve and the ratio
-   // is >= 1 by itself - the extension can only brighten. No saturate on the result either: the display map owns
-   // the roll-off.
-   return sdrRef * (extended / max3(curved));
+   // No denominator floor: this branch only runs above the pivot, where F(sourcePeak) >= F(0.35) = 0.433. In real
+   // arithmetic the ratio needs no floor either - F is concave from its inflection at 0.065 up (F'' < 0, checked to
+   // 200), so the tangent sits above the curve and the extension can only brighten. max(1, ...) stays regardless:
+   // `extended` and `max3(curved)` are evaluated independently in float32, and right at the pivot, where they
+   // coincide, rounding lands the ratio a few ULP under 1 (measured 1 - 1.2e-7 at 0.350001). The floor enforces
+   // the invariant the maths promises, HDR never darker than vanilla, after that rounding; it is not an artistic
+   // clamp. It also turns a NaN ratio into vanilla, since max() returns its non-NaN operand. No saturate on the
+   // result: the display map owns the roll-off.
+   const float gain = max(1.0, extended / max3(curved));
+
+   return sdrRef * gain;
 }
 
 #endif // TONEMAP_TYPE >= 1 && ME2_UBER_FILMIC
