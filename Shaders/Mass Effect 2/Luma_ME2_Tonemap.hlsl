@@ -45,6 +45,16 @@
 #define ME2_HARDCLIP_HUE_SPACE 1
 #endif
 
+// DEVELOPMENT A/B for the FILMIC permutation's highlight-colour transfer, the only stage that differs:
+// 0 = the shipped Oklch EmulateHighlightHue, 1 = the canonical MacLeod-Boynton model solved in BT.2020.
+// Target, reference, mask and the exact BT.709 Y restore are identical on both legs, so this isolates the
+// perceptual model. ⚠ At full mask BOTH legs replace the chromaticity entirely with the reference's, so
+// they converge there by construction and the two differ only across the mask ramp; measured in
+// _tools/me2_bridge/me2_filmic_ab.py. Production stays 0 until a runtime pass says otherwise.
+#ifndef ME2_FILMIC_HUE_MODEL
+#define ME2_FILMIC_HUE_MODEL 0
+#endif
+
 #if ME2_HARDCLIP_HUE_SPACE == 0
 // Only the BT.709 leg of the A/B needs an explicit descriptor: the canonical helper ships a BT.2020 one and no
 // other. Matrices from ../Includes/Color.hlsl.
@@ -266,7 +276,17 @@ float3 ME2_ApplyFilmicHighlightColor(float3 scene, float3 recovered)
    if (!(GetLuminance(reference, CS_BT709) > epsilonY))
       return recovered;
 
+#if ME2_FILMIC_HUE_MODEL
+   // Candidate: the same transfer under the canonical model, solved in BT.2020 like every other
+   // MacLeod-Boynton port here. Hue and chrominance both take the mask weight, which is the closest
+   // equivalent of the Oklch leg's hue/whitening pairing: the +1 EV reference is never MORE pure than the
+   // target on this content (0 of 20000 sampled, me2_filmic_probe.py), so MB's unclamped chrominance moves
+   // the same direction as Oklch's min()-clamped whitening and only the model changes.
+   const float3 transferred = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(
+       BT709_To_BT2020(recovered), BT709_To_BT2020(reference), hueStrength * weight, blowout * weight));
+#else
    const float3 transferred = EmulateHighlightHue(recovered, reference, hueStrength * weight, blowout * weight);
+#endif
    if (!ME2_FilmicColorIsFinite(transferred) || all(transferred == recovered))
       return recovered;
    const float transferredY = GetLuminance(transferred, CS_BT709);

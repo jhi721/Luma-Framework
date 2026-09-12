@@ -500,6 +500,13 @@ public:
             "0 - solved in BT.709, the form shipped in the previous build\n"
             "Purity is measured against that space's gamut boundary, so the two differ most on saturated green and blue.",
             1},
+         {"ME2_FILMIC_HUE_MODEL", '0', true, kExperimentLocked,
+            "Filmic highlight colour: which perceptual model carries the hue transfer (HDR only; the gameplay permutation)\n"
+            "0 - Oklch, the shipped transfer\n"
+            "1 - MacLeod-Boynton solved in BT.2020, the model the hard-clip permutation and the sibling ports use\n"
+            "Both legs use the same +1 EV vanilla reference, the same mask and the same luminance restore, so only the model changes.\n"
+            "At full mask the two converge by construction: they differ across the mask ramp, not at its top.",
+            1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
