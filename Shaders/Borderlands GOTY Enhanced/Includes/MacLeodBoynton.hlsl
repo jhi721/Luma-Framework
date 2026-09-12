@@ -545,6 +545,9 @@ float3 HueAndPurityEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt20
 }
 
 // Reference hue direction on the target's own purity and T; nothing of the reference's purity is taken.
+// Deliberately a plain call: a hand-specialised copy (reference purity solve and chrominance branch removed)
+// compiles to byte-identical DXBC, since fxc already eliminates that dead work, so it would only duplicate
+// the hue block. Measured on both BL1 wrappers and held bit-exact over random pairs before being dropped.
 float3 HueOnlyBT2020(float3 ungraded_bt2020, float3 reference_bt2020)
 {
    return HueAndPurityEmulationBT2020(ungraded_bt2020, reference_bt2020, 1.f, 0.f);
