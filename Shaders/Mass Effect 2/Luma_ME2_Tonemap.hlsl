@@ -8,6 +8,7 @@
 #include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip, and Oklab through it
 #include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise (hue-shift reference)
+#include "Includes/MacLeodBoynton.hlsl"     // MacLeodBoynton::HueAndPurityEmulation. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
 // clang-format on
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
@@ -33,6 +34,16 @@
 #ifndef ME2_MATERIAL_GRAIN
 #define ME2_MATERIAL_GRAIN 0
 #endif
+
+// The RGB working space the MacLeod-Boynton model runs in, used by the hard-clip permutation's hue transfer. The
+// three sibling games (BL GOTY, ME1 2007, MoHA) call its BT.2020 wrapper because their hue stage and their display
+// map live in ONE pass. ME2's are split: what this pass writes is the LINEAR BT.709 fp16 canvas the native vignette
+// multiplies and the material later maps, so the model runs in the space the value is actually in. That also keeps
+// the solver's own guarantee worth something - it constrains RGB(t) >= 0 in its working space, so no negative
+// channel can reach the canvas. Note purity in MB is the fraction of the distance from white to the GAMUT BOUNDARY,
+// so the same physical colour reads a different purity here than it would in BT.2020; that is the model's
+// definition, not a divergence from the siblings.
+static const MacLeodBoynton::RGBColorSpace ME2_RGB_BT709 = {BT709_To_XYZ, XYZ_To_BT709}; // ../Includes/Color.hlsl
 
 // ---------------------------------------- Shared ----------------------------------------
 
@@ -127,10 +138,11 @@ float3 ME2_NativeToneCurve(float3 scene)
 // Deliberately here and not with the includes at the top: it evaluates the curve above and its analytic slope.
 #include "Includes/FilmicRecovery.hlsl"
 
-// Highlight hue emulation for the unclamped-grade recovery (hard-clip perm only). The unclamped
-// grade keeps a blown source's real channel ratio; no SDR pipeline ever showed that ratio — a per-channel limiter turned
-// the hue toward white (R saturates first, then G) and dropped chroma. `hdr` = unclamped grade, `reference` = the colour
-// after the limiter being emulated, the RenoDX synthetic one built at the call site, both LINEAR with 1.0 = SDR white. Oklch: rotate the hue
+// Highlight hue emulation in Oklch. FILMIC permutation only — the hard-clip one runs the canonical MacLeod-Boynton
+// model instead. It exists because a recovery that is one scalar keeps vanilla's channel ratios exactly, while no SDR
+// pipeline ever showed those ratios: a per-channel limiter turned the hue toward white (R saturates first, then G) and
+// dropped chroma. `hdr` = the recovered colour, `reference` = the colour whose hue is being borrowed, built at the
+// call site, both LINEAR with 1.0 = SDR white. Oklch: rotate the hue
 // along the shortest arc toward the reference's, keep the HDR lightness, and optionally lower saturation toward the
 // reference's (its whitening). Saturation is compared as C/L, so a dimmer reference does not read as extra whitening,
 // and the whole transfer is scale-invariant: Game Paper White cannot move it. Powerless guard: hue is undefined near the
@@ -323,18 +335,21 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // (fire +31.4 deg in BT.2020 vs +41.8 in 709).
    const float3 hueEmuRef = BT2020_To_BT709(Reinhard::ReinhardPiecewise(BT709_To_BT2020(recovered), 5.0, 1.5));
    // Exact gate: below 1.0 the reference equals `recovered` (the Reinhard shoulder sits at 1.5 and the BT.2020
-   // channels of a BT.709 colour never exceed its max), so the transfer is a provable no-op and the Oklab round trips
-   // run only on real highlights.
-   // Tuned constants, not user controls: full hue shift, and no whitening - the powerless guard inside the helper
-   // makes 1.0 safe on the hue axis, while path-to-white is left to DICE at the display peak.
+   // channels of a BT.709 colour never exceed its max), so the transfer is a provable no-op. It also pays for itself
+   // here - the model below runs three purity solves, so a real branch is worth taking on everything that is not a
+   // highlight. Hue 1 / chrominance 0 is the canonical HueOnly contract: the reference supplies a hue DIRECTION and
+   // nothing else, while the target keeps its own purity and its own T = L + M, so this stage cannot move brightness.
+   // Tuned constants, not user controls; path-to-white stays with DICE at the display peak.
    [branch] if (max3(recovered) > 1.0)
-       recovered = EmulateHighlightHue(recovered, hueEmuRef, 1.0, 0.0);
+   {
+      recovered = MacLeodBoynton::HueAndPurityEmulation(recovered, hueEmuRef, 1.0, 0.0, ME2_RGB_BT709, float2(-1.0, -1.0), 1e-7);
+   }
 #endif
 
-   // NEITHER recovery restores hue, deliberately: the FILMIC one rebuilds by a SCALAR ratio and the hard-clip one
-   // carries the unclamped grade's own channel ratio. Evidence in NOTES.md; the display map owns path-to-white.
-   // What follows on the filmic perm is a separate, opt-in artistic pass that leaves the recovered brightness alone
-   // rather than correcting it: at its default strengths of 0 this line is the whole HDR colour.
+   // Neither permutation uses a post-map RestoreHueAndChrominance, deliberately: the FILMIC one rebuilds brightness by
+   // a SCALAR ratio, so vanilla's channel ratios survive it untouched, and the hard-clip one has just set its own hue
+   // above. Evidence in NOTES.md; the display map owns path-to-white.
+   // What follows on the filmic perm is a separate artistic pass over the recovered colour, at tuned constants.
    float3 hdr = recovered;
 
 #if ME2_UBER_FILMIC
