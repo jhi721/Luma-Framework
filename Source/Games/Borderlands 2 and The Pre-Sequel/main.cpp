@@ -1682,12 +1682,22 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Borderlands 2 & The Pre-Sequel\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds native HDR, SMAA anti-aliasing, HDR bloom, and 16x anisotropic filtering.\n"
-         "The game's own anti-aliasing can be left at either setting; Luma reduces it to a copy.\n"
+         "It adds HDR, HDR bloom, SMAA anti-aliasing, and 16x anisotropic filtering.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
+         "The game's own anti-aliasing can be left at either setting; Luma reduces it to a copy.\n"
+         "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
-         "Do NOT run another HDR mod (e.g. RenoDX) alongside it.");
+         "If you enjoy it, consider donating.");
       ImGui::PopTextWrapPos();
+
+      ImGui::NewLine();
+      ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 134, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70 + 9, 134 + 9, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
+      static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
+      if (ImGui::Button(donation_link.c_str()))
+         ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+      ImGui::PopStyleColor(3);
 
       ImGui::NewLine();
       static const std::string social_link = std::string("Join our \"HDR Den\" Discord ") + std::string(ICON_FK_SEARCH);
@@ -1713,11 +1723,9 @@ public:
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
                   "\nDICE (HDR tonemapper)"
-                  "\nOklab (hue/chroma restoration)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS)"
-                  "\ndgVoodoo2 (DirectX 9 -> 11 wrapper, required)"
-                  "");
+                  "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
    }
 };
 
