@@ -13,10 +13,10 @@
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
 
-// HDR / vanilla. 1 = recover real highlights + DICE display map. 0 = vanilla clamped SDR reference (default while
-// the port is being brought up: it is the reference every HDR change gets compared against).
+// HDR / vanilla. 1 = recover real highlights + DICE display map (the default, as in main.cpp). 0 = vanilla clamped
+// SDR reference, the one every HDR change gets compared against.
 #ifndef TONEMAP_TYPE
-#define TONEMAP_TYPE 0
+#define TONEMAP_TYPE 1
 #endif
 
 // Set by the 0xDB1022A7 entry point only: that permutation runs the native filmic curve before the grade.

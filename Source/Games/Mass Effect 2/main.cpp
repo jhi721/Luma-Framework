@@ -492,10 +492,10 @@ class MassEffect2Game final : public Game
 public:
    void OnInit(bool async) override
    {
-      // TONEMAP_TYPE 0 (vanilla) is the scaffold default on purpose: it is the reference the HDR work gets compared
-      // against, and it keeps a half-finished port from shipping a changed picture.
+      // TONEMAP_TYPE 1 (Luma) is the shipped default, as in the sibling ports; 0 stays selectable as the vanilla
+      // reference every HDR change gets compared against.
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", /*default value*/ '0', true, false, /*tooltip*/ "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", /*max value*/ 1},
+         {"TONEMAP_TYPE", /*default value*/ '1', true, false, /*tooltip*/ "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", /*max value*/ 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
