@@ -210,11 +210,20 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
 #if POST_PROCESS_SPACE_TYPE == 0
    // Store gamma so the game's gamma-space HUD blends like vanilla; composition decodes + applies paper white.
    outColor = linear_to_gamma(outColor);
-   // Anti-banding dither in the stored gamma space (the core composition does not dither). Animated triangular
-   // noise; sub-perceptual at bit depth 9 so the later SMAA/RCAS passes don't visibly amplify it. HDR path only.
+   // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
 #if TONEMAP_TYPE >= 1
    if (LumaSettings.GameSettings.Dithering > 0.5)
-      ApplyDithering(outColor, v1.xy, true, 1.0, DITHERING_BIT_DEPTH, LumaSettings.FrameIndex, true);
+   {
+      if (LumaSettings.DisplayMode == 0)
+         ApplyDithering(outColor, v1.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
+      else
+      {
+         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
+         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(outColor, GCT_MIRROR) * pqScale), GCT_MIRROR);
+         ApplyDithering(pq, v1.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
+         outColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
+      }
+   }
 #endif
 #endif
 }
