@@ -353,11 +353,19 @@ void main(
       postProcessedColor = max(0.0, postProcessedColor);
       postProcessedColor = linear_to_gamma(postProcessedColor, GCT_MIRROR);
 
-      // Animated triangular dither in the stored gamma space, HDR and SDR alike (MELE precedent): the core
-      // composition never dithers, and the 8-bit SDR output bands harder than the HDR one. Deliberately NOT
-      // vanilla — vanilla had no dither — hence the runtime toggle.
+      // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
       if (LumaSettings.GameSettings.Dithering > 0.5)
-         ApplyDithering(postProcessedColor, v5.xy, true, 1.0, DITHERING_BIT_DEPTH, LumaSettings.FrameIndex, true);
+      {
+         if (LumaSettings.DisplayMode == 0)
+            ApplyDithering(postProcessedColor, v5.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
+         else
+         {
+            const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
+            float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(postProcessedColor, GCT_MIRROR) * pqScale), GCT_MIRROR);
+            ApplyDithering(pq, v5.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
+            postProcessedColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
+         }
+      }
 
       vanillaColor = postProcessedColor;
    }
