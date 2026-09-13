@@ -1476,7 +1476,7 @@ public:
          reshade::set_config_value(nullptr, PROJECT_NAME, "Dithering", gs.Dithering);
       }
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Reduces gradient banding (HDR output).");
+         ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.
