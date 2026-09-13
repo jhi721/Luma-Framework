@@ -128,9 +128,19 @@ const float rEncoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
    o1 = 0.25 * log2(adaptLuma * 15 + 1);
 }
 
-// Apply animated triangular dither in gamma for HDR and SDR.
+// Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
 if (LumaSettings.GameSettings.Dithering > 0.5)
-   ApplyDithering(o0.xyz, v1.xy, true, 1.0, DITHERING_BIT_DEPTH, LumaSettings.FrameIndex, true);
+{
+   if (LumaSettings.DisplayMode == 0)
+      ApplyDithering(o0.xyz, v1.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
+   else
+   {
+      const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
+      float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(o0.xyz, GCT_MIRROR) * pqScale), GCT_MIRROR);
+      ApplyDithering(pq, v1.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
+      o0.xyz = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
+   }
+}
 
 #if TM_ALPHA_LUMA
 o0.w = dot(o0.xyz, float3(0.298999995, 0.587000012, 0.114)); // Preserve native ME3LE luma alpha, unclamped as native.
