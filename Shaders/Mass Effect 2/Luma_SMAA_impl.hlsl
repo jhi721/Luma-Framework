@@ -84,7 +84,8 @@ void smaa_neighborhood_blending_vs(uint id : SV_VertexID, out float4 position : 
 
 float4 smaa_neighborhood_blending_ps(float4 position : SV_Position, float2 texcoord : TEXCOORD0, float4 offset : TEXCOORD1) : SV_Target
 {
-   // tex0 = colorTex (gamma copy), tex1 = blendTex. Blend in gamma (the buffer's space): keeps the bright HDR sky
-   // compressed so 1px-thin dark features survive. No HDR tail, no re-encode - output stays in the canvas' space.
-   return SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1);
+   // tex0 = colorTex (linear copy), tex1 = blendTex. Re-encode to the canvas' gamma.
+   float4 color = SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1);
+   color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
+   return color;
 }
