@@ -1134,8 +1134,6 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
-         // No "(HDR output)" qualifier: this dither is gated on TONEMAP_TYPE, not on the display mode, so it runs
-         // in SDR too whenever that mode is on (as in the sibling Witcher 2 port).
          ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
