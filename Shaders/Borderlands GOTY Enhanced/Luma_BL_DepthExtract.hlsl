@@ -14,7 +14,7 @@
 // SMAA_PREDICATION_THRESHOLD is simply 0.5 whatever the scale, FOV or resolution - tune P.x, not it.
 //
 // DIFFERENCE FROM MoH: this game hands us hardware d24, not a linear depth, so each tap is linearized first
-// through the game's own MinZ_MaxZRatioCS - the identical expression XeGTAO uses. DepthScaleRT is deliberately
+// through the game's own MinZ_MaxZRatio - the identical expression XeGTAO uses. DepthScaleRT is deliberately
 // NOT applied: the tolerance is a fraction of view depth, so a uniform divisor cancels out of the ratio and the
 // calibrated value carries across games unchanged.
 
@@ -26,21 +26,17 @@ cbuffer PredCB : register(b0)
    float4 P; // P.x = relative tolerance: plane deviation counted as a full edge, as a fraction of view depth
 }
 
-// The game's own constants, bound from the buffer captured where the engine keeps it live (see main.cpp). Only
-// MinZ_MaxZRatioCS is read; the rest is declared to place it at its real offset.
-cbuffer CSOffsetConstants : register(b2)
+// The cel-shading pass's PSOffsetConstants, captured with the depth (see main.cpp). Only MinZ_MaxZRatio is read.
+cbuffer PSOffsetConstants : register(b2)
 {
-   float4x4 ViewProjectionMatrixCS;  // Offset:   0
-   float4 CameraPositionCS;          // Offset:  64
-   float4 ScreenPositionScaleBiasCS; // Offset:  80
-   float4 MinZ_MaxZRatioCS;          // Offset:  96
-   float4 DynamicScaleCS;            // Offset: 112
+   float4 ScreenPositionScaleBias;
+   float4 MinZ_MaxZRatio;
 }
 
 float ViewDepthAt(int3 p)
 {
    const float d = depth.Load(p).r;
-   return max(0.0, 1.0 / max(1e-7, d * MinZ_MaxZRatioCS.z - MinZ_MaxZRatioCS.w));
+   return max(0.0, 1.0 / max(1e-7, d * MinZ_MaxZRatio.z - MinZ_MaxZRatio.w));
 }
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {

@@ -4,9 +4,9 @@
 //   emulation, then DICE-maps to the display. The video (0x0E97A4A0) and lens-flare (0x010371F2) passes are
 //   replaced too. Core Display Composition does the paper-white scale + encode.
 //   One HDR mod owns the swapchain -> any other HDR mod must be removed from the game folder.
-// - AA: compute FXAA (3.11 work-queue) -> SMAA (ULTRA + color edge + depth predication) + optional RCAS. The scene
-//   is stored in GAMMA space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white), so edge detection gets an extra
-//   sRGB-encoded copy and blending takes the stored one; the result is CopyResource'd back into the swapchain.
+// - AA: compute FXAA (3.11 work-queue) -> SMAA (ULTRA + color edge + depth predication) + optional RCAS. Edge
+//   detection reads the scene as stored, in GAMMA space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white); the blend
+//   reads its linear decode. The result is CopyResource'd back into the swapchain.
 // - AO: XeGTAO replaces the native HBAO+ (hash block below). Plus AF16x and a fix for the game's movie RAM leak.
 
 #define GAME_BORDERLANDS_GOTY 1
@@ -103,7 +103,6 @@ namespace BLMovieLeakFix
    static uintptr_t g_exe_base = 0;
    static int g_cur_gen = 0;
    static uint32_t g_last_movie_frame = 0;
-   static bool g_first_movie = true;
    // Coarse cross-thread gates (present thread writes g_frame; workers read). atomic = no data race;
    // real map sync is g_mtx.
    static std::atomic<bool> g_have_movie{false};
@@ -111,25 +110,6 @@ namespace BLMovieLeakFix
    static uint64_t g_freed_bytes = 0;
    static uint32_t g_freed_tex = 0;
    static bool g_build_checked = false; // one-shot build-mismatch telemetry guard (present thread only)
-
-   inline uint64_t EstimateBytes(const reshade::api::resource_desc& d)
-   {
-      using namespace reshade::api;
-      if (d.type == resource_type::buffer)
-         return d.buffer.size;
-      const uint32_t w = d.texture.width ? d.texture.width : 1;
-      const uint32_t h = d.texture.height ? d.texture.height : 1;
-      const uint32_t layers = d.texture.depth_or_layers ? d.texture.depth_or_layers : 1;
-      const uint32_t levels = d.texture.levels ? d.texture.levels : 1;
-      const uint32_t slice = format_slice_pitch(d.texture.format, format_row_pitch(d.texture.format, w), h);
-      uint64_t s = (uint64_t)slice * layers, total = 0;
-      for (uint32_t l = 0; l < levels; ++l)
-      {
-         total += s;
-         s = s > 4 ? s / 4 : 1;
-      }
-      return total;
-   }
 
    inline bool StackIsMovie(void* const* frames, int n)
    {
@@ -157,7 +137,7 @@ namespace BLMovieLeakFix
       // streaming-fn span -> no mistag/UAF, and skips the stack walk for every texture.
       if (desc.type != reshade::api::resource_type::buffer)
          return;
-      const uint64_t bytes = EstimateBytes(desc);
+      const uint64_t bytes = desc.buffer.size;
       if (bytes < STACKWALK_MIN_BYTES)
          return;
       void* frames[MAX_FRAMES];
@@ -166,11 +146,8 @@ namespace BLMovieLeakFix
          return;
       const std::lock_guard<std::mutex> lk(g_mtx);
       const uint32_t f = g_frame;
-      if (g_first_movie || (f - g_last_movie_frame) > NEW_GEN_GAP_FRAMES)
-      {
+      if (g_cur_gen == 0 || (f - g_last_movie_frame) > NEW_GEN_GAP_FRAMES)
          g_cur_gen += 1;
-         g_first_movie = false;
-      }
       g_last_movie_frame = f;
       g_movie[handle.handle] = MovieTex{bytes, g_cur_gen, f};
       g_have_movie = true;
@@ -243,7 +220,7 @@ namespace BLMovieLeakFix
       }
       uint32_t ft = 0;
       uint64_t fb = 0; // Phase C: RELEASE with the lock released
-      uint32_t partial = 0;
+      bool partial = false;
       for (const Plan& p : plans)
       {
          for (uintptr_t v : p.views)
@@ -257,7 +234,7 @@ namespace BLMovieLeakFix
             fb += p.bytes;
          }
          else
-            partial++;
+            partial = true;
       }
       g_freed_tex += ft;
       g_freed_bytes += fb;
@@ -282,14 +259,9 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    bool logged_no_fp16 = false; // warned once: swapchain not fp16 (HDR upgrade absent) -> SMAA skipped
 #endif
 
-   // Scene depth (D24S8, viewed r24_unorm_x8_uint) captured from the cel-shading pass, linearized into the
-   // predication signal below.
+   // Predication inputs, captured per frame from the cel-shading pass: scene depth (D24S8, viewed
+   // r24_unorm_x8_uint) and the PSOffsetConstants (MinZ_MaxZRatio) that pass linearizes it with.
    ComPtr<ID3D11ShaderResourceView> srv_depth;
-
-   // The game's cb2 (CSOffsetConstants), kept by reference from the AO chain, where the engine has it live. The
-   // predication extract reads MinZ_MaxZRatioCS out of it; SMAA runs at the FXAA resolve, where the slot holds
-   // something else, so the buffer has to be carried rather than read in place. Contents are the game's, so this
-   // stays correct as the camera moves; only a frame with no AO chain at all leaves it unset.
    ComPtr<ID3D11Buffer> cb_game_offsets;
 
    // SMAA predication: plane-deviation edge-ness (R16F) built from srv_depth by the BL Depth Extract CS.
@@ -320,12 +292,13 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    // Tracks the size DrawSMAA built its core-managed intermediates at (to rebuild on resolution change).
    uint32_t smaa_core_w = 0, smaa_core_h = 0;
 
-   // SMAA scratch (fp16), recreated on resolution change. tex_input = scene-color snapshot (CopyResource'd each
-   // frame); the linearize CS then writes tex_lin = pass-through copy (SMAA blending) and tex_gam = sRGB-encoded
-   // copy (SMAA edge detection).
-   ComPtr<ID3D11Texture2D> tex_input, tex_lin, tex_gam;
-   ComPtr<ID3D11ShaderResourceView> srv_input, srv_lin, srv_gam;
-   ComPtr<ID3D11UnorderedAccessView> uav_lin, uav_gam;
+   // SMAA inputs (fp16), recreated on resolution change: scene-color snapshot (CopyResource'd each frame, edge
+   // detection) and its linear-light decode (neighborhood blend).
+   ComPtr<ID3D11Texture2D> tex_input;
+   ComPtr<ID3D11ShaderResourceView> srv_input;
+   ComPtr<ID3D11Texture2D> tex_input_linear;
+   ComPtr<ID3D11UnorderedAccessView> uav_input_linear;
+   ComPtr<ID3D11ShaderResourceView> srv_input_linear;
    uint32_t smaa_temps_w = 0, smaa_temps_h = 0;
 
    // SMAA output temp (fp16, SRV+RTV). Copied into the swapchain target after SMAA (or fed to RCAS first).
@@ -345,10 +318,9 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
 
    // --- XeGTAO scratch (all at the game's AO full-res; cached, rebuilt on size change). ---
    // Game inputs captured per frame (reset in OnPresent): full-res r24 scene depth (deinterleave t0) and
-   // the packed view normals (coarse-AO t0). gtao_active_this_frame arms the blur-dispatch takeover.
+   // the packed view normals (coarse-AO t0). A captured srv_gtao_depth arms the coarse/blur takeover.
    ComPtr<ID3D11ShaderResourceView> srv_gtao_depth;
    ComPtr<ID3D11ShaderResourceView> srv_gtao_normals;
-   bool gtao_active_this_frame = false;
    // Prefiltered viewspace-depth MIP pyramid (R32F, 5 mips) — 5 per-mip UAVs + one full SRV.
    ComPtr<ID3D11Texture2D> tex_gtao_depth_mips;
    ComPtr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5];
@@ -361,6 +333,21 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    // LumaGTAO knob CB (b11) = (FinalValuePower, DepthScale, RadiusOverride, DebugView); recreated on change.
    ComPtr<ID3D11Buffer> cb_gtao;
    float gtao_cb_fvp = -1.f, gtao_cb_depth_scale = -1.f, gtao_cb_radius = -1.f, gtao_cb_debug = -1.f;
+
+   void ReleaseGTAOScratch()
+   {
+      tex_gtao_depth_mips.reset();
+      for (auto& uav : gtao_depth_mip_uavs)
+         uav.reset();
+      srv_gtao_depth_mips.reset();
+      for (int i = 0; i < 2; i++)
+      {
+         tex_gtao_working[i].reset();
+         uav_gtao_working[i].reset();
+         srv_gtao_working[i].reset();
+      }
+      gtao_w = gtao_h = 0;
+   }
 };
 
 class BorderlandsGoty final : public Game
@@ -368,6 +355,26 @@ class BorderlandsGoty final : public Game
    static BorderlandsGotyGameDeviceData& GetGameDeviceData(DeviceData& device_data)
    {
       return *static_cast<BorderlandsGotyGameDeviceData*>(device_data.game);
+   }
+
+   // Named injected shaders live in unordered_maps the render thread otherwise only reads: look them up with
+   // "find" (operator[] would default-insert on a miss and mutate a map DrawSMAA reads concurrently).
+   template <typename ShaderMap>
+   static auto FindShader(const ShaderMap& shaders, uint32_t name_hash)
+   {
+      const auto it = shaders.find(name_hash);
+      return it != shaders.end() ? it->second.get() : nullptr;
+   }
+
+   template <typename ShaderMap>
+   static bool AllShadersReady(const ShaderMap& shaders, std::initializer_list<uint32_t> name_hashes)
+   {
+      for (uint32_t name_hash : name_hashes)
+      {
+         if (FindShader(shaders, name_hash) == nullptr)
+            return false;
+      }
+      return true;
    }
 
    // Create an IMMUTABLE constant buffer holding `size` bytes from `data`. Resets `out`; returns true on success.
@@ -522,10 +529,9 @@ public:
       GetShaderDefineData(GAMUT_MAPPING_TYPE_HASH).SetDefaultValue('1'); // gamut-map wild colors in composition
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
-      // SMAA linearize helper (the 6 SMAA passes register automatically under ENABLE_SMAA).
-      native_shaders_definitions.emplace(CompileTimeStringHash("SMAA Linear To sRGB CS"),
-         ShaderDefinition("Luma_SMAA_LinearTosRGB_CS", reshade::api::pipeline_subobject_type::compute_shader));
-
+      // Linear-light decode of the SMAA input for its neighborhood blend.
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL SMAA Linearize CS"),
+         ShaderDefinition("Luma_BL_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
       // Depth-extract CS for SMAA predication: hardware d24 -> R16F plane-deviation edge-ness.
       native_shaders_definitions.emplace(CompileTimeStringHash("BL Depth Extract CS"),
          ShaderDefinition("Luma_BL_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
@@ -575,50 +581,8 @@ public:
 
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
-      if (device_data.game)
-      {
-         auto& gd = GetGameDeviceData(device_data);
-         gd.srv_depth.reset();
-         gd.cb_game_offsets.reset();
-         gd.cb_pred.reset();
-         gd.uav_pred.reset();
-         gd.srv_pred.reset();
-         gd.tex_pred.reset();
-#if DEVELOPMENT
-         gd.pred_measure.staging.reset();
-         gd.pred_measure.width = 0;
-         gd.pred_measure.copy_pending = false;
-#endif
-         gd.cb_smaa_metrics.reset();
-         gd.srv_input.reset();
-         gd.tex_input.reset();
-         gd.uav_lin.reset();
-         gd.srv_lin.reset();
-         gd.tex_lin.reset();
-         gd.uav_gam.reset();
-         gd.srv_gam.reset();
-         gd.tex_gam.reset();
-         gd.tex_smaa_out.reset();
-         gd.tex_smaa_out_rtv.reset();
-         gd.tex_smaa_out_srv.reset();
-         gd.cb_sharpen.reset();
-         gd.tex_rcas_out.reset();
-         gd.tex_rcas_out_rtv.reset();
-         gd.srv_gtao_depth.reset();
-         gd.srv_gtao_normals.reset();
-         gd.tex_gtao_depth_mips.reset();
-         for (auto& uav : gd.gtao_depth_mip_uavs)
-            uav.reset();
-         gd.srv_gtao_depth_mips.reset();
-         for (int i = 0; i < 2; i++)
-         {
-            gd.tex_gtao_working[i].reset();
-            gd.uav_gtao_working[i].reset();
-            gd.srv_gtao_working[i].reset();
-         }
-         gd.cb_gtao.reset();
-      }
-      delete device_data.game;
+      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
+      delete static_cast<BorderlandsGotyGameDeviceData*>(device_data.game);
       device_data.game = nullptr;
    }
 
@@ -629,10 +593,9 @@ public:
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
 
       // Hide HUD: cancel the game's UI draws (for clean screenshots). A UI draw = one targeting a swapchain back
-      // buffer AFTER the scene post-processing ran — the same detection the core UI handling uses
-      // (RTV resource in device_data.back_buffers; see core.hpp). Compute/offscreen draws have no swapchain RTV
-      // so they're untouched, and pre-scene menu draws (post not yet done) still show.
-      if (g_hide_ui && is_immediate && !is_custom_pass && device_data.has_drawn_main_post_processing)
+      // buffer — the same detection the core UI handling uses (RTV resource in device_data.back_buffers; see
+      // core.hpp). Compute/offscreen draws have no swapchain RTV so they're untouched.
+      if (g_hide_ui && is_immediate && !is_custom_pass)
       {
          ComPtr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
@@ -653,28 +616,14 @@ public:
          }
       }
 
-      // Track the scene depth for SMAA predication: the cel-shading edge pass binds the D24S8 depth as PS t0.
+      // SMAA predication inputs: the cel-shading edge pass binds the D24S8 depth at PS t0 and linearizes it with
+      // PSOffsetConstants at PS b2.
       if (is_immediate && original_shader_hashes.Contains(kCelShadingHash, reshade::api::shader_stage::pixel))
       {
-         ComPtr<ID3D11ShaderResourceView> srv_d;
-         native_device_context->PSGetShaderResources(0, 1, srv_d.put());
-         if (srv_d)
-         {
-            gd.srv_depth = srv_d;
-         }
-      }
-
-      // Keep a reference to the game's cb2 (CSOffsetConstants) from the AO chain, where the engine has it bound
-      // with the current projection. Deliberately NOT gated on g_gtao_enable: the predication extract needs
-      // MinZ_MaxZRatioCS whether or not we take the AO chain over, and this is the one point in the frame where
-      // the slot is known to hold it. Never cleared - a frame whose AO chain does not run keeps the last one,
-      // which is the same projection unless the camera changed, and the alternative is losing predication.
-      if (is_immediate && original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
-      {
-         ComPtr<ID3D11Buffer> cb2;
-         native_device_context->CSGetConstantBuffers(2, 1, cb2.put());
-         if (cb2)
-            gd.cb_game_offsets = cb2;
+         gd.srv_depth.reset();
+         gd.cb_game_offsets.reset();
+         native_device_context->PSGetShaderResources(0, 1, gd.srv_depth.put());
+         native_device_context->PSGetConstantBuffers(2, 1, gd.cb_game_offsets.put());
       }
 
       // XeGTAO replaces the game's native HBAO+ (chain order: deinterleave x2 -> normals 0xB2B47225 ->
@@ -688,12 +637,7 @@ public:
          // the native dispatch. Both dispatches of the pair hit this branch (second is a cheap re-capture).
          if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
          {
-            const bool gtao_shaders_ready =
-               device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Prefilter Depths CS")].get() != nullptr &&
-               device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Main Pass CS")].get() != nullptr &&
-               device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Denoise Pass 1 CS")].get() != nullptr &&
-               device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS")].get() != nullptr;
-            if (!gtao_shaders_ready)
+            if (!AllShadersReady(device_data.native_compute_shaders, {CompileTimeStringHash("BL XeGTAO Prefilter Depths CS"), CompileTimeStringHash("BL XeGTAO Main Pass CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS")}))
                return DrawOrDispatchOverrideType::None;
 
             ComPtr<ID3D11ShaderResourceView> srv_d;
@@ -713,17 +657,7 @@ public:
             // (Re)create the scratch at the game's AO full-res (cached; NOT per-frame).
             if (gd.gtao_w != w || gd.gtao_h != h || !gd.tex_gtao_depth_mips || !gd.tex_gtao_working[1])
             {
-               gd.tex_gtao_depth_mips.reset();
-               for (auto& uav : gd.gtao_depth_mip_uavs)
-                  uav.reset();
-               gd.srv_gtao_depth_mips.reset();
-               for (int i = 0; i < 2; i++)
-               {
-                  gd.tex_gtao_working[i].reset();
-                  gd.uav_gtao_working[i].reset();
-                  gd.srv_gtao_working[i].reset();
-               }
-               gd.gtao_w = gd.gtao_h = 0;
+               gd.ReleaseGTAOScratch();
 
                D3D11_TEXTURE2D_DESC td = {};
                td.Width = w;
@@ -755,16 +689,7 @@ public:
                }
                if (!ok)
                {
-                  gd.tex_gtao_depth_mips.reset();
-                  for (auto& uav : gd.gtao_depth_mip_uavs)
-                     uav.reset();
-                  gd.srv_gtao_depth_mips.reset();
-                  for (int i = 0; i < 2; i++)
-                  {
-                     gd.tex_gtao_working[i].reset();
-                     gd.uav_gtao_working[i].reset();
-                     gd.srv_gtao_working[i].reset();
-                  }
+                  gd.ReleaseGTAOScratch();
                   return DrawOrDispatchOverrideType::None; // native chain runs whole
                }
                gd.gtao_w = w;
@@ -793,7 +718,6 @@ public:
                return DrawOrDispatchOverrideType::None;
 
             gd.srv_gtao_depth = srv_d;
-            gd.gtao_active_this_frame = true;
 
             return DrawOrDispatchOverrideType::Replaced; // skip the native deinterleave
          }
@@ -802,7 +726,7 @@ public:
          // we own the chain this frame — otherwise the native pipeline is left fully intact.
          if (original_shader_hashes.Contains(kAOCoarseHash, reshade::api::shader_stage::compute))
          {
-            if (!gd.gtao_active_this_frame)
+            if (!gd.srv_gtao_depth)
                return DrawOrDispatchOverrideType::None;
             ComPtr<ID3D11ShaderResourceView> srv_n;
             native_device_context->CSGetShaderResources(0, 1, srv_n.put());
@@ -815,7 +739,7 @@ public:
          // cancel the native dispatch. The game's apply blit (untouched) then multiplies it into the scene.
          if (original_shader_hashes.Contains(kAOBlurHash, reshade::api::shader_stage::compute))
          {
-            if (!gd.gtao_active_this_frame)
+            if (!gd.srv_gtao_depth)
                return DrawOrDispatchOverrideType::None;
 
             ComPtr<ID3D11UnorderedAccessView> uav_final;
@@ -824,7 +748,7 @@ public:
             // there is nothing for either path to write, so leave the native blur running rather than cancel it.
             if (!uav_final)
                return DrawOrDispatchOverrideType::None;
-            if (!gd.srv_gtao_depth || !gd.srv_gtao_normals)
+            if (!gd.srv_gtao_normals)
             {
                // Shouldn't happen (chain order is fixed); write "no AO" so a stale buffer can't apply.
                const FLOAT ones[4] = {1.f, 1.f, 1.f, 1.f};
@@ -833,6 +757,10 @@ public:
             }
 
             const uint32_t w = gd.gtao_w, h = gd.gtao_h;
+            auto* cs_prefilter = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL XeGTAO Prefilter Depths CS"));
+            auto* cs_main = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL XeGTAO Main Pass CS"));
+            auto* cs_denoise_1 = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL XeGTAO Denoise Pass 1 CS"));
+            auto* cs_denoise_2 = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS"));
             DrawStateStack<DrawStateStackType::Compute> st;
             st.Cache(native_device_context, device_data.uav_max_count);
 
@@ -856,7 +784,7 @@ public:
                   gd.gtao_depth_mip_uavs[2].get(), gd.gtao_depth_mip_uavs[3].get(), gd.gtao_depth_mip_uavs[4].get()};
                native_device_context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
                native_device_context->CSSetShaderResources(0, 1, &srv);
-               native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Prefilter Depths CS")].get(), nullptr, 0);
+               native_device_context->CSSetShader(cs_prefilter, nullptr, 0);
                native_device_context->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
                native_device_context->CSSetUnorderedAccessViews(0, 5, uav_nulls5.data(), nullptr);
             }
@@ -871,7 +799,7 @@ public:
                ID3D11UnorderedAccessView* uav = gd.uav_gtao_working[0].get();
                native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
                native_device_context->CSSetShaderResources(0, 2, srvs);
-               native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Main Pass CS")].get(), nullptr, 0);
+               native_device_context->CSSetShader(cs_main, nullptr, 0);
                native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
             }
             // 3) Denoise 1: working0 -> working1 (2 horizontal pixels per thread).
@@ -881,7 +809,7 @@ public:
                ID3D11UnorderedAccessView* uav = gd.uav_gtao_working[1].get();
                native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
                native_device_context->CSSetShaderResources(0, 1, &srv);
-               native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Denoise Pass 1 CS")].get(), nullptr, 0);
+               native_device_context->CSSetShader(cs_denoise_1, nullptr, 0);
                native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
             }
             // 4) Denoise 2 (final): working1 -> the game's r16g16_float AO target.
@@ -891,7 +819,7 @@ public:
                ID3D11UnorderedAccessView* uav = uav_final.get();
                native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
                native_device_context->CSSetShaderResources(0, 1, &srv);
-               native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS")].get(), nullptr, 0);
+               native_device_context->CSSetShader(cs_denoise_2, nullptr, 0);
                native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
             }
 
@@ -922,13 +850,13 @@ public:
          uint4 cinfo{};
          DXGI_FORMAT cfmt = DXGI_FORMAT_UNKNOWN;
          GetResourceInfo(color_res.get(), cinfo, cfmt);
-         uint32_t w = cinfo.x, h = cinfo.y, color_fmt = (uint32_t)cfmt;
+         const uint32_t w = cinfo.x, h = cinfo.y;
          if (w == 0 || h == 0)
             return DrawOrDispatchOverrideType::None;
          // fp16 guard: the SMAA path forces R16G16B16A16_FLOAT temps; CopyResource silently no-ops on a format
          // mismatch, so a non-fp16 swapchain (HDR upgrade absent) would feed SMAA uninitialized memory and copy
          // garbage back. Bail to the game's native FXAA instead of shipping a corrupt frame.
-         if (color_fmt != (uint32_t)DXGI_FORMAT_R16G16B16A16_FLOAT)
+         if (cfmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
          {
 #if DEVELOPMENT || TEST
             if (!gd.logged_no_fp16)
@@ -944,7 +872,8 @@ public:
          // Predication depth is valid only if captured this frame AND it matches the color dimensions (a resolution
          // change can leave a different-size depth). When invalid we pass a null predication texture and a scale of
          // 1.0 so SMAA uses the plain ULTRA threshold rather than the doubled predicated baseline.
-         bool pred_ok = g_smaa_predication && gd.srv_depth && gd.cb_game_offsets && device_data.native_compute_shaders[CompileTimeStringHash("BL Depth Extract CS")].get() != nullptr;
+         auto* pred_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL Depth Extract CS"));
+         bool pred_ok = g_smaa_predication && gd.srv_depth && gd.cb_game_offsets && pred_cs != nullptr;
          if (pred_ok)
          {
             // The extract CS maps texels 1:1, so a depth buffer of a different size would read a sub-rect and
@@ -980,15 +909,9 @@ public:
          const float pred_scale = pred_ok ? 2.f : 1.f;
 
          // Shader-readiness gate (async loader / dev live-reload). If anything is missing, fall through to native FXAA.
-         const bool smaa_ready =
-            device_data.native_pixel_shaders[CompileTimeStringHash("SMAA Edge Detection PS")].get() != nullptr &&
-            device_data.native_pixel_shaders[CompileTimeStringHash("SMAA Blending Weight Calculation PS")].get() != nullptr &&
-            device_data.native_pixel_shaders[CompileTimeStringHash("SMAA Neighborhood Blending PS")].get() != nullptr &&
-            device_data.native_vertex_shaders[CompileTimeStringHash("SMAA Edge Detection VS")].get() != nullptr &&
-            device_data.native_vertex_shaders[CompileTimeStringHash("SMAA Blending Weight Calculation VS")].get() != nullptr &&
-            device_data.native_vertex_shaders[CompileTimeStringHash("SMAA Neighborhood Blending VS")].get() != nullptr &&
-            device_data.native_compute_shaders[CompileTimeStringHash("SMAA Linear To sRGB CS")].get() != nullptr;
-         if (!smaa_ready)
+         auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL SMAA Linearize CS"));
+         if (linearize_cs == nullptr || !AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) ||
+             !AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")}))
             return DrawOrDispatchOverrideType::None;
 
          // DrawSMAA sizes its edge/blend/DSV intermediates from the first RTV and rebuilds only on swapchain re-init.
@@ -1035,70 +958,60 @@ public:
          if (!gd.tex_smaa_out_rtv || !gd.tex_smaa_out_srv)
             return DrawOrDispatchOverrideType::None;
 
-         // (Re)create the SMAA scratch textures + views on resolution change (cached like tex_smaa_out — avoids
-         // ~3x full-res fp16 alloc/free every replaced frame). tex_input = SRV-readable snapshot of the in-place
-         // scene color; tex_lin/tex_gam = the pass-through and sRGB-encoded copies the linearize CS writes.
+         // (Re)create the SMAA inputs on resolution change (cached like tex_smaa_out, no full-res fp16 alloc/free
+         // every replaced frame).
          if (!gd.tex_input || gd.smaa_temps_w != w || gd.smaa_temps_h != h)
          {
             gd.srv_input.reset();
-            gd.tex_input.reset();
-            gd.uav_lin.reset();
-            gd.srv_lin.reset();
-            gd.tex_lin.reset();
-            gd.uav_gam.reset();
-            gd.srv_gam.reset();
-            gd.tex_gam.reset();
+            gd.uav_input_linear.reset();
+            gd.srv_input_linear.reset();
             if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input) &&
-                CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_lin) &&
-                CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_gam))
+                CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_input_linear))
             {
                native_device->CreateShaderResourceView(gd.tex_input.get(), nullptr, gd.srv_input.put());
-               native_device->CreateUnorderedAccessView(gd.tex_lin.get(), nullptr, gd.uav_lin.put());
-               native_device->CreateUnorderedAccessView(gd.tex_gam.get(), nullptr, gd.uav_gam.put());
-               native_device->CreateShaderResourceView(gd.tex_lin.get(), nullptr, gd.srv_lin.put());
-               native_device->CreateShaderResourceView(gd.tex_gam.get(), nullptr, gd.srv_gam.put());
+               native_device->CreateUnorderedAccessView(gd.tex_input_linear.get(), nullptr, gd.uav_input_linear.put());
+               native_device->CreateShaderResourceView(gd.tex_input_linear.get(), nullptr, gd.srv_input_linear.put());
                gd.smaa_temps_w = w;
                gd.smaa_temps_h = h;
             }
          }
-         if (!gd.srv_input || !gd.uav_lin || !gd.uav_gam || !gd.srv_lin || !gd.srv_gam)
+         if (!gd.srv_input || !gd.uav_input_linear || !gd.srv_input_linear)
             return DrawOrDispatchOverrideType::None;
 
          // Snapshot the (in-place) scene color out of the swapchain so SMAA can read it (no alloc — reuses tex_input).
          native_device_context->CopyResource(gd.tex_input.get(), color_res.get());
 
-         // Wrap in core's Compute state stack: restores the game's prior CS shader/UAVs/SRV after our dispatch (core
-         // only auto-restores compute state in DEVELOPMENT, so shipping needs this) and unbinds our u0/u1 UAVs before
-         // DrawSMAA reads them as SRVs (avoids the output-vs-read hazard).
+         // Linear-light decode of the snapshot for the neighborhood blend (Luma_BL_SMAALinearize.hlsl).
          {
-            DrawStateStack<DrawStateStackType::Compute> linearize_cs_state;
-            linearize_cs_state.Cache(native_device_context, device_data.uav_max_count);
-
-            ID3D11ShaderResourceView* cs_srv = gd.srv_input.get();
-            ID3D11UnorderedAccessView* cs_uavs[2] = {gd.uav_lin.get(), gd.uav_gam.get()}; // u0 = pass-through copy (blend), u1 = sRGB-encoded (edge detect)
-            native_device_context->CSSetShaderResources(0, 1, &cs_srv);
-            native_device_context->CSSetUnorderedAccessViews(0, 2, cs_uavs, nullptr);
-            native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("SMAA Linear To sRGB CS")].get(), nullptr, 0);
+            DrawStateStack<DrawStateStackType::Compute> linearize_state;
+            linearize_state.Cache(native_device_context, device_data.uav_max_count);
+            ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
+            ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
+            native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
+            native_device_context->CSSetShaderResources(0, 1, &lin_srv);
+            native_device_context->CSSetShader(linearize_cs, nullptr, 0);
             native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            linearize_state.Restore(native_device_context);
+         }
 
-            // Predication extract: hardware d24 -> plane-deviation edge-ness in R16F, under the same state stack.
-            // Restoring it before DrawSMAA is what makes both results readable: an SRV of a resource still bound
-            // as a UAV reads as null.
-            if (pred_ok)
-            {
-               ID3D11ShaderResourceView* pred_srv = gd.srv_depth.get();
-               ID3D11UnorderedAccessView* pred_uav = gd.uav_pred.get();
-               ID3D11Buffer* pred_cbs[1] = {gd.cb_pred.get()};
-               ID3D11Buffer* game_cb[1] = {gd.cb_game_offsets.get()};
-               native_device_context->CSSetUnorderedAccessViews(0, 1, &pred_uav, nullptr);
-               native_device_context->CSSetShaderResources(0, 1, &pred_srv);
-               native_device_context->CSSetConstantBuffers(0, 1, pred_cbs);
-               native_device_context->CSSetConstantBuffers(2, 1, game_cb); // CSOffsetConstants: MinZ_MaxZRatioCS
-               native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL Depth Extract CS")].get(), nullptr, 0);
-               native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-            }
-
-            linearize_cs_state.Restore(native_device_context);
+         // Predication extract: hardware d24 -> plane-deviation edge-ness in R16F. Core's Compute state stack restores
+         // the game's CS state (core only auto-restores it in DEVELOPMENT) and unbinds our UAV before DrawSMAA reads
+         // it as an SRV (an SRV of a resource still bound as a UAV reads as null).
+         if (pred_ok)
+         {
+            DrawStateStack<DrawStateStackType::Compute> pred_state;
+            pred_state.Cache(native_device_context, device_data.uav_max_count);
+            ID3D11ShaderResourceView* pred_srv = gd.srv_depth.get();
+            ID3D11UnorderedAccessView* pred_uav = gd.uav_pred.get();
+            ID3D11Buffer* pred_cbs[1] = {gd.cb_pred.get()};
+            ID3D11Buffer* game_cb[1] = {gd.cb_game_offsets.get()};
+            native_device_context->CSSetUnorderedAccessViews(0, 1, &pred_uav, nullptr);
+            native_device_context->CSSetShaderResources(0, 1, &pred_srv);
+            native_device_context->CSSetConstantBuffers(0, 1, pred_cbs);
+            native_device_context->CSSetConstantBuffers(2, 1, game_cb); // PSOffsetConstants: MinZ_MaxZRatio
+            native_device_context->CSSetShader(pred_cs, nullptr, 0);
+            native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            pred_state.Restore(native_device_context);
          }
 
 #if DEVELOPMENT
@@ -1109,8 +1022,8 @@ public:
 
          if (pred_ok && g_smaa_pred_debug)
          {
-            auto* debug_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
-            auto* debug_ps = device_data.native_pixel_shaders[CompileTimeStringHash("Copy PS")].get();
+            auto* debug_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+            auto* debug_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
             if (debug_vs != nullptr && debug_ps != nullptr)
             {
                // The mask is single-channel, so the core copy lands it in RED - unmistakably a debug view. It
@@ -1138,16 +1051,15 @@ public:
          // Pass depth for predication only when valid (same-size, captured this frame); otherwise null + the
          // pred_scale=1.0 baked into the metrics CB make SMAA run as plain ULTRA instead of degraded predication.
          DrawSMAA(native_device, native_device_context, device_data,
-            gd.tex_smaa_out_rtv.get(), gd.srv_lin.get() /*color (blend)*/, gd.srv_gam.get() /*color gamma (edge detect)*/,
+            gd.tex_smaa_out_rtv.get(), gd.srv_input_linear.get(), gd.srv_input.get(),
             pred_ok ? gd.srv_pred.get() : nullptr /*predication (plane-deviation edge-ness)*/);
 
-         // --- Optional RCAS sharpen on the (linear scRGB) SMAA output, then copy into the swapchain target. ---
+         // --- Optional RCAS sharpen on the SMAA output, then copy into the swapchain target. ---
          // SMAA output -> RCAS -> tex_rcas_out -> color_res. If sharpening is off or anything isn't ready, copy the
          // SMAA output straight through (never leave the swapchain unwritten on a Replaced dispatch).
-         const bool sharpen_shaders_ready =
-            device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get() != nullptr &&
-            device_data.native_pixel_shaders[CompileTimeStringHash("BL Sharpen PS")].get() != nullptr;
-         bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_shaders_ready;
+         auto* sharpen_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+         auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL Sharpen PS"));
+         bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs != nullptr && sharpen_ps != nullptr;
          if (do_sharpen)
          {
             // (Re)create the RCAS CB on resolution/sharpness change.
@@ -1179,8 +1091,6 @@ public:
 
          if (do_sharpen)
          {
-            auto* sharpen_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
-            auto* sharpen_ps = device_data.native_pixel_shaders[CompileTimeStringHash("BL Sharpen PS")].get();
             // DrawCustomPixelShader does NOT restore state -> wrap in core's DrawStateStack<FullGraphics>.
             DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
             sharpen_state.Cache(native_device_context, device_data.uav_max_count);
@@ -1204,7 +1114,6 @@ public:
          native_device_context->VSSetConstantBuffers(1, 1, &vcb);
          native_device_context->PSSetConstantBuffers(1, 1, &pcb);
 
-         device_data.has_drawn_main_post_processing = true;
          return DrawOrDispatchOverrideType::Replaced; // cancel the FXAA resolve dispatch
       }
 #endif // ENABLE_SMAA
@@ -1230,14 +1139,14 @@ public:
                "[BL-Leak] no movie buffers detected after warmup -- game build may differ from the one this leak fix targets; the fix is inactive (RAM-growth crash not mitigated).");
       }
 
-      // Predication depth is captured per-frame at the cel pass; drop it every present so a frame without that pass
-      // (menu/transition/reorder) uses NO predication, not last frame's (possibly wrong-size) depth. Null handled at bind.
+      // Predication inputs are captured per-frame at the cel pass; drop them every present so a frame without that
+      // pass (menu/transition/reorder) uses NO predication, not last frame's (possibly wrong-size) depth.
       gd.srv_depth.reset();
+      gd.cb_game_offsets.reset();
 
       // XeGTAO inputs are captured per-frame at the deinterleave/coarse passes; disarm the takeover + drop the
       // captured SRVs every present so a frame without the AO chain (AO off in-game / transition) can't apply a
       // stale AO buffer.
-      gd.gtao_active_this_frame = false;
       gd.srv_gtao_depth.reset();
       gd.srv_gtao_normals.reset();
 
@@ -1271,6 +1180,8 @@ public:
       ImGui::SeparatorText("Anti-Aliasing");
       if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings).");
       ImGui::BeginDisabled(!g_smaa_enable);
       ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f); // updates live; persist on release
       if (ImGui::IsItemDeactivatedAfterEdit())
@@ -1298,7 +1209,7 @@ public:
 #endif
       ImGui::EndDisabled();
 
-      // --- HDR grade (read in Luma_BL_Tonemap.hlsl via LumaSettings.GameSettings; HDR tonemap path only) ---
+      // --- Grade (read in Luma_BL_Tonemap.hlsl via LumaSettings.GameSettings) ---
       auto& gs = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
 
@@ -1343,6 +1254,17 @@ public:
       if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightDechroma"))
          device_data.cb_luma_global_settings_dirty = true;
 
+      ImGui::SeparatorText("Bloom");
+      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
+      {
+         reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
+         device_data.cb_luma_global_settings_dirty = true;
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
+      if (DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity"))
+         device_data.cb_luma_global_settings_dirty = true;
+
       // --- Ambient Occlusion: XeGTAO replaces the game's native HBAO+ ---
       ImGui::SeparatorText("Ambient Occlusion");
       if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
@@ -1363,16 +1285,6 @@ public:
 
       // --- Post-effect scales + output toggle ---
       ImGui::SeparatorText("Effects");
-
-      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
-         device_data.cb_luma_global_settings_dirty = true;
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
-      if (DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity"))
-         device_data.cb_luma_global_settings_dirty = true;
 
       if (ImGui::SliderFloat("Lens Flare Intensity", &gs.FlareOut, 0.f, 1.f))
       {
@@ -1425,7 +1337,7 @@ public:
       if (ImGui::Checkbox("Fix Movie Memory Leak", &g_fix_movie_leak))
          reshade::set_config_value(nullptr, NAME, "FixMovieLeak", g_fix_movie_leak);
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Frees the loading/cutscene movie textures the game leaks on each transition (fixes the RAM-growth crash). Movies still play.");
+         ImGui::SetTooltip("Frees the loading/cutscene movie memory the game leaks on each transition (fixes the RAM-growth crash). Movies still play.");
       if (g_fix_movie_leak && !BLMovieLeakFix::g_have_movie.load() && BLMovieLeakFix::g_frame >= BLMovieLeakFix::BUILD_CHECK_FRAME)
          ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "Inactive: no movie buffers detected (game build may differ).");
 #if DEVELOPMENT || TEST
@@ -1438,10 +1350,21 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Borderlands GOTY Enhanced\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR and replaces the game's FXAA with SMAA (plus 16x anisotropic filtering).\n"
+         "It adds HDR and replaces the game's FXAA with SMAA and its HBAO+ with XeGTAO, plus 16x anisotropic filtering and a fix for the game's movie memory leak.\n"
+         "Enable Anti-Aliasing and Ambient Occlusion in the game's video settings for SMAA and XeGTAO to apply.\n"
+         "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
-         "Do NOT run another HDR mod (e.g. RenoDX) alongside it.");
+         "If you enjoy it, consider donating.");
       ImGui::PopTextWrapPos();
+
+      ImGui::NewLine();
+      ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 134, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70 + 9, 134 + 9, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
+      static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
+      if (ImGui::Button(donation_link.c_str()))
+         ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+      ImGui::PopStyleColor(3);
 
       ImGui::NewLine();
       static const std::string social_link = std::string("Join our \"HDR Den\" Discord ") + std::string(ICON_FK_SEARCH);
@@ -1469,8 +1392,8 @@ public:
                   "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
-                  "\nAMD FidelityFX (RCAS)",
-         "");
+                  "\nXeGTAO (Intel)"
+                  "\nAMD FidelityFX (RCAS)");
    }
 };
 
@@ -1485,7 +1408,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       Globals::SetGlobals(cleared_project_name, "Borderlands GOTY Enhanced Luma HDR + SMAA mod", "", mod_version);
 
       // Native HDR: swapchain -> scRGB fp16; core Display Composition does the paper-white scale + scRGB encode +
-      // gamut map at present. Replaced tonemap PS writes scene-referred HDR-linear into the (now fp16) post chain.
+      // gamut map at present. Replaced tonemap PS writes gamma-encoded HDR (1.0 = paper white) into the (now fp16) post chain.
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // r10g10b10a2 backbuffer -> r16g16b16a16_float
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;

@@ -42,9 +42,6 @@
 #define TONEMAP_TYPE 1
 #endif
 
-// HighlightDechroma is an optional user slider (see step 7 below); default 0 = off (only the mandatory DICE/gamut
-// desaturation applies).
-
 // --- Game bindings (must match the original shader exactly) ---
 cbuffer _Globals : register(b0)
 {
@@ -102,12 +99,7 @@ float3 GradeUE3_FromPostMidtones(float3 c, bool clampSDR)
    return exp2(c); // gamma-encoded graded color
 }
 
-float3 GradeUE3(float3 scene, bool clampSDR)
-{
-   return GradeUE3_FromPostMidtones(GradeUE3_PostMidtones(scene, clampSDR), clampSDR);
-}
-
-// Core tonemap. `v0`/`v1` are the game's interpolators (TEXCOORD0/1). Returns scene-referred linear color
+// Core tonemap. `v0`/`v1` are the game's interpolators (TEXCOORD0/1). Returns the color in post-process space
 // (1.0 = paper white) in `outColor`, and the FXAA luma the game's edge CS expects in `outLuma`.
 void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
 {
@@ -128,9 +120,9 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    outLuma = 0.25 * log2(dot(postMidtones, float3(0.212670997, 0.715160012, 0.0721689984)) * 15.0 + 1.0);
 
 #if TONEMAP_TYPE >= 1
-   // 3. The extended HDR grade (see GradeUE3), computed once: the hue reference and the display map both start
+   // 3. The extended HDR grade (clampSDR false), computed once: the hue reference and the display map both start
    // from it.
-   float3 extendedLinear = gamma_to_linear(GradeUE3(untonemapped, false));
+   float3 extendedLinear = gamma_to_linear(GradeUE3_FromPostMidtones(GradeUE3_PostMidtones(untonemapped, false), false));
 
    // 3b. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
    // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
@@ -139,8 +131,7 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
    [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
    {
-      const float midGray = 0.18;
-      extendedLinear = exp2(LumaSettings.GameSettings.Contrast * log2(max(extendedLinear / midGray, 1e-30))) * midGray;
+      extendedLinear = exp2(LumaSettings.GameSettings.Contrast * log2(max(extendedLinear / MidGray, 1e-30))) * MidGray;
    }
 
    const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
@@ -181,20 +172,15 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // run its shoulder trigger (an RGB average), its compression and its channel containment on doubly-narrowed
    // primaries. Neutrals cancel out; saturated highlights do not.
    ds.InOutColorSpace = CS_BT2020;
-   float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
-   hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
+   outColor = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
+   outColor = BT2020_To_BT709(SimpleGamutClip(outColor, true));
 
-   // 7. Highlight dechroma happens inside DICE (ds.HighlightsDesaturation above), so there is no pass here.
-
-   // User saturation LAST, after the display map: the repo's convention (luminance-relative RGB lerp, shared helper).
-   // 1.0 = neutral.
-   hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
-
-   outColor = hdr; // linear, 1.0 = paper white
+   // 7. User saturation LAST, after the display map: the repo's convention (luminance-relative RGB lerp, shared
+   // helper). 1.0 = neutral. Output is linear, 1.0 = paper white.
+   outColor = Saturation(outColor, LumaSettings.GameSettings.Saturation);
 #else
    // Vanilla reference: the exact clamped SDR grade (gamma-encoded), linearized.
-   float3 vanillaSDRGamma = GradeUE3_FromPostMidtones(postMidtones, true);
-   outColor = gamma_to_linear(saturate(vanillaSDRGamma));
+   outColor = gamma_to_linear(saturate(GradeUE3_FromPostMidtones(postMidtones, true)));
 #endif
 
    // --- Common tail: UI paper-white pre-scale + post-process-space encode ---

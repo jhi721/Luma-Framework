@@ -9,8 +9,8 @@
 // Mirrors c++ name spaces.
 namespace CB
 {
-// User-facing grade controls, drawn in DrawImGuiSettings (main.cpp) and read in Luma_BL_Tonemap.hlsl.
-// All apply only on the HDR tonemap path. SMAA metrics are passed via a dedicated CB at b1, not here.
+// User-facing controls, drawn in DrawImGuiSettings (main.cpp) and read by the replaced shaders.
+// SMAA metrics are passed via a dedicated CB at b1, not here.
 struct LumaGameSettings
 {
    float Exposure;           // exposure multiplier (1 = vanilla). Applied scene-referred, pre-grade.
