@@ -1332,8 +1332,6 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
-         // No "(HDR output)" qualifier: gated on TONEMAP_TYPE, not the display mode, so it runs in SDR too (as in
-         // Witcher 2).
          ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
