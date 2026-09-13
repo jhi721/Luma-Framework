@@ -106,9 +106,13 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    uint32_t scratch_w = 0, scratch_h = 0;
    // SMAA metrics CB (b1) = (1/w,1/h,w,h) + (predication scale,0,0,0); scale 2.0 when predication on, else 1.0.
    ComPtr<ID3D11Buffer> cb_smaa_metrics;
-   // SMAA scratch. tex_input = SRV snapshot of the canvas (already gamma, fed to both DrawSMAA color args).
+   // SMAA scratch. tex_input = SRV snapshot of the canvas (gamma, for edge detection); tex_input_linear = its
+   // linear-light decode, for the neighborhood blend.
    ComPtr<ID3D11Texture2D> tex_input;
    ComPtr<ID3D11ShaderResourceView> srv_input;
+   ComPtr<ID3D11Texture2D> tex_input_linear;
+   ComPtr<ID3D11UnorderedAccessView> uav_input_linear;
+   ComPtr<ID3D11ShaderResourceView> srv_input_linear;
    // RCAS input temp (SRV+RTV), allocated ONLY while sharpening is on: with RCAS off, SMAA's last pass writes
    // the canvas directly and this stays null.
    ComPtr<ID3D11Texture2D> tex_smaa_out;
@@ -186,12 +190,15 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       cb_gtao.reset(); // it holds the viewport size
    }
 
-   // Turning a feature off gives the address space back: at 4K these hold ~130 MB (SMAA) and ~30 MB (GTAO)
+   // Turning a feature off gives the address space back: at 4K these hold ~200 MB (SMAA) and ~30 MB (GTAO)
    // in a 32-bit process, and everything is recreated on demand.
    void ReleaseSMAAScratch()
    {
       srv_input.reset();
       tex_input.reset();
+      uav_input_linear.reset();
+      srv_input_linear.reset();
+      tex_input_linear.reset();
       ReleaseSharpenScratch();
    }
 
@@ -601,9 +608,10 @@ class TheWitcher2Game final : public Game
       }
 
       // Skip SMAA this frame if a pass is still missing (async loader / live reload).
-      const bool smaa_ready =
-         AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) &&
-         AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
+      auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 SMAA Linearize CS"));
+      const bool smaa_ready = linearize_cs != nullptr &&
+                              AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) &&
+                              AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
       if (!smaa_ready)
       {
          return;
@@ -683,11 +691,29 @@ class TheWitcher2Game final : public Game
 
       if (!gd.tex_input && CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input, cfmt))
          native_device->CreateShaderResourceView(gd.tex_input.get(), nullptr, gd.srv_input.put());
-      if (!gd.srv_input)
+      if (!gd.tex_input_linear && CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_input_linear, DXGI_FORMAT_R16G16B16A16_FLOAT))
+      {
+         native_device->CreateUnorderedAccessView(gd.tex_input_linear.get(), nullptr, gd.uav_input_linear.put());
+         native_device->CreateShaderResourceView(gd.tex_input_linear.get(), nullptr, gd.srv_input_linear.put());
+      }
+      if (!gd.srv_input || !gd.uav_input_linear || !gd.srv_input_linear)
          return;
 
       // Snapshot the canvas color: the chain writes the canvas, so it must sample this copy, not the canvas.
       native_device_context->CopyResource(gd.tex_input.get(), canvas_res);
+
+      // Linear-light decode of the snapshot for the neighborhood blend (Luma_TW2_SMAALinearize.hlsl).
+      {
+         DrawStateStack<DrawStateStackType::Compute> linearize_state;
+         linearize_state.Cache(native_device_context, device_data.uav_max_count);
+         ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
+         ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
+         native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
+         native_device_context->CSSetShaderResources(0, 1, &lin_srv);
+         native_device_context->CSSetShader(linearize_cs, nullptr, 0);
+         native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+         linearize_state.Restore(native_device_context);
+      }
 
       // Predication signal: the game's linear r32f depth -> plane-deviation edge-ness in R16F (gd.tex_pred);
       // see Luma_TW2_DepthExtract.hlsl for why this is an edge test rather than a depth rescale.
@@ -719,7 +745,7 @@ class TheWitcher2Game final : public Game
       // The last pass of the chain renders straight into the canvas RTV — no write-back copy. Reading the
       // canvas is safe because SMAA/RCAS sample the snapshot (tex_input), never the canvas itself.
       DrawSMAA(native_device, native_device_context, device_data,
-         do_sharpen ? gd.tex_smaa_out_rtv.get() : canvas_rtv, gd.srv_input.get(), gd.srv_input.get(),
+         do_sharpen ? gd.tex_smaa_out_rtv.get() : canvas_rtv, gd.srv_input_linear.get(), gd.srv_input.get(),
          pred_ok ? gd.srv_pred.get() : nullptr /*predication signal*/);
 
       if (do_sharpen)
@@ -984,8 +1010,10 @@ public:
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
 #if ENABLE_SMAA
-      // Core auto-registers the 6 SMAA passes. The canvas is GAMMA space and feeds both DrawSMAA color args
-      // directly, with no color-prep CS.
+      // Core auto-registers the 6 SMAA passes. Edge detection reads the GAMMA canvas; the blend reads its linear
+      // decode.
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 SMAA Linearize CS"),
+         ShaderDefinition("Luma_TW2_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
       // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA).
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Sharpen PS"),
          ShaderDefinition{"Luma_TW2_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
@@ -1328,7 +1356,6 @@ public:
          "It adds HDR and replaces the game's FXAA with SMAA and its SSAO with XeGTAO, plus 16x anisotropic filtering.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Enable SSAO in the game's video settings for XeGTAO to apply; SMAA works either way.\n"
-         "Keep the in-game Brightness and Gamma sliders at their defaults.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
@@ -1365,12 +1392,13 @@ public:
                   "\n\nThird Party:"
                   "\nReShade"
                   "\nImGui"
+                  "\nRenoDX (HDR tonemap method)"
                   "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
                   "\nAMD FidelityFX (RCAS)"
-                  "\ndgVoodoo2 (DirectX 9 -> 11 wrapper, required)");
+                  "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
    }
 };
 
