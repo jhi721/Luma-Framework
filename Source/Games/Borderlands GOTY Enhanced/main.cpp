@@ -1413,7 +1413,7 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Reduces gradient banding (HDR output).");
+         ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       if (ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui))
