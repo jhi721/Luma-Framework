@@ -2,15 +2,16 @@
 // ORDER MATTERS — see Luma_TW2_Tonemap.hlsl (game-local Common.hlsl defines LumaGameSettings first).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings — keep FIRST
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // RestoreHueAndChrominance (vanilla clip hue/chroma emulation)
 #include "../Includes/DICE.hlsl"
+#include "../Includes/Reinhard.hlsl"    // Reinhard::ReinhardPiecewise, the soft hue reference
+#include "Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
 // clang-format on
 
 // The Witcher 2 FINAL GRADE pass (dgVoodoo -> ps_5_0, hash 0xDE5CF9CD), the engine's
 // CEnvFinalColorBalanceParameters: FXAA + shadow offset, midtone power and highlight gain + luma-keyed split
 // toning + vignette, on the full-res fp16 canvas right before the UI draws.
 // Vanilla body transcribed VERBATIM (register-level, constants cb4[N] = DX9 c(N-8)). This is also where the
-// Luma HDR output block lives (expansion + DICE + UI paper-white pre-scale): the highlight split tone lerps
+// Luma HDR output block lives (highlight hue + DICE + UI paper-white pre-scale): the highlight split tone lerps
 // toward a SATURATED luma target and soft-clips everything above 1.0, so the HDR range dies here unless it is
 // rebuilt after it. The tonemap replacements stay vanilla-only.
 //
@@ -219,6 +220,16 @@ void main(
    float lumaAA = dot(aaColor, float3(0.299, 0.587, 0.114));
    float3 color = saturate(lumaAA * cb4[62].w) * -cb4[62].rgb + aaColor; // c54 vShadow: offset, ramped in from black by .w
 
+#if TONEMAP_TYPE == 1
+   // HDR: grade the colour at its clip point and give the brightness back after linearization (the HDR block below).
+   // Vanilla fed this grade at most 1 (the glow blend clips first), and extrapolating its per-channel power and gain
+   // past that turned a neutral 10 into Y ~24 with a blue cast in a graded area, and let the Gamma slider (it scales
+   // vMidtone) move highlight brightness. Dividing by the max channel keeps every stage on its authored 0-1 domain; at
+   // or below 1 the scale is exactly 1.0, so the result is bit-identical there.
+   const float gradeScale = (LumaSettings.DisplayMode == 1) ? max(max3(color), 1.0) : 1.0;
+   color /= gradeScale;
+#endif
+
    float3 clamped = max(color, 0.0);
    color.r = DgVoodooLog2(clamped.r);
    color.g = DgVoodooLog2(clamped.g);
@@ -270,7 +281,8 @@ void main(
 #if TONEMAP_TYPE == 1
    // ---- Luma HDR output (BL2-shape tail; this pass runs once per frame, full-res, scene only) ----
    {
-      float3 lin = gamma_to_linear(vanillaColor, GCT_MIRROR); // VANILLA_ENCODING_TYPE 1: gamma 2.2 buffers
+      // VANILLA_ENCODING_TYPE 1: gamma 2.2 buffers. gradeScale gives back the brightness the grade was normalized by.
+      float3 lin = gamma_to_linear(vanillaColor, GCT_MIRROR) * gradeScale;
 
       float3 postProcessedColor;
       if (LumaSettings.DisplayMode == 1) // HDR
@@ -278,43 +290,26 @@ void main(
          const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
          const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
 
-         // Vanilla highlight emulation (ALWAYS ON — part of the game's look, not a user knob). The vanilla SDR
-         // ceiling was a per-channel clamp at exactly 1.0 in two places: the glow screen blend (0x12931281)
-         // saturates the scene BEFORE this grade, and dgVoodoo's present blit (PS 0x2749AFD8, a bare
-         // "sample_l -> o0") wrote into an 8-bit r8g8b8a8 intermediate, so the output merger clamped again after
-         // it. Luma re-adds the blend's excess in HDR and upgrades that intermediate to fp16
-         // (texture_upgrade_formats in main.cpp), which is exactly why the clamp — and with it the vanilla look —
-         // disappears and has to be put back here, in the last pass before that blit. On a bright saturated
-         // source one channel reaches 1.0 first, which both skews the hue toward white (fire -> yellow-white) AND
-         // desaturates it; the highlight split tone above adds a partial soft clip of its own.
-         //
-         // REFERENCE = saturate(lin), the vanilla per-channel clip itself: this pass transcribes the whole
-         // vanilla grade, so the vanilla SDR color is already here and needs no stand-in (the pre-grade blend clip
-         // is folded into this post-grade one, an approximation left open in NOTES.md). A synthetic
-         // ReinhardPiecewise reference is only the fallback for passes with no vanilla SDR in hand, and it is a
-         // poor one here — a ceiling-5 reference recovers ~4% of the needed hue swing on a moderate highlight
-         // (G/R 0.347 where vanilla clips to 0.400), leaving fire red.
-         //
-         // Clip in BT.709: the artifact happened in the game's 8-bit sRGB buffer, so that is the faithful domain
-         // and both gamut matrices disappear with it. Clipping before or after the transfer function is
-         // equivalent, since a per-channel clamp at 1.0 commutes with any monotonic curve fixing 1 -> 1.
-         // The gate is exact, not conservative: below 1.0 saturate is the identity, so hueRef == lin and the
-         // restore provably does nothing, sparing two Oklab round trips on the ~96% of pixels that sit below.
-         [branch] if (max(lin.r, max(lin.g, lin.b)) > 1.0)
+         // Highlight hue: the colour stage of the other hard-clip ports (Borderlands GOTY, Medal of Honor Airborne,
+         // Mass Effect 2007 and 2010) and of RenoDX's BL1 template. Vanilla clipped per channel twice, in the glow blend
+         // before this grade and in the 8-bit present blit after it, which bends a bright saturated source toward
+         // yellow-white; Luma removes both clips. This stage bends the hue the same way, partway and without the
+         // whitening: a per-channel ReinhardPiecewise(5, 1.5) of the colour itself in BT.2020 supplies a hue DIRECTION,
+         // and MacLeod-Boynton rebuilds it on the colour's own purity and T = L + M, before the display map so DICE rolls
+         // off the bent colour. Full hue strength and no purity transfer (the RenoDX ports' Hue Shift 100% and Blowout 0),
+         // fixed rather than exposed. Measured in a graded area (2026-09-13): fire (6, 2, 0.4) goes from 8 to 23 degrees
+         // at unchanged purity. The exact clip colour as reference instead (hue 60, half the purity) read as greenish
+         // white at HDR brightness, and a fully clipped reference is achromatic, with no MacLeod-Boynton direction at all
+         // (it turned such fire blue).
+         // The gate sits at the reference's shoulder: below it ReinhardPiecewise returns its input exactly, and the
+         // BT.2020 channels of a BT.709 colour never exceed its max, so the reference equals the colour, the stage is a
+         // no-op up to float rounding, and those pixels skip the MacLeod-Boynton solve. One constant for both keeps them
+         // from drifting apart.
+         const float hueReferenceShoulder = 1.5;
+         [branch] if (max3(lin) > hueReferenceShoulder)
          {
-            float3 hueRef = saturate(lin);
-            // Shipped 0.8 hue / 0.4 whitening, both from GameSettings. 0.8 is the catalog value for a clipped
-            // SDR reference; 0.4 reproduces part of the clip's own chroma loss without paying for path-to-white
-            // twice, since DICE desaturates again at the display peak and Highlights Desaturation adds more on
-            // request. A non-zero whitening is only defensible because the reference here IS the vanilla clip.
-            // Only the CHROMA argument can whiten: the helper transfers hue, then restores chrominance exactly.
-            //
-            // HAZARD: hue strength must stay BELOW 1.0. Once every channel clips, hueRef is (1,1,1) whose
-            // chrominance is 1.7e-4 rather than 0, so the helper misses its safe-division fallback and its
-            // renormalization goes near-singular — the hue runs away while chroma stays put. On (6,5,4) linear:
-            // +0.87 deg at 0.80, +2.02 at 0.90, +4.49 at 0.95, +36.9 at 0.99, +143.9 at 1.00, where a white-hot
-            // pixel comes out CYAN. 0.80 keeps 61-79% of the vanilla hue swing; 0.90 is the hard ceiling.
-            lin = RestoreHueAndChrominance(lin, hueRef, saturate(LumaSettings.GameSettings.HighlightsHueStrength), saturate(LumaSettings.GameSettings.HighlightsHueChroma));
+            const float3 target2020 = BT709_To_BT2020(lin);
+            lin = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(target2020, Reinhard::ReinhardPiecewise(target2020, 5.0, hueReferenceShoulder)));
          }
 
          // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the

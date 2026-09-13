@@ -117,11 +117,5 @@ float4 RunTonemap(float4 v5)
    const float vanillaAlpha = scene.a;
 #endif
 
-   // NOTE: the Luma HDR output block (expansion + DICE + UI pre-scale + dither) does NOT live here:
-   // the game runs a FINAL GRADE pass after this one (FXAA + colour balance + split toning + vignette,
-   // FinalGrade_0xDE5CF9CD.ps_5_0.hlsl) whose highlight split tone would crush anything above 1.
-   // This pass therefore stays bit-exact vanilla (fp16 keeps the small unclamped overshoot alive),
-   // plus the user Exposure above; the HDR block runs at the end of the final grade replacement.
-
    return float4(vanillaColor, vanillaAlpha);
 }
