@@ -510,11 +510,19 @@ float4 RunTonemap(float4 v5, float4 v6)
    // trilinear read really can hand it a signed excursion.
    postProcessedColor = linear_to_gamma(postProcessedColor, GCT_NONE);
 
-   // Sub-perceptual animated triangular dither (9-bit, gamma space) vs gradient banding from the HDR expansion +
-   // 10-bit PQ encode. HDR only, runtime toggle (GameSettings.Dithering), FrameIndex animates it. Runs before
-   // SMAA but ~1/511 noise is below SMAA's 0.05 edge threshold -> no spawned edges / RCAS amplification.
-   if (LumaSettings.DisplayMode == 1 && LumaSettings.GameSettings.Dithering > 0.5)
-      ApplyDithering(postProcessedColor, v6.xy, true, 1.0, DITHERING_BIT_DEPTH, LumaSettings.FrameIndex, true);
+   // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
+   if (LumaSettings.GameSettings.Dithering > 0.5)
+   {
+      if (LumaSettings.DisplayMode == 0)
+         ApplyDithering(postProcessedColor, v6.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
+      else
+      {
+         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
+         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(postProcessedColor, GCT_MIRROR) * pqScale), GCT_MIRROR);
+         ApplyDithering(pq, v6.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
+         postProcessedColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
+      }
+   }
 
    return float4(postProcessedColor, 0.0); // vanilla wrote o0.w = 0
 }

@@ -21,7 +21,7 @@ struct LumaGameSettings
    float Contrast;           // 1 = vanilla. Multiplicative contrast around 18% mid-gray, applied before the display map.
    float VignetteIntensity;  // 1 = vanilla. Scales the game's vignette darkening (0 = no vignette).
    float LumaBloomEnable;    // 0/1. 1 = composite Luma HDR pyramidal bloom (t5 BL2 / t8 TPS, additive); 0 = vanilla game bloom (t1).
-   float Dithering;          // 0/1 toggle. Animated triangular dither at output (HDR only) to break gradient banding.
+   float Dithering;          // 0/1 toggle. Animated triangular dither at output (HDR and SDR) to break gradient banding.
    float VideoAutoHDREnable; // 0/1. 1 = light PumboAutoHDR on Bink videos (HDR only); 0 = flat SDR at paper white.
    float VideoAutoHDRBoost;  // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off.
    float BloomThreshold;     // Native bright pass's threshold, kept live off cb4[17].y -> the Luma prefilter's knee.

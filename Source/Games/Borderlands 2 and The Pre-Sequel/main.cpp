@@ -544,7 +544,7 @@ public:
       default_luma_global_game_settings.Contrast = 1.f;           // slope around 18% mid-gray
       default_luma_global_game_settings.VignetteIntensity = 1.f;  // game vignette darkening scale
       default_luma_global_game_settings.LumaBloomEnable = 1.f;    // 1 = Luma HDR pyramidal bloom, 0 = vanilla game bloom
-      default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR), anti-banding on
+      default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR and SDR), anti-banding on
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f; // light AutoHDR on Bink videos (HDR only)
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f; // highlight-expansion strength (peak ~165 nits at 0.5)
       default_luma_global_game_settings.BloomThreshold = 1.f;     // replaced within a frame by the native bright pass
@@ -1659,7 +1659,7 @@ public:
       }
       ImGui::EndDisabled();
 
-      // Gated on DisplayMode == 1 in Luma_BL2TPS_Tonemap.hlsl, so it only does anything on the HDR output.
+      // Luma_BL2TPS_Tonemap.hlsl dithers in HDR and SDR alike, so this checkbox has no display-mode gate.
       bool dithering = gs.Dithering > 0.5f;
       if (ImGui::Checkbox("Dithering", &dithering))
       {
@@ -1668,7 +1668,7 @@ public:
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
       }
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Reduces gradient banding (HDR output).");
+         ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       if (ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui))
