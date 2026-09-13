@@ -705,8 +705,6 @@ public:
          "Video highlight strength (0 = off).");
       ImGui::EndDisabled();
 
-      // No "(HDR output)" qualifier: this dither is gated on TONEMAP_TYPE, not on the display mode, so it runs in
-      // SDR too whenever that mode is on (as in the sibling ME1 2007 and Witcher 2 ports).
       Toggle("Dithering", gs.Dithering, "Dithering", "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
