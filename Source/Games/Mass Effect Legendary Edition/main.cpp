@@ -199,6 +199,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_input;
    ComPtr<ID3D11ShaderResourceView> srv_input;
    uint32_t smaa_temps_w = 0, smaa_temps_h = 0;
+   // Its linear-light decode, for the neighborhood blend.
+   ComPtr<ID3D11Texture2D> tex_input_linear;
+   ComPtr<ID3D11UnorderedAccessView> uav_input_linear;
+   ComPtr<ID3D11ShaderResourceView> srv_input_linear;
+   uint32_t smaa_linear_w = 0, smaa_linear_h = 0;
 
    // fp16 SMAA output, copied back directly or through RCAS.
    ComPtr<ID3D11Texture2D> tex_smaa_out;
@@ -286,6 +291,7 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameSMAABlendPS = CompileTimeStringHash("SMAA Neighborhood Blending PS");
    static constexpr uint32_t kNameCopyVS = CompileTimeStringHash("Copy VS");
    static constexpr uint32_t kNameSharpenPS = CompileTimeStringHash("MELE Sharpen PS");
+   static constexpr uint32_t kNameSMAALinearizeCS = CompileTimeStringHash("MELE SMAA Linearize CS");
 
    // operator[] default-inserts on a miss, which would mutate a map the render thread otherwise only reads.
    template <typename ShaderMap>
@@ -335,7 +341,7 @@ class MassEffectLE final : public Game
    // (Re)create an fp16 scratch target and its views on resolution change. Pass nullptr for a view the target does
    // not use: bind flags follow the requested views, so an unused one cannot leave a stale flag behind.
    static bool EnsureRGBA16FTarget(ID3D11Device* device, uint32_t w, uint32_t h, ComPtr<ID3D11Texture2D>& tex,
-      ComPtr<ID3D11RenderTargetView>* rtv, ComPtr<ID3D11ShaderResourceView>* srv, uint32_t& cached_w, uint32_t& cached_h)
+      ComPtr<ID3D11RenderTargetView>* rtv, ComPtr<ID3D11ShaderResourceView>* srv, uint32_t& cached_w, uint32_t& cached_h, ComPtr<ID3D11UnorderedAccessView>* uav = nullptr)
    {
       if (!tex || cached_w != w || cached_h != h)
       {
@@ -343,19 +349,23 @@ class MassEffectLE final : public Game
             rtv->reset();
          if (srv != nullptr)
             srv->reset();
+         if (uav != nullptr)
+            uav->reset();
          tex.reset();
-         const UINT bind_flags = (srv != nullptr ? D3D11_BIND_SHADER_RESOURCE : 0u) | (rtv != nullptr ? D3D11_BIND_RENDER_TARGET : 0u);
+         const UINT bind_flags = (srv != nullptr ? D3D11_BIND_SHADER_RESOURCE : 0u) | (rtv != nullptr ? D3D11_BIND_RENDER_TARGET : 0u) | (uav != nullptr ? D3D11_BIND_UNORDERED_ACCESS : 0u);
          if (CreateDefaultRGBA16FTex(device, w, h, bind_flags, tex))
          {
             if (rtv != nullptr)
                device->CreateRenderTargetView(tex.get(), nullptr, rtv->put());
             if (srv != nullptr)
                device->CreateShaderResourceView(tex.get(), nullptr, srv->put());
+            if (uav != nullptr)
+               device->CreateUnorderedAccessView(tex.get(), nullptr, uav->put());
             cached_w = w;
             cached_h = h;
          }
       }
-      return (rtv == nullptr || *rtv) && (srv == nullptr || *srv);
+      return (rtv == nullptr || *rtv) && (srv == nullptr || *srv) && (uav == nullptr || *uav);
    }
 
    static void ReleaseGTAOScratch(MassEffectGameDeviceData& gd)
@@ -403,8 +413,10 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
-      // Core registers SMAA through ENABLE_SMAA; no input linearization is needed because the post buffer stays
-      // gamma encoded. RCAS runs afterwards through Copy VS and DrawCustomPixelShader.
+      // Core registers SMAA through ENABLE_SMAA; its neighborhood blend reads a linear decode of the gamma post buffer.
+      // RCAS runs afterwards through Copy VS and DrawCustomPixelShader.
+      native_shaders_definitions.emplace(kNameSMAALinearizeCS,
+         ShaderDefinition("Luma_MELE_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(kNameSharpenPS,
          ShaderDefinition{"Luma_MELE_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 
@@ -1067,9 +1079,10 @@ public:
          const float pred_scale = depth_ok ? kPredScale : 1.f;
 
          // Async loading and live reload may temporarily require native FXAA fallback.
-         const bool smaa_ready =
-            AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
-            AllShadersReady(device_data.native_vertex_shaders, {kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS});
+         auto* linearize_cs = FindShader(device_data.native_compute_shaders, kNameSMAALinearizeCS);
+         const bool smaa_ready = linearize_cs != nullptr &&
+                                 AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
+                                 AllShadersReady(device_data.native_vertex_shaders, {kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS});
          if (!smaa_ready)
             return DrawOrDispatchOverrideType::None;
 
@@ -1101,11 +1114,23 @@ public:
          if (!EnsureRGBA16FTarget(native_device, w, h, gd.tex_smaa_out, std::addressof(gd.tex_smaa_out_rtv), std::addressof(gd.tex_smaa_out_srv), gd.smaa_out_w, gd.smaa_out_h))
             return DrawOrDispatchOverrideType::None;
 
-         // The gamma snapshot is only ever read.
-         if (!EnsureRGBA16FTarget(native_device, w, h, gd.tex_input, nullptr, std::addressof(gd.srv_input), gd.smaa_temps_w, gd.smaa_temps_h))
+         // The gamma snapshot is only ever read; its linear-light decode feeds the neighborhood blend.
+         if (!EnsureRGBA16FTarget(native_device, w, h, gd.tex_input, nullptr, std::addressof(gd.srv_input), gd.smaa_temps_w, gd.smaa_temps_h) ||
+             !EnsureRGBA16FTarget(native_device, w, h, gd.tex_input_linear, nullptr, std::addressof(gd.srv_input_linear), gd.smaa_linear_w, gd.smaa_linear_h, std::addressof(gd.uav_input_linear)))
             return DrawOrDispatchOverrideType::None;
 
          native_device_context->CopyResource(gd.tex_input.get(), color_res.get());
+         {
+            DrawStateStack<DrawStateStackType::Compute> linearize_state;
+            linearize_state.Cache(native_device_context, device_data.uav_max_count);
+            ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
+            ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
+            native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
+            native_device_context->CSSetShaderResources(0, 1, &lin_srv);
+            native_device_context->CSSetShader(linearize_cs, nullptr, 0);
+            native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            linearize_state.Restore(native_device_context);
+         }
 
          // DrawSMAA restores shaders, resources, and targets, but not cbuffer slots; save VS/PS b1 explicitly.
          ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
@@ -1116,7 +1141,7 @@ public:
          native_device_context->PSSetConstantBuffers(1, 1, &mcb);
 
          DrawSMAA(native_device, native_device_context, device_data,
-            gd.tex_smaa_out_rtv.get(), gd.srv_input.get() /*edge color (gamma)*/, gd.srv_input.get() /*blend color (gamma)*/,
+            gd.tex_smaa_out_rtv.get(), gd.srv_input_linear.get() /*blend color (linear)*/, gd.srv_input.get() /*edge color (gamma)*/,
             depth_ok ? gd.srv_depth.get() : nullptr /*predication*/);
 
          // Apply optional RCAS, otherwise copy SMAA directly so the cancelled resolve always produces output.
@@ -1553,12 +1578,11 @@ public:
                   "\n\nThird Party:"
                   "\nReShade"
                   "\nImGui"
+                  "\nRenoDX (HDR tonemap method)"
+                  "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
-                  "\nAMD FidelityFX (RCAS)"
-                  "\nDICE (HDR tonemapper)"
-                  "\n3Dmigoto"
-                  "\nRenoDX (HDR tonemap method)");
+                  "\nAMD FidelityFX (RCAS)");
    }
 };
 
