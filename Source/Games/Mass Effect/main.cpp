@@ -151,6 +151,10 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // SRV-readable snapshot of the canvas; the chain writes the canvas, so it must sample this copy instead.
    ComPtr<ID3D11Texture2D> tex_input;
    ComPtr<ID3D11ShaderResourceView> srv_input;
+   // Its linear-light decode, for the neighborhood blend.
+   ComPtr<ID3D11Texture2D> tex_input_linear;
+   ComPtr<ID3D11UnorderedAccessView> uav_input_linear;
+   ComPtr<ID3D11ShaderResourceView> srv_input_linear;
    uint32_t smaa_temps_w = 0, smaa_temps_h = 0;
 
    // SMAA predication: srv_scene's alpha turned into an edge-ness mask by the depth-extract CS.
@@ -186,11 +190,14 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       smaa_out_w = smaa_out_h = 0;
    }
 
-   // Turning the feature off must give the address space back: ~66 MB at 4K here, and a stock exe is capped at 2 GB.
+   // Turning the feature off must give the address space back: ~132 MB at 4K here, and a stock exe is capped at 2 GB.
    void ReleaseSMAAScratch()
    {
       srv_input.reset();
       tex_input.reset();
+      uav_input_linear.reset();
+      srv_input_linear.reset();
+      tex_input_linear.reset();
       smaa_temps_w = smaa_temps_h = 0;
       ReleasePredicationScratch();
       ReleaseSharpenScratch();
@@ -587,7 +594,10 @@ public:
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
 #if ENABLE_SMAA
-      // Core auto-registers the 6 SMAA passes. Only the predication CS is ours: scene alpha -> R16F edge-ness in [0,1].
+      // Core auto-registers the 6 SMAA passes. Ours: the linear decode its blend reads, and the predication CS (scene
+      // alpha -> R16F edge-ness in [0,1]).
+      native_shaders_definitions.emplace(CompileTimeStringHash("ME1 SMAA Linearize CS"),
+         ShaderDefinition("Luma_ME1_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("ME1 Depth Extract CS"),
          ShaderDefinition("Luma_ME1_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
       // RCAS PS, drawn via core "Copy VS" + DrawCustomPixelShader.
@@ -705,8 +715,9 @@ public:
          return;
 
       // Shader-readiness gate (async loader / dev live-reload): skip SMAA this frame if anything is missing.
-      const bool smaa_ready =
-         AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) && AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
+      auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("ME1 SMAA Linearize CS"));
+      const bool smaa_ready = linearize_cs != nullptr &&
+                              AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) && AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
       if (!smaa_ready)
          return;
 
@@ -800,17 +811,35 @@ public:
       {
          gd.srv_input.reset();
          gd.tex_input.reset();
-         if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input, cfmt))
+         gd.uav_input_linear.reset();
+         gd.srv_input_linear.reset();
+         if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input, cfmt) &&
+             CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_input_linear, DXGI_FORMAT_R16G16B16A16_FLOAT))
          {
             native_device->CreateShaderResourceView(gd.tex_input.get(), nullptr, gd.srv_input.put());
+            native_device->CreateUnorderedAccessView(gd.tex_input_linear.get(), nullptr, gd.uav_input_linear.put());
+            native_device->CreateShaderResourceView(gd.tex_input_linear.get(), nullptr, gd.srv_input_linear.put());
             gd.smaa_temps_w = w;
             gd.smaa_temps_h = h;
          }
       }
-      if (!gd.srv_input)
+      if (!gd.srv_input || !gd.uav_input_linear || !gd.srv_input_linear)
          return;
 
       native_device_context->CopyResource(gd.tex_input.get(), canvas_res);
+
+      // Linear-light decode of the snapshot for the neighborhood blend (Luma_ME1_SMAALinearize.hlsl).
+      {
+         DrawStateStack<DrawStateStackType::Compute> linearize_state;
+         linearize_state.Cache(native_device_context, device_data.uav_max_count);
+         ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
+         ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
+         native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
+         native_device_context->CSSetShaderResources(0, 1, &lin_srv);
+         native_device_context->CSSetShader(linearize_cs, nullptr, 0);
+         native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+         linearize_state.Restore(native_device_context);
+      }
 
       // Scene alpha -> plane-deviation edge-ness in R16F; Luma_ME1_DepthExtract.hlsl says why it is an edge test, not a
       // rescale.
@@ -867,7 +896,7 @@ public:
       native_device_context->PSSetConstantBuffers(1, 1, &mcb);
 
       // Reading the canvas as the target is safe: the chain samples the snapshot, never the canvas itself.
-      DrawSMAA(native_device, native_device_context, device_data, do_sharpen ? gd.tex_smaa_out_rtv.get() : canvas_rtv, gd.srv_input.get(), gd.srv_input.get(), pred_ok ? gd.srv_pred.get() : nullptr /*predication signal*/);
+      DrawSMAA(native_device, native_device_context, device_data, do_sharpen ? gd.tex_smaa_out_rtv.get() : canvas_rtv, gd.srv_input_linear.get(), gd.srv_input.get(), pred_ok ? gd.srv_pred.get() : nullptr /*predication signal*/);
 
       if (do_sharpen)
       {
@@ -1345,7 +1374,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Mass Effect\" (2007) is developed by DristoforColumb and is open source and free.\n"
-         "It adds native HDR, HDR bloom, SMAA anti-aliasing, and 16x anisotropic filtering.\n"
+         "It adds HDR, HDR bloom, SMAA anti-aliasing, and 16x anisotropic filtering.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -1385,10 +1414,10 @@ public:
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
                   "\nDICE (HDR tonemapper)"
-                  "\nOklab (hue/chroma restoration)"
+                  "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS)"
-                  "\ndgVoodoo2 (DirectX 9 -> 11 wrapper, required)");
+                  "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
    }
 };
 
