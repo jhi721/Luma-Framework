@@ -6,17 +6,19 @@
 #include "../Includes/DICE.hlsl"
 // clang-format on
 
-// The Witcher 2 FINAL GRADE pass (dgVoodoo -> ps_5_0, hash 0xDE5CF9CD): FXAA + the in-game Gamma slider +
-// highlight/shadow tint lerps + vignette, on the full-res fp16 canvas right before the UI draws.
+// The Witcher 2 FINAL GRADE pass (dgVoodoo -> ps_5_0, hash 0xDE5CF9CD), the engine's
+// CEnvFinalColorBalanceParameters: FXAA + shadow offset, midtone power and highlight gain + luma-keyed split
+// toning + vignette, on the full-res fp16 canvas right before the UI draws.
 // Vanilla body transcribed VERBATIM (register-level, constants cb4[N] = DX9 c(N-8)). This is also where the
-// Luma HDR output block lives (expansion + DICE + UI paper-white pre-scale): the vanilla tint lerps weight by
-// SATURATED luma and soft-clip everything above 1.0, so the HDR range dies here unless it is rebuilt after
-// them. The tonemap replacements stay vanilla-only.
+// Luma HDR output block lives (expansion + DICE + UI paper-white pre-scale): the highlight split tone lerps
+// toward a SATURATED luma target and soft-clips everything above 1.0, so the HDR range dies here unless it is
+// rebuilt after it. The tonemap replacements stay vanilla-only.
 //
-// Three permutations, and the only ones that exist: this file (FXAA + vignette), 0xCF3B72A9 with the game's
-// Anti-aliasing off (no FXAA block, scene alpha instead of 0) and 0xBABBFFAD with the vignette stage dropped
-// as well (no t2/s2 mask sample, no cb4[66..67]). The wrappers include this file and select with
-// LUMA_TW2_NO_FXAA_PERM / LUMA_TW2_NO_VIGNETTE_PERM, so the grade tail lives in one place.
+// Four permutations, the engine's 2x2 matrix of FXAA in/out x vignette in/out: this file (FXAA + vignette),
+// 0x058E2498 with the vignette stage dropped (no t2/s2 mask sample, no cb4[66..67]), 0xCF3B72A9 with the game's
+// Anti-aliasing off (no FXAA block, scene alpha instead of 0) and 0xBABBFFAD with both dropped. The wrappers
+// include this file and select with LUMA_TW2_NO_FXAA_PERM / LUMA_TW2_NO_VIGNETTE_PERM, so the grade tail lives
+// in one place. (The four dark-mode permutations are unreachable in the Enhanced Edition, see NOTES.md.)
 #ifndef LUMA_TW2_NO_FXAA_PERM
 #define LUMA_TW2_NO_FXAA_PERM 0
 #endif
@@ -24,7 +26,7 @@
 #define LUMA_TW2_NO_VIGNETTE_PERM 0
 #endif
 
-Texture2D<float4> t0 : register(t0); // scene canvas (full-res fp16, gamma-space, carries >1 Luma HDR range)
+Texture2D<float4> t0 : register(t0); // scene canvas (full-res fp16, LINEAR light: the vMidtone power below encodes it; carries >1 Luma HDR range)
 #if !LUMA_TW2_NO_VIGNETTE_PERM
 Texture2D<float4> t2 : register(t2); // vignette mask
 #endif
@@ -212,38 +214,41 @@ void main(
    }
 #endif // !LUMA_TW2_NO_FXAA_PERM
 
-   // ---- vanilla grade tail (verbatim): desat, gamma slider (log2/exp2 pow), tints, vignette ----
+   // ---- vanilla grade tail (verbatim) = CEnvFinalColorBalanceParameters: shadow offset, midtone power (log2/exp2),
+   // highlight gain, split toning, vignette ----
    float lumaAA = dot(aaColor, float3(0.299, 0.587, 0.114));
-   float3 color = saturate(lumaAA * cb4[62].w) * -cb4[62].rgb + aaColor;
+   float3 color = saturate(lumaAA * cb4[62].w) * -cb4[62].rgb + aaColor; // c54 vShadow: offset, ramped in from black by .w
 
    float3 clamped = max(color, 0.0);
    color.r = DgVoodooLog2(clamped.r);
    color.g = DgVoodooLog2(clamped.g);
    color.b = DgVoodooLog2(clamped.b);
-   color *= cb4[61].rgb; // in-game Gamma slider exponent
+   color *= cb4[61].rgb; // c53 vMidtone: per-channel power exponent, the display encode (measured 1/2.2 at neutral)
    color = exp2(color);
-   color *= cb4[60].rgb; // scale
+   color *= cb4[60].rgb; // c52 vHighlight: gain
 
    float lum = dot(color, float3(0.299, 0.587, 0.114));
 
-   // Highlight tint branch: lerp toward lum * cb4[68].rgb / cb4[70].y, weight sat((1.3 - lum) * cb4[71].x * 4) * cb4[68].w
-   float3 hiTarget = lum * cb4[68].rgb;
-   float hiWeight = saturate((1.3 - lum) * cb4[71].x * 4.0) * cb4[68].w;
-   float3 hiBranch = hiWeight * (hiTarget * DgVoodooRcp(cb4[70].y) - color) + color;
+   // Shadow split tone (c60 vSplitToneShadows, c62 vSplitToneBalance.y, c63 vSplitToneRange.x): lerp toward
+   // lum * cb4[68].rgb / cb4[70].y, weight sat((1.3 - lum) * cb4[71].x * 4) * cb4[68].w
+   float3 shadowToneTarget = lum * cb4[68].rgb;
+   float shadowToneWeight = saturate((1.3 - lum) * cb4[71].x * 4.0) * cb4[68].w;
+   float3 shadowToneBranch = shadowToneWeight * (shadowToneTarget * DgVoodooRcp(cb4[70].y) - color) + color;
 
-   // Shadow tint branch: lerp toward SATURATED lum * cb4[69].rgb / cb4[70].z — the vanilla >1 soft-clip lives here
-   float3 loTarget = saturate(lum) * cb4[69].rgb;
-   float loWeight = saturate((lum + 0.3) * cb4[71].y * 4.0) * cb4[69].w;
-   float3 loBranch = loWeight * (loTarget * DgVoodooRcp(cb4[70].z) - color) + color;
+   // Highlight split tone (c61 vSplitToneHighlights, c62 vSplitToneBalance.z, c63 vSplitToneRange.y): lerp toward
+   // SATURATED lum * cb4[69].rgb / cb4[70].z — the vanilla >1 soft clip lives here
+   float3 highlightToneTarget = saturate(lum) * cb4[69].rgb;
+   float highlightToneWeight = saturate((lum + 0.3) * cb4[71].y * 4.0) * cb4[69].w;
+   float3 highlightToneBranch = highlightToneWeight * (highlightToneTarget * DgVoodooRcp(cb4[70].z) - color) + color;
 
-   // Vanilla: final = lerp(hiBranch, loBranch, sat(lum * cb4[70].x * 5))
+   // Vanilla: final = lerp(shadowToneBranch, highlightToneBranch, sat(lum * cb4[70].x * 5)), c62 vSplitToneBalance.x
    float mixWeight = saturate(lum * cb4[70].x * 5.0);
-   float3 graded = mixWeight * (loBranch - hiBranch) + hiBranch;
+   float3 graded = mixWeight * (highlightToneBranch - shadowToneBranch) + shadowToneBranch;
 
-   // User Color Grading Intensity fades the two tint lerps back toward the untinted grade (the game's
-   // yellow-sepia cast); "color" is already the exact untinted reference, so nothing is recomputed. In the
-   // vanilla tail on purpose, so it applies in SDR too. Side effect: the shadow-tint branch carries vanilla's
-   // saturate(lum) soft-clip, so below 1.0 highlights above white reach a little further in HDR.
+   // User Color Grading Intensity fades the split toning back toward the un-toned grade: "color" is already the
+   // exact reference (offset, power and gain applied, no split tone), so nothing is recomputed. In the vanilla
+   // tail on purpose, so it applies in SDR too. Side effect: the highlight split tone carries vanilla's
+   // saturate(lum) soft clip, so below 1.0 highlights above white reach a little further in HDR.
    [branch] if (LumaSettings.GameSettings.ColorGradingIntensity != 1.0)
        graded = lerp(color, graded, LumaSettings.GameSettings.ColorGradingIntensity);
 
@@ -253,7 +258,7 @@ void main(
    // Vignette Intensity slider has nothing to scale here.
    float3 vanillaColor = graded;
 #else
-   // Vignette
+   // Vignette (c58 vVignetteWeights, c59 vVignetteColor)
    float4 vignette = DgVoodooTexFixup(t2.Sample(s2_s, v7.xy), cb3[48], cb3[49]);
    float vigWeight = saturate(dot(cb4[66], vignette));
    float3 vanillaColor = vigWeight * (cb4[67].rgb - graded) + graded;
@@ -274,16 +279,18 @@ void main(
          const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
 
          // Vanilla highlight emulation (ALWAYS ON — part of the game's look, not a user knob). The vanilla SDR
-         // ceiling was a per-channel clamp at exactly 1.0, and it lived in the ROP, not in any shader: dgVoodoo's
-         // present blit (PS 0x2749AFD8) is a bare "sample_l -> o0" with zero math, and it wrote into an 8-bit
-         // r8g8b8a8 intermediate, so the output merger did the clamping. Luma upgrades that very intermediate to
-         // fp16 (texture_upgrade_formats in main.cpp), which is exactly why the clamp — and with it the vanilla
-         // look — disappears and has to be put back here, in the last pass before that blit. On a bright
-         // saturated source one channel reaches 1.0 first, which both skews the hue toward white (fire ->
-         // yellow-white) AND desaturates it; the shadow-tint branch above adds a partial soft clip of its own.
+         // ceiling was a per-channel clamp at exactly 1.0 in two places: the glow screen blend (0x12931281)
+         // saturates the scene BEFORE this grade, and dgVoodoo's present blit (PS 0x2749AFD8, a bare
+         // "sample_l -> o0") wrote into an 8-bit r8g8b8a8 intermediate, so the output merger clamped again after
+         // it. Luma re-adds the blend's excess in HDR and upgrades that intermediate to fp16
+         // (texture_upgrade_formats in main.cpp), which is exactly why the clamp — and with it the vanilla look —
+         // disappears and has to be put back here, in the last pass before that blit. On a bright saturated
+         // source one channel reaches 1.0 first, which both skews the hue toward white (fire -> yellow-white) AND
+         // desaturates it; the highlight split tone above adds a partial soft clip of its own.
          //
          // REFERENCE = saturate(lin), the vanilla per-channel clip itself: this pass transcribes the whole
-         // vanilla grade, so the real vanilla SDR color is already here and needs no stand-in. A synthetic
+         // vanilla grade, so the vanilla SDR color is already here and needs no stand-in (the pre-grade blend clip
+         // is folded into this post-grade one, an approximation left open in NOTES.md). A synthetic
          // ReinhardPiecewise reference is only the fallback for passes with no vanilla SDR in hand, and it is a
          // poor one here — a ceiling-5 reference recovers ~4% of the needed hue swing on a moderate highlight
          // (G/R 0.347 where vanilla clips to 0.400), leaving fire red.

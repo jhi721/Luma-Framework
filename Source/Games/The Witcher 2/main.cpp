@@ -2,8 +2,9 @@
 //
 // Hashes are the dgVoodoo-TRANSLATED ones and change with every wrapper build: 2.87.3 and 2.81.3 are keyed
 // (2.81.3 emits ps_4_0 for the same passes), any other build needs a re-dump.
-// The post chain is fp16 throughout and the "tonemap" is an adaptive exposure multiply, no curve or clamp.
-// The UI blends src-alpha onto that fp16 scene in gamma space; the main menu draws no tonemap at all.
+// The post chain is fp16 throughout and linear until the final grade's vMidtone power encodes it; the "tonemap" is
+// an adaptive exposure multiply, no curve or clamp. The UI blends src-alpha onto the graded gamma canvas; the main
+// menu draws no tonemap at all.
 // Only ONE Luma .addon, and no other swapchain-hooking ReShade addon: they crash through dgVoodoo.
 
 // The MessageBox is invisible under a borderless/fullscreen game and blocks the loader -> ReShade error 1114.
@@ -25,11 +26,11 @@
 #include "..\..\Core\core.hpp"
 
 // Tonemap ("exposure") permutations, dgVoodoo-translated ps_5_0 hashes.
-static constexpr uint32_t kTonemapAdaptiveNoTint = 0x91348C0F; // DX9 0xC5ADBC35: exposure+scale, alpha passthrough
-static constexpr uint32_t kTonemapAdaptiveTint = 0x00E31BF9;   // DX9 0xF01A691E: + fade/saturation/tint
+static constexpr uint32_t kTonemapExposure = 0x91348C0F;   // DX9 0xC5ADBC35: exposure+scale, alpha passthrough
+static constexpr uint32_t kTonemapBrightPass = 0x00E31BF9; // DX9 0xF01A691E: bloom bright-pass (threshold ramp, saturation, colour)
 // Two static permutations (exposure from PSC_LumRanges) have never been captured; their signature is 1 texture,
 // dp4 cb4[58], min cap cb4[59].x. Not declared as 0: an absent pipeline hash reads as 0 and would match.
-// Final grade (FXAA + gamma + tints + vignette), last pass before UI; hosts the HDR block and the SMAA hook.
+// Final grade (FXAA + colour balance + split toning + vignette), last pass before UI; hosts the HDR block and the SMAA hook.
 static constexpr uint32_t kFinalGrade = 0xDE5CF9CD;
 static constexpr uint32_t kFinalGradeNoAA = 0xCF3B72A9;       // game AA off: no FXAA block, scene alpha passed through
 static constexpr uint32_t kFinalGradeNoVignette = 0xBABBFFAD; // no FXAA and no vignette
@@ -41,14 +42,14 @@ static constexpr uint32_t kFinalGradeAANoVignette = 0x058E2498;
 // Needs SSAO on in the game's video settings.
 static constexpr uint32_t kAOGen = 0x3FEEC0F7;
 // AO pack (t0 = full-res r32_float LINEAR depth, t1 = the AO target): depth-capture fallback for SMAA
-// predication, since it runs every frame while the tonemap capture only fires on the TINT perm.
+// predication, since it runs every frame while the tonemap capture only fires on the BRIGHT-PASS perm.
 static constexpr uint32_t kAOPack = 0x953119B5;
 
 // The same passes as translated by dgVoodoo 2.81.3 (the build that runs under Proton), which emits ps_4_0 and
 // therefore different hashes. Dump-verified as signature-identical to their counterparts above: same
 // interpolators, t/s registers and cb slots, so the replacements and the slot-based captures are shared.
-static constexpr uint32_t kTonemapAdaptiveNoTint_v281 = 0x6CF3E8B7;
-static constexpr uint32_t kTonemapAdaptiveTint_v281 = 0xB293C5B1;
+static constexpr uint32_t kTonemapExposure_v281 = 0x6CF3E8B7;
+static constexpr uint32_t kTonemapBrightPass_v281 = 0xB293C5B1;
 static constexpr uint32_t kFinalGrade_v281 = 0x517DC6D5;
 static constexpr uint32_t kFinalGradeNoAA_v281 = 0xBBFEC706;
 static constexpr uint32_t kFinalGradeNoVignette_v281 = 0x2CA0631E;
@@ -62,7 +63,7 @@ static constexpr uint32_t kAOPack_v281 = 0x495E9133;
 // User settings, persisted in the [Luma] config section (LoadConfigs) unless noted otherwise.
 static bool g_smaa_enable = true;
 static float g_rcas_sharpness = 0.f;   // RCAS sharpen on SMAA output (0 = off)
-static bool g_smaa_predication = true; // SMAA depth predication (r32f depth captured at the tint tonemap or the AO pack pass)
+static bool g_smaa_predication = true; // SMAA depth predication (r32f depth captured at the bright-pass tonemap or the AO pack pass)
 // Plane deviation counted as a full edge, as a fraction of view depth, so it is resolution independent.
 // 0.02 = ~14 cm at the measured 7 m median depth; XeGTAO uses 0.011 and ASSAO 0.040 for the same test.
 static float g_smaa_pred_tolerance = 0.02f;
@@ -116,8 +117,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Buffer> cb_sharpen;
    uint32_t sharpen_w = 0, sharpen_h = 0;
    float sharpen_amount = -1.f;
-   // Full-res r32_float depth, captured at whichever comes first: the TINT tonemap draw (t1) or the AO pack
-   // pass (t0). tex_pred is the R16F edge-ness from the Depth Extract CS, not a depth.
+   // Full-res r32_float depth, captured at whichever comes first: the BRIGHT-PASS tonemap draw (t1) or the AO
+   // pack pass (t0). tex_pred is the R16F edge-ness from the Depth Extract CS, not a depth.
    ComPtr<ID3D11ShaderResourceView> srv_scene_depth;
    ComPtr<ID3D11Texture2D> tex_pred;
    ComPtr<ID3D11UnorderedAccessView> uav_pred;
@@ -146,6 +147,24 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Buffer> cb_gtao; // knobs + viewport (kGTAOKnobsCBSlot), immutable, recreated on change
    float gtao_cb_fvp = -1.f, gtao_cb_depth_scale = -1.f, gtao_cb_radius = -1.f, gtao_cb_debug = -1.f;
    uint32_t gtao_cb_w = 0, gtao_cb_h = 0;
+
+#if DEVELOPMENT
+   // ---- Vanilla constant logger (see LogVanillaGrade / LogVanillaTonemap) ----
+   // Staging copies are mapped a frame later without waiting, so the render thread never stalls.
+   struct ConstantCapture
+   {
+      ComPtr<ID3D11Buffer> staging;
+      UINT bytes = 0;
+      bool copy_pending = false;
+   };
+   ConstantCapture grade_cb;
+   ConstantCapture tonemap_cb;
+   ComPtr<ID3D11Texture2D> adaptation_staging; // 1x1 copy of the exposure pass's sLumFinal
+   bool adaptation_copy_pending = false;
+   std::string last_grade_line;
+   std::string last_tonemap_line;
+   uint32_t frame_counter = 0;
+#endif
 
    void ReleaseGTAOScratch()
    {
@@ -216,8 +235,154 @@ class TheWitcher2Game final : public Game
 
    static bool IsTonemap(const ShaderHashesList<OneShaderPerPipeline>& shader_hashes)
    {
-      return ContainsPixelShader(shader_hashes, kTonemapAdaptiveNoTint, kTonemapAdaptiveNoTint_v281) || ContainsPixelShader(shader_hashes, kTonemapAdaptiveTint, kTonemapAdaptiveTint_v281);
+      return ContainsPixelShader(shader_hashes, kTonemapExposure, kTonemapExposure_v281) || ContainsPixelShader(shader_hashes, kTonemapBrightPass, kTonemapBrightPass_v281);
    }
+
+#if DEVELOPMENT
+   // Another process can own ReShade.log (the BL2 launcher precedent), so every line also goes to our own file
+   // beside the exe.
+   static void LogVanillaLine(const std::string& line)
+   {
+      reshade::log::message(reshade::log::level::info, line.c_str());
+      std::ofstream file("Luma-TW2.log", std::ios::app);
+      if (file)
+         file << line << std::endl;
+   }
+
+   // Copy the pass's PS cb4 and hand back `row_count` rows of it, one frame late (the BL2 CaptureConstantRows path).
+   // False = nothing to read yet, normal on the first calls.
+   static bool CaptureConstantRows(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, TheWitcher2GameDeviceData::ConstantCapture& capture, uint32_t first_row, uint32_t row_count, float* out)
+   {
+      ComPtr<ID3D11Buffer> cb;
+      native_device_context->PSGetConstantBuffers(4, 1, cb.put());
+      if (!cb)
+         return false;
+      D3D11_BUFFER_DESC bd = {};
+      cb->GetDesc(&bd);
+      if (bd.ByteWidth < (first_row + row_count) * 16)
+         return false;
+
+      if (capture.bytes != bd.ByteWidth)
+      {
+         D3D11_BUFFER_DESC sd = {};
+         sd.ByteWidth = bd.ByteWidth;
+         sd.Usage = D3D11_USAGE_STAGING;
+         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+         capture.staging.reset();
+         capture.copy_pending = false;
+         if (FAILED(native_device->CreateBuffer(&sd, nullptr, capture.staging.put())) || !capture.staging)
+         {
+            capture.bytes = 0;
+            return false;
+         }
+         capture.bytes = bd.ByteWidth;
+      }
+
+      bool have_rows = false;
+      if (capture.copy_pending)
+      {
+         D3D11_MAPPED_SUBRESOURCE mapped = {};
+         if (SUCCEEDED(native_device_context->Map(capture.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) && mapped.pData != nullptr)
+         {
+            std::memcpy(out, (const uint8_t*)mapped.pData + (size_t)first_row * 16, (size_t)row_count * 16);
+            native_device_context->Unmap(capture.staging.get(), 0);
+            capture.copy_pending = false;
+            have_rows = true;
+         }
+      }
+      if (!capture.copy_pending)
+      {
+         native_device_context->CopyResource(capture.staging.get(), cb.get());
+         capture.copy_pending = true;
+      }
+      return have_rows;
+   }
+
+   // CEnvFinalColorBalanceParameters at the final grade (cb4[60..71] = DX9 c52..c63), logged whenever a value changes.
+   // vMidtone should sit near 1/2.2: it is the only power stage between the linear lighting and the gamma-space UI.
+   static void LogVanillaGrade(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, TheWitcher2GameDeviceData& gd)
+   {
+      if ((gd.frame_counter & 15u) != 0u)
+         return;
+      float r[12 * 4] = {};
+      if (!CaptureConstantRows(native_device, native_device_context, gd.grade_cb, 60, 12, r))
+         return;
+      const auto row = [&r](uint32_t cb4_index)
+      {
+         const float* v = &r[(cb4_index - 60) * 4];
+         return std::format("({:.4f}, {:.4f}, {:.4f}, {:.4f})", v[0], v[1], v[2], v[3]);
+      };
+      std::string line = std::format("[TW2-Grade] vHighlight={} vMidtone={} vShadow={} vVignetteWeights={} vVignetteColor={} vSplitToneShadows={} vSplitToneHighlights={} vSplitToneBalance={} vSplitToneRange={}",
+         row(60), row(61), row(62), row(66), row(67), row(68), row(69), row(70), row(71));
+      if (line == gd.last_grade_line)
+         return;
+      LogVanillaLine(std::format("{} frame={}", line, gd.frame_counter));
+      gd.last_grade_line = std::move(line);
+   }
+
+   // The exposure pass at its main draw: PSC_LumWeights and PSC_LumRanges2 (cb4[58..59]) whenever they change, and the
+   // 1x1 adaptation texel at t1 every 120 frames, which holds (black, white, gain = 1 / max(white - black, 0.01)).
+   static void LogVanillaTonemap(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, TheWitcher2GameDeviceData& gd)
+   {
+      if ((gd.frame_counter % 120u) != 0u)
+         return;
+      float r[2 * 4] = {};
+      if (CaptureConstantRows(native_device, native_device_context, gd.tonemap_cb, 58, 2, r))
+      {
+         std::string line = std::format("[TW2-Tonemap] PSC_LumWeights=({:.4f}, {:.4f}, {:.4f}, {:.4f}) PSC_LumRanges2=({:.4f}, {:.4f}, {:.4f}, {:.4f})", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+         if (line != gd.last_tonemap_line)
+         {
+            LogVanillaLine(std::format("{} frame={}", line, gd.frame_counter));
+            gd.last_tonemap_line = std::move(line);
+         }
+      }
+
+      // Validated on every call, not once: anything but a 1x1 fp16 texel would decode as garbage.
+      ComPtr<ID3D11ShaderResourceView> srv;
+      native_device_context->PSGetShaderResources(1, 1, srv.put());
+      if (!srv)
+         return;
+      ComPtr<ID3D11Resource> res;
+      srv->GetResource(res.put());
+      ComPtr<ID3D11Texture2D> tex;
+      if (!res || FAILED(res->QueryInterface(tex.put())))
+         return;
+      D3D11_TEXTURE2D_DESC td = {};
+      tex->GetDesc(&td);
+      if (td.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || td.Width != 1 || td.Height != 1)
+         return;
+
+      if (gd.adaptation_copy_pending)
+      {
+         D3D11_MAPPED_SUBRESOURCE mapped = {};
+         if (SUCCEEDED(native_device_context->Map(gd.adaptation_staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) && mapped.pData != nullptr)
+         {
+            const uint16_t* texel = static_cast<const uint16_t*>(mapped.pData);
+            LogVanillaLine(std::format("[TW2-Adaptation] black={:.5f} white={:.5f} gain={:.5f} frame={}", DirectX::PackedVector::XMConvertHalfToFloat(texel[0]),
+               DirectX::PackedVector::XMConvertHalfToFloat(texel[1]), DirectX::PackedVector::XMConvertHalfToFloat(texel[2]), gd.frame_counter));
+            native_device_context->Unmap(gd.adaptation_staging.get(), 0);
+            gd.adaptation_copy_pending = false;
+         }
+      }
+      if (!gd.adaptation_copy_pending)
+      {
+         if (!gd.adaptation_staging)
+         {
+            D3D11_TEXTURE2D_DESC sd = td;
+            sd.MipLevels = 1;
+            sd.ArraySize = 1;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sd.MiscFlags = 0;
+            if (FAILED(native_device->CreateTexture2D(&sd, nullptr, gd.adaptation_staging.put())))
+               return;
+         }
+         native_device_context->CopySubresourceRegion(gd.adaptation_staging.get(), 0, 0, 0, 0, tex.get(), 0, nullptr);
+         gd.adaptation_copy_pending = true;
+      }
+   }
+#endif
 
    // Named injected shaders live in unordered_maps the render thread otherwise only reads: look them up with
    // "find" (operator[] would default-insert on a miss and mutate a map DrawSMAA reads concurrently).
@@ -783,8 +948,9 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
-      // DX9-era gamma-2.2 SDR: post buffers stay GAMMA so the gamma-SDR HUD blends like vanilla. The final
-      // grade pre-scales by GamePaperWhite/UIPaperWhite (UI_DRAW_TYPE 2) so the HUD lands at its own level.
+      // DX9-era gamma-2.2 SDR: the scene is linear until the final grade's vMidtone power encodes it (1/2.2 in the
+      // neutral environment), so the canvas the HUD blends onto is GAMMA, like vanilla. The final grade pre-scales by
+      // GamePaperWhite/UIPaperWhite (UI_DRAW_TYPE 2) so the HUD lands at its own level.
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0');
       GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('1'); // Gamma 2.2 in and out
@@ -813,7 +979,7 @@ public:
       default_luma_global_game_settings.HighlightsHueStrength = 0.8f; // hue adoption; never 1.0 — a fully clipped reference is achromatic (see the shader)
       default_luma_global_game_settings.Contrast = 1.f;               // slope contrast around 18% mid-gray (HDR path)
       default_luma_global_game_settings.BloomIntensity = 1.f;         // engine glow scale (0 = no halo around lights)
-      default_luma_global_game_settings.ColorGradingIntensity = 1.f;  // vanilla highlight/shadow tint strength (0 = untinted grade)
+      default_luma_global_game_settings.ColorGradingIntensity = 1.f;  // vanilla shadow/highlight split toning strength (0 = no split toning)
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
 #if ENABLE_SMAA
@@ -902,10 +1068,15 @@ public:
             device_data.has_drawn_main_post_processing = true;
          }
 
+#if DEVELOPMENT
+         if (is_main && ContainsPixelShader(original_shader_hashes, kTonemapExposure, kTonemapExposure_v281))
+            LogVanillaTonemap(native_device, native_device_context, game_device_data);
+#endif
+
 #if ENABLE_SMAA
-         // The tint perm binds the full-res r32_float depth at t1 (declared-but-unused there); capture it for
+         // The bright-pass perm binds the full-res r32_float depth at t1 (declared-but-unused there); capture it for
          // SMAA predication. Bindings are read regardless of the pass being hash-replaced.
-         if (ContainsPixelShader(original_shader_hashes, kTonemapAdaptiveTint, kTonemapAdaptiveTint_v281))
+         if (ContainsPixelShader(original_shader_hashes, kTonemapBrightPass, kTonemapBrightPass_v281))
          {
             game_device_data.srv_scene_depth = nullptr;
             native_device_context->PSGetShaderResources(1, 1, game_device_data.srv_scene_depth.put());
@@ -922,6 +1093,9 @@ public:
       {
          // CustomData2 = SMAA active, which makes the grade skip its built-in FXAA.
          game_device_data.final_grade_fired_this_frame = true; // opens the Hide UI window for the rest of the frame
+#if DEVELOPMENT
+         LogVanillaGrade(native_device, native_device_context, game_device_data);
+#endif
 
          const uint32_t smaa_active = g_smaa_enable ? 1u : 0u;
 
@@ -957,7 +1131,7 @@ public:
       if (ContainsPixelShader(original_shader_hashes, kAOPack, kAOPack_v281))
       {
          // Fallback depth capture: the AO pack pass binds the same r32_float depth at t0 every frame, while
-         // the tonemap capture only fires on the TINT perm. First capture of the frame wins, same buffer.
+         // the tonemap capture only fires on the BRIGHT-PASS perm. First capture of the frame wins, same buffer.
          if (g_smaa_predication && !game_device_data.srv_scene_depth)
          {
             native_device_context->PSGetShaderResources(0, 1, game_device_data.srv_scene_depth.put());
@@ -977,6 +1151,9 @@ public:
       // Menu/loading frames run no tonemap: "has_drawn_main_post_processing" stays false there so the core
       // display composition treats the frame as plain SDR UI at UIPaperWhite (do NOT force it here).
       game_device_data.final_grade_fired_this_frame = false; // re-arm the Hide UI window for the next frame
+#if DEVELOPMENT
+      game_device_data.frame_counter++;
+#endif
 
       // Give the scratch back when a feature is switched off; it is all lazily recreated. Predication and the
       // RCAS intermediate are separate because either can be off while SMAA runs.
@@ -1069,7 +1246,7 @@ public:
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
       }
 
-      // Not HDR-gated: the tint lerps this fades live in the vanilla grade tail, so it applies in SDR as well.
+      // Not HDR-gated: the split toning this fades lives in the vanilla grade tail, so it applies in SDR as well.
       if (ImGui::SliderFloat("Color Grading Intensity", &gs.ColorGradingIntensity, 0.f, 1.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())

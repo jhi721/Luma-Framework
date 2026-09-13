@@ -15,7 +15,7 @@
 #include "Includes/Common.hlsl" // game-local: LumaSettings (DisplayMode gates the HDR-only excess restore)
 
 Texture2D<float4> t0 : register(t0); // light-shaft / glow source
-Texture2D<float4> t1 : register(t1); // scene canvas (fp16, gamma-space; carries Luma HDR range > 1)
+Texture2D<float4> t1 : register(t1); // scene canvas (fp16, linear light ahead of the final grade; carries Luma HDR range > 1)
 
 SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
@@ -68,8 +68,8 @@ void main(
    // Undo the (1 - shaftPart) damping on the part of the canvas that sits above 1: vanilla sinks HDR
    // highlights by up to ~30% wherever god rays overlap them. Identity for any canvas <= 1.
    // HDR display path only. The SDR one has to see what vanilla produced, and not because the composition
-   // clips later anyway: this pass runs BEFORE the final grade, whose saturated-luma tint weights and
-   // per-channel gamma pow react non-linearly to an above-1 input, so the excess would move graded values
+   // clips later anyway: this pass runs BEFORE the final grade, whose luma-keyed split toning and per-channel
+   // vMidtone power react non-linearly to an above-1 input, so the excess would move graded values
    // that end up BELOW 1 as well. "== 1" also keeps the dev "SDR on HDR" mode honest — composition only
    // clamps for DisplayMode 0, so there the excess would never be clipped downstream either.
    [branch] if (LumaSettings.DisplayMode == 1)

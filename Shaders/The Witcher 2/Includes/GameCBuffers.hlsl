@@ -29,7 +29,7 @@ struct LumaGameSettings
    float HighlightsHueStrength; // 0.8 shipped
    float Contrast;              // 1 = vanilla. Multiplicative contrast around 18% mid-gray, applied before the display map. HDR display path only
    float BloomIntensity;        // 1 = vanilla, 0 = none. Scales the engine's glow where it enters the screen blend (SDR + HDR)
-   float ColorGradingIntensity; // 1 = vanilla, 0 = no tint. Fades the vanilla highlight/shadow tint lerps out of the grade (SDR + HDR)
+   float ColorGradingIntensity; // 1 = vanilla, 0 = no split toning. Fades the vanilla shadow/highlight split toning out of the grade (SDR + HDR)
 };
 
 // Define the game specific cbuffer (instance/pass) data here
