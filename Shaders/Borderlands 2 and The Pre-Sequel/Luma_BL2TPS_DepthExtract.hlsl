@@ -1,24 +1,18 @@
 // Borderlands 2 / The Pre-Sequel — SMAA predication signal, ported from Medal of Honor: Airborne (which took it
-// from The Witcher 2). Neither game exposes a depth buffer under dgVoodoo, but UE3 packs LINEAR view-space depth in
-// the ALPHA of the fp16 scene colour, already captured in main.cpp at the tonemap draw.
+// from The Witcher 2). No depth buffer under dgVoodoo, but UE3 packs LINEAR view-space depth in the ALPHA of the fp16
+// scene colour, captured in main.cpp at the tonemap draw. Rescaling that depth cannot work: SMAA's predication is a
+// plain first difference between adjacent pixels, and on linear depth a plane's own per-pixel change grows as z^2, so
+// a distant floor seen edge-on moves more than a near silhouette and no remap or threshold fixes that ratio.
 //
-// This measures deviation from the local tangent plane, NOT a rescale of depth. Rescaling cannot work: SMAA's
-// predication is a plain first difference between adjacent pixels, and on linear depth a plane's own per-pixel
-// change grows as z^2, so a distant floor seen edge-on moves more between neighbours than a nearby silhouette
-// does - no monotonic remap of z and no threshold fixes that ratio. The earlier BL2 signal was exactly such a
-// remap (z/(z+k)) and failed in both directions: it fired on grazing ground at distance and missed near
-// silhouettes whose absolute depth step is small.
+// This measures deviation from the local tangent plane instead: a slope-adjusted second difference with a
+// depth-proportional tolerance, the same math as XeGTAO_CalculateEdges (SVGF, Schied et al. 2017; Emil Persson 2009).
+// Output is one-sided (LEFT and TOP only), because SMAA compares centre-vs-left and centre-vs-top; a symmetric mask
+// would read 1 on both sides of a silhouette and difference to 0 exactly where predication must fire. Normalizing by
+// centreZ makes it a unitless edge-ness in [0,1], so SMAA_PREDICATION_THRESHOLD is simply 0.5 whatever the scale, FOV
+// or resolution - tune P.x, not it.
 //
-// The math is a slope-adjusted second difference with a depth-proportional tolerance, the same as
-// XeGTAO_CalculateEdges (SVGF, Schied et al. 2017; Emil Persson 2009). Output is one-sided, against the LEFT and
-// TOP neighbours only, because SMAA compares centre-vs-left on one axis and centre-vs-top on the other; a
-// symmetric mask would read 1 on both sides of a silhouette and difference to 0 exactly where predication must
-// fire. Normalizing by centreZ makes it a unitless edge-ness in [0,1], so SMAA_PREDICATION_THRESHOLD is simply 0.5
-// whatever the scale, FOV or resolution - tune P.x, not it.
-//
-// DIFFERENCE FROM MoH: the sign. There the alpha is positive depth; here geometry carries NEGATIVE view z and
-// sky/invalid is a >= 0 (the +65472 far sentinel, measured). So each tap is mapped through DepthFromAlpha below,
-// which also pins sky far away so foreground silhouettes against it register a full edge.
+// DIFFERENCE FROM MoH: the sign. Geometry carries NEGATIVE view z here and sky/invalid is a >= 0 (the +65472 far
+// sentinel, measured), so each tap goes through DepthFromAlpha, which also pins sky far away.
 
 Texture2D<float4> scene : register(t0); // fp16 scene colour; .a = view-space Z (negative for geometry)
 RWTexture2D<float> uav : register(u0);  // R16_FLOAT predication signal (0 = on the local plane, 1 = edge)

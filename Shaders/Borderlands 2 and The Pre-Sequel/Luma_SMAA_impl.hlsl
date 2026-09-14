@@ -68,7 +68,7 @@ void smaa_edge_detection_vs(uint id : SV_VertexID, out float4 position : SV_Posi
 
 float2 smaa_edge_detection_ps(float4 position : SV_Position, float2 texcoord : TEXCOORD0, float4 offset[3] : TEXCOORD1) : SV_Target
 {
-   // tex0 = colorTexGamma (gamma-encoded scene color)
+   // tex0 = colorTexGamma (the gamma-encoded LDR snapshot)
    // tex1 = predicationTex (plane-deviation edge-ness; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
    return SMAAColorEdgeDetectionPS(texcoord, offset, tex0, tex1);
 }
@@ -95,13 +95,10 @@ void smaa_neighborhood_blending_vs(uint id : SV_VertexID, out float4 position : 
 
 float4 smaa_neighborhood_blending_ps(float4 position : SV_Position, float2 texcoord : TEXCOORD0, float4 offset : TEXCOORD1) : SV_Target
 {
-   // tex0 = colorTex, the LINEAR decode of the LDR (Luma_BL2TPS_SMAALinearize); tex1 = blendTex. The pass averages
-   // a pixel with its neighbour through the hardware bilinear, which is only correct on linear light, so re-encode
-   // the result here to the tonemap's own gamma 2.2 (its linear_to_gamma, DefaultGamma with no CUSTOM_SDR_GAMMA).
-   // Encoded with the tonemap's own helper so both sides move together if DefaultGamma ever does. GCT_MIRROR mirrors
-   // the decode, so the dither's negative half at black comes back out unclamped. Exactly one encode: the RTV is a
-   // plain UNORM/float view, never an SRGB one. Alpha carries nothing (the tonemap writes o0.w = 0), so it is left as
-   // the blend produced it. No HDR tail.
+   // tex0 = colorTex, the LINEAR decode of the LDR (Luma_BL2TPS_SMAALinearize says why); tex1 = blendTex. Re-encode
+   // with the tonemap's own linear_to_gamma, so both sides move together if DefaultGamma ever does; GCT_MIRROR brings
+   // the dither's negative half at black back out unclamped. One encode only: the RTV is never an SRGB view. Alpha
+   // is left as the blend produced it (the tonemap writes o0.w = 0). No HDR tail.
    float4 color = SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1);
    color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
    return color;

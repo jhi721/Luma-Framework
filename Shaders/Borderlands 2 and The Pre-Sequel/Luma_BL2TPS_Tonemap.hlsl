@@ -21,10 +21,8 @@
 // per-channel hue, saturation, tint and its own highlight whitening. A separate unbounded continuation of the
 // measured K=0 response (W*c in linear light) passes through a reversible bounded copy of the real LUT to obtain
 // HDR luminance, and ONLY that luminance is projected onto the native graded RGB ratios. DICE performs the only
-// final display rolloff. SDR executes none of the reconstruction; the native ImageAdjustments + LUT
-// arithmetic and the SDR output branch are unchanged by it. (That is not the same as claiming the SDR
-// image is vanilla: the user Exposure, Bloom and Vignette controls above still act on the scene, and
-// Luma's pyramidal bloom is on by default.)
+// final display rolloff. SDR executes none of the reconstruction (its scene still gets the user Exposure, Bloom
+// and Vignette controls, and Luma's pyramidal bloom is on by default).
 //
 // This is NOT inverse tonemapping, NOT hue restoration from the raw scene, and NOT MELE family 05's hard-clip
 // treatment: no path anywhere takes chroma from the working value.
@@ -35,7 +33,7 @@
 // dgVoodoo maps DX9 sampler sN 1:1 onto DX11 tN. TPS inserts a LightShaftTexture at slot 1, shifting bloom/vignette/
 // LUT/DOF down one (DX9: BL2 tonemap_0x54ED86A0 LUT@s3/DOF@s4; TPS tps_tonemap_0xF8997849 lightshaft@s1/LUT@s4/DOF@s5).
 // The grade math is identical, so the body is shared: the TPS wrapper #defines these macros, BL2 leaves them at the
-// identity below and stays byte-for-byte unchanged.
+// identity below.
 #ifndef TM_T_BLOOM
 #define TM_T_BLOOM     t1 // FilterColor1Texture (screen-blend bloom)
 #define TM_T_VIGNETTE  t2 // VignetteTexture
@@ -222,8 +220,7 @@ bool BL2TPS_TryBuildWorkingLuminance(float3 curveInput, out float targetLuminanc
    // do its job, which is a failure rather than something to clamp quietly.
    // workLinear is non-negative and q is tested positive, so the proxy cannot be negative; only its
    // ceiling is still open. A bad q needs no separate test either: -INF and negatives fail q <= 0,
-   // +INF fails q > 1, and a NaN q poisons every proxy channel, which then fails the range test -
-   // all(x <= limit) rejects NaN where the old max3(x) > limit relied on max's NaN behaviour.
+   // +INF fails q > 1, and a NaN q poisons every proxy channel, which then fails all(x <= limit).
    const float3 proxyLinear = workLinear * q;
    if (q <= 0.0 || q > 1.0 || !all(proxyLinear <= 1.0 + BL2TPS_HDR_PROXY_EPS))
    {
@@ -291,11 +288,10 @@ float3 BL2TPS_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetL
    // below, and the function then returns that same black.
    if (targetLuminance == 0.0)
    {
-      return float3(0.0, 0.0, 0.0); // The grade produced that black.
+      return float3(0.0, 0.0, 0.0);
    }
    // The reference is already proven finite and non-negative, so its BT.709 luminance cannot be
-   // negative; the floor and an overflow ceiling are the whole test. Note the !(lo && hi) shape - the
-   // inverted form would accept a NaN, because NaN fails both ordered comparisons.
+   // negative; the floor and an overflow ceiling are the whole test, in the !(lo && hi) shape.
    const float referenceLuminance = GetLuminance(nativeReferenceLinear, CS_BT709);
    if (!(referenceLuminance >= BL2TPS_NATIVE_COLOR_MIN_LUMINANCE && referenceLuminance <= FLT_MAX))
    {
@@ -375,8 +371,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    // User Exposure (scene-referred, pre-grade; 1 = vanilla). Applies to both SDR and HDR — the grade below tracks it.
    hdrColor *= LumaSettings.GameSettings.Exposure;
 
-   // The grade runs on the NATIVE scene like vanilla; the HDR reconstruction is a separate branch off this same
-   // value, and it changes only the luminance of the graded result. As in MELE.
+   // The grade runs on the NATIVE scene like vanilla; the HDR reconstruction branches off it after the vignette.
    r0.xyz = hdrColor;
 
    // --- vignette (verbatim) ---
@@ -436,9 +431,8 @@ float4 RunTonemap(float4 v5, float4 v6)
    o.xyz = r0.x * r0.yzw + r1.xyz;
 
    // ====================== Luma HDR output ======================
-   // o.rgb is the graded look in gamma space, produced from the NATIVE scene, and it is the COMPLETE colour
-   // reference: hue, saturation, per-channel tint, the LUT's grading and the game's own highlight whitening all
-   // live in it. HDR replaces its luminance and nothing else. SDR presents it untouched.
+   // o.rgb is the native graded look in gamma space and the COMPLETE colour reference (see the file header): HDR
+   // replaces its luminance and nothing else, SDR presents it untouched.
    float3 gradedSdrGamma = o.rgb;
    float3 sdrLinear = gamma_to_linear(gradedSdrGamma, GCT_MIRROR);
 
@@ -463,7 +457,7 @@ float4 RunTonemap(float4 v5, float4 v6)
       // --- User HDR grade (HDR display path only; defaults are vanilla no-ops) ---
       // Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
       // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
-      // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code 0.5).
+      // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (gamma code ~0.46).
       // [branch] on a cbuffer uniform: at the 1.0 default this must be a BIT-EXACT no-op. The pow is spelled out with a
       // floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
       [branch] if (LumaSettings.GameSettings.Contrast != 1.0)

@@ -1,18 +1,10 @@
 // Borderlands 2 / The Pre-Sequel — linear-light copy of the post-tonemap LDR, for SMAA's neighborhood blend.
-//
-// SMAA detects edges on the ENCODED signal, the domain its thresholds are tuned in, but the third pass AVERAGES
-// colour and that average only means anything in linear light. It cannot decode after sampling: the blend mixes a
-// pixel with its neighbour by sampling at a fractional coordinate and letting the hardware bilinear do the mixing
-// (SMAA.hlsl "We exploit bilinear filtering"), so by the time the shader sees a value the average over encoded
-// values has already happened. Hence this pass - decode once, up front, into the texture that feeds only that pass.
-//
-// The encoding is the tonemap's own: plain gamma 2.2, NOT sRGB - which is why no hardware SRGB view can stand in
-// for this. It is decoded with the same shared helper the tonemap encodes with (linear_to_gamma there, this its
-// inverse), so the exponent is DefaultGamma on both sides and cannot drift if this game ever sets a custom one.
-// GCT_MIRROR, as in the sibling mods: the dither the tonemap applies after its encode can undershoot black by up to
-// one output step, and mirroring carries that negative half through the decode, the blend and the re-encode instead
-// of clamping it (dither is the final colour op), without pow() ever seeing a negative base. Alpha carries nothing
-// (the tonemap writes o0.w = 0) and is passed through untouched.
+// Edges are detected on the ENCODED signal (the domain SMAA's thresholds are tuned in), but the blend AVERAGES through
+// the hardware bilinear (SMAA.hlsl "We exploit bilinear filtering"), so it needs linear input up front: decoding after
+// the sample would average encoded values. The encoding is the tonemap's plain gamma 2.2, NOT sRGB, so no SRGB view can
+// stand in; the same shared helper decodes it, keeping DefaultGamma in step on both sides. GCT_MIRROR, as in the
+// sibling mods: the tonemap's dither can undershoot black by up to one output step, and the mirror carries that
+// negative half through the blend and the re-encode instead of clamping it. Alpha passes through untouched.
 #include "../Includes/Color.hlsl"
 
 Texture2D<float4> encoded : register(t0); // post-tonemap LDR snapshot (gamma 2.2)

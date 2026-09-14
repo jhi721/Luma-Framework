@@ -1,16 +1,16 @@
 // Borderlands 2 + The Pre-Sequel — Luma HDR + SMAA mod (Unreal Engine 3, native DX9 -> D3D11 via dgVoodoo2).
 //
-// dgVoodoo2 translates SM3.0 to ps_5_0, so CSO hashes differ from the native DX9 ones. Launch the game exe
-// DIRECTLY: XNA Launcher.exe also loads d3d9 and would capture ReShade instead of the game.
+// dgVoodoo2 translates SM3.0 to ps_5_0 (ps_4_0 under 2.81.3), so CSO hashes differ from the native DX9 ones. Launch
+// the game exe DIRECTLY: XNA Launcher.exe also loads d3d9 and would capture ReShade instead of the game.
 // One shared addon serves both games, discriminated by the tonemap hash:
 // - TONEMAP PS 0xD00AA2A7 (BL2) / 0xFCFE623E (TPS): scene fp16 + bloom + vignette + LUT + DOF -> 8-bit LDR.
-//   Replaced to recover HDR; the UI composites AFTER, on the LDR.
+//   Replaced to recover HDR; the HUD draws after it (onto the LDR on BL2, onto a post-FXAA buffer on TPS).
 // - FXAA PS 0x0D3001F6 (only with in-game AA on) -> cancelled while SMAA is on (see the FXAA override): dropped on
 //   BL2, where it runs pre-tonemap into a buffer nothing samples, and reduced to a plain copy on TPS, where it runs
 //   post-tonemap into the buffer the HUD then draws onto. SMAA itself is injected post-tonemap, so it neither
 //   depends on the game's AA setting nor perturbs the DoF.
-// All SDR/gamma space. Only ONE Luma .addon, and no other swapchain-hooking ReShade addon: they crash through
-// dgVoodoo.
+// Post buffers stay gamma-space SDR. Only ONE Luma .addon per game folder, and no other HDR mod (e.g. RenoDX)
+// alongside it.
 
 // Don't pop the DEVELOPMENT auto-debugger MessageBox on DLL attach: under a borderless/fullscreen game it's
 // invisible and blocks the loader (ReShade times out the addon load -> error 1114).
@@ -30,7 +30,7 @@
 // the draw override); also used by Hide UI to keep this opaque pass out of the HUD filter.
 static constexpr uint32_t kFXAAResolveHash = 0x0D3001F6;
 static constexpr uint32_t kTonemapHash = 0xD00AA2A7;    // BL2: writes the LDR buffer the HUD then draws onto
-static constexpr uint32_t kTonemapHashTPS = 0xFCFE623E; // The Pre-Sequel: same engine, different tonemap CSO (one addon serves both)
+static constexpr uint32_t kTonemapHashTPS = 0xFCFE623E; // The Pre-Sequel: same engine, different tonemap CSO
 
 // dgVoodoo 2.81.3 emits ps_4_0 where 2.87.3 emits ps_5_0, so the SAME shaders hash differently; the Is* helpers
 // below match both. FXAA/video/icon are byte-shared between BL2 and TPS, so one 2.81.3 hash each covers both.
@@ -45,7 +45,7 @@ static constexpr uint32_t kBloomBrightPassHash = 0x997ACB8E;      // dgVoodoo 2.
 static constexpr uint32_t kBloomBrightPassHash_v281 = 0x5605F6C2; // dgVoodoo 2.81.3 (ps_4_0)
 
 // Luma-injected SRV slots on the tonemap. No compile-time link to the shader register macros in
-// Tonemap_0xD00AA2A7.ps_5_0.hlsl (BL2) and Tonemap_0xFCFE623E.ps_5_0.hlsl (TPS), so keep them in sync:
+// Luma_BL2TPS_Tonemap.hlsl (BL2 default) and Tonemap_0xFCFE623E.ps_5_0.hlsl (TPS), so keep them in sync:
 //   bloom -> TM_T_LUMABLOOM : BL2 t5 / TPS t8 (TPS t5 is the native DOF)
 static constexpr uint32_t kLumaBloomSlotBL2 = 5;
 static constexpr uint32_t kLumaBloomSlotTPS = 8;
@@ -164,11 +164,11 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    // Resource the tonemap renders to; on BL2 the HUD draws onto it afterwards. Used by Hide UI and the FXAA override.
    uint64_t ldr_buffer_handle = 0;
    // Set when the tonemap runs, cleared every Present: scopes Hide UI's alpha-blend skip to the post-tonemap
-   // span of THIS frame (so next frame's pre-tonemap transparents aren't dropped). See the Hide HUD block.
+   // span of THIS frame (so next frame's pre-tonemap transparents aren't dropped). See the Hide UI block in OnDrawOrDispatch.
    bool tonemap_fired_this_frame = false;
 
-   // SMAA depth predication. Scene-color SRV (depth packed in .a) captured at the tonemap, + the single-channel
-   // (R16F) plane-deviation edge-ness the BL2TPS Depth Extract CS builds from it.
+   // SMAA depth predication. Scene-color SRV (depth packed in .a) captured at the tonemap, which the FXAA override
+   // also keys on, + the single-channel (R16F) plane-deviation edge-ness the BL2TPS Depth Extract CS builds from it.
    ComPtr<ID3D11ShaderResourceView> srv_scene_depth;
    ComPtr<ID3D11Texture2D> tex_pred;
    ComPtr<ID3D11UnorderedAccessView> uav_pred;
@@ -271,8 +271,8 @@ class Borderlands2 final : public Game
    }
 
 #if ENABLE_SMAA
-   // Post-tonemap SMAA on the LDR (gamma space). It runs AFTER the tonemap so it cannot perturb the DoF that
-   // is composited inside it. Snapshot LDR -> DrawSMAA -> optional RCAS, the last pass writing the LDR RTV.
+   // Post-tonemap SMAA on the gamma LDR: AFTER the tonemap, so it cannot perturb the DoF composited inside it.
+   // Snapshot LDR -> linearize (+ predication extract) CS -> DrawSMAA -> optional RCAS; the last pass writes the LDR RTV.
    void RunPostTonemapSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, Borderlands2GameDeviceData& gd, ID3D11RenderTargetView* ldr_rtv)
    {
       ComPtr<ID3D11Resource> ldr_res;
@@ -361,8 +361,8 @@ class Borderlands2 final : public Game
       if (!gd.cb_smaa_metrics)
          return;
 
-      // Resolve RCAS before allocating: it decides whether the last pass writes the LDR RTV directly, which
-      // removes both the copy back and the intermediate.
+      // Resolve RCAS before allocating: it decides whether SMAA renders into the LDR RTV directly or into the
+      // intermediate RCAS reads.
       auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS Sharpen PS"));
       bool do_sharpen = g_rcas_sharpness > 0.f && copy_vs != nullptr && sharpen_ps != nullptr;
@@ -485,8 +485,8 @@ class Borderlands2 final : public Game
       native_device_context->VSSetConstantBuffers(1, 1, &mcb);
       native_device_context->PSSetConstantBuffers(1, 1, &mcb);
 
-      // The last pass of the chain renders straight into the LDR RTV — no write-back copy. Reading the LDR is
-      // safe because SMAA and RCAS sample the snapshot copies, never the LDR itself.
+      // The last pass of the chain renders straight into the LDR RTV, which is safe because SMAA and RCAS sample
+      // the snapshot copies, never the LDR itself.
       DrawSMAA(native_device, native_device_context, device_data,
          do_sharpen ? gd.tex_smaa_out_rtv.get() : ldr_rtv,
          gd.srv_input_linear.get() /*neighborhood blend (linear light)*/,
@@ -529,11 +529,8 @@ public:
       // "UI Paper White" slider on UI_DRAW_TYPE >= 1 && !use_os_reference_white_level. UI default 203 nits (BT.2408).
       use_os_reference_white_level = false;
 
-      // Core auto-registers the 6 SMAA passes. Our tonemap outputs GAMMA, so the two DrawSMAA colour args get
-      // different textures: the snapshot itself for edge detection, and the linearize CS's decode of it
-      // (Luma_BL2TPS_SMAALinearize.hlsl) for the neighborhood blend, whose own PS re-encodes the blended result
-      // back to gamma 2.2 (Luma_SMAA_impl.hlsl).
-      // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA).
+      // Core auto-registers the 6 SMAA passes; these three are this game's own. RCAS sharpen PS (drawn via core
+      // "Copy VS" + DrawCustomPixelShader after SMAA).
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Sharpen PS"),
          ShaderDefinition{"Luma_BL2TPS_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
       // Depth-extract CS for SMAA predication: scene-color .a (linear view Z) -> R16F plane-deviation edge-ness.
@@ -547,8 +544,8 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
-      // User HDR grade controls (read in Luma_BL2TPS_Tonemap.hlsl via LumaSettings.GameSettings). All
-      // default to a vanilla no-op. Exposure/Bloom/Vignette act on both SDR+HDR; Saturation/Dechroma/Contrast HDR-only.
+      // User settings mirrored into LumaSettings.GameSettings. The grade sliders default to a vanilla no-op;
+      // Exposure/Bloom/Vignette act on both SDR+HDR, Saturation/Dechroma/Contrast HDR-only.
       default_luma_global_game_settings.Exposure = 1.f;           // scene multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;         // BT.709-luminance lerp (Color.hlsl Saturation)
       default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only mandatory DICE/gamut desat applies
@@ -559,7 +556,7 @@ public:
       default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR and SDR), anti-banding on
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f; // light AutoHDR on Bink videos (HDR only)
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f; // highlight-expansion strength (peak ~165 nits at 0.5)
-      default_luma_global_game_settings.BloomThreshold = 1.f;     // replaced within a frame by the native bright pass
+      default_luma_global_game_settings.BloomThreshold = 1.f;     // replaced once the native bright pass is read back
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
 
@@ -1259,7 +1256,7 @@ public:
       if (RepairScaleformStencilMask(native_device, native_device_context, gd, original_shader_hashes, is_custom_pass, is_immediate, original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
-      // Track the LDR buffer (the tonemap's render target) for Hide UI and the FXAA override.
+      // The tonemap draw: track its LDR target (Hide UI, FXAA override), capture the scene SRV, build the Luma bloom, then SMAA.
       if (is_immediate && IsAnyTonemap(original_shader_hashes))
       {
          // TPS inserts a LightShaftTexture at slot 1, shifting its native textures down one (LUT@t4, DOF@t5); the
