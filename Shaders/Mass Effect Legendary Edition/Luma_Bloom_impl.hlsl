@@ -4,7 +4,7 @@
 // effective intensity and the prefilter reads threshold from GameSettings.BloomThreshold. Note the native pass
 // weights every tap and only then accumulates, while the shared prefilter blurs first and calls this on the sum.
 
-// DrawBloom binds only b11; main.cpp explicitly preserves live LumaSettings in b13 for the prefilter.
+// DrawBloom binds only b11; main.cpp binds live LumaSettings at b13 before calling it, for the prefilter.
 #include "Includes/Common.hlsl"
 
 // Vanilla bloom was bounded to [0,1] by its R16G16B16A16_UNORM target alone; the bright pass clamps nothing.

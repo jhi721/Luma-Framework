@@ -1,9 +1,9 @@
 // Shared stage-1 output tail, included inside each main() after it defines gradedHDR, sdrGamma, v0, v1, o0, o1.
-// The bodies decode sdrGamma for gradedHDR as well (MELE_NativeColorGradedHDR, or 0x225A8330's hue donor), but this
-// tail decodes it again on purpose: consuming that decode instead reschedules the vanilla curve on 0x2754F750 and 0x69F03340 in Publishing, turning r0*w + (1 - e)
-// into (r0*w - e) + 1 at the same instruction count. Float32 addition is not associative and that line is native
-// transcription, so the duplicate decode stays. Measured, not assumed.
-// Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (none / radial-power / ME3LE smoothstep), TM_HAS_GRAIN,
+// The bodies already decode sdrGamma for gradedHDR (MELE_NativeColorGradedHDR, or 0x225A8330's hue donor), but this
+// tail decodes it again on purpose: consuming that decode reschedules the vanilla curve on 0x2754F750 and 0x69F03340
+// in Publishing, turning r0*w + (1 - e) into (r0*w - e) + 1 at the same instruction count. Float32 addition is not
+// associative and that line is native transcription, so the duplicate decode stays (measured).
+// Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (0 none, 1 radial power, 3 ME3LE smoothstep), TM_HAS_GRAIN,
 // TM_ALPHA_LUMA (native ME3LE output luma to alpha).
 #ifndef TM_VIGNETTE_TYPE
 #define TM_VIGNETTE_TYPE 0
@@ -25,8 +25,8 @@ float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
 // Native vignette, hoisted ahead of the tonemap and expressed in linear so DICE absorbs its blue-tinted white
 // point instead of the frame leaving stage 1 above Scene Peak. linear_to_gamma is a signed pure pow, so this is
-// exactly the vanilla multiply in the encoded domain and SDR stays bit-identical. Grain and dither stay in gamma
-// below, where hoisting would amplify shadow noise.
+// exactly the vanilla multiply in the encoded domain. Grain and dither stay in gamma below, where hoisting would
+// amplify shadow noise.
 float3 vigLinear = 1.0;
 #if TM_VIGNETTE_TYPE == 1
 // The slider scales only radial darkening, so zero intensity does not alter the native white point tint.
@@ -60,7 +60,7 @@ float3 vigLinear = 1.0;
 float3 postProcessedColor;
 if (LumaSettings.DisplayMode == 1) // HDR
 {
-   // gradedHDR arrives as paper-white-relative linear HDR; DICE owns peak rolloff and gamut from here.
+   // gradedHDR arrives as Game-Paper-White-relative linear HDR; DICE owns peak rolloff and gamut from here.
    float3 vignettedHDR = gradedHDR * vigLinear;
 
    // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider
@@ -74,7 +74,7 @@ if (LumaSettings.DisplayMode == 1) // HDR
       vignettedHDR = exp2(LumaSettings.GameSettings.Contrast * log2(max(vignettedHDR / midGray, 1e-30))) * midGray;
    }
 
-   // DICE works in absolute-nit ratios, so its cap lands at the display peak. Type 2 also runs
+   // DICE works in absolute-nit ratios, so its cap lands at Scene Peak White (PeakWhiteNits). Type 2 also runs
    // CorrectOutOfRangeColor. Grain, dither, and RCAS can still push the result ~2% past Scene Peak; accepted.
    DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
    // Highlight dechroma handed to DICE rather than run as our own pass afterwards, so it runs INSIDE the containment
@@ -95,11 +95,11 @@ else // SDR still uses the scRGB swapchain; sdrLinear is the exact native grade.
    postProcessedColor = sdrLinear * vigLinear;
 }
 
-postProcessedColor = IsNaN_Strict(postProcessedColor) ? 0.0 : postProcessedColor; // Replace NaN with zero.
+postProcessedColor = IsNaN_Strict(postProcessedColor) ? 0.0 : postProcessedColor;
 postProcessedColor = max(0.0, postProcessedColor);
 
-// Encode gamma(scene / R), R = UI Paper White / Game Paper White. The native gamma HUD blends before stage 2,
-// which restores R; Core then applies Game Paper White once to the combined frame.
+// Encode gamma(scene / R), R = UI Paper White / Game Paper White. The native gamma HUD blends before stage 2
+// (Output_0x0765601C), which restores R and applies Game Paper White once to the combined frame.
 const float uiPaperWhiteRelativeToGame = MELE_GetUIPaperWhiteRelativeToGame();
 o0.xyz = linear_to_gamma(postProcessedColor / max(uiPaperWhiteRelativeToGame, 1e-4), GCT_MIRROR);
 
@@ -127,7 +127,7 @@ const float rEncoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
    o1 = 0.25 * log2(adaptLuma * 15 + 1);
 }
 
-// Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
+// Anti-banding dither, one step of the output quantizer: 8-bit in SDR, 10-bit BT.2020 PQ in HDR and SDR on HDR.
 if (LumaSettings.GameSettings.Dithering > 0.5)
 {
    if (LumaSettings.DisplayMode == 0)

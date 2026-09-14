@@ -160,9 +160,9 @@ SamplerState NoiseTextureSampler_s : register(S_NOISE);
 SamplerState smpFilmicLUTSampler_s : register(S_FILMIC);
 #endif
 
-// Native ME1LE/ME2LE SDR grade transcribed from live CSOs, evaluated exactly once on the untouched per-channel value
-// in every Display Mode. SDR uses this result directly. HDR keeps its RGB ratios and replaces only its
-// luminance with the reconstruction's. Preserve register-level swizzles; the filmic 1D LUT stays inline in main().
+// Native ME1LE/ME2LE SDR grade transcribed from live CSOs. main() runs it once on the untouched native value in every
+// Display Mode and, in HDR, once more on the grade proxy; HDR keeps the native result's RGB ratios and takes only
+// luminance from the reconstruction. Preserve register-level swizzles; the filmic 1D LUT stays inline in main().
 float3 MELE_ME12LE_GradeChain(float3 c)
 {
    float4 r0, r1, r2;
@@ -288,7 +288,7 @@ void main(
    r0.zw = cmp(float2(0, 0) < MinMaxBlurClamp.xy);
    r1.w = (int)r0.w | (int)r0.z;
 
-   // Native near/far depth-of-field composite shared with ME1LE.
+   // Native near/far depth-of-field composite.
    if (r1.w != 0)
    {
       r1.xyz = MELE_CompositeDOF(r0.xy, r0.zw, r1.xyz);
@@ -318,8 +318,7 @@ void main(
    r1.z = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.yy).x;
    r1.x = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.zz).x;
    r1.xyz = saturate(r1.xyz);
-   // The native per-channel filmic value reaches the 16-slice LUT untouched - that is this branch's SDR output.
-   // r1.xyz stays the native post-filmic value.
+   // r1.xyz keeps the native post-filmic value, which reaches the 16-slice LUT untouched as this branch's SDR result.
 #else
    // Non-filmic path from 0x2754F750: bloom, exponential curve, highlight desaturation, adjustments, then LUT.
    r0.xyz = BlurredImageSeperateBloom.Sample(BlurredImageSeperateBloomSampler_s, r0.xy).xyz * LumaSettings.GameSettings.BloomIntensity;
@@ -329,8 +328,8 @@ void main(
    r0.w = exp2(r0.w);
    r0.w = saturate(BloomTintAndScreenBlendThreshold.w * r0.w);
 
-   // Captured before the curve below rewrites r1. Both are RGB here: the blend above built the bloom in BRG and
-   // the .yzx on the line above rotates it back, while r1 still holds the post-exposure scene in RGB.
+   // Captured before the curve below rewrites r1. Both are RGB: the blend above built the bloom in BRG and the .yzx
+   // below rotates it back, while r1 still holds the post-exposure scene in RGB.
    const float3 sceneLinear = r1.xyz;
    const float3 bloomLinear = r0.yzx * r0.www;
 
@@ -340,8 +339,7 @@ void main(
    r1.xyz = float3(1, 1, 1) + -r1.xyz;
    r0.xyz = r0.xyz * r0.www + r1.xyz;
 
-   // The native per-channel value still reaches the grade untouched - that is this branch's SDR output.
-   // r0.xyz stays the native per-channel value.
+   // r0.xyz keeps the native per-channel value, which reaches the grade untouched as this branch's SDR result.
 #endif
 
    // HDR working value. Family 01 grades the native curve continued on the scene; family 03 also continues the
@@ -353,8 +351,8 @@ void main(
       float3 workRGB;
       bool sourceValid = MELE_TryExpExtendedInput(sceneLinear, bloomLinear, workRGB);
 #if TM_HAS_FILMIC
-      // That sum is the filmic LUT's input z. The native filmic samples in r1 were written BRG, so they are rotated
-      // to RGB here.
+      // workRGB, the continued scene plus bloom, is the filmic LUT's input z. The native filmic samples in r1 were
+      // written BRG, so they are rotated to RGB here.
       const float3 z = workRGB;
       if (sourceValid)
       {

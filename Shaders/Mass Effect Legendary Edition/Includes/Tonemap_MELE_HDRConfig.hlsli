@@ -10,7 +10,7 @@
 //   05  ME3LE analytic hard-clip grade                      0x225A8330 only
 //
 // There is no selector here and no second reconstruction to select; an in-game A/B across the three
-// games on 2026-09-11 chose these five.
+// games chose these five.
 //
 // WHAT THESE MODELS DO. They prepare the grade INPUT - a compressed proxy, or a tone curve continued
 // past mid-gray - and divide the scale back out afterwards, so the grade sees range the vanilla clip
@@ -24,7 +24,7 @@
 // linear domain.
 
 // Bench values: exercised against the captured LUTs and cbuffers, and carried unchanged through the
-// 2026-09-11 A/B that chose these families. That A/B judged the families as a whole, so it validates
+// in-game A/B that chose these families. That A/B judged the families as a whole, so it validates
 // this set as a working combination and not any one number individually - none of them may be presented
 // as individually tuned, and changing one still needs its own frames.
 #define MELE_HDR_BRIDGE_SHOULDER 0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
@@ -48,8 +48,8 @@
 #define MELE_FILMIC_MIN_SLOPE_X 1e-5
 
 // Strength of family 05's hue-only transfer toward the native hard-clipped SDR. A calibration value, not
-// a property of the algorithm. The 2026-09-11 in-game A/B ran family 05 at 1.0; 0.75 replaced it afterwards on
-// the offline measurement below and was kept as final on 2026-09-14 without a second in-game A/B.
+// a property of the algorithm. The in-game A/B ran family 05 at 1.0; 0.75 replaced it afterwards on the
+// offline measurement below, without a second in-game A/B.
 //
 // Why not 1.0: at exactly 1.0 the blend IS the donor's ab, so the target keeps none of its own. A hard
 // clip drives the brightest colours to white, and a white donor's OKLab ab is not zero but matrix

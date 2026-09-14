@@ -1,10 +1,10 @@
 // Shared stage-1 body for ME1LE/ME2LE analytic scene permutations used by the galaxy map, some Mako scenes, and
-// cutscenes. These permutations have no LUT, motion blur, or film grain. Bindings: t0 scene, t1 DoF, t2/t3
+// cutscenes. These permutations have no LUT, vignette, motion blur, or film grain. Bindings: t0 scene, t1 DoF, t2/t3
 // near/far DoF, t4 bloom.
 //
-// ME1LE 0xAAE8755A and ME2LE 0xCC76075F share the decompiled scene preparation and grade. Thin entry points select
-// vignette parameters and ME2LE's post-gamma white point. Preserve register-level swizzles for comparison with the
-// live CSOs. This body produces linear gradedHDR and native gamma sdrGamma; the shared tail applies DICE.
+// ME1LE 0xAAE8755A and ME2LE 0xCC76075F share the decompiled scene preparation and grade; the thin entry points add
+// only ME2LE's post-gamma white point. Preserve register-level swizzles for comparison with the live CSOs. This body
+// produces linear gradedHDR and native gamma sdrGamma; the shared tail applies DICE.
 // ME3LE analytic shader 0x225A8330 has a different cbuffer layout and no exponential curve.
 
 // clang-format off
@@ -132,9 +132,9 @@ bool MELE_TryAnalyticGradeChainHDR(float3 c, out float3 workHDR)
    float4 r0;
    r0.xyz = MELE_Analytic_GradeHead(c);
 
-   // Native analytic Scene grade, with only the upper half of the opening saturate removed. The shift is checked
-   // BEFORE the max, which would hide a NaN; that check also covers the signed artistic head above and c itself, whose
-   // non-finite values propagate into it.
+   // Native analytic Scene grade, with only the upper half of the opening saturate removed. The shift itself is
+   // checked, not its max, which would hide a NaN; that check also covers the signed artistic head above and c itself,
+   // whose non-finite values propagate into it.
    const float3 shifted = -SceneShadowsAndDesaturation.xyz + r0.xyz;
    // A negative shift is ordinary artist data, not an error. A non-finite SceneInverseHighLights turns the
    // product into NaN or inf, which the non-negative check on the log base rejects.
@@ -199,10 +199,10 @@ void main(
    // Scene-referred exposure before tonemapping.
    r1.xyz = r1.xyz * LumaSettings.GameSettings.Exposure;
 
-   // Native screen-blend using Luma's rebound fp16 bloom; preserve unclamped linear scene+bloom for HDR.
+   // Native screen-blend using Luma's rebound fp16 bloom.
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
-   // Captured before the curve below overwrites r1. Straight RGB here, unlike the ME1LE/ME2LE LUT body.
+   // Captured before the curve below overwrites r1. Straight RGB, with no BRG rotation to undo.
    const float3 sceneLinear = r1.xyz;
    const float3 bloomLinear = r0.xyz * r0.www;
 
@@ -224,11 +224,11 @@ void main(
       workValid = sourceValid && MELE_TryAnalyticGradeChainHDR(workNative, workHDR);
    }
 
-   // Apply the same native grade function to the working value and, below, to the SDR reference. Hue and saturation
-   // come from that bounded grade, never from the uncapped twin or the scene; only the luminance is the twin's.
+   // The native grade runs only on the SDR reference; the working value took its uncapped twin above. Hue and
+   // saturation come from this bounded grade, never from the twin or the scene; only the luminance is the twin's.
    float3 sdrGamma = MELE_Analytic_GradeChain(r0.xyz);
    float3 gradedHDR = MELE_NativeColorGradedHDR(sdrGamma, workHDR, workValid);
 
-   // Entry point supplies vignette macros. Analytic ME1LE/ME2LE permutations have no grain and write zero alpha.
+   // Analytic ME1LE/ME2LE permutations have no vignette or grain and write zero alpha.
 #include "Includes/Tonemap_MELE_Output.hlsli"
 }

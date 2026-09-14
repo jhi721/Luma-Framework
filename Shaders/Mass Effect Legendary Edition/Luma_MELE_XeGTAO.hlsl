@@ -1,9 +1,9 @@
-// XeGTAO replacement for the trilogy-wide NVIDIA HBAO+ chain, adapted from the repository's canonical port.
+// XeGTAO replacement for the trilogy-wide NVIDIA HBAO+ chain, adapted from the repository's existing XeGTAO ports.
 // Source: https://github.com/GameTechDev/XeGTAO
 //
 // MELE-specific contracts shared by all three games:
 // - Run at native AO half resolution and write visibility to blur u0, the game's final R8_UNORM AO target.
-//   Apply shader 0x2E826C0F retains blend dst*src_color into the fp16 scene.
+//   The native apply shader 0x2E826C0F still blends dst*src_color into the fp16 scene.
 // - Inherit cb0 HBAO+ $Globals and cb2 CSOffsetConstants; layouts come from live disassembly of
 //   0x80212FD6/0x06D92B08 and retain standard GFSDK offsets.
 // - Depth input = the game's half-res r24_unorm_x8 depth copy (deinterleave 0x497830D8 t0), read with explicit
@@ -87,7 +87,7 @@ cbuffer LumaGTAO : register(b11)
 #endif
 
 #ifndef FINAL_VALUE_POWER
-#define FINAL_VALUE_POWER 1.0 // Fallback only; runtime FinalValuePowerRT applies.
+#define FINAL_VALUE_POWER 1.0 // Unused; the main pass reads runtime FinalValuePowerRT.
 #endif
 
 #ifndef DEPTH_MIP_SAMPLING_OFFSET

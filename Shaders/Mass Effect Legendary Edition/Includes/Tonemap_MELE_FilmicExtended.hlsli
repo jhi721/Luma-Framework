@@ -20,7 +20,7 @@
 // bloom, so it checks only the native samples.
 
 // The LUT in its own input domain z: the strip is addressed as SC * z, where SC is the native input
-// scale covering scene-linear to about 16.2. This is the raw read, with no pre-curve of any kind.
+// scale covering z up to about 16.2. This is the raw read, with no pre-curve of any kind.
 float MELE_FilmicLookupZ(float z)
 {
    const float SC = 0.0616082214;

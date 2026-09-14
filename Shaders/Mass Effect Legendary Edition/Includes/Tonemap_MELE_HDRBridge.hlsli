@@ -4,13 +4,12 @@
 #include "Tonemap_MELE_HDRConfig.hlsli"
 
 // Pure math. Prerequisites, which this file deliberately does NOT include:
-//   Includes/Common.hlsl      MELE_IsFinite, MELE_IsFiniteNonNegative
-//   ../Includes/Color.hlsl    gamma_to_linear, GetLuminance, GCT_MIRROR
+//   Includes/Common.hlsl      MELE_IsFiniteNonNegative
+//   ../Includes/Color.hlsl    gamma_to_linear, GetLuminance, GCT_MIRROR, CS_BT709
 //   ../Includes/Math.hlsl     max3, FLT_MAX  (arrive through Color.hlsl)
 //   ../Includes/Reinhard.hlsl ReinhardRange
-// Reinhard.hlsl has no include guard, unlike every other shared header, so including it from here
-// would be a duplicate-namespace error in the bodies that already include it. Include it in the body,
-// before this file.
+// Reinhard.hlsl has no include guard, so including it from here would redefine its contents in the
+// bodies that already include it. Include it in the body, before this file.
 
 // Max-channel proxy. One scalar for all three channels, so the limiter cannot move an RGB ratio; the
 // per-channel character stays owned by the working curve and by the native reference.
@@ -21,8 +20,8 @@
 // cbuffer and never hardcoded to 2.2. Scaling the grade INPUT by s scales the decoded linear OUTPUT by s^r,
 // so compressing in the adapted domain makes the restore exact - W = A(X), P = q*W, Q = A^-1(P) scales the
 // input by q^(1/r), the output by exactly q, and a plain divide undoes it. A raw input multiply with a
-// linear divide would leave a q^(r-1) residue whenever r != 1. GCT_MIRROR keeps a negative working value
-// signed rather than turning it into a NaN.
+// linear divide would leave a q^(r-1) residue whenever r != 1. A negative working value is refused before
+// either conversion, so GCT_MIRROR never sees one here.
 //
 // ReinhardRange with In_Peak <= 0 compresses from infinity and is the shifted rational shoulder this
 // needs: identity at and below k, C1 across the seam, asymptotic to 1. It is NOT ReinhardPiecewise,
@@ -32,8 +31,9 @@
 // nits, and MELE_TryRestoreGradeRange must be handed the same q this produced.
 //
 // Every check runs BEFORE the pow, the division and the LUT read it protects. An invalid working
-// value cannot be recognised afterwards from the finiteness of the output: every permutation's grade
-// opens with a saturate or a min(1), which launders a bad input into a plausible number.
+// value cannot be recognised afterwards from the finiteness of the output: every grade this feeds
+// passes it through a LUT read or a saturate (MELE_NativeGammaCurve opens with one), which launders
+// a bad input into a plausible number.
 //
 // On failure both out parameters keep the neutral values written at entry and the caller must use
 // neither: false means the HDR reconstruction declined and the caller retains the exact
@@ -48,7 +48,7 @@ bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3
       return false;
    }
 
-   // pow(x, 1) is exp2(log2(x)) on this hardware, not the identity, and r was measured at exactly 1
+   // pow(x, 1) compiles to exp2(log2(x)) in DXBC, not the identity, and r was measured at exactly 1
    // in every captured frame. This keeps that common case bit-exact; it is a shortcut for one value
    // of r, never an assumption that r is 1.
    const float3 adapted = (r == 1.0) ? workNative : gamma_to_linear(workNative, GCT_MIRROR, r);
@@ -102,12 +102,12 @@ bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 //
 // Of the working value only Y is used; its own hue and chroma are deliberately discarded.
 //
-// The guarantee ends here, before the shared output tail. The vignette, DICE, the user controls and
-// the late SDR clamp all run after it.
+// The guarantee ends here, before the shared output tail. The vignette, DICE, the user controls, grain
+// and dither all run after it.
 //
 // Guard contract, deliberately not one blanket fallback:
-//   the WHOLE reference triple is validated, not only its luminance: a dot product returns a finite
-//     number from non-finite channels, and a positive one from a reference with a negative channel.
+//   the WHOLE reference triple is validated, not only its luminance: a reference with a negative
+//     channel can still have a positive luminance.
 //   exactly black reference or exactly zero target -> black. The grade produced that black.
 //   near-black but positive reference -> divided normally. The LUT permutations carry clampFloor, so
 //     a vanilla black arrives here at 1e-4 in luminance, two decades above the guard. Collapsing that

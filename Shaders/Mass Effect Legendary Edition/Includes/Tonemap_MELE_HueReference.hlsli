@@ -16,21 +16,21 @@
 //
 // The rescale back to the target's chroma is what makes that true, and it also bounds the operation:
 // the blended vector is always renormalized to a length the target already had, so this cannot
-// amplify anything. The one degenerate case is a blended vector of exactly zero - a fully neutral
-// donor at strength 1, or exactly anti-parallel ab - where safeDivision returns 1 and the result
-// comes out achromatic. That is left as it is deliberately; a donor-chroma threshold would be a new
-// artistic rule, and the shipped strength is below 1 precisely so a neutral donor still leaves a
-// direction to keep.
+// amplify anything. The degenerate case is a blended vector at or near zero - a neutral donor at
+// strength 1, or a donor ab that cancels the target's: exactly zero comes out achromatic (safeDivision
+// returns 1), and round-off is scaled up to the target's chroma in an arbitrary direction. That is left
+// as it is deliberately; a donor-chroma threshold would be a new artistic rule, and the shipped strength
+// is below 1 precisely so a neutral donor still leaves a direction to keep (MELE_HARDCLIP_HUE_STRENGTH).
 //
 // GAMUT. RenoDX clamps to positive AP1 and converts back, which is wider than BT.709: a negative
 // BT.709 component coming out of this is ordinary wide-gamut colour and is NOT a reason to abandon
-// the correction: a whole-triple rejection there produces a visible switching boundary. The only fallback
-// here is for arithmetic that actually broke.
+// the correction - a whole-triple rejection there would produce a visible switching boundary. The only
+// fallback here is for arithmetic that actually broke.
 //
 // DICE, further down the shared output tail, stays the one and only display mapper.
 //
 // The OKLab locals stay snake_case where the rest of this game's HDR code is camelCase: this is a line-by-line port,
-// and keeping the source spelling keeps the two diffable, as Shaders/Includes/ACES.hlsl and Reinhard.hlsl do.
+// and keeping the source's snake_case keeps the two diffable, as Shaders/Includes/ACES.hlsl and Reinhard.hlsl do.
 float3 MELE_HueReferenceOKLab(float3 target, float3 reference, float strength)
 {
    float3 target_lab = Oklab::linear_srgb_to_oklab(target);

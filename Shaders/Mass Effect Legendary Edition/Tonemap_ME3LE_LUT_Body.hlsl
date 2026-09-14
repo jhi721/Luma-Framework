@@ -5,11 +5,11 @@
 //
 // Grade and filmic paths are transcribed from 0x00944C2E; motion blur comes from 0x36B90B12. Preserve their
 // register-level structure for comparison with live CSOs.
-// ME3LE deltas vs the ME2LE body:
-// - The 4096x1 R16_UNORM filmic LUT is the tonemap; input scale 0.0616082214 covers scene-linear to about 16.2.
-// - Channels remain straight RGB, bloom uses a 4x scale, and motion blur weights each tap by velocity.
+// ME3LE deltas vs the ME1LE/ME2LE LUT body:
+// - The 4096x1 R16_UNORM filmic LUT is the whole tonemap, with no exponential pre-curve before it.
+// - Channels remain straight RGB, and motion blur weights each tap by velocity.
 // - The smoothstep vignette contains a blue-tinted white point; the slider affects only radial darkening.
-// - All variants share one $Globals layout; grain appends c40/c41 and moves ScreenUVScaleBias from c40 to c42.
+// - Motion blur does not change the $Globals layout; grain appends c40/c41 and moves ScreenUVScaleBias from c40 to c42.
 
 // clang-format off
 #include "Includes/Common.hlsl"      // Defines game settings; keep first.
@@ -31,8 +31,8 @@
 #define cmp -
 
 // Texture and sampler registers follow this fixed order:
-//   [depth vel (MB)] scene dof near far bloom lut [noise (grain)] filmic
-// Unlike ME2LE, motion-blur velocity occupies t2 and shifts later DoF, bloom, and LUT slots by one.
+//   [depth (MB)] scene [vel (MB)] dof near far bloom lut [noise (grain)] filmic
+// Unlike the ME1LE/ME2LE LUT body, motion-blur velocity occupies t2 and shifts later DoF, bloom, and LUT slots by one.
 #if TM_HAS_MOTIONBLUR
 #define R_DEPTH   t0
 #define R_SCENE   t1
@@ -142,9 +142,9 @@ SamplerState NoiseTextureSampler_s : register(S_NOISE);
 #endif
 SamplerState smpFilmicLUTSampler_s : register(S_FILMIC);
 
-// Native ME3LE SDR grade transcribed from the live CSO, evaluated exactly once on the untouched per-channel value
-// in every Display Mode. SDR uses this result directly. HDR keeps its RGB ratios and replaces only its
-// luminance with the reconstruction's. Preserve register-level operations; the filmic 1D LUT stays inline in main().
+// Native ME3LE SDR grade transcribed from the live CSO. main() runs it once on the untouched native value in every
+// Display Mode and, in HDR, once more on the grade proxy; HDR keeps the native result's RGB ratios and takes only
+// luminance from the reconstruction. Preserve register-level operations; the filmic 1D LUT stays inline in main().
 float3 MELE_ME3LE_GradeChain(float3 c)
 {
    float4 r0, r1;

@@ -2,8 +2,8 @@
 // or pre-grade tonemap curve: analytic Scene* operates directly on linear scene+bloom, followed by gamma, the
 // ME3LE blue-tinted white point, and a clamp. Bindings: t0 scene, t1 DoF, t2/t3 near/far DoF, t4 bloom.
 //
-// Transcribed from live CSO 0x225A8330. Its only tone limit is that final clamp, so family 05 recovers range by
-// running the grade on a bounded proxy and restoring the scale afterwards, then takes hue alone from the exact
+// Transcribed from live CSO 0x225A8330. Its only tone limits are the grade's own clamps, so family 05 recovers range
+// by running the grade on a bounded proxy and restoring the scale afterwards, then moves only hue toward the exact
 // native hard-clipped result.
 
 // clang-format off
@@ -54,10 +54,9 @@ Texture2D<float4> DOFBlurredNear : register(t2);
 Texture2D<float4> DOFBlurredFar : register(t3);
 Texture2D<float4> BlurredImageSeperateBloom : register(t4);
 
-// Native analytic SDR grade transcribed from the live CSO, evaluated exactly once on the untouched per-channel
-// value in every Display Mode. SDR uses this result directly. HDR decodes the same exact hard-clipped result
-// and uses it only as the hue reference; its range comes from the working grade-bridge path instead. Preserve
-// its register-level operations.
+// Native analytic SDR grade transcribed from the live CSO. main() runs it once on the untouched scene+bloom in every
+// Display Mode and, in HDR, once more on the grade proxy; HDR takes its range from the proxy path and uses the exact
+// hard-clipped native result only as the hue reference. Preserve its register-level operations.
 float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 {
    float4 r0;
@@ -135,14 +134,9 @@ void main(
    float3 gradedHDR = gamma_to_linear(sdrGamma, GCT_MIRROR);
    if (workValid)
    {
-      // Validity was decided before the grade, not read off the finiteness of its output.
-      //
-      // Family 05's range comes from the reversible grade bridge. The native hard-clipped SDR result above is used
-      // ONLY as a hue reference, following RenoDX hard-clip hue-emulation practice. The HDR target keeps its own
-      // perceptual lightness and chroma magnitude. DICE remains the final display mapper.
-      //
-      // A broken hue transfer does not discard the reconstruction: MELE_HueReferenceOKLab returns its
-      // target untouched, so the working HDR value survives an optional correction failing.
+      // The native hard-clipped result is ONLY a hue reference, following RenoDX hard-clip hue emulation; the working
+      // value keeps its own OKLab lightness and chroma magnitude. If the transfer breaks, MELE_HueReferenceOKLab
+      // returns its target untouched, so the reconstruction survives.
       gradedHDR = MELE_HueReferenceOKLab(workHDR, gradedHDR, MELE_HARDCLIP_HUE_STRENGTH);
    }
 
