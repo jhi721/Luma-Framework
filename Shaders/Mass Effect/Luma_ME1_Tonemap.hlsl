@@ -207,8 +207,10 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
    // The extended grade carries no fade (outputScale = 1) and is decoded through the DOWNSTREAM display gamma
    // (VanillaToLinear, not a plain gamma decode): the direct continuation of the full vanilla chain is the HDR signal.
    float3 hdr = FinishME1HDR(VanillaToLinear(GradeUE3(untonemapped, false, 1.0)));
-   // Re-apply the engine fade linearly, LAST, after the creative sliders. At rest it is a no-op.
-   float3 outColor = hdr * outputScale; // LINEAR, 1.0 = paper white, into the fp16 intermediate
+   // Re-apply the engine fade LAST, after the creative sliders, as the gain vanilla's chain gives it: the scale sits
+   // before this pass's exponent and the display gamma, so in linear it is scale^(w * DisplayGamma), not scale. At
+   // rest (scale 1) it is a no-op; mid-fade it matches the vanilla curve instead of running brighter.
+   float3 outColor = hdr * VanillaToLinear(PowUE3(outputScale, GammaColorScaleAndInverse.www)); // LINEAR, 1.0 = paper white
 #else
    float3 outColor = sdr_vanilla; // vanilla encoding, whatever this pass's exponent is
 #endif
@@ -262,8 +264,9 @@ float3 RunME1GammaCorrection(float2 sceneUV)
    float3 hdr;
    if (LumaData.GameData.UberRanThisFrame > 0.5)
    {
-      // Stage 1 left LINEAR light here, its SDR reference already carrying this pass's gamma: only the scale applies.
-      hdr = scene.xyz * GcColorScale.xyz;
+      // Stage 1 left LINEAR light here, its SDR reference already carrying this pass's gamma: only the scale applies,
+      // as the gain vanilla's chain gives it (the scale sits before this pass's exponent and the display gamma).
+      hdr = scene.xyz * gamma_to_linear(PowUE3(GcColorScale.xyz, GcInverseGamma.xxx));
    }
    else
    {
@@ -279,9 +282,12 @@ float3 RunME1GammaCorrection(float2 sceneUV)
    float3 outColor = hdr; // linear, 1.0 = paper white
    [branch] if (GcOverlayColor.w > 0.0)
    {
-      // The overlay is a pre-encode SDR value, so a fade toward it happens in linear, decoded as the references are.
-      const float3 overlay = gamma_to_linear(PowUE3(saturate(GcOverlayColor.xyz), GcInverseGamma.xxx));
-      outColor = lerp(hdr, overlay, GcOverlayColor.w);
+      // Vanilla lerps toward the overlay BEFORE its inverse-gamma pow and the display decode, so the fade curve is
+      // taken in that encoded domain: the linear HDR is re-encoded through the inverse of the two exponents, blended,
+      // and decoded again. Below 1.0 this is the vanilla fade exactly; above it, its continuation.
+      const float invGamma = max(GcInverseGamma.x, 1e-4);
+      const float3 encoded = PowUE3(linear_to_gamma(hdr, GCT_POSITIVE), (1.0 / invGamma).xxx);
+      outColor = gamma_to_linear(PowUE3(lerp(encoded, GcOverlayColor.xyz, GcOverlayColor.w), invGamma.xxx));
    }
 
    // --- Common tail: UI paper-white pre-scale + post-process-space encode ---
