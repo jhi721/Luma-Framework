@@ -307,9 +307,10 @@ void main(
    r1.xyz = exp2(r1.xyz);
    r1.xyz = float3(1, 1, 1) + -r1.xyz;
 
-   // The native screen-blend weight reads the luma of the CURVED scene, not the linear one (0x222186F8 CSO).
+   // The native screen-blend weight reads the luma of the CURVED scene (0x222186F8 CSO); the HDR family's bloom
+   // takes the linear-scene weight instead, see MELE_BloomScreenBlendWeight.
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
-   const float3 bloomLinear = r0.xyz * r0.www;
+   const float3 bloomLinear = r0.xyz * MELE_BloomScreenBlendWeight(sceneLinear);
    r0.xyz = r0.xyz * r0.www + r1.xyz;
 
    // Native 4096x1 R16_UNORM filmic LUT. Preserve its channel rotation.
@@ -337,8 +338,9 @@ void main(
    r0.xyzw = float4(4, 4, 4, -3) * r0.xyzw;
    r0.w = exp2(r0.w);
    r0.w = saturate(BloomTintAndScreenBlendThreshold.w * r0.w);
-   // RGB, like sceneLinear: the .yzx rotates the BRG bloom back.
-   const float3 bloomLinear = r0.yzx * r0.www;
+   // RGB, like sceneLinear: the .yzx rotates the BRG bloom back. The HDR family's bloom takes the linear-scene weight
+   // instead of the native one, see MELE_BloomScreenBlendWeight.
+   const float3 bloomLinear = r0.yzx * MELE_BloomScreenBlendWeight(sceneLinear);
    r0.xyz = r0.xyz * r0.www + r1.xyz;
 
    // r0.xyz keeps the native per-channel value, which reaches the grade untouched as this branch's SDR result.

@@ -74,8 +74,25 @@ float3 MELE_CompositeDOF(float2 uv, float2 blurEnable, float3 scene)
 // because the game adds the bloom between two tone stages. The ME1LE/ME2LE non-filmic path carries an internal
 // BRG rotation on these same operations and is deliberately not routed through here.
 //
-// scene is whatever the native luma reads: the scene AFTER the exponential pre-curve on the ME2LE filmic and
-// ME1LE/ME2LE analytic permutations, and the linear scene on ME3LE, which has no pre-curve.
+// The screen-blend weight, saturate(threshold * 2^(-3 * luma(scene))), for the bloom the HDR families 01-03 receive.
+// The native SDR path reads the luma of the scene AFTER the exponential pre-curve (luma < 1, so at the measured
+// threshold of 10 the weight is always 1); the HDR families pass the LINEAR scene instead: their curve continues
+// past mid-gray, so a full-strength bloom there would flatten the highlight detail the reconstruction recovers, while
+// this weight fades it out above about 1.1 linear. A deliberate HDR choice, not a transcription, and the families
+// were calibrated with it; the SDR reference keeps the native weight. ME3LE has no pre-curve, so native and HDR agree.
+float MELE_BloomScreenBlendWeight(float3 scene)
+{
+   return saturate(BloomTintAndScreenBlendThreshold.w * exp2(-3.0 * dot(scene, float3(0.298999995, 0.587000012, 0.114))));
+}
+
+// Native bloom screen blend, straight-RGB form used by the ME2LE filmic, ME3LE, and analytic permutations. Tinted
+// bloom and screen-blend weight come out separately because their product is needed as a value of its own, not
+// only folded into the native per-channel curve: families 02 and 03 must keep the scene and the bloom apart,
+// because the game adds the bloom between two tone stages. The ME1LE/ME2LE non-filmic path carries an internal
+// BRG rotation on these same operations and is deliberately not routed through here.
+//
+// Kept as the register-level transcription rather than routed through MELE_BloomScreenBlendWeight: the shared form
+// reschedules the native path in every ME3LE permutation (bytecode-gated).
 float3 MELE_BloomScreenBlend(float2 uv, float3 scene, out float weight)
 {
    float4 r0;

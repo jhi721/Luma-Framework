@@ -207,10 +207,10 @@ void main(
    r1.xyz = exp2(r1.xyz);
    r1.xyz = float3(1, 1, 1) + -r1.xyz;
 
-   // Native screen blend using Luma's rebound fp16 bloom. Its weight reads the luma of the CURVED scene, not the
-   // linear one (0xAAE8755A and 0xCC76075F CSOs).
+   // Native screen blend using Luma's rebound fp16 bloom. Its weight reads the luma of the CURVED scene (0xAAE8755A
+   // and 0xCC76075F CSOs); the HDR family's bloom takes the linear-scene weight instead, see MELE_BloomScreenBlendWeight.
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
-   const float3 bloomLinear = r0.xyz * r0.www;
+   const float3 bloomLinear = r0.xyz * MELE_BloomScreenBlendWeight(sceneLinear);
    r0.xyz = r0.xyz * r0.www + r1.xyz;
    // The native per-channel value still reaches the analytic grade untouched - that is this body's SDR output.
    // Family 02 does not touch it; it builds a second, uncapped working value from the scene instead.
