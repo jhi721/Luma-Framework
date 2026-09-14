@@ -63,6 +63,9 @@ Texture2D<float4> t4 : register(TM_T_DOF);       // LowResPostProcessBuffer (hal
 Texture2D<float4> t5 : register(TM_T_LUMABLOOM); // Luma HDR pyramidal bloom, bound by the mod when LumaBloomEnable (BL2 t5 / TPS t8 — TPS t5 is the native DOF)
 
 SamplerState s0_s : register(s0);
+#if TM_HAS_LIGHTSHAFT
+SamplerState s_lightshaft_s : register(TM_S_LIGHTSHAFT); // TPS s1: the light-shaft texture's own sampler
+#endif
 SamplerState s1_s : register(TM_S_BLOOM);    // BL2 s1 / TPS s2
 SamplerState s2_s : register(TM_S_VIGNETTE); // BL2 s2 / TPS s3
 SamplerState s3_s : register(TM_S_LUT);      // BL2 s3 / TPS s4
@@ -369,7 +372,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    // into darker pixels), additive x4 colour, and a per-pixel attenuation in .a where shafts occlude.
    {
       float lsGate = saturate(exp2(dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999)) * -3.0));
-      float4 ls = t_lightshaft.Sample(s0_s, v5.zw);
+      float4 ls = t_lightshaft.Sample(s_lightshaft_s, v5.zw);
       hdrColor = hdrColor * ls.w + (ls.xyz * 4.0) * lsGate;
    }
 #endif
@@ -406,14 +409,17 @@ float4 RunTonemap(float4 v5, float4 v6)
    r1 = r0.zzxy + -ImageAdjustments2.z;
    r1 = saturate(r1 * 10000);
    r2.xyz = r0.xyz + ImageAdjustments2.x;
-   r3.z = 1 / abs(r2.x);
-   r3.w = 1 / abs(r2.y);
-   r3.xy = 1 / abs(r2.z);
+   // Native guards: a zero divisor becomes 1e37 instead of inf, and log runs on |x| with -inf pinned to -1e37, so a
+   // negative or zero channel still yields a finite value rather than NaN.
+   r3.z = (abs(r2.x) > 0.0) ? 1 / abs(r2.x) : 1e37;
+   r3.w = (abs(r2.y) > 0.0) ? 1 / abs(r2.y) : 1e37;
+   r3.xy = (abs(r2.z) > 0.0) ? 1 / abs(r2.z) : 1e37;
    r2 = r0.zzxy * r3;
    r0.xyz = r0.xyz * ImageAdjustments2.w;
-   r3.x = log2(r0.x);
-   r3.y = log2(r0.y);
-   r3.z = log2(r0.z);
+   r3.x = log2(abs(r0.x));
+   r3.y = log2(abs(r0.y));
+   r3.z = log2(abs(r0.z));
+   r3.xyz = (asuint(r3.xyz) == 0xff800000u) ? -1e37 : r3.xyz;
    r0.xyz = r3.xyz * 0.454545468;
    r3.z = exp2(r0.x);
    r3.w = exp2(r0.y);
