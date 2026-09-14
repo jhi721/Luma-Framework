@@ -27,8 +27,8 @@
 // clang-format off
 // ORDER IS LOAD-BEARING — do not sort. The game-local "Includes/Common.hlsl" MUST come first: it defines
 // LUMA_GAME_CB_STRUCTS (via GameCBuffers.hlsl) BEFORE any shared header pulls Settings.hlsl, so
-// LumaSettings.GameSettings resolves to the real grade struct rather than the empty dummy. When clang-format
-// sorted it below the shared "../Includes/*" block, Settings.hlsl's dummy won -> "invalid subscript 'BloomIntensity'".
+// LumaSettings.GameSettings resolves to the real grade struct rather than the empty dummy. Sorted below the
+// shared "../Includes/*" block, Settings.hlsl's dummy wins -> "invalid subscript 'BloomIntensity'".
 #include "Includes/Common.hlsl"             // game-local: defines LumaGameSettings (grade sliders) before LumaSettings cbuffer
 #include "../Includes/Color.hlsl"
 #include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
@@ -126,7 +126,7 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
 
    // 3b. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
    // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
-   // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code 0.5).
+   // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code ~0.46).
    // [branch] on a cbuffer uniform: at the 1.0 default this must be a BIT-EXACT no-op. The pow is spelled out with a
    // floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
    [branch] if (LumaSettings.GameSettings.Contrast != 1.0)

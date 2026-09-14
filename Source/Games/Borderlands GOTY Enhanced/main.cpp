@@ -32,13 +32,13 @@ static constexpr uint32_t kCelShadingHash = 0x08DC66D1;  // cel-shading edge PS 
 // blur 0x4E1BEE34 -> apply-multiply PS 0x44764BF6. We capture scene depth at the deinterleave and the
 // packed view normals at the coarse pass (skipping both), then at the blur dispatch run the 4 XeGTAO passes
 // into ITS u0 (the game's FINAL r16g16_float AO; apply reads .x) so the apply blit composites our AO
-// unchanged. XeGTAO binds the game's own cb0 ($Globals: ProjInfo) + cb2 (MinZ_MaxZRatioCS), still bound at
+// unchanged. XeGTAO reads the game's own cb0 ($Globals: ProjInfo) + cb2 (MinZ_MaxZRatioCS), still bound at
 // the injection point. No TAA -> NoiseIndex frozen 0, spatial denoise x2.
 static constexpr uint32_t kAODeinterleaveHash = 0xFFE232A6; // scene depth -> quarter-res array — skipped (we build our own mip pyramid)
 static constexpr uint32_t kAOCoarseHash = 0xF534EB09;       // HBAO+ horizon march (x2), binds view normals at t0 — skipped (capture normals)
 static constexpr uint32_t kAOBlurHash = 0x4E1BEE34;         // bilateral blur -> FINAL r16g16_float u0 — replaced with XeGTAO
 
-// User-facing settings (persisted via ReShade config; loaded in LoadConfigs, saved on UI change).
+// User settings, persisted in the [Luma] config section (LoadConfigs) unless noted otherwise.
 static bool g_smaa_enable = true;
 static float g_rcas_sharpness = 0.f; // RCAS sharpen on SMAA output; default off — the ink outlines are already clean and sharpening haloes them.
 static bool g_hide_ui = false;       // hide the game's HUD (skips swapchain-targeting UI draws) — for clean screenshots
@@ -67,7 +67,7 @@ static float g_gtao_radius_override = 0.f;
 static int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges (drawn via the game's apply blit). DEV only: the shader's DebugViewRT blocks are #if DEVELOPMENT.
 #endif
 
-// Loading-movie memory-leak fix (toggle "Fix Movie Memory Leak" under Fixes; default ON).
+// Loading-movie memory-leak fix (toggle "Fix Movie Memory Leak" under Fixes).
 // The game's Bink movies create D3D11 YUV decode buffers and never release them -> linear RAM
 // growth -> OOM. The leak is the GAME, not Luma. We drop the game's leaked COM refs on OLD movie
 // generations (orphaned: a movie's buffers are sampled only during its own playback). Tagged by
@@ -99,7 +99,7 @@ namespace BLMovieLeakFix
 
    static std::mutex g_mtx;
    static std::unordered_map<uint64_t, MovieTex> g_movie;    // resource handle -> info
-   static std::unordered_map<uint64_t, uint64_t> g_view2res; // view handle -> resource handle (tagged textures only)
+   static std::unordered_map<uint64_t, uint64_t> g_view2res; // view handle -> resource handle (tagged buffers only)
    static uintptr_t g_exe_base = 0;
    static int g_cur_gen = 0;
    static uint32_t g_last_movie_frame = 0;
@@ -995,8 +995,8 @@ public:
          }
 
          // Predication extract: hardware d24 -> plane-deviation edge-ness in R16F. Core's Compute state stack restores
-         // the game's CS state (core only auto-restores it in DEVELOPMENT) and unbinds our UAV before DrawSMAA reads
-         // it as an SRV (an SRV of a resource still bound as a UAV reads as null).
+         // the game's CS state and unbinds our UAV before DrawSMAA reads it as an SRV (an SRV of a resource still bound
+         // as a UAV reads as null).
          if (pred_ok)
          {
             DrawStateStack<DrawStateStackType::Compute> pred_state;
@@ -1404,7 +1404,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       const char* project_name = PROJECT_NAME;
       const char* cleared_project_name = (project_name[0] == '_') ? (project_name + 1) : project_name;
 
-      uint32_t mod_version = 3; // clears stale shader-define slots (phantom "Define 13") + invalidates cached settings/shaders
+      uint32_t mod_version = 3; // a bump resets stale shader-define slots and cached settings/shaders
       Globals::SetGlobals(cleared_project_name, "Borderlands GOTY Enhanced Luma HDR + SMAA mod", "", mod_version);
 
       // Native HDR: swapchain -> scRGB fp16; core Display Composition does the paper-white scale + scRGB encode +
@@ -1412,18 +1412,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // r10g10b10a2 backbuffer -> r16g16b16a16_float
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-      // Safety minimum: the remaster already renders its whole post chain in fp16, and the one low-precision
-      // target (the r10g10b10a2 backbuffer) is covered by the swapchain upgrade above. r8/b8 formats are left
-      // alone deliberately - nothing downstream needs them, and _srgb -> fp16 risks a sampling shift.
+      // Safety minimum: the remaster already renders its post chain in fp16. r10g10b10a2 catches textures in the
+      // backbuffer's format outside the swapchain upgrade above; r11g11b10_float includes the HBAO+ view normals
+      // XeGTAO reads. r8/b8 formats are left alone deliberately - nothing downstream needs them, and _srgb -> fp16
+      // risks a sampling shift.
       texture_upgrade_formats = {
          reshade::api::format::r10g10b10a2_unorm,
          reshade::api::format::r10g10b10a2_typeless,
-         reshade::api::format::r11g11b10_float, // bloom / lens-flare-style intermediates
+         reshade::api::format::r11g11b10_float,
       };
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio;
       force_disable_display_composition = false; // core composition does the scRGB encode + paper white
 
-      // AF16x: mode 4 upgrades the game's AF samplers to MaxAnisotropy=16 (clarity on oblique surfaces, zero risk).
+      // AF16x: mode 4 upgrades the game's AF samplers to MaxAnisotropy=16 (clarity on oblique surfaces).
       // LOD bias offset stays 0 (no TAA in this game; a negative bias would shimmer).
       enable_samplers_upgrade = true; // boot-time only
       samplers_upgrade_mode = 4;
