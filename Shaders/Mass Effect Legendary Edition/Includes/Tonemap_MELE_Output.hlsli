@@ -1,6 +1,6 @@
 // Shared stage-1 output tail, included inside each main() after it defines gradedHDR, sdrGamma, v0, v1, o0, o1.
-// The bodies also hold the decoded sdrLinear, but this tail decodes sdrGamma again on purpose: consuming their
-// local instead reschedules the vanilla curve on 0x2754F750 and 0x69F03340 in Publishing, turning r0*w + (1 - e)
+// The bodies decode sdrGamma for gradedHDR as well (MELE_NativeColorGradedHDR, or 0x225A8330's hue donor), but this
+// tail decodes it again on purpose: consuming that decode instead reschedules the vanilla curve on 0x2754F750 and 0x69F03340 in Publishing, turning r0*w + (1 - e)
 // into (r0*w - e) + 1 at the same instruction count. Float32 addition is not associative and that line is native
 // transcription, so the duplicate decode stays. Measured, not assumed.
 // Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (none / radial-power / ME3LE smoothstep), TM_HAS_GRAIN,
@@ -21,7 +21,7 @@
 const float paperWhite = MELE_GetGamePaperWhiteScale();
 const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
 
-float3 sdrLin = gamma_to_linear(sdrGamma, GCT_MIRROR);
+float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
 // Native vignette, hoisted ahead of the tonemap and expressed in linear so DICE absorbs its blue-tinted white
 // point instead of the frame leaving stage 1 above Scene Peak. linear_to_gamma is a signed pure pow, so this is
@@ -77,21 +77,22 @@ if (LumaSettings.DisplayMode == 1) // HDR
    // DICE works in absolute-nit ratios, so its cap lands at the display peak. Type 2 also runs
    // CorrectOutOfRangeColor. Grain, dither, and RCAS can still push the result ~2% past Scene Peak; accepted.
    DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
-   // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
-   // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
-   // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
-   // flattens it for every pixel above the shoulder.
+   // Highlight dechroma handed to DICE rather than run as our own pass afterwards, so it runs INSIDE the containment
+   // in the processing primaries. DICE ramps it on the compressed MAX CHANNEL from ShoulderStart * PeakWhite (1/3 of
+   // peak for this type, so mid-tones cannot be touched) to peak, but only enters that block once the channel
+   // AVERAGE passes the same shoulder: a saturated highlight below it is not desaturated, and a non-zero setting
+   // switches on with a step where the average crosses. That gate is shared DICE.hlsl code. 0 = off for the OUTPUT
+   // but not the cost: DICE's guard carries no [branch], so fxc flattens it for every pixel above the shoulder.
    settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
    postProcessedColor = DICETonemap(vignettedHDR * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
 
    // User saturation LAST, after the display map, in Game-Paper-White-relative linear RGB; 1.0 is a no-op.
    postProcessedColor = Saturation(postProcessedColor, LumaSettings.GameSettings.Saturation);
 }
-else // SDR still uses the scRGB swapchain; sdrLin is the exact native grade.
+else // SDR still uses the scRGB swapchain; sdrLinear is the exact native grade.
 {
    // No tonemap sits between here and the encode, so the linear vignette equals the vanilla gamma multiply.
-   postProcessedColor = sdrLin * vigLinear;
+   postProcessedColor = sdrLinear * vigLinear;
 }
 
 postProcessedColor = IsNaN_Strict(postProcessedColor) ? 0.0 : postProcessedColor; // Replace NaN with zero.

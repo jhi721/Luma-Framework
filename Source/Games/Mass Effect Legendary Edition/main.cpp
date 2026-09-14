@@ -8,18 +8,15 @@
 // Sub-native borderless is best-effort: the game allocates desktop-sized targets but renders a top-left
 // sub-rectangle through cb2 DynamicScale, so injected in-place passes process the full allocation.
 //
-// No DLSS or DLAA: UE3 LE exposes only an 8-bit SoftEdge mask, not usable motion vectors, so the source
-// precision caps what any temporal upscaler could do here regardless of integration effort.
+// No DLSS or DLAA. The velocity target is RGBA8 with one velocity per object: VelocityShader.usf discards the
+// per-pixel vectors its VS computes, and the stage-1 blur reads only its red channel as a blur amount. Runtime
+// captures on ME3LE showed the velocity pass drawing only the player and only with in-game Motion Blur on, and
+// skinned motion uses the current bone palette, so full-scene vectors would need stream-out over the base pass.
 
 #define DISABLE_AUTO_DEBUGGER 1 // The DEVELOPMENT attach prompt is hidden by fullscreen and blocks the loader.
 
 #define ENABLE_SMAA 1  // replaces the game's compute FXAA
 #define ENABLE_BLOOM 1 // fp16 pyramidal bloom replaces the game's clamped bloom
-// Stage-1 diagnostics dump for the HDR reconstruction. Development-only: it writes raw game
-// resources to disk and stalls on first sight of each permutation.
-#ifndef ENABLE_TONEMAP_DIAGNOSTICS
-#define ENABLE_TONEMAP_DIAGNOSTICS DEVELOPMENT
-#endif
 
 #include "..\..\Core\core.hpp"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
@@ -30,9 +27,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#if ENABLE_TONEMAP_DIAGNOSTICS
-#include <fstream>
-#endif
 
 // Selects the per-game tonemap table used by injected resource-slot handling; replacement stays CSO-hash keyed.
 enum class MEGame
@@ -74,35 +68,31 @@ struct TonemapPermDesc
    uint32_t hash;
    uint8_t scene_slot; // 1 on motion-blur permutations, where t0 is depth instead of scene color.
    uint8_t bloom_slot;
-   const char* name;       // Short descriptor for the DEVELOPMENT stage-1 readout.
-   const char* hdr_family; // Which HDR reconstruction this permutation is drawn with.
 };
-// The families partition the 19 stage-1 tonemaps 8 + 2 + 4 + 4 + 1, and which one a permutation gets
-// follows from the body it shares: this column names it for the readout rather than selecting it.
 static constexpr TonemapPermDesc kTonemapPermsME1LE[] = {
-   {0x151FE4CA, 1, 5, "MB + grain, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x69F03340, 1, 5, "MB, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x109F3B6E, 0, 4, "grain, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x8C8E8CA2, 0, 4, "LUT grade", "HDR family 01 - exponential + LUT"},
-   {0xAAE8755A, 0, 4, "analytic grade (no LUT)", "HDR family 02 - exponential + analytic"},
+   {0x151FE4CA, 1, 5}, // MB + grain, LUT grade
+   {0x69F03340, 1, 5}, // MB, LUT grade
+   {0x109F3B6E, 0, 4}, // grain, LUT grade
+   {0x8C8E8CA2, 0, 4}, // LUT grade
+   {0xAAE8755A, 0, 4}, // analytic grade (no LUT)
 };
 static constexpr TonemapPermDesc kTonemapPermsME2LE[] = {
-   {0x2754F750, 1, 5, "MB, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x1536C5B5, 1, 5, "MB + grain, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x940979D8, 1, 5, "MB, filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
-   {0x75BFAFBC, 1, 5, "MB + grain, filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
-   {0xCC76075F, 0, 4, "analytic grade (no LUT)", "HDR family 02 - exponential + analytic"},
-   {0xD077D06B, 0, 4, "LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x8E0C0DBB, 0, 4, "grain, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x222186F8, 0, 4, "filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
-   {0xEC890842, 0, 4, "grain, filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
+   {0x2754F750, 1, 5}, // MB, LUT grade
+   {0x1536C5B5, 1, 5}, // MB + grain, LUT grade
+   {0x940979D8, 1, 5}, // MB, filmic + LUT grade
+   {0x75BFAFBC, 1, 5}, // MB + grain, filmic + LUT grade
+   {0xCC76075F, 0, 4}, // analytic grade (no LUT)
+   {0xD077D06B, 0, 4}, // LUT grade
+   {0x8E0C0DBB, 0, 4}, // grain, LUT grade
+   {0x222186F8, 0, 4}, // filmic + LUT grade
+   {0xEC890842, 0, 4}, // grain, filmic + LUT grade
 };
 static constexpr TonemapPermDesc kTonemapPermsME3LE[] = {
-   {0x36B90B12, 1, 6, "MB(depth), filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
-   {0x49BD5A95, 1, 6, "MB(depth) + grain, filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
-   {0x00944C2E, 0, 4, "filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
-   {0x5AA0BD09, 0, 4, "grain, filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
-   {0x225A8330, 0, 4, "analytic grade (no LUT)", "HDR family 05 - analytic hard clip"},
+   {0x36B90B12, 1, 6}, // MB(depth), filmic + LUT grade
+   {0x49BD5A95, 1, 6}, // MB(depth) + grain, filmic + LUT grade
+   {0x00944C2E, 0, 4}, // filmic + LUT grade
+   {0x5AA0BD09, 0, 4}, // grain, filmic + LUT grade
+   {0x225A8330, 0, 4}, // analytic grade (no LUT)
 };
 // Selected once in DllMain.
 static std::span<const TonemapPermDesc> g_tonemap_perms = kTonemapPermsME1LE;
@@ -178,7 +168,17 @@ static int g_gtao_debug_view = 0; // 0=off, 1=depth, 2=normals, 3=AO x8, 4=edges
 
 // Native DoF is retained: its fp16 near/far chain has no SDR clamp, and stage 1 composites those buffers.
 
-// Per-device SMAA resources. The gamma snapshot feeds both DrawSMAA color inputs; no linear copy is needed.
+// fp16 scratch target and the views it was created with; EnsureRGBA16FTarget rebuilds it on resolution change.
+struct RGBA16FTarget
+{
+   ComPtr<ID3D11Texture2D> tex;
+   ComPtr<ID3D11RenderTargetView> rtv;
+   ComPtr<ID3D11ShaderResourceView> srv;
+   ComPtr<ID3D11UnorderedAccessView> uav;
+   uint32_t w = 0, h = 0;
+};
+
+// Per-device SMAA resources. SMAA detects edges on a gamma snapshot and blends a linear decode of it.
 struct MassEffectGameDeviceData final : public GameDeviceData
 {
    // Handles already processed by SMAA this frame; later in-place FXAA resolves must be skipped.
@@ -196,28 +196,18 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    uint32_t smaa_core_w = 0, smaa_core_h = 0;
 
    // SRV-readable snapshot of the in-place gamma post buffer.
-   ComPtr<ID3D11Texture2D> tex_input;
-   ComPtr<ID3D11ShaderResourceView> srv_input;
-   uint32_t smaa_temps_w = 0, smaa_temps_h = 0;
+   RGBA16FTarget smaa_input;
    // Its linear-light decode, for the neighborhood blend.
-   ComPtr<ID3D11Texture2D> tex_input_linear;
-   ComPtr<ID3D11UnorderedAccessView> uav_input_linear;
-   ComPtr<ID3D11ShaderResourceView> srv_input_linear;
-   uint32_t smaa_linear_w = 0, smaa_linear_h = 0;
+   RGBA16FTarget smaa_input_linear;
 
    // fp16 SMAA output, copied back directly or through RCAS.
-   ComPtr<ID3D11Texture2D> tex_smaa_out;
-   ComPtr<ID3D11RenderTargetView> tex_smaa_out_rtv;
-   ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
-   uint32_t smaa_out_w = 0, smaa_out_h = 0;
+   RGBA16FTarget smaa_out;
 
    // RCAS b0 = (width, height, sharpness, 0).
    ComPtr<ID3D11Buffer> cb_sharpen;
    uint32_t sharpen_w = 0, sharpen_h = 0;
    float sharpen_amount = -1.f;
-   ComPtr<ID3D11Texture2D> tex_rcas_out;
-   ComPtr<ID3D11RenderTargetView> tex_rcas_out_rtv;
-   uint32_t rcas_out_w = 0, rcas_out_h = 0;
+   RGBA16FTarget rcas_out;
 
    // XeGTAO scratch at half-res AO size: R24 depth from deinterleave t0, packed R8G8 view normals from horizon t0.
    ComPtr<ID3D11ShaderResourceView> srv_gtao_depth;
@@ -255,19 +245,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // one of them does not cover the other.
    const TonemapPermDesc* stage1_perm = nullptr;
    int stage1_draws = 0;
-
-#if ENABLE_TONEMAP_DIAGNOSTICS
-   // Per stage-1 hash: snapshots already written, and the frame index it becomes eligible again so the samples
-   // are spread over seconds, not frames. Several, not one: the first frame a permutation appears on is often a
-   // fade or a loading screen, whose cbuffer does not describe gameplay. Measured on ME1LE 0x69F03340, first
-   // seen with GammaColorScaleAndInverse.xyz at 1e-4, a full fade to black.
-   struct DiagnosticsState
-   {
-      uint32_t taken = 0;
-      uint32_t next_frame = 0;
-   };
-   std::unordered_map<uint32_t, DiagnosticsState> diagnostics;
-#endif
 #endif
 };
 
@@ -342,34 +319,26 @@ class MassEffectLE final : public Game
       return SUCCEEDED(device->CreateTexture2D(&td, nullptr, out.put()));
    }
 
-   // (Re)create an fp16 scratch target and its views on resolution change. Pass nullptr for a view the target does
-   // not use: bind flags follow the requested views, so an unused one cannot leave a stale flag behind.
-   static bool EnsureRGBA16FTarget(ID3D11Device* device, uint32_t w, uint32_t h, ComPtr<ID3D11Texture2D>& tex,
-      ComPtr<ID3D11RenderTargetView>* rtv, ComPtr<ID3D11ShaderResourceView>* srv, uint32_t& cached_w, uint32_t& cached_h, ComPtr<ID3D11UnorderedAccessView>* uav = nullptr)
+   // (Re)create an fp16 scratch target on resolution change, with exactly the views its bind flags ask for, so a view
+   // the target does not use cannot leave a stale flag behind.
+   static bool EnsureRGBA16FTarget(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, RGBA16FTarget* target)
    {
-      if (!tex || cached_w != w || cached_h != h)
+      if (!target->tex || target->w != w || target->h != h)
       {
-         if (rtv != nullptr)
-            rtv->reset();
-         if (srv != nullptr)
-            srv->reset();
-         if (uav != nullptr)
-            uav->reset();
-         tex.reset();
-         const UINT bind_flags = (srv != nullptr ? D3D11_BIND_SHADER_RESOURCE : 0u) | (rtv != nullptr ? D3D11_BIND_RENDER_TARGET : 0u) | (uav != nullptr ? D3D11_BIND_UNORDERED_ACCESS : 0u);
-         if (CreateDefaultRGBA16FTex(device, w, h, bind_flags, tex))
+         *target = {};
+         if (CreateDefaultRGBA16FTex(device, w, h, bind_flags, target->tex))
          {
-            if (rtv != nullptr)
-               device->CreateRenderTargetView(tex.get(), nullptr, rtv->put());
-            if (srv != nullptr)
-               device->CreateShaderResourceView(tex.get(), nullptr, srv->put());
-            if (uav != nullptr)
-               device->CreateUnorderedAccessView(tex.get(), nullptr, uav->put());
-            cached_w = w;
-            cached_h = h;
+            if (bind_flags & D3D11_BIND_RENDER_TARGET)
+               device->CreateRenderTargetView(target->tex.get(), nullptr, target->rtv.put());
+            if (bind_flags & D3D11_BIND_SHADER_RESOURCE)
+               device->CreateShaderResourceView(target->tex.get(), nullptr, target->srv.put());
+            if (bind_flags & D3D11_BIND_UNORDERED_ACCESS)
+               device->CreateUnorderedAccessView(target->tex.get(), nullptr, target->uav.put());
+            target->w = w;
+            target->h = h;
          }
       }
-      return (rtv == nullptr || *rtv) && (srv == nullptr || *srv) && (uav == nullptr || *uav);
+      return target->tex && (!(bind_flags & D3D11_BIND_RENDER_TARGET) || target->rtv) && (!(bind_flags & D3D11_BIND_SHADER_RESOURCE) || target->srv) && (!(bind_flags & D3D11_BIND_UNORDERED_ACCESS) || target->uav);
    }
 
    static void ReleaseGTAOScratch(MassEffectGameDeviceData& gd)
@@ -467,208 +436,6 @@ public:
       delete static_cast<MassEffectGameDeviceData*>(device_data.game);
       device_data.game = nullptr;
    }
-
-#if ENABLE_TONEMAP_DIAGNOSTICS
-   // Stage-1 diagnostics dump. Everything the offline bench (_tools/mele_bridge)
-   // cannot know: the live $Globals payload, the real 1D filmic LUT, the real
-   // 16-slice colour LUT, and the sampler state each is read through. Without
-   // these the bench runs on invented grade parameters and synthetic tables, so it
-   // can only prove that the code matches the specified model, never that the
-   // model suits this game.
-   //
-   // Deliberately dumps RAW bytes plus a manifest rather than decoded fields: the
-   // $Globals layout differs per permutation family (ME1LE/ME2LE LUT c4-c6, the
-   // analytic body c4-c10, 0x225A8330 c36+), so any offset table compiled in here
-   // would be a second source of truth that silently drifts from the HLSL. The
-   // Python side reads the packoffsets straight out of the shader source instead.
-   //
-   // Bindings are read before any custom-pass gate, because stage 1 is
-   // hash-replaced and a replaced pass still carries the game's own resources at
-   // this point.
-   //
-   // A few spaced snapshots per hash per session, blocking Map, no ring buffer:
-   // this is a diagnostic build and an occasional stall is cheaper than the
-   // complexity of avoiding it.
-   void DumpTonemapDiagnostics(
-      ID3D11Device* native_device, ID3D11DeviceContext* native_device_context,
-      MassEffectGameDeviceData& gd,
-      const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
-   {
-      uint32_t hash = 0;
-      for (const TonemapPermDesc& candidate : g_tonemap_perms)
-      {
-         if (original_shader_hashes.Contains(candidate.hash,
-                reshade::api::shader_stage::pixel))
-         {
-            hash = candidate.hash;
-            break;
-         }
-      }
-      constexpr uint32_t kSnapshotsPerHash = 8;         // Enough to get past a fade without filling the disk.
-      constexpr uint32_t kFramesBetweenSnapshots = 120; // Roughly two seconds apart at 60 fps.
-      if (hash == 0)
-         return;
-      // Spaced, not consecutive. Eight snapshots taken on back-to-back draws span about a tenth of a
-      // second and can all land inside one fade, which is exactly what the first ME2LE capture did:
-      // 0x2754F750 reported the same 1e-4 output scale eight times over.
-      const uint32_t frame = cb_luma_global_settings.FrameIndex;
-      auto& state = gd.diagnostics[hash];
-      if (state.taken >= kSnapshotsPerHash || frame < state.next_frame)
-         return;
-      state.next_frame = frame + kFramesBetweenSnapshots;
-      const uint32_t snapshot = state.taken++;
-
-      std::error_code ec;
-      const std::filesystem::path root =
-         System::GetModulePath().parent_path() / "Luma-MELE-Diagnostics";
-      std::filesystem::create_directories(root, ec);
-      if (ec)
-         return;
-
-      char stem[24];
-      std::snprintf(stem, sizeof(stem), "0x%08X_s%u", hash, snapshot);
-
-      std::ofstream manifest(root / (std::string(stem) + "_manifest.txt"));
-      if (!manifest)
-         return;
-      manifest << "hash " << Shader::Hash_NumToStr(hash, true) << "\n";
-      manifest << "snapshot " << snapshot << "\n";
-      manifest << "frame " << frame << "\n";
-
-      const auto write_blob = [&root](const std::string& name, const void* data,
-                                 size_t bytes)
-      {
-         std::ofstream out(root / name, std::ios::binary);
-         out.write(static_cast<const char*>(data),
-            static_cast<std::streamsize>(bytes));
-      };
-
-      // $Globals at b0. Raw, with its byte size recorded so a truncated or
-      // unexpectedly sized buffer is visible rather than silently misread.
-      {
-         ComPtr<ID3D11Buffer> cb0;
-         native_device_context->PSGetConstantBuffers(0, 1, cb0.put());
-         if (cb0)
-         {
-            D3D11_BUFFER_DESC bd{};
-            cb0->GetDesc(&bd);
-            D3D11_BUFFER_DESC sd = bd;
-            sd.Usage = D3D11_USAGE_STAGING;
-            sd.BindFlags = 0;
-            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            sd.MiscFlags = 0;
-            ComPtr<ID3D11Buffer> staging;
-            if (SUCCEEDED(native_device->CreateBuffer(&sd, nullptr, staging.put())))
-            {
-               native_device_context->CopyResource(staging.get(), cb0.get());
-               D3D11_MAPPED_SUBRESOURCE ms{};
-               if (SUCCEEDED(native_device_context->Map(staging.get(), 0,
-                      D3D11_MAP_READ, 0, &ms)))
-               {
-                  write_blob(std::string(stem) + "_cb0.bin", ms.pData, bd.ByteWidth);
-                  native_device_context->Unmap(staging.get(), 0);
-                  manifest << "cb0 bytes " << bd.ByteWidth << " float4s "
-                           << (bd.ByteWidth / 16) << " file " << stem << "_cb0.bin\n";
-               }
-            }
-         }
-      }
-
-      // Every bound pixel-stage SRV. Small textures are dumped whole; large ones
-      // are scene, bloom, depth and velocity and only their descriptions are
-      // recorded. Enumerating rather than indexing a slot table means this cannot
-      // drift from the permutation map, and it reports what is actually bound.
-      constexpr UINT kMaxSlots = 16;
-      constexpr UINT kMaxDumpTexels =
-         1u
-         << 16; // A 4096x1 curve or a 256x16 strip fits; a frame buffer does not.
-      ComPtr<ID3D11ShaderResourceView> srvs[kMaxSlots];
-      ID3D11ShaderResourceView* raw_srvs[kMaxSlots] = {};
-      native_device_context->PSGetShaderResources(0, kMaxSlots, raw_srvs);
-      for (UINT slot = 0; slot < kMaxSlots; ++slot)
-      {
-         srvs[slot].attach(raw_srvs[slot]); // Adopts the AddRef from PSGetShaderResources.
-         if (!srvs[slot])
-            continue;
-
-         ComPtr<ID3D11Resource> resource;
-         srvs[slot]->GetResource(resource.put());
-         ComPtr<ID3D11Texture2D> tex;
-         if (!resource || FAILED(resource->QueryInterface(IID_PPV_ARGS(tex.put()))))
-            continue;
-
-         D3D11_TEXTURE2D_DESC td{};
-         tex->GetDesc(&td);
-         manifest << "t" << slot << " " << td.Width << "x" << td.Height << " mips "
-                  << td.MipLevels << " arr " << td.ArraySize << " dxgi "
-                  << static_cast<uint32_t>(td.Format);
-
-         if (static_cast<uint64_t>(td.Width) * td.Height > kMaxDumpTexels)
-         {
-            manifest << " skipped (too large)\n";
-            continue;
-         }
-
-         D3D11_TEXTURE2D_DESC sd = td;
-         sd.Usage = D3D11_USAGE_STAGING;
-         sd.BindFlags = 0;
-         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-         sd.MiscFlags = 0;
-         sd.MipLevels = 1;
-         sd.ArraySize = 1;
-         sd.SampleDesc = {1, 0};
-         ComPtr<ID3D11Texture2D> staging;
-         if (FAILED(native_device->CreateTexture2D(&sd, nullptr, staging.put())))
-         {
-            manifest << " staging failed\n";
-            continue;
-         }
-         native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0,
-            tex.get(), 0, nullptr);
-         D3D11_MAPPED_SUBRESOURCE ms{};
-         if (FAILED(native_device_context->Map(staging.get(), 0, D3D11_MAP_READ, 0,
-                &ms)))
-         {
-            manifest << " map failed\n";
-            continue;
-         }
-         // The whole mapped slice at once. DepthPitch is its true size, which matters for
-         // block-compressed formats: those have Height/4 rows of blocks, so walking Height
-         // rows at RowPitch reads past the end of the mapping. ME3LE binds a 256x256 BC1
-         // texture beside its LUTs and hit exactly that.
-         char name[64];
-         std::snprintf(name, sizeof(name), "%s_t%u.bin", stem, slot);
-         write_blob(name, ms.pData, ms.DepthPitch);
-         native_device_context->Unmap(staging.get(), 0);
-         manifest << " pitch " << ms.RowPitch << " bytes " << ms.DepthPitch << " file " << name << "\n";
-      }
-
-      // Sampler state matters for the probe reads: address mode decides what a
-      // coordinate past the last texel returns, and the filter decides whether the
-      // per-pixel Sample and the fit's SampleLevel see the same
-      // value. Both are assumptions the offline model currently cannot check.
-      ID3D11SamplerState* raw_samplers[kMaxSlots] = {};
-      native_device_context->PSGetSamplers(0, kMaxSlots, raw_samplers);
-      for (UINT slot = 0; slot < kMaxSlots; ++slot)
-      {
-         if (!raw_samplers[slot])
-            continue;
-         D3D11_SAMPLER_DESC sad{};
-         raw_samplers[slot]->GetDesc(&sad);
-         manifest << "s" << slot << " filter " << static_cast<uint32_t>(sad.Filter)
-                  << " addr " << static_cast<uint32_t>(sad.AddressU) << ","
-                  << static_cast<uint32_t>(sad.AddressV) << " mip " << sad.MinLOD
-                  << ".." << sad.MaxLOD << " bias " << sad.MipLODBias << "\n";
-         raw_samplers[slot]->Release();
-      }
-
-      // The live user settings that scale the captured signals; without them the
-      // dump cannot be reproduced.
-      manifest << "exposure " << cb_luma_global_settings.GameSettings.Exposure << "\n";
-      manifest << "bloom_scale_live " << gd.bloom_scale_live
-               << " bloom_threshold_live " << gd.bloom_threshold_live << "\n";
-   }
-#endif
 
    // Capture bright-pass cb0 into a staging ring and map the oldest entry with DO_NOT_WAIT, so the readback
    // never stalls. OnPresent turns the live artist-authored BloomScale into the effective intensity.
@@ -1103,20 +870,20 @@ public:
             return DrawOrDispatchOverrideType::None;
 
          // The fp16 SMAA output is both a render target and an SRV for the optional sharpen pass.
-         if (!EnsureRGBA16FTarget(native_device, w, h, gd.tex_smaa_out, std::addressof(gd.tex_smaa_out_rtv), std::addressof(gd.tex_smaa_out_srv), gd.smaa_out_w, gd.smaa_out_h))
+         if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &gd.smaa_out))
             return DrawOrDispatchOverrideType::None;
 
          // The gamma snapshot is only ever read; its linear-light decode feeds the neighborhood blend.
-         if (!EnsureRGBA16FTarget(native_device, w, h, gd.tex_input, nullptr, std::addressof(gd.srv_input), gd.smaa_temps_w, gd.smaa_temps_h) ||
-             !EnsureRGBA16FTarget(native_device, w, h, gd.tex_input_linear, nullptr, std::addressof(gd.srv_input_linear), gd.smaa_linear_w, gd.smaa_linear_h, std::addressof(gd.uav_input_linear)))
+         if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, &gd.smaa_input) ||
+             !EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &gd.smaa_input_linear))
             return DrawOrDispatchOverrideType::None;
 
-         native_device_context->CopyResource(gd.tex_input.get(), color_res.get());
+         native_device_context->CopyResource(gd.smaa_input.tex.get(), color_res.get());
          {
             DrawStateStack<DrawStateStackType::Compute> linearize_state;
             linearize_state.Cache(native_device_context, device_data.uav_max_count);
-            ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
-            ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
+            ID3D11ShaderResourceView* lin_srv = gd.smaa_input.srv.get();
+            ID3D11UnorderedAccessView* lin_uav = gd.smaa_input_linear.uav.get();
             native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
             native_device_context->CSSetShaderResources(0, 1, &lin_srv);
             native_device_context->CSSetShader(linearize_cs, nullptr, 0);
@@ -1133,7 +900,7 @@ public:
          native_device_context->PSSetConstantBuffers(1, 1, &mcb);
 
          DrawSMAA(native_device, native_device_context, device_data,
-            gd.tex_smaa_out_rtv.get(), gd.srv_input_linear.get() /*blend color (linear)*/, gd.srv_input.get() /*edge color (gamma)*/,
+            gd.smaa_out.rtv.get(), gd.smaa_input_linear.srv.get() /*blend color (linear)*/, gd.smaa_input.srv.get() /*edge color (gamma)*/,
             depth_ok ? gd.srv_depth.get() : nullptr /*predication*/);
 
          // Apply optional RCAS, otherwise copy SMAA directly so the cancelled resolve always produces output.
@@ -1155,7 +922,7 @@ public:
             }
             // Written by the sharpen pass and then copied out, so it needs no SRV.
             const bool rcas_target_ready =
-               EnsureRGBA16FTarget(native_device, w, h, gd.tex_rcas_out, std::addressof(gd.tex_rcas_out_rtv), nullptr, gd.rcas_out_w, gd.rcas_out_h);
+               EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET, &gd.rcas_out);
             if (!gd.cb_sharpen || !rcas_target_ready)
                do_sharpen = false;
          }
@@ -1171,15 +938,15 @@ public:
             ID3D11Buffer* scb = gd.cb_sharpen.get();
             native_device_context->PSSetConstantBuffers(0, 1, &scb);
             DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-               sharpen_vs, sharpen_ps, gd.tex_smaa_out_srv.get(), gd.tex_rcas_out_rtv.get(), w, h, false);
+               sharpen_vs, sharpen_ps, gd.smaa_out.srv.get(), gd.rcas_out.rtv.get(), w, h, false);
 
             sharpen_state.Restore(native_device_context);
 
-            native_device_context->CopyResource(color_res.get(), gd.tex_rcas_out.get());
+            native_device_context->CopyResource(color_res.get(), gd.rcas_out.tex.get());
          }
          else
          {
-            native_device_context->CopyResource(color_res.get(), gd.tex_smaa_out.get());
+            native_device_context->CopyResource(color_res.get(), gd.smaa_out.tex.get());
          }
 
          // Restore native VS/PS b1; no compute state was changed.
@@ -1217,11 +984,6 @@ public:
       // movies without a scene resolve, and pre-scene menus remain intact.
       if (g_hide_ui && !is_custom_pass && gd.scene_post_done_this_frame)
          return DrawOrDispatchOverrideType::Replaced;
-
-#if ENABLE_TONEMAP_DIAGNOSTICS
-      // First, so the dump records the game's own bindings before any injection replaces them.
-      DumpTonemapDiagnostics(native_device, native_device_context, gd, original_shader_hashes);
-#endif
 
       CaptureBloomScale(native_device, native_device_context, gd, original_shader_hashes);
 
@@ -1512,10 +1274,9 @@ public:
          }
          else
          {
-            ImGui::Text("perm 0x%08X  %s", gd.stage1_perm->hash, gd.stage1_perm->name);
-            ImGui::Text("%s  (draws this frame: %d)", gd.stage1_perm->hdr_family, gd.stage1_draws);
+            ImGui::Text("perm 0x%08X  (draws this frame: %d)", gd.stage1_perm->hash, gd.stage1_draws);
             if (ImGui::IsItemHovered())
-               ImGui::SetTooltip("The HDR reconstruction THIS permutation is drawn with. A frame reporting two draws switched permutation mid-frame and may be using two.");
+               ImGui::SetTooltip("The stage-1 permutation the game drew last; its description and HDR family are in the matching Tonemap_0x<hash> shader. A frame reporting two draws switched permutation mid-frame and may be using two families.");
          }
 
          ImGui::SeparatorText("Bloom DEV readout");

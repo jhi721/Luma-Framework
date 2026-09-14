@@ -1,13 +1,13 @@
 #ifndef LUMA_MELE_TONEMAP_HUE_REFERENCE
 #define LUMA_MELE_TONEMAP_HUE_REFERENCE
 
-#include "../../Includes/ACES.hlsl"     // BT709 <-> AP1 matrices for the gamut clamp.
-#include "../../Includes/Oklab.hlsl"    // Same include root as this folder's Common.hlsl, not the body's.
-#include "Tonemap_MELE_HDRBridge.hlsli" // MELE_IsFinite; needs ../Includes/Reinhard.hlsl before it.
+#include "../../Includes/ACES.hlsl"  // BT709 <-> AP1 matrices for the gamut clamp.
+#include "../../Includes/Oklab.hlsl" // Same include root as this folder's Common.hlsl, not the body's.
 
 // Hue-only transfer for family 05, adapted from renodx::color::correct::HueOKLab
 // (renodx/src/shaders/colorcorrect.hlsl) with RenoDX's AP1-positive clamp
-// (renodx/src/shaders/color/clamp.hlsl) rebuilt on Luma's own ACES matrices.
+// (renodx/src/shaders/color/clamp.hlsl) rebuilt on Luma's own ACES matrices. MELE_IsFinite comes from
+// Includes/Common.hlsl.
 //
 // WHAT MOVES AND WHAT DOES NOT. Only the direction of the OKLab (a, b) vector is allowed to travel
 // toward the reference. The target keeps its perceptual lightness L and the magnitude of its own
@@ -28,6 +28,9 @@
 // here is for arithmetic that actually broke.
 //
 // DICE, further down the shared output tail, stays the one and only display mapper.
+//
+// The OKLab locals stay snake_case where the rest of this game's HDR code is camelCase: this is a line-by-line port,
+// and keeping the source spelling keeps the two diffable, as Shaders/Includes/ACES.hlsl and Reinhard.hlsl do.
 float3 MELE_HueReferenceOKLab(float3 target, float3 reference, float strength)
 {
    float3 target_lab = Oklab::linear_srgb_to_oklab(target);

@@ -4,5 +4,5 @@
 #define TM_HAS_GRAIN      1
 #define TM_HAS_FILMIC     0
 #define TM_VIG_POW        100.0
-#define TM_VIG_FLOOR      kMELE_ME1VignetteFloor
+#define TM_VIG_FLOOR      kMELE_ME1LEVignetteFloor
 #include "Tonemap_ME12LE_LUT_Body.hlsl"

@@ -4,39 +4,13 @@
 #include "Tonemap_MELE_HDRConfig.hlsli"
 
 // Pure math. Prerequisites, which this file deliberately does NOT include:
+//   Includes/Common.hlsl      MELE_IsFinite, MELE_IsFiniteNonNegative
 //   ../Includes/Color.hlsl    gamma_to_linear, GetLuminance, GCT_MIRROR
 //   ../Includes/Math.hlsl     max3, FLT_MAX  (arrive through Color.hlsl)
 //   ../Includes/Reinhard.hlsl ReinhardRange
 // Reinhard.hlsl has no include guard, unlike every other shared header, so including it from here
 // would be a duplicate-namespace error in the bodies that already include it. Include it in the body,
 // before this file.
-
-// Two predicates, not one. Every value this reconstruction guards is either a light quantity that has no
-// meaning below zero, or an artist dial whose sign is free - a shadow lift, a luminance weight, an
-// overlay offset, and the signed differences those produce. Applying the non-negative form to one of
-// those would reject valid game data as corrupt, so the choice is made per value.
-//
-// Ordered comparisons against constants, not the IsNaN_Strict/IsInfinite_Strict bit tests: NaN fails both
-// (DXBC ge/le are ordered), +INF fails the upper bound, -INF and negatives the lower, so the sets are
-// identical. This is not the x != x idiom Math.hlsl warns fxc folds away, and it costs 2 instructions per
-// channel where the bit tests cost about 7 - the same trade Luma_BL2TPS_Tonemap.hlsl measured.
-// Keep any negation OUTSIDE the conjunction: (x < lo || x > hi) is false for NaN and would accept it.
-bool MELE_IsFinite(float x)
-{
-   return abs(x) <= FLT_MAX;
-}
-bool MELE_IsFinite(float3 v)
-{
-   return all(abs(v) <= FLT_MAX);
-}
-bool MELE_IsFiniteNonNegative(float x)
-{
-   return x >= 0.0 && x <= FLT_MAX;
-}
-bool MELE_IsFiniteNonNegative(float3 v)
-{
-   return all(v >= 0.0) && all(v <= FLT_MAX);
-}
 
 // Max-channel proxy. One scalar for all three channels, so the limiter cannot move an RGB ratio; the
 // per-channel character stays owned by the working curve and by the native reference.
@@ -95,7 +69,7 @@ bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3
    // The shoulder is asymptotic to 1, so the tolerance covers roundoff in it and nothing else. A
    // compressed value genuinely above 1 means the shoulder did not do its job, which is a failure
    // rather than something to clamp quietly.
-   if (!(scale > 0.0 && scale <= 1.0) || !MELE_IsFiniteNonNegative(compressed) || max3(compressed) > 1.0 + MELE_BRIDGE_PROXY_EPS)
+   if (!(scale > 0.0 && scale <= 1.0) || !MELE_IsFiniteNonNegative(compressed) || max3(compressed) > 1.0 + MELE_HDR_BRIDGE_PROXY_EPS)
    {
       return false;
    }
@@ -174,5 +148,21 @@ float3 MELE_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetLum
       return nativeReferenceLinear;
    }
    return result;
+}
+
+// gradedHDR for families 01-04. The exact native SDR result, decoded once, is the starting value and the only
+// fallback for the whole triple; a valid reconstruction keeps its RGB ratios at the working luminance, so whatever
+// hue the grade gave the working value is dropped. The output tail decodes sdrGamma again on purpose; see
+// Tonemap_MELE_Output.hlsli.
+float3 MELE_NativeColorGradedHDR(float3 sdrGamma, float3 workHDR, bool workValid)
+{
+   const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
+   // One exit: an early return inside the branch trips fxc's X4000 on the inlined result.
+   float3 gradedHDR = sdrLinear;
+   if (workValid)
+   {
+      gradedHDR = MELE_NativeColorAtLuminance(sdrLinear, GetLuminance(workHDR, CS_BT709));
+   }
+   return gradedHDR;
 }
 #endif // LUMA_MELE_TONEMAP_HDR_BRIDGE

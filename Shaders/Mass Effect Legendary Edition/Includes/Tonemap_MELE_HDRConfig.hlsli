@@ -35,7 +35,7 @@
 // Roundoff tolerance on the bridge's bounded-proxy assertion. The shoulder is asymptotic to 1, so a
 // compressed max channel can only exceed it by arithmetic error. It is not a clamp: widening it to make a
 // failing case pass would hide the condition the check exists to report.
-#define MELE_BRIDGE_PROXY_EPS 1e-4
+#define MELE_HDR_BRIDGE_PROXY_EPS 1e-4
 
 // Minimum accepted slope for each filmic family's fit. The two are in DIFFERENT domains and the
 // numbers are not interchangeable: family 04 fits in scene-x, family 03 in the LUT's own input z, and
@@ -48,8 +48,8 @@
 #define MELE_FILMIC_MIN_SLOPE_X 1e-5
 
 // Strength of family 05's hue-only transfer toward the native hard-clipped SDR. A calibration value, not
-// a property of the algorithm. The family was promoted by the 2026-09-11 A/B; this number was set back
-// to 0.75 afterwards, so it is the one part of family 05 that A/B did not run at its shipped value.
+// a property of the algorithm. The 2026-09-11 in-game A/B ran family 05 at 1.0; 0.75 replaced it afterwards on
+// the offline measurement below and was kept as final on 2026-09-14 without a second in-game A/B.
 //
 // Why not 1.0: at exactly 1.0 the blend IS the donor's ab, so the target keeps none of its own. A hard
 // clip drives the brightest colours to white, and a white donor's OKLab ab is not zero but matrix
@@ -60,9 +60,5 @@
 // neutral donor. No donor-chroma threshold is added to paper over it: that would be a new artistic
 // rule, and lowering this number is the honest control.
 #define MELE_HARDCLIP_HUE_STRENGTH 0.75
-
-// Swizzle adapters for the ME1LE/ME2LE LUT body, whose grade chain is transcribed BRG-in / RGB-out.
-#define MELE_RGB_TO_BRG(v) ((v).zxy)
-#define MELE_BRG_TO_RGB(v) ((v).yzx)
 
 #endif // LUMA_MELE_TONEMAP_HDR_CONFIG

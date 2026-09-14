@@ -19,7 +19,7 @@
 #include "../Includes/DICE.hlsl"     // Display-peak tonemap.
 #include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
 #include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
-#include "Includes/Tonemap_MELE_ExpExtended.hlsli" // Tangent continuation of the native curve.
+#include "Includes/Tonemap_MELE_ExpExtended.hlsli" // Continued scene curve and its validated work input.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
@@ -221,31 +221,6 @@ float3 MELE_ME12LE_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_FilmicExtended.hlsli"
 #endif
 
-// The HDR grade for both families this body serves: 01 on the non-filmic branch and 03 on the filmic one.
-// They differ in what they feed it, never in what it does, so there is one of it.
-//
-// Defined here, after MELE_ME12LE_GradeChain, so the bridge drives the real game grade and the real 16-slice
-// LUT rather than an approximation. The BRG rotation stays inside: both branches of that chain are transcribed
-// BRG-in / RGB-out, which is a property of the chain and not of either caller.
-//
-// r is the exponent of the composite tail from grade input to linear gradedHDR, read from the frame's own
-// cbuffer and never assumed to be 1.
-//
-// False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the whole
-// triple and workHDR must not be read then. The bridge validates workRGB before any pow, division or LUT
-// read, so a bad working value is rejected rather than laundered by the saturate the grade chain opens with.
-bool MELE_TryME12LE_GradeHDR(float3 workRGB, out float3 workHDR)
-{
-   workHDR = float3(0.0, 0.0, 0.0);
-   float q;
-   float3 proxyRGB;
-   if (!MELE_TryBuildGradeProxy(workRGB, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))
-   {
-      return false;
-   }
-   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxyRGB)), GCT_MIRROR), q, workHDR);
-}
-
 void main(
     float4 v0 : TEXCOORD0,
     float2 v1 : TEXCOORD1,
@@ -258,7 +233,8 @@ void main(
    r1.xyz = SceneColorTexture.Sample(SceneColorTextureSampler_s, r0.xy).xyz;
 
 #if TM_HAS_MOTIONBLUR
-   // Native five-tap camera blur from 0x2754F750. VelocityBuffer.x is a SoftEdge mask that scales the vector.
+   // Native five-tap camera blur from 0x2754F750 (SFXMotionBlur in MotionBlurCommon.usf). VelocityBuffer.x is its
+   // DynamicVelocity.x, which scales the camera vector.
    r0.z = VelocityBuffer.Sample(VelocityBufferSampler_s, r0.xy).x;
    r0.w = SceneDepthTexture.Sample(SceneDepthTextureSampler_s, r0.xy).x;
    r0.w = r0.w * MinZ_MaxZRatio.z + -MinZ_MaxZRatio.w;
@@ -321,9 +297,6 @@ void main(
    // Scene-referred exposure before SDR and HDR tonemapping.
    r1.xyz = r1.xyz * LumaSettings.GameSettings.Exposure;
 
-   // HDR working value, filled only in HDR by the branch below; workValid false keeps the native SDR result.
-   float3 workHDR = 0.0;
-   bool workValid = false;
 #if TM_HAS_FILMIC
    // Filmic path from 0x222186F8: bloom, exponential curve, then per-channel 4096x1 LUT.
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
@@ -346,18 +319,6 @@ void main(
    r1.x = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.zz).x;
    r1.xyz = saturate(r1.xyz);
    // The native per-channel filmic value reaches the 16-slice LUT untouched - that is this branch's SDR output.
-   // Family 03 does not touch it; it continues both tone stages and grades that second value.
-   if (LumaSettings.DisplayMode == 1)
-   {
-      // The native filmic samples were written BRG by the three assignments above, so rotate once to RGB
-      // before the shared helper sees them, and let the wrapper rotate back for the grade.
-      float3 extendedFilmic;
-      workValid = MELE_TryEvaluateME2LEFilmicExtended(sceneLinear, bloomLinear, MELE_BRG_TO_RGB(r1.xyz), extendedFilmic);
-      if (workValid)
-      {
-         workValid = MELE_TryME12LE_GradeHDR(extendedFilmic, workHDR);
-      }
-   }
    // r1.xyz stays the native post-filmic value.
 #else
    // Non-filmic path from 0x2754F750: bloom, exponential curve, highlight desaturation, adjustments, then LUT.
@@ -380,24 +341,35 @@ void main(
    r0.xyz = r0.xyz * r0.www + r1.xyz;
 
    // The native per-channel value still reaches the grade untouched - that is this branch's SDR output.
-   // Family 01 does not touch it; it continues the curve on the scene and grades that second value.
-   if (LumaSettings.DisplayMode == 1)
-   {
-      // The scene and the bloom are validated HERE, separately, before the exponential runs on either.
-      // The bridge downstream only ever sees their SUM, and a positive bloom hides a bad scene channel
-      // inside it: with C = -0.1 and B = 0.2 the sum is F(-0.1) + 0.2 = 0.074941, which is finite and
-      // non-negative and passes every later check, while the source already left this model's domain.
-      // A whole-triple refusal is the answer; the scene is never repaired with max(C, 0).
-      //
-      // The extension applies to the scene BEFORE its curve; the bloom is added where vanilla adds it, so this
-      // reduces to the native grade input exactly wherever the scene sits at or below the pivot.
-      if (MELE_IsFiniteNonNegative(sceneLinear) && MELE_IsFiniteNonNegative(bloomLinear))
-      {
-         workValid = MELE_TryME12LE_GradeHDR(MELE_ExpExtended(sceneLinear, MELE_HDR_PIVOT) + bloomLinear, workHDR);
-      }
-   }
    // r0.xyz stays the native per-channel value.
 #endif
+
+   // HDR working value. Family 01 grades the native curve continued on the scene; family 03 also continues the
+   // second tone stage, the filmic LUT. Both reduce to the native grade input below their pivots.
+   float3 workHDR = 0.0;
+   bool workValid = false;
+   if (LumaSettings.DisplayMode == 1)
+   {
+      float3 workRGB;
+      bool sourceValid = MELE_TryExpExtendedInput(sceneLinear, bloomLinear, workRGB);
+#if TM_HAS_FILMIC
+      // That sum is the filmic LUT's input z. The native filmic samples in r1 were written BRG, so they are rotated
+      // to RGB here.
+      const float3 z = workRGB;
+      if (sourceValid)
+      {
+         sourceValid = MELE_TryEvaluateME2LEFilmicExtended(z, r1.yzx, workRGB);
+      }
+#endif
+      // The bridge drives the real grade and 16-slice LUT, whose chain is transcribed BRG-in / RGB-out in both
+      // branches, so the proxy is rotated into it. r is read from the frame's own cbuffer, never assumed to be 1.
+      float q;
+      float3 proxyRGB;
+      if (sourceValid && MELE_TryBuildGradeProxy(workRGB, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))
+      {
+         workValid = MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME12LE_GradeChain(proxyRGB.zxy), GCT_MIRROR), q, workHDR);
+      }
+   }
 
    // Use one native grade function for both the working value and SDR reference. Filmic feeds r1; non-filmic r0.
 #if TM_HAS_FILMIC
@@ -405,19 +377,7 @@ void main(
 #else
    float3 sdrGamma = MELE_ME12LE_GradeChain(r0.xyz);
 #endif
-
-   // The output tail decodes sdrGamma again on purpose; see Tonemap_MELE_Output.hlsli.
-   const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
-
-   // The exact native SDR result is the starting value and the only fallback, for the whole triple.
-   float3 gradedHDR = sdrLinear;
-   // One projection for both branches: they differ in what fills workHDR, never in what is done with it.
-   // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
-   // Whatever hue the LUT gave the q-proxy belongs to workHDR and is deliberately dropped here.
-   if (workValid)
-   {
-      gradedHDR = MELE_NativeColorAtLuminance(sdrLinear, GetLuminance(workHDR, CS_BT709));
-   }
+   float3 gradedHDR = MELE_NativeColorGradedHDR(sdrGamma, workHDR, workValid);
 
    // Shared tail: radial vignette, optional grain, and zero alpha. Defaults are ME2LE's power-200 curve and blue
    // white point; ME1LE entry points override both.
@@ -426,7 +386,7 @@ void main(
 #define TM_VIG_POW 200.0
 #endif
 #ifndef TM_VIG_FLOOR
-#define TM_VIG_FLOOR kMELE_ME2VignetteFloor
+#define TM_VIG_FLOOR kMELE_ME2LEVignetteFloor
 #endif
 #include "Includes/Tonemap_MELE_Output.hlsli"
 }

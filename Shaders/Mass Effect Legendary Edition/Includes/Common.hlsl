@@ -39,15 +39,48 @@ float3 MELE_NativeGammaCurve(float3 c, float3 scale, float invGamma, bool clampF
    return exp2(c);
 }
 
-// Native per-channel tone curve from the stage-1 decompiles, asymptotic to 1. It stays the exact native branch
-// below the HDR continuation pivot, and it also supplies the domain the ME2LE staged filmic fit probes in.
+// Native per-channel tone curve from the stage-1 decompiles, asymptotic to 1: F(x) = 1 - exp2(-a * x). It stays the
+// exact native branch below the HDR continuation pivot, and it also supplies the domain the ME2LE staged filmic fit
+// probes in. The bodies' register-level transcription of the same curve keeps its literal.
+static const float kMELE_NativeToneCurveRate = 1.70000005;
 float MELE_NativeToneCurve(float x)
 {
-   return 1.0 - exp2(-1.70000005 * x);
+   return 1.0 - exp2(-kMELE_NativeToneCurveRate * x);
 }
 
 // Native radial-vignette floors, transcribed from the stage-1 decompiles and selected through TM_VIG_FLOOR. The
 // shared tail rebuilds each white point as TM_VIG_FLOOR + 1, so these carry the tint too: ME1LE nearly neutral,
 // ME2LE strongly blue.
-static const float3 kMELE_ME1VignetteFloor = float3(0.0103630004, 5.75000013e-06, 0.0130924946);
-static const float3 kMELE_ME2VignetteFloor = float3(0.0103630004, 5.75000013e-06, 0.163092494);
+static const float3 kMELE_ME1LEVignetteFloor = float3(0.0103630004, 5.75000013e-06, 0.0130924946);
+static const float3 kMELE_ME2LEVignetteFloor = float3(0.0103630004, 5.75000013e-06, 0.163092494);
+
+// Finite guards for the stage-1 HDR reconstruction. Two predicates, not one: every value it guards is either a light
+// quantity that has no meaning below zero, or an artist dial whose sign is free - a shadow lift, a luminance weight,
+// an overlay offset, and the signed differences those produce. Applying the non-negative form to one of those would
+// reject valid game data as corrupt, so the choice is made per value.
+//
+// Ordered comparisons against constants, not the IsNaN_Strict/IsInfinite_Strict bit tests: NaN fails both (DXBC ge/le
+// are ordered), +INF fails the upper bound, -INF and negatives the lower, so the sets are identical, at 2 instructions
+// per channel where the bit tests cost about 7 - the same trade Luma_BL2TPS_Tonemap.hlsl measured. Keep any negation
+// OUTSIDE the conjunction: (x < lo || x > hi) is false for NaN and would accept it.
+//
+// COMPUTED VALUES ONLY. Without IEEE strictness (/Gis) fxc treats a raw constant-buffer read as finite and deletes
+// these comparisons on it: MELE_IsFinite(SceneMidTones.xyz) vanished from the analytic listings, measured 2026-09-14.
+// A product, sum or quotient can overflow, so its comparison survives. Guard a raw cbuffer value with the
+// IsNaN_Strict/IsInfinite_Strict bit tests instead.
+bool MELE_IsFinite(float x)
+{
+   return abs(x) <= FLT_MAX;
+}
+bool MELE_IsFinite(float3 v)
+{
+   return all(abs(v) <= FLT_MAX);
+}
+bool MELE_IsFiniteNonNegative(float x)
+{
+   return x >= 0.0 && x <= FLT_MAX;
+}
+bool MELE_IsFiniteNonNegative(float3 v)
+{
+   return all(v >= 0.0) && all(v <= FLT_MAX);
+}

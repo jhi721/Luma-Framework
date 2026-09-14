@@ -130,23 +130,20 @@ void main(
 
    float3 sdrGamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
 
-   // The output tail decodes sdrGamma again on purpose; see Tonemap_MELE_Output.hlsli.
-   const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
-
-   // The exact native SDR result is the starting value and the only fallback, for the whole triple.
-   float3 gradedHDR = sdrLinear;
+   // The exact native SDR result is the starting value and the only fallback, for the whole triple. The output tail
+   // decodes sdrGamma again on purpose; see Tonemap_MELE_Output.hlsli.
+   float3 gradedHDR = gamma_to_linear(sdrGamma, GCT_MIRROR);
    if (workValid)
    {
       // Validity was decided before the grade, not read off the finiteness of its output.
       //
-      // Family 05's range comes from the reversible grade bridge. sdrLinear - the exact decoded vanilla
-      // hard-clipped SDR result, already computed above - is used ONLY as a hue reference, following
-      // RenoDX hard-clip hue-emulation practice. The HDR target keeps its own perceptual lightness and
-      // chroma magnitude. DICE remains the final display mapper.
+      // Family 05's range comes from the reversible grade bridge. The native hard-clipped SDR result above is used
+      // ONLY as a hue reference, following RenoDX hard-clip hue-emulation practice. The HDR target keeps its own
+      // perceptual lightness and chroma magnitude. DICE remains the final display mapper.
       //
       // A broken hue transfer does not discard the reconstruction: MELE_HueReferenceOKLab returns its
       // target untouched, so the working HDR value survives an optional correction failing.
-      gradedHDR = MELE_HueReferenceOKLab(workHDR, sdrLinear, MELE_HARDCLIP_HUE_STRENGTH);
+      gradedHDR = MELE_HueReferenceOKLab(workHDR, gradedHDR, MELE_HARDCLIP_HUE_STRENGTH);
    }
 
    // ME3LE analytic tail: no vignette or grain; preserve native output luma in alpha.

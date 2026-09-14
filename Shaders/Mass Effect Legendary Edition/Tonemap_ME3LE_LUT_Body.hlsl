@@ -183,8 +183,9 @@ void main(
    r1.xyz = SceneColorTexture.Sample(SceneColorTextureSampler_s, r0.xy).xyz;
 
 #if TM_HAS_MOTIONBLUR
-   // Native camera blur from 0x36B90B12. VelocityBuffer.x is a SoftEdge mask; each tap uses weight 0.2*velocity
-   // and the result is normalized by their sum.
+   // Native camera blur from 0x36B90B12 (SFXMotionBlur in MotionBlurCommon.usf). VelocityBuffer.x is its
+   // DynamicVelocity.x: it scales the camera vector, each tap uses weight 0.2*velocity, and the result is normalized
+   // by their sum.
    r0.z = VelocityBuffer.Sample(VelocityBufferSampler_s, r0.xy).x;
    r0.w = SceneDepthTexture.Sample(SceneDepthTextureSampler_s, r0.xy).x;
    r0.w = r0.w * MinZ_MaxZRatio.z + -MinZ_MaxZRatio.w;
@@ -280,30 +281,21 @@ void main(
       // untonemapped is the combined scene+bloom, which is correct HERE: this family has no pre-curve, so the
       // LUT genuinely sees C+B. Do not carry the ME2LE L(F(C)+B) split into this body.
       float3 extendedFilmic;
-      float q;
-      float3 proxyRGB;
+      const bool sourceValid = MELE_TryEvaluateME3LEFilmicExtended(untonemapped, r0.xyz, extendedFilmic);
       // The grade bridge drives the real colour LUT and native tail. This body is straight RGB throughout -
       // slice from blue, strip-x from red - so the ME1LE/ME2LE BRG rotation must not be copied over.
-      if (MELE_TryEvaluateME3LEFilmicExtended(untonemapped, r0.xyz, extendedFilmic) && MELE_TryBuildGradeProxy(extendedFilmic, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))
+      float q;
+      float3 proxyRGB;
+      if (sourceValid && MELE_TryBuildGradeProxy(extendedFilmic, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))
       {
          workValid = MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LE_GradeChain(proxyRGB), GCT_MIRROR), q, workHDR);
       }
    }
 
-   // Use one native grade function for both the working value and SDR reference.
+   // Use one native grade function for both the working value and SDR reference. The white blowout the native result
+   // already contains is kept as it is; it is not given back its lost saturation.
    float3 sdrGamma = MELE_ME3LE_GradeChain(r0.xyz);
-
-   // The output tail decodes sdrGamma again on purpose; see Tonemap_MELE_Output.hlsli.
-   const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
-
-   // The exact native SDR result is the starting value and the only fallback, for the whole triple.
-   float3 gradedHDR = sdrLinear;
-   if (workValid)
-   {
-      // RGB ratios of the real tone LUT plus colour LUT plus native tail, at the working luminance. The white
-      // blowout that reference already contains is kept as it is; it is not given back its lost saturation.
-      gradedHDR = MELE_NativeColorAtLuminance(sdrLinear, GetLuminance(workHDR, CS_BT709));
-   }
+   float3 gradedHDR = MELE_NativeColorGradedHDR(sdrGamma, workHDR, workValid);
 
    // ME3LE tail: smoothstep vignette, optional grain, and native output luma in alpha.
 #define TM_VIGNETTE_TYPE 3
