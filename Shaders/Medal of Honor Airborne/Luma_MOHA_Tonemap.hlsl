@@ -241,11 +241,9 @@ float3 RunMOHATonemap(float2 blurUV, float2 sceneUV)
    // and is re-applied as a gain at the end, after the display map, so it cannot bias the hue stage or the rolloff.
    const float3 outputScale = GammaColorScaleAndInverse.xyz;
 
-   // 2. The game's own grade (artistic intent), gamma-encoded SDR. Vanilla-exact, fade included.
-   float3 sdrVanillaGamma = GradeUE3(untonemapped, true, outputScale);
-
-   // The extended grade carries no fade (outputScale = 1); it is re-applied inside FinishMOHA as a plain gain.
-   return FinishMOHA(untonemapped, sdrVanillaGamma, GradeUE3(untonemapped, false, 1.0), outputScale, float4(0.0, 0.0, 0.0, 0.0), sceneUV);
+   // 2. The game's own grade (artistic intent), gamma-encoded SDR: vanilla-exact, fade included. The extended grade
+   // carries no fade (outputScale = 1); it is re-applied inside FinishMOHA as a plain gain.
+   return FinishMOHA(untonemapped, GradeUE3(untonemapped, true, outputScale), GradeUE3(untonemapped, false, 1.0), outputScale, float4(0.0, 0.0, 0.0, 0.0), sceneUV);
 }
 
 // The DoF-off final pass: UE3 FGammaCorrectionPixelShader (PS 0x52B868E0, VS 0xA2F269CA). With "bAllowDepthOfField =
@@ -253,22 +251,6 @@ float3 RunMOHATonemap(float2 blurUV, float2 sceneUV)
 #define GcColorScale   PsConstants[12] // .xyz ColorScale
 #define GcOverlayColor PsConstants[13] // .xyz OverlayColor, .w its blend weight (this pass's fade)
 #define GcInverseGamma PsConstants[14] // .x inverse display gamma (1/DisplayGamma, 0.4545 at the ini default 2.2)
-
-// The extended grade: overlay (the fade) held OUT, FinishMOHA re-applies it after the display map; the vanilla
-// saturate() as a lower-only max(0), so highlights keep their real channel ratio. Everything else verbatim.
-float3 GradeGCExtended(float3 scene)
-{
-   float3 c = scene * GcColorScale.xyz;
-   c = max(0.0, c); // mad_sat in the original
-   return PowUE3(c, GcInverseGamma.xxx);
-}
-
-// Vanilla-exact: saturate(lerp(scene * ColorScale, Overlay.rgb, Overlay.a)) then the inverse-gamma pow.
-float3 GradeGCVanilla(float3 scene)
-{
-   float3 c = lerp(scene * GcColorScale.xyz, GcOverlayColor.xyz, GcOverlayColor.w);
-   return PowUE3(saturate(c), GcInverseGamma.xxx);
-}
 
 // `sceneUV` is TEXCOORD0 (v5) — unlike UberPostProcessBlend, which reads the scene from TEXCOORD1.
 float3 RunMOHAGammaCorrection(float2 sceneUV)
@@ -281,6 +263,10 @@ float3 RunMOHAGammaCorrection(float2 sceneUV)
 
    // The original ends in a branch on PsConstants[8].x selecting a colour-grading LUT blend. That LUT is never bound,
    // so dgVoodoo folded its six sample stages to the constant (0,0,0,1). Only the direct path is reproduced.
-   float3 sdrVanillaGamma = GradeGCVanilla(untonemapped);
-   return FinishMOHA(untonemapped, sdrVanillaGamma, GradeGCExtended(untonemapped), 1.0, GcOverlayColor, sceneUV);
+   // Vanilla-exact: saturate(lerp(scene * ColorScale, Overlay.rgb, Overlay.a)) then the inverse-gamma pow.
+   // Extended: overlay (the fade) held OUT, FinishMOHA re-applies it after the display map; the vanilla saturate()
+   // (mad_sat in the original) as a lower-only max(0), so highlights keep their real channel ratio.
+   const float3 scaled = untonemapped * GcColorScale.xyz;
+   return FinishMOHA(untonemapped, PowUE3(saturate(lerp(scaled, GcOverlayColor.xyz, GcOverlayColor.w)), GcInverseGamma.xxx),
+                     PowUE3(max(0.0, scaled), GcInverseGamma.xxx), 1.0, GcOverlayColor, sceneUV);
 }

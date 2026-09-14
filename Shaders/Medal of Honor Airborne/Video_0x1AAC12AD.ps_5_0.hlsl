@@ -13,11 +13,14 @@
 // hash also never appears in a gameplay frame, so it is movie-exclusive and not a generic textured quad.
 //
 // Body transcribed from the dgVoodoo->ps_5_0 disasm of 0x1AAC12AD. The cb3 and/or pairs are dgVoodoo's texture
-// format bit emulation (mask+set), kept exactly via asuint/asfloat.
+// format bit emulation (mask+set), kept exactly via ApplyDgvMask.
 // TWO details differ from BL2 and both matter: the tint/alpha come from the VERTEX COLOUR (v2), not a cbuffer
 // row, and the vanilla `saturate` sits on only ONE of the two gamma branches (see below).
 
-#include "Includes/Common.hlsl" // game-local: pulls GameCBuffers (LumaGameSettings VideoAutoHDR* fields) + shared Common
+// clang-format off
+#include "Includes/Common.hlsl"       // game-local: pulls GameCBuffers (LumaGameSettings VideoAutoHDR* fields) + shared Common
+#include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask
+// clang-format on
 
 // Light AutoHDR on movies (0 = off -> flat SDR at paper white). Peak kept low on purpose: Bink is low-bitrate and
 // pushing peak amplifies block artifacts. PumboAutoHDR self-noops in SDR (peak == paper white), so no display branch.
@@ -35,15 +38,6 @@ Texture2D<float4> t2 : register(t2); // V plane
 SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
 SamplerState s2_s : register(s2);
-
-cbuffer cb3 : register(b3)
-{
-   float4 cb3[77];
-}
-cbuffer cb4 : register(b4)
-{
-   float4 cb4[236];
-}
 
 // Full 13-entry interpolator layout, declared in order even where unread: linkage is by REGISTER (see
 // Luma_MOHA_Tonemap.hlsl). Only COLOR0 (v2, centroid: tint + alpha) and TEXCOORD0 (v5.xy, the movie UV) are read.
@@ -63,19 +57,11 @@ void main(
     float4 v12 : TEXCOORD7,
     out float4 o0 : SV_TARGET0)
 {
-   float4 r0;
-
    // --- YUV plane fetch + dgVoodoo format-emulation mask (verbatim; all three planes share v5.xy) ---
    float3 yuv;
-   r0 = t0.Sample(s0_s, v5.xy);
-   r0 = asfloat((asuint(r0) & asuint(cb3[44])) | asuint(cb3[45]));
-   yuv.x = r0.x - 0.0625; // Y, limited range (16/256)
-   r0 = t1.Sample(s1_s, v5.xy);
-   r0 = asfloat((asuint(r0) & asuint(cb3[46])) | asuint(cb3[47]));
-   yuv.y = r0.x - 0.5; // U
-   r0 = t2.Sample(s2_s, v5.xy);
-   r0 = asfloat((asuint(r0) & asuint(cb3[48])) | asuint(cb3[49]));
-   yuv.z = r0.x - 0.5; // V
+   yuv.x = ApplyDgvMask(t0.Sample(s0_s, v5.xy), DgvMaskT0, DgvFillT0).x - 0.0625; // Y, limited range (16/256)
+   yuv.y = ApplyDgvMask(t1.Sample(s1_s, v5.xy), DgvMaskT1, DgvFillT1).x - 0.5;    // U
+   yuv.z = ApplyDgvMask(t2.Sample(s2_s, v5.xy), DgvMaskT2, DgvFillT2).x - 0.5;    // V
 
    // --- YUV -> RGB, BT.601 limited range (verbatim literals; green is the only 3-term row) ---
    float3 rgb;
@@ -86,7 +72,7 @@ void main(
    rgb *= v2.xyz; // tint from the vertex colour (movie fades ride on this)
 
    // --- gamma branch, verbatim: the pow is bypassed when the exponent is EXACTLY 1 ---
-   const float gammaExp = cb4[8].x;
+   const float gammaExp = PsConstants[8].x;
    rgb = (gammaExp == 1.0) ? rgb : pow(saturate(rgb), gammaExp);
 
    // Restore the vanilla clamp. Vanilla got it free from an 8-bit UNORM canvas and the original only saturates inside

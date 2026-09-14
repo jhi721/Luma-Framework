@@ -89,12 +89,10 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
    };
    std::map<D3D11_BLEND_DESC, ComPtr<ID3D11BlendState>, BlendDescCompare> fixed_blend_states;
 
-   bool has_drawn_tonemap = false;
    // Wrapper-build telemetry: an unkeyed dgVoodoo build fails SILENTLY (format-keyed upgrades still fire: fp16
    // canvas, no replacements). Latched across frames, reported once after warmup (OnPresent).
    bool ever_matched_final_pass = false;
-   bool build_check_done = false;
-   uint32_t frames_presented = 0;
+   uint32_t frames_presented = 0; // stops counting at the warmup frame, which is when the check runs
 #if DEVELOPMENT
    // Format-upgrade diagnostics, one-shot per DEVICE rather than per process: dgVoodoo recreates the device on
    // resolution and display-mode changes, which is exactly when the fp16 mirror is worth re-reading.
@@ -373,20 +371,17 @@ class MedalOfHonorAirborne final : public Game
       if (!disagreement)
          return false;
 
+      // RT0's blend bit is loop-invariant, so the two shapes are mutually exclusive: one flag out of the loop.
       ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
       native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, nullptr);
-      bool bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      bool bound_disagreement = false;
       for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
       {
-         bound[i] = rtvs[i] != nullptr;
-         if (rtvs[i])
-            rtvs[i]->Release(); // OMGetRenderTargets hands back references; only the bound/not-bound answer is kept
+         if (rtvs[i] == nullptr)
+            continue;
+         bound_disagreement |= i > 0 && bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
+         rtvs[i]->Release(); // OMGetRenderTargets hands back references; only the bound/not-bound answer is kept
       }
-
-      // RT0's blend bit is loop-invariant, so the two shapes are mutually exclusive: one flag out of the loop.
-      bool bound_disagreement = false;
-      for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && !bound_disagreement; i++)
-         bound_disagreement = bound[i] && bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
       const bool needs_fix = bound_disagreement && !rt0_blending;
       [[maybe_unused]] const bool inverse_shape = bound_disagreement && rt0_blending;
 
@@ -435,18 +430,6 @@ class MedalOfHonorAirborne final : public Game
       (*original_draw_dispatch_func)();
       native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask); // hand the game back its own state
       return true;
-   }
-
-   // The resource behind the currently bound RTV 0, or null. Identifies the canvas at the final color pass, and
-   // tests whether a later draw targets that same canvas. Not DEVELOPMENT-only: Hide UI needs it to ship.
-   static ComPtr<ID3D11Resource> GetBoundRenderTargetResource(ID3D11DeviceContext* native_device_context)
-   {
-      ComPtr<ID3D11Resource> res;
-      ComPtr<ID3D11RenderTargetView> rtv;
-      native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-      if (rtv)
-         rtv->GetResource(res.put());
-      return res;
    }
 
 #if DEVELOPMENT
@@ -544,19 +527,6 @@ public:
       delete static_cast<MedalOfHonorAirborneGameDeviceData*>(device_data.game);
       device_data.game = nullptr;
    }
-
-#if ENABLE_BLOOM
-   // Core's DrawKarisAverage output: full-res fp16, ~66 MB at 4K (it inherits the scene texture's size). Core
-   // drops only the UAV, and only on swapchain init, so a feature-off toggle has to release both views itself.
-   // Guarded with BLOOM, not SMAA: the Karis average is a bloom resource and its only caller is the bloom-off
-   // release in OnPresent, so pairing it with SMAA made ENABLE_SMAA 0 + ENABLE_BLOOM 1 fail to compile.
-   static void ReleaseCoreKarisAverage(DeviceData& device_data)
-   {
-      auto& mr = device_data.managed_resources;
-      mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
-      mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
-   }
-#endif
 
 #if ENABLE_SMAA
    // Core's DrawSMAA intermediates, ~83 MB at 4K, sized from the RTV handed to them and dropped only on swapchain
@@ -698,36 +668,33 @@ public:
 
       native_device_context->CopyResource(gd.tex_input.get(), canvas_res);
 
-      // Linear-light decode of the snapshot for the neighborhood blend (Luma_MOHA_SMAALinearize.hlsl).
       {
-         DrawStateStack<DrawStateStackType::Compute> linearize_state;
-         linearize_state.Cache(native_device_context, device_data.uav_max_count);
+         DrawStateStack<DrawStateStackType::Compute> compute_state;
+         compute_state.Cache(native_device_context, device_data.uav_max_count);
+
+         // Linear-light decode of the snapshot for the neighborhood blend (Luma_MOHA_SMAALinearize.hlsl).
          ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
          ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
          native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
          native_device_context->CSSetShaderResources(0, 1, &lin_srv);
          native_device_context->CSSetShader(linearize_cs, nullptr, 0);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-         linearize_state.Restore(native_device_context);
-      }
 
-      // Scene alpha (linear depth) -> plane-deviation edge-ness in R16F; see Luma_MOHA_DepthExtract.hlsl for why
-      // this is an edge test rather than a depth rescale.
-      if (pred_ok)
-      {
-         DrawStateStack<DrawStateStackType::Compute> pred_cs_state;
-         pred_cs_state.Cache(native_device_context, device_data.uav_max_count);
+         // Scene alpha (linear depth) -> plane-deviation edge-ness in R16F; see Luma_MOHA_DepthExtract.hlsl for why
+         // this is an edge test rather than a depth rescale.
+         if (pred_ok)
+         {
+            ID3D11ShaderResourceView* ps_srv = gd.srv_scene.get();
+            ID3D11UnorderedAccessView* ps_uav = gd.uav_pred.get();
+            ID3D11Buffer* ps_cb = gd.cb_pred.get();
+            native_device_context->CSSetUnorderedAccessViews(0, 1, &ps_uav, nullptr);
+            native_device_context->CSSetShaderResources(0, 1, &ps_srv);
+            native_device_context->CSSetConstantBuffers(0, 1, &ps_cb);
+            native_device_context->CSSetShader(pred_cs, nullptr, 0);
+            native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+         }
 
-         ID3D11ShaderResourceView* ps_srv = gd.srv_scene.get();
-         ID3D11UnorderedAccessView* ps_uav = gd.uav_pred.get();
-         ID3D11Buffer* ps_cb = gd.cb_pred.get();
-         native_device_context->CSSetShaderResources(0, 1, &ps_srv);
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &ps_uav, nullptr);
-         native_device_context->CSSetConstantBuffers(0, 1, &ps_cb);
-         native_device_context->CSSetShader(pred_cs, nullptr, 0);
-         native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-
-         pred_cs_state.Restore(native_device_context);
+         compute_state.Restore(native_device_context);
       }
 
 #if DEVELOPMENT
@@ -749,10 +716,10 @@ public:
       }
 #endif
 
-      // Metrics CB at VS+PS b1 (DrawSMAA restores VS/PS/SRVs/RTs, but not cbuffers).
-      ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
-      native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
-      native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
+      // DrawSMAA restores VS/PS/SRVs/RTs but not cbuffers: one stack covers the metrics CB (VS+PS b1) and RCAS' b0.
+      DrawStateStack<DrawStateStackType::FullGraphics> smaa_state;
+      smaa_state.Cache(native_device_context, device_data.uav_max_count);
+
       ID3D11Buffer* mcb = gd.cb_smaa_metrics.get();
       native_device_context->VSSetConstantBuffers(1, 1, &mcb);
       native_device_context->PSSetConstantBuffers(1, 1, &mcb);
@@ -763,21 +730,13 @@ public:
       // RCAS on the SMAA output, written into the canvas.
       if (do_sharpen)
       {
-         DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
-         sharpen_state.Cache(native_device_context, device_data.uav_max_count);
-
          ID3D11Buffer* scb = gd.cb_sharpen.get();
          native_device_context->PSSetConstantBuffers(0, 1, &scb);
          DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
             copy_vs, sharpen_ps, gd.tex_smaa_out_srv.get(), canvas_rtv, w, h, false);
-
-         sharpen_state.Restore(native_device_context);
       }
 
-      ID3D11Buffer* vcb = vs_cb1_orig.get();
-      ID3D11Buffer* pcb = ps_cb1_orig.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &vcb);
-      native_device_context->PSSetConstantBuffers(1, 1, &pcb);
+      smaa_state.Restore(native_device_context);
    }
 #endif // ENABLE_SMAA
 
@@ -789,9 +748,13 @@ public:
 
       // Hide HUD: cancel draws that run AFTER the final color pass AND target the same canvas. The render-target test
       // is load-bearing - "everything after the tonemap" also swallows the present blit.
-      if (g_hide_ui && is_immediate && !is_custom_pass && gd.has_drawn_tonemap && gd.canvas_res)
+      if (g_hide_ui && is_immediate && !is_custom_pass && device_data.has_drawn_main_post_processing && gd.canvas_res)
       {
-         ComPtr<ID3D11Resource> rt = GetBoundRenderTargetResource(native_device_context);
+         ComPtr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+         ComPtr<ID3D11Resource> rt;
+         if (rtv)
+            rtv->GetResource(rt.put());
          if (rt.get() == gd.canvas_res.get())
             return DrawOrDispatchOverrideType::Replaced;
       }
@@ -818,14 +781,14 @@ public:
 
       // Wrapper-build telemetry, deliberately AHEAD of the gate below: an unkeyed dgVoodoo build has to be
       // reported whichever context recorded the pass (the warning itself fires in OnPresent).
-      if (!gd.ever_matched_final_pass && IsFinalColorPass(original_shader_hashes))
+      const bool is_final_color_pass = IsFinalColorPass(original_shader_hashes);
+      if (is_final_color_pass)
          gd.ever_matched_final_pass = true;
 
       // The final color pass ends main post processing. Read the hash list before any early-out: is_custom_pass is
       // true for hash-replaced passes too. Gated on is_immediate (BL GOTY does the same).
-      if (is_immediate && !gd.has_drawn_tonemap && IsFinalColorPass(original_shader_hashes))
+      if (is_immediate && !device_data.has_drawn_main_post_processing && is_final_color_pass)
       {
-         gd.has_drawn_tonemap = true;
          device_data.has_drawn_main_post_processing = true;
 
          // Push LumaSettings HERE, at the seam, not inside a feature block: every consumer below reads b13 (the
@@ -910,15 +873,10 @@ public:
       // One-shot telemetry (BL GOTY precedent). The frame budget is warmup only: the menu runs the same pass, so
       // a few frames are enough.
       constexpr uint32_t kBuildCheckFrame = 120;
-      if (!gd.build_check_done && ++gd.frames_presented >= kBuildCheckFrame)
-      {
-         gd.build_check_done = true;
-         if (!gd.ever_matched_final_pass)
-            reshade::log::message(reshade::log::level::warning,
-               "[Luma] MOHA: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
-      }
+      if (gd.frames_presented < kBuildCheckFrame && ++gd.frames_presented == kBuildCheckFrame && !gd.ever_matched_final_pass)
+         reshade::log::message(reshade::log::level::warning,
+            "[Luma] MOHA: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
 
-      gd.has_drawn_tonemap = false;
       gd.canvas_res.reset(); // do not hold a reference across frames: it would outlive a resize or a mirror swap
       // Core never clears this, so leaving it set would claim a tonemapped scene on frames with no final pass
       // (movies, loading). Inert here: consumers need enable_ui_separation (off).
@@ -928,10 +886,15 @@ public:
 #if ENABLE_BLOOM
       gd.bloom_scale_captured_this_frame = false; // re-arm the once-per-frame ring advance
 
-      // Give the address space back when the pyramid is off, on the render thread. Unconditional while off: resetting
-      // empty entries is two map lookups. Only core's Karis buffer is reachable.
+      // Give the address space back when the pyramid is off, on the render thread. Only core's DrawKarisAverage output
+      // is reachable: full-res fp16, ~66 MB at 4K, and core drops only its UAV, only on swapchain init, so both views
+      // go here. Unconditional while off: resetting empty entries is two map lookups.
       if (!g_luma_bloom_enable)
-         ReleaseCoreKarisAverage(device_data);
+      {
+         auto& mr = device_data.managed_resources;
+         mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
+         mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
+      }
 
       // THE SOLE WRITER of the effective BloomIntensity. The UI only ever touches the raw slider and the enable
       // flag; if it wrote this field too, the two would fight each other while the slider is dragged.
@@ -1038,48 +1001,28 @@ public:
       // --- Grade (read in Luma_MOHA_Tonemap.hlsl via LumaSettings.GameSettings). HDR tonemap path only except
       // Exposure, which is applied scene-referred on the vanilla SDR path as well. ---
       auto& gs = cb_luma_global_settings.GameSettings;
+      const auto& gs_def = default_luma_global_game_settings;
       ImGui::SeparatorText("Grade");
 
-      if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
+      const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max_value, const char* tooltip)
       {
-         reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
-         device_data.cb_luma_global_settings_dirty = true;
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Overall image brightness (1 = vanilla).");
-      if (DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure"))
-         device_data.cb_luma_global_settings_dirty = true;
+         if (ImGui::SliderFloat(label, value, 0.f, max_value))
+         {
+            reshade::set_config_value(nullptr, NAME, key, *value);
+            device_data.cb_luma_global_settings_dirty = true;
+         }
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", tooltip);
+         if (DrawResetButton(*value, default_value, key))
+            device_data.cb_luma_global_settings_dirty = true;
+      };
 
-      if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
-         device_data.cb_luma_global_settings_dirty = true;
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Overall image contrast, HDR only (1 = vanilla).");
-      if (DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast"))
-         device_data.cb_luma_global_settings_dirty = true;
-
-      if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
-         device_data.cb_luma_global_settings_dirty = true;
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Color saturation, HDR only (1 = vanilla).");
-      if (DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation"))
-         device_data.cb_luma_global_settings_dirty = true;
-
-      if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
-         device_data.cb_luma_global_settings_dirty = true;
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).\n"
-                           "Only acts above a third of your Peak Brightness, so mid-tones keep their color whatever this is set to.");
-      if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation"))
-         device_data.cb_luma_global_settings_dirty = true;
+      slider("Exposure", &gs.Exposure, gs_def.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
+      slider("Contrast", &gs.Contrast, gs_def.Contrast, "Contrast", 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+      slider("Saturation", &gs.Saturation, gs_def.Saturation, "Saturation", 2.f, "Color saturation, HDR only (1 = vanilla).");
+      slider("Highlights Desaturation", &gs.HighlightDechroma, gs_def.HighlightDechroma, "HighlightsDesaturation", 1.f,
+         "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).\n"
+         "Only acts above a third of your Peak Brightness, so mid-tones keep their color whatever this is set to.");
 
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");
