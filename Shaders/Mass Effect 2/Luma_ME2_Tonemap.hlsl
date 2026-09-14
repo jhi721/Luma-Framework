@@ -82,6 +82,29 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    // hue-preserving; 1.0 is a no-op. Scale-linear, so it needs no view of the engine fade the uber re-applies.
    return Saturation(hdr, LumaSettings.GameSettings.Saturation);
 }
+
+// Linear scene -> the canvas the HUD blends onto. Shared by the material and the material-less fallback.
+float3 EncodeME2Canvas(float3 sceneHDR)
+{
+   float3 c = MapME2ToDisplay(sceneHDR);
+
+   // The additive terms the material adds after this still stay in gamma, where vanilla put them: an add is not
+   // domain-invariant, and grain needs constant perceptual amplitude rather than amplitude that collapses in shadows.
+
+#if UI_DRAW_TYPE >= 2
+   // Pre-scale so the gamma-SDR HUD on this canvas lands at UIPaperWhite after composition rescales by it. Accessors,
+   // not LumaSettings (see MapME2ToDisplay), and still guarded: a zero would black the scene and leave the HUD.
+   if (GamePaperWhiteNits > 0.0)
+      c *= GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0);
+#endif
+
+#if POST_PROCESS_SPACE_TYPE == 0
+   // Store gamma so the game's gamma-space HUD blends like vanilla; composition decodes and applies paper white.
+   // GCT_POSITIVE, not MIRROR: no negative light may reach the canvas the gamma HUD blends onto.
+   c = linear_to_gamma(c, GCT_POSITIVE);
+#endif
+   return c;
+}
 #endif // TONEMAP_TYPE >= 1
 
 // ---------- Stage 1: UberPostProcessBlend -> fp16 canvas, LINEAR unmapped in HDR / vanilla in SDR ----------
@@ -341,23 +364,7 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
 
    // THEN the display map, last colour operation of the scene, so peak containment covers the vignette's white point
    // too. renodx's ordering; the two alternatives that failed (+39% blue, magenta rim) are recorded in NOTES.md.
-   outColor = MapME2ToDisplay(outColor);
-
-   // The additive terms below still stay in gamma, where vanilla put them: an add is not domain-invariant, and
-   // grain needs constant perceptual amplitude rather than amplitude that collapses in shadows.
-
-#if UI_DRAW_TYPE >= 2
-   // Pre-scale so the gamma-SDR HUD on this canvas lands at UIPaperWhite after composition rescales by it. Accessors,
-   // not LumaSettings (see MapME2ToDisplay), and still guarded: a zero would black the scene and leave the HUD.
-   if (GamePaperWhiteNits > 0.0)
-      outColor *= GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0);
-#endif
-
-#if POST_PROCESS_SPACE_TYPE == 0
-   // Store gamma so the game's gamma-space HUD blends like vanilla; composition decodes and applies paper white.
-   // GCT_POSITIVE, not MIRROR: no negative light may reach the canvas the gamma HUD blends onto.
-   outColor = linear_to_gamma(outColor, GCT_POSITIVE);
-#endif
+   outColor = EncodeME2Canvas(outColor);
 #else
    // Vanilla: the canvas holds the vanilla display-encoded value, so every operation here is the original's -
    // including the vignette, which stays in this pass and in the encoded domain exactly as the game had it.

@@ -44,14 +44,14 @@ static constexpr uint32_t kSolidFillAlphaHash = 0xD8C503D9;  // the same with an
 
 // ---- The same passes under dgVoodoo 2.81.3, which emits ps_4_0 and therefore hashes differently. Dump-verified
 // equivalent to their 2.87.3 twins apart from register numbering, `centroid` and rcp-vs-div (Bink and the Canvas tile
-// are byte-identical). Found by constant/opcode fingerprint over 367 ps_4_0 shaders; FGammaCorrection has no entry
-// because it never drew in that session either.
+// are byte-identical). Found by constant/opcode fingerprint over the ps_4_0 dump.
 static constexpr uint32_t kUberPostFilmicHash_v281 = 0x9EE2F5B0;
 static constexpr uint32_t kUberPostHash_v281 = 0xD95F610B;
 static constexpr uint32_t kMaterialHash_v281 = 0xFEC7717C;
 static constexpr uint32_t kMaterialGrainHash_v281 = 0xEA297C13;
 static constexpr uint32_t kDofBloomGatherHash_v281 = 0xE5D70519;
 static constexpr uint32_t kDofBloomGather4Hash_v281 = 0xD4C3E9E1;
+static constexpr uint32_t kGammaCorrectionHash_v281 = 0x87D136D3;
 static constexpr uint32_t kVideoHash_v281 = 0x7EBF990A;
 static constexpr uint32_t kCanvasTextHash_v281 = 0x8DA32F73;
 static constexpr uint32_t kCanvasTileHash_v281 = 0x6DB9CD5A;
@@ -69,7 +69,7 @@ static constexpr uint32_t kLoggedPassHashes[] = {kUberPostFilmicHash, kUberPostH
    kDofBloomGatherHash, kDofBloomGather4Hash, kGammaCorrectionHash, kVideoHash, kCanvasTextHash, kCanvasTileHash,
    kCanvasSolidHash, kCanvasSolidFadeHash, kCanvasTileTintHash, kCanvasTwoTexHash, kSolidFillHash, kSolidFillAlphaHash,
    kUberPostFilmicHash_v281, kUberPostHash_v281, kMaterialHash_v281, kMaterialGrainHash_v281,
-   kDofBloomGatherHash_v281, kDofBloomGather4Hash_v281, kVideoHash_v281, kCanvasTextHash_v281, kCanvasTileHash_v281,
+   kDofBloomGatherHash_v281, kDofBloomGather4Hash_v281, kGammaCorrectionHash_v281, kVideoHash_v281, kCanvasTextHash_v281, kCanvasTileHash_v281,
    kCanvasSolidHash_v281, kCanvasSolidFadeHash_v281, kCanvasTileTintHash_v281, kCanvasTwoTexHash_v281,
    kSolidFillHash_v281, kSolidFillAlphaHash_v281};
 
@@ -112,6 +112,16 @@ static constexpr uint32_t kGradeRowCount = 6;
 
 struct MassEffect2GameDeviceData final : public GameDeviceData
 {
+   // Repaired blend states, keyed by the ORIGINAL desc (DXHR).
+   struct BlendDescCompare
+   {
+      bool operator()(const D3D11_BLEND_DESC& a, const D3D11_BLEND_DESC& b) const
+      {
+         return memcmp(&a, &b, sizeof(D3D11_BLEND_DESC)) < 0;
+      }
+   };
+   std::map<D3D11_BLEND_DESC, ComPtr<ID3D11BlendState>, BlendDescCompare> fixed_blend_states;
+
    bool has_drawn_uber = false;
    bool has_drawn_material = false;
 
@@ -129,6 +139,11 @@ struct MassEffect2GameDeviceData final : public GameDeviceData
    // The canvas the material pass wrote into this frame, captured from its bound RTV. Consumed by Hide UI (which
    // needs to recognise later draws targeting it) and by the SMAA hook. Released every Present.
    ComPtr<ID3D11Resource> canvas_res;
+
+   // The uber's target until the material draws; still set when a later draw targets it = material-less frame.
+   ComPtr<ID3D11Resource> uber_rt_res;
+   ComPtr<ID3D11Texture2D> tex_display_map;
+   ComPtr<ID3D11ShaderResourceView> srv_display_map;
 
 #if ENABLE_SMAA || ENABLE_BLOOM
    // The game's fp16 scene from the UBER draw's t0: bloom-pyramid source, and its ALPHA is the linear depth SMAA
@@ -518,6 +533,8 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("ME2 Sharpen PS"),
          ShaderDefinition{"Luma_ME2_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 #endif
+      native_shaders_definitions.emplace(CompileTimeStringHash("ME2 Display Map PS"),
+         ShaderDefinition{"Luma_ME2_DisplayMap", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "display_map_ps"});
 
       // All measured, none assumed. The canvas stores gamma so the game's UE3 Canvas HUD blends onto it exactly as
       // vanilla; core's display composition decodes and applies Game Paper White.
@@ -990,6 +1007,47 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
       }
 
+      // Material-less frame (squad, galaxy map): the uber's linear HDR would reach the HUD unmapped, so map and encode it
+      // before the first draw onto the uber's target.
+      if (is_immediate && game_device_data.uber_rt_res && (!is_custom_pass || original_shader_hashes.pixel_shaders[0] != UINT64_MAX) && !IsMaterialPass(original_shader_hashes) && GetBoundRenderTargetResource(native_device_context).get() == game_device_data.uber_rt_res.get())
+      {
+         auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+         auto* map_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("ME2 Display Map PS"));
+         uint4 info{};
+         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+         GetResourceInfo(game_device_data.uber_rt_res.get(), info, fmt);
+         const DXGI_FORMAT typed_fmt = (DXGI_FORMAT)reshade::api::format_to_default_typed((reshade::api::format)fmt);
+         if (game_device_data.tex_display_map)
+         {
+            uint4 sinfo{};
+            DXGI_FORMAT sfmt = DXGI_FORMAT_UNKNOWN;
+            GetResourceInfo(game_device_data.tex_display_map.get(), sinfo, sfmt);
+            if (sinfo.x != info.x || sinfo.y != info.y || sfmt != typed_fmt)
+            {
+               game_device_data.srv_display_map.reset();
+               game_device_data.tex_display_map.reset();
+            }
+         }
+         if (!game_device_data.tex_display_map)
+         {
+            game_device_data.tex_display_map = CloneTexture<ID3D11Texture2D>(native_device, game_device_data.uber_rt_res.get(), typed_fmt, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_RENDER_TARGET, false, false).get();
+            if (game_device_data.tex_display_map)
+               native_device->CreateShaderResourceView(game_device_data.tex_display_map.get(), nullptr, game_device_data.srv_display_map.put());
+         }
+         ComPtr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+         if (GetShaderDefineCompiledNumericalValue(char_ptr_crc32("TONEMAP_TYPE")) >= 1 && copy_vs && map_ps && game_device_data.srv_display_map && rtv)
+         {
+            native_device_context->CopyResource(game_device_data.tex_display_map.get(), game_device_data.uber_rt_res.get());
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            DrawStateStack<DrawStateStackType::FullGraphics> map_state;
+            map_state.Cache(native_device_context, device_data.uav_max_count);
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, map_ps, game_device_data.srv_display_map.get(), rtv.get(), info.x, info.y, false);
+            map_state.Restore(native_device_context);
+         }
+         game_device_data.uber_rt_res.reset();
+      }
+
 #if ENABLE_BLOOM
       // The gather runs before the uber: read its BloomScale here (deferred, no stall). Bloom-only work, so it
       // follows the feature's own switch - GameSettings.BloomScaleLive is read by nothing else.
@@ -1004,6 +1062,7 @@ public:
       {
          game_device_data.has_drawn_uber = true;
          game_device_data.ever_matched_keyed_pass = true;
+         game_device_data.uber_rt_res = GetBoundRenderTargetResource(native_device_context);
 
 #if DEVELOPMENT
          // Grade rows off this draw's b4, before anything below rebinds. Deferred, so it costs a CopyResource here
@@ -1056,6 +1115,7 @@ public:
       {
          game_device_data.has_drawn_material = true;
          game_device_data.ever_matched_keyed_pass = true;
+         game_device_data.uber_rt_res.reset();
 
          // The canvas SMAA antialiases and the present blit's source. Captured every frame because an upgrade or resize can
          // swap the mirror, and kept in device data because Hide UI needs the identity on later draws.
@@ -1081,6 +1141,54 @@ public:
 #endif
       }
 
+      // Last: it re-issues the draw, so no hook may run after it (ME1/TW2 shape).
+      if (!is_custom_pass && (stages & reshade::api::shader_stage::pixel) != 0 && original_draw_dispatch_func != nullptr)
+      {
+         // dgVoodoo leaves blending ENABLED on a bound secondary RT while RT0 has it off - D3D9 has one global state.
+         ComPtr<ID3D11BlendState> blend_state;
+         FLOAT blend_factor[4];
+         UINT sample_mask = 0;
+         native_device_context->OMGetBlendState(blend_state.put(), blend_factor, &sample_mask);
+         D3D11_BLEND_DESC bd;
+         if (blend_state && (blend_state->GetDesc(&bd), bd.IndependentBlendEnable) && !bd.RenderTarget[0].BlendEnable)
+         {
+            ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+            native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, nullptr);
+            bool needs_fix = false;
+            for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+            {
+               // Only BOUND targets count: unused slots carry stale BlendEnable.
+               needs_fix |= rtvs[i] != nullptr && bd.RenderTarget[i].BlendEnable;
+               if (rtvs[i])
+                  rtvs[i]->Release();
+            }
+            if (rtvs[0])
+               rtvs[0]->Release();
+
+            if (needs_fix)
+            {
+               ComPtr<ID3D11BlendState>& fixed_state = game_device_data.fixed_blend_states[bd];
+               if (!fixed_state)
+               {
+                  D3D11_BLEND_DESC fixed_desc = bd;
+                  for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+                  {
+                     fixed_desc.RenderTarget[i] = bd.RenderTarget[0];
+                     fixed_desc.RenderTarget[i].RenderTargetWriteMask = bd.RenderTarget[i].RenderTargetWriteMask; // per-RT masks are legal in D3D9
+                  }
+                  native_device->CreateBlendState(&fixed_desc, fixed_state.put());
+               }
+               if (fixed_state)
+               {
+                  native_device_context->OMSetBlendState(fixed_state.get(), blend_factor, sample_mask);
+                  (*original_draw_dispatch_func)();
+                  native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
+                  return DrawOrDispatchOverrideType::Replaced;
+               }
+            }
+         }
+      }
+
       return DrawOrDispatchOverrideType::None;
    }
 
@@ -1103,6 +1211,7 @@ public:
       game_device_data.has_drawn_uber = false;
       game_device_data.has_drawn_material = false;
       game_device_data.canvas_res.reset(); // do not hold a reference across frames: it would outlive a resize or a mirror swap
+      game_device_data.uber_rt_res.reset();
 
 #if DEVELOPMENT
       game_device_data.grade_cb_ring.advanced_this_frame = false;
