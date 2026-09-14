@@ -8,9 +8,9 @@
 // clang-format on
 
 // The Witcher 2 EE — tonemap ("exposure") pass SHARED IMPLEMENTATION (REDengine, DX9 via dgVoodoo D3D9->11).
-// Holds the pass body as RunTonemap(); the per-hash wrapper files (Tonemap_0x<HASH>.ps_5_0.hlsl, one per
-// permutation × dgVoodoo build) declare the full dgVoodoo interpolator set + main() and forward to it. No hash
-// in this filename -> not matched/replaced directly; it is #included by the wrappers.
+// Holds the whole pass including main(); the per-hash wrapper files (Tonemap_0x<HASH>.ps_5_0.hlsl, one per
+// permutation × dgVoodoo build) only set TM_BRIGHT_PASS and #include it. No hash in this filename -> not
+// matched/replaced directly.
 //
 // Vanilla body transcribed VERBATIM (register-level) from the dgVoodoo-translated CSOs (0x91348C0F exposure,
 // 0x00E31BF9 bloom bright-pass; DX9 origins 0xC5ADBC35/0xF01A691E), constants remapped DX9 cN -> cb4[N+8].
@@ -81,9 +81,23 @@ float DgVoodooRcp(float x)
    return (abs(x) > 0.0) ? (1.0 / x) : 1e37;
 }
 
-// The tonemap body. v5 = TEXCOORD0 (scene UV in .xy — the only interpolator the pass uses).
-// Returns the exposed linear color (alpha: scene passthrough on the exposure perm, 1 on the bright-pass perm).
-float4 RunTonemap(float4 v5)
+// Full dgVoodoo interpolator set; v5 = TEXCOORD0 (scene UV in .xy) is the only one the pass uses.
+// Output: the exposed linear color (alpha: scene passthrough on the exposure perm, 1 on the bright-pass perm).
+void main(
+    float4 v0 : SV_POSITION0,
+    float4 v1 : TEXCOORD8,
+    float4 v2 : COLOR0,
+    float4 v3 : COLOR1,
+    float4 v4 : TEXCOORD9,
+    float4 v5 : TEXCOORD0,
+    float4 v6 : TEXCOORD1,
+    float4 v7 : TEXCOORD2,
+    float4 v8 : TEXCOORD3,
+    float4 v9 : TEXCOORD4,
+    float4 v10 : TEXCOORD5,
+    float4 v11 : TEXCOORD6,
+    float4 v12 : TEXCOORD7,
+    out float4 o0 : SV_TARGET0)
 {
    // --- vanilla body (verbatim transcription) ---
    float4 adaptation = t_adapt.SampleLevel(s_adapt_s, float2(0.0, 0.0), 0.0);
@@ -117,5 +131,5 @@ float4 RunTonemap(float4 v5)
    const float vanillaAlpha = scene.a;
 #endif
 
-   return float4(vanillaColor, vanillaAlpha);
+   o0 = float4(vanillaColor, vanillaAlpha);
 }

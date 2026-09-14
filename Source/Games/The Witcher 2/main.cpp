@@ -494,18 +494,15 @@ class TheWitcher2Game final : public Game
 
       ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
       native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, nullptr);
-      bool bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-      for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-      {
-         bound[i] = rtvs[i] != nullptr;
-         if (rtvs[i])
-            rtvs[i]->Release(); // OMGetRenderTargets hands back references; only the bound/not-bound answer is kept
-      }
-
       // RT0's blend bit is loop-invariant, so the two shapes are mutually exclusive: one flag out of the loop.
       bool bound_disagreement = false;
-      for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && !bound_disagreement; i++)
-         bound_disagreement = bound[i] && bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
+      for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+      {
+         if (rtvs[i] == nullptr)
+            continue;
+         bound_disagreement |= i > 0 && bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
+         rtvs[i]->Release(); // OMGetRenderTargets hands back references; only the bound/not-bound answer is kept
+      }
       const bool needs_fix = bound_disagreement && !rt0_blending;
       [[maybe_unused]] const bool inverse_shape = bound_disagreement && rt0_blending;
 
@@ -1048,10 +1045,11 @@ public:
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+      const bool is_final_grade = IsFinalGrade(original_shader_hashes);
 
       // After the final grade the HUD is the only alpha-blended geometry while the post chain is opaque, so
       // keying on blend state within this frame's post-grade span hides it without touching the scene.
-      if (g_hide_ui && game_device_data.final_grade_fired_this_frame && !is_custom_pass && !IsFinalGrade(original_shader_hashes))
+      if (g_hide_ui && game_device_data.final_grade_fired_this_frame && !is_custom_pass && !is_final_grade)
       {
          ComPtr<ID3D11BlendState> blend_state;
          FLOAT blend_factor[4];
@@ -1096,14 +1094,13 @@ public:
 #if ENABLE_SMAA
          // The bright-pass perm binds the full-res r32_float depth at t1 (declared-but-unused there); capture it for
          // SMAA predication. Bindings are read regardless of the pass being hash-replaced.
-         if (ContainsPixelShader(original_shader_hashes, kTonemapBrightPass, kTonemapBrightPass_v281))
+         if (g_smaa_predication && ContainsPixelShader(original_shader_hashes, kTonemapBrightPass, kTonemapBrightPass_v281))
          {
-            game_device_data.srv_scene_depth = nullptr;
             native_device_context->PSGetShaderResources(1, 1, game_device_data.srv_scene_depth.put());
          }
 #endif
       }
-      else if (IsFinalGrade(original_shader_hashes))
+      else if (is_final_grade)
       {
          // CustomData2 = SMAA active, which makes the grade skip its built-in FXAA.
          game_device_data.final_grade_fired_this_frame = true; // opens the Hide UI window for the rest of the frame
