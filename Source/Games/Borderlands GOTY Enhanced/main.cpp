@@ -1410,12 +1410,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // Native HDR: swapchain -> scRGB fp16; core Display Composition does the paper-white scale + scRGB encode +
       // gamut map at present. Replaced tonemap PS writes gamma-encoded HDR (1.0 = paper white) into the (now fp16) post chain.
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
-      swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // r10g10b10a2 backbuffer -> r16g16b16a16_float
+      swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // r8g8b8a8_unorm backbuffer -> r16g16b16a16_float
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-      // Safety minimum: the remaster already renders its post chain in fp16. r10g10b10a2 catches textures in the
-      // backbuffer's format outside the swapchain upgrade above; r11g11b10_float includes the HBAO+ view normals
-      // XeGTAO reads. r8/b8 formats are left alone deliberately - nothing downstream needs them, and _srgb -> fp16
-      // risks a sampling shift.
+      // Safety minimum: the remaster already renders its post chain in fp16. r10g10b10a2 covers any 10-bit target at
+      // swapchain size (the backbuffer itself is r8g8b8a8); r11g11b10_float includes the HBAO+ view normals XeGTAO
+      // reads. r8/b8 formats are left alone deliberately - nothing downstream needs them, and _srgb -> fp16 risks a
+      // sampling shift.
       texture_upgrade_formats = {
          reshade::api::format::r10g10b10a2_unorm,
          reshade::api::format::r10g10b10a2_typeless,
