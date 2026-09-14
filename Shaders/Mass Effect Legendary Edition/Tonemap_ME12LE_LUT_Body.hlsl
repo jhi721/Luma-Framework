@@ -243,8 +243,7 @@ bool MELE_TryME12LE_GradeHDR(float3 workRGB, out float3 workHDR)
    {
       return false;
    }
-   const float3 gradedLinear = gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxyRGB)), GCT_MIRROR);
-   return MELE_TryRestoreGradeRange(gradedLinear, q, workHDR);
+   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME12LE_GradeChain(MELE_RGB_TO_BRG(proxyRGB)), GCT_MIRROR), q, workHDR);
 }
 
 void main(
@@ -322,6 +321,9 @@ void main(
    // Scene-referred exposure before SDR and HDR tonemapping.
    r1.xyz = r1.xyz * LumaSettings.GameSettings.Exposure;
 
+   // HDR working value, filled only in HDR by the branch below; workValid false keeps the native SDR result.
+   float3 workHDR = 0.0;
+   bool workValid = false;
 #if TM_HAS_FILMIC
    // Filmic path from 0x222186F8: bloom, exponential curve, then per-channel 4096x1 LUT.
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
@@ -345,14 +347,12 @@ void main(
    r1.xyz = saturate(r1.xyz);
    // The native per-channel filmic value reaches the 16-slice LUT untouched - that is this branch's SDR output.
    // Family 03 does not touch it; it continues both tone stages and grades that second value.
-   float3 workHDR = 0.0;
-   bool workValid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // The native filmic samples were written BRG by the three assignments above, so rotate once to RGB
       // before the shared helper sees them, and let the wrapper rotate back for the grade.
       float3 extendedFilmic;
-      workValid = MELE_TryEvaluateME2FilmicExtended(sceneLinear, bloomLinear, MELE_BRG_TO_RGB(r1.xyz), extendedFilmic);
+      workValid = MELE_TryEvaluateME2LEFilmicExtended(sceneLinear, bloomLinear, MELE_BRG_TO_RGB(r1.xyz), extendedFilmic);
       if (workValid)
       {
          workValid = MELE_TryME12LE_GradeHDR(extendedFilmic, workHDR);
@@ -381,8 +381,6 @@ void main(
 
    // The native per-channel value still reaches the grade untouched - that is this branch's SDR output.
    // Family 01 does not touch it; it continues the curve on the scene and grades that second value.
-   float3 workHDR = 0.0;
-   bool workValid = false;
    if (LumaSettings.DisplayMode == 1)
    {
       // The scene and the bloom are validated HERE, separately, before the exponential runs on either.
@@ -408,19 +406,15 @@ void main(
    float3 sdrGamma = MELE_ME12LE_GradeChain(r0.xyz);
 #endif
 
-   // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
-   // sdrGamma again for the native SDR path; reusing this local changes fxc scheduling in two
-   // Publishing permutations. See Tonemap_MELE_Output.hlsli.
+   // The output tail decodes sdrGamma again on purpose; see Tonemap_MELE_Output.hlsli.
    const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
-   // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
-   // it for the whole triple rather than reaching for a different HDR model; there is none. Both branches
-   // reduce to it in SDR, where neither runs.
+   // The exact native SDR result is the starting value and the only fallback, for the whole triple.
    float3 gradedHDR = sdrLinear;
    // One projection for both branches: they differ in what fills workHDR, never in what is done with it.
    // RGB ratios stay the exact native grade result; only the luminance comes from the working value.
    // Whatever hue the LUT gave the q-proxy belongs to workHDR and is deliberately dropped here.
-   if (LumaSettings.DisplayMode == 1 && workValid)
+   if (workValid)
    {
       gradedHDR = MELE_NativeColorAtLuminance(sdrLinear, GetLuminance(workHDR, CS_BT709));
    }

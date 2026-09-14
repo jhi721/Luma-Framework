@@ -13,8 +13,7 @@ float MELE_GetUIPaperWhiteRelativeToGame()
 
 // Absolute scRGB scale G = Game Paper White / 80. Under EARLY_DISPLAY_ENCODING 1 the game owns it, so exactly two
 // passes apply it: stage 2 and direct-to-swapchain Bink. Core's Display Composition divides it back out under the
-// same define, so the two agree whether or not that pass runs. The stage-1 output tail calls this too, but only
-// to convert into the absolute-nit domain DICE works in and straight back out; it applies nothing.
+// same define, so the two agree whether or not that pass runs.
 float MELE_GetGamePaperWhiteScale()
 {
    return LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
@@ -41,7 +40,7 @@ float3 MELE_NativeGammaCurve(float3 c, float3 scale, float invGamma, bool clampF
 }
 
 // Native per-channel tone curve from the stage-1 decompiles, asymptotic to 1. It stays the exact native branch
-// below the HDR continuation pivot, and it also supplies the domain the ME2 staged filmic fit probes in.
+// below the HDR continuation pivot, and it also supplies the domain the ME2LE staged filmic fit probes in.
 float MELE_NativeToneCurve(float x)
 {
    return 1.0 - exp2(-1.70000005 * x);

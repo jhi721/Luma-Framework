@@ -83,23 +83,6 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
 #include "Includes/Tonemap_MELE_HueReference.hlsli"
-// Family 05. The grade chain is called unchanged, caps and all: this path earns its range by preparing
-// the INPUT, not by stripping the grade. The blue white point and the black floor stay inside that
-// function and are not hoisted into the output tail.
-//
-// False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the
-// whole triple and workHDR must not be read then.
-bool MELE_TryME3LEAnalytic_GradeHDR(float3 workLinear, out float3 workHDR)
-{
-   workHDR = float3(0.0, 0.0, 0.0);
-   float q;
-   float3 proxy;
-   if (!MELE_TryBuildGradeProxy(workLinear, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy))
-   {
-      return false;
-   }
-   return MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), q, workHDR);
-}
 
 void main(
     float4 v0 : TEXCOORD0,
@@ -135,20 +118,24 @@ void main(
    bool workValid = false;
    if (LumaSettings.DisplayMode == 1)
    {
-      workValid = MELE_TryME3LEAnalytic_GradeHDR(untonemapped, workHDR);
+      // Family 05. The grade chain is called unchanged, caps and all: this path earns its range by preparing
+      // the INPUT, not by stripping the grade. The blue white point and the black floor stay inside it.
+      float q;
+      float3 proxy;
+      if (MELE_TryBuildGradeProxy(untonemapped, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy))
+      {
+         workValid = MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LEAnalytic_GradeChain(proxy), GCT_MIRROR), q, workHDR);
+      }
    }
 
    float3 sdrGamma = MELE_ME3LEAnalytic_GradeChain(r0.xyz);
 
-   // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
-   // sdrGamma again for the native SDR path; reusing this local changes fxc scheduling in two
-   // Publishing permutations. See Tonemap_MELE_Output.hlsli.
+   // The output tail decodes sdrGamma again on purpose; see Tonemap_MELE_Output.hlsli.
    const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
-   // The exact native SDR result is the starting value and the only fallback. A declined reconstruction
-   // keeps it for the whole triple rather than reaching for a different HDR model; there is none.
+   // The exact native SDR result is the starting value and the only fallback, for the whole triple.
    float3 gradedHDR = sdrLinear;
-   if (LumaSettings.DisplayMode == 1 && workValid)
+   if (workValid)
    {
       // Validity was decided before the grade, not read off the finiteness of its output.
       //

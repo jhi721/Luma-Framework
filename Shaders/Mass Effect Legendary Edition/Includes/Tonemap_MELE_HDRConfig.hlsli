@@ -9,20 +9,19 @@
 //   04  ME3LE 1D filmic LUT from linear scene+bloom + LUT   4 permutations
 //   05  ME3LE analytic hard-clip grade                      0x225A8330 only
 //
-// There is no selector here and no second reconstruction to select. An in-game A/B across the three
-// games on 2026-09-11 chose these five, they shipped enabled, and the max-channel path they replaced
-// was deleted afterwards. Git history is how that path is read now.
+// There is no selector here and no second reconstruction to select; an in-game A/B across the three
+// games on 2026-09-11 chose these five.
 //
 // WHAT THESE MODELS DO. They prepare the grade INPUT - a compressed proxy, or a tone curve continued
 // past mid-gray - and divide the scale back out afterwards, so the grade sees range the vanilla clip
-// had already flattened. Where a model declines, the caller keeps the exact native SDR result; it
-// never falls back to a different reconstruction, because there is no longer one to fall back to.
+// had already flattened. Where a model declines, the caller keeps the exact native SDR result.
+// Families 01-04 take their RGB ratios from that native result and only their luminance from the
+// reconstruction; family 05 keeps its working HDR and moves only its hue.
 //
 // Porting a model to ANOTHER game is a separate decision with its own evidence. Families 01-04 were
-// ported once, to Shaders/Borderlands 2 and The Pre-Sequel/Luma_BL2TPS_Tonemap.hlsl, where they are now
-// the only HDR path; that port re-measured BL2's own vanilla curve first rather than carrying these
-// frames over, and it drops the domain adapter because it compresses and restores in the same linear
-// domain. The earlier rejection of a max-channel wrap there is history, not a standing prior.
+// ported to Shaders/Borderlands 2 and The Pre-Sequel/Luma_BL2TPS_Tonemap.hlsl, which re-measured BL2's
+// own vanilla curve first and drops the domain adapter because it compresses and restores in the same
+// linear domain.
 
 // Bench values: exercised against the captured LUTs and cbuffers, and carried unchanged through the
 // 2026-09-11 A/B that chose these families. That A/B judged the families as a whole, so it validates
@@ -60,15 +59,7 @@
 // above that round-off, so the direction survives and the degenerate case cannot be reached from a
 // neutral donor. No donor-chroma threshold is added to paper over it: that would be a new artistic
 // rule, and lowering this number is the honest control.
-#ifndef MELE_HARDCLIP_HUE_STRENGTH
 #define MELE_HARDCLIP_HUE_STRENGTH 0.75
-#endif
-
-// One colour path per family, not selectable. Families 01-04 take their RGB ratios from the real graded SDR
-// and only their luminance from the new branch; family 05 keeps its working HDR and moves only its hue.
-//
-// The guarantee ends at gradedHDR, before the shared output tail. The vignette, DICE, the user
-// saturation/contrast controls and the late SDR clamp all run after it and are judged separately.
 
 // Swizzle adapters for the ME1LE/ME2LE LUT body, whose grade chain is transcribed BRG-in / RGB-out.
 #define MELE_RGB_TO_BRG(v) ((v).zxy)

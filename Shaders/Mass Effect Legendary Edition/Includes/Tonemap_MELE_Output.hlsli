@@ -83,12 +83,10 @@ if (LumaSettings.DisplayMode == 1) // HDR
    // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
    // flattens it for every pixel above the shoulder.
    settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   float3 displayMapped = DICETonemap(vignettedHDR * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
+   postProcessedColor = DICETonemap(vignettedHDR * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
 
    // User saturation LAST, after the display map, in Game-Paper-White-relative linear RGB; 1.0 is a no-op.
-   displayMapped = Saturation(displayMapped, LumaSettings.GameSettings.Saturation);
-
-   postProcessedColor = displayMapped;
+   postProcessedColor = Saturation(postProcessedColor, LumaSettings.GameSettings.Saturation);
 }
 else // SDR still uses the scRGB swapchain; sdrLin is the exact native grade.
 {

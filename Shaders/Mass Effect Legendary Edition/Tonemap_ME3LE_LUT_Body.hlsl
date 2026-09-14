@@ -170,23 +170,6 @@ float3 MELE_ME3LE_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
 #include "Includes/Tonemap_MELE_FilmicExtended.hlsli"
-// Family 04. Defined after MELE_ME3LE_GradeChain so the bridge drives the real colour LUT and the
-// real native tail. This body is straight RGB throughout - slice from blue, strip-x from red - so no swizzle
-// adapter is applied here; the ME1LE/ME2LE BRG rotation belongs to the other body and must not be copied over.
-// False means the HDR reconstruction declined; the caller retains the exact native SDR reference for the whole
-// triple and workHDR must not be read then.
-bool MELE_TryME3LE_FilmicGradeHDR(float3 workRGB, out float3 workHDR)
-{
-   workHDR = float3(0.0, 0.0, 0.0);
-   float q;
-   float3 proxyRGB;
-   if (!MELE_TryBuildGradeProxy(workRGB, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))
-   {
-      return false;
-   }
-   const float3 gradedLinear = gamma_to_linear(MELE_ME3LE_GradeChain(proxyRGB), GCT_MIRROR);
-   return MELE_TryRestoreGradeRange(gradedLinear, q, workHDR);
-}
 
 void main(
     float4 v0 : TEXCOORD0,
@@ -297,25 +280,25 @@ void main(
       // untonemapped is the combined scene+bloom, which is correct HERE: this family has no pre-curve, so the
       // LUT genuinely sees C+B. Do not carry the ME2LE L(F(C)+B) split into this body.
       float3 extendedFilmic;
-      workValid = MELE_TryEvaluateME3FilmicExtended(untonemapped, r0.xyz, extendedFilmic);
-      if (workValid)
+      float q;
+      float3 proxyRGB;
+      // The grade bridge drives the real colour LUT and native tail. This body is straight RGB throughout -
+      // slice from blue, strip-x from red - so the ME1LE/ME2LE BRG rotation must not be copied over.
+      if (MELE_TryEvaluateME3LEFilmicExtended(untonemapped, r0.xyz, extendedFilmic) && MELE_TryBuildGradeProxy(extendedFilmic, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))
       {
-         workValid = MELE_TryME3LE_FilmicGradeHDR(extendedFilmic, workHDR);
+         workValid = MELE_TryRestoreGradeRange(gamma_to_linear(MELE_ME3LE_GradeChain(proxyRGB), GCT_MIRROR), q, workHDR);
       }
    }
 
    // Use one native grade function for both the working value and SDR reference.
    float3 sdrGamma = MELE_ME3LE_GradeChain(r0.xyz);
 
-   // Decode once here for the HDR/reference path. The shared output tail intentionally decodes
-   // sdrGamma again for the native SDR path; reusing this local changes fxc scheduling in two
-   // Publishing permutations. See Tonemap_MELE_Output.hlsli.
+   // The output tail decodes sdrGamma again on purpose; see Tonemap_MELE_Output.hlsli.
    const float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
-   // The exact native SDR result is the starting value and the only fallback. A declined reconstruction keeps
-   // it for the whole triple rather than reaching for a different HDR model; there is none.
+   // The exact native SDR result is the starting value and the only fallback, for the whole triple.
    float3 gradedHDR = sdrLinear;
-   if (LumaSettings.DisplayMode == 1 && workValid)
+   if (workValid)
    {
       // RGB ratios of the real tone LUT plus colour LUT plus native tail, at the working luminance. The white
       // blowout that reference already contains is kept as it is; it is not given back its lost saturation.

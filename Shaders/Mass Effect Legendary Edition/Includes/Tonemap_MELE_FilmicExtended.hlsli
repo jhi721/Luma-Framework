@@ -9,12 +9,12 @@
 // permutation declares smpFilmicLUT and its sampler. The includes above carry guards, so a body that
 // already pulled them in pays nothing.
 //
-// The fit's probe and pivot names stay snake_case where everything else here is camelCase: z_lo, z_hi and
-// pivot_z are formula subscripts, printed the same way in the derivations beside them. Shaders/Includes/
-// ACES.hlsl and Reinhard.hlsl keep their source style for the same reason.
-//
 // Nothing here invents a curve. Every anchor is a real read of the bound LUT, so a different shipped
 // table gives a different continuation; the constants are probe positions, not curve coefficients.
+//
+// Both evaluators hand their result straight to MELE_TryBuildGradeProxy, which rejects a non-finite or
+// negative working value before any use. Only what that check cannot see is validated here: the inputs,
+// because a bad channel that stays below the pivot selects the native sample and would otherwise pass.
 
 // The LUT in its own input domain z: the strip is addressed as SC * z, where SC is the native input
 // scale covering scene-linear to about 16.2. This is the raw read, with no pre-curve of any kind.
@@ -33,7 +33,8 @@ struct MELE_FilmicFit
 };
 
 // The one piece of arithmetic the two families genuinely share: three reads and a secant between the
-// outer two. Everything that differs between them is in the nodes the caller passes.
+// outer two. Everything that differs between them is in the nodes the caller passes, which are
+// compile-time probe positions with z_lo < pivot_z < z_hi.
 //
 // The slope denominator is the difference of the NODES. The input scale is already inside the sampled
 // values, so dividing by a coordinate delta would count it twice.
@@ -57,7 +58,7 @@ MELE_FilmicFit MELE_BuildFilmicFitZ(float z_lo, float pivot_z, float z_hi, float
    fit.pivot_value = MELE_FilmicLookupZ(pivot_z);
    const float probe_hi = MELE_FilmicLookupZ(z_hi);
    fit.slope = (probe_hi - probe_lo) / (z_hi - z_lo);
-   fit.valid = MELE_IsFiniteNonNegative(float3(z_lo, pivot_z, z_hi)) && z_hi > z_lo && MELE_IsFiniteNonNegative(float3(probe_lo, fit.pivot_value, probe_hi)) && probe_lo <= fit.pivot_value && fit.pivot_value <= probe_hi && MELE_IsFiniteNonNegative(fit.slope) && fit.slope > min_slope;
+   fit.valid = MELE_IsFiniteNonNegative(float3(probe_lo, fit.pivot_value, probe_hi)) && probe_lo <= fit.pivot_value && fit.pivot_value <= probe_hi && MELE_IsFiniteNonNegative(fit.slope) && fit.slope > min_slope;
    return fit;
 }
 
@@ -68,7 +69,7 @@ MELE_FilmicFit MELE_BuildFilmicFitZ(float z_lo, float pivot_z, float z_hi, float
 //
 // Below the pivot the caller's already-sampled native value is reused rather than re-probed, so that
 // region is the native result and not an approximation of it.
-bool MELE_TryEvaluateME3FilmicExtended(float3 sceneWithBloom, float3 nativeFilmicRGB, out float3 extendedFilmicRGB)
+bool MELE_TryEvaluateME3LEFilmicExtended(float3 sceneWithBloom, float3 nativeFilmicRGB, out float3 extendedFilmicRGB)
 {
    extendedFilmicRGB = nativeFilmicRGB;
    if (!MELE_IsFiniteNonNegative(sceneWithBloom) || !MELE_IsFiniteNonNegative(nativeFilmicRGB))
@@ -76,20 +77,8 @@ bool MELE_TryEvaluateME3FilmicExtended(float3 sceneWithBloom, float3 nativeFilmi
       return false;
    }
    const MELE_FilmicFit fit = MELE_BuildFilmicFitZ(MELE_HDR_PROBE_LO, MELE_HDR_PIVOT, MELE_HDR_PROBE_HI, MELE_FILMIC_MIN_SLOPE_X);
-   if (!fit.valid)
-   {
-      return false;
-   }
-   const float3 continued = fit.pivot_value + fit.slope * (sceneWithBloom - fit.pivot_z);
-   const float3 result = float3(sceneWithBloom.x <= fit.pivot_z ? nativeFilmicRGB.x : continued.x,
-                                sceneWithBloom.y <= fit.pivot_z ? nativeFilmicRGB.y : continued.y,
-                                sceneWithBloom.z <= fit.pivot_z ? nativeFilmicRGB.z : continued.z);
-   if (!MELE_IsFiniteNonNegative(result))
-   {
-      return false;
-   }
-   extendedFilmicRGB = result;
-   return true;
+   extendedFilmicRGB = sceneWithBloom <= fit.pivot_z ? nativeFilmicRGB : fit.pivot_value + fit.slope * (sceneWithBloom - fit.pivot_z);
+   return fit.valid;
 }
 
 // ME2LE, family 03. The game runs two tone stages in series and adds the bloom BETWEEN them:
@@ -105,16 +94,12 @@ bool MELE_TryEvaluateME3FilmicExtended(float3 sceneWithBloom, float3 nativeFilmi
 // THE FIT NODES COME FROM F ALONE and do not depend on C or B. Anchors that move with the signal they
 // extend invert this curve's direction: the table flattens as its coordinate rises, so a brighter
 // bloom would lower the fitted slope and make the working response FALL while the native one rises.
-// That is the defect this family was rebuilt to remove - do not reintroduce B-dependent anchors.
+// Do not introduce B-dependent anchors.
 //
-// One consequence worth keeping in mind: one fit now serves all three channels, so a tinted bloom
-// costs nothing extra. The probes still may not be cached across frames - the table's contents can be
-// rewritten in place, so a cache keyed on the SRV pointer would be wrong.
-MELE_FilmicFit MELE_BuildME2StagedFit()
-{
-   return MELE_BuildFilmicFitZ(MELE_NativeToneCurve(MELE_HDR_PROBE_LO), MELE_NativeToneCurve(MELE_HDR_PIVOT), MELE_NativeToneCurve(MELE_HDR_PROBE_HI), MELE_FILMIC_MIN_SLOPE_Z);
-}
-
+// One fit serves all three channels, so a tinted bloom costs nothing extra. The probes still may not be
+// cached across frames - the table's contents can be rewritten in place, so a cache keyed on the SRV
+// pointer would be wrong.
+//
 // Per channel, the continuation runs when the SECOND stage has passed its pivot - which a bright bloom
 // alone can cause even where the scene never left the native region. Otherwise the caller's native
 // sample is reused, because both stages then stayed native and it IS the native result.
@@ -123,33 +108,19 @@ MELE_FilmicFit MELE_BuildME2StagedFit()
 // where float32 rounding defeats that (slope * (C - p) underflowing to zero within about a thousand
 // ULP of the pivot) a fresh read at z returns exactly the native sample anyway - measured over the
 // full ULP neighbourhood and a 200k random float32 sample on the shipped table.
-bool MELE_TryEvaluateME2FilmicExtended(float3 sceneBeforePrecurve, float3 nativeBloomContribution, float3 nativeFilmicRGB, out float3 extendedFilmicRGB)
+bool MELE_TryEvaluateME2LEFilmicExtended(float3 sceneBeforePrecurve, float3 nativeBloomContribution, float3 nativeFilmicRGB, out float3 extendedFilmicRGB)
 {
    extendedFilmicRGB = nativeFilmicRGB;
    if (!MELE_IsFiniteNonNegative(sceneBeforePrecurve) || !MELE_IsFiniteNonNegative(nativeBloomContribution) || !MELE_IsFiniteNonNegative(nativeFilmicRGB))
    {
       return false;
    }
-   const MELE_FilmicFit fit = MELE_BuildME2StagedFit();
-   if (!fit.valid)
-   {
-      return false;
-   }
+   const MELE_FilmicFit fit = MELE_BuildFilmicFitZ(MELE_NativeToneCurve(MELE_HDR_PROBE_LO), MELE_NativeToneCurve(MELE_HDR_PIVOT), MELE_NativeToneCurve(MELE_HDR_PROBE_HI), MELE_FILMIC_MIN_SLOPE_Z);
+   // Finite non-negative inputs keep z non-negative and never NaN; an overflow to +inf lands above the
+   // pivot and is rejected downstream.
    const float3 z = MELE_ExpExtended(sceneBeforePrecurve, MELE_HDR_PIVOT) + nativeBloomContribution;
-   if (!MELE_IsFiniteNonNegative(z))
-   {
-      return false;
-   }
-   const float3 continued = fit.pivot_value + fit.slope * (z - fit.pivot_z);
-   const float3 tone = float3(z.x > fit.pivot_z ? continued.x : nativeFilmicRGB.x,
-                              z.y > fit.pivot_z ? continued.y : nativeFilmicRGB.y,
-                              z.z > fit.pivot_z ? continued.z : nativeFilmicRGB.z);
-   if (!MELE_IsFiniteNonNegative(tone))
-   {
-      return false;
-   }
-   extendedFilmicRGB = tone;
-   return true;
+   extendedFilmicRGB = z > fit.pivot_z ? fit.pivot_value + fit.slope * (z - fit.pivot_z) : nativeFilmicRGB;
+   return fit.valid;
 }
 
 #endif // LUMA_MELE_TONEMAP_FILMIC_EXTENDED

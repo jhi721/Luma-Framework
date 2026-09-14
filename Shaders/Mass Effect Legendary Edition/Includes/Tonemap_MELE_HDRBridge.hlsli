@@ -5,7 +5,7 @@
 
 // Pure math. Prerequisites, which this file deliberately does NOT include:
 //   ../Includes/Color.hlsl    gamma_to_linear, GetLuminance, GCT_MIRROR
-//   ../Includes/Math.hlsl     max3, IsNaN_Strict, IsInfinite_Strict  (arrive through Color.hlsl)
+//   ../Includes/Math.hlsl     max3, FLT_MAX  (arrive through Color.hlsl)
 //   ../Includes/Reinhard.hlsl ReinhardRange
 // Reinhard.hlsl has no include guard, unlike every other shared header, so including it from here
 // would be a duplicate-namespace error in the bodies that already include it. Include it in the body,
@@ -16,51 +16,39 @@
 // overlay offset, and the signed differences those produce. Applying the non-negative form to one of
 // those would reject valid game data as corrupt, so the choice is made per value.
 //
-// The non-negative pair repeats the two strict tests instead of calling MELE_IsFinite. That is
-// deliberate: expressing it as MELE_IsFinite(x) && x >= 0 reads better but fxc does not fold the call
-// away, and it cost two instructions in every permutation that uses the bridge. Measured, not assumed.
+// Ordered comparisons against constants, not the IsNaN_Strict/IsInfinite_Strict bit tests: NaN fails both
+// (DXBC ge/le are ordered), +INF fails the upper bound, -INF and negatives the lower, so the sets are
+// identical. This is not the x != x idiom Math.hlsl warns fxc folds away, and it costs 2 instructions per
+// channel where the bit tests cost about 7 - the same trade Luma_BL2TPS_Tonemap.hlsl measured.
+// Keep any negation OUTSIDE the conjunction: (x < lo || x > hi) is false for NaN and would accept it.
 bool MELE_IsFinite(float x)
 {
-   return !IsNaN_Strict(x) && !IsInfinite_Strict(x);
+   return abs(x) <= FLT_MAX;
 }
 bool MELE_IsFinite(float3 v)
 {
-   return !IsAnyNaN_Strict(v) && !any(IsInfinite_Strict(v));
+   return all(abs(v) <= FLT_MAX);
 }
 bool MELE_IsFiniteNonNegative(float x)
 {
-   return !IsNaN_Strict(x) && !IsInfinite_Strict(x) && x >= 0.0;
+   return x >= 0.0 && x <= FLT_MAX;
 }
 bool MELE_IsFiniteNonNegative(float3 v)
 {
-   return !IsAnyNaN_Strict(v) && !any(IsInfinite_Strict(v)) && all(v >= 0.0);
-}
-
-// The composite transfer between the grade-input domain and the linear domain the caller works in.
-// For every MELE family the tail from grade input to linear gradedHDR is MELE_NativeGammaCurve
-// followed by gamma_to_linear(., GCT_MIRROR), which with an identity colour grade composes to
-// (scale*c)^r for r = GammaColorScaleAndInverse.w * DefaultGamma.
-//
-// r is read from the frame's own cbuffer and never hardcoded to 2.2. Passing it in keeps this header
-// free of the per-body $Globals.
-//
-// Why an adapter at all: scaling the grade INPUT by s scales the decoded linear OUTPUT by s^r.
-// Compressing in the adapted domain makes the restore exact - W = A(X), P = q*W, Q = A^-1(P) scales
-// the input by q^(1/r), so the output scales by exactly q and a plain divide undoes it. A raw input
-// multiply with a linear divide would leave a q^(r-1) residue whenever r != 1. GCT_MIRROR keeps a
-// negative working value signed rather than turning it into a NaN; whether to trust it stays the
-// caller's decision.
-float3 MELE_BridgeAdapt(float3 v, float r)
-{
-   return gamma_to_linear(v, GCT_MIRROR, r);
-}
-float3 MELE_BridgeUnadapt(float3 v, float r)
-{
-   return gamma_to_linear(v, GCT_MIRROR, 1.0 / r);
+   return all(v >= 0.0) && all(v <= FLT_MAX);
 }
 
 // Max-channel proxy. One scalar for all three channels, so the limiter cannot move an RGB ratio; the
 // per-channel character stays owned by the working curve and by the native reference.
+//
+// Adapted domain. For every MELE family the tail from grade input to linear gradedHDR is
+// MELE_NativeGammaCurve followed by gamma_to_linear(., GCT_MIRROR), which with an identity colour grade
+// composes to (scale*c)^r for r = GammaColorScaleAndInverse.w * DefaultGamma, read from the frame's own
+// cbuffer and never hardcoded to 2.2. Scaling the grade INPUT by s scales the decoded linear OUTPUT by s^r,
+// so compressing in the adapted domain makes the restore exact - W = A(X), P = q*W, Q = A^-1(P) scales the
+// input by q^(1/r), the output by exactly q, and a plain divide undoes it. A raw input multiply with a
+// linear divide would leave a q^(r-1) residue whenever r != 1. GCT_MIRROR keeps a negative working value
+// signed rather than turning it into a NaN.
 //
 // ReinhardRange with In_Peak <= 0 compresses from infinity and is the shifted rational shoulder this
 // needs: identity at and below k, C1 across the seam, asymptotic to 1. It is NOT ReinhardPiecewise,
@@ -75,14 +63,13 @@ float3 MELE_BridgeUnadapt(float3 v, float r)
 //
 // On failure both out parameters keep the neutral values written at entry and the caller must use
 // neither: false means the HDR reconstruction declined and the caller retains the exact
-// native SDR reference for the whole RGB triple.
+// native SDR reference for the whole RGB triple. On success q is finite and in (0, 1].
 bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3 proxyNative)
 {
    q = 1.0;
    proxyNative = workNative;
 
-   const float k = MELE_HDR_BRIDGE_SHOULDER;
-   if (!MELE_IsFiniteNonNegative(workNative) || !MELE_IsFiniteNonNegative(r) || r <= 0.0 || !(k > 0.0 && k < 1.0))
+   if (!MELE_IsFiniteNonNegative(workNative) || !(r > 0.0 && r <= FLT_MAX))
    {
       return false;
    }
@@ -90,12 +77,13 @@ bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3
    // pow(x, 1) is exp2(log2(x)) on this hardware, not the identity, and r was measured at exactly 1
    // in every captured frame. This keeps that common case bit-exact; it is a shortcut for one value
    // of r, never an assumption that r is 1.
-   const float3 adapted = (r == 1.0) ? workNative : MELE_BridgeAdapt(workNative, r);
+   const float3 adapted = (r == 1.0) ? workNative : gamma_to_linear(workNative, GCT_MIRROR, r);
    if (!MELE_IsFiniteNonNegative(adapted))
    {
       return false;
    }
 
+   const float k = MELE_HDR_BRIDGE_SHOULDER;
    const float m = max3(adapted);
    if (m <= k)
    {
@@ -107,12 +95,12 @@ bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3
    // The shoulder is asymptotic to 1, so the tolerance covers roundoff in it and nothing else. A
    // compressed value genuinely above 1 means the shoulder did not do its job, which is a failure
    // rather than something to clamp quietly.
-   if (!MELE_IsFiniteNonNegative(scale) || scale <= 0.0 || scale > 1.0 || !MELE_IsFiniteNonNegative(compressed) || max3(compressed) > 1.0 + MELE_BRIDGE_PROXY_EPS)
+   if (!(scale > 0.0 && scale <= 1.0) || !MELE_IsFiniteNonNegative(compressed) || max3(compressed) > 1.0 + MELE_BRIDGE_PROXY_EPS)
    {
       return false;
    }
 
-   const float3 candidateProxy = (r == 1.0) ? compressed : MELE_BridgeUnadapt(compressed, r);
+   const float3 candidateProxy = (r == 1.0) ? compressed : gamma_to_linear(compressed, GCT_MIRROR, 1.0 / r);
    if (!MELE_IsFiniteNonNegative(candidateProxy))
    {
       return false;
@@ -124,20 +112,12 @@ bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3
 
 // Undo the compression on the decoded linear grade output. Never invert the curve by re-reading the
 // changed LUT output: the LUT moved the colour, so that read cannot recover the original scale.
+// q must come from a successful MELE_TryBuildGradeProxy, so only the quotient needs checking: a bad
+// gradedLinear stays bad after dividing by a finite positive q.
 bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 {
-   workHDR = gradedLinear;
-   if (!MELE_IsFiniteNonNegative(gradedLinear) || !MELE_IsFiniteNonNegative(q) || q <= 0.0)
-   {
-      return false;
-   }
-   const float3 restored = gradedLinear / q;
-   if (!MELE_IsFiniteNonNegative(restored))
-   {
-      return false;
-   }
-   workHDR = restored;
-   return true;
+   workHDR = gradedLinear / q;
+   return MELE_IsFiniteNonNegative(workHDR);
 }
 
 // The NATIVE colour contract for families 01-04: RGB ratios from the exact native grade result,
@@ -168,8 +148,8 @@ bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 // measured: fxc costs 3 to 4 extra instructions on every permutation that uses this helper, because
 // it stops folding the fallback into the select it already emits. That is the eighteen of families
 // 01-04, +4 on sixteen of them and +3 on the two analytic ones; 0x225A8330 takes its colour from the
-// hue donor instead, never calls this, and did not move. Measured, not assumed - see the same trade
-// in MELE_IsFiniteNonNegative above. Do not re-attempt it without re-measuring.
+// hue donor instead, never calls this, and did not move. Measured, not assumed. Do not re-attempt it
+// without re-measuring.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
 float3 MELE_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetLuminance)

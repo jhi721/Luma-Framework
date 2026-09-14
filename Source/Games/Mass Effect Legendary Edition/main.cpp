@@ -68,7 +68,7 @@ static constexpr uint32_t kFXAAResolveVHash = 0xF43DBFFD; // Vertical in-place r
 // Stage-1 tonemap permutations (MB = motion blur, FG = film grain). Slots are stored per permutation because
 // MB binds depth at t0 and pushes everything up one, and ME3LE additionally binds velocity at t2. They mirror
 // R_SCENE and R_BLOOM in the matching HLSL body with no compile-time cross-check, so a re-captured permutation
-// must move both sides. Unlisted permutations stay vanilla; this table drives only bloom and SMAA depth capture.
+// must move both sides. Unlisted permutations stay vanilla; this table drives bloom, SMAA depth capture and the DEVELOPMENT readout.
 struct TonemapPermDesc
 {
    uint32_t hash;
@@ -89,19 +89,19 @@ static constexpr TonemapPermDesc kTonemapPermsME1LE[] = {
 static constexpr TonemapPermDesc kTonemapPermsME2LE[] = {
    {0x2754F750, 1, 5, "MB, LUT grade", "HDR family 01 - exponential + LUT"},
    {0x1536C5B5, 1, 5, "MB + grain, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x940979D8, 1, 5, "MB, filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
-   {0x75BFAFBC, 1, 5, "MB + grain, filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
+   {0x940979D8, 1, 5, "MB, filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
+   {0x75BFAFBC, 1, 5, "MB + grain, filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
    {0xCC76075F, 0, 4, "analytic grade (no LUT)", "HDR family 02 - exponential + analytic"},
    {0xD077D06B, 0, 4, "LUT grade", "HDR family 01 - exponential + LUT"},
    {0x8E0C0DBB, 0, 4, "grain, LUT grade", "HDR family 01 - exponential + LUT"},
-   {0x222186F8, 0, 4, "filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
-   {0xEC890842, 0, 4, "grain, filmic + LUT grade", "HDR family 03 - ME2 filmic + LUT"},
+   {0x222186F8, 0, 4, "filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
+   {0xEC890842, 0, 4, "grain, filmic + LUT grade", "HDR family 03 - ME2LE filmic + LUT"},
 };
 static constexpr TonemapPermDesc kTonemapPermsME3LE[] = {
-   {0x36B90B12, 1, 6, "MB(depth), filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
-   {0x49BD5A95, 1, 6, "MB(depth) + grain, filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
-   {0x00944C2E, 0, 4, "filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
-   {0x5AA0BD09, 0, 4, "grain, filmic + LUT grade", "HDR family 04 - ME3 filmic + LUT"},
+   {0x36B90B12, 1, 6, "MB(depth), filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
+   {0x49BD5A95, 1, 6, "MB(depth) + grain, filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
+   {0x00944C2E, 0, 4, "filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
+   {0x5AA0BD09, 0, 4, "grain, filmic + LUT grade", "HDR family 04 - ME3LE filmic + LUT"},
    {0x225A8330, 0, 4, "analytic grade (no LUT)", "HDR family 05 - analytic hard clip"},
 };
 // Selected once in DllMain.
@@ -257,12 +257,16 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    int stage1_draws = 0;
 
 #if ENABLE_TONEMAP_DIAGNOSTICS
-   // Snapshots already written per stage-1 hash. Several, not one: the first frame a permutation appears
-   // on is often a fade or a loading screen, whose cbuffer does not describe gameplay. Measured on ME1LE
-   // 0x69F03340, first seen with GammaColorScaleAndInverse.xyz at 1e-4, a full fade to black.
-   std::unordered_map<uint32_t, uint32_t> diagnostics_dumped;
-   // Frame index each hash becomes eligible again, so the samples are spread over seconds, not frames.
-   std::unordered_map<uint32_t, uint32_t> diagnostics_next_frame;
+   // Per stage-1 hash: snapshots already written, and the frame index it becomes eligible again so the samples
+   // are spread over seconds, not frames. Several, not one: the first frame a permutation appears on is often a
+   // fade or a loading screen, whose cbuffer does not describe gameplay. Measured on ME1LE 0x69F03340, first
+   // seen with GammaColorScaleAndInverse.xyz at 1e-4, a full fade to black.
+   struct DiagnosticsState
+   {
+      uint32_t taken = 0;
+      uint32_t next_frame = 0;
+   };
+   std::unordered_map<uint32_t, DiagnosticsState> diagnostics;
 #endif
 #endif
 };
@@ -482,9 +486,9 @@ public:
    // hash-replaced and a replaced pass still carries the game's own resources at
    // this point.
    //
-   // One dump per hash per session, blocking Map, no ring buffer: this is a
-   // diagnostic build and a one-off stall on first sight of each permutation is
-   // cheaper than the complexity of avoiding it.
+   // A few spaced snapshots per hash per session, blocking Map, no ring buffer:
+   // this is a diagnostic build and an occasional stall is cheaper than the
+   // complexity of avoiding it.
    void DumpTonemapDiagnostics(
       ID3D11Device* native_device, ID3D11DeviceContext* native_device_context,
       MassEffectGameDeviceData& gd,
@@ -508,14 +512,11 @@ public:
       // second and can all land inside one fade, which is exactly what the first ME2LE capture did:
       // 0x2754F750 reported the same 1e-4 output scale eight times over.
       const uint32_t frame = cb_luma_global_settings.FrameIndex;
-      uint32_t& next_frame = gd.diagnostics_next_frame[hash];
-      if (frame < next_frame)
+      auto& state = gd.diagnostics[hash];
+      if (state.taken >= kSnapshotsPerHash || frame < state.next_frame)
          return;
-      uint32_t& taken = gd.diagnostics_dumped[hash];
-      if (taken >= kSnapshotsPerHash)
-         return;
-      next_frame = frame + kFramesBetweenSnapshots;
-      const uint32_t snapshot = taken++;
+      state.next_frame = frame + kFramesBetweenSnapshots;
+      const uint32_t snapshot = state.taken++;
 
       std::error_code ec;
       const std::filesystem::path root =
@@ -530,9 +531,7 @@ public:
       std::ofstream manifest(root / (std::string(stem) + "_manifest.txt"));
       if (!manifest)
          return;
-      char hash_text[16];
-      std::snprintf(hash_text, sizeof(hash_text), "0x%08X", hash);
-      manifest << "hash " << hash_text << "\n";
+      manifest << "hash " << Shader::Hash_NumToStr(hash, true) << "\n";
       manifest << "snapshot " << snapshot << "\n";
       manifest << "frame " << frame << "\n";
 
@@ -588,10 +587,7 @@ public:
       native_device_context->PSGetShaderResources(0, kMaxSlots, raw_srvs);
       for (UINT slot = 0; slot < kMaxSlots; ++slot)
       {
-         srvs[slot] = raw_srvs[slot]; // Adopt so the AddRef from
-                                      // PSGetShaderResources is released.
-         if (raw_srvs[slot])
-            raw_srvs[slot]->Release();
+         srvs[slot].attach(raw_srvs[slot]); // Adopts the AddRef from PSGetShaderResources.
          if (!srvs[slot])
             continue;
 
@@ -642,11 +638,7 @@ public:
          // texture beside its LUTs and hit exactly that.
          char name[64];
          std::snprintf(name, sizeof(name), "%s_t%u.bin", stem, slot);
-         {
-            std::ofstream out(root / name, std::ios::binary);
-            out.write(static_cast<const char*>(ms.pData),
-               static_cast<std::streamsize>(ms.DepthPitch));
-         }
+         write_blob(name, ms.pData, ms.DepthPitch);
          native_device_context->Unmap(staging.get(), 0);
          manifest << " pitch " << ms.RowPitch << " bytes " << ms.DepthPitch << " file " << name << "\n";
       }

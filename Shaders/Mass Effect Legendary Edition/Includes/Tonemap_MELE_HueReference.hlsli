@@ -24,22 +24,12 @@
 //
 // GAMUT. RenoDX clamps to positive AP1 and converts back, which is wider than BT.709: a negative
 // BT.709 component coming out of this is ordinary wide-gamut colour and is NOT a reason to abandon
-// the correction. The whole-triple rejection an earlier family 05 used is exactly what produced a
-// visible switching boundary, and it is not coming back. The only fallback here is for arithmetic
-// that actually broke.
+// the correction: a whole-triple rejection there produces a visible switching boundary. The only fallback
+// here is for arithmetic that actually broke.
 //
 // DICE, further down the shared output tail, stays the one and only display mapper.
-//
-// The OKLab locals below stay snake_case where the rest of this game's HDR code is camelCase: they are a
-// line-by-line port and keeping the source spelling keeps the two diffable, exactly as Shaders/Includes/
-// ACES.hlsl and Reinhard.hlsl do.
 float3 MELE_HueReferenceOKLab(float3 target, float3 reference, float strength)
 {
-   if (strength == 0.0)
-   {
-      return target;
-   }
-
    float3 target_lab = Oklab::linear_srgb_to_oklab(target);
    const float3 reference_lab = Oklab::linear_srgb_to_oklab(reference);
 
