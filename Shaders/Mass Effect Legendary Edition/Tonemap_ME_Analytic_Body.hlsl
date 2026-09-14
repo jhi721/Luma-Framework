@@ -199,18 +199,19 @@ void main(
    // Scene-referred exposure before tonemapping.
    r1.xyz = r1.xyz * LumaSettings.GameSettings.Exposure;
 
+   // Native screen-blend using Luma's rebound fp16 bloom. DELIBERATE DEVIATION: the weight reads the LINEAR scene,
+   // where the native CSO reads it after the curve; bright pixels lose their bloom, which keeps highlight detail and
+   // colour in HDR. A/B'd in game (see Shaders AGENTS.md).
+   r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
+
    // Captured before the curve below overwrites r1. Straight RGB, with no BRG rotation to undo.
    const float3 sceneLinear = r1.xyz;
+   const float3 bloomLinear = r0.xyz * r0.www;
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.xyz;
    r1.xyz = exp2(r1.xyz);
    r1.xyz = float3(1, 1, 1) + -r1.xyz;
-
-   // Native screen blend using Luma's rebound fp16 bloom. Its weight reads the luma of the CURVED scene (0xAAE8755A
-   // and 0xCC76075F CSOs); the HDR family's bloom takes the linear-scene weight instead, see MELE_BloomScreenBlendWeight.
-   r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
-   const float3 bloomLinear = r0.xyz * MELE_BloomScreenBlendWeight(sceneLinear);
    r0.xyz = r0.xyz * r0.www + r1.xyz;
    // The native per-channel value still reaches the analytic grade untouched - that is this body's SDR output.
    // Family 02 does not touch it; it builds a second, uncapped working value from the scene instead.

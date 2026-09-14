@@ -298,19 +298,22 @@ void main(
    r1.xyz = r1.xyz * LumaSettings.GameSettings.Exposure;
 
 #if TM_HAS_FILMIC
-   // Filmic path from 0x222186F8: exponential curve, bloom, then per-channel 4096x1 LUT. The scene and the bloom are
-   // kept separate on purpose: the game evaluates L(F(C) + B), so C and B must not be summed before the pre-curve.
+   // Filmic path from 0x222186F8: bloom, exponential curve, then per-channel 4096x1 LUT. DELIBERATE DEVIATION: the
+   // screen-blend weight reads the luma of the LINEAR scene, where the native CSO reads it after the curve (always 1
+   // at the measured threshold). Bright pixels therefore lose their bloom; that keeps highlight detail and colour in
+   // HDR, and the families were calibrated with it. Restoring the native weight was A/B'd in game and rejected
+   // (see Shaders AGENTS.md).
+   r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
+
+   // Kept separate on purpose: the game evaluates L(F(C) + B), so C and B must not be summed before the
+   // pre-curve.
    const float3 sceneLinear = r1.xyz;
+   const float3 bloomLinear = r0.xyz * r0.www;
 
    // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
    r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.xyz;
    r1.xyz = exp2(r1.xyz);
    r1.xyz = float3(1, 1, 1) + -r1.xyz;
-
-   // The native screen-blend weight reads the luma of the CURVED scene (0x222186F8 CSO); the HDR family's bloom
-   // takes the linear-scene weight instead, see MELE_BloomScreenBlendWeight.
-   r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
-   const float3 bloomLinear = r0.xyz * MELE_BloomScreenBlendWeight(sceneLinear);
    r0.xyz = r0.xyz * r0.www + r1.xyz;
 
    // Native 4096x1 R16_UNORM filmic LUT. Preserve its channel rotation.
@@ -321,26 +324,27 @@ void main(
    r1.xyz = saturate(r1.xyz);
    // r1.xyz keeps the native post-filmic value, which reaches the 16-slice LUT untouched as this branch's SDR result.
 #else
-   // Non-filmic path from 0x2754F750: exponential curve, bloom, highlight desaturation, adjustments, then LUT. The
-   // post-exposure scene is captured in RGB before the curve rewrites r1.
-   const float3 sceneLinear = r1.xyz;
-
-   // Native per-channel SDR curve: 1 - exp2(-1.7 * scene), written BRG.
-   r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.zxy;
-   r1.xyz = exp2(r1.xyz);
-   r1.xyz = float3(1, 1, 1) + -r1.xyz;
-
-   // Native bloom screen blend, built in BRG. Its weight reads the luma of the CURVED scene, and r1.yzx rotates that
-   // BRG value back to RGB for the luma weights (0x2754F750 and 0x8C8E8CA2 CSOs).
+   // Non-filmic path from 0x2754F750: bloom, exponential curve, highlight desaturation, adjustments, then LUT.
+   // DELIBERATE DEVIATION: the screen-blend weight reads the LINEAR scene through r1.yzx (native reads the curved BRG
+   // scene, where .yzx restores RGB), so bright pixels lose their bloom, with a hue-dependent threshold. Keeps
+   // highlight detail and colour in HDR; the families were calibrated with it, and the native weight and an RGB-order
+   // linear weight were both A/B'd in game and rejected (see Shaders AGENTS.md).
    r0.xyz = BlurredImageSeperateBloom.Sample(BlurredImageSeperateBloomSampler_s, r0.xy).xyz * LumaSettings.GameSettings.BloomIntensity;
    r0.xyz = BloomTintAndScreenBlendThreshold.zxy * r0.zxy;
    r0.w = dot(r1.yzx, float3(0.298999995, 0.587000012, 0.114));
    r0.xyzw = float4(4, 4, 4, -3) * r0.xyzw;
    r0.w = exp2(r0.w);
    r0.w = saturate(BloomTintAndScreenBlendThreshold.w * r0.w);
-   // RGB, like sceneLinear: the .yzx rotates the BRG bloom back. The HDR family's bloom takes the linear-scene weight
-   // instead of the native one, see MELE_BloomScreenBlendWeight.
-   const float3 bloomLinear = r0.yzx * MELE_BloomScreenBlendWeight(sceneLinear);
+
+   // Captured before the curve below rewrites r1. Both are RGB: the blend above built the bloom in BRG and the .yzx
+   // below rotates it back, while r1 still holds the post-exposure scene in RGB.
+   const float3 sceneLinear = r1.xyz;
+   const float3 bloomLinear = r0.yzx * r0.www;
+
+   // Native per-channel SDR curve: 1 - exp2(-1.7 * scene).
+   r1.xyz = float3(-1.70000005, -1.70000005, -1.70000005) * r1.zxy;
+   r1.xyz = exp2(r1.xyz);
+   r1.xyz = float3(1, 1, 1) + -r1.xyz;
    r0.xyz = r0.xyz * r0.www + r1.xyz;
 
    // r0.xyz keeps the native per-channel value, which reaches the grade untouched as this branch's SDR result.
