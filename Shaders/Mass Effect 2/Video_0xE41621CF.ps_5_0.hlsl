@@ -72,9 +72,11 @@ void main(
       lin = PumboAutoHDR(lin, peakNits, GamePaperWhiteNits);
    }
 #endif
-#if UI_DRAW_TYPE >= 2
+#if UI_DRAW_TYPE >= 2 && TONEMAP_TYPE >= 1
    // Match the scene passes' pre-scale so movies land at gameplay brightness after composition rescales by UIPaperWhite.
-   // Accessors, not LumaSettings - a deliberate divergence from ME1 2007 (NOTES.md). The zero guard has to stay.
+   // Gated like the scene passes: on TONEMAP_TYPE 0 they write the vanilla value with no pre-scale, so the movie must
+   // not carry one either. Accessors, not LumaSettings - a deliberate divergence from ME1 2007 (NOTES.md). The zero
+   // guard has to stay.
    if (GamePaperWhiteNits > 0.0)
       lin *= GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0);
 #endif

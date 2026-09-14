@@ -83,8 +83,10 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    return Saturation(hdr, LumaSettings.GameSettings.Saturation);
 }
 
-// Linear scene -> the canvas the HUD blends onto. Shared by the material and the material-less fallback.
-float3 EncodeME2Canvas(float3 sceneHDR)
+// Linear scene -> the canvas the HUD blends onto. Shared by the material and the material-less fallback. The material
+// passes paperWhitePrescale = false and applies the same scale itself AFTER its grain and offset, so those stay
+// relative to the scene as vanilla had them.
+float3 EncodeME2Canvas(float3 sceneHDR, bool paperWhitePrescale)
 {
    float3 c = MapME2ToDisplay(sceneHDR);
 
@@ -94,7 +96,7 @@ float3 EncodeME2Canvas(float3 sceneHDR)
 #if UI_DRAW_TYPE >= 2
    // Pre-scale so the gamma-SDR HUD on this canvas lands at UIPaperWhite after composition rescales by it. Accessors,
    // not LumaSettings (see MapME2ToDisplay), and still guarded: a zero would black the scene and leave the HUD.
-   if (GamePaperWhiteNits > 0.0)
+   if (paperWhitePrescale && GamePaperWhiteNits > 0.0)
       c *= GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0);
 #endif
 
@@ -364,7 +366,7 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
 
    // THEN the display map, last colour operation of the scene, so peak containment covers the vignette's white point
    // too. renodx's ordering; the two alternatives that failed (+39% blue, magenta rim) are recorded in NOTES.md.
-   outColor = EncodeME2Canvas(outColor);
+   outColor = EncodeME2Canvas(outColor, false);
 #else
    // Vanilla: the canvas holds the vanilla display-encoded value, so every operation here is the original's -
    // including the vignette, which stays in this pass and in the encoded domain exactly as the game had it.
@@ -379,6 +381,26 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
    outColor = ME2_Grain(outColor, grainUV, TONEMAP_TYPE >= 1 ? LumaSettings.GameSettings.FilmGrainIntensity : 1.0);
 #endif
    outColor += MatOffset.xyz;
+
+#if TONEMAP_TYPE >= 1
+#if UI_DRAW_TYPE >= 2
+   // The UI paper-white pre-scale EncodeME2Canvas skipped, applied after grain and offset so both keep vanilla's
+   // relation to the scene. A pure-pow encode makes the gamma-domain multiply equal the linear one.
+   if (GamePaperWhiteNits > 0.0)
+   {
+      const float paperWhitePrescale = GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0);
+#if POST_PROCESS_SPACE_TYPE == 0
+      outColor *= linear_to_gamma1(paperWhitePrescale, GCT_POSITIVE);
+#else
+      outColor *= paperWhitePrescale;
+#endif
+   }
+#endif
+#else
+   // Vanilla wrote this into an 8-bit UNORM canvas, which clamped grain and offset along with the vignette's white
+   // point; the fp16 canvas needs the clamp spelled out.
+   outColor = saturate(outColor);
+#endif
 
 #if TONEMAP_TYPE >= 1 && POST_PROCESS_SPACE_TYPE == 0
    // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.

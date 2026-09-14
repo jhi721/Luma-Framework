@@ -22,7 +22,7 @@ void main(
    // lerp(scene * ColorScale, OverlayColor, OverlayColor.w)
    const float3 c = lerp(scene * PsConstants[8].rgb, PsConstants[10].rgb, PsConstants[10].w);
 #if TONEMAP_TYPE >= 1
-   o0.rgb = Sanitize(EncodeME2Canvas(max(c, 0.0)));
+   o0.rgb = Sanitize(EncodeME2Canvas(max(c, 0.0), true));
 #else
    o0.rgb = PowUE3(max(saturate(c), 1e-4), PsConstants[11].xxx);
 #endif
