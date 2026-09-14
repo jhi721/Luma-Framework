@@ -25,37 +25,34 @@
 
 #include "..\..\Core\core.hpp"
 
-// Tonemap ("exposure") permutations, dgVoodoo-translated ps_5_0 hashes.
-static constexpr uint32_t kTonemapExposure = 0x91348C0F;   // DX9 0xC5ADBC35: exposure+scale, alpha passthrough
-static constexpr uint32_t kTonemapBrightPass = 0x00E31BF9; // DX9 0xF01A691E: bloom bright-pass (threshold ramp, saturation, colour)
+// Every pass is keyed under both dgVoodoo builds: 2.87.3, and 2.81.3 (the build that runs under Proton), which emits
+// ps_4_0 and therefore different hashes. Dump-verified as signature-identical: same interpolators, t/s registers and cb
+// slots, so the replacements and the slot-based captures are shared.
+struct DgVoodooHashes
+{
+   uint32_t v2873;
+   uint32_t v2813;
+};
+
+// Tonemap ("exposure") permutations.
+static constexpr DgVoodooHashes kTonemapExposure = {0x91348C0F, 0x6CF3E8B7};   // DX9 0xC5ADBC35: exposure+scale, alpha passthrough
+static constexpr DgVoodooHashes kTonemapBrightPass = {0x00E31BF9, 0xB293C5B1}; // DX9 0xF01A691E: bloom bright-pass (threshold ramp, saturation, colour)
 // Two static permutations (exposure from PSC_LumRanges) have never been captured; their signature is 1 texture,
 // dp4 cb4[58], min cap cb4[59].x. Not declared as 0: an absent pipeline hash reads as 0 and would match.
 // Final grade (FXAA + colour balance + split toning + vignette), last pass before UI; hosts the HDR block and the SMAA hook.
-static constexpr uint32_t kFinalGrade = 0xDE5CF9CD;
-static constexpr uint32_t kFinalGradeNoAA = 0xCF3B72A9;       // game AA off: no FXAA block, scene alpha passed through
-static constexpr uint32_t kFinalGradeNoVignette = 0xBABBFFAD; // no FXAA and no vignette
+static constexpr DgVoodooHashes kFinalGrade = {0xDE5CF9CD, 0x517DC6D5};
+static constexpr DgVoodooHashes kFinalGradeNoAA = {0xCF3B72A9, 0xBBFEC706};       // game AA off: no FXAA block, scene alpha passed through
+static constexpr DgVoodooHashes kFinalGradeNoVignette = {0xBABBFFAD, 0x2CA0631E}; // no FXAA and no vignette
 // FXAA on, vignette off: the fourth corner of the 2x2 permutation matrix.
-static constexpr uint32_t kFinalGradeAANoVignette = 0x058E2498;
+static constexpr DgVoodooHashes kFinalGradeAANoVignette = {0x058E2498, 0xA966D512};
 // Native SSAO generator (HBAO variant, VS 0x5D9D0449): half-res r32_float LINEAR view depth at t0 -> half-res
 // r8g8b8a8 (.x = AO, .y = viewZ). Only this draw is replaced; the vanilla chain downstream reads just .x:
 // pack 0x953119B5 -> ping-pong 0xC131C40D x2 -> blur 0xD01CBD13 x2 -> apply 0x5C63E1C2.
 // Needs SSAO on in the game's video settings.
-static constexpr uint32_t kAOGen = 0x3FEEC0F7;
+static constexpr DgVoodooHashes kAOGen = {0x3FEEC0F7, 0x6EC596CA};
 // AO pack (t0 = full-res r32_float LINEAR depth, t1 = the AO target): depth-capture fallback for SMAA
 // predication, since it runs every frame while the tonemap capture only fires on the BRIGHT-PASS perm.
-static constexpr uint32_t kAOPack = 0x953119B5;
-
-// The same passes as translated by dgVoodoo 2.81.3 (the build that runs under Proton), which emits ps_4_0 and
-// therefore different hashes. Dump-verified as signature-identical to their counterparts above: same
-// interpolators, t/s registers and cb slots, so the replacements and the slot-based captures are shared.
-static constexpr uint32_t kTonemapExposure_v281 = 0x6CF3E8B7;
-static constexpr uint32_t kTonemapBrightPass_v281 = 0xB293C5B1;
-static constexpr uint32_t kFinalGrade_v281 = 0x517DC6D5;
-static constexpr uint32_t kFinalGradeNoAA_v281 = 0xBBFEC706;
-static constexpr uint32_t kFinalGradeNoVignette_v281 = 0x2CA0631E;
-static constexpr uint32_t kFinalGradeAANoVignette_v281 = 0xA966D512;
-static constexpr uint32_t kAOGen_v281 = 0x6EC596CA;
-static constexpr uint32_t kAOPack_v281 = 0x495E9133;
+static constexpr DgVoodooHashes kAOPack = {0x953119B5, 0x495E9133};
 
 // The engine's glow chain (halo around candles and torches, distinct from the god rays): copy 0x5A8E5532 and the
 // 12-tap blur 0x88C500CF x2 stay vanilla; the screen blend 0x12931281 is replaced (LightShaftBlend_0x12931281).
@@ -120,7 +117,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
    // RCAS sharpen CB (b0) = (w,h,sharpness,0) + output temp (canvas format, RTV).
    ComPtr<ID3D11Buffer> cb_sharpen;
-   float sharpen_amount = -1.f;
+   float sharpen_amount = 0.f; // the value cb_sharpen was built with; meaningful only while cb_sharpen exists
    // Full-res r32_float depth, captured at whichever comes first: the BRIGHT-PASS tonemap draw (t1) or the AO
    // pack pass (t0). tex_pred is the R16F edge-ness from the Depth Extract CS, not a depth.
    ComPtr<ID3D11ShaderResourceView> srv_scene_depth;
@@ -128,8 +125,9 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11UnorderedAccessView> uav_pred;
    ComPtr<ID3D11ShaderResourceView> srv_pred;
    ComPtr<ID3D11Buffer> cb_pred;
-   float pred_tolerance = -1.f;
-   float smaa_metrics_pred_scale = -1.f; // recreate the metrics CB when predication turns on/off
+   // The values cb_pred and cb_smaa_metrics were built with; meaningful only while that CB exists.
+   float pred_tolerance = 0.f;
+   float smaa_metrics_pred_scale = 0.f; // recreate the metrics CB when predication turns on/off
 
    // ---- XeGTAO (see RunXeGTAO) ----
    // Sized from the depth SRV captured at the hooked draw, so no per-present reset is needed. tex_gtao_final
@@ -148,7 +146,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    uint32_t gtao_w = 0, gtao_h = 0;
    DXGI_FORMAT gtao_final_fmt = DXGI_FORMAT_UNKNOWN; // actual (possibly Luma-upgraded) AO RT format
    ComPtr<ID3D11Buffer> cb_gtao;                     // knobs + viewport (kGTAOKnobsCBSlot), immutable, recreated on change and with the set
-   float gtao_cb_fvp = -1.f, gtao_cb_depth_scale = -1.f, gtao_cb_radius = -1.f, gtao_cb_debug = -1.f;
+   float gtao_cb_data[8] = {};                       // what cb_gtao was built with; meaningful only while cb_gtao exists
 
 #if DEVELOPMENT
    // ---- Vanilla constant logger (see LogVanillaGrade / LogVanillaTonemap) ----
@@ -210,7 +208,6 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       tex_smaa_out_srv.reset();
       tex_smaa_out.reset();
       cb_sharpen.reset();
-      sharpen_amount = -1.f;
    }
 
    void ReleasePredicationScratch()
@@ -219,7 +216,6 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       srv_pred.reset();
       tex_pred.reset();
       cb_pred.reset();
-      pred_tolerance = -1.f;
    }
 };
 
@@ -231,14 +227,14 @@ class TheWitcher2Game final : public Game
    }
 
    // Matches a pass by both of its keyed dgVoodoo hashes.
-   static bool ContainsPixelShader(const ShaderHashesList<OneShaderPerPipeline>& shader_hashes, uint32_t hash, uint32_t hash_v281)
+   static bool ContainsPixelShader(const ShaderHashesList<OneShaderPerPipeline>& shader_hashes, const DgVoodooHashes& pass)
    {
-      return shader_hashes.Contains(hash, reshade::api::shader_stage::pixel) || shader_hashes.Contains(hash_v281, reshade::api::shader_stage::pixel);
+      return shader_hashes.Contains(pass.v2873, reshade::api::shader_stage::pixel) || shader_hashes.Contains(pass.v2813, reshade::api::shader_stage::pixel);
    }
 
    static bool IsTonemap(const ShaderHashesList<OneShaderPerPipeline>& shader_hashes)
    {
-      return ContainsPixelShader(shader_hashes, kTonemapExposure, kTonemapExposure_v281) || ContainsPixelShader(shader_hashes, kTonemapBrightPass, kTonemapBrightPass_v281);
+      return ContainsPixelShader(shader_hashes, kTonemapExposure) || ContainsPixelShader(shader_hashes, kTonemapBrightPass);
    }
 
 #if DEVELOPMENT
@@ -307,12 +303,12 @@ class TheWitcher2Game final : public Game
    {
       if ((gd.frame_counter & 15u) != 0u)
          return;
-      float r[12 * 4] = {};
-      if (!CaptureConstantRows(native_device, native_device_context, gd.grade_cb, 60, 12, r))
+      float rows[12 * 4] = {};
+      if (!CaptureConstantRows(native_device, native_device_context, gd.grade_cb, 60, 12, rows))
          return;
-      const auto row = [&r](uint32_t cb4_index)
+      const auto row = [&rows](uint32_t cb4_index)
       {
-         const float* v = &r[(cb4_index - 60) * 4];
+         const float* v = &rows[(cb4_index - 60) * 4];
          return std::format("({:.4f}, {:.4f}, {:.4f}, {:.4f})", v[0], v[1], v[2], v[3]);
       };
       std::string line = std::format("[TW2-Grade] vHighlight={} vMidtone={} vShadow={} vVignetteWeights={} vVignetteColor={} vSplitToneShadows={} vSplitToneHighlights={} vSplitToneBalance={} vSplitToneRange={}",
@@ -329,10 +325,10 @@ class TheWitcher2Game final : public Game
    {
       if ((gd.frame_counter % 120u) != 0u)
          return;
-      float r[2 * 4] = {};
-      if (CaptureConstantRows(native_device, native_device_context, gd.tonemap_cb, 58, 2, r))
+      float rows[2 * 4] = {};
+      if (CaptureConstantRows(native_device, native_device_context, gd.tonemap_cb, 58, 2, rows))
       {
-         std::string line = std::format("[TW2-Tonemap] PSC_LumWeights=({:.4f}, {:.4f}, {:.4f}, {:.4f}) PSC_LumRanges2=({:.4f}, {:.4f}, {:.4f}, {:.4f})", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+         std::string line = std::format("[TW2-Tonemap] PSC_LumWeights=({:.4f}, {:.4f}, {:.4f}, {:.4f}) PSC_LumRanges2=({:.4f}, {:.4f}, {:.4f}, {:.4f})", rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7]);
          if (line != gd.last_tonemap_line)
          {
             LogVanillaLine(std::format("{} frame={}", line, gd.frame_counter));
@@ -395,8 +391,8 @@ class TheWitcher2Game final : public Game
    {
       if ((gd.frame_counter & 15u) != 0u)
          return;
-      float r[9 * 4] = {};
-      if (!CaptureConstantRows(native_device, native_device_context, gd.aogen_cb, 8, 9, r))
+      float rows[9 * 4] = {};
+      if (!CaptureConstantRows(native_device, native_device_context, gd.aogen_cb, 8, 9, rows))
          return;
       D3D11_VIEWPORT viewport = {};
       UINT viewport_count = 1;
@@ -409,9 +405,9 @@ class TheWitcher2Game final : public Game
       DXGI_FORMAT rt_fmt = DXGI_FORMAT_UNKNOWN, depth_fmt = DXGI_FORMAT_UNKNOWN;
       GetResourceInfo(rtv.get(), rt_info, rt_fmt);
       GetResourceInfo(srv_depth.get(), depth_info, depth_fmt);
-      const auto row = [&r](uint32_t cb4_index)
+      const auto row = [&rows](uint32_t cb4_index)
       {
-         const float* v = &r[(cb4_index - 8) * 4];
+         const float* v = &rows[(cb4_index - 8) * 4];
          return std::format("({:.6f}, {:.6f}, {:.6f}, {:.6f})", v[0], v[1], v[2], v[3]);
       };
       std::string line = std::format("[TW2-AOGen] output={}x{} viewport=({:.1f}, {:.1f}) {:.1f}x{:.1f} rt={}x{} depth={}x{} cb4[8]={} cb4[9]={} cb4[10]={} cb4[11]={} cb4[14]={} cb4[15]={} cb4[16]={}",
@@ -448,7 +444,7 @@ class TheWitcher2Game final : public Game
    // four host the Luma HDR block through the same shader file.
    static bool IsFinalGrade(const ShaderHashesList<OneShaderPerPipeline>& shader_hashes)
    {
-      return ContainsPixelShader(shader_hashes, kFinalGrade, kFinalGrade_v281) || ContainsPixelShader(shader_hashes, kFinalGradeNoAA, kFinalGradeNoAA_v281) || ContainsPixelShader(shader_hashes, kFinalGradeNoVignette, kFinalGradeNoVignette_v281) || ContainsPixelShader(shader_hashes, kFinalGradeAANoVignette, kFinalGradeAANoVignette_v281);
+      return ContainsPixelShader(shader_hashes, kFinalGrade) || ContainsPixelShader(shader_hashes, kFinalGradeNoAA) || ContainsPixelShader(shader_hashes, kFinalGradeNoVignette) || ContainsPixelShader(shader_hashes, kFinalGradeAANoVignette);
    }
 
    // dgVoodoo sometimes leaves blending ENABLED on a secondary render target while RT0 has it off. D3D9 has one
@@ -599,7 +595,7 @@ class TheWitcher2Game final : public Game
       DXGI_FORMAT cfmt = DXGI_FORMAT_UNKNOWN;
       GetResourceInfo(canvas_res, cinfo, cfmt);
       uint32_t w = cinfo.x, h = cinfo.y;
-      if (w == 0 || h == 0 || (uint32_t)cfmt == (uint32_t)DXGI_FORMAT_UNKNOWN)
+      if (w == 0 || h == 0 || cfmt == DXGI_FORMAT_UNKNOWN)
       {
          return;
       }
@@ -641,8 +637,8 @@ class TheWitcher2Game final : public Game
       {
          if (!gd.cb_pred || gd.pred_tolerance != g_smaa_pred_tolerance)
          {
-            const float p[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
-            if (CreateImmutableCB(native_device, p, sizeof(p), gd.cb_pred))
+            const float pred_params[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
+            if (CreateImmutableCB(native_device, pred_params, sizeof(pred_params), gd.cb_pred))
                gd.pred_tolerance = g_smaa_pred_tolerance;
          }
          if (!gd.tex_pred && CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_pred, DXGI_FORMAT_R16_FLOAT))
@@ -673,8 +669,8 @@ class TheWitcher2Game final : public Game
       {
          if (!gd.cb_sharpen || gd.sharpen_amount != g_rcas_sharpness)
          {
-            const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-            if (CreateImmutableCB(native_device, sp, sizeof(sp), gd.cb_sharpen))
+            const float sharpen_params[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
+            if (CreateImmutableCB(native_device, sharpen_params, sizeof(sharpen_params), gd.cb_sharpen))
                gd.sharpen_amount = g_rcas_sharpness;
          }
          if (!gd.tex_smaa_out && CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd.tex_smaa_out, cfmt))
@@ -703,10 +699,8 @@ class TheWitcher2Game final : public Game
       {
          DrawStateStack<DrawStateStackType::Compute> linearize_state;
          linearize_state.Cache(native_device_context, device_data.uav_max_count);
-         ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
-         ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &lin_srv);
+         native_device_context->CSSetUnorderedAccessViews(0, 1, gd.uav_input_linear.get_addressof(), nullptr);
+         native_device_context->CSSetShaderResources(0, 1, gd.srv_input.get_addressof());
          native_device_context->CSSetShader(linearize_cs, nullptr, 0);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
          linearize_state.Restore(native_device_context);
@@ -719,12 +713,9 @@ class TheWitcher2Game final : public Game
          DrawStateStack<DrawStateStackType::Compute> pred_cs_state;
          pred_cs_state.Cache(native_device_context, device_data.uav_max_count);
 
-         ID3D11ShaderResourceView* ps_srv = gd.srv_scene_depth.get();
-         ID3D11UnorderedAccessView* ps_uav = gd.uav_pred.get();
-         ID3D11Buffer* ps_cb = gd.cb_pred.get();
-         native_device_context->CSSetShaderResources(0, 1, &ps_srv);
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &ps_uav, nullptr);
-         native_device_context->CSSetConstantBuffers(0, 1, &ps_cb);
+         native_device_context->CSSetShaderResources(0, 1, gd.srv_scene_depth.get_addressof());
+         native_device_context->CSSetUnorderedAccessViews(0, 1, gd.uav_pred.get_addressof(), nullptr);
+         native_device_context->CSSetConstantBuffers(0, 1, gd.cb_pred.get_addressof());
          native_device_context->CSSetShader(pred_cs, nullptr, 0);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 
@@ -735,9 +726,8 @@ class TheWitcher2Game final : public Game
       ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
       native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
       native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-      ID3D11Buffer* mcb = gd.cb_smaa_metrics.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &mcb);
-      native_device_context->PSSetConstantBuffers(1, 1, &mcb);
+      native_device_context->VSSetConstantBuffers(1, 1, gd.cb_smaa_metrics.get_addressof());
+      native_device_context->PSSetConstantBuffers(1, 1, gd.cb_smaa_metrics.get_addressof());
 
       // The last pass of the chain renders straight into the canvas RTV — no write-back copy. Reading the
       // canvas is safe because SMAA/RCAS sample the snapshot (tex_input), never the canvas itself.
@@ -750,18 +740,15 @@ class TheWitcher2Game final : public Game
          DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
          sharpen_state.Cache(native_device_context, device_data.uav_max_count);
 
-         ID3D11Buffer* scb = gd.cb_sharpen.get();
-         native_device_context->PSSetConstantBuffers(0, 1, &scb);
+         native_device_context->PSSetConstantBuffers(0, 1, gd.cb_sharpen.get_addressof());
          DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
             sharpen_vs, sharpen_ps, gd.tex_smaa_out_srv.get(), canvas_rtv, w, h, false);
 
          sharpen_state.Restore(native_device_context);
       }
 
-      ID3D11Buffer* vcb = vs_cb1_orig.get();
-      ID3D11Buffer* pcb = ps_cb1_orig.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &vcb);
-      native_device_context->PSSetConstantBuffers(1, 1, &pcb);
+      native_device_context->VSSetConstantBuffers(1, 1, vs_cb1_orig.get_addressof());
+      native_device_context->PSSetConstantBuffers(1, 1, ps_cb1_orig.get_addressof());
    }
 #endif // ENABLE_SMAA
 
@@ -843,19 +830,16 @@ class TheWitcher2Game final : public Game
          }
          ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd.tex_gtao_depth_mips.get(), nullptr, gd.srv_gtao_depth_mips.put()));
 
-         td.MipLevels = 1;
-         td.Format = DXGI_FORMAT_R8G8_UNORM;
          for (int i = 0; ok && i < 2; i++)
          {
-            ok = ok && SUCCEEDED(native_device->CreateTexture2D(&td, nullptr, gd.tex_gtao_working[i].put()));
+            ok = ok && CreateDefaultTex(native_device, w, h, td.BindFlags, gd.tex_gtao_working[i], DXGI_FORMAT_R8G8_UNORM);
             ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.tex_gtao_working[i].get(), nullptr, gd.uav_gtao_working[i].put()));
             ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd.tex_gtao_working[i].get(), nullptr, gd.srv_gtao_working[i].put()));
          }
 
          // Final AO in the game's channel layout (.x = AO), in the RT's ACTUAL format so CopyResource is legal.
          // The shader writes a plain float4 UAV, valid against both unorm8 and fp16.
-         td.Format = final_fmt;
-         ok = ok && SUCCEEDED(native_device->CreateTexture2D(&td, nullptr, gd.tex_gtao_final.put()));
+         ok = ok && CreateDefaultTex(native_device, w, h, td.BindFlags, gd.tex_gtao_final, final_fmt);
          ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.tex_gtao_final.get(), nullptr, gd.uav_gtao_final.put()));
 
          if (!ok)
@@ -869,35 +853,27 @@ class TheWitcher2Game final : public Game
          return DrawOrDispatchOverrideType::None; // the allocation failed for this size and format: the native draw runs
 
 #if DEVELOPMENT
-      const float dbg = (float)g_gtao_debug_view;
+      const float debug_view = (float)g_gtao_debug_view;
 #else
-      const float dbg = 0.f;
+      const float debug_view = 0.f;
 #endif
       // Knobs + viewport CB. The viewport rides along so the shader never trusts game constants for it.
-      if (!gd.cb_gtao || gd.gtao_cb_fvp != g_gtao_final_value_power || gd.gtao_cb_depth_scale != g_gtao_depth_scale ||
-          gd.gtao_cb_radius != g_gtao_radius_override || gd.gtao_cb_debug != dbg)
+      const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, debug_view, 1.f / (float)w, 1.f / (float)h, 0.f, 0.f};
+      if (!gd.cb_gtao || memcmp(gd.gtao_cb_data, knobs, sizeof(knobs)) != 0)
       {
-         const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, 1.f / (float)w, 1.f / (float)h, 0.f, 0.f};
          if (CreateImmutableCB(native_device, knobs, sizeof(knobs), gd.cb_gtao))
-         {
-            gd.gtao_cb_fvp = g_gtao_final_value_power;
-            gd.gtao_cb_depth_scale = g_gtao_depth_scale;
-            gd.gtao_cb_radius = g_gtao_radius_override;
-            gd.gtao_cb_debug = dbg;
-         }
+            memcpy(gd.gtao_cb_data, knobs, sizeof(knobs));
       }
       if (!gd.cb_gtao)
          return DrawOrDispatchOverrideType::None;
 
-      DrawStateStack<DrawStateStackType::Compute> st;
-      st.Cache(native_device_context, device_data.uav_max_count);
+      DrawStateStack<DrawStateStackType::Compute> compute_state;
+      compute_state.Cache(native_device_context, device_data.uav_max_count);
 
-      ID3D11Buffer* gcb = game_cb4.get();
-      native_device_context->CSSetConstantBuffers(4, 1, &gcb);
-      ID3D11Buffer* kcb = gd.cb_gtao.get();
-      native_device_context->CSSetConstantBuffers(kGTAOKnobsCBSlot, 1, &kcb);
-      ID3D11SamplerState* smp = device_data.sampler_state_point.get();
-      native_device_context->CSSetSamplers(0, 1, &smp);
+      native_device_context->CSSetConstantBuffers(4, 1, game_cb4.get_addressof());
+      native_device_context->CSSetConstantBuffers(kGTAOKnobsCBSlot, 1, gd.cb_gtao.get_addressof());
+      ID3D11SamplerState* point_sampler = device_data.sampler_state_point.get();
+      native_device_context->CSSetSamplers(0, 1, &point_sampler);
 
       static constexpr std::array<ID3D11UnorderedAccessView*, 5> uav_nulls5 = {};
       static constexpr std::array<ID3D11ShaderResourceView*, 2> srv_nulls2 = {};
@@ -905,11 +881,10 @@ class TheWitcher2Game final : public Game
       // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
       {
          native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         ID3D11ShaderResourceView* srv = srv_depth.get();
          ID3D11UnorderedAccessView* uavs[5] = {gd.gtao_depth_mip_uavs[0].get(), gd.gtao_depth_mip_uavs[1].get(),
             gd.gtao_depth_mip_uavs[2].get(), gd.gtao_depth_mip_uavs[3].get(), gd.gtao_depth_mip_uavs[4].get()};
          native_device_context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &srv);
+         native_device_context->CSSetShaderResources(0, 1, srv_depth.get_addressof());
          native_device_context->CSSetShader(cs_prefilter, nullptr, 0);
          native_device_context->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
          native_device_context->CSSetUnorderedAccessViews(0, 5, uav_nulls5.data(), nullptr);
@@ -918,35 +893,29 @@ class TheWitcher2Game final : public Game
       // silently nulls the conflicting SRV. Normals are generated from depth inside the shader.
       {
          native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         ID3D11ShaderResourceView* srv = gd.srv_gtao_depth_mips.get();
-         ID3D11UnorderedAccessView* uav = gd.uav_gtao_working[0].get();
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &srv);
+         native_device_context->CSSetUnorderedAccessViews(0, 1, gd.uav_gtao_working[0].get_addressof(), nullptr);
+         native_device_context->CSSetShaderResources(0, 1, gd.srv_gtao_depth_mips.get_addressof());
          native_device_context->CSSetShader(cs_main, nullptr, 0);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
       }
       // First denoiser writes working1, two horizontal pixels per thread.
       {
          native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         ID3D11ShaderResourceView* srv = gd.srv_gtao_working[0].get();
-         ID3D11UnorderedAccessView* uav = gd.uav_gtao_working[1].get();
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &srv);
+         native_device_context->CSSetUnorderedAccessViews(0, 1, gd.uav_gtao_working[1].get_addressof(), nullptr);
+         native_device_context->CSSetShaderResources(0, 1, gd.srv_gtao_working[0].get_addressof());
          native_device_context->CSSetShader(cs_denoise_1, nullptr, 0);
          native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
       }
       {
          native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         ID3D11ShaderResourceView* srv = gd.srv_gtao_working[1].get();
-         ID3D11UnorderedAccessView* uav = gd.uav_gtao_final.get();
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &srv);
+         native_device_context->CSSetUnorderedAccessViews(0, 1, gd.uav_gtao_final.get_addressof(), nullptr);
+         native_device_context->CSSetShaderResources(0, 1, gd.srv_gtao_working[1].get_addressof());
          native_device_context->CSSetShader(cs_denoise_2, nullptr, 0);
          native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
          native_device_context->CSSetUnorderedAccessViews(0, 1, uav_nulls5.data(), nullptr);
       }
 
-      st.Restore(native_device_context);
+      compute_state.Restore(native_device_context);
 
       // The destination is still bound as the draw's render target, and copying into an OM-bound resource is a
       // D3D11 hazard the runtime does not resolve: unbind around the copy, then restore the game's binding.
@@ -955,8 +924,7 @@ class TheWitcher2Game final : public Game
          native_device_context->OMGetRenderTargets(0, nullptr, dsv_orig.put());
          native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
          native_device_context->CopyResource(rt_res.get(), gd.tex_gtao_final.get());
-         ID3D11RenderTargetView* rtv_raw = rtv.get();
-         native_device_context->OMSetRenderTargets(1, &rtv_raw, dsv_orig.get());
+         native_device_context->OMSetRenderTargets(1, rtv.get_addressof(), dsv_orig.get());
       }
 
       return DrawOrDispatchOverrideType::Replaced;
@@ -1066,7 +1034,7 @@ public:
 
       if (IsTonemap(original_shader_hashes))
       {
-         // One permutation, two roles: the MAIN grade draws at swapchain resolution, aux draws feed DoF/flare
+         // One permutation, two roles: the MAIN grade draws at swapchain size or larger, aux draws feed DoF/flare
          // smaller. Both stay bit-exact vanilla; the role only picks which draw marks main post processing.
          ComPtr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
@@ -1077,9 +1045,7 @@ public:
          // aspect plus at-least-swapchain size still excludes the smaller aux targets.
          const UINT out_w = (UINT)device_data.output_resolution.x;
          const UINT out_h = (UINT)device_data.output_resolution.y;
-         const bool at_least_full_res = rt_info.x >= out_w && rt_info.y >= out_h;
-         const bool aspect_matches = out_h != 0 && rt_info.y != 0 && fabsf(((float)rt_info.x / (float)rt_info.y) - ((float)out_w / (float)out_h)) < 0.05f;
-         const bool is_main = at_least_full_res && aspect_matches;
+         const bool is_main = rt_info.x >= out_w && rt_info.y >= out_h && out_h != 0 && rt_info.y != 0 && fabsf(((float)rt_info.x / (float)rt_info.y) - ((float)out_w / (float)out_h)) < 0.05f;
 
          if (is_main)
          {
@@ -1087,14 +1053,14 @@ public:
          }
 
 #if DEVELOPMENT
-         if (is_main && ContainsPixelShader(original_shader_hashes, kTonemapExposure, kTonemapExposure_v281))
+         if (is_main && ContainsPixelShader(original_shader_hashes, kTonemapExposure))
             LogVanillaTonemap(native_device, native_device_context, game_device_data);
 #endif
 
 #if ENABLE_SMAA
          // The bright-pass perm binds the full-res r32_float depth at t1 (declared-but-unused there); capture it for
          // SMAA predication. Bindings are read regardless of the pass being hash-replaced.
-         if (g_smaa_predication && ContainsPixelShader(original_shader_hashes, kTonemapBrightPass, kTonemapBrightPass_v281))
+         if (g_smaa_predication && ContainsPixelShader(original_shader_hashes, kTonemapBrightPass))
          {
             native_device_context->PSGetShaderResources(1, 1, game_device_data.srv_scene_depth.put());
          }
@@ -1132,7 +1098,7 @@ public:
 #endif
       }
       // Native SSAO generator -> XeGTAO takeover; independent of the tonemap/grade chain above.
-      if (ContainsPixelShader(original_shader_hashes, kAOGen, kAOGen_v281))
+      if (ContainsPixelShader(original_shader_hashes, kAOGen))
       {
 #if DEVELOPMENT
          LogAOGenLayout(native_device, native_device_context, device_data, game_device_data); // with XeGTAO off too
@@ -1141,7 +1107,7 @@ public:
             return RunXeGTAO(native_device, native_device_context, device_data, game_device_data);
       }
 #if ENABLE_SMAA
-      if (ContainsPixelShader(original_shader_hashes, kAOPack, kAOPack_v281))
+      if (ContainsPixelShader(original_shader_hashes, kAOPack))
       {
          // Fallback depth capture: the AO pack pass binds the same r32_float depth at t0 every frame, while
          // the tonemap capture only fires on the BRIGHT-PASS perm. First capture of the frame wins, same buffer.
@@ -1184,7 +1150,7 @@ public:
          game_device_data.ReleaseSharpenScratch();
       // Per-frame capture: never let a stale depth SRV from a previous scene leak into a frame whose
       // tonemap didn't re-capture it (menus; the SMAA pass then falls back to null predication).
-      game_device_data.srv_scene_depth = nullptr;
+      game_device_data.srv_scene_depth.reset();
 #endif
    }
 

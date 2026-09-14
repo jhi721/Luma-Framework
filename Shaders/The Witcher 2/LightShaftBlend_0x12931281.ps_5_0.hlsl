@@ -15,28 +15,14 @@
 // cb4[61], the full 0..1 rect of the scene.
 // The output alpha is the SCENE's: vanilla forwards the t1 sample's .a (`mov o0.w, r1.w` in both wrapper
 // builds; the D3D9 source 9aeff34b writes sTextureColor2.w), and the glow's alpha is never read.
-#include "Includes/Common.hlsl" // game-local: LumaSettings (DisplayMode gates the HDR-only excess restore)
+#include "Includes/Common.hlsl"       // game-local: LumaSettings (DisplayMode gates the HDR-only excess restore)
+#include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask
 
 Texture2D<float4> t0 : register(t0); // engine glow
 Texture2D<float4> t1 : register(t1); // scene (fp16, linear light ahead of the final grade; carries Luma HDR range > 1)
 
 SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
-
-cbuffer cb3 : register(b3)
-{
-   float4 cb3[77];
-}
-cbuffer cb4 : register(b4)
-{
-   float4 cb4[236];
-}
-
-// dgVoodoo texture-format fixup masks (see Luma_TW2_Tonemap.hlsl) — transcribed verbatim.
-float4 DgVoodooTexFixup(float4 color, float4 mask_and, float4 mask_or)
-{
-   return asfloat((asuint(color) & asuint(mask_and)) | asuint(mask_or));
-}
 
 void main(
     float4 v0 : SV_POSITION0,
@@ -56,9 +42,9 @@ void main(
 {
    // Vanilla UV clamp rects (cb4[60] glow, cb4[61] scene: .xy min, .zw max)
    float2 uv0 = min(cb4[60].zw, max(v5.xy, cb4[60].xy));
-   float4 glow = DgVoodooTexFixup(t0.Sample(s0_s, uv0), cb3[44], cb3[45]);
+   float4 glow = ApplyDgvMask(t0.Sample(s0_s, uv0), DgvMaskT0, DgvFillT0);
    float2 uv1 = min(cb4[61].zw, max(v6.xy, cb4[61].xy));
-   float4 scene = DgVoodooTexFixup(t1.Sample(s1_s, uv1), cb3[46], cb3[47]);
+   float4 scene = ApplyDgvMask(t1.Sample(s1_s, uv1), DgvMaskT1, DgvFillT1);
 
    // User Bloom Intensity (1 = vanilla, 0 = no halo): scale the engine's glow where it enters the blend, so
    // everything downstream — the screen blend, and the HDR excess restore below, which derives from this same

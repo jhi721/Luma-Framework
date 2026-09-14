@@ -5,6 +5,7 @@
 // and every LumaSettings.GameSettings.* reference fails to compile (invalid subscript).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings (grade sliders) — keep FIRST
 #include "../Includes/Color.hlsl"
+#include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, DgVoodooRcp
 // clang-format on
 
 // The Witcher 2 EE — tonemap ("exposure") pass SHARED IMPLEMENTATION (REDengine, DX9 via dgVoodoo D3D9->11).
@@ -23,9 +24,9 @@
 // This pass stays bit-exact vanilla apart from the user Exposure; the Luma HDR output block runs at the end
 // of the FINAL GRADE replacement instead, and fp16 keeps this pass's small overshoot alive for it.
 //
-// The SAME shader runs two roles per frame: a MAIN grade (RT == swapchain resolution, feeds post/UI/present)
-// and an AUX draw (smaller RT, DoF/flare source). Both are vanilla here; main.cpp detects the role from the
-// bound RT size, for the main-post-processing flag and to scope the exposure readback to one draw per frame.
+// The SAME shader runs two roles per frame: a MAIN grade (RT at least the swapchain size with its aspect ratio, feeds
+// post/UI/present) and an AUX draw (smaller RT, DoF/flare source). Both are vanilla here; main.cpp detects the role from
+// the bound RT size, for the main-post-processing flag and to scope the exposure readback to one draw per frame.
 
 // ---- Permutation map (set by the wrappers) -----------------------------------------------------------
 // TM_BRIGHT_PASS 0 -> DX9 0xC5ADBC35: exposure + post-scale only, alpha passthrough, adaptation at t1/s1.
@@ -34,15 +35,15 @@
 // Future static perms (DX9 0xA7D76FB1/0xEC6F063B, DX11 hashes unknown) read the exposure from
 // PSC_LumRanges constants instead of the adaptation texture — add TM_STATIC here when they are dumped.
 #if TM_BRIGHT_PASS
-#define TM_T_ADAPT        t2
-#define TM_S_ADAPT        s2
-#define TM_ADAPT_MASK_AND cb3[48]
-#define TM_ADAPT_MASK_OR  cb3[49]
+#define TM_T_ADAPT    t2
+#define TM_S_ADAPT    s2
+#define TM_ADAPT_MASK DgvMaskT2
+#define TM_ADAPT_FILL DgvFillT2
 #else
-#define TM_T_ADAPT        t1
-#define TM_S_ADAPT        s1
-#define TM_ADAPT_MASK_AND cb3[46]
-#define TM_ADAPT_MASK_OR  cb3[47]
+#define TM_T_ADAPT    t1
+#define TM_S_ADAPT    s1
+#define TM_ADAPT_MASK DgvMaskT1
+#define TM_ADAPT_FILL DgvFillT1
 #endif
 
 Texture2D<float4> t0 : register(t0);              // scene (fp16, linear light, unclamped)
@@ -51,35 +52,11 @@ Texture2D<float4> t_adapt : register(TM_T_ADAPT); // 1x1 fp16 adaptation (.x bla
 SamplerState s0_s : register(s0);
 SamplerState s_adapt_s : register(TM_S_ADAPT);
 
-cbuffer cb3 : register(b3)
-{
-   float4 cb3[77];
-}
-cbuffer cb4 : register(b4)
-{
-   float4 cb4[236];
-}
-
 #define LumWeights        cb4[58] // c50 PSC_LumWeights — luminance dot (dp4: folds scene alpha in)
 #define LumRanges2        cb4[59] // c51 PSC_LumRanges2 — .x exposure cap (m_maxMultiplier), .y post-scale
 #define BrightPassWeights cb4[60] // c52 vWeights — bright-pass luminance dot (dp4 folds alpha)
 #define BrightPassParams  cb4[61] // c53 vParams — .x saturation, .y threshold, .z threshold range
 #define BrightPassColor   cb4[62] // c54 vColor — bright-pass colour
-
-// dgVoodoo texture-format fixup: every game texture read goes through (value & maskAnd) | maskOr (e.g. forcing
-// alpha to 1 on X8 formats). The masks are dgVoodoo-internal state in cb3 — transcribed verbatim, do not simplify.
-float4 DgVoodooTexFixup(float4 color, float4 mask_and, float4 mask_or)
-{
-   return asfloat((asuint(color) & asuint(mask_and)) | asuint(mask_or));
-}
-
-// dgVoodoo's guarded reciprocal: rcp with a huge-constant fallback at exactly 0 (movc in the translated CSO).
-// The constant is 1e37 in every dump (l(9999999933815812510711506376257961984.0)) — keep it exact, since it is
-// multiplied downstream and 1e38 overflows to inf ten times sooner.
-float DgVoodooRcp(float x)
-{
-   return (abs(x) > 0.0) ? (1.0 / x) : 1e37;
-}
 
 // Full dgVoodoo interpolator set; v5 = TEXCOORD0 (scene UV in .xy) is the only one the pass uses.
 // Output: the exposed linear color (alpha: scene passthrough on the exposure perm, 1 on the bright-pass perm).
@@ -101,9 +78,9 @@ void main(
 {
    // --- vanilla body (verbatim transcription) ---
    float4 adaptation = t_adapt.SampleLevel(s_adapt_s, float2(0.0, 0.0), 0.0);
-   adaptation = DgVoodooTexFixup(adaptation, TM_ADAPT_MASK_AND, TM_ADAPT_MASK_OR);
+   adaptation = ApplyDgvMask(adaptation, TM_ADAPT_MASK, TM_ADAPT_FILL);
    float4 scene = t0.Sample(s0_s, v5.xy);
-   scene = DgVoodooTexFixup(scene, cb3[44], cb3[45]);
+   scene = ApplyDgvMask(scene, DgvMaskT0, DgvFillT0);
 
 #if TONEMAP_TYPE == 1
    // User exposure (1 = vanilla): a real scene multiplier before the adaptive exposure reads it, so the

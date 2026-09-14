@@ -5,6 +5,7 @@
 #include "../Includes/DICE.hlsl"
 #include "../Includes/Reinhard.hlsl"    // Reinhard::ReinhardPiecewise, the soft hue reference
 #include "Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
+#include "Includes/GameBindings.hlsl"   // b3/b4, the dgVoodoo masks, ApplyDgvMask, DgVoodooRcp, DgVoodooLog2
 // clang-format on
 
 // The Witcher 2 FINAL GRADE pass (dgVoodoo -> ps_5_0, hash 0xDE5CF9CD), the engine's
@@ -37,38 +38,6 @@ SamplerState s0_s : register(s0);
 SamplerState s2_s : register(s2);
 #endif
 
-cbuffer cb3 : register(b3)
-{
-   float4 cb3[77];
-}
-cbuffer cb4 : register(b4)
-{
-   float4 cb4[236];
-}
-
-// dgVoodoo texture-format fixup + guarded ops — transcribed verbatim. Deliberately duplicated per replacement
-// rather than shared: each hash-replaced file stays self-contained for side-by-side comparison with its dump.
-// Names match Luma_TW2_Tonemap.hlsl's copies exactly, so identical bodies never read as different helpers.
-float4 DgVoodooTexFixup(float4 color, float4 mask_and, float4 mask_or)
-{
-   return asfloat((asuint(color) & asuint(mask_and)) | asuint(mask_or));
-}
-// 1e37 is the exact sentinel every dgVoodoo dump uses (l(9999999933815812510711506376257961984.0)); it must
-// not be rounded up to 1e38, or "hiTarget * DgVoodooRcp(0)" below overflows to inf ten times sooner and the
-// zero-weight lerp around it turns into 0 * inf = NaN (which the guard at the end paints black).
-#define DGVOODOO_BIG 1e37
-float DgVoodooRcp(float x)
-{
-   return (abs(x) > 0.0) ? (1.0 / x) : DGVOODOO_BIG;
-}
-float DgVoodooLog2(float x)
-{
-   float l = log2(abs(x));
-   // dgVoodoo: log(0) = -inf -> -BIG (so exp2 later yields 0). It tests the -inf BIT PATTERN, not isinf(), so
-   // a +inf input keeps propagating as vanilla does instead of being flipped to ~0 (a white pixel gone black).
-   return (asuint(l) == 0xff800000u) ? -DGVOODOO_BIG : l;
-}
-
 // FXAA luma approximation the pass uses everywhere: R + 1.963211 * G
 float FxaaLuma(float4 c)
 {
@@ -77,7 +46,7 @@ float FxaaLuma(float4 c)
 
 float4 SampleScene(float2 uv)
 {
-   return DgVoodooTexFixup(t0.SampleLevel(s0_s, uv, 0.0), cb3[44], cb3[45]);
+   return ApplyDgvMask(t0.SampleLevel(s0_s, uv, 0.0), DgvMaskT0, DgvFillT0);
 }
 
 void main(
@@ -270,7 +239,7 @@ void main(
    float3 vanillaColor = graded;
 #else
    // Vignette (c58 vVignetteWeights, c59 vVignetteColor)
-   float4 vignette = DgVoodooTexFixup(t2.Sample(s2_s, v7.xy), cb3[48], cb3[49]);
+   float4 vignette = ApplyDgvMask(t2.Sample(s2_s, v7.xy), DgvMaskT2, DgvFillT2);
    float vigWeight = saturate(dot(cb4[66], vignette));
    float3 vanillaColor = vigWeight * (cb4[67].rgb - graded) + graded;
    // User Vignette Intensity: lerp between the pre-vignette grade and the vignetted result (1 = vanilla,
@@ -349,7 +318,7 @@ void main(
       postProcessedColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
 #endif
 
-      postProcessedColor = (postProcessedColor == postProcessedColor) ? postProcessedColor : 0.0; // NaN -> 0
+      postProcessedColor = IsNaN_Strict(postProcessedColor) ? 0.0 : postProcessedColor; // explicit exponent/mantissa bit test
       postProcessedColor = max(0.0, postProcessedColor);
       postProcessedColor = linear_to_gamma(postProcessedColor, GCT_MIRROR);
 

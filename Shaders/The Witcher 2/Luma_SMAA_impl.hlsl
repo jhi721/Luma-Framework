@@ -1,6 +1,6 @@
 // SMAA implementation for The Witcher 2. Reference: https://github.com/iryoku/smaa
 // ULTRA preset + color edge detection, run POST-final-grade on the graded gamma canvas: main.cpp uses the
-// post-draw callback on FinalGrade 0xDE5CF9CD to run the grade, then SMAA on its output, before the UI draws
+// post-draw callback on the final grade (all four permutations, both dgVoodoo builds) to run the grade, then SMAA on its output, before the UI draws
 // on the same canvas. The grade skips its built-in FXAA while SMAA is active (LumaData.CustomData2), so this
 // is a strict replacement rather than double AA.
 // The canvas is GAMMA (POST_PROCESS_SPACE_TYPE=0) and carries display-mapped HDR values, so >1 is possible;

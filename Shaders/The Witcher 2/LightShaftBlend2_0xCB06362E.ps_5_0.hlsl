@@ -12,28 +12,14 @@
 // vanilla is already correct in HDR. Found by a full fingerprint sweep of the 592-shader dump; that sweep
 // also confirmed there is no fourth grade permutation and no SSAO-generator permutation.
 
-#include "Includes/Common.hlsl" // game-local: LumaSettings (DisplayMode gates the HDR-only excess restore)
+#include "Includes/Common.hlsl"       // game-local: LumaSettings (DisplayMode gates the HDR-only excess restore)
+#include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask
 
 Texture2D<float4> t0 : register(t0); // light-shaft / glow source
 Texture2D<float4> t1 : register(t1); // scene canvas (fp16, linear light ahead of the final grade; carries Luma HDR range > 1)
 
 SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
-
-cbuffer cb3 : register(b3)
-{
-   float4 cb3[77];
-}
-cbuffer cb4 : register(b4)
-{
-   float4 cb4[236];
-}
-
-// dgVoodoo texture-format fixup masks (see Luma_TW2_Tonemap.hlsl) — transcribed verbatim.
-float4 DgVoodooTexFixup(float4 color, float4 mask_and, float4 mask_or)
-{
-   return asfloat((asuint(color) & asuint(mask_and)) | asuint(mask_or));
-}
 
 void main(
     float4 v0 : SV_POSITION0,
@@ -51,13 +37,13 @@ void main(
     float4 v12 : TEXCOORD7,
     out float4 o0 : SV_TARGET0)
 {
-   float4 canvas = DgVoodooTexFixup(t1.Sample(s1_s, v6.xy), cb3[46], cb3[47]);
+   float4 canvas = ApplyDgvMask(t1.Sample(s1_s, v6.xy), DgvMaskT1, DgvFillT1);
    float lum = dot(canvas.rgb, float3(0.30, 0.59, 0.11));
    // DXBC "exp" is base-2 (the vanilla disasm multiplies by exactly -3, with no folded log2(e) factor), so
    // this must be exp2: HLSL exp() would attenuate the shafts up to 60% too hard on a bright canvas.
    float atten = saturate(exp2(lum * -3.0) * cb4[62].w);
 
-   float4 shafts = DgVoodooTexFixup(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]);
+   float4 shafts = ApplyDgvMask(t0.Sample(s0_s, v5.xy), DgvMaskT0, DgvFillT0);
    float3 shaftPart = saturate(atten * (shafts.rgb * cb4[62].xyz));
 
    // Vanilla screen blend on the RAW canvas (this permutation does not saturate it, unlike 0x12931281), so
