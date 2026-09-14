@@ -242,7 +242,7 @@ bool BL2TPS_TryBuildWorkingLuminance(float3 curveInput, out float targetLuminanc
    // b * 15, so the trilinear read extrapolates a hair past the upper slice and a channel whose upper
    // sample is darker can land about 1e-4 below zero. The native block does exactly the same and its
    // own tail clamps it the same way. Without this the guard below would decline the entire
-   // reconstruction on a near-black pixel and flicker back to the shipping path. GCT_MIRROR keeps the
+   // reconstruction on a near-black pixel and flicker back to the native graded colour. GCT_MIRROR keeps the
    // value signed rather than raising a NaN, so the max can see it.
    const float3 proxyGamma = saturate(linear_to_gamma(proxyLinear, GCT_NONE));
    const float3 gradedLinear = max(0.0, gamma_to_linear(BL2TPS_SampleColorGradeGamma(proxyGamma), GCT_MIRROR));
@@ -351,8 +351,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    }
    else
    {
-      // Vanilla bloom (screen-blend gated by luminance, t1). BloomIntensity is pinned to 1 on this branch - the
-      // slider scales the Luma pyramid only, and main.cpp disables it while that is off - so this is vanilla.
+      // Vanilla bloom (screen-blend gated by luminance, t1), never scaled: Bloom Intensity belongs to the Luma pyramid.
       r0.w = dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999));
       r0.w = r0.w * -3;
       r0.w = exp2(r0.w);
@@ -360,7 +359,7 @@ float4 RunTonemap(float4 v5, float4 v6)
       r1 = t1.Sample(s1_s, v5.zw);
       r1.xyz = r1.xyz * BloomTintAndScreenBlendThreshold.xyz;
       r1.xyz = r1.xyz * 4;
-      hdrColor += r1.xyz * r0.w * LumaSettings.GameSettings.BloomIntensity;
+      hdrColor += r1.xyz * r0.w;
    }
 
 #if TM_HAS_LIGHTSHAFT
@@ -476,11 +475,11 @@ float4 RunTonemap(float4 v5, float4 v6)
       // PEAK_WHITE type also gamut-maps a single channel riding past peak. Feed linear BT.709 directly: DICE converts to
       // BT.2020 itself, and a manual 709<->2020 round-trip no longer cancels once the per-channel gamut map is in.
       DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-      // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
-      // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
-      // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
-      // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
-      // flattens it for every pixel above the shoulder.
+      // Highlight dechroma handed to DICE rather than run as our own pass afterwards: it runs INSIDE the containment in
+      // the processing primaries, and only above ShoulderStart * PeakWhite (1/3 of peak for this type), so mid-tones
+      // cannot be touched. Its ramp follows the max channel, but DICE enters it on its AVERAGE luminance, so a saturated
+      // highlight switches on with a visible step (DICE.hlsl notes it; shared code, left as is). 0 = off for the OUTPUT
+      // but not the cost: DICE's guard carries no [branch], so fxc flattens it for every pixel above the shoulder.
       settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
       float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, settings) / paperWhite;
 
@@ -501,7 +500,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    postProcessedColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
 #endif
 
-   // Sanitize (inverse divide + DICE + gamma encode can emit NaN/negatives -> garbage on the swapchain).
+   // Sanitize (signed LUT excursions, the user grade and DICE can emit NaN/negatives -> garbage on the swapchain).
    postProcessedColor = (postProcessedColor == postProcessedColor) ? postProcessedColor : 0.0; // NaN -> 0
    postProcessedColor = max(0.0, postProcessedColor);
 

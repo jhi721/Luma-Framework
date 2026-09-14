@@ -1,21 +1,17 @@
 // SMAA for Borderlands 2 / The Pre-Sequel. Reference: https://github.com/iryoku/smaa
 // ULTRA preset + color edge detection, run POST-tonemap on the gamma LDR (main.cpp RunPostTonemapSMAA) so it cannot
-// perturb the DoF composited inside the tonemap; the native FXAA is left alone (under dgVoodoo nothing downstream
-// reads its output anyway). Edge detection reads the ENCODED post-tonemap signal, the domain its thresholds are
+// perturb the DoF composited inside the tonemap; the native FXAA is cancelled while SMAA is on (main.cpp's FXAA
+// override). Edge detection reads the ENCODED post-tonemap signal, the domain its thresholds are
 // tuned in; neighborhood blending reads the LINEAR-light decode of that same signal (Luma_BL2TPS_SMAALinearize) and
 // this file re-encodes the blended result, so what goes back downstream is still the game's gamma 2.2 LDR. The PS
 // appends no HDR tail (Display Composition does paper-white + scRGB). Predication = plane-deviation edge-ness
 // built from the scene-color .a depth (Luma_BL2TPS_DepthExtract), null texture + scale 1.0 as the fallback.
 
-// Only Color.hlsl is pulled in, for the re-encode helper. It carries no conditionals of its own (it includes
-// Math.hlsl and nothing else) and ../Includes/SMAA.hlsl below is self-contained, so every entry point stays
-// byte-identical across the Development and Publishing define sets.
-
 // (1/W, 1/H, W, H) at output resolution — filled by the mod (see main.cpp RunPostTonemapSMAA).
 cbuffer SmaaMetricsCB : register(b1)
 {
    float4 SmaaRtMetrics;
-   // x = predication threshold scale: 2.0 when predication is active (scene-color .a depth bound) -> frame-wide
+   // x = predication threshold scale: 2.0 when predication is active (edge-ness texture bound) -> frame-wide
    // threshold 0.10 on flats; 1.0 with a null predication texture (fallback) -> plain ULTRA threshold 0.05. yzw unused.
    float4 SmaaPredication;
 }
@@ -48,6 +44,8 @@ SamplerState PointSampler : register(s1);
 #define SMAATexture2DMS2(tex)                         Texture2DMS<float4, 2> tex
 #define SMAALoad(tex, pos, sample)                    tex.Load(pos, sample)
 #define SMAAGather(tex, coord)                        tex.Gather(LinearSampler, coord, 0)
+// Color.hlsl only for the re-encode helper. Neither it (it includes only Math.hlsl) nor the self-contained SMAA.hlsl
+// has a DEVELOPMENT/TEST conditional, so every entry point stays byte-identical across the two define sets.
 #include "../Includes/Color.hlsl"
 #include "../Includes/SMAA.hlsl"
 
@@ -71,7 +69,7 @@ void smaa_edge_detection_vs(uint id : SV_VertexID, out float4 position : SV_Posi
 float2 smaa_edge_detection_ps(float4 position : SV_Position, float2 texcoord : TEXCOORD0, float4 offset[3] : TEXCOORD1) : SV_Target
 {
    // tex0 = colorTexGamma (gamma-encoded scene color)
-   // tex1 = predicationTex (scene .a depth; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
+   // tex1 = predicationTex (plane-deviation edge-ness; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
    return SMAAColorEdgeDetectionPS(texcoord, offset, tex0, tex1);
 }
 
@@ -100,13 +98,11 @@ float4 smaa_neighborhood_blending_ps(float4 position : SV_Position, float2 texco
    // tex0 = colorTex, the LINEAR decode of the LDR (Luma_BL2TPS_SMAALinearize); tex1 = blendTex. The pass averages
    // a pixel with its neighbour through the hardware bilinear, which is only correct on linear light, so re-encode
    // the result here to the tonemap's own gamma 2.2 (its linear_to_gamma, DefaultGamma with no CUSTOM_SDR_GAMMA).
-   // Encoded with the tonemap's own helper so both sides move together if DefaultGamma ever does. Its clamp is
-   // redundant on paper - the decode already clamped and a convex combination of non-negative samples cannot go
-   // negative - but GCT_NONE does not survive /WX here: fxc cannot see that through the blend and raises X3571 on
-   // the bare pow. GCT_POSITIVE is that proof, and costs one max. Exactly one encode: the RTV is a plain
-   // UNORM/float view, never an SRGB one. Alpha carries nothing (the tonemap writes o0.w = 0), so it is left as
+   // Encoded with the tonemap's own helper so both sides move together if DefaultGamma ever does. GCT_MIRROR mirrors
+   // the decode, so the dither's negative half at black comes back out unclamped. Exactly one encode: the RTV is a
+   // plain UNORM/float view, never an SRGB one. Alpha carries nothing (the tonemap writes o0.w = 0), so it is left as
    // the blend produced it. No HDR tail.
    float4 color = SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1);
-   color.rgb = linear_to_gamma(color.rgb, GCT_POSITIVE);
+   color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
    return color;
 }

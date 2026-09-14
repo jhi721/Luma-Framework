@@ -5,13 +5,10 @@
 // One shared addon serves both games, discriminated by the tonemap hash:
 // - TONEMAP PS 0xD00AA2A7 (BL2) / 0xFCFE623E (TPS): scene fp16 + bloom + vignette + LUT + DOF -> 8-bit LDR.
 //   Replaced to recover HDR; the UI composites AFTER, on the LDR.
-// - FXAA PS 0x0D3001F6 (only with in-game AA on) -> demoted to a plain copy while SMAA is on, keeping the pass's
-//   routing role and dropping only the filtering. Devkit, 4K gameplay frame: on BL2 it runs PRE-tonemap (draw 623
-//   vs 642), reads the fp16 scene and writes a second fp16 4K buffer nothing downstream samples - the tonemap's
-//   t0 is the resolve's own INPUT, and its bindings are handle-identical with the game's AA setting on and off,
-//   so there it was pure wasted bandwidth. On TPS the same shader runs POST-tonemap into the buffer the HUD then
-//   draws onto, which is why it is copied rather than skipped. SMAA itself is injected post-tonemap: the FXAA
-//   slot sits before the DoF the tonemap composites, so it cannot host SMAA on either game.
+// - FXAA PS 0x0D3001F6 (only with in-game AA on) -> cancelled while SMAA is on (see the FXAA override): dropped on
+//   BL2, where it runs pre-tonemap into a buffer nothing samples, and reduced to a plain copy on TPS, where it runs
+//   post-tonemap into the buffer the HUD then draws onto. SMAA itself is injected post-tonemap, so it neither
+//   depends on the game's AA setting nor perturbs the DoF.
 // All SDR/gamma space. Only ONE Luma .addon, and no other swapchain-hooking ReShade addon: they crash through
 // dgVoodoo.
 
@@ -29,8 +26,8 @@
 #include "..\..\Core\core.hpp"
 #include <shellapi.h> // ShellExecuteA for About links (system("start ...") hangs the render thread in exclusive fullscreen)
 
-// FXAA resolve PS (only present when AA is enabled in the game's video settings). Demoted to a copy while SMAA is
-// on (see the draw override); also used by Hide UI to keep this opaque pass out of the HUD filter.
+// FXAA resolve PS (only present when AA is enabled in the game's video settings). Cancelled while SMAA is on (see
+// the draw override); also used by Hide UI to keep this opaque pass out of the HUD filter.
 static constexpr uint32_t kFXAAResolveHash = 0x0D3001F6;
 static constexpr uint32_t kTonemapHash = 0xD00AA2A7;    // BL2: writes the LDR buffer the HUD then draws onto
 static constexpr uint32_t kTonemapHashTPS = 0xFCFE623E; // The Pre-Sequel: same engine, different tonemap CSO (one addon serves both)
@@ -116,6 +113,7 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
 
 #if DEVELOPMENT
    ConstantCapture grade_cb;
+   bool grade_k_warned = false; // one-shot: a non-zero ImageAdjustments K, which the HDR continuation does not model
 
    // A/B energy measurement between the native bloom buffer and the Luma pyramid (see LogBloomEnergy): one staging
    // texture each, read a frame late on a slow cadence.
@@ -163,7 +161,7 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    uint32_t sharpen_w = 0, sharpen_h = 0;
    float sharpen_amount = -1.f;
 
-   // Resource the tonemap renders to; on BL2 the HUD draws onto it afterwards. Used by Hide UI.
+   // Resource the tonemap renders to; on BL2 the HUD draws onto it afterwards. Used by Hide UI and the FXAA override.
    uint64_t ldr_buffer_handle = 0;
    // Set when the tonemap runs, cleared every Present: scopes Hide UI's alpha-blend skip to the post-tonemap
    // span of THIS frame (so next frame's pre-tonemap transparents aren't dropped). See the Hide HUD block.
@@ -224,6 +222,25 @@ class Borderlands2 final : public Game
       return hashes.Contains(kFXAAResolveHash, reshade::api::shader_stage::pixel) || hashes.Contains(kFXAAResolveHash_v281, reshade::api::shader_stage::pixel);
    }
 
+   // Named injected shaders live in unordered_maps the render thread otherwise only reads: look them up with
+   // "find" (operator[] would default-insert on a miss, mutating a map core's draw helpers read concurrently).
+   template <typename ShaderMap>
+   static auto FindShader(const ShaderMap& shaders, uint32_t name)
+   {
+      const auto it = shaders.find(name);
+      return it != shaders.end() ? it->second.get() : nullptr;
+   }
+   template <typename ShaderMap>
+   static bool AllShadersReady(const ShaderMap& shaders, std::initializer_list<uint32_t> names)
+   {
+      for (const uint32_t name : names)
+      {
+         if (FindShader(shaders, name) == nullptr)
+            return false;
+      }
+      return true;
+   }
+
    static bool CreateImmutableCB(ID3D11Device* device, const void* data, UINT size, ComPtr<ID3D11Buffer>& out)
    {
       out.reset();
@@ -236,8 +253,8 @@ class Borderlands2 final : public Game
       return SUCCEEDED(device->CreateBuffer(&bd, &sd, out.put()));
    }
 
-   // Default-pool 2D texture. Format defaults to fp16 (bloom/scene callers); pass the live LDR 8-bit format for
-   // SMAA color temps, since CopyResource requires identical formats.
+   // Default-pool 2D texture. Format defaults to fp16 (the SMAA linear copy); pass the live LDR format for LDR-shaped
+   // temps, since CopyResource requires identical formats.
    static bool CreateDefaultTex(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, ComPtr<ID3D11Texture2D>& out, DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT)
    {
       out.reset();
@@ -269,17 +286,13 @@ class Borderlands2 final : public Game
          return;
       }
 
-      // Shader-readiness gate (async loader / dev live-reload): skip SMAA this frame if anything is missing.
-      const bool smaa_ready =
-         device_data.native_pixel_shaders[CompileTimeStringHash("SMAA Edge Detection PS")].get() != nullptr &&
-         device_data.native_pixel_shaders[CompileTimeStringHash("SMAA Blending Weight Calculation PS")].get() != nullptr &&
-         device_data.native_pixel_shaders[CompileTimeStringHash("SMAA Neighborhood Blending PS")].get() != nullptr &&
-         device_data.native_vertex_shaders[CompileTimeStringHash("SMAA Edge Detection VS")].get() != nullptr &&
-         device_data.native_vertex_shaders[CompileTimeStringHash("SMAA Blending Weight Calculation VS")].get() != nullptr &&
-         device_data.native_vertex_shaders[CompileTimeStringHash("SMAA Neighborhood Blending VS")].get() != nullptr &&
-         // The decode feeds the neighborhood pass; without it that pass would sample an empty texture, so the
-         // chain is all-or-nothing rather than partially configured.
-         device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS SMAA Linearize CS")].get() != nullptr;
+      // Shader-readiness gate (async loader / dev live-reload): skip SMAA this frame if anything is missing. The
+      // decode feeds the neighborhood pass; without it that pass would sample an empty texture, so the chain is
+      // all-or-nothing rather than partially configured.
+      auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL2TPS SMAA Linearize CS"));
+      const bool smaa_ready = linearize_cs != nullptr &&
+                              AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) &&
+                              AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
       if (!smaa_ready)
       {
          return;
@@ -298,8 +311,8 @@ class Borderlands2 final : public Game
 
       // SMAA depth predication: plane-deviation edge-ness from the captured scene-color SRV (.a). Plain ULTRA fallback when
       // any input is missing (never scale 2.0 with a null texture).
-      const bool pred_cs_ready = device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS Depth Extract CS")].get() != nullptr;
-      bool pred_ok = g_smaa_predication && gd.srv_scene_depth && pred_cs_ready;
+      auto* pred_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL2TPS Depth Extract CS"));
+      bool pred_ok = g_smaa_predication && gd.srv_scene_depth && pred_cs != nullptr;
       if (pred_ok)
       {
          // The extract CS maps texels 1:1, so a scene buffer of a different size would read a sub-rect and
@@ -350,9 +363,9 @@ class Borderlands2 final : public Game
 
       // Resolve RCAS before allocating: it decides whether the last pass writes the LDR RTV directly, which
       // removes both the copy back and the intermediate.
-      auto* sharpen_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
-      auto* sharpen_ps = device_data.native_pixel_shaders[CompileTimeStringHash("BL2TPS Sharpen PS")].get();
-      bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs != nullptr && sharpen_ps != nullptr;
+      auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+      auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS Sharpen PS"));
+      bool do_sharpen = g_rcas_sharpness > 0.f && copy_vs != nullptr && sharpen_ps != nullptr;
       if (do_sharpen)
       {
          if (!gd.cb_sharpen || gd.sharpen_w != w || gd.sharpen_h != h || gd.sharpen_amount != g_rcas_sharpness)
@@ -405,7 +418,7 @@ class Borderlands2 final : public Game
       if (!gd.srv_input_encoded || !gd.uav_input_linear || !gd.srv_input_linear)
          return;
 
-      // Snapshot the LDR color into an SRV-readable temp (LDR is both the SMAA input and the write-back target).
+      // Snapshot the LDR color into an SRV-readable temp (LDR is both the SMAA input and its output target).
       native_device_context->CopyResource(gd.tex_input_encoded.get(), ldr_res.get());
 
       // Both compute prepasses, under one state stack. Restoring it before DrawSMAA is what makes the results
@@ -420,7 +433,7 @@ class Borderlands2 final : public Game
          ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
          native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
          native_device_context->CSSetShaderResources(0, 1, &lin_srv);
-         native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS SMAA Linearize CS")].get(), nullptr, 0);
+         native_device_context->CSSetShader(linearize_cs, nullptr, 0);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 
          // Predication extract: scene-color .a -> plane-deviation edge-ness in R16F (gd.tex_pred). Independent of
@@ -433,7 +446,7 @@ class Borderlands2 final : public Game
             native_device_context->CSSetUnorderedAccessViews(0, 1, &ps_uav, nullptr);
             native_device_context->CSSetShaderResources(0, 1, &ps_srv);
             native_device_context->CSSetConstantBuffers(0, 1, &ps_cb);
-            native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("BL2TPS Depth Extract CS")].get(), nullptr, 0);
+            native_device_context->CSSetShader(pred_cs, nullptr, 0);
             native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
          }
 
@@ -448,9 +461,8 @@ class Borderlands2 final : public Game
 
       if (pred_ok && g_smaa_pred_debug)
       {
-         auto* debug_vs = device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get();
-         auto* debug_ps = device_data.native_pixel_shaders[CompileTimeStringHash("Copy PS")].get();
-         if (debug_vs != nullptr && debug_ps != nullptr)
+         auto* copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
+         if (copy_vs != nullptr && copy_ps != nullptr)
          {
             // The mask is single-channel, so the core copy lands it in RED - unmistakably a debug view. It
             // REPLACES the antialiased frame rather than blending over it, hence the early return (which also
@@ -458,7 +470,7 @@ class Borderlands2 final : public Game
             DrawStateStack<DrawStateStackType::FullGraphics> debug_state;
             debug_state.Cache(native_device_context, device_data.uav_max_count);
             DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-               debug_vs, debug_ps, gd.srv_pred.get(), ldr_rtv, w, h, false);
+               copy_vs, copy_ps, gd.srv_pred.get(), ldr_rtv, w, h, false);
             debug_state.Restore(native_device_context);
             return;
          }
@@ -479,7 +491,7 @@ class Borderlands2 final : public Game
          do_sharpen ? gd.tex_smaa_out_rtv.get() : ldr_rtv,
          gd.srv_input_linear.get() /*neighborhood blend (linear light)*/,
          gd.srv_input_encoded.get() /*edge detection (gamma 2.2)*/,
-         pred_ok ? gd.srv_pred.get() : nullptr /*predication depth (scene .a)*/);
+         pred_ok ? gd.srv_pred.get() : nullptr /*predication signal*/);
 
       if (do_sharpen)
       {
@@ -489,7 +501,7 @@ class Borderlands2 final : public Game
          ID3D11Buffer* scb = gd.cb_sharpen.get();
          native_device_context->PSSetConstantBuffers(0, 1, &scb);
          DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-            sharpen_vs, sharpen_ps, gd.tex_smaa_out_srv.get(), ldr_rtv, w, h, false);
+            copy_vs, sharpen_ps, gd.tex_smaa_out_srv.get(), ldr_rtv, w, h, false);
 
          sharpen_state.Restore(native_device_context);
       }
@@ -541,7 +553,7 @@ public:
       default_luma_global_game_settings.Saturation = 1.f;         // BT.709-luminance lerp (Color.hlsl Saturation)
       default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only mandatory DICE/gamut desat applies
       default_luma_global_game_settings.BloomIntensity = 1.f;     // seed only; OnDrawOrDispatch owns the effective value
-      default_luma_global_game_settings.Contrast = 1.f;           // slope around 18% mid-gray
+      default_luma_global_game_settings.Contrast = 1.f;           // multiplicative around 18% mid-gray, pre-DICE
       default_luma_global_game_settings.VignetteIntensity = 1.f;  // game vignette darkening scale
       default_luma_global_game_settings.LumaBloomEnable = 1.f;    // 1 = Luma HDR pyramidal bloom, 0 = vanilla game bloom
       default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR and SDR), anti-banding on
@@ -558,30 +570,8 @@ public:
 
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
-      if (device_data.game)
-      {
-         auto& gd = GetGameDeviceData(device_data);
-         gd.cb_smaa_metrics.reset();
-         gd.srv_input_encoded.reset();
-         gd.tex_input_encoded.reset();
-         gd.srv_input_linear.reset();
-         gd.uav_input_linear.reset();
-         gd.tex_input_linear.reset();
-         gd.tex_smaa_out.reset();
-         gd.tex_smaa_out_rtv.reset();
-         gd.tex_smaa_out_srv.reset();
-         gd.cb_sharpen.reset();
-         gd.srv_luma_bloom.reset();
-         gd.dss_scaleform_mask_write.reset();
-         gd.dss_scaleform_mask_test.reset();
-         gd.dsv_scaleform_mask_active.reset();
-         for (auto& slot : gd.scaleform_mask_ds_cache)
-         {
-            slot.dsv.reset();
-            slot.tex.reset();
-         }
-      }
-      delete device_data.game;
+      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
+      delete static_cast<Borderlands2GameDeviceData*>(device_data.game);
       device_data.game = nullptr;
    }
 
@@ -994,7 +984,7 @@ public:
    // average drowns in that, so this reports COVERAGE at the level SMAA actually compares against (0.5) plus the
    // shape either side of it. Every texel is read, not a stride - a 1px silhouette is precisely the signal a
    // subsample would step over. Copies on the frame the button is pressed and maps on a later one (non-blocking),
-   // like the bloom A/B above, so the press never stalls the render thread.
+   // like the bloom A/B below, so the press never stalls the render thread.
    static void LogPredicationStats(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData& gd)
    {
       auto& capture = gd.pred_measure;
@@ -1036,7 +1026,7 @@ public:
 
       constexpr uint32_t kBins = 256;
       uint64_t histogram[kBins] = {};
-      uint64_t total = 0;
+      const uint64_t total = (uint64_t)capture.width * capture.height;
       uint64_t non_finite = 0;
       for (UINT y = 0; y < capture.height; y++)
       {
@@ -1048,14 +1038,10 @@ public:
             // through to (uint32_t)NaN - 0x80000000 on x86 - and index far outside this stack array. The extract
             // CS saturates, so a NaN here means it met one upstream (ME2 measured inf - inf in the scene alpha on
             // the same shader family); count them rather than bin them, a silent 0 would read as a flat surface.
-            if (!(v >= 0.f && v <= 1.f))
-            {
+            if (v >= 0.f && v <= 1.f)
+               histogram[(uint32_t)(v * (float)(kBins - 1))]++;
+            else
                non_finite++;
-               total++;
-               continue;
-            }
-            histogram[(uint32_t)(v * (float)(kBins - 1))]++;
-            total++;
          }
       }
       native_device_context->Unmap(capture.staging.get(), 0);
@@ -1227,6 +1213,19 @@ public:
 
       const float* ia2 = rows + 2 * 4; // cb4[17] = (A, Y, Z, W)
       const float* ia3 = rows + 3 * 4; // cb4[18].x = K
+
+      // The HDR working continuation models the K = 0 curve only (BL2TPS_TryBuildWorkingLuminance in
+      // Luma_BL2TPS_Tonemap.hlsl); on anything else it declines and the native graded colour is presented as-is.
+      // K has never been observed non-zero, so say so loudly, once, if it ever is. Ahead of the de-dup below on
+      // purpose: A and Z follow W, so exposure drift alone keeps adding sets until its 64-set cap returns early.
+      if (ia3[0] != 0.f && !gd.grade_k_warned)
+      {
+         gd.grade_k_warned = true;
+         LogGradeLine(std::format("[BL-HDR] WARNING: non-zero ImageAdjustments K={:.5f}; the HDR working continuation does not "
+                                  "model this curve, so HDR falls back to the native graded range for it.",
+            ia3[0]));
+      }
+
       // W is the live exposure gain and moves every frame while the eye adapts, so it is quantized coarsely and
       // the shape parameters keep 1e-3: one line per distinct curve, not per frame.
       const float keyed[5] = {ia2[0], ia2[1], ia2[2], ia2[3], ia3[0]};
@@ -1238,18 +1237,6 @@ public:
          ia2[0], ia2[1], ia2[2], ia2[3], ia3[0],
          rows[6 * 4 + 0], rows[6 * 4 + 1], rows[6 * 4 + 2], rows[6 * 4 + 3],
          rows[7 * 4 + 0], rows[7 * 4 + 1], rows[7 * 4 + 2], rows[7 * 4 + 3]));
-
-      // The HDR working continuation models the K = 0 curve only (BL2TPS_TryBuildWorkingLuminance in
-      // Luma_BL2TPS_Tonemap.hlsl); on anything else it declines and the native graded colour is presented as-is.
-      // K has never been observed non-zero, so say so loudly if it ever is. This sits after the de-dup above and
-      // inherits it: one line per distinct curve, never per frame. Known limit - past 64 distinct sets that guard
-      // returns early, so this stops reporting too.
-      if (ia3[0] != 0.f)
-      {
-         LogGradeLine(std::format("[BL-HDR] WARNING: non-zero ImageAdjustments K={:.5f}; the HDR working continuation does not "
-                                  "model this curve, so HDR falls back to the native graded range for it.",
-            ia3[0]));
-      }
    }
 
 #endif // DEVELOPMENT
@@ -1272,7 +1259,7 @@ public:
       if (RepairScaleformStencilMask(native_device, native_device_context, gd, original_shader_hashes, is_custom_pass, is_immediate, original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
-      // Track the LDR buffer (the tonemap's render target) for Hide UI.
+      // Track the LDR buffer (the tonemap's render target) for Hide UI and the FXAA override.
       if (is_immediate && IsAnyTonemap(original_shader_hashes))
       {
          // TPS inserts a LightShaftTexture at slot 1, shifting its native textures down one (LUT@t4, DOF@t5); the
@@ -1293,54 +1280,44 @@ public:
             if (res)
                gd.ldr_buffer_handle = (uint64_t)res.get();
          }
-         // Capture the scene-color SRV (PS t0) for SMAA predication: its .a holds linear view-space depth. The
-         // tonemap reads (doesn't overwrite) this buffer, so .a is still valid when SMAA runs later this frame.
+         // Capture the scene-color SRV (PS t0) for SMAA predication (its .a holds linear view-space depth) and for the
+         // FXAA override, which recognizes BL2's resolve by it. The tonemap reads (doesn't overwrite) this buffer, so .a
+         // is still valid when SMAA runs later this frame.
          ComPtr<ID3D11ShaderResourceView> scene_srv;
          native_device_context->PSGetShaderResources(0, 1, scene_srv.put());
          if (scene_srv)
             gd.srv_scene_depth = scene_srv;
-
-         // THE SOLE WRITER of the effective BloomIntensity - the UI only touches the raw slider. BOTH composites in
-         // the tonemap read this one field, so it has to be written on every tonemap draw and not only while the
-         // pyramid is running: gated on g_luma_bloom_enable it froze at the pyramid's pre-scaled value the moment the
-         // toggle went off, which left the game's own bloom running at kBloomPyramidToNativeEnergy strength and made
-         // it look like the bloom had vanished.
-         //
-         // The slider scales the Luma pyramid only, and is disabled in the UI while that is off. With it off the
-         // vanilla composite therefore gets a flat 1, the strength the game's artists authored.
-         {
-            auto& gs = cb_luma_global_settings.GameSettings;
-            const float effective_intensity = g_luma_bloom_enable ? (g_bloom_intensity * kBloomPyramidToNativeEnergy) : 1.f;
-            if (fabsf(gs.BloomIntensity - effective_intensity) > 1e-6f)
-            {
-               gs.BloomIntensity = effective_intensity;
-               device_data.cb_luma_global_settings_dirty = true;
-            }
-         }
 
 #if ENABLE_BLOOM
          // Pyramidal bloom from the fp16 scene (tonemap t0), bound at PS t5 (BL2) / t8 (TPS); it ignores native bloom
          // t1, so no doubling. The graphics state stack restores the tonemap's RT/PS/SRVs afterwards.
          if (g_luma_bloom_enable && scene_srv)
          {
+            auto& gs = cb_luma_global_settings.GameSettings;
+
+            // THE SOLE WRITER of the effective BloomIntensity - the UI only touches the raw slider. Only the Luma
+            // composite reads it (the game's own bloom is never scaled), so it is written only where the pyramid runs.
+            const float effective_intensity = g_bloom_intensity * kBloomPyramidToNativeEnergy;
+            if (fabsf(gs.BloomIntensity - effective_intensity) > 1e-6f)
+            {
+               gs.BloomIntensity = effective_intensity;
+               device_data.cb_luma_global_settings_dirty = true;
+            }
+
             // Follow the area's authored knee: the prefilter reads GameSettings.BloomThreshold, kept live off the
             // native bright pass. 1.0 until the first readback, mid-range for this game (measured 0.50 to 1.32).
+            // Never-captured means the bright-pass hash did not match (new dgVoodoo build, or the pass is not
+            // byte-shared after all). The fallback looks plausible, so say it once.
+            if (gd.bloom_threshold_live < 0.f && !gd.bloom_threshold_warned && gd.frame_counter > 600)
             {
-               auto& gs = cb_luma_global_settings.GameSettings;
-
-               // Never-captured means the bright-pass hash did not match (new dgVoodoo build, or the pass is not
-               // byte-shared after all). The fallback looks plausible, so say it once.
-               if (gd.bloom_threshold_live < 0.f && !gd.bloom_threshold_warned && gd.frame_counter > 600)
-               {
-                  gd.bloom_threshold_warned = true;
-                  LogGradeLine("[BL-Bloom] WARNING: the native bright pass never reported a threshold - the Luma bloom is running on the fallback, so its knee is not the game's");
-               }
-               const float thr = gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : default_luma_global_game_settings.BloomThreshold;
-               if (fabsf(gs.BloomThreshold - thr) > 1e-4f)
-               {
-                  gs.BloomThreshold = thr;
-                  device_data.cb_luma_global_settings_dirty = true;
-               }
+               gd.bloom_threshold_warned = true;
+               LogGradeLine("[BL-Bloom] WARNING: the native bright pass never reported a threshold - the Luma bloom is running on the fallback, so its knee is not the game's");
+            }
+            const float thr = gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : default_luma_global_game_settings.BloomThreshold;
+            if (fabsf(gs.BloomThreshold - thr) > 1e-4f)
+            {
+               gs.BloomThreshold = thr;
+               device_data.cb_luma_global_settings_dirty = true;
             }
 
             DrawStateStack<DrawStateStackType::FullGraphics> bloom_state;
@@ -1366,7 +1343,7 @@ public:
                native_device_context->PSSetShaderResources(is_tps ? kLumaBloomSlotTPS : kLumaBloomSlotBL2, 1, &b);
             }
 #if DEVELOPMENT
-            LogBloomEnergy(native_device, native_device_context, gd, is_tps, cb_luma_global_settings.GameSettings.BloomThreshold);
+            LogBloomEnergy(native_device, native_device_context, gd, is_tps, gs.BloomThreshold);
 #endif
          }
 #endif
@@ -1390,15 +1367,12 @@ public:
       }
 
 #if ENABLE_SMAA
-      // Cancel the native FXAA resolve while SMAA is on. The two games put this one shader (0x0D3001F6) at
-      // opposite ends of the frame, and the resolve's own SOURCE says which case this is, so nothing here has to
-      // know which game it is in. If it reads the buffer the tonemap wrote, the pass is a routing step over a
-      // result SMAA has already antialiased (TPS - its output is what the HUD then draws onto) and that routing
-      // has to be kept, so copy. If it reads anything else, the pass sits upstream of the tonemap and nothing
-      // downstream samples its output (BL2, measured: the tonemap's t0 is the resolve's own input, and its
-      // bindings are handle-identical with the game's AA setting on and off) - there a copy would be ~130 MB per
-      // frame at 4K into a dead buffer, so drop the draw instead. Left alone when SMAA is off: the game's own AA
-      // is then the only one there is.
+      // Cancel the native FXAA resolve while SMAA is on, keyed on the resolve's own SOURCE, so nothing here has to know
+      // which game it is in. Reading the scene the tonemap samples at t0 is BL2's shape (devkit at 4K: it draws before
+      // the tonemap, 623 vs 642, and nothing samples its output), so the draw is dropped. Reading the tonemap's output
+      // is TPS's: it routes the antialiased frame to the buffer the HUD draws onto, so it is copied. Anything else (no
+      // tonemap captured yet, an unhooked uber permutation, a recreated target, a size or format mismatch) keeps the
+      // game's own draw: a second AA pass is harmless, a buffer left unwritten under the HUD is not.
       if (g_smaa_enable && is_immediate && !is_custom_pass && IsFXAA(original_shader_hashes))
       {
          ComPtr<ID3D11ShaderResourceView> fxaa_srv;
@@ -1408,20 +1382,25 @@ public:
             fxaa_srv->GetResource(src_res.put());
          if (src_res)
          {
-            if ((uint64_t)src_res.get() != gd.ldr_buffer_handle)
-               return DrawOrDispatchOverrideType::Replaced; // upstream of the tonemap: its output feeds nothing
+            ComPtr<ID3D11Resource> scene_res;
+            if (gd.srv_scene_depth)
+               gd.srv_scene_depth->GetResource(scene_res.put());
+            if (src_res.get() == scene_res.get())
+               return DrawOrDispatchOverrideType::Replaced; // BL2: upstream of the tonemap, its output feeds nothing
 
-            ComPtr<ID3D11RenderTargetView> fxaa_rtv;
-            native_device_context->OMGetRenderTargets(1, fxaa_rtv.put(), nullptr);
-            ComPtr<ID3D11Resource> dst_res;
-            if (fxaa_rtv)
-               fxaa_rtv->GetResource(dst_res.put());
-            // CopyResource silently no-ops on a mismatch, which would leave a stale buffer under the HUD, so
-            // anything unexpected falls through to the game's own draw rather than to a broken frame.
-            if (dst_res && dst_res.get() != src_res.get() && AreResourcesEqual(dst_res.get(), src_res.get()))
+            if ((uint64_t)src_res.get() == gd.ldr_buffer_handle)
             {
-               native_device_context->CopyResource(dst_res.get(), src_res.get());
-               return DrawOrDispatchOverrideType::Replaced;
+               ComPtr<ID3D11RenderTargetView> fxaa_rtv;
+               native_device_context->OMGetRenderTargets(1, fxaa_rtv.put(), nullptr);
+               ComPtr<ID3D11Resource> dst_res;
+               if (fxaa_rtv)
+                  fxaa_rtv->GetResource(dst_res.put());
+               // CopyResource silently no-ops on a mismatch, which would leave a stale buffer under the HUD.
+               if (dst_res && dst_res.get() != src_res.get() && AreResourcesEqual(dst_res.get(), src_res.get()))
+               {
+                  native_device_context->CopyResource(dst_res.get(), src_res.get());
+                  return DrawOrDispatchOverrideType::Replaced;
+               }
             }
          }
       }
@@ -1512,7 +1491,7 @@ public:
       if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("SMAA anti-aliasing, applied after the tonemap.\nThe game's own AA can be left on or off: while this is enabled its FXAA pass is reduced to a copy, so it neither filters the image twice nor costs a full pass.");
+         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's Anti-aliasing setting on or off).");
       ImGui::BeginDisabled(!g_smaa_enable);
       ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
@@ -1615,7 +1594,7 @@ public:
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", g_bloom_intensity);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Luma bloom strength (1 = vanilla strength, 0 = none). Needs Luma Bloom Enable.");
+         ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
       if (DrawResetButton<float, false>(g_bloom_intensity, 1.f, "BloomIntensity"))
       {
          device_data.cb_luma_global_settings_dirty = true;
@@ -1684,7 +1663,6 @@ public:
          "Luma for \"Borderlands 2 & The Pre-Sequel\" is developed by DristoforColumb and is open source and free.\n"
          "It adds HDR, HDR bloom, SMAA anti-aliasing, and 16x anisotropic filtering.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
-         "The game's own anti-aliasing can be left at either setting; Luma reduces it to a copy.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
