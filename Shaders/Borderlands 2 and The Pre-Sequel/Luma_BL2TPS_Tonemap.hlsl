@@ -29,6 +29,12 @@
 // The per-channel ImageAdjustments curve below MUST keep the original's swizzles (r0.zzxy / r3.z,w,xy) — a
 // "cleaner" rewrite swaps channels and casts the whole image green.
 
+// HDR / vanilla. 1 = the reconstruction + DICE display map above (default). 0 = the vanilla SDR grade on every
+// display mode, without the dither.
+#ifndef TONEMAP_TYPE
+#define TONEMAP_TYPE 1
+#endif
+
 // ---- Per-game texture/sampler slot map: Borderlands 2 vs The Pre-Sequel ------------------------------
 // dgVoodoo maps DX9 sampler sN 1:1 onto DX11 tN. TPS inserts a LightShaftTexture at slot 1, shifting bloom/vignette/
 // LUT/DOF down one (DX9: BL2 tonemap_0x54ED86A0 LUT@s3/DOF@s4; TPS tps_tonemap_0xF8997849 lightshaft@s1/LUT@s4/DOF@s5).
@@ -438,6 +444,7 @@ float4 RunTonemap(float4 v5, float4 v6)
 
    float3 postProcessedColor;
 
+#if TONEMAP_TYPE >= 1
    if (LumaSettings.DisplayMode == 1) // HDR
    {
       const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
@@ -484,6 +491,7 @@ float4 RunTonemap(float4 v5, float4 v6)
       postProcessedColor = hdr;
    }
    else // SDR (still presented through the scRGB swapchain) — sdrLinear is the vanilla grade, untouched
+#endif
    {
       postProcessedColor = sdrLinear;
    }
@@ -504,6 +512,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    postProcessedColor = linear_to_gamma(postProcessedColor, GCT_NONE);
 
    // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
+#if TONEMAP_TYPE >= 1
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
       if (LumaSettings.DisplayMode == 0)
@@ -516,6 +525,7 @@ float4 RunTonemap(float4 v5, float4 v6)
          postProcessedColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
       }
    }
+#endif
 
    return float4(postProcessedColor, 0.0); // vanilla wrote o0.w = 0
 }

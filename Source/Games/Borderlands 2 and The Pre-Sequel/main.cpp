@@ -516,6 +516,13 @@ class Borderlands2 final : public Game
 public:
    void OnInit(bool async) override
    {
+      // Game-specific toggle consumed by the tonemap replacement (Luma_BL2TPS_Tonemap.hlsl).
+      std::vector<ShaderDefineData> game_shader_defines_data = {
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla grade (reference)\n1 - HDR: native grade + reconstructed luminance + DICE display map", 1},
+      };
+      shader_defines_data.append_range(game_shader_defines_data);
+      assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
+
       // UE3 is all SDR (UNORM) gamma space: post buffers stay GAMMA so the gamma-SDR HUD blends like vanilla.
       // The tonemap pre-scales by GamePaperWhite/UIPaperWhite (UI_DRAW_TYPE 2) so the HUD lands at its own level.
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0');
@@ -545,7 +552,8 @@ public:
       luma_data_cbuffer_index = 12;
 
       // User settings mirrored into LumaSettings.GameSettings. The grade sliders default to a vanilla no-op;
-      // Exposure/Bloom/Vignette act on both SDR+HDR, Saturation/Dechroma/Contrast HDR-only.
+      // Exposure/Bloom/Vignette act on both SDR+HDR, Saturation/Dechroma/Contrast HDR-only; those three and Dithering
+      // need TONEMAP_TYPE 1.
       default_luma_global_game_settings.Exposure = 1.f;           // scene multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;         // BT.709-luminance lerp (Color.hlsl Saturation)
       default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only mandatory DICE/gamut desat applies

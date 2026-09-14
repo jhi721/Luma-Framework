@@ -12,7 +12,7 @@ namespace CB
 // Settings mirrored to the shaders from main.cpp, read by the tonemap, the bloom prefilter (BloomThreshold) and the
 // video pass (VideoAutoHDR*). The grade sliders default to a vanilla no-op; Exposure/BloomIntensity/VignetteIntensity
 // act on SDR too (shared scene mix and vignette block), Saturation/HighlightDechroma/Contrast are HDR-display-path only.
-// SMAA metrics use their own CB at b1.
+// Those three and Dithering act only with TONEMAP_TYPE 1. SMAA metrics use their own CB at b1.
 struct LumaGameSettings
 {
    float Exposure;           // 1 = vanilla. Scene exposure multiplier, scene-referred / pre-grade.
