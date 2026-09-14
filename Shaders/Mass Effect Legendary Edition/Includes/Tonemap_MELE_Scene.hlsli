@@ -73,6 +73,9 @@ float3 MELE_CompositeDOF(float2 uv, float2 blurEnable, float3 scene)
 // only folded into the native per-channel curve: families 02 and 03 must keep the scene and the bloom apart,
 // because the game adds the bloom between two tone stages. The ME1LE/ME2LE non-filmic path carries an internal
 // BRG rotation on these same operations and is deliberately not routed through here.
+//
+// scene is whatever the native luma reads: the scene AFTER the exponential pre-curve on the ME2LE filmic and
+// ME1LE/ME2LE analytic permutations, and the linear scene on ME3LE, which has no pre-curve.
 float3 MELE_BloomScreenBlend(float2 uv, float3 scene, out float weight)
 {
    float4 r0;
