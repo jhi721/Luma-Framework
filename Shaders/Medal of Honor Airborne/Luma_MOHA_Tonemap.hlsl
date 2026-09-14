@@ -66,6 +66,8 @@ float3 ApplyLumaBloom(float3 untonemapped, float2 sceneUV)
 // The game's grade, verbatim from the disassembly. `clampSDR`: true = vanilla saturate() path, false = unclamped
 // (max 0), keeping the highlights' real channel ratio instead of a per-channel hue shift. `outputScale` is normally
 // GammaColorScaleAndInverse.xyz; the HDR path passes 1 and re-applies the real scale afterwards.
+// A bool rather than a clamp ceiling on purpose: both call sites pass a literal, so fxc folds the dead branch, while
+// clamp(c, 0, FLT_MAX) keeps two extra per-pixel min() instructions in the HDR path.
 float3 GradeUE3(float3 scene, bool clampSDR, float3 outputScale)
 {
    // Head: shadows -> scale -> midtones.
@@ -121,10 +123,9 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
    // per channel, where the RenoDX BL1 port builds it. Linear below 1.5 and rolling toward 5 above, it compresses a
    // saturated highlight's strong channel before its weak ones, so the hue leans the way the vanilla clip leaned it,
    // without the clip's whitening. MacLeod-Boynton then rebuilds that reference's hue direction on the target's own
-   // purity and T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it.
-   float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-   const float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
-   float3 diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
+   // purity and T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it: its
+   // output is DICE's input below.
+   const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
 
    // 6. Display rolloff (DICE, hue-preserving by luminance). Luminance in PQ, then CORRECT_CHANNELS_BEYOND_PEAK_WHITE
    // desaturates any channel still over peak toward white — panels clip per channel, so an uncorrected saturated
@@ -135,13 +136,13 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
    // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
    // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
    // flattens it for every pixel above the shoulder.
-   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
+   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightsDesaturation;
    // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The colour is already
    // BT.2020 here and is converted back below, so the default CS_BT709 would make it convert a SECOND time and
    // run its shoulder trigger (an RGB average), its compression and its channel containment on doubly-narrowed
    // primaries. Neutrals cancel out; saturated highlights do not.
    ds.InOutColorSpace = CS_BT2020;
-   float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
+   float3 hdr = DICETonemap(MacLeodBoynton::HueOnlyBT2020(extendedBT2020, Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5)) * paperWhite, peakWhite, ds) / paperWhite;
    hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
 
    // User saturation LAST, after the display map: the repo's convention (shared helper: a lerp against BT.709
@@ -156,16 +157,11 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
    float3 outColor = hdr; // linear, 1.0 = paper white
 #else
    // Vanilla reference: linearize the clamped SDR grade.
-   float3 outColor = gamma_to_linear(saturate(sdrVanillaGamma));
+   float3 outColor = gamma_to_linear(sdrVanillaGamma);
 #endif
 
    // --- Common tail: UI paper-white pre-scale + post-process-space encode ---
-#if UI_DRAW_TYPE >= 2
-   // Pre-scale so the gamma-SDR HUD on this same canvas lands at UIPaperWhite after composition rescales by it.
-   // Guarded: an unset GamePaperWhiteNits would black the scene and leave the HUD, i.e. "the 3D disappeared".
-   if (LumaSettings.GamePaperWhiteNits > 0.0)
-      outColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
+   outColor = PreScaleForUIPaperWhite(outColor);
    outColor = max(0.0, outColor); // negatives would turn into NaN in linear_to_gamma below
 #if POST_PROCESS_SPACE_TYPE == 0
    // Store gamma so the game's gamma-space HUD blends like vanilla; composition decodes + applies paper white.
@@ -199,7 +195,7 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
    if (LumaSettings.DevSetting02 > 0.5)
       return linear_to_gamma(saturate(untonemapped));
    if (LumaSettings.DevSetting03 > 0.5)
-      return saturate(sdrVanillaGamma);
+      return sdrVanillaGamma;
 #endif
 
    return outColor;
@@ -212,21 +208,14 @@ float3 RunMOHATonemap(float2 blurUV, float2 sceneUV)
    // 1. Scene mix, exactly as vanilla: depth-driven DoF weight, bloom at x4, normalized by the weight sum.
    float4 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorTextureSampler_s, sceneUV), DgvMaskT0, DgvFillT0);
 
-   const float depth = scene.w; // UE3 packs scene depth in the fp16 alpha
-   const float signedDistance = depth - DoFParams.x;
-   const float normalizedDistance = saturate(abs(signedDistance) * DoFParams.y);
-   const float maxBlur = (signedDistance >= 0.0) ? DoFMaxBlur.y : DoFMaxBlur.x;
-   const float blurAmount = min(PowUE3(normalizedDistance.xxx, DoFParams.zzz).x, maxBlur);
-   const float sceneWeight = saturate(1.0 - blurAmount);
+   const float sceneWeight = saturate(1.0 - DoFBlurAmount(scene.w, DoFParams, DoFMaxBlur)); // UE3 packs scene depth in the fp16 alpha
 
    float4 blurred = ApplyDgvMask(BlurredImage.Sample(BlurredImageSampler_s, blurUV), DgvMaskT1, DgvFillT1);
    // The engine's combined DoF blur + native bloom target, stored pre-divided by 4, hence the x4; vanilla's unorm view
    // also capped it at 4.0, a cap the fp16 upgrade lifted. NEVER scale this by BloomIntensity: DoF and bloom are SUMMED
    // in it, and in the sniper scope this term IS the frame.
-   const float3 blurContribution = blurred.xyz * 4.0;
    const float weightSum = blurred.w * 4.0 + sceneWeight;
-
-   float3 untonemapped = scene.xyz * sceneWeight + blurContribution;
+   float3 untonemapped = scene.xyz * sceneWeight + blurred.xyz * 4.0;
    untonemapped *= (abs(weightSum) > 0.0) ? rcp(weightSum) : FLT_MAX; // rcp guard, as the original does
 
    // AFTER the normalisation: the weight sum belongs to the DoF composite, and dividing the glow by it would
