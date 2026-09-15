@@ -108,13 +108,11 @@ float3 Sanitize(float3 c)
 // Shared HDR back half: extended grade -> contrast -> BT.2020 -> soft hue reference -> MacLeod-Boynton hue -> display
 // rolloff -> gamut clip -> BT.709 -> saturation. Contrast sits ahead of the rolloff on purpose (see 3), saturation
 // behind it, as in the repo. Takes and returns LINEAR light, 1.0 = paper white, NO engine fade (the caller re-applies
-// it: contrast pivots on mid-gray, so a fade before it would never reach black). `extendedGradeLinear` is the pass's
+// it: contrast pivots on mid-gray, so a fade before it would never reach black). `color` is the pass's
 // own grade with its upper saturate()s as max(0), decoded to display-linear: vanilla-exact below the clip and its own
 // analytic continuation above it, so range, luminance and chroma all come from the game's math.
-float3 FinishME1HDR(float3 extendedGradeLinear)
+float3 FinishME1HDR(float3 color)
 {
-   float3 color = extendedGradeLinear;
-
    // 3. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
    // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
    // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code 0.5).
@@ -169,17 +167,10 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
    // normalized by the weight sum.
    float4 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorTextureSampler_s, sceneUV), DgvMaskT0, DgvFillT0);
 
-   const float depth = scene.w; // UE3 packs scene depth in the fp16 alpha
-   // Handed back so the entry point writes it into the target alpha without a second t0 sample: the copy pass carries
-   // it to the gamma pass, where the SMAA predication CS reads it.
-   sceneDepth = depth;
-   // Vanilla DoF weight. Includes/DofBloomGather.hlsl computes the same off the same rows and is deliberately NOT
-   // shared: independent transcriptions of two DIFFERENT shaders, each verified against its own disassembly.
-   const float signedDistance = depth - DoFParams.x;
-   const float normalizedDistance = saturate(abs(signedDistance) * DoFParams.y);
-   const float maxBlur = (signedDistance >= 0.0) ? DoFMaxBlur.y : DoFMaxBlur.x;
-   const float blurAmount = min(PowUE3(normalizedDistance.xxx, DoFParams.zzz).x, maxBlur);
-   const float sceneWeight = saturate(1.0 - blurAmount);
+   // UE3 packs scene depth in the fp16 alpha. Handed back so the entry point writes it into the target alpha without a
+   // second t0 sample: the copy pass carries it to the gamma pass, where the SMAA predication CS reads it.
+   sceneDepth = scene.w;
+   const float sceneWeight = saturate(1.0 - DoFBlurAmount(sceneDepth, DoFParams, DoFMaxBlur)); // vanilla DoF weight
 
    float4 blurred = ApplyDgvMask(BlurredImage.Sample(BlurredImageSampler_s, blurUV), DgvMaskT1, DgvFillT1);
    // The engine's combined DoF blur + native bloom target, stored pre-divided by 4, hence the x4; vanilla's unorm view
@@ -261,12 +252,12 @@ float3 RunME1GammaCorrection(float2 sceneUV)
 #if TONEMAP_TYPE >= 1
    // The post-load flash (0.35 s re-graded frame: mids x0.10, highlights x2.25, peak 222 -> 953 nits) is NOT a stale
    // graded buffer - gating this on the intermediate's alpha changed nothing in game. NOTES.md; do not re-add it.
-   float3 hdr;
+   float3 outColor; // linear, 1.0 = paper white
    if (LumaData.GameData.UberRanThisFrame > 0.5)
    {
       // Stage 1 left LINEAR light here, its SDR reference already carrying this pass's gamma: only the scale applies,
       // as the gain vanilla's chain gives it (the scale sits before this pass's exponent and the display gamma).
-      hdr = scene.xyz * gamma_to_linear(PowUE3(GcColorScale.xyz, GcInverseGamma.xxx));
+      outColor = scene.xyz * gamma_to_linear(PowUE3(GcColorScale.xyz, GcInverseGamma.xxx));
    }
    else
    {
@@ -275,29 +266,22 @@ float3 RunME1GammaCorrection(float2 sceneUV)
       // gamma_to_linear (NOT VanillaToLinear, which would apply the display gamma twice). No Luma bloom: the pyramid is
       // injected at the uber draw.
       float3 untonemapped = scene.xyz * LumaSettings.GameSettings.Exposure;
-      hdr = FinishME1HDR(gamma_to_linear(GradeGCExtended(untonemapped)));
+      outColor = FinishME1HDR(gamma_to_linear(GradeGCExtended(untonemapped)));
    }
    // The fade LAST, after the creative sliders. Branched, not lerped: the decode is uniform but fxc hoists it into
    // the preamble, where .w is 0 with no fade - measured 48 -> 42 executed instructions.
-   float3 outColor = hdr; // linear, 1.0 = paper white
    [branch] if (GcOverlayColor.w > 0.0)
    {
       // Vanilla lerps toward the overlay BEFORE its inverse-gamma pow and the display decode, so the fade curve is
       // taken in that encoded domain: the linear HDR is re-encoded through the inverse of the two exponents, blended,
       // and decoded again. Below 1.0 this is the vanilla fade exactly; above it, its continuation.
       const float invGamma = max(GcInverseGamma.x, 1e-4);
-      const float3 encoded = PowUE3(linear_to_gamma(hdr, GCT_POSITIVE), (1.0 / invGamma).xxx);
+      const float3 encoded = PowUE3(linear_to_gamma(outColor, GCT_POSITIVE), (1.0 / invGamma).xxx);
       outColor = gamma_to_linear(PowUE3(lerp(encoded, GcOverlayColor.xyz, GcOverlayColor.w), invGamma.xxx));
    }
 
    // --- Common tail: UI paper-white pre-scale + post-process-space encode ---
-#if UI_DRAW_TYPE >= 2
-   // Pre-scale so the gamma-SDR HUD lands at UIPaperWhite after composition rescales. Guarded: an unset
-   // GamePaperWhiteNits would black the scene and leave the HUD, i.e. "the 3D disappeared".
-   if (LumaSettings.GamePaperWhiteNits > 0.0)
-      outColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
-   outColor = max(0.0, outColor); // negatives would turn into NaN in linear_to_gamma below
+   outColor = max(0.0, PreScaleForUIPaperWhite(outColor)); // negatives would turn into NaN in linear_to_gamma below
 #if POST_PROCESS_SPACE_TYPE == 0
    // Store gamma so the game's gamma-space HUD blends like vanilla; composition decodes + applies paper white.
    outColor = linear_to_gamma(outColor);

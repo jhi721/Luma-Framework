@@ -72,13 +72,9 @@ void main(
       lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
    }
 #endif
-#if UI_DRAW_TYPE >= 2
-   // Match the scene passes' pre-scale so movies land at gameplay brightness. Guarded the same way: a zero
-   // GamePaperWhiteNits would scale the movie to black.
-   if (LumaSettings.GamePaperWhiteNits > 0.0)
-      lin *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
 
-   o0.rgb = linear_to_gamma(lin); // the canvas is a gamma-space buffer; the composition decodes it at present
-   o0.w = BinkConstant.w;         // vanilla alpha (constant)
+   // Same pre-scale as the scene passes, so movies land at gameplay brightness. The canvas is a gamma-space buffer;
+   // the composition decodes it at present.
+   o0.rgb = linear_to_gamma(PreScaleForUIPaperWhite(lin));
+   o0.w = BinkConstant.w; // vanilla alpha (constant)
 }

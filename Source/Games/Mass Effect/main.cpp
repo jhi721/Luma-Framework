@@ -66,11 +66,11 @@ static float g_rcas_sharpness = 0.f;
 static bool g_smaa_pred_debug = false;   // show the predication mask instead of the antialiased frame
 static bool g_smaa_pred_measure = false; // one-shot: log the mask's coverage above 0.5 and percentiles
 #endif
+#endif
 #if DEVELOPMENT
 // One-shot dump of the copy/uber/gamma cb4 grade rows, disarmed by the gamma pass. On demand: each dump is a blocking
 // Map.
 static bool g_dump_pass_cb = false;
-#endif
 #endif
 
 // Mirrored into GameSettings.LumaBloomEnable, read by both the grade and the replaced gather, so one switch swaps the
@@ -91,11 +91,10 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::map<D3D11_BLEND_DESC, ComPtr<ID3D11BlendState>, BlendDescCompare> fixed_blend_states;
 
    bool has_drawn_tonemap = false; // bloom injected, scene captured
-   bool has_drawn_final = false;   // canvas captured, SMAA done
+   // "Canvas captured, SMAA done" is core's device_data.has_drawn_main_post_processing, set at the final pass.
    // An unkeyed dgVoodoo build fails SILENTLY (format-keyed upgrades still fire, no replacements). Reported once after
    // warmup.
    bool ever_matched_final_pass = false;
-   bool build_check_done = false;
    uint32_t frames_presented = 0;
 #if DEVELOPMENT
    // One-shot per DEVICE, not per process: dgVoodoo recreates the device on resolution changes, when the mirror is
@@ -144,10 +143,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
 #if ENABLE_SMAA
    // ---- SMAA (TW2/BL2 shape, see RunPostFinalGradeSMAA) ----
    // Metrics CB (b1) = (1/w, 1/h, w, h) + (predication scale, 0, 0, 0).
+   // Canvas size every resource below (and core's DrawSMAA intermediates) was created for. A change releases them all
+   // at once; each is then recreated on first use, so no resource tracks a size of its own.
+   uint32_t smaa_w = 0, smaa_h = 0;
    ComPtr<ID3D11Buffer> cb_smaa_metrics;
-   uint32_t smaa_metrics_w = 0, smaa_metrics_h = 0;
    float smaa_metrics_pred_scale = -1.f;
-   uint32_t smaa_core_w = 0, smaa_core_h = 0;
    // SRV-readable snapshot of the canvas; the chain writes the canvas, so it must sample this copy instead.
    ComPtr<ID3D11Texture2D> tex_input;
    ComPtr<ID3D11ShaderResourceView> srv_input;
@@ -155,7 +155,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_input_linear;
    ComPtr<ID3D11UnorderedAccessView> uav_input_linear;
    ComPtr<ID3D11ShaderResourceView> srv_input_linear;
-   uint32_t smaa_temps_w = 0, smaa_temps_h = 0;
 
    // SMAA predication: srv_scene's alpha turned into an edge-ness mask by the depth-extract CS.
    ComPtr<ID3D11Buffer> cb_pred;
@@ -163,31 +162,26 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_pred;
    ComPtr<ID3D11UnorderedAccessView> uav_pred;
    ComPtr<ID3D11ShaderResourceView> srv_pred;
-   uint32_t pred_w = 0, pred_h = 0;
 
    void ReleasePredicationScratch()
    {
       uav_pred.reset();
       srv_pred.reset();
       tex_pred.reset();
-      pred_w = pred_h = 0;
    }
 
    // RCAS. The intermediate exists ONLY while sharpening is on: at 0 the last SMAA pass writes the canvas directly.
    ComPtr<ID3D11Buffer> cb_sharpen;
-   uint32_t sharpen_w = 0, sharpen_h = 0;
    float sharpen_amount = -1.f;
    ComPtr<ID3D11Texture2D> tex_smaa_out;
    ComPtr<ID3D11RenderTargetView> tex_smaa_out_rtv;
    ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
-   uint32_t smaa_out_w = 0, smaa_out_h = 0;
 
    void ReleaseSharpenScratch()
    {
       tex_smaa_out_rtv.reset();
       tex_smaa_out_srv.reset();
       tex_smaa_out.reset();
-      smaa_out_w = smaa_out_h = 0;
    }
 
    // Turning the feature off must give the address space back: ~132 MB at 4K here, and a stock exe is capped at 2 GB.
@@ -198,7 +192,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       uav_input_linear.reset();
       srv_input_linear.reset();
       tex_input_linear.reset();
-      smaa_temps_w = smaa_temps_h = 0;
       ReleasePredicationScratch();
       ReleaseSharpenScratch();
    }
@@ -386,20 +379,17 @@ class MassEffect final : public Game
       if (!disagreement)
          return false;
 
+      // RT0's blend bit is loop-invariant, so the two shapes are mutually exclusive: one flag out of the loop.
       ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
       native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, nullptr);
-      bool bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      bool bound_disagreement = false;
       for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
       {
-         bound[i] = rtvs[i] != nullptr;
-         if (rtvs[i])
-            rtvs[i]->Release(); // references handed back; only bound/not-bound is kept
+         if (rtvs[i] == nullptr)
+            continue;
+         bound_disagreement |= i > 0 && bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
+         rtvs[i]->Release(); // references handed back; only bound/not-bound matters
       }
-
-      // RT0's blend bit is loop-invariant, so the two shapes are mutually exclusive: one flag out of the loop.
-      bool bound_disagreement = false;
-      for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && !bound_disagreement; i++)
-         bound_disagreement = bound[i] && bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
       const bool needs_fix = bound_disagreement && !rt0_blending;
       [[maybe_unused]] const bool inverse_shape = bound_disagreement && rt0_blending;
 
@@ -679,17 +669,6 @@ public:
       data.GameData.UberRanThisFrame = GetGameDeviceData(device_data).has_drawn_tonemap ? 1.f : 0.f;
    }
 
-#if ENABLE_BLOOM
-   // Core's DrawKarisAverage output, ~66 MB at 4K. Core drops only the UAV on swapchain init, so release both views
-   // here.
-   static void ReleaseCoreKarisAverage(DeviceData& device_data)
-   {
-      auto& mr = device_data.managed_resources;
-      mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
-      mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
-   }
-#endif
-
 #if ENABLE_SMAA
    // Core's DrawSMAA intermediates, ~83 MB at 4K, dropped only on swapchain init. The SRVs hold references, so release
    // both.
@@ -721,12 +700,16 @@ public:
       if (!smaa_ready)
          return;
 
-      // Drop DrawSMAA's core-managed intermediates on resolution change so they recreate at the new size.
-      if (gd.smaa_core_w != w || gd.smaa_core_h != h)
+      // Resolution change: drop every size-bound resource, ours and DrawSMAA's core-managed intermediates, so each is
+      // recreated at the new size (below, or by core). The predication CB does not depend on the size and stays.
+      if (gd.smaa_w != w || gd.smaa_h != h)
       {
+         gd.ReleaseSMAAScratch();
+         gd.cb_smaa_metrics.reset();
+         gd.cb_sharpen.reset();
          ReleaseCoreSMAAIntermediates(device_data);
-         gd.smaa_core_w = w;
-         gd.smaa_core_h = h;
+         gd.smaa_w = w;
+         gd.smaa_h = h;
       }
 
       // Scale and mask fall back together: 2.0 with a null mask raises the threshold frame-wide. The CS maps texels
@@ -748,30 +731,24 @@ public:
             if (CreateImmutableCB(native_device, p, sizeof(p), gd.cb_pred))
                gd.pred_tolerance = g_smaa_pred_tolerance;
          }
-         if (!gd.tex_pred || gd.pred_w != w || gd.pred_h != h)
+         if (!gd.uav_pred || !gd.srv_pred)
          {
             gd.ReleasePredicationScratch();
             if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_pred, DXGI_FORMAT_R16_FLOAT))
             {
                native_device->CreateUnorderedAccessView(gd.tex_pred.get(), nullptr, gd.uav_pred.put());
                native_device->CreateShaderResourceView(gd.tex_pred.get(), nullptr, gd.srv_pred.put());
-               gd.pred_w = w;
-               gd.pred_h = h;
             }
          }
          pred_ok = gd.cb_pred && gd.uav_pred && gd.srv_pred;
       }
 
       const float pred_scale = pred_ok ? 2.f : 1.f;
-      if (!gd.cb_smaa_metrics || gd.smaa_metrics_w != w || gd.smaa_metrics_h != h || gd.smaa_metrics_pred_scale != pred_scale)
+      if (!gd.cb_smaa_metrics || gd.smaa_metrics_pred_scale != pred_scale)
       {
          const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, 0.f, 0.f, 0.f};
          if (CreateImmutableCB(native_device, metrics, sizeof(metrics), gd.cb_smaa_metrics))
-         {
-            gd.smaa_metrics_w = w;
-            gd.smaa_metrics_h = h;
             gd.smaa_metrics_pred_scale = pred_scale;
-         }
       }
       if (!gd.cb_smaa_metrics)
          return;
@@ -782,32 +759,26 @@ public:
       bool do_sharpen = g_rcas_sharpness > 0.f && copy_vs != nullptr && sharpen_ps != nullptr;
       if (do_sharpen)
       {
-         if (!gd.cb_sharpen || gd.sharpen_w != w || gd.sharpen_h != h || gd.sharpen_amount != g_rcas_sharpness)
+         if (!gd.cb_sharpen || gd.sharpen_amount != g_rcas_sharpness)
          {
             const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
             if (CreateImmutableCB(native_device, sp, sizeof(sp), gd.cb_sharpen))
-            {
-               gd.sharpen_w = w;
-               gd.sharpen_h = h;
                gd.sharpen_amount = g_rcas_sharpness;
-            }
          }
-         if (!gd.tex_smaa_out || gd.smaa_out_w != w || gd.smaa_out_h != h)
+         if (!gd.tex_smaa_out_rtv || !gd.tex_smaa_out_srv)
          {
             gd.ReleaseSharpenScratch();
             if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd.tex_smaa_out, cfmt))
             {
                native_device->CreateRenderTargetView(gd.tex_smaa_out.get(), nullptr, gd.tex_smaa_out_rtv.put());
                native_device->CreateShaderResourceView(gd.tex_smaa_out.get(), nullptr, gd.tex_smaa_out_srv.put());
-               gd.smaa_out_w = w;
-               gd.smaa_out_h = h;
             }
          }
          if (!gd.cb_sharpen || !gd.tex_smaa_out_rtv || !gd.tex_smaa_out_srv)
             do_sharpen = false; // allocation failed: fall back to the un-sharpened chain rather than dropping SMAA
       }
 
-      if (!gd.tex_input || gd.smaa_temps_w != w || gd.smaa_temps_h != h)
+      if (!gd.srv_input || !gd.uav_input_linear || !gd.srv_input_linear)
       {
          gd.srv_input.reset();
          gd.tex_input.reset();
@@ -819,8 +790,6 @@ public:
             native_device->CreateShaderResourceView(gd.tex_input.get(), nullptr, gd.srv_input.put());
             native_device->CreateUnorderedAccessView(gd.tex_input_linear.get(), nullptr, gd.uav_input_linear.put());
             native_device->CreateShaderResourceView(gd.tex_input_linear.get(), nullptr, gd.srv_input_linear.put());
-            gd.smaa_temps_w = w;
-            gd.smaa_temps_h = h;
          }
       }
       if (!gd.srv_input || !gd.uav_input_linear || !gd.srv_input_linear)
@@ -927,7 +896,7 @@ public:
       // Hide HUD: cancel post-final draws targeting the same canvas - the render-target test is the load-bearing half.
       // The UI families are hash-replaced, so is_custom_pass is true for them: an original PS hash (not UINT64_MAX)
       // is what separates a replaced game draw from one of Luma's own injected passes.
-      if (g_hide_ui && is_immediate && (!is_custom_pass || original_shader_hashes.pixel_shaders[0] != UINT64_MAX) && gd.has_drawn_final && gd.canvas_res)
+      if (g_hide_ui && is_immediate && (!is_custom_pass || original_shader_hashes.pixel_shaders[0] != UINT64_MAX) && device_data.has_drawn_main_post_processing && gd.canvas_res)
       {
          ComPtr<ID3D11Resource> rt = GetBoundRenderTargetResource(native_device_context);
          if (rt.get() == gd.canvas_res.get())
@@ -944,7 +913,7 @@ public:
 #if DEVELOPMENT
       // HUD permutation net: logs post-final canvas draws whose PS is NOT replaced (Includes/GFxUI.hlsl covers eight
       // families x both dgVoodoo builds). Complete only FOR WHAT DREW.
-      if (is_immediate && !is_custom_pass && gd.has_drawn_final && gd.canvas_res && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
+      if (is_immediate && !is_custom_pass && device_data.has_drawn_main_post_processing && gd.canvas_res && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
       {
          const uint32_t ps_hash = (uint32_t)original_shader_hashes.pixel_shaders[0];
          if (!gd.diag_post_final_ps.contains(ps_hash) && GetBoundRenderTargetResource(native_device_context).get() == gd.canvas_res.get())
@@ -1044,9 +1013,8 @@ public:
 #endif
       }
 
-      if (is_immediate && !gd.has_drawn_final && IsFinalColorPass(original_shader_hashes))
+      if (is_immediate && !device_data.has_drawn_main_post_processing && IsFinalColorPass(original_shader_hashes))
       {
-         gd.has_drawn_final = true;
          device_data.has_drawn_main_post_processing = true;
 
          // Same seam rule: this replacement reads LumaSettings and LumaData, and the SMAA path returns Replaced,
@@ -1085,7 +1053,7 @@ public:
 #endif
 
          // The display gamma this pass applies, for the grade's SDR reference. Once per frame: the block gates on
-         // !has_drawn_final.
+         // !has_drawn_main_post_processing.
          TrackCB4Row(native_device, native_device_context, gd.gamma_cb_ring, 11, 0.25f, 1.f, &gd.gamma_inverse_live, &gd.gamma_inverse_valid); // 1/gamma for gamma in [1, 4]
 
 #if ENABLE_SMAA
@@ -1113,16 +1081,11 @@ public:
 
       // One-shot telemetry (BL GOTY). Warmup budget only: the menu runs the same pass, so a few frames are enough.
       constexpr uint32_t kBuildCheckFrame = 120;
-      if (!gd.build_check_done && ++gd.frames_presented >= kBuildCheckFrame)
-      {
-         gd.build_check_done = true;
-         if (!gd.ever_matched_final_pass)
-            reshade::log::message(reshade::log::level::warning,
-               "[Luma] ME1: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
-      }
+      if (gd.frames_presented < kBuildCheckFrame && ++gd.frames_presented == kBuildCheckFrame && !gd.ever_matched_final_pass)
+         reshade::log::message(reshade::log::level::warning,
+            "[Luma] ME1: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
 
       gd.has_drawn_tonemap = false;
-      gd.has_drawn_final = false;
       gd.gamma_cb_ring.advanced_this_frame = false; // re-arm the once-per-frame ring advances
       gd.bloom_cb_ring.advanced_this_frame = false;
 
@@ -1147,10 +1110,14 @@ public:
       gd.srv_scene.reset(); // recaptured every frame; never held across one
 
 #if ENABLE_BLOOM
-      // Give the address space back on the render thread. Unconditional while off: resetting empty entries is two
-      // lookups.
+      // Give the address space back on the render thread: core's DrawKarisAverage output, ~66 MB at 4K. Core drops only
+      // the UAV on swapchain init, so both views go here. Unconditional while off: resetting empty entries is two lookups.
       if (!g_luma_bloom_enable)
-         ReleaseCoreKarisAverage(device_data);
+      {
+         auto& mr = device_data.managed_resources;
+         mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
+         mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
+      }
 #endif
 
 #if ENABLE_SMAA
@@ -1159,7 +1126,7 @@ public:
       {
          gd.ReleaseSMAAScratch();
          ReleaseCoreSMAAIntermediates(device_data);
-         gd.smaa_core_w = gd.smaa_core_h = 0; // core recreates lazily; keep our latch from claiming they are current
+         gd.smaa_w = gd.smaa_h = 0; // core recreates lazily; keep the latch from claiming anything is current
       }
       else
       {

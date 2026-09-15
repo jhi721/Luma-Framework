@@ -7,7 +7,7 @@
 // clang-format off
 // ORDER IS LOAD-BEARING - game-local Common.hlsl first, so LUMA_GAME_CB_STRUCTS is defined before Settings.hlsl.
 #include "Common.hlsl"       // game-local: LumaSettings.GameSettings.LumaBloomEnable
-#include "GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
+#include "GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, DoFBlurAmount
 // clang-format on
 
 // Only what this pass samples.
@@ -31,11 +31,7 @@ float4 GatherTap(float2 uv)
 
    const float3 bloom = any(s.xyz > 1.0) ? s.xyz * LumaGatherBloomScale : (float3)0.0;
 
-   // Vanilla DoF weight, per tap. Same math as Luma_ME1_Tonemap.hlsl, deliberately separate - see the note there.
-   const float signedDistance = s.w - DoFParams.x;
-   const float normalizedDistance = saturate(abs(signedDistance) * DoFParams.y);
-   const float maxBlur = (signedDistance >= 0.0) ? DoFMaxBlur.y : DoFMaxBlur.x;
-   const float blurAmount = min(PowUE3(normalizedDistance.xxx, DoFParams.zzz).x, maxBlur);
+   const float blurAmount = DoFBlurAmount(s.w, DoFParams, DoFMaxBlur); // vanilla DoF weight, per tap
 
    return float4(blurAmount * s.xyz + bloom, blurAmount);
 }

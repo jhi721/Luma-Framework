@@ -35,4 +35,15 @@ float3 PowUE3(float3 base, float3 exponent)
    return exp2(exponent * log2(max(abs(base), 1e-30)));
 }
 
+// UE3's depth-of-field blur weight at linear `depth`, as both the gather and the uber grade compute it. The rows are
+// passed in, each pass naming them from its own register map: `dofParams` .x focus distance, .y 1/range, .z falloff
+// exponent; `dofMaxBlur` .x max blur near, .y max blur far.
+float DoFBlurAmount(float depth, float4 dofParams, float4 dofMaxBlur)
+{
+   const float signedDistance = depth - dofParams.x;
+   const float normalizedDistance = saturate(abs(signedDistance) * dofParams.y);
+   const float maxBlur = (signedDistance >= 0.0) ? dofMaxBlur.y : dofMaxBlur.x;
+   return min(PowUE3(normalizedDistance.xxx, dofParams.zzz).x, maxBlur);
+}
+
 #endif // LUMA_ME1_GAME_BINDINGS
