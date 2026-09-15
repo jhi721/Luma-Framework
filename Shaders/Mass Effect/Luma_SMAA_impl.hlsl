@@ -1,7 +1,9 @@
 // Reference: https://github.com/iryoku/smaa
 
 // SMAA ULTRA + colour edge detection, ported from BL2/TPS and Witcher 2 (same dgVoodoo stack). ADDS antialiasing: the
-// game ships none. Injected post-grade on 0x17CE0932, in GAMMA space, before the HUD; Display Composition runs after.
+// game ships none. Injected after the gamma pass 0x17CE0932, before the HUD; Display Composition runs after. Edges are
+// detected on the GAMMA canvas, the neighborhood blend runs in linear light (Luma_ME1_SMAALinearize) and re-encodes.
+// The predication mask comes from Luma_ME1_DepthExtract.
 
 #include "Includes/Common.hlsl"
 

@@ -13,8 +13,7 @@
 #define ENABLE_SMAA 1
 // Replaces the game's quarter-res bright-pass glow, which the replaced gather then stops writing.
 #define ENABLE_BLOOM 1
-// Outside DEVELOPMENT this define is what makes original_draw_dispatch_func non-null; without it the callback never
-// fires.
+// Outside DEVELOPMENT only this define makes original_draw_dispatch_func non-null; without it the callback never fires.
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 
 #include "..\..\Core\core.hpp"
@@ -22,23 +21,19 @@
 #include <unordered_set>
 
 // Both replaced, separate register maps. The gamma correction pass ends every frame; the uber runs first when it
-// runs at all - the engine skips it in elevators and some loading scenes, which UberRanThisFrame carries over.
+// runs at all - the engine skips it in elevators and some loading scenes, which b12 UberRanThisFrame reports.
 static constexpr uint32_t kUberPostHash = 0xAC8341E0;        // HDR grade -> fp16 intermediate
 static constexpr uint32_t kGammaCorrectionHash = 0x17CE0932; // canvas encode, the FINAL pass
-// Engine copy scene B -> A. Not replaced; DEVELOPMENT dumps its gamma row, since a non-1 exponent would move the encode
-// here.
+// Engine copy scene B -> A. Not replaced; DEVELOPMENT dumps its gamma row: a non-1 exponent would move the encode here.
 static constexpr uint32_t kCopyPassHash = 0x1E37D75B;
 
-// UE3 DOFAndBloomGather, REPLACED: bloom and the DoF blur share one quarter-res target, so the glow can only be dropped
-// inside it.
+// UE3 DOFAndBloomGather, REPLACED: bloom and DoF blur share one quarter-res target, so only it can drop the glow.
 static constexpr uint32_t kDofBloomGatherHash = 0x56854256;  // QualityBloom=TRUE, 16 taps
 static constexpr uint32_t kDofBloomGather4Hash = 0x28F8DB16; // QualityBloom=FALSE, 4 taps
-// UE3 FilterPixelShader, 9 taps, NOT replaced. Its weights (PS cb4[10..18]) and offsets (VS cb4[25..29]) set the
-// vanilla glow radius.
+// UE3 FilterPixelShader, 9 taps, NOT replaced: PS cb4[10..18] weights and VS cb4[25..29] offsets set the glow radius.
 static constexpr uint32_t kBloomFilterHash = 0x6A1129DF;
 
-// The same passes under dgVoodoo 2.81.3, which emits ps_4_0 and hashes differently. Only C++-keyed hashes need a
-// constant.
+// The same passes under dgVoodoo 2.81.3 (emits ps_4_0, so different hashes). Only C++-keyed hashes need a constant.
 static constexpr uint32_t kUberPostHash_v281 = 0x786BC3B3;
 static constexpr uint32_t kGammaCorrectionHash_v281 = 0x3BEF1CD6;
 static constexpr uint32_t kCopyPassHash_v281 = 0xDDEAEB7C;
@@ -46,8 +41,7 @@ static constexpr uint32_t kDofBloomGatherHash_v281 = 0x4B65EEAE;
 static constexpr uint32_t kDofBloomGather4Hash_v281 = 0xAA369C00;
 static constexpr uint32_t kBloomFilterHash_v281 = 0x464E33BB;
 
-// Luma bloom pyramid mip 0, read by the grade replacements: clear of t0 (scene) and t1 (blur), the only slots they
-// declare.
+// Luma bloom pyramid mip 0 for the grade replacements; clear of t0 (scene) and t1 (blur), the only slots they declare.
 static constexpr uint32_t kLumaBloomSlot = 6;
 // One sigma per mip, count taken FROM the array so the two cannot drift (MELE). Blended 0.5/0.5 = energy-preserving.
 static constexpr float g_bloom_sigmas[] = {1.5f, 2.f, 2.f, 2.f, 1.f, 0.5f};
@@ -57,30 +51,25 @@ static bool g_hide_ui = false; // session-only, never persisted
 static bool g_smaa_enable = true;
 static bool g_smaa_predication = true;      // on geometry, from the depth in the scene buffer's alpha
 static float g_smaa_pred_tolerance = 0.02f; // a fraction of view depth
-// RCAS on the SMAA output, opt-in at 0 (BL2/TW2): at 0 the pass never runs and its full-res intermediate is never
-// allocated.
+// RCAS on the SMAA output, opt-in (BL2/TW2): at 0 the pass never runs and its full-res intermediate is not allocated.
 static float g_rcas_sharpness = 0.f;
 #if DEVELOPMENT
-// Calibration aid: predication's effect is the ABSENCE of smearing, which the eye reads badly - judge the mask, not the
-// frame.
+// Calibration aid: predication's effect is the ABSENCE of smearing, which the eye misjudges - judge the mask instead.
 static bool g_smaa_pred_debug = false;   // show the predication mask instead of the antialiased frame
 static bool g_smaa_pred_measure = false; // one-shot: log the mask's coverage above 0.5 and percentiles
 #endif
 #endif
 #if DEVELOPMENT
-// One-shot dump of the copy/uber/gamma cb4 grade rows, disarmed by the gamma pass. On demand: each dump is a blocking
-// Map.
+// One-shot dump of the copy/uber/gamma cb4 grade rows, disarmed by the gamma pass. On demand: each dump blocks.
 static bool g_dump_pass_cb = false;
 #endif
 
-// Mirrored into GameSettings.LumaBloomEnable, read by both the grade and the replaced gather, so one switch swaps the
-// blooms.
+// Mirrored into GameSettings.LumaBloomEnable for both the grade and the replaced gather: one switch swaps the blooms.
 static bool g_luma_bloom_enable = true;
 
 struct MassEffectGameDeviceData final : public GameDeviceData
 {
-   // Repaired blend states, keyed by the ORIGINAL desc (DXHR): a released state cannot leave a stale key for a later
-   // allocation.
+   // Repaired blend states, keyed by the ORIGINAL desc (DXHR) so a released state cannot leave a stale key behind.
    struct BlendDescCompare
    {
       bool operator()(const D3D11_BLEND_DESC& a, const D3D11_BLEND_DESC& b) const
@@ -92,43 +81,36 @@ struct MassEffectGameDeviceData final : public GameDeviceData
 
    bool uber_ran_this_frame = false; // bloom injected, scene captured
    // "Canvas captured, SMAA done" is core's device_data.has_drawn_main_post_processing, set at the final pass.
-   // An unkeyed dgVoodoo build fails SILENTLY (format-keyed upgrades still fire, no replacements). Reported once after
-   // warmup.
+   // An unkeyed dgVoodoo build fails SILENTLY (format upgrades still fire, replacements don't); reported after warmup.
    bool ever_matched_final_pass = false;
    uint32_t frames_presented = 0;
 #if DEVELOPMENT
-   // One-shot per DEVICE, not per process: dgVoodoo recreates the device on resolution changes, when the mirror is
-   // worth re-reading.
+   // One-shot per DEVICE, not per process: dgVoodoo recreates the device on a resize, which is worth re-reading.
    bool diag_logged_gather = false;
    bool diag_logged_rt = false;
    // Vanilla bloom kernel capture, one-shot: the two filter draws of one frame (H then V) and the gather's constants.
    uint32_t diag_filter_dumps = 0;
-   // The HUD family: each lands on the fp16 mirror with no 8-bit clamp and needs a saturating UI_GFx*. Unreplaced
-   // shaders only.
+   // HUD family: each lands on the fp16 mirror unclamped and needs a saturating UI_* replacement. Unreplaced PS only.
    std::unordered_set<uint32_t> diag_post_final_ps;
 #endif
-   // Deferred cbuffer readback (MoHA/MELE): copy at the draw, non-blocking Map of the copy from two frames ago, so
-   // nothing stalls.
+   // Deferred cbuffer readback (MoHA/MELE): copy at the draw, Map the copy from two frames ago without waiting.
    struct DeferredCBRing
    {
       static constexpr uint32_t kSlots = 3;
       ComPtr<ID3D11Buffer> staging[kSlots];
       uint32_t bytes = 0;
       uint32_t writes = 0;
-      // One advance per frame, re-armed at Present: a second capture pushes the oldest slot out and the non-blocking
-      // Map fails forever.
+      // One advance per frame (re-armed at Present): more would read copies still in flight; the Map never lands.
       bool advanced_this_frame = false;
    };
-   // Gamma pass inverse display gamma (cb4[11].x, measured 0.625 = 1/1.6; uber and copy are 1.0). Travels via
-   // GameSettings.
+   // Gamma pass 1/display gamma (cb4[11].x, measured 0.625 = 1/1.6; uber and copy are 1.0), sent via GameSettings.
    DeferredCBRing gamma_cb_ring;
    float gamma_inverse_live = 0.f;
    bool gamma_inverse_valid = false;
    // Gather BloomScale (cb4[11].x, measured 0.1), same scheme. Per post-process volume in UE3, so it changes per area.
    DeferredCBRing bloom_cb_ring;
    float bloom_scale_live = 0.f;
-   // Validity is a FLAG, not the sign: bloom off in a volume reports BloomScale 0, a real reading the shader must
-   // receive.
+   // Validity is a FLAG, not the sign: bloom off in a volume reports BloomScale 0, a real value the shader must get.
    bool bloom_scale_valid = false;
 
    // The canvas the final color pass wrote, from its bound RTV. Used by Hide UI and SMAA. Released every Present.
@@ -274,8 +256,7 @@ class MassEffect final : public Game
       return SUCCEEDED(device->CreateTexture2D(&td, nullptr, out.put()));
    }
 
-   // One cbuffer row from the copy two frames ago. False when nothing is readable: fresh ring, failed alloc, slot in
-   // flight.
+   // One cbuffer row from the copy two frames ago. False when unreadable: fresh ring, failed alloc or slot in flight.
    static bool ReadCBRowDeferred(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, ID3D11Buffer* cb,
       MassEffectGameDeviceData::DeferredCBRing& ring, uint32_t row, float out[4])
    {
@@ -317,7 +298,7 @@ class MassEffect final : public Game
       if (ring.writes < kSlots)
          return false; // nothing old enough to read yet
 
-      // The slot about to be overwritten is the oldest, i.e. the copy issued kSlots frames ago.
+      // The next slot to be overwritten is the oldest: the copy issued kSlots - 1 frames ago.
       ID3D11Buffer* oldest = ring.staging[ring.writes % kSlots].get();
       D3D11_MAPPED_SUBRESOURCE mapped = {};
       if (FAILED(native_device_context->Map(oldest, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) || mapped.pData == nullptr)
@@ -343,12 +324,10 @@ class MassEffect final : public Game
       }
    }
 
-   // dgVoodoo leaves blending ENABLED on a secondary RT while RT0 has it off - D3D9 has one global state (TW2 water
-   // 0xDA16C815).
+   // dgVoodoo leaves blending ON for a secondary RT with RT0 off; D3D9 has one global state (TW2 water 0xDA16C815).
    static bool FixImpossiblePerRTBlend(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData& gd, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, std::function<void()>* original_draw_dispatch_func)
    {
-      // Our injected passes set their blend state deliberately, and re-issuing the draw is the only way to apply
-      // another.
+      // Injected passes set their blend deliberately; without the dispatch func the draw cannot be re-issued.
       if (is_custom_pass || (stages & reshade::api::shader_stage::pixel) == 0 || original_draw_dispatch_func == nullptr)
          return false;
 
@@ -366,8 +345,7 @@ class MassEffect final : public Game
 
       const bool rt0_blending = bd.RenderTarget[0].BlendEnable != FALSE;
 #if !DEVELOPMENT
-      // Only the "RT0 off, RTn on" shape is repaired, so outside DEVELOPMENT a blending RT0 skips the scan and the RT
-      // query.
+      // Only "RT0 off, RTn on" is repaired, so outside DEVELOPMENT a blending RT0 skips the scan and the RT query.
       if (rt0_blending)
          return false;
 #endif
@@ -508,8 +486,7 @@ class MassEffect final : public Game
    }
 
 #if ENABLE_SMAA
-   // Calibration readback (MoHA method): coverage above 0.5 is the geometry fraction, ~1% on a real frame. One-shot, it
-   // stalls.
+   // Calibration readback (MoHA method): coverage above 0.5 = geometry fraction, typically ~1%. One-shot; stalls.
    static void MeasurePredicationMask(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, ID3D11Texture2D* pred)
    {
       // Desc taken off the mask, not rebuilt: CopyResource requires agreement and the walk must cover what was copied.
@@ -584,8 +561,8 @@ public:
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
 #if ENABLE_SMAA
-      // Core auto-registers the 6 SMAA passes. Ours: the linear decode its blend reads, and the predication CS (scene
-      // alpha -> R16F edge-ness in [0,1]).
+      // Core auto-registers the 6 SMAA passes. Added here: the linear decode the neighborhood blend reads, and the
+      // predication CS turning scene alpha into R16F edge-ness in [0,1].
       native_shaders_definitions.emplace(CompileTimeStringHash("ME1 SMAA Linearize CS"),
          ShaderDefinition("Luma_ME1_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("ME1 Depth Extract CS"),
@@ -595,8 +572,7 @@ public:
          ShaderDefinition{"Luma_ME1_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 #endif
 
-      // Address-space ceiling, PROBED: no LARGE_ADDRESS_AWARE (0x0102 measured) = 2 GB, and Luma's 4K scratch is ~365
-      // MB.
+      // Address-space ceiling, PROBED: no LARGE_ADDRESS_AWARE (0x0102 measured) = 2 GB, Luma's 4K scratch ~365 MB.
       static bool address_space_checked = false;
       if (!address_space_checked)
       {
@@ -611,8 +587,7 @@ public:
                "LARGE_ADDRESS_AWARE bit, or lower the resolution / turn off SMAA and HDR bloom.");
       }
 
-      // GAMMA space: the gamma-SDR HUD blends onto this canvas and a linear buffer washes it out. Composition encodes
-      // scRGB.
+      // GAMMA space: the gamma-SDR HUD blends onto this canvas and linear washes it out. Composition encodes scRGB.
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0');
       GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('1'); // game shipped gamma-2.2 SDR
@@ -621,7 +596,7 @@ public:
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
       // dgVoodoo's D3D9 mirrors are b3/b4. b11 (core DrawBloom's own constants) and b12/b13 are taken as free, as in
-      // MoHA; the full slot occupancy is not yet measured here (NOTES).
+      // MoHA; the full slot occupancy is not measured for this game.
       // luma_ui stays off: the game draws its own UI.
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
@@ -655,24 +630,21 @@ public:
       device_data.game = new MassEffectGameDeviceData;
    }
 
-   // Core never frees device_data.game (TW2/BL2), and GameDeviceData has no virtual destructor: delete the concrete
-   // type.
+   // Core's default deletes through GameDeviceData*, which has no virtual destructor: delete the concrete type.
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
       delete static_cast<MassEffectGameDeviceData*>(device_data.game);
       device_data.game = nullptr;
    }
 
-   // b12 at the gamma seam: whether the uber ran. The engine skips it in elevators, and the gamma replacement must
-   // know.
+   // b12 at the gamma seam: whether the uber ran (skipped in elevators), which the gamma replacement branches on.
    void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData& cmd_list_data, DeviceData& device_data) override
    {
       data.GameData.UberRanThisFrame = GetGameDeviceData(device_data).uber_ran_this_frame ? 1.f : 0.f;
    }
 
 #if ENABLE_SMAA
-   // Core's DrawSMAA intermediates, ~83 MB at 4K, dropped only on swapchain init. The SRVs hold references, so release
-   // both.
+   // Core's DrawSMAA intermediates, ~83 MB at 4K, dropped only on swapchain init. Views hold references: release all.
    static void ReleaseCoreSMAAIntermediates(DeviceData& device_data)
    {
       auto& mr = device_data.managed_resources;
@@ -683,8 +655,7 @@ public:
       mr.shader_resource_views[CompileTimeStringHash("smaa_blending_weight_calculation")].reset();
    }
 
-   // SMAA from the post-draw callback, after the grade and before the HUD. TW2/BL2 chain: snapshot -> SRV -> DrawSMAA
-   // -> canvas.
+   // SMAA after the grade, before the HUD (TW2/BL2 chain): snapshot -> linear decode -> DrawSMAA -> [RCAS] -> canvas.
    void RunPostFinalGradeSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, ID3D11Resource* canvas_res, ID3D11RenderTargetView* canvas_rtv)
    {
       uint4 cinfo{};
@@ -713,8 +684,7 @@ public:
          gd.smaa_h = h;
       }
 
-      // Scale and mask fall back together: 2.0 with a null mask raises the threshold frame-wide. The CS maps texels
-      // 1:1.
+      // Scale and mask fall back together: 2.0 with a null mask raises the threshold frame-wide. CS maps texels 1:1.
       auto* pred_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("ME1 Depth Extract CS"));
       bool pred_ok = g_smaa_predication && gd.srv_scene.get() != nullptr && pred_cs != nullptr;
       if (pred_ok)
@@ -811,8 +781,7 @@ public:
          linearize_state.Restore(native_device_context);
       }
 
-      // Scene alpha -> plane-deviation edge-ness in R16F; Luma_ME1_DepthExtract.hlsl says why it is an edge test, not a
-      // rescale.
+      // Scene alpha -> plane-deviation edge-ness (R16F); why an edge test, not a rescale: Luma_ME1_DepthExtract.hlsl.
       if (pred_ok)
       {
          DrawStateStack<DrawStateStackType::Compute> pred_cs_state;
@@ -845,8 +814,7 @@ public:
          auto* copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
          if (copy_vs != nullptr && copy_ps != nullptr)
          {
-            // Single-channel, so the copy lands it in RED - unmistakably a debug view. Replaces the frame, hence the
-            // early return.
+            // Single-channel, so the copy shows it in RED. It replaces the frame, hence the early return.
             DrawStateStack<DrawStateStackType::FullGraphics> debug_state;
             debug_state.Cache(native_device_context, device_data.uav_max_count);
             DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
@@ -905,15 +873,14 @@ public:
       }
 
 #if ENABLE_BLOOM
-      // The gather runs before the uber: read BloomScale here, deferred. Bloom-only, so it follows the feature's own
-      // switch.
+      // The gather runs before the uber: read BloomScale here, deferred. Bloom-only, so it follows the bloom switch.
       if (g_luma_bloom_enable && is_immediate && !gd.bloom_cb_ring.advanced_this_frame && IsDofBloomGather(original_shader_hashes))
          TrackCB4Row(native_device, native_device_context, gd.bloom_cb_ring, 11, 0.f, 4.f, &gd.bloom_scale_live, &gd.bloom_scale_valid); // engine BloomScale, measured 0.1
 #endif
 
 #if DEVELOPMENT
-      // HUD permutation net: logs post-final canvas draws whose PS is NOT replaced (Includes/GFxUI.hlsl covers eight
-      // families x both dgVoodoo builds). Complete only FOR WHAT DREW.
+      // HUD permutation net: logs unreplaced post-final canvas draws. UI_*.hlsl cover eight families x both dgVoodoo
+      // builds; the net is complete only FOR WHAT DREW.
       if (is_immediate && !is_custom_pass && device_data.has_drawn_main_post_processing && gd.canvas_res && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
       {
          const uint32_t ps_hash = (uint32_t)original_shader_hashes.pixel_shaders[0];
@@ -934,19 +901,16 @@ public:
          }
       }
 
-      // The devkit cannot see an indirect upgrade, so the render target bound here is the only place the fp16 mirror
-      // shows.
+      // The devkit cannot see an indirect upgrade, so the RT bound here is the only view of the fp16 mirror.
       if (is_immediate && !gd.diag_logged_gather && IsDofBloomGather(original_shader_hashes))
       {
          gd.diag_logged_gather = true;
          DumpBoundRenderTarget(native_device_context, "bloom buffer");
-         // Vanilla bloom model: BloomScale (PS row 11.x) and the 16 tap offsets (VS rows 20..27, xy/wz pairs in UV
-         // units).
+         // Vanilla bloom model: BloomScale (PS row 11.x) and 16 tap offsets (VS rows 20..27, xy/wz pairs, UV units).
          DumpConstantRows(native_device, native_device_context, "gather PS", 8, 4);
          DumpConstantRows(native_device, native_device_context, "gather VS", 20, 8, true);
       }
-      // The separable blur: 9 weights (PS rows 10..18) and 4 offset pairs (VS rows 25..29), both directions of one
-      // frame.
+      // The separable blur: 9 weights (PS rows 10..18), 4 offset pairs (VS rows 25..29), both directions of one frame.
       if (is_immediate && gd.diag_filter_dumps < 2 && ContainsPixelShader(original_shader_hashes, kBloomFilterHash, kBloomFilterHash_v281))
       {
          gd.diag_filter_dumps++;
@@ -960,8 +924,7 @@ public:
          gd.ever_matched_final_pass = true;
 
 #if DEVELOPMENT
-      // Which pass encodes: uber row 15.w, copy row 8, gamma row 11 - measured 1.0 / 1.0 / 0.625. Dump on gameplay, not
-      // a fade.
+      // Which pass encodes: uber row 15.w, copy row 8, gamma row 11.x - measured 1.0 / 1.0 / 0.625.
       if (is_immediate && g_dump_pass_cb && ContainsPixelShader(original_shader_hashes, kCopyPassHash, kCopyPassHash_v281))
          DumpConstantRows(native_device, native_device_context, "copy 0x1E37D75B", 8, 1);
 #endif
@@ -971,12 +934,10 @@ public:
       {
          gd.uber_ran_this_frame = true;
 
-         // Push LumaSettings at the seam, not inside a feature block: bloom off used to leave the grade on the previous
-         // upload (MoHA).
+         // Push LumaSettings at the seam, not in a feature block (MoHA): bloom off left the grade on a stale upload.
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
 
-         // The scene is bound at t0 right here (fp16, alpha = linear depth): bloom source and SMAA predication source,
-         // no extra pass.
+         // Scene at t0 here (fp16, alpha = linear depth): the bloom and SMAA predication source, no extra pass.
          gd.srv_scene.reset();
          native_device_context->PSGetShaderResources(0, 1, gd.srv_scene.put());
 
@@ -989,8 +950,7 @@ public:
 #endif
 
 #if ENABLE_BLOOM
-         // Pyramid off the fp16 LINEAR scene at t0, pre-glow by construction. Karis average first: no TAA, so fireflies
-         // die spatially.
+         // Pyramid off the fp16 LINEAR scene at t0, pre-glow. Karis average first: no TAA, so fireflies die spatially.
          gd.srv_luma_bloom.reset(); // DrawBloom AddRef's its mip 0 into this
          if (g_luma_bloom_enable && gd.srv_scene)
          {
@@ -1006,8 +966,7 @@ public:
             bloom_state.Restore(native_device_context);
          }
          {
-            // Bound every frame, null included: the composite gates on LumaBloomEnable, and dgVoodoo's placeholder
-            // would sample garbage.
+            // Bound every frame, null included (composite gates on LumaBloomEnable): a stale slot samples garbage.
             ID3D11ShaderResourceView* bloom_srv = gd.srv_luma_bloom.get();
             native_device_context->PSSetShaderResources(kLumaBloomSlot, 1, &bloom_srv);
          }
@@ -1018,8 +977,7 @@ public:
       {
          device_data.has_drawn_main_post_processing = true;
 
-         // Same seam rule: this replacement reads LumaSettings and LumaData, and the SMAA path returns Replaced,
-         // skipping core's upload.
+         // Same seam rule: this pass reads LumaSettings and LumaData, and the SMAA path skips core's upload.
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData);
 
@@ -1030,8 +988,7 @@ public:
             native_device_context->PSGetShaderResources(0, 1, gd.srv_scene.put());
          }
 
-         // Hide UI needs the resource, SMAA the view. Captured every frame: an indirect upgrade or a resize can swap
-         // the mirror.
+         // Hide UI needs the resource, SMAA the view. Recaptured each frame: upgrades and resizes swap the mirror.
          ComPtr<ID3D11RenderTargetView> canvas_rtv;
          native_device_context->OMGetRenderTargets(1, canvas_rtv.put(), nullptr);
          gd.canvas_res.reset();
@@ -1039,8 +996,7 @@ public:
             canvas_rtv->GetResource(gd.canvas_res.put());
 
 #if DEVELOPMENT
-         // The devkit only ever sees the original r8g8b8a8 resource, so the bound render target here is the only honest
-         // read.
+         // The devkit only sees the original r8g8b8a8 resource; the render target bound here is the only honest read.
          if (!gd.diag_logged_rt)
          {
             gd.diag_logged_rt = true;
@@ -1053,13 +1009,11 @@ public:
          }
 #endif
 
-         // The display gamma this pass applies, for the grade's SDR reference. Once per frame: the block gates on
-         // !has_drawn_main_post_processing.
+         // The display gamma this pass applies, for the grade's SDR reference. Once per frame, via the gate above.
          TrackCB4Row(native_device, native_device_context, gd.gamma_cb_ring, 11, 0.25f, 1.f, &gd.gamma_inverse_live, &gd.gamma_inverse_valid); // 1/gamma for gamma in [1, 4]
 
 #if ENABLE_SMAA
-         // Run the pass ourselves, then SMAA, so AA lands before the HUD. Falls back to a plain draw (one frame without
-         // AA).
+         // Run the pass ourselves, then SMAA, so AA lands before the HUD. Otherwise the game draws it without AA.
          if (g_smaa_enable && original_draw_dispatch_func != nullptr && canvas_rtv && gd.canvas_res)
          {
             (*original_draw_dispatch_func)();
@@ -1175,8 +1129,7 @@ public:
       if (g_smaa_enable)
       {
 #if DEVELOPMENT
-         // Not a preference: it only relaxes the threshold back to base ULTRA on geometry, never below. Dev bisect
-         // switch.
+         // Not a preference: on geometry it relaxes the threshold back to base ULTRA, never below. A bisect switch.
          if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
             reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
          if (ImGui::IsItemHovered())
@@ -1243,8 +1196,7 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
-         // "How far", not "how soon": DICE's ramp always starts at a third of peak, so the slider sets depth, not
-         // onset.
+         // "How far", not "how soon": DICE's ramp starts at a third of peak, so the slider sets depth, not onset.
          ImGui::SetTooltip("How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation"))
          device_data.cb_luma_global_settings_dirty = true;
@@ -1267,8 +1219,7 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
 
-      // Everything below drives the Luma pyramid alone and greys out with it: no slider here reaches the game's own
-      // glow.
+      // Everything below drives the Luma pyramid and greys out with it: nothing here reaches the game's own glow.
       ImGui::BeginDisabled(!g_luma_bloom_enable);
 
       if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
@@ -1297,8 +1248,7 @@ public:
 #endif // ENABLE_BLOOM
 
       ImGui::SeparatorText("Effects");
-      // Read in Video_0x1A82565B.ps_5_0.hlsl. Inert in SDR by construction (peak == paper white makes PumboAutoHDR
-      // identity).
+      // Read in Video_0x1A82565B.ps_5_0.hlsl. Inert in SDR: peak == paper white makes PumboAutoHDR an identity.
       bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
       if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
       {
@@ -1403,17 +1353,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // scRGB fp16 swapchain (the game's backbuffer is 8-bit).
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
-      // The brightness slider is a D3D9 SetGammaRamp dgVoodoo forwards to the OS ramp, distorting scRGB. 1.6 is already
-      // in the grade.
+      // The brightness slider is a D3D9 SetGammaRamp that dgVoodoo forwards to the OS ramp, distorting scRGB.
+      // The game's DisplayGamma 1.6 is already applied in the grade.
       allow_disabling_gamma_ramp = true;
 
-      // force_borderless covers LEAVING fullscreen too, so the window cannot come back with a title bar after alt-tab
-      // (TW2).
+      // force_borderless also covers LEAVING fullscreen, so alt-tab cannot restore a title bar (TW2).
       prevent_fullscreen_state = true;
       force_borderless = true;
 
-      // Two families clip the HDR signal, upgraded INDIRECTLY: changing a dgVoodoo creation format black-screens it
-      // (MEA).
+      // Two HDR-clipping families, upgraded INDIRECTLY: changing a dgVoodoo creation format black-screens it (MEA).
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       enable_indirect_texture_format_upgrades = true; // creation-time mirrors, substituted at bind (BL2/TW2 scheme)
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies;
@@ -1421,12 +1369,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          reshade::api::format::r8g8b8a8_typeless,     // dgVoodoo's D3D9 backbuffer surface (the LDR canvas)
          reshade::api::format::r16g16b16a16_typeless, // DoF/bloom gather, blur and blit targets, viewed as unorm
       };
-      // "No1Px" is mandatory under dgVoodoo (BL2): it binds 1x1 placeholders in unused slots and a 1x1 passes the
-      // aspect filter.
+      // "No1Px" is mandatory under dgVoodoo (BL2): 1x1 placeholders fill unused slots and pass the aspect filter.
       texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
 
-      // AF16x, an addition not an upgrade. force_upgrade_linear_samplers is load-bearing: core rewrites only
-      // anisotropic ones (TW2).
+      // AF16x. force_upgrade_linear_samplers is load-bearing: otherwise core rewrites only anisotropic samplers (TW2).
       enable_samplers_upgrade = true; // boot-time only (cannot be changed after device creation)
       samplers_upgrade_mode = 4;
       force_upgrade_linear_samplers = true;

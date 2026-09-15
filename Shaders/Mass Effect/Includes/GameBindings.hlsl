@@ -1,8 +1,9 @@
 #ifndef LUMA_ME1_GAME_BINDINGS
 #define LUMA_ME1_GAME_BINDINGS
 
-// Bindings shared by the replaced passes (tonemap, gather, Bink video), and nothing else. NO textures, samplers or
-// cbuffer-row aliases: meaning is per pass (t0 = scene here, Y plane in Video; cb4[8] = DoFParams vs matrix row).
+// Bindings shared by the replaced passes (tonemap, gather, Bink video, GFx HUD), and nothing else. NO textures,
+// samplers or cbuffer-row aliases: meaning is per pass (t0 = scene here, Y plane in Video; cb4[8] = DoFParams vs matrix
+// row).
 
 // b3/b4 are dgVoodoo's D3D9 constant mirrors, declared at the original's sizes (CB3[77], CB4[236]).
 cbuffer DgVoodooState : register(b3)

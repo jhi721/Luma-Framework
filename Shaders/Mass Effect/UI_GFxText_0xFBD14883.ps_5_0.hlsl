@@ -1,5 +1,6 @@
 // Mass Effect (2007) - GFx text: constant colour, alpha from the glyph texture. Seen on the canvas after the gamma pass
-// by the DEV net (SrcAlpha/InvSrcAlpha). See Includes/GFxUI.hlsl: vanilla body plus the 8-bit canvas clamp.
+// by the DEVELOPMENT HUD permutation net (SrcAlpha/InvSrcAlpha). See Includes/GFxUI.hlsl: vanilla body plus the 8-bit
+// canvas clamp.
 #include "Includes/GFxUI.hlsl"
 
 Texture2D<float4> t0 : register(t0);

@@ -16,15 +16,16 @@ struct LumaGameSettings
    float Saturation;        // 1 = vanilla. Saturation multiplier on the final HDR color (lerp against luminance).
    float HighlightDechroma; // 0 = off (default; keep color, only mandatory gamut desat applies); higher = bright sources fade further toward white.
    float BloomIntensity;    // 1 = default. Scales the Luma pyramid ONLY; the game's own glow shares a buffer with the DoF blur and is never scaled.
-   float Contrast;          // 1 = vanilla. Slope contrast around 18% mid-gray on the final HDR color.
+   float Contrast;          // 1 = vanilla. Power contrast around 18% mid-gray, applied before the display map.
    float Dithering;         // 0/1 toggle. Animated triangular dither at output to break gradient banding.
    // Appended, never reordered: this struct is a C++/HLSL ABI mirror.
    float LumaBloomEnable;    // 0/1. 1 = the Luma multi-scale HDR pyramid REPLACES the game's bloom (which the gather replacement then stops writing).
-   float BloomThreshold;     // linear scene brightness where bloom starts. 1.0 matches the game's own bright-pass; near 0 makes the whole scene glow.
-   float VideoAutoHDREnable; // 0/1. 1 = light PumboAutoHDR on the Bink movie pass (HDR only); 0 = flat SDR at paper white.
+   float BloomThreshold;     // Luma_Bloom_impl.hlsl: linear scene brightness where bloom starts. 1.0 matches the game's own bright-pass; near 0 makes the whole scene glow.
+   float VideoAutoHDREnable; // Video_0x1A82565B: 0/1. 1 = light PumboAutoHDR on the Bink movie pass (HDR only); 0 = flat SDR at paper white.
    float VideoAutoHDRBoost;  // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off.
    // Not a user setting: the inverse display gamma the FGammaCorrection pass applies (cb4[11].x, measured 0.625), read
-   // back by main.cpp and folded into the grade's SDR reference, because the two live in different passes.
+   // back by main.cpp and folded into the uber grade's display-linear decode (VanillaToLinear), because the two live in
+   // different passes.
    float DisplayGammaInverse;
    // Not a user setting: the engine's BloomScale (gather cb4[11].x, measured 0.1), read back by main.cpp. The Luma
    // pyramid is energy-preserving, so this is the gain that makes BloomIntensity 1 mean vanilla strength.

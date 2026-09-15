@@ -2,7 +2,8 @@
 #define LUMA_ME1_DOF_BLOOM_GATHER
 
 // UE3 DOFAndBloomGather, per-tap body of both QualityBloom perms (TRUE 0x56854256, 16 taps x1/64; FALSE 0x28F8DB16,
-// 4 taps x1/16) plus a 1/4 pre-divide for the UNORM clamp; 2.87.3 transcription, replaced only to zero vanilla bloom.
+// 4 taps x1/16) plus a 1/4 pre-divide for the UNORM clamp; 2.87.3 transcription, also included by the 2.81.3 ps_4_0
+// twins (0x4B65EEAE, 0xAA369C00). Replaced only to zero vanilla bloom.
 
 // clang-format off
 // ORDER IS LOAD-BEARING - game-local Common.hlsl first, so LUMA_GAME_CB_STRUCTS is defined before Settings.hlsl.
@@ -21,7 +22,7 @@ Texture2D<float4> SceneColorTexture : register(t0); // fp16 scene color; .w carr
 #define DoFBloomScale PsConstants[11] // .x = bloom scale
 
 // Vanilla glow gain, or zero when the Luma pyramid owns the glow. Read as a BOOLEAN (C++ bool; a weight would leave
-// half the vanilla glow) and it is that glow's ONLY switch. Hoisted out of GatherTap: 15 slots/px across 16 taps.
+// half the vanilla glow) and it is that glow's ONLY switch. Hoisted out of GatherTap so it is not re-evaluated per tap.
 static const float LumaGatherBloomScale = (LumaSettings.GameSettings.LumaBloomEnable > 0.5) ? 0.0 : DoFBloomScale.x;
 
 // One tap: (blur * colour + bloom, blur). Vanilla bright-pass: the tap passes through when any channel is above 1.0.

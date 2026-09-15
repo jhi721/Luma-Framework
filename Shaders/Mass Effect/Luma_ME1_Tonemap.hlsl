@@ -1,15 +1,17 @@
 // Mass Effect (2007) — Luma HDR tonemap replacement, split across the TWO colour passes that end a frame
 // (devkit-measured order): UberPostProcessBlend (PS 0xAC8341E0) reads scene A (fp16, depth in alpha) plus the
 // quarter-res DoF/bloom blur into scene B; copy 0x1E37D75B mirrors B into A; FGammaCorrection (PS 0x17CE0932)
-// reads A and writes the 8-bit canvas the HUD blends onto. They CHAIN here, so the work is split: the uber
-// replacement runs the whole HDR block and leaves LINEAR light (1.0 = paper white) in the intermediate; the
-// gamma replacement adds that pass's fade, the UI paper-white pre-scale, the gamma encode, dither and sanitize.
-// HDR strategy (analytic in-shader, no LUT; the Borderlands GOTY / MoH Airborne production pipeline): reconstruct the
+// reads A and writes the canvas (dgVoodoo's 8-bit backbuffer, upgraded to an fp16 mirror) the HUD blends onto.
+// dgVoodoo 2.81.3 emits ps_4_0 twins (0x786BC3B3, 0x3BEF1CD6) that include these entry points. The passes CHAIN, so
+// the work is split: the uber replacement runs the HDR block and leaves LINEAR light (1.0 = paper white) in the
+// intermediate; the gamma replacement adds that pass's fade, the UI paper-white pre-scale, the gamma encode, dither
+// and sanitize.
+// HDR pipeline (analytic in-shader, no LUT; the Borderlands GOTY / MoH Airborne production pipeline): reconstruct the
 // scene mix exactly as the game does -> untonemapped; keep the game's own clamped grade as the exact SDR reference;
-// run that same grade with its upper saturate()s as max(0) and decode it to display-linear -> the HDR signal (range,
-// luminance, chroma); in BT.2020 build a soft per-channel ReinhardPiecewise(5, 1.5) hue reference and let
-// MacLeod-Boynton rebuild its hue direction on the target's own purity (Hue 1, Blowout 0); DICE rolloff to the user's
-// peak/paper white; user saturation and the engine fade last.
+// run that same grade with its upper saturate()s as max(0), decoded to display-linear -> the HDR signal; user
+// contrast; in BT.2020 a soft per-channel ReinhardPiecewise(5, 1.5) hue reference, whose hue direction
+// MacLeodBoynton::HueOnlyBT2020 rebuilds on the signal's own purity; DICE rolloff to the user's peak/paper white;
+// SimpleGamutClip and back to BT.709; user saturation; the engine fade last, through the vanilla curve.
 // The engine SKIPS the uber in elevators and some loading scenes; main.cpp reports that through
 // LumaData.GameData.UberRanThisFrame and the gamma replacement then runs the HDR block itself off the RAW scene.
 // Measured cb4 exponents: uber 1.0, copy 1.0, gamma 0.625 = 1/1.6 (the game's DisplayGamma), so the intermediate
@@ -28,7 +30,7 @@
 #include "Includes/MacLeodBoynton.hlsl"     // MacLeodBoynton::HueOnlyBT2020. Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
 // clang-format on
 
-#include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
+#include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3, DoFBlurAmount
 
 // HDR / vanilla. 1 = extended native grade + MacLeod-Boynton hue + DICE display map (default). 0 = vanilla clamped SDR
 // reference.
@@ -108,14 +110,14 @@ float3 Sanitize(float3 c)
 // Shared HDR back half: extended grade -> contrast -> BT.2020 -> soft hue reference -> MacLeod-Boynton hue -> display
 // rolloff -> gamut clip -> BT.709 -> saturation. Contrast sits ahead of the rolloff on purpose (see 3), saturation
 // behind it, as in the repo. Takes and returns LINEAR light, 1.0 = paper white, NO engine fade (the caller re-applies
-// it: contrast pivots on mid-gray, so a fade before it would never reach black). `color` is the pass's
-// own grade with its upper saturate()s as max(0), decoded to display-linear: vanilla-exact below the clip and its own
-// analytic continuation above it, so range, luminance and chroma all come from the game's math.
+// it: contrast pivots on mid-gray, so a fade before it would never reach black). `color` is the pass's own grade with
+// its upper saturate()s as max(0), decoded to display-linear: vanilla-exact below the clip and its own analytic
+// continuation above it, so range, luminance and chroma all come from the game's math.
 float3 FinishME1HDR(float3 color)
 {
    // 3. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
    // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
-   // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code 0.5).
+   // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code ~0.46).
    // [branch] on a cbuffer uniform: at the 1.0 default this must be a BIT-EXACT no-op. The max() cannot go either -
    // PowUE3 floors with abs(), which would MIRROR a small negative rather than crush it.
    [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
@@ -144,10 +146,10 @@ float3 FinishME1HDR(float3 color)
    // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
    // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
    // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
-   // flattens it to 8 ALU plus a movc for every pixel above the shoulder. Measured +5 slots for the placement.
+   // flattens it for every pixel above the shoulder.
    ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   // DICE converts InOutColorSpace -> Processing on entry and back on exit. The colour is already BT.2020 and is
-   // converted back below, so the default CS_BT709 would convert a SECOND time and compress on doubly-narrowed
+   // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The colour is already BT.2020 and
+   // is converted back below, so the default CS_BT709 would convert a SECOND time and compress on doubly-narrowed
    // primaries. Neutrals cancel out; saturated highlights do not.
    ds.InOutColorSpace = CS_BT2020;
    float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
@@ -221,7 +223,7 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
    return outColor;
 }
 
-// Stage 2: FGammaCorrection (PS 0x17CE0932) -> the 8-bit canvas, the frame's LAST colour pass before the HUD.
+// Stage 2: FGammaCorrection (PS 0x17CE0932) -> the canvas, the frame's LAST colour pass before the HUD.
 // Reads scene A: stage 1's LINEAR HDR when the uber ran, the RAW fp16 scene when it was skipped. Own register map.
 #define GcColorScale   PsConstants[8]  // .xyz ColorScale
 #define GcOverlayColor PsConstants[10] // .xyz OverlayColor, .w its blend weight (this pass's fade)
@@ -251,7 +253,7 @@ float3 RunME1GammaCorrection(float2 sceneUV)
 
 #if TONEMAP_TYPE >= 1
    // The post-load flash (0.35 s re-graded frame: mids x0.10, highlights x2.25, peak 222 -> 953 nits) is NOT a stale
-   // graded buffer - gating this on the intermediate's alpha changed nothing in game. NOTES.md; do not re-add it.
+   // graded buffer - gating this on the intermediate's alpha changed nothing in game; do not re-add it.
    float3 outColor; // linear, 1.0 = paper white
    if (LumaData.GameData.UberRanThisFrame > 0.5)
    {
@@ -269,7 +271,7 @@ float3 RunME1GammaCorrection(float2 sceneUV)
       outColor = FinishME1HDR(gamma_to_linear(GradeGCExtended(untonemapped)));
    }
    // The fade LAST, after the creative sliders. Branched, not lerped: the decode is uniform but fxc hoists it into
-   // the preamble, where .w is 0 with no fade - measured 48 -> 42 executed instructions.
+   // the preamble, and .w is 0 whenever no fade runs, so the branch skips the whole re-encode.
    [branch] if (GcOverlayColor.w > 0.0)
    {
       // Vanilla lerps toward the overlay BEFORE its inverse-gamma pow and the display decode, so the fade curve is
