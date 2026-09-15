@@ -643,8 +643,8 @@ public:
       // the peak is 165/80 = ~2x paper white.
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
-      // Until the first readback lands: the UE3 default DisplayGamma 2.2. Measured live value here is 0.625 (1/1.6).
-      default_luma_global_game_settings.DisplayGammaInverse = 1.f / 2.2f;
+      // Until the first readback lands (~3 frames): the shipped DisplayGamma 1.6 (DefaultEngine.ini), measured 0.625.
+      default_luma_global_game_settings.DisplayGammaInverse = 0.625f;
       // Until the gather reports: the value measured on the Citadel.
       default_luma_global_game_settings.BloomScaleLive = 0.1f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
@@ -1202,8 +1202,8 @@ public:
       }
 #endif
 
-      // --- Grade (read in Luma_ME1_Tonemap.hlsl via LumaSettings.GameSettings). HDR tonemap path only except
-      // Exposure and the bloom fields, which also apply on the vanilla SDR path when the uber pass runs. ---
+      // --- Grade (read in Luma_ME1_Tonemap.hlsl via LumaSettings.GameSettings). HDR tonemap path only except Exposure
+      // and the bloom fields, which apply on the vanilla SDR path too (bloom only when the uber pass runs). ---
       auto& gs = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
 

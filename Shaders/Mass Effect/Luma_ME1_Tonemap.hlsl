@@ -71,10 +71,10 @@ float3 LumaBloom(float2 sceneUV)
 // direct continuation of the FULL vanilla chain, not of this pass alone.
 float3 VanillaToLinear(float3 graded)
 {
-   // Read back by main.cpp (0.625 measured, a few frames of latency, seeded 1/2.2). The fallback also covers an
-   // unbound b13, which reads zeros and would make this pow(x, 0) = 1 (TW2).
+   // Read back by main.cpp (0.625 measured, a few frames of latency, seeded 0.625). The fallback, the game's shipped
+   // DisplayGamma 1.6, covers an unbound b13, which reads zeros and would make this pow(x, 0) = 1 (TW2).
    const float displayGammaInverse = LumaSettings.GameSettings.DisplayGammaInverse;
-   return gamma_to_linear(PowUE3(max(0.0, graded), (displayGammaInverse > 0.0 ? displayGammaInverse : 1.0 / 2.2).xxx));
+   return gamma_to_linear(PowUE3(max(0.0, graded), (displayGammaInverse > 0.0 ? displayGammaInverse : 0.625).xxx));
 }
 
 // The game's grade, verbatim from the disassembly. `clampSDR` false = max(0) instead of saturate, keeping the real
@@ -300,8 +300,10 @@ float3 RunME1GammaCorrection(float2 sceneUV)
    }
 #endif
 #else
-   // Vanilla: this pass's saturate and pow are the original's, so both frame shapes come out vanilla-exact.
-   float3 outColor = GradeGCVanilla(scene.xyz);
+   // Vanilla: this pass's saturate and pow are the original's, so both frame shapes come out vanilla-exact. Exposure
+   // only on gamma-only frames: when the uber ran, its output already carries it.
+   const float exposure = LumaData.GameData.UberRanThisFrame > 0.5 ? 1.0 : LumaSettings.GameSettings.Exposure;
+   float3 outColor = GradeGCVanilla(scene.xyz * exposure);
 #endif
 
    return Sanitize(outColor);

@@ -7,8 +7,9 @@
 
 namespace CB
 {
-// Grade controls, drawn in DrawImGuiSettings (main.cpp), read in Luma_ME1_Tonemap.hlsl. HDR tonemap path only, except
-// Exposure and the bloom fields, which also apply on the vanilla SDR path when the uber pass runs.
+// Grade controls, drawn in DrawImGuiSettings (main.cpp), read in Luma_ME1_Tonemap.hlsl unless noted. HDR tonemap path
+// only, except Exposure and the bloom fields, which apply on the vanilla SDR path too (bloom only when the uber pass
+// runs).
 struct LumaGameSettings
 {
    float Exposure;          // exposure multiplier (1 = vanilla). Applied scene-referred, pre-grade.
