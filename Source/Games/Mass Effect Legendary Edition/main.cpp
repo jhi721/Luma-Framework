@@ -1353,8 +1353,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
       Globals::SetGlobals(PROJECT_NAME, "Mass Effect Legendary Edition Luma mod", "", 3);
 
-      // Native in-game HDR is required; it already supplies the fp16 scRGB swapchain and RGBA16F stage-1/2
-      // transport. A general texture upgrade would also catch R8G8B8A8 velocity and UI, breaking their contracts.
+      // With in-game HDR on, the game already supplies the fp16 scRGB swapchain and RGBA16F stage-1/2 transport.
+      // A general texture upgrade would also catch R8G8B8A8 velocity and UI, breaking their contracts.
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled; // Enables scRGB and linear composition.
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
       texture_format_upgrades_type = TextureFormatUpgradesType::None; // HDR buffers are already fp16.

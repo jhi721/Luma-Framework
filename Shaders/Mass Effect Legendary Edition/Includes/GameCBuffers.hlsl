@@ -14,7 +14,7 @@ struct LumaGameSettings
 {
    float Exposure;           // 1 = vanilla. Scene exposure multiplier, scene-referred / pre-grade.
    float Saturation;         // 1 = vanilla. Luminance-based saturation multiplier on the final HDR color.
-   float HighlightDechroma;  // 0 = off (default). DICE highlight desaturation: sources above a third of peak fade toward white, mid-tones untouched.
+   float HighlightDechroma;  // 0 = off (default). DICE HighlightsDesaturation: max channel ramps toward white from a third of peak to peak, only once luminance passes that shoulder.
    float Contrast;           // 1 = vanilla. Multiplicative contrast around 18% mid-gray, applied before the display map.
    float VignetteIntensity;  // 1 = vanilla. Scales the game's vignette darkening (0 = none; the native white-point tint stays).
    float FilmGrainIntensity; // 1 = vanilla. Scales the game's film grain (0 = off).

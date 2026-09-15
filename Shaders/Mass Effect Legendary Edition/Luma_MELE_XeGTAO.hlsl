@@ -9,7 +9,8 @@
 // - Depth input = the game's half-res r24_unorm_x8 depth copy (deinterleave 0x497830D8 t0), read with explicit
 //   .Load: GatherRed on an r24_unorm_x8 view returns all-zeros on some drivers and silently kills the AO.
 // - ViewNormalTex from horizon shader 0x80212FD6 stores view-space xy in R8G8_UNORM; reconstruct z locally.
-// - With no TAA or motion vectors, freeze NoiseIndex at zero and rely on Very High quality plus two denoisers.
+// - With no TAA or motion vectors, pass temporalIndex 0 to SpatioTemporalNoise and rely on Very High quality plus two
+//   denoisers.
 // - Divide UE3 view Z by DepthScale=50 to approximate the meter-scale range expected by XeGTAO.
 
 // Native constant buffers inherited at the hooked dispatches; offsets come from live disassembly.

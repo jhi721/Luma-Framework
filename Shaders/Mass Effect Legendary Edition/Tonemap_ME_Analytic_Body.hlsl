@@ -199,9 +199,10 @@ void main(
    // Scene-referred exposure before tonemapping.
    r1.xyz = r1.xyz * LumaSettings.GameSettings.Exposure;
 
-   // Native screen-blend using Luma's rebound fp16 bloom. DELIBERATE DEVIATION: the weight reads the LINEAR scene,
-   // where the native CSO reads it after the curve; bright pixels lose their bloom, which keeps highlight detail and
-   // colour in HDR. A/B'd in game (see Shaders AGENTS.md).
+   // Screen blend using Luma's rebound fp16 bloom. DELIBERATE DEVIATION: the weight reads the LINEAR scene, where the
+   // native CSOs read it after the curve; bright pixels lose their bloom, which keeps highlight detail and colour in
+   // HDR, and the family was calibrated with it. Do not change the weight or its input without an in-game A/B (see
+   // Shaders/Mass Effect Legendary Edition/AGENTS.md).
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
    // Captured before the curve below overwrites r1. Straight RGB, with no BRG rotation to undo.

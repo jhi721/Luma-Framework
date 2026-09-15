@@ -301,8 +301,8 @@ void main(
    // Filmic path from 0x222186F8: bloom, exponential curve, then per-channel 4096x1 LUT. DELIBERATE DEVIATION: the
    // screen-blend weight reads the luma of the LINEAR scene, where the native CSO reads it after the curve (always 1
    // at the measured threshold). Bright pixels therefore lose their bloom; that keeps highlight detail and colour in
-   // HDR, and the families were calibrated with it. Restoring the native weight was A/B'd in game and rejected
-   // (see Shaders AGENTS.md).
+   // HDR, and the families were calibrated with it. Restoring the native weight was A/B'd in game and rejected; do not
+   // change the weight or its input without an in-game A/B (see Shaders/Mass Effect Legendary Edition/AGENTS.md).
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
    // Kept separate on purpose: the game evaluates L(F(C) + B), so C and B must not be summed before the
@@ -325,10 +325,11 @@ void main(
    // r1.xyz keeps the native post-filmic value, which reaches the 16-slice LUT untouched as this branch's SDR result.
 #else
    // Non-filmic path from 0x2754F750: bloom, exponential curve, highlight desaturation, adjustments, then LUT.
-   // DELIBERATE DEVIATION: the screen-blend weight reads the LINEAR scene through r1.yzx (native reads the curved BRG
-   // scene, where .yzx restores RGB), so bright pixels lose their bloom, with a hue-dependent threshold. Keeps
-   // highlight detail and colour in HDR; the families were calibrated with it, and the native weight and an RGB-order
-   // linear weight were both A/B'd in game and rejected (see Shaders AGENTS.md).
+   // DELIBERATE DEVIATION: the screen-blend weight reads the LINEAR RGB scene through r1.yzx, i.e. in GBR order (native
+   // reads the curved BRG scene, where .yzx restores RGB), so bright pixels lose their bloom, with a hue-dependent
+   // threshold. Keeps highlight detail and colour in HDR; the families were calibrated with it, and the native weight
+   // and an RGB-order linear weight were both A/B'd in game and rejected. Do not change the weight, its input or its
+   // channel order without an in-game A/B (see Shaders/Mass Effect Legendary Edition/AGENTS.md).
    r0.xyz = BlurredImageSeperateBloom.Sample(BlurredImageSeperateBloomSampler_s, r0.xy).xyz * LumaSettings.GameSettings.BloomIntensity;
    r0.xyz = BloomTintAndScreenBlendThreshold.zxy * r0.zxy;
    r0.w = dot(r1.yzx, float3(0.298999995, 0.587000012, 0.114));

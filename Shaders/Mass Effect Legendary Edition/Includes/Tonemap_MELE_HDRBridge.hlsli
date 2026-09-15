@@ -14,7 +14,7 @@
 // Max-channel proxy. One scalar for all three channels, so the limiter cannot move an RGB ratio; the
 // per-channel character stays owned by the working curve and by the native reference.
 //
-// Adapted domain. For every MELE family the tail from grade input to linear gradedHDR is
+// Adapted domain. For every family that uses this proxy (01, 03, 04, 05) the tail from grade input to linear gradedHDR is
 // MELE_NativeGammaCurve followed by gamma_to_linear(., GCT_MIRROR), which with an identity colour grade
 // composes to (scale*c)^r for r = GammaColorScaleAndInverse.w * DefaultGamma, read from the frame's own
 // cbuffer and never hardcoded to 2.2. Scaling the grade INPUT by s scales the decoded linear OUTPUT by s^r,
