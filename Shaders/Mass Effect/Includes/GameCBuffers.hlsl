@@ -7,12 +7,13 @@
 
 namespace CB
 {
-// Grade controls, drawn in DrawImGuiSettings (main.cpp), read in Luma_ME1_Tonemap.hlsl. HDR tonemap path only.
+// Grade controls, drawn in DrawImGuiSettings (main.cpp), read in Luma_ME1_Tonemap.hlsl. HDR tonemap path only, except
+// Exposure and the bloom fields, which also apply on the vanilla SDR path when the uber pass runs.
 struct LumaGameSettings
 {
    float Exposure;          // exposure multiplier (1 = vanilla). Applied scene-referred, pre-grade.
    float Saturation;        // 1 = vanilla. Saturation multiplier on the final HDR color (lerp against luminance).
-   float HighlightDechroma; // 0 = off (default; keep color, only mandatory gamut desat applies); higher = bright sources fade to white sooner.
+   float HighlightDechroma; // 0 = off (default; keep color, only mandatory gamut desat applies); higher = bright sources fade further toward white.
    float BloomIntensity;    // 1 = default. Scales the Luma pyramid ONLY; the game's own glow shares a buffer with the DoF blur and is never scaled.
    float Contrast;          // 1 = vanilla. Slope contrast around 18% mid-gray on the final HDR color.
    float Dithering;         // 0/1 toggle. Animated triangular dither at output to break gradient banding.

@@ -29,6 +29,6 @@ cbuffer PredCB : register(b0)
    // Depth-proportional tolerance: what matters scales with distance. Both terms are required - the slope adjustment
    // alone degrades toward the vanishing point, a depth-proportional threshold alone cannot reject a grazing plane.
    const float tolerance = max(centerZ, 1e-3) * max(P.x, 1e-4);
-   // Left and top only (see the header): this is the axis pairing SMAA's predication actually compares.
+   // Left and top only: this is the axis pairing SMAA's predication actually compares.
    uav[id.xy] = saturate(max(edgesLRTB.x, edgesLRTB.z) / tolerance);
 }

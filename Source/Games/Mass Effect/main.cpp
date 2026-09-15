@@ -50,7 +50,7 @@ static constexpr uint32_t kBloomFilterHash_v281 = 0x464E33BB;
 // declare.
 static constexpr uint32_t kLumaBloomSlot = 6;
 // One sigma per mip, count taken FROM the array so the two cannot drift (MELE). Blended 0.5/0.5 = energy-preserving.
-static float g_bloom_sigmas[] = {1.5f, 2.f, 2.f, 2.f, 1.f, 0.5f};
+static constexpr float g_bloom_sigmas[] = {1.5f, 2.f, 2.f, 2.f, 1.f, 0.5f};
 
 static bool g_hide_ui = false; // session-only, never persisted
 #if ENABLE_SMAA
@@ -90,7 +90,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    };
    std::map<D3D11_BLEND_DESC, ComPtr<ID3D11BlendState>, BlendDescCompare> fixed_blend_states;
 
-   bool has_drawn_tonemap = false; // bloom injected, scene captured
+   bool uber_ran_this_frame = false; // bloom injected, scene captured
    // "Canvas captured, SMAA done" is core's device_data.has_drawn_main_post_processing, set at the final pass.
    // An unkeyed dgVoodoo build fails SILENTLY (format-keyed upgrades still fire, no replacements). Reported once after
    // warmup.
@@ -620,7 +620,8 @@ public:
       GetShaderDefineData(GAMUT_MAPPING_TYPE_HASH).SetDefaultValue('1'); // gamut-map wild colors in composition
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
-      // dgVoodoo binds b0-b5 only (measured), so b11 (core DrawBloom's own constants) and b12/b13 are free.
+      // dgVoodoo's D3D9 mirrors are b3/b4. b11 (core DrawBloom's own constants) and b12/b13 are taken as free, as in
+      // MoHA; the full slot occupancy is not yet measured here (NOTES).
       // luma_ui stays off: the game draws its own UI.
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
@@ -638,8 +639,8 @@ public:
       default_luma_global_game_settings.LumaBloomEnable = ENABLE_BLOOM ? 1.f : 0.f;
       // 1.0 is exactly where the game's own bright-pass sits (DofBloomGather_0x56854256: any channel > 1.0).
       default_luma_global_game_settings.BloomThreshold = 1.f;
-      // Light AutoHDR on the Bink pass (Video_0x1A82565B): movies bypass the scene passes. BL2's calibrated pair, ~165
-      // nits at 0.5.
+      // Light AutoHDR on the Bink pass (Video_0x1A82565B): movies bypass the scene passes. BL2's calibrated pair: at 0.5
+      // the peak is 165/80 = ~2x paper white.
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       // Until the first readback lands: the UE3 default DisplayGamma 2.2. Measured live value here is 0.625 (1/1.6).
@@ -666,7 +667,7 @@ public:
    // know.
    void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData& cmd_list_data, DeviceData& device_data) override
    {
-      data.GameData.UberRanThisFrame = GetGameDeviceData(device_data).has_drawn_tonemap ? 1.f : 0.f;
+      data.GameData.UberRanThisFrame = GetGameDeviceData(device_data).uber_ran_this_frame ? 1.f : 0.f;
    }
 
 #if ENABLE_SMAA
@@ -817,12 +818,12 @@ public:
          DrawStateStack<DrawStateStackType::Compute> pred_cs_state;
          pred_cs_state.Cache(native_device_context, device_data.uav_max_count);
 
-         ID3D11ShaderResourceView* ps_srv = gd.srv_scene.get();
-         ID3D11UnorderedAccessView* ps_uav = gd.uav_pred.get();
-         ID3D11Buffer* ps_cb = gd.cb_pred.get();
-         native_device_context->CSSetShaderResources(0, 1, &ps_srv);
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &ps_uav, nullptr);
-         native_device_context->CSSetConstantBuffers(0, 1, &ps_cb);
+         ID3D11ShaderResourceView* pred_srv = gd.srv_scene.get();
+         ID3D11UnorderedAccessView* pred_uav = gd.uav_pred.get();
+         ID3D11Buffer* pred_cb = gd.cb_pred.get();
+         native_device_context->CSSetShaderResources(0, 1, &pred_srv);
+         native_device_context->CSSetUnorderedAccessViews(0, 1, &pred_uav, nullptr);
+         native_device_context->CSSetConstantBuffers(0, 1, &pred_cb);
          native_device_context->CSSetShader(pred_cs, nullptr, 0);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 
@@ -966,9 +967,9 @@ public:
 #endif
 
       // The uber pass. Read the hash list before any early-out: is_custom_pass is true for hash-replaced passes too.
-      if (is_immediate && !gd.has_drawn_tonemap && IsUberPostPass(original_shader_hashes))
+      if (is_immediate && !gd.uber_ran_this_frame && IsUberPostPass(original_shader_hashes))
       {
-         gd.has_drawn_tonemap = true;
+         gd.uber_ran_this_frame = true;
 
          // Push LumaSettings at the seam, not inside a feature block: bloom off used to leave the grade on the previous
          // upload (MoHA).
@@ -1023,7 +1024,7 @@ public:
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData);
 
          // Gamma-only frames: nothing captured the scene for predication, and this pass reads the RAW fp16 scene at t0.
-         if (!gd.has_drawn_tonemap)
+         if (!gd.uber_ran_this_frame)
          {
             gd.srv_scene.reset();
             native_device_context->PSGetShaderResources(0, 1, gd.srv_scene.put());
@@ -1085,7 +1086,7 @@ public:
          reshade::log::message(reshade::log::level::warning,
             "[Luma] ME1: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
 
-      gd.has_drawn_tonemap = false;
+      gd.uber_ran_this_frame = false;
       gd.gamma_cb_ring.advanced_this_frame = false; // re-arm the once-per-frame ring advances
       gd.bloom_cb_ring.advanced_this_frame = false;
 
@@ -1202,7 +1203,7 @@ public:
 #endif
 
       // --- Grade (read in Luma_ME1_Tonemap.hlsl via LumaSettings.GameSettings). HDR tonemap path only except
-      // Exposure and the bloom fields, which apply on the vanilla SDR path too. ---
+      // Exposure and the bloom fields, which also apply on the vanilla SDR path when the uber pass runs. ---
       auto& gs = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
 
