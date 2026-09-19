@@ -43,7 +43,7 @@ struct LumaGameSettings
 // whose input depends on what already ran this frame. Both 0 = the engine skipped uber post: t0 is the RAW fp16 scene.
 struct LumaGameData
 {
-   float UberRanThisFrame;        // 1 = the uber replacement ran, leaving LINEAR UNMAPPED light in its target
+   float UberRanThisFrame;        // 1 = the uber replacement ran, leaving display-mapped, encoded light in its target
    float CanvasFinishedThisFrame; // 1 = a canvas is already display-mapped, encoded and pre-scaled; wins over the above
 };
 } // namespace CB

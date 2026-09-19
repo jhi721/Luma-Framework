@@ -1,6 +1,8 @@
-// Mass Effect 2 (2010) Luma HDR tonemap, split across the two colour passes that end a frame: the uber leaves
-// LINEAR UNMAPPED light, the material vignettes and THEN display-maps. Material-less frames are finished by
-// Luma_ME2_DisplayMap.hlsl; FGammaCorrection, never yet seen drawing, is handled for whichever of those ran before it.
+// Mass Effect 2 (2010) Luma HDR tonemap, split across the two colour passes that end a frame: the uber display-maps
+// and encodes, so the canvas between them holds vanilla's domain (gamma) for the game's post-uber feedback materials
+// (bMergePostUber: Singularity, Warp, ...) drawn in between; the material decodes, vignettes and contains the
+// vignette's white point to peak. Material-less frames are finished by Luma_ME2_DisplayMap.hlsl; FGammaCorrection,
+// never yet seen drawing, is handled for whichever of those ran before it.
 // Every dgVoodoo entry point declares all 13 interpolators, in order, even the unread ones: VS->PS linkage is by
 // REGISTER, so dropping one shifts every later TEXCOORD.
 
@@ -47,19 +49,18 @@ float3 Sanitize(float3 c)
 }
 
 #if TONEMAP_TYPE >= 1
-// The display map plus the user saturation: the LAST colour operations of the scene. Called by every pass that
-// finishes a canvas from unmapped light: the material (after the vignette), the material-less display map and the
-// gamma pass. Takes/returns LINEAR light, 1.0 = paper white; reads only LumaSettings and NO cb4 row, so any of them
-// can call it.
-float3 MapME2ToDisplay(float3 sceneHDR)
+// Paper and peak white in DICE's units. Through the Settings.hlsl accessors, not LumaSettings directly: they carry the
+// HDR_TONEMAP_* overrides and the devkit white level. Floors stay - outside DEVELOPMENT there is no unset fallback,
+// and DICE divides by both.
+void ME2_DisplayWhites(out float paperWhite, out float peakWhite)
 {
-   // Through the Settings.hlsl accessors, not LumaSettings directly: they carry the HDR_TONEMAP_* overrides and the
-   // devkit white level. Floors stay - outside DEVELOPMENT there is no unset fallback, and DICE divides by both.
-   const float paperWhite = max(GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
-   const float peakWhite = max(PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
-   // The map runs in a BT.2020 working space and is round-tripped back below: gamut-correct handling of highly
-   // saturated highlights, NOT a display-gamut expansion. Validated offline.
-   sceneHDR = BT709_To_BT2020(sceneHDR);
+   paperWhite = max(GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
+   peakWhite = max(PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
+}
+
+// The display map's DICE settings, shared with ME2_ContainToPeak so both contain to the same peak the same way.
+DICESettings ME2_DisplayDICESettings()
+{
    // Luminance in PQ (hue-preserving), then CORRECT_CHANNELS_BEYOND_PEAK_WHITE fades over-peak channels to white.
    // Identity below the shoulder (a third of peak), so diffuse content and the upstream sliders are untouched.
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
@@ -69,11 +70,23 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
    // flattens it for every pixel above the shoulder.
    ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. We already converted above
-   // and undo it below, so leaving the default CS_BT709 in makes it convert a SECOND time and run its compression,
-   // its average()-based source luminance and its channel containment on doubly-narrowed primaries.
+   // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The callers convert to BT.2020
+   // themselves and undo it after, so leaving the default CS_BT709 in makes it convert a SECOND time and run its
+   // compression, its average()-based source luminance and its channel containment on doubly-narrowed primaries.
    ds.InOutColorSpace = CS_BT2020;
-   float3 hdr = DICETonemap(sceneHDR * paperWhite, peakWhite, ds) / paperWhite;
+   return ds;
+}
+
+// The display map plus the user saturation. Called by the uber (so the canvas after it is display-referred, as
+// vanilla's was) and by the gamma pass on a raw-scene frame. Takes/returns LINEAR light, 1.0 = paper white; reads
+// only LumaSettings and NO cb4 row, so either can call it.
+float3 MapME2ToDisplay(float3 sceneHDR)
+{
+   float paperWhite, peakWhite;
+   ME2_DisplayWhites(paperWhite, peakWhite);
+   // The map runs in a BT.2020 working space and is round-tripped back below: gamut-correct handling of highly
+   // saturated highlights, NOT a display-gamut expansion. Validated offline.
+   float3 hdr = DICETonemap(BT709_To_BT2020(sceneHDR) * paperWhite, peakWhite, ME2_DisplayDICESettings()) / paperWhite;
    // The clip is a guard, not a working step: nothing upstream can leave BT.2020 here. Every caller hands in
    // non-negative BT.709 (the uber's Sanitize, the gamma pass's max(0)), which sits strictly inside BT.2020, and every
    // DICE step either preserves chromaticity or pulls inward - the luminance scale, the desaturation toward luminance,
@@ -87,6 +100,18 @@ float3 MapME2ToDisplay(float3 sceneHDR)
    return Saturation(hdr, LumaSettings.GameSettings.Saturation);
 }
 
+// The beyond-peak step DICE ends with, run alone: for a gain applied AFTER the map (the material's vignette, whose
+// white point lifts blue x1.39 in linear). Desaturates over-peak channels toward white as the map would have; no hue
+// restore follows it, so nothing can undo that (the magenta rim of the old hoisted vignette). LINEAR in and out.
+float3 ME2_ContainToPeak(float3 mapped)
+{
+   float paperWhite, peakWhite;
+   ME2_DisplayWhites(paperWhite, peakWhite);
+   const DICESettings ds = ME2_DisplayDICESettings();
+   const float smoothing = ds.GamutMappingSmoothing >= 0.0 ? ds.GamutMappingSmoothing : 1.0 - ds.ShoulderStart; // as DICE
+   return BT2020_To_BT709(CorrectOutOfRangeColor(BT709_To_BT2020(mapped) * paperWhite, ds.Mirrored, true, ds.DesaturationVsDarkeningRatio, peakWhite, smoothing, ds.ProcessingColorSpace) / paperWhite);
+}
+
 // Display-mapped linear light -> the canvas' post-process space. The pre-scale comes later, in FinishME2Canvas, so the
 // material's grain and offset between the two stay relative to the scene as vanilla had them.
 float3 EncodeME2Canvas(float3 mapped)
@@ -97,6 +122,16 @@ float3 EncodeME2Canvas(float3 mapped)
    return linear_to_gamma(mapped, GCT_POSITIVE);
 #else
    return mapped;
+#endif
+}
+
+// The inverse of EncodeME2Canvas. MIRROR: the feedback materials between the uber and the material may leave negatives.
+float3 DecodeME2Canvas(float3 encoded)
+{
+#if POST_PROCESS_SPACE_TYPE == 0
+   return gamma_to_linear(encoded, GCT_MIRROR);
+#else
+   return encoded;
 #endif
 }
 
@@ -157,7 +192,7 @@ float3 ME2_ApplyContrast(float3 color)
 }
 #endif // TONEMAP_TYPE >= 1
 
-// ---------- Stage 1: UberPostProcessBlend -> fp16 canvas, LINEAR unmapped in HDR / vanilla in SDR ----------
+// ---------- Stage 1: UberPostProcessBlend -> fp16 canvas, display-mapped and encoded (vanilla in SDR) ----------
 // `sceneUV` is TEXCOORD1 (t0), `blurUV` is TEXCOORD0 (t1) - the original samples t0 with v6 and t1 with v5.
 #define DoFParams                 PsConstants[8]  // .x focus distance, .y 1/range, .z falloff exponent
 #define DoFMaxBlur                PsConstants[10] // .x max blur near, .y max blur far
@@ -292,7 +327,7 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
       // and the one the canonical wrapper is built for. Only this island moves: the reconstruction above and
       // everything below stay BT.709. A HueOnly solve re-applies the TARGET's own purity, and the target is a
       // BT.709-authored UE3 grade, so the result stays inside BT.709 in practice (measured: 0 of 20000 sampled
-      // highlights left the gamut; the closing Sanitize is the containment for any remainder). Purity is the
+      // highlights left the gamut; the display map's gamut clip contains any remainder). Purity is the
       // fraction of the distance from white to the GAMUT BOUNDARY, so the working space is part of the answer.
       const float3 target2020 = BT709_To_BT2020(recovered);
       // Hue reference: a per-channel Reinhard (ceiling 5, shoulder 1.5) of the colour itself, the reference our
@@ -313,9 +348,9 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // must precede it. User saturation runs inside MapME2ToDisplay, after the display map.
    recovered = ME2_ApplyContrast(recovered);
 
-   // Re-apply the engine fade linearly, LAST, after contrast. At rest it is a no-op.
-   // ⚠ This pass leaves UNMAPPED linear HDR (values can reach hundreds); whichever pass finishes the canvas maps it.
-   float3 outColor = recovered * outputScale;
+   // Re-apply the engine fade linearly, after contrast (a no-op at rest), then map and encode: the canvas carries
+   // vanilla's domain to the feedback materials drawn before the BioSceneEffect material, as MELE's stage 1 does.
+   float3 outColor = EncodeME2Canvas(MapME2ToDisplay(Sanitize(recovered * outputScale)));
 #else
    float3 outColor = sdr_vanilla; // vanilla display-encoded value
 #endif
@@ -330,7 +365,7 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    if (LumaSettings.DevSetting03 > 0.5)
       return saturate(sdr_vanilla);
    // DevSetting04 paints the engine fade as a flat colour: mid-grey = 1.0 at rest, darker = fading down. Needed
-   // because the HDR path holds that row out of its references and re-applies it at the end.
+   // because the HDR path holds that row out of its references and re-applies it before the display map.
    if (LumaSettings.DevSetting04 > 0.5)
       return saturate(outputScale * 0.5);
 #endif
@@ -358,7 +393,7 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
 
 SamplerState MatSceneSampler_s : register(s0);
 SamplerState MatGrainSampler_s : register(s1);
-Texture2D<float4> MatSceneTexture : register(t0); // the canvas the uber wrote
+Texture2D<float4> MatSceneTexture : register(t0); // the canvas the uber (and any feedback material after it) wrote
 Texture2D<float4> MatGrainTexture : register(t1); // grain permutation only
 
 // The native BioSceneEffect radial vignette, from 0x277DA7AE / 0xCF0CB35A. Its centre value is a blue-tinted WHITE
@@ -399,13 +434,11 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
 
    float3 outColor;
 #if TONEMAP_TYPE >= 1
-   // The uber left UNMAPPED linear light here. Vignette first, in vanilla's place: linear_to_gamma is a signed pure
-   // pow, so multiplying by gamma_to_linear(vig) in linear IS the vanilla multiply in the encoded domain.
-   outColor = scene * gamma_to_linear(ME2_Vignette(grainUV), GCT_POSITIVE); // vig = lerp(tint+1, tint+exp2(..)) >= 0
-
-   // THEN the display map, last colour operation of the scene, so peak containment covers the vignette's white point
-   // too. renodx's ordering, kept after two alternatives measured +39% blue and a magenta rim.
-   outColor = EncodeME2Canvas(MapME2ToDisplay(outColor));
+   // The uber left the display-mapped, encoded scene here. The vignette in vanilla's place: the encode is a pure pow,
+   // so multiplying by gamma_to_linear(vig) in linear IS the vanilla multiply in the encoded domain. Its white point
+   // lifts blue past peak (vanilla's 8-bit canvas clipped it), so the map's own beyond-peak step contains it.
+   outColor = DecodeME2Canvas(scene) * gamma_to_linear(ME2_Vignette(grainUV), GCT_POSITIVE); // vig >= 0
+   outColor = EncodeME2Canvas(ME2_ContainToPeak(outColor));
 #else
    // Vanilla: the canvas holds the vanilla display-encoded value, so every operation here is the original's -
    // including the vignette, which stays in this pass and in the encoded domain exactly as the game had it.
@@ -438,9 +471,9 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
 
 // ---------- Stage 3: UE3 FGammaCorrection -> a canvas, on whatever frame reaches it ----------
 // Never yet seen drawing. What it reads depends on what ran before it this frame, which main.cpp reports through
-// LumaData: nothing (t0 is the RAW fp16 scene and this pass is the whole grade), the uber (t0 holds its LINEAR UNMAPPED
-// output), or a finished canvas (the material, the material-less display map or an earlier gamma draw wrote it). Same
-// t0/s0 as the material.
+// LumaData: nothing (t0 is the RAW fp16 scene and this pass is the whole grade), the uber (t0 holds its display-mapped,
+// encoded output), or a finished canvas (the material, the material-less display map or an earlier gamma draw wrote
+// it, pre-scaled). Same t0/s0 as the material.
 #define GcColorScale   PsConstants[8]  // .xyz ColorScale
 #define GcOverlayColor PsConstants[10] // .xyz OverlayColor, .w its blend weight (this pass's fade)
 #define GcInverseGamma PsConstants[11] // .x inverse display gamma
@@ -461,22 +494,18 @@ float3 RunME2GammaCorrection(float2 sceneUV)
    {
       input = scene * LumaSettings.GameSettings.Exposure; // no Luma bloom: the pyramid is injected at the uber draw
    }
-   else if (canvasFinished)
+   else
    {
+      float3 canvas = scene;
 #if UI_DRAW_TYPE >= 2
-      const float3 canvas = scene / ME2_CanvasUIPrescale();
-#else
-      const float3 canvas = scene;
+      if (canvasFinished)
+         canvas /= ME2_CanvasUIPrescale();
 #endif
 #if POST_PROCESS_SPACE_TYPE == 0
       input = max(canvas, 0.0);
 #else
       input = linear_to_gamma(canvas, GCT_POSITIVE);
 #endif
-   }
-   else
-   {
-      input = linear_to_gamma(scene, GCT_POSITIVE);
    }
 
    // Vanilla's grade with the saturate() as a lower-only max(0), so highlights keep their real channel ratio, and the
@@ -495,11 +524,11 @@ float3 RunME2GammaCorrection(float2 sceneUV)
       outColor = VanillaToLinear(PowUE3(lerp(encoded, GcOverlayColor.xyz, GcOverlayColor.w), invGamma.xxx));
    }
 
-   // A finished canvas was already display-mapped and dithered, and the exponents above only pull it inward (below
-   // peak), so it is re-encoded as is. Every other input is mapped here, as the material would have.
-   if (canvasFinished)
-      return FinishME2Canvas(EncodeME2Canvas(outColor), sceneUV, false);
-   return FinishME2Canvas(EncodeME2Canvas(MapME2ToDisplay(outColor)), sceneUV, true);
+   // The uber's output and a finished canvas are already display-mapped, and the exponents above only pull them inward
+   // (below peak), so they are re-encoded as is; only a finished canvas was dithered already. A raw scene is mapped here.
+   if (rawScene)
+      outColor = MapME2ToDisplay(outColor);
+   return FinishME2Canvas(EncodeME2Canvas(outColor), sceneUV, !canvasFinished);
 #else
    // Vanilla: pow(saturate(lerp(c * ColorScale, Overlay.rgb, Overlay.a)), InverseGamma).
    const float3 c = lerp(scene * GcColorScale.xyz, GcOverlayColor.xyz, GcOverlayColor.w);
