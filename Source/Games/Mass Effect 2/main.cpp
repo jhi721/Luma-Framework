@@ -997,8 +997,8 @@ public:
       // (BL GOTY, MEA and MoHA gate every hook the same way). Cached by core; avoids a per-draw virtual query.
       const bool is_immediate = cmd_list_data.is_primary;
 
-      // Material-less frame (squad, galaxy map): the uber's linear HDR would reach the HUD unmapped, so finish the canvas
-      // the way the material would - map, encode, pre-scale, dither, SMAA - before the first draw onto the uber's target,
+      // Material-less frame (squad, galaxy map): the uber's canvas lacks the UI pre-scale and dither, so finish it the
+      // way the material would - pre-scale, dither, SMAA - before the first draw onto the uber's target,
       // and hand it to Hide UI below as this frame's canvas. The custom-pass clause rejects only Luma's own passes.
       if (is_immediate && game_device_data.uber_rt_res && (!is_custom_pass || original_shader_hashes.pixel_shaders[0] != UINT64_MAX) && !IsMaterialPass(original_shader_hashes) && !IsGammaCorrectionPass(original_shader_hashes))
       {
@@ -1009,7 +1009,7 @@ public:
             rtv->GetResource(rt_res.put());
          if (rt_res && rt_res.get() == game_device_data.uber_rt_res.get())
          {
-            // The vanilla uber already wrote an encoded SDR canvas, so nothing to map (or allocate) on TONEMAP_TYPE 0.
+            // TONEMAP_TYPE 0 has no pre-scale or dither to add, so nothing to run (or allocate) there.
             auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
             auto* map_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("ME2 Display Map PS"));
             if (GetShaderDefineCompiledNumericalValue(char_ptr_crc32("TONEMAP_TYPE")) >= 1 && copy_vs && map_ps)
