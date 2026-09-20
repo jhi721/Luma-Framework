@@ -1,7 +1,7 @@
 // Mass Effect 2 (2010) - Adrenaline Rush feedback material (Adrenaline_FB_Mat). See Includes/FXMaterial.hlsl.
 #include "Includes/FXMaterial.hlsl"
 
-void main(FX_MAIN_SIGNATURE)
+void main(ME2_MAIN_SIGNATURE)
 {
    // Chromatic zoom split: three zooms around the centre, mixed by c10 then c11.
    const float3 zoomA = FX_SceneHDR(FX_ScreenUV(lerp(0.5, v5.xy, (FXC(6).x * (FXC(7).x - 0.245) + 0.245) * 4.0)));

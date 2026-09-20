@@ -1,7 +1,7 @@
 // Mass Effect 2 (2010) - Firewalker security camera feedback material (Security_Cam_View_Mat). Additive: vanilla's UNORM target clamped the output. See Includes/FXMaterial.hlsl.
 #include "Includes/FXMaterial.hlsl"
 
-void main(FX_MAIN_SIGNATURE)
+void main(ME2_MAIN_SIGNATURE)
 {
    const float a = FX_Fetch(Tex4, Sampler4, float2(FXC(6).x, v5.y * 5.0 + FXC(6).y), 4).x * FXC(10).x * FXC(11).x;
    const float zoom = 3.0 * FXC(13).x;

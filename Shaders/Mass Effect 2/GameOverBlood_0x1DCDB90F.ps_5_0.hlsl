@@ -1,16 +1,16 @@
 // Mass Effect 2 (2010) - near-death blood feedback material (mat_GameOverBlood). See Includes/FXMaterial.hlsl.
 #include "Includes/FXMaterial.hlsl"
 
-void main(FX_MAIN_SIGNATURE)
+void main(ME2_MAIN_SIGNATURE)
 {
    const float s = FXC(5).x; // damage amount
    const float2 a = v5.xy * 2.5 - 1.25;
-   const float vigA = 1.0 - exp2(log2(max(abs(dot(a, a)), 1e-4)) * 0.05);
+   const float vigA = 1.0 - PowUE3(max(abs(dot(a, a)), 1e-4), 0.05);
    const float2 flow = FX_Fetch(Tex1, Sampler1, v5.xy * 3.0 + FXC(2).xy, 1).xy;
    const float pulse = min(max(sin(frac(FXC(6).x * (0.9 * s + 0.1) + 0.5) * 6.2831855 - 3.1415927), 0.0), 0.5) * FXC(7).x;
    const float2 blood = FX_Fetch(Tex2, Sampler2, pulse * flow + v5.xy, 2).xy;
    const float2 b = (3.0 * s + 1.0) * (v5.xy - 0.5);
-   const float vigB = saturate(exp2(log2(max(abs(dot(b, b)), 1e-4)) * (5.0 - 4.5 * s)));
+   const float vigB = saturate(PowUE3(max(abs(dot(b, b)), 1e-4), 5.0 - 4.5 * s));
    const float k = min(max((10.0 * s + 10.0) * blood.y, 0.0), 1.7);
    const float wet = saturate(vigA * (1.0 - saturate(blood.y * 10.0)) * vigB);
 

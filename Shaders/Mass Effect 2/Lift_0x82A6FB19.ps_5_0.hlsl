@@ -1,7 +1,7 @@
 // Mass Effect 2 (2010) - biotic Lift feedback material (Lift_FB_Mat). See Includes/FXMaterial.hlsl.
 #include "Includes/FXMaterial.hlsl"
 
-void main(FX_MAIN_SIGNATURE)
+void main(ME2_MAIN_SIGNATURE)
 {
    const float2 c = v5.xy - 0.5;
    const float len = length(c);

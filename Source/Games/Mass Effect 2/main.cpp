@@ -28,7 +28,8 @@ static constexpr uint32_t kUberPostHash = 0x88CBF48C;       // same pass, tonema
 static constexpr uint32_t kMaterialHash = 0x277DA7AE;       // BioSceneEffect: vignette only (film grain off)
 static constexpr uint32_t kMaterialGrainHash = 0xCF0CB35A;  // BioSceneEffect: vignette + film grain
 // UE3 FDOFAndBloomBlend, REPLACED: the standalone composite of the chains that carry a DOFAndBloomEffect and no
-// uber (Drunk_PostProcess in the Citadel lounge, the flamethrower's Burninate chain, the UI/thumbnail chains).
+// uber - BioVFX_DesignerCamera.Drunk_PostProcess, BioVFX_Crt_FlameThrower's FlameThrower_FB_PP and the two
+// EngineMaterials UI/thumbnail chains (enumerated in DofBloomBlend_0x780BCE69.ps_5_0.hlsl).
 // Never captured at runtime; hashes come from the cooked SM3 program through _tools/dgv_hashgen.
 static constexpr uint32_t kDofBloomBlendHash = 0x780BCE69;
 static constexpr uint32_t kDofBloomGatherHash = 0x565795ED;  // DOFAndBloomGather, 16 taps (QualityBloom=TRUE)
@@ -297,6 +298,76 @@ class MassEffect2Game final : public Game
       return ContainsPixelShader(hashes, kGammaCorrectionHash, kGammaCorrectionHash_v281);
    }
 
+   // dgVoodoo leaves blending ENABLED on a bound secondary RT while RT0 has it off - D3D9 has one global state.
+   // Re-issues the draw with a repaired state and returns true when it did (ME1/ME3/MoHA/BL2/TW2 carry the same one).
+   static bool FixImpossiblePerRTBlend(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MassEffect2GameDeviceData* gd, reshade::api::shader_stage stages, bool is_custom_pass, std::function<void()>* original_draw_dispatch_func)
+   {
+      // Injected passes set their blend deliberately; without the dispatch func the draw cannot be re-issued.
+      if (is_custom_pass || (stages & reshade::api::shader_stage::pixel) == 0 || original_draw_dispatch_func == nullptr)
+         return false;
+
+      ComPtr<ID3D11BlendState> blend_state;
+      FLOAT blend_factor[4];
+      UINT sample_mask = 0;
+      native_device_context->OMGetBlendState(blend_state.put(), blend_factor, &sample_mask);
+      D3D11_BLEND_DESC bd;
+      if (!blend_state || (blend_state->GetDesc(&bd), !bd.IndependentBlendEnable) || bd.RenderTarget[0].BlendEnable ||
+          std::none_of(bd.RenderTarget + 1, bd.RenderTarget + D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, [](const D3D11_RENDER_TARGET_BLEND_DESC& rt)
+             { return rt.BlendEnable; }))
+         return false;
+
+      ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, nullptr);
+      bool needs_fix = false;
+      for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+      {
+         // Only BOUND targets count: unused slots carry stale BlendEnable.
+         needs_fix |= rtvs[i] != nullptr && bd.RenderTarget[i].BlendEnable;
+         if (rtvs[i])
+            rtvs[i]->Release();
+      }
+      if (rtvs[0])
+         rtvs[0]->Release();
+      if (!needs_fix)
+         return false;
+
+      ComPtr<ID3D11BlendState> fixed_state;
+      if (const auto it = gd->fixed_blend_states.find(bd); it != gd->fixed_blend_states.end())
+      {
+         fixed_state = it->second;
+      }
+      else
+      {
+         D3D11_BLEND_DESC fixed_desc = bd;
+         for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+         {
+            fixed_desc.RenderTarget[i] = bd.RenderTarget[0];
+            fixed_desc.RenderTarget[i].RenderTargetWriteMask = bd.RenderTarget[i].RenderTargetWriteMask; // per-RT masks are legal in D3D9
+         }
+         // Cached only on success, so a failed creation retries rather than pinning a null entry.
+         if (SUCCEEDED(native_device->CreateBlendState(&fixed_desc, fixed_state.put())))
+            gd->fixed_blend_states.emplace(bd, fixed_state);
+      }
+      if (!fixed_state)
+         return false;
+
+      native_device_context->OMSetBlendState(fixed_state.get(), blend_factor, sample_mask);
+      (*original_draw_dispatch_func)();
+      native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
+      return true;
+   }
+
+   // The frame's canvas is finished: whoever finished it owns `canvas_res` (Hide UI and SMAA key on it) and retires
+   // the uber's target, so the material-less finisher cannot fire again on the same frame.
+   static void ClaimFinishedCanvas(MassEffect2GameDeviceData* gd, ID3D11RenderTargetView* canvas_rtv)
+   {
+      gd->has_finished_canvas = true;
+      gd->uber_rt_res.reset();
+      gd->canvas_res.reset();
+      if (canvas_rtv)
+         canvas_rtv->GetResource(gd->canvas_res.put());
+   }
+
    // The resource behind the currently bound RTV 0, or null: the uber target capture and Hide UI's canvas test.
    static ComPtr<ID3D11Resource> GetBoundRenderTargetResource(ID3D11DeviceContext* native_device_context)
    {
@@ -421,8 +492,9 @@ class MassEffect2Game final : public Game
 
 #if ENABLE_BLOOM
    // The pyramid and its slot, for whichever pass composites the glow this frame: the uber, or the standalone
-   // DOFAndBloom blend on the chains that have no uber (ME1 2007's shape - no cooked chain has both, so the glow
-   // is never doubled). Karis average first: no TAA, so fireflies have to die spatially.
+   // DOFAndBloom blend on the chains that have no uber (ME1 2007's shape). The blend hook calls this only when
+   // the uber has not drawn, so the glow is never built - or added - twice on a frame that has both. Karis
+   // average first: no TAA, so fireflies have to die spatially.
    static void BindLumaBloom(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_scene)
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -750,7 +822,7 @@ public:
 
       ImGui::SeparatorText("Effects");
 
-      // Row order is the house one (docs/UI-Toggle-Standard.md; MELE is the exact twin). Both sliders scale only the
+      // Row order is the house one, with MELE's Effects section as the exact twin. Both sliders scale only the
       // effect, never the vignette's blue-tinted white point, which is part of the vanilla grade.
       if (ImGui::SliderFloat("Vignette Intensity", &gs.VignetteIntensity, 0.f, 1.f))
       {
@@ -839,7 +911,8 @@ public:
       device_data.has_drawn_main_post_processing = true;
    }
 
-   // Read by the FGammaCorrection replacement only: what already wrote the target it reads this frame.
+   // What already ran this frame, for the replacements whose input depends on it: the gather, the DoF/bloom
+   // blend, the material and FGammaCorrection read UberRanThisFrame; only FGammaCorrection reads the other.
    void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData& cmd_list_data, DeviceData& device_data) override
    {
       const auto& game_device_data = GetGameDeviceData(device_data);
@@ -1132,9 +1205,7 @@ public:
                   map_state.Restore(native_device_context);
                }
             }
-            game_device_data.uber_rt_res.reset();
-            game_device_data.has_finished_canvas = true;
-            game_device_data.canvas_res = rt_res;
+            ClaimFinishedCanvas(&game_device_data, rtv.get());
 #if ENABLE_SMAA
             if (g_smaa_enable)
                RunPostMaterialSMAA(native_device, native_device_context, device_data, game_device_data, rt_res.get(), rtv.get());
@@ -1171,14 +1242,10 @@ public:
 #if DEVELOPMENT
       // Outside the once-a-frame latch below, so the count is the real number of uber draws. Not cosmetic: the
       // two permutations take different HDR paths, so an A/B that changes nothing is usually this readout.
-      if (is_immediate && IsUberPass(original_shader_hashes))
+      if (const uint32_t matched = is_immediate ? MatchedUberHash(original_shader_hashes) : 0; matched != 0)
       {
-         const uint32_t matched = MatchedUberHash(original_shader_hashes);
-         if (matched != 0)
-         {
-            game_device_data.uber_perm_hash = matched;
-            game_device_data.uber_draws++;
-         }
+         game_device_data.uber_perm_hash = matched;
+         game_device_data.uber_draws++;
       }
 #endif
 
@@ -1244,17 +1311,13 @@ public:
       // The material is the last scene pass, so it - not the uber - finishes the canvas on a normal frame.
       if (is_immediate && !game_device_data.has_finished_canvas && IsMaterialPass(original_shader_hashes))
       {
-         game_device_data.has_finished_canvas = true;
          game_device_data.ever_matched_keyed_pass = true;
-         game_device_data.uber_rt_res.reset();
 
          // The canvas SMAA antialiases and the present blit's source. Captured every frame because an upgrade or resize can
          // swap the mirror, and kept in device data because Hide UI needs the identity on later draws.
          ComPtr<ID3D11RenderTargetView> canvas_rtv;
          native_device_context->OMGetRenderTargets(1, canvas_rtv.put(), nullptr);
-         game_device_data.canvas_res.reset();
-         if (canvas_rtv)
-            canvas_rtv->GetResource(game_device_data.canvas_res.put());
+         ClaimFinishedCanvas(&game_device_data, canvas_rtv.get());
 
 #if ENABLE_SMAA
          // Run the pass ourselves, then SMAA on the canvas, so the antialiasing lands before the HUD. Without the
@@ -1297,10 +1360,7 @@ public:
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData);
             (*original_draw_dispatch_func)();
 
-            game_device_data.has_finished_canvas = true;
-            game_device_data.uber_rt_res.reset();
-            game_device_data.canvas_res.reset();
-            canvas_rtv->GetResource(game_device_data.canvas_res.put());
+            ClaimFinishedCanvas(&game_device_data, canvas_rtv.get());
 #if ENABLE_SMAA
             if (g_smaa_enable)
                RunPostMaterialSMAA(native_device, native_device_context, device_data, game_device_data, game_device_data.canvas_res.get(), canvas_rtv.get());
@@ -1310,60 +1370,8 @@ public:
       }
 
       // Last: it re-issues the draw, so no hook may run after it (ME1/TW2 shape).
-      if (!is_custom_pass && (stages & reshade::api::shader_stage::pixel) != 0 && original_draw_dispatch_func != nullptr)
-      {
-         // dgVoodoo leaves blending ENABLED on a bound secondary RT while RT0 has it off - D3D9 has one global state.
-         ComPtr<ID3D11BlendState> blend_state;
-         FLOAT blend_factor[4];
-         UINT sample_mask = 0;
-         native_device_context->OMGetBlendState(blend_state.put(), blend_factor, &sample_mask);
-         D3D11_BLEND_DESC bd;
-         if (blend_state && (blend_state->GetDesc(&bd), bd.IndependentBlendEnable) && !bd.RenderTarget[0].BlendEnable &&
-             std::any_of(bd.RenderTarget + 1, bd.RenderTarget + D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, [](const D3D11_RENDER_TARGET_BLEND_DESC& rt)
-                { return rt.BlendEnable; }))
-         {
-            ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-            native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, nullptr);
-            bool needs_fix = false;
-            for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-            {
-               // Only BOUND targets count: unused slots carry stale BlendEnable.
-               needs_fix |= rtvs[i] != nullptr && bd.RenderTarget[i].BlendEnable;
-               if (rtvs[i])
-                  rtvs[i]->Release();
-            }
-            if (rtvs[0])
-               rtvs[0]->Release();
-
-            if (needs_fix)
-            {
-               ComPtr<ID3D11BlendState> fixed_state;
-               if (const auto it = game_device_data.fixed_blend_states.find(bd); it != game_device_data.fixed_blend_states.end())
-               {
-                  fixed_state = it->second;
-               }
-               else
-               {
-                  D3D11_BLEND_DESC fixed_desc = bd;
-                  for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-                  {
-                     fixed_desc.RenderTarget[i] = bd.RenderTarget[0];
-                     fixed_desc.RenderTarget[i].RenderTargetWriteMask = bd.RenderTarget[i].RenderTargetWriteMask; // per-RT masks are legal in D3D9
-                  }
-                  // Cached only on success, so a failed creation retries rather than pinning a null entry.
-                  if (SUCCEEDED(native_device->CreateBlendState(&fixed_desc, fixed_state.put())))
-                     game_device_data.fixed_blend_states.emplace(bd, fixed_state);
-               }
-               if (fixed_state)
-               {
-                  native_device_context->OMSetBlendState(fixed_state.get(), blend_factor, sample_mask);
-                  (*original_draw_dispatch_func)();
-                  native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
-                  return DrawOrDispatchOverrideType::Replaced;
-               }
-            }
-         }
-      }
+      if (FixImpossiblePerRTBlend(native_device, native_device_context, &game_device_data, stages, is_custom_pass, original_draw_dispatch_func))
+         return DrawOrDispatchOverrideType::Replaced;
 
       return DrawOrDispatchOverrideType::None;
    }

@@ -3,8 +3,6 @@
 // (bMergePostUber: Singularity, Warp, ...) drawn in between; the material decodes, vignettes and contains the
 // vignette's white point to peak. Material-less frames are finished by Luma_ME2_DisplayMap.hlsl; FGammaCorrection,
 // never yet seen drawing, is handled for whichever of those ran before it.
-// Every dgVoodoo entry point declares all 13 interpolators, in order, even the unread ones: VS->PS linkage is by
-// REGISTER, so dropping one shifts every later TEXCOORD.
 
 // clang-format off
 // ORDER IS LOAD-BEARING, do not sort: game-local Common.hlsl first, or GameSettings resolves to the empty dummy.
@@ -192,6 +190,18 @@ float3 ME2_ApplyContrast(float3 color)
 }
 #endif // TONEMAP_TYPE >= 1
 
+// The depth-driven DoF weight of UE3's blend, transcribed once: the uber and the standalone blend are the same
+// engine arithmetic reading the same two cb4 rows, so a correction to it must not have to be made twice. The rows
+// are passed in because each stage names them itself - row meaning is per pass in this game.
+float ME2_DoFSceneWeight(float depth, float4 dofParams, float4 maxBlurNearFar)
+{
+   const float signedDistance = depth - dofParams.x;
+   const float normalizedDistance = saturate(abs(signedDistance) * dofParams.y);
+   const float maxBlur = (signedDistance >= 0.0) ? maxBlurNearFar.y : maxBlurNearFar.x;
+   const float blurAmount = min(PowUE3(max(normalizedDistance, 1e-4).xxx, dofParams.zzz).x, maxBlur); // 1e-4 as the original
+   return saturate(1.0 - blurAmount);
+}
+
 // ---------- Stage 1: UberPostProcessBlend -> fp16 canvas, display-mapped and encoded (vanilla in SDR) ----------
 // `sceneUV` is TEXCOORD1 (t0), `blurUV` is TEXCOORD0 (t1) - the original samples t0 with v6 and t1 with v5.
 #define DoFParams                 PsConstants[8]  // .x focus distance, .y 1/range, .z falloff exponent
@@ -269,11 +279,7 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
 
    const float depth = scene.w; // UE3 packs scene depth in the fp16 alpha; read for the DoF weight, not written back
 
-   const float signedDistance = depth - DoFParams.x;
-   const float normalizedDistance = saturate(abs(signedDistance) * DoFParams.y);
-   const float maxBlur = (signedDistance >= 0.0) ? DoFMaxBlur.y : DoFMaxBlur.x;
-   const float blurAmount = min(PowUE3(max(normalizedDistance, 1e-4).xxx, DoFParams.zzz).x, maxBlur); // 1e-4 as the original
-   const float sceneWeight = saturate(1.0 - blurAmount);
+   const float sceneWeight = ME2_DoFSceneWeight(depth, DoFParams, DoFMaxBlur);
 
    const float4 blurred = ApplyDgvMask(BlurredImage.Sample(BlurredImageSampler_s, blurUV), DgvMaskT1, DgvFillT1);
    // Stored pre-divided by 4, hence the x4. NEVER scaled by a bloom slider: DoF and bloom are SUMMED into this
@@ -320,8 +326,8 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // The gate sits at the donor's own shoulder, and ONE constant serves both so they cannot drift (Witcher 2's
    // shape). Below it ReinhardPiecewise returns its input exactly, so the reference equals the target and the
    // transfer is a provable no-op; the test may be taken in BT.709 because every BT.2020 channel is a convex
-   // combination of the BT.709 ones (the matrix rows sum to 1), so it can never exceed their max. Simulated in
-   // float32 over the shipped model (2026-09-20): above the shoulder the gate changes nothing at all, and below it
+   // combination of the BT.709 ones (the matrix rows sum to 1), so it can never exceed their max. SIMULATED in
+   // float32 over the shipped model: above the shoulder the gate changes nothing at all, and below it
    // running the stage anyway costs up to 2.8e-3 relative on saturated near-gamut colours - pure round-off from the
    // RGB->LMS->MB round trip and the 1/t_max solve, for a result that should be the input. Raising it further is NOT
    // free: past the shoulder the donor starts bending real hue. Tuned constants, not user controls; path-to-white
@@ -407,42 +413,35 @@ float4 RunME2DofBloomBlend(float2 blurUV, float2 sceneUV)
    const float4 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorTextureSampler_s, sceneUV), DgvMaskT0, DgvFillT0);
    const float depth = scene.w; // UE3 packs scene depth in the fp16 alpha, and this pass passes it through
 
-   const float signedDistance = depth - BlendDoFParams.x;
-   const float normalizedDistance = saturate(abs(signedDistance) * BlendDoFParams.y);
-   const float maxBlur = (signedDistance >= 0.0) ? BlendMaxBlur.y : BlendMaxBlur.x;
-   const float blurAmount = min(PowUE3(max(normalizedDistance, 1e-4).xxx, BlendDoFParams.zzz).x, maxBlur); // 1e-4 as the original
-   const float sceneWeight = saturate(1.0 - blurAmount);
+   const float sceneWeight = ME2_DoFSceneWeight(depth, BlendDoFParams, BlendMaxBlur);
 
    const float4 blurred = ApplyDgvMask(BlurredImage.Sample(BlurredImageSampler_s, blurUV), DgvMaskT1, DgvFillT1);
    const float3 bloom = blurred.xyz * 4.0;
-   const float weightSum = blurred.w * 4.0 + sceneWeight;
+   const float3 vanillaMix = scene.xyz * sceneWeight + bloom;
+   const float rcpWeightSum = rcp(max(blurred.w * 4.0 + sceneWeight, 1e-3)); // the original's own floor, not the uber's abs() guard
 
 #if TONEMAP_TYPE >= 1
-   // WHOSE FRAME IS THIS. Both chains carrying this pass are attached as a VFX template's `oFrameBufferEffect`
-   // (BioVFXTemplate, bPlayerOnly, intensity curve) - BioVFX_DesignerCamera.DrunkCamera in the bars and the
-   // Normandy medbay, BioVFX_Crt_FlameThrower.VFX.Flame_Thrower_FB_VFX in SFXGame. Whether BioWare's engine
-   // REPLACES the level's chain with that one or MERGES it in is engine code, not package data, so this pass does
-   // not assume: LumaData says what already ran this frame, exactly as the material asks.
+   // WHOSE FRAME IS THIS. The two in-game chains that carry this pass are attached as a VFX template's
+   // `oFrameBufferEffect` (BioVFXTemplate, bPlayerOnly, intensity curve): BioVFX_DesignerCamera.DrunkCamera in
+   // the bars and the Normandy medbay, and BioVFX_Crt_FlameThrower.VFX.Flame_Thrower_FB_VFX in SFXGame (the
+   // third pair of chains is UnrealEd's UI/thumbnail ones). Whether BioWare's engine REPLACES the level's chain
+   // with that one or MERGES it in is engine code, not package data, so this pass does not assume: LumaData says
+   // what already ran this frame, exactly as the material asks.
    [branch] if (LumaData.GameData.UberRanThisFrame > 0.5)
    {
       // Merged after the uber: t0 is its display-mapped, encoded canvas. Vanilla's arithmetic is the whole pass
       // here - no second display map, and no second Luma glow, which the uber's composite already added.
-      float3 merged = scene.xyz * sceneWeight + bloom;
-      merged *= rcp(max(weightSum, 1e-3));
-      return float4(Sanitize(merged), depth);
+      return float4(Sanitize(vanillaMix * rcpWeightSum), depth);
    }
 
    // Uber-less chain: this IS the frame's colour pass. The Luma glow joins the numerator where the vanilla one
    // sits, since the replaced gather has already stopped writing that one, and the display map and the canvas
-   // encode happen here because nothing downstream will do them.
-   float3 mixed = scene.xyz * sceneWeight + bloom + LumaBloom(sceneUV);
-   mixed *= rcp(max(weightSum, 1e-3)); // the original's own floor, not the uber's abs() guard
-   mixed = ME2_ApplyContrast(Sanitize(mixed) * LumaSettings.GameSettings.Exposure);
+   // encode happen here because nothing downstream will do them. The sample stays inside this branch: on a merged
+   // frame the pyramid is not this pass's to add.
+   const float3 mixed = ME2_ApplyContrast(Sanitize((vanillaMix + LumaBloom(sceneUV)) * rcpWeightSum) * LumaSettings.GameSettings.Exposure);
    return float4(EncodeME2Canvas(MapME2ToDisplay(mixed)), depth);
 #else
-   float3 mixed = scene.xyz * sceneWeight + bloom;
-   mixed *= rcp(max(weightSum, 1e-3));
-   return float4(mixed, depth);
+   return float4(vanillaMix * rcpWeightSum, depth);
 #endif
 }
 
@@ -511,11 +510,13 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
    }
    else
    {
-      // Uber-less chain (the standalone DOFAndBloom blend, 0x780BCE69 / 2.81.3 0x8B012337, unreplaced): t0 is RAW
-      // linear scene, so decoding it as gamma would crush the frame. Map it here instead, the way this pass did
-      // before the canvas contract changed - and with the map LAST, DICE contains the vignette's white point itself,
-      // which is what ME2_ContainToPeak exists to redo on the other branch. No Luma bloom: the pyramid is built at
+      // Neither the uber nor the standalone DOFAndBloom blend ran: t0 is RAW linear scene, so decoding it as gamma
+      // would crush the frame. Map it here instead - with the map LAST, DICE contains the vignette's white point
+      // itself, which is what ME2_ContainToPeak redoes on the other branch. No Luma bloom: the pyramid is built at
       // the uber draw, which by definition did not happen. Exposure as the gamma pass applies it on a raw scene.
+      // Only these two producers are covered, and none of the 384 cooked chains pairs the blend with this material:
+      // the blend leaves an ENCODED canvas, which would take this branch, and the flag it would have to set cannot
+      // be set there without suppressing a later uber draw on a merged chain.
       outColor = EncodeME2Canvas(MapME2ToDisplay(Sanitize(scene * LumaSettings.GameSettings.Exposure) * vignette));
    }
 #else

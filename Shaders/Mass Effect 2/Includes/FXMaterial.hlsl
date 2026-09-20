@@ -79,8 +79,4 @@ float4 FX_SquareFlash(float2 uv, float4 screenPos, uint r, float3 squareScale)
    return FX_Output(FX_Desaturate(lerp(scene, glow, k), FXC(r + 11).x) + FXC(0).xyz, FX_Desaturate(excess, FXC(r + 11).x), screenPos.w);
 }
 
-// dgVoodoo's fixed interpolator layout (linkage is by register): every entry point declares all 13.
-#define FX_MAIN_SIGNATURE \
-   float4 v0 : SV_POSITION0, float4 v1 : TEXCOORD8, float4 v2 : COLOR0, float4 v3 : COLOR1, float4 v4 : TEXCOORD9, float4 v5 : TEXCOORD0, float4 v6 : TEXCOORD1, float4 v7 : TEXCOORD2, float4 v8 : TEXCOORD3, float4 v9 : TEXCOORD4, float4 v10 : TEXCOORD5, float4 v11 : TEXCOORD6, float4 v12 : TEXCOORD7, out float4 o0 : SV_TARGET0
-
 #endif // LUMA_ME2_FX_MATERIAL

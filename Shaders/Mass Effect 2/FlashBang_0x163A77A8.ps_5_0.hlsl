@@ -1,7 +1,7 @@
 // Mass Effect 2 (2010) - Kasumi flashbang feedback material (FlashBang_FB_Mat). Additive: vanilla's UNORM target clamped the output. See Includes/FXMaterial.hlsl.
 #include "Includes/FXMaterial.hlsl"
 
-void main(FX_MAIN_SIGNATURE)
+void main(ME2_MAIN_SIGNATURE)
 {
    const float3 flashA = FX_Fetch(Tex1, Sampler1, FXC(4).x * v5.xy + FXC(5).x, 1).xyz;
    const float3 flashB = FX_Fetch(Tex1, Sampler1, FXC(6).x * v5.xy + FXC(7).x, 1).xyz;

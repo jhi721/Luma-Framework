@@ -39,8 +39,10 @@ struct LumaGameSettings
                           // energy-preserving, so this is the gain that makes BloomIntensity 1 mean vanilla.
 };
 
-// Game specific cbuffer (instance/pass) data, uploaded per replaced draw. Read only by the FGammaCorrection replacement,
-// whose input depends on what already ran this frame. Both 0 = the engine skipped uber post: t0 is the RAW fp16 scene.
+// Game specific cbuffer (instance/pass) data, uploaded per replaced draw: what already ran this frame, for the
+// passes whose input depends on it. `UberRanThisFrame` is read by the gather, the DoF/bloom blend, the material and
+// the FGammaCorrection replacements; `CanvasFinishedThisFrame` by FGammaCorrection alone. Both 0 at that pass = the
+// engine skipped uber post: t0 is the RAW fp16 scene.
 struct LumaGameData
 {
    float UberRanThisFrame;        // 1 = the uber replacement ran, leaving display-mapped, encoded light in its target

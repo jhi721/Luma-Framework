@@ -45,8 +45,9 @@ float4 GatherTail(float4 sceneSum, float3 bloomSum, float invN)
 {
    const float4 avg = sceneSum * invN;
 
-   // Vanilla DoF weight. Luma_ME2_Tonemap.hlsl computes the same thing and the two are deliberately NOT shared: they
-   // are independent transcriptions of two DIFFERENT vanilla shaders, and a helper could not carry the rows anyway.
+   // Vanilla DoF weight. Luma_ME2_Tonemap.hlsl's ME2_DoFSceneWeight computes the same thing and the two are
+   // deliberately NOT shared: they are independent transcriptions of two DIFFERENT vanilla shaders, and this one
+   // takes the AVERAGE depth of the taps rather than the pixel's own.
    const float signedDistance = avg.w - DoFParams.x;
    const float normalizedDistance = saturate(abs(signedDistance) * DoFParams.y);
    const float maxBlur = (signedDistance >= 0.0) ? DoFMaxBlur.y : DoFMaxBlur.x;
