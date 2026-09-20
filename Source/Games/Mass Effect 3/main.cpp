@@ -1413,8 +1413,9 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Mass Effect 3\" (2012) is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, HDR bloom, SMAA anti-aliasing, and 16x anisotropic filtering.\n"
+         "It replaces the game's FXAA with SMAA, adds HDR and HDR bloom, plus 16x anisotropic filtering.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
+         "Enable Anti-Aliasing in the game's video settings for SMAA to apply.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
