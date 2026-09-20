@@ -317,11 +317,17 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // Hard-clip permutation: nothing to invert, so the grade run UNCLAMPED is the rebuild — vanilla-exact below the
    // clip and its own analytic continuation above it.
    float3 recovered = VanillaToLinear(GradeUE3(curved, false, 1.0));
-   // Exact gate: below 1.0 the reference equals the target (the Reinhard shoulder sits at 1.5 and the BT.2020
-   // channels of a BT.709 colour never exceed its max), so the transfer is a provable no-op. It also pays for
-   // itself - the model runs purity solves, so a real branch is worth taking on everything that is not a
-   // highlight. Tuned constants, not user controls; path-to-white stays with DICE at the display peak.
-   [branch] if (max3(recovered) > 1.0)
+   // The gate sits at the donor's own shoulder, and ONE constant serves both so they cannot drift (Witcher 2's
+   // shape). Below it ReinhardPiecewise returns its input exactly, so the reference equals the target and the
+   // transfer is a provable no-op; the test may be taken in BT.709 because every BT.2020 channel is a convex
+   // combination of the BT.709 ones (the matrix rows sum to 1), so it can never exceed their max. Simulated in
+   // float32 over the shipped model (2026-09-20): above the shoulder the gate changes nothing at all, and below it
+   // running the stage anyway costs up to 2.8e-3 relative on saturated near-gamut colours - pure round-off from the
+   // RGB->LMS->MB round trip and the 1/t_max solve, for a result that should be the input. Raising it further is NOT
+   // free: past the shoulder the donor starts bending real hue. Tuned constants, not user controls; path-to-white
+   // stays with DICE at the display peak.
+   const float hueReferenceShoulder = 1.5;
+   [branch] if (max3(recovered) > hueReferenceShoulder)
    {
       // The hue stage alone runs in BT.2020 - the working space every other MacLeod-Boynton port in this repo uses,
       // and the one the canonical wrapper is built for. Only this island moves: the reconstruction above and
@@ -332,7 +338,7 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
       const float3 target2020 = BT709_To_BT2020(recovered);
       // Hue reference: a per-channel Reinhard (ceiling 5, shoulder 1.5) of the colour itself, the reference our
       // RenoDX ports ship. Primaries decide which channel turns first, hence the skew magnitude.
-      const float3 reference2020 = Reinhard::ReinhardPiecewise(target2020, 5.0, 1.5);
+      const float3 reference2020 = Reinhard::ReinhardPiecewise(target2020, 5.0, hueReferenceShoulder);
       // Hue 1 / chrominance 0, the canonical HueOnly contract: the reference supplies a hue DIRECTION and nothing
       // else, while the target keeps its own purity and its own T = L + M. T is MacLeod-Boynton's intensity anchor,
       // NOT photometric luminance - BT.709 Y does move here, most of all on saturated blues.
