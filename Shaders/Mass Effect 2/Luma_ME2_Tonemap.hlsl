@@ -390,6 +390,65 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
 #undef GammaColorScaleAndInverse
 #undef GammaOverlayColor
 
+// ---------- Stage 1b: FDOFAndBloomBlend -> the canvas, on chains that have no uber ----------
+// The vanilla pass is the uber's scene mix and nothing else: same DoF weight, same x4 blur, same normalisation,
+// alpha carrying the scene depth through. Transcribed from the cooked SM3 (18 slots): c0 -> cb4[8], c2 -> cb4[10],
+// which is the SM3 c<N> = cb4[N+8] mapping the FX materials use, and the same two rows the gather reads.
+//
+// On the HDR path this pass has to finish what the uber would have: the Luma glow goes in where the vanilla one
+// was, then the display map and the canvas encode, so a frame from one of these chains reaches the HUD and the
+// present blit in the SAME domain as an uber frame. There is no grade here and no engine fade row - that row
+// belongs to the uber - so neither is applied; the scene simply is not graded on these chains, as in vanilla.
+#define BlendDoFParams PsConstants[8]  // .x focus distance, .y 1/range, .z falloff exponent
+#define BlendMaxBlur   PsConstants[10] // .x max blur near, .y max blur far
+
+float4 RunME2DofBloomBlend(float2 blurUV, float2 sceneUV)
+{
+   const float4 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorTextureSampler_s, sceneUV), DgvMaskT0, DgvFillT0);
+   const float depth = scene.w; // UE3 packs scene depth in the fp16 alpha, and this pass passes it through
+
+   const float signedDistance = depth - BlendDoFParams.x;
+   const float normalizedDistance = saturate(abs(signedDistance) * BlendDoFParams.y);
+   const float maxBlur = (signedDistance >= 0.0) ? BlendMaxBlur.y : BlendMaxBlur.x;
+   const float blurAmount = min(PowUE3(max(normalizedDistance, 1e-4).xxx, BlendDoFParams.zzz).x, maxBlur); // 1e-4 as the original
+   const float sceneWeight = saturate(1.0 - blurAmount);
+
+   const float4 blurred = ApplyDgvMask(BlurredImage.Sample(BlurredImageSampler_s, blurUV), DgvMaskT1, DgvFillT1);
+   const float3 bloom = blurred.xyz * 4.0;
+   const float weightSum = blurred.w * 4.0 + sceneWeight;
+
+#if TONEMAP_TYPE >= 1
+   // WHOSE FRAME IS THIS. Both chains carrying this pass are attached as a VFX template's `oFrameBufferEffect`
+   // (BioVFXTemplate, bPlayerOnly, intensity curve) - BioVFX_DesignerCamera.DrunkCamera in the bars and the
+   // Normandy medbay, BioVFX_Crt_FlameThrower.VFX.Flame_Thrower_FB_VFX in SFXGame. Whether BioWare's engine
+   // REPLACES the level's chain with that one or MERGES it in is engine code, not package data, so this pass does
+   // not assume: LumaData says what already ran this frame, exactly as the material asks.
+   [branch] if (LumaData.GameData.UberRanThisFrame > 0.5)
+   {
+      // Merged after the uber: t0 is its display-mapped, encoded canvas. Vanilla's arithmetic is the whole pass
+      // here - no second display map, and no second Luma glow, which the uber's composite already added.
+      float3 merged = scene.xyz * sceneWeight + bloom;
+      merged *= rcp(max(weightSum, 1e-3));
+      return float4(Sanitize(merged), depth);
+   }
+
+   // Uber-less chain: this IS the frame's colour pass. The Luma glow joins the numerator where the vanilla one
+   // sits, since the replaced gather has already stopped writing that one, and the display map and the canvas
+   // encode happen here because nothing downstream will do them.
+   float3 mixed = scene.xyz * sceneWeight + bloom + LumaBloom(sceneUV);
+   mixed *= rcp(max(weightSum, 1e-3)); // the original's own floor, not the uber's abs() guard
+   mixed = ME2_ApplyContrast(Sanitize(mixed) * LumaSettings.GameSettings.Exposure);
+   return float4(EncodeME2Canvas(MapME2ToDisplay(mixed)), depth);
+#else
+   float3 mixed = scene.xyz * sceneWeight + bloom;
+   mixed *= rcp(max(weightSum, 1e-3));
+   return float4(mixed, depth);
+#endif
+}
+
+#undef BlendDoFParams
+#undef BlendMaxBlur
+
 // ---------- Stage 2: BioSceneEffect material -> the canvas the present blit takes, the frame's LAST pass ----------
 // Its own register map: PsConstants[8] means something different here than on the uber.
 #define MatOffset      PsConstants[8]  // .xyz additive offset, applied last in the encoded domain
@@ -440,11 +499,25 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
 
    float3 outColor;
 #if TONEMAP_TYPE >= 1
-   // The uber left the display-mapped, encoded scene here. The vignette in vanilla's place: the encode is a pure pow,
-   // so multiplying by gamma_to_linear(vig) in linear IS the vanilla multiply in the encoded domain. Its white point
-   // lifts blue past peak (vanilla's 8-bit canvas clipped it), so the map's own beyond-peak step contains it.
-   outColor = DecodeME2Canvas(scene) * gamma_to_linear(ME2_Vignette(grainUV), GCT_POSITIVE); // vig >= 0
-   outColor = EncodeME2Canvas(ME2_ContainToPeak(outColor));
+   // The vignette in vanilla's place either way: the encode is a pure pow, so multiplying by gamma_to_linear(vig) in
+   // linear IS the vanilla multiply in the encoded domain. What t0 holds is NOT a given, so it is asked rather than
+   // assumed - core refreshes LumaData on every replaced draw, not just the gamma pass's.
+   const float3 vignette = gamma_to_linear(ME2_Vignette(grainUV), GCT_POSITIVE); // vig >= 0
+   [branch] if (LumaData.GameData.UberRanThisFrame > 0.5)
+   {
+      // The uber left the display-mapped, encoded scene here. Its vignette white point lifts blue past peak
+      // (vanilla's 8-bit canvas clipped it), so the map's own beyond-peak step contains it.
+      outColor = EncodeME2Canvas(ME2_ContainToPeak(DecodeME2Canvas(scene) * vignette));
+   }
+   else
+   {
+      // Uber-less chain (the standalone DOFAndBloom blend, 0x780BCE69 / 2.81.3 0x8B012337, unreplaced): t0 is RAW
+      // linear scene, so decoding it as gamma would crush the frame. Map it here instead, the way this pass did
+      // before the canvas contract changed - and with the map LAST, DICE contains the vignette's white point itself,
+      // which is what ME2_ContainToPeak exists to redo on the other branch. No Luma bloom: the pyramid is built at
+      // the uber draw, which by definition did not happen. Exposure as the gamma pass applies it on a raw scene.
+      outColor = EncodeME2Canvas(MapME2ToDisplay(Sanitize(scene * LumaSettings.GameSettings.Exposure) * vignette));
+   }
 #else
    // Vanilla: the canvas holds the vanilla display-encoded value, so every operation here is the original's -
    // including the vignette, which stays in this pass and in the encoded domain exactly as the game had it.

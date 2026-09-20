@@ -23,10 +23,14 @@
 
 // ---- Measured pass hashes, dgVoodoo 2.87.3 (ps_5_0) then 2.81.3 (ps_4_0). Replacements are bound by FILE NAME, so
 // a constant is only needed where the C++ keys on a pass.
-static constexpr uint32_t kUberPostFilmicHash = 0xDB1022A7;  // UberPostProcessBlend + Hejl filmic curve (live perm)
-static constexpr uint32_t kUberPostHash = 0x88CBF48C;        // same pass, tonemap-less perm (hard clip)
-static constexpr uint32_t kMaterialHash = 0x277DA7AE;        // BioSceneEffect: vignette only (film grain off)
-static constexpr uint32_t kMaterialGrainHash = 0xCF0CB35A;   // BioSceneEffect: vignette + film grain
+static constexpr uint32_t kUberPostFilmicHash = 0xDB1022A7; // UberPostProcessBlend + Hejl filmic curve (live perm)
+static constexpr uint32_t kUberPostHash = 0x88CBF48C;       // same pass, tonemap-less perm (hard clip)
+static constexpr uint32_t kMaterialHash = 0x277DA7AE;       // BioSceneEffect: vignette only (film grain off)
+static constexpr uint32_t kMaterialGrainHash = 0xCF0CB35A;  // BioSceneEffect: vignette + film grain
+// UE3 FDOFAndBloomBlend, REPLACED: the standalone composite of the chains that carry a DOFAndBloomEffect and no
+// uber (Drunk_PostProcess in the Citadel lounge, the flamethrower's Burninate chain, the UI/thumbnail chains).
+// Never captured at runtime; hashes come from the cooked SM3 program through _tools/dgv_hashgen.
+static constexpr uint32_t kDofBloomBlendHash = 0x780BCE69;
 static constexpr uint32_t kDofBloomGatherHash = 0x565795ED;  // DOFAndBloomGather, 16 taps (QualityBloom=TRUE)
 static constexpr uint32_t kDofBloomGather4Hash = 0x3BEE36AD; // DOFAndBloomGather, 4 taps (QualityBloom=FALSE)
 static constexpr uint32_t kGammaCorrectionHash = 0x0160196C; // UE3 FGammaCorrection: in the dump, never yet seen drawing
@@ -38,6 +42,7 @@ static constexpr uint32_t kUberPostFilmicHash_v281 = 0x9EE2F5B0;
 static constexpr uint32_t kUberPostHash_v281 = 0xD95F610B;
 static constexpr uint32_t kMaterialHash_v281 = 0xFEC7717C;
 static constexpr uint32_t kMaterialGrainHash_v281 = 0xEA297C13;
+static constexpr uint32_t kDofBloomBlendHash_v281 = 0x8B012337;
 static constexpr uint32_t kDofBloomGatherHash_v281 = 0xE5D70519;
 static constexpr uint32_t kDofBloomGather4Hash_v281 = 0xD4C3E9E1;
 static constexpr uint32_t kGammaCorrectionHash_v281 = 0x87D136D3;
@@ -104,6 +109,10 @@ struct MassEffect2GameDeviceData final : public GameDeviceData
 #if DEVELOPMENT
    // One-shot per DEVICE, not per process: dgVoodoo recreates the device on a resize, which is worth re-reading.
    bool diag_logged_gamma = false;
+   // Which uber permutation the game drew last, and how many uber draws this frame (MELE's stage-1 readout).
+   // The hash deliberately survives a frame with no uber draw: a menu or a paused frame would otherwise blank it.
+   uint32_t uber_perm_hash = 0;
+   uint32_t uber_draws = 0;
 #endif
 
    // The finished canvas this frame, captured from the finishing pass' bound RTV. Consumed by Hide UI (which needs to
@@ -157,6 +166,9 @@ struct MassEffect2GameDeviceData final : public GameDeviceData
    bool bloom_scale_valid = false;
 
    bool karis_released = false; // latch for the bloom-off release in OnPresent (see ReleaseCoreKarisAverage)
+#if DEVELOPMENT
+   float bloom_scale_logged = -1.f; // last value the DIAG line printed, so a volume ramp does not print every step
+#endif
 
    // Borrowed view onto core's DrawBloom mip 0 (AddRef'd by DrawBloom; the pyramid itself is core-managed).
    // Rebuilt every frame the feature is on, released every Present.
@@ -236,6 +248,35 @@ class MassEffect2Game final : public Game
    static bool ContainsPixelShader(const ShaderHashesList<OneShaderPerPipeline>& hashes, uint32_t hash, uint32_t hash_v281)
    {
       return hashes.Contains(hash, reshade::api::shader_stage::pixel) || hashes.Contains(hash_v281, reshade::api::shader_stage::pixel);
+   }
+
+#if DEVELOPMENT
+   // Which of the four uber hashes matched, for the DEV readout: the dgVoodoo build decides whether the 2.87.3 or
+   // the 2.81.3 twin is live, so the raw hash is worth printing rather than just "filmic" or "hard clip".
+   static uint32_t MatchedUberHash(const ShaderHashesList<OneShaderPerPipeline>& hashes)
+   {
+      if (hashes.Contains(kUberPostFilmicHash, reshade::api::shader_stage::pixel))
+         return kUberPostFilmicHash;
+      if (hashes.Contains(kUberPostFilmicHash_v281, reshade::api::shader_stage::pixel))
+         return kUberPostFilmicHash_v281;
+      if (hashes.Contains(kUberPostHash, reshade::api::shader_stage::pixel))
+         return kUberPostHash;
+      if (hashes.Contains(kUberPostHash_v281, reshade::api::shader_stage::pixel))
+         return kUberPostHash_v281;
+      return 0;
+   }
+
+   static bool IsFilmicUberHash(uint32_t hash)
+   {
+      return hash == kUberPostFilmicHash || hash == kUberPostFilmicHash_v281;
+   }
+#endif
+
+   // The uber-less chains' composite. Not latched anywhere: it can draw more than once, and each draw needs a
+   // pyramid of its own (ME1 2007's shape).
+   static bool IsDofBloomBlendPass(const ShaderHashesList<OneShaderPerPipeline>& hashes)
+   {
+      return ContainsPixelShader(hashes, kDofBloomBlendHash, kDofBloomBlendHash_v281);
    }
 
    static bool IsUberPass(const ShaderHashesList<OneShaderPerPipeline>& hashes)
@@ -379,6 +420,35 @@ class MassEffect2Game final : public Game
    }
 
 #if ENABLE_BLOOM
+   // The pyramid and its slot, for whichever pass composites the glow this frame: the uber, or the standalone
+   // DOFAndBloom blend on the chains that have no uber (ME1 2007's shape - no cooked chain has both, so the glow
+   // is never doubled). Karis average first: no TAA, so fireflies have to die spatially.
+   static void BindLumaBloom(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_scene)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      gd.srv_luma_bloom.reset(); // DrawBloom AddRef's its mip 0 into this
+      // Readiness gate: both core helpers reach their shaders with .at(), which THROWS while the async loader
+      // or a dev live-reload has not compiled them yet.
+      if (g_luma_bloom_enable && srv_scene != nullptr &&
+          AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("Bloom Prefilter PS"), CompileTimeStringHash("Bloom Downsample PS"), CompileTimeStringHash("Bloom Upsample PS")}) && AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("Bloom VS")}) && AllShadersReady(device_data.native_compute_shaders, {CompileTimeStringHash("Karis Average CS")}))
+      {
+         DrawStateStack<DrawStateStackType::FullGraphics> bloom_state;
+         bloom_state.Cache(native_device_context, device_data.uav_max_count);
+
+         ComPtr<ID3D11ShaderResourceView> srv_karis;
+         DrawKarisAverage(native_device, native_device_context, device_data, srv_scene, srv_karis.put());
+         // The sigmas are in mip texels, so nothing here is resolution-dependent.
+         if (srv_karis)
+            DrawBloom(native_device, native_device_context, device_data, srv_karis.get(), (int)std::size(g_bloom_sigmas), g_bloom_sigmas, gd.srv_luma_bloom.put());
+
+         bloom_state.Restore(native_device_context);
+      }
+      // Bound every time, null included: the composite is gated on LumaBloomEnable, not on the slot, and
+      // dgVoodoo's 1x1 placeholder would otherwise be sampled as garbage. The composite ADDS this.
+      ID3D11ShaderResourceView* bloom_srv = gd.srv_luma_bloom.get();
+      native_device_context->PSSetShaderResources(kLumaBloomSlot, 1, &bloom_srv);
+   }
+
    // Core drops only DrawKarisAverage's UAV, and only on swapchain init, so a feature-off toggle releases both views
    // itself. ⚠ Karis only: DrawBloom's mip statics have no reachable release, ~66 MB stays.
    static void ReleaseCoreKarisAverage(DeviceData& device_data)
@@ -740,6 +810,23 @@ public:
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only: a stuck "on" would look like a broken HUD.
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
+
+#if DEVELOPMENT
+      {
+         const auto& gd = GetGameDeviceData(device_data);
+         ImGui::SeparatorText("Uber DEV readout");
+         if (gd.uber_perm_hash == 0)
+         {
+            ImGui::Text("no uber draw seen yet");
+         }
+         else
+         {
+            ImGui::Text("perm 0x%08X %s  (draws this frame: %u)", gd.uber_perm_hash, IsFilmicUberHash(gd.uber_perm_hash) ? "FILMIC" : "HARD CLIP", gd.uber_draws);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("The UberPostProcessBlend permutation the game drew last, and how many times it drew this frame. FILMIC runs the native Hejl curve and recovers brightness by a scalar, with no colour stage; HARD CLIP has no curve and rebuilds through the unclamped grade, with the MacLeod-Boynton hue stage over it. 0 draws with a hash shown means the last frame had no uber pass at all.");
+         }
+      }
+#endif
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
@@ -1081,6 +1168,48 @@ public:
       }
 #endif
 
+#if DEVELOPMENT
+      // Outside the once-a-frame latch below, so the count is the real number of uber draws. Not cosmetic: the
+      // two permutations take different HDR paths, so an A/B that changes nothing is usually this readout.
+      if (is_immediate && IsUberPass(original_shader_hashes))
+      {
+         const uint32_t matched = MatchedUberHash(original_shader_hashes);
+         if (matched != 0)
+         {
+            game_device_data.uber_perm_hash = matched;
+            game_device_data.uber_draws++;
+         }
+      }
+#endif
+
+#if ENABLE_BLOOM
+      // Uber-less chains composite DoF and bloom here instead, so the glow the uber would have added is added here.
+      // NOT latched: the pass can draw more than once, and each draw wants its own pyramid (ME1 2007's shape).
+      if (is_immediate && IsDofBloomBlendPass(original_shader_hashes))
+      {
+         game_device_data.ever_matched_keyed_pass = true;
+         // b13 at the seam, as at the uber draw: core uploads only after this callback returns, so the replacement
+         // would otherwise read last frame's settings. Needed either way - the replacement reads LumaData to find
+         // out whether the uber already ran this frame.
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+
+         // Only an uber-LESS frame needs anything from us: a merged chain (if that is what BioWare's frame-buffer
+         // effects do) already has its glow and its canvas from the uber, and a second pyramid would double the halo.
+         if (!game_device_data.has_drawn_uber)
+         {
+            ComPtr<ID3D11ShaderResourceView> srv_blend_scene;
+            native_device_context->PSGetShaderResources(0, 1, srv_blend_scene.put());
+            BindLumaBloom(native_device, native_device_context, device_data, srv_blend_scene.get());
+
+            // This pass IS the canvas on those chains (none of them carries a BioSceneEffect material), so hand its
+            // target to the finisher that adds the UI pre-scale, the dither and SMAA - the path a material-less
+            // uber frame takes. Only the first blend of the frame claims it; a later one writes the same target.
+            if (!game_device_data.uber_rt_res)
+               game_device_data.uber_rt_res = GetBoundRenderTargetResource(native_device_context);
+         }
+      }
+#endif
+
       if (is_immediate && !game_device_data.has_drawn_uber && IsUberPass(original_shader_hashes))
       {
          game_device_data.has_drawn_uber = true;
@@ -1108,30 +1237,8 @@ public:
 
 #if ENABLE_BLOOM
          // Luma bloom pyramid off the fp16 LINEAR scene at t0, pre-glow by construction (the halo is added later,
-         // in the uber's own composite). Karis average first: no TAA, so fireflies have to die spatially.
-         game_device_data.srv_luma_bloom.reset(); // DrawBloom AddRef's its mip 0 into this
-         // Readiness gate: both core helpers reach their shaders with .at(), which THROWS while the async loader
-         // or a dev live-reload has not compiled them yet.
-         if (g_luma_bloom_enable && game_device_data.srv_scene &&
-             AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("Bloom Prefilter PS"), CompileTimeStringHash("Bloom Downsample PS"), CompileTimeStringHash("Bloom Upsample PS")}) && AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("Bloom VS")}) && AllShadersReady(device_data.native_compute_shaders, {CompileTimeStringHash("Karis Average CS")}))
-         {
-            DrawStateStack<DrawStateStackType::FullGraphics> bloom_state;
-            bloom_state.Cache(native_device_context, device_data.uav_max_count);
-
-            ComPtr<ID3D11ShaderResourceView> srv_karis;
-            DrawKarisAverage(native_device, native_device_context, device_data, game_device_data.srv_scene.get(), srv_karis.put());
-            // The sigmas are in mip texels, so nothing here is resolution-dependent.
-            if (srv_karis)
-               DrawBloom(native_device, native_device_context, device_data, srv_karis.get(), (int)std::size(g_bloom_sigmas), g_bloom_sigmas, game_device_data.srv_luma_bloom.put());
-
-            bloom_state.Restore(native_device_context);
-         }
-         {
-            // Bound every frame, null included: the composite is gated on LumaBloomEnable, not on the slot, and
-            // dgVoodoo's 1x1 placeholder would otherwise be sampled as garbage. The composite ADDS this.
-            ID3D11ShaderResourceView* bloom_srv = game_device_data.srv_luma_bloom.get();
-            native_device_context->PSSetShaderResources(kLumaBloomSlot, 1, &bloom_srv);
-         }
+         // in the uber's own composite).
+         BindLumaBloom(native_device, native_device_context, device_data, game_device_data.srv_scene.get());
 #endif
       }
       // The material is the last scene pass, so it - not the uber - finishes the canvas on a normal frame.
@@ -1275,6 +1382,9 @@ public:
 
       game_device_data.has_drawn_uber = false;
       game_device_data.has_finished_canvas = false;
+#if DEVELOPMENT
+      game_device_data.uber_draws = 0; // uber_perm_hash deliberately survives: a menu frame would otherwise blank it
+#endif
       game_device_data.canvas_res.reset(); // do not hold a reference across frames: it would outlive a resize or a mirror swap
       game_device_data.uber_rt_res.reset();
 
@@ -1338,11 +1448,17 @@ public:
          cb_luma_global_settings.GameSettings.BloomScaleLive = game_device_data.bloom_scale_live;
          device_data.cb_luma_global_settings_dirty = true;
 #if DEVELOPMENT
-         // One line per change, so the seeded default can be replaced with a measured value (and so a zone with
-         // vanilla bloom off is visible as a real 0 rather than read as a broken readback).
-         char msg[128];
-         std::snprintf(msg, sizeof(msg), "[Luma] ME2 DIAG: engine BloomScale now %.5f", game_device_data.bloom_scale_live);
-         reshade::log::message(reshade::log::level::info, msg);
+         // One line per DISTINCT reading, so the seeded default can be replaced with a measured value (and so a
+         // zone with vanilla bloom off is visible as a real 0 rather than read as a broken readback). The engine
+         // interpolates between post-process volumes, so logging every change printed the whole ramp - hundreds of
+         // lines per walk. Only a step of a tenth counts, which still catches a zone change and a real 0.
+         if (std::abs(game_device_data.bloom_scale_live - game_device_data.bloom_scale_logged) > 0.1f * (game_device_data.bloom_scale_logged > 0.1f ? game_device_data.bloom_scale_logged : 0.1f) || (game_device_data.bloom_scale_live == 0.f) != (game_device_data.bloom_scale_logged == 0.f))
+         {
+            game_device_data.bloom_scale_logged = game_device_data.bloom_scale_live;
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "[Luma] ME2 DIAG: engine BloomScale now %.5f", game_device_data.bloom_scale_live);
+            reshade::log::message(reshade::log::level::info, msg);
+         }
 #endif
       }
 

@@ -22,7 +22,13 @@ Texture2D<float4> SceneColorTexture : register(t0); // fp16 scene color; .w carr
 
 // The vanilla glow's gain, or zero when the Luma pyramid owns the glow. Read as a BOOLEAN - a weight would leave
 // half the glow here, and this is the glow's ONLY switch. Uniform, so it folds in once instead of per tap.
-static const float LumaGatherBloomScale = (LumaSettings.GameSettings.LumaBloomEnable > 0.5) ? 0.0 : DoFBloomScale.x;
+//
+// ONE exception, and it is decided by what already ran this frame. On a normal frame this pass feeds the uber, so
+// the uber has not drawn yet and the Luma pyramid is about to replace this glow. A VFX frame-buffer effect
+// (BioVFX_DesignerCamera.DrunkCamera, the flamethrower) brings its own DOFAndBloom pair, and if BioWare merges it
+// after the uber, that second gather runs with the uber already drawn - nothing downstream will add a Luma glow to
+// it, so zeroing here would silently drop the effect's own bloom. Keep vanilla's in that case.
+static const float LumaGatherBloomScale = (LumaSettings.GameSettings.LumaBloomEnable > 0.5 && LumaData.GameData.UberRanThisFrame <= 0.5) ? 0.0 : DoFBloomScale.x;
 
 // One tap: the raw sample accumulates for the average (depth included, in .w), the bright pass accumulates
 // separately. Vanilla bright-pass: the tap passes through whole when any channel is above 1.0.
