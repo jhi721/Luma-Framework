@@ -10,7 +10,7 @@
 //    bounded proxy, divide the scale back out, keep the native result's RGB ratios at the new luminance.
 //  - ALU (menus, squad, 3D previews): the classic UE3 formula grade with a hard clip and no tone curve. HDR is the UE3
 //    hard-clip canon shipped on ME1 2007 / BL GOTY: the same grade with its upper saturates lifted, a
-//    ReinhardPiecewise(5, 1.5) hue reference and MacLeod-Boynton hue in BT.2020, then DICE.
+//    ReinhardPiecewise(5, ME3_HUE_REFERENCE_SHOULDER) hue reference and MacLeod-Boynton hue in BT.2020, then DICE.
 // The HDR paths run only in the HDR Display Mode; SDR and TONEMAP_TYPE 0 output the exact vanilla grade.
 // Two dgVoodoo rules hold throughout: every fetch is followed by the b3 mask pair, and the entry points declare all 13
 // interpolators, because VS->PS linkage is by register.
@@ -198,6 +198,9 @@ float ME3_PeakWhite()
    return max(LumaSettings.PeakWhiteNits, LumaSettings.GamePaperWhiteNits) / sRGB_WhiteLevelNits;
 }
 
+// Shoulder of the ALU family's hue reference: the Reinhard donor's own, and the gate that skips the whole colour
+// stage below it. Tuned constant, not a user control; path-to-white stays with DICE at the display peak.
+#define ME3_HUE_REFERENCE_SHOULDER      1.5
 #define MELE_HDR_BRIDGE_SHOULDER        0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
 #define MELE_HDR_PIVOT                  0.18 // p, scene mid-gray, where the tone-curve continuation starts.
 #define MELE_HDR_PROBE_LO               0.16 // Sampled-fit probes, in scene-x.
@@ -294,9 +297,19 @@ float3 ME3_Grade(float3 untonemapped, bool hdr, float3 vignette)
       // Colour stage in BT.2020: the soft per-channel reference bends a saturated highlight the way the vanilla clip
       // did, without its whitening; MacLeod-Boynton rebuilds that hue on the signal's own purity. Then DICE, with
       // InOutColorSpace BT.2020 so it does not convert a second time.
+      //
+      // The hue stage is gated on the donor's own shoulder, ONE constant for both so they cannot drift: below it
+      // ReinhardPiecewise returns its input exactly, so the reference equals the target and the transfer is a
+      // no-op. The test is taken in BT.709, before the conversion, because every BT.2020 channel is a convex
+      // combination of the BT.709 ones (the matrix rows sum to 1) and so can never exceed their max. Worth a real
+      // branch: the model runs purity solves, some 300 instructions that most of the frame does not need.
       const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-      const float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
-      const float3 diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
+      float3 diceInBT2020 = extendedBT2020;
+      [branch] if (max3(extendedLinear) > ME3_HUE_REFERENCE_SHOULDER)
+      {
+         const float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, ME3_HUE_REFERENCE_SHOULDER);
+         diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
+      }
       DICESettings settings = ME3_DICESettings();
       settings.InOutColorSpace = CS_BT2020;
       float3 hdrColor = DICETonemap(diceInBT2020 * ME3_PaperWhite(), ME3_PeakWhite(), settings) / ME3_PaperWhite();

@@ -50,7 +50,14 @@ void main(DGV_MAIN_SIGNATURE)
    // Vanilla DoF weight from the AVERAGE depth.
    const float blur = ME3_DoFBlur(avg.w, DoFParams.xyz, DoFMaxBlur.xy);
 
-   // No vanilla glow when the Luma pyramid owns it.
+   // No vanilla glow when the Luma pyramid owns it, which the uber then composites. Unconditional on purpose:
+   // in ME3 this pass only ever runs inside a UberPostProcessEffect (UE3's uber owns the DoF/bloom gather), so
+   // there is no frame where the glow is zeroed here and no uber adds the pyramid back. Checked against the
+   // cooked packages (2420 of them, 31 distinct PostProcessChains): the only chains carrying a standalone
+   // DOFAndBloomEffect are EngineMaterials.DefaultUIPostProcess and DefaultThumbnailPostProcess, and every
+   // frame-buffer VFX chain (biotics, adrenaline, flamethrower, banshee, fades, motion blur) is
+   // BioMaterialInstanceEffect only - no gather at all. ME2 needed a guard here because its VFX chains DO
+   // carry DOFAndBloom pairs.
    const float3 bloom = LumaSettings.GameSettings.LumaBloomEnable > 0.5 ? 0.0 : bloomSum * BloomScaleAndThreshold.x * (1.0 / GATHER_TAPS);
    o0 = float4(avg.xyz * blur + bloom, blur) * 0.25;
 }
