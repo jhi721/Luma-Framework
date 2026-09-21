@@ -507,6 +507,30 @@ class MassEffect2Game final : public Game
          DrawStateStack<DrawStateStackType::FullGraphics> bloom_state;
          bloom_state.Cache(native_device_context, device_data.uav_max_count);
 
+         // Core creates its Karis target ONCE, at the size of the first source, and drops it only on swapchain init.
+         // When the scene buffer later changes size (a save loaded from the main menu, at some display resolutions),
+         // the dispatch covers only the new size and the rest of the target keeps old highlights, which the pyramid
+         // then blurs back in as ghosts that stay on screen. Turning Luma Bloom off and on cleared it by accident (the
+         // off path releases the target); release it here whenever the two sizes disagree.
+         if (const auto it = device_data.managed_resources.shader_resource_views.find(CompileTimeStringHash("luma_karis_average")); it != device_data.managed_resources.shader_resource_views.end() && it->second)
+         {
+            ComPtr<ID3D11Resource> karis_res, scene_res;
+            it->second->GetResource(karis_res.put());
+            srv_scene->GetResource(scene_res.put());
+            uint4 karis_info{}, scene_info{};
+            DXGI_FORMAT karis_fmt = DXGI_FORMAT_UNKNOWN, scene_fmt = DXGI_FORMAT_UNKNOWN;
+            GetResourceInfo(karis_res.get(), karis_info, karis_fmt);
+            GetResourceInfo(scene_res.get(), scene_info, scene_fmt);
+            if (karis_info.x != scene_info.x || karis_info.y != scene_info.y)
+            {
+               // Not DEVELOPMENT-only: this only ever reproduced on players' machines, and it fires once per resize.
+               char msg[128];
+               std::snprintf(msg, sizeof(msg), "[Luma] ME2: scene buffer %ux%u -> %ux%u, rebuilding the bloom's Karis target", karis_info.x, karis_info.y, scene_info.x, scene_info.y);
+               reshade::log::message(reshade::log::level::info, msg);
+               ReleaseCoreKarisAverage(device_data);
+            }
+         }
+
          ComPtr<ID3D11ShaderResourceView> srv_karis;
          DrawKarisAverage(native_device, native_device_context, device_data, srv_scene, srv_karis.put());
          // The sigmas are in mip texels, so nothing here is resolution-dependent.
@@ -521,8 +545,8 @@ class MassEffect2Game final : public Game
       native_device_context->PSSetShaderResources(kLumaBloomSlot, 1, &bloom_srv);
    }
 
-   // Core drops only DrawKarisAverage's UAV, and only on swapchain init, so a feature-off toggle releases both views
-   // itself. ⚠ Karis only: DrawBloom's mip statics have no reachable release, ~66 MB stays.
+   // Core drops only DrawKarisAverage's UAV, and only on swapchain init, so a feature-off toggle and a scene resize
+   // (BindLumaBloom) release both views themselves. ⚠ Karis only: DrawBloom's mip statics have no reachable release, ~66 MB stays.
    static void ReleaseCoreKarisAverage(DeviceData& device_data)
    {
       auto& mr = device_data.managed_resources;
