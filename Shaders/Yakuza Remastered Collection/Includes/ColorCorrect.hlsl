@@ -14,6 +14,8 @@
 //   CCR_COLLECTION ps_color_collection: 5-tap cross blur-sharpen before the grade
 //   CCR_BRIGHTNESS_AFTER_CONTRAST (Y5R builds) the brightness offset cb5[0].y is added after the contrast stage, not before
 //   CCR_NO_ZONES   fx_ccr_*_mask_n (Y5R): no shadow/midtone/highlight terms, only the global cb5[0..3] controls
+//   CCR_MATERIAL_CURVE (Y5R builds) the scene comes from the extended Y5R material tone curve: the vanilla SDR scene is
+//                  rebuilt through YRC_Y5VanillaMaterialCurve instead of the UNORM clamp
 // The zone weights (shadow/mid/highlight) always come from the mean of the stage input color. Every stage is
 // transcribed operand-for-operand from the disassembly (ps_ccr_* in the games' sh_* shader archives).
 //
@@ -59,6 +61,9 @@
 #ifndef CCR_NO_ZONES
 #define CCR_NO_ZONES 0
 #endif
+#ifndef CCR_MATERIAL_CURVE
+#define CCR_MATERIAL_CURVE 0
+#endif
 
 cbuffer cb5 : register(b5)
 {
@@ -86,15 +91,15 @@ SamplerState s2_s : register(s2);
 Texture2D<float4> t2 : register(t2); // mask (r)
 #endif
 
-// Shadow / midtone / highlight weights from the mean of the stage input.
-float3 ZoneWeights(float3 c)
+// Shadow / midtone / highlight weights from the mean of the vanilla (SDR) stage input. The HDR grade takes them from it
+// too: above 1 the mean of an over-range saturated color would pick highlight weights vanilla never applied (black under
+// inverted cutscene contrast), and the polynomials turn around.
+float3 ZoneWeights(float3 sceneSDR)
 {
 #if CCR_NO_ZONES
    return 0.0; // Folds every zone term away, leaving the global controls
 #else
-   // From the clamped color, as vanilla saw it: above 1 (HDR only) the mean of an over-range saturated color would pick
-   // highlight weights vanilla never applied (black under inverted cutscene contrast), and the polynomials turn around.
-   float m = saturate(dot(saturate(c), 1.0 / 3.0));
+   float m = saturate(dot(sceneSDR, 1.0 / 3.0));
    float im = 1.0 - m;
    return saturate(float3(im * im, 1.0 - im * im - m * m, m * m));
 #endif
@@ -155,10 +160,9 @@ float3 HLSStage(float3 c, float3 w)
 }
 #endif
 
-// The whole vanilla grade. `clampSDR` true = verbatim; false = the extended HDR function (see header).
-float3 Grade(float3 c, bool clampSDR)
+// The whole vanilla grade. `clampSDR` true = verbatim; false = the extended HDR function (see header). `w` = ZoneWeights.
+float3 Grade(float3 c, float3 w, bool clampSDR)
 {
-   const float3 w = ZoneWeights(c);
 
 #if CCR_HLS
    // HLS is only defined inside [0,1]: grade the color normalized by its max channel and restore the scale
@@ -221,8 +225,13 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
 #endif
 
    // Vanilla: the scene RT was UNORM, so the grade only ever saw [0,1].
+#if CCR_MATERIAL_CURVE
+   const float3 sceneSDR = YRC_Y5VanillaMaterialCurve(float4(scene, 0.0)).rgb;
+#else
    const float3 sceneSDR = saturate(scene);
-   float3 gradedSDR = Grade(sceneSDR, true);
+#endif
+   const float3 w = ZoneWeights(sceneSDR);
+   float3 gradedSDR = Grade(sceneSDR, w, true);
 #if CCR_MASK
    const float maskWeight = t2.Sample(s2_s, uv.zw).r * cb4[0].x;
    gradedSDR = (gradedSDR - sceneSDR) * maskWeight + sceneSDR;
@@ -230,7 +239,7 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
 
 #if TONEMAP_TYPE >= 1
    const float3 sceneHDR = max(0.0, scene);
-   float3 gradedHDR = Grade(sceneHDR, false);
+   float3 gradedHDR = Grade(sceneHDR, w, false);
 #if CCR_MASK
    gradedHDR = (gradedHDR - sceneHDR) * maskWeight + sceneHDR;
 #endif

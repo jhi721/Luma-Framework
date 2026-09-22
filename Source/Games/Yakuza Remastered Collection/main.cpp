@@ -7,14 +7,15 @@
 #define ENABLE_BLOOM 1
 // XeGTAO re-issues the ASSAO apply draw with its own pixel shader, so it needs "original_draw_dispatch_func".
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
-// Effects that relied on the vanilla UNORM clamp get a saturate appended in place (see "PatchShaderBytecodeSync").
+// Effects that relied on the vanilla UNORM clamp get a saturate appended in place, and the Y5R material tone curve is
+// extended in place (see "PatchShaderBytecodeSync").
 #define LUMA_PATCH_BYTECODE_SYNC 1
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 
 // The engine has no tone curve: materials write gamma-space `color * exposure` into an 8-bit scene RT whose UNORM clamp
-// is the only highlight limit. The whole post chain (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized
+// is the only highlight limit (Y5R materials add their own curve, see "PatchY5MaterialToneCurve"). The whole post chain (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized
 // b8g8r8a8/r8g8b8a8 targets, upgraded to fp16 here. The HDR tonemap lives in the "color correct" replacements
 // (Shaders/Yakuza Remastered Collection/Includes/ColorCorrect.hlsl), the first full-screen pass reading the finished scene.
 // Hashes are Y3R's unless marked. A hash absent from the running game never matches, so the games' sets are merged;
@@ -29,6 +30,7 @@ namespace
       uint32_t glow_downsample_pixel_shader; // Flagged to clamp its source per texel; per game because Y3's 0x54A5E7AC is Y4's ps_cubic
       bool grades_aliased_passthrough_ccr;   // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
       bool glow_downsample_rms;              // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
+      bool material_tone_curve;              // Y5R: lit materials tone-compress in-shader (see "PatchY5MaterialToneCurve")
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
 
@@ -40,10 +42,10 @@ namespace
       for (auto& c : exe)
          c = (char)tolower((unsigned char)c);
       if (exe.find("yakuza5") != std::string::npos)
-         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true, false};
+         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true, false, true};
       if (exe.find("yakuza4") != std::string::npos)
-         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true};
-      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false, false};
+         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true, false};
+      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false, false, false};
    }
 
    // User settings, persisted in the [Luma] config section.
@@ -111,6 +113,88 @@ namespace
       0x7FEC9B44, 0x8083C110, 0x82552855, 0x85D925A4, 0x8C90CF92, 0x92627902, 0x9AC1CDB0, 0x9BED49EA, 0xA156C6FA, 0xABB7BCA4, 0xAE62C507, 0xB2EA0E19, 0xB4C297E5, 0xB620DDFB,
       0xB68688F9, 0xB68FA494, 0xB78A1D16, 0xBA8283E5, 0xBB2C0F00, 0xC35158E3, 0xD0BEFEA7, 0xD333A633, 0xD3CB7109, 0xD6D2F14E, 0xD7ABB7B3, 0xDC481F4C, 0xE3E323BA, 0xEF5F306A,
       0xF1D626DC, 0xF476B17D, 0xF7283DA8, 0xFCDB3E0E, 0x4CC91AE4, 0x9BB484AC, 0xA8049B74, 0xB0FBCECD, 0xE118D7F2, 0xED6A2631, 0xFF3FCF4D};
+
+   // Y5R lit materials tone-compress in-shader, per channel, before fog and the cb2[15] scale: F(u) = sqrt(max(0, 1 - exp(-u)))
+   // with u = color * cb2[6].x (exposure). Their highlights never pass 1, so the fp16 scene alone gives Y5R no HDR. The curve
+   // is continued past u = pivot along its tangent, E(u) = F(min(u, p)) + exp(-p) * max(u - p, 0) inside the sqrt: vanilla
+   // bit for bit below p, rising instead of saturating above. The grade rebuilds the vanilla SDR scene from it
+   // (YRC_Y5VanillaMaterialCurve, mirrors these constants). Pivot 1.2 keeps vanilla up to 0.84 of white.
+   constexpr float y5_material_curve_pivot = 1.2f;
+   constexpr float y5_material_curve_slope = 0.301194212f; // exp(-pivot)
+   std::atomic<uint32_t> y5_material_curve_patches = 0;    // Shaders patched so far (logged in DEVELOPMENT)
+
+   // All 294 Y5R shaders with the curve (292 lit materials, fx_rigid_snow, the unused ps_tonemap) compile it in place on one
+   // temp register rN, with no modifiers: "mul rN, rN, l(-1.442695)", "exp rN, rN", "add rN, -rN, l(1)", then max and sqrt.
+   // Y3R/Y4R have no shader with that constant. Adds temp rT and inserts "add rT, rN, -p", "max rT, rT, 0", "min rN, rN, p"
+   // before the mul and "mad rN, rT, slope, rN" after the add. Returns the new token stream, empty if the shader has no curve.
+   std::vector<uint32_t> PatchY5MaterialToneCurve(const uint32_t* tokens, size_t count)
+   {
+      constexpr uint32_t neg_log2e = 0xBFB8AA3B; // -1.442695f
+      size_t temps_at = count;
+      size_t mul_at = count;
+      for (size_t i = 0; i < count;)
+      {
+         const uint32_t opcode = DECODE_D3D10_SB_OPCODE_TYPE(tokens[i]);
+         const size_t length = opcode == D3D10_SB_OPCODE_CUSTOMDATA ? (i + 1 < count ? tokens[i + 1] : 0) : DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(tokens[i]);
+         if (length == 0 || i + length > count)
+            return {};
+         if (opcode == D3D10_SB_OPCODE_DCL_TEMPS)
+            temps_at = i;
+         // mul: opcode, dst (token + index), src (token + index), 4-component literal (token + 4 values)
+         else if (opcode == D3D10_SB_OPCODE_MUL && length == 10 && std::ranges::any_of(tokens + i + 6, tokens + i + 10, [](uint32_t v)
+                                                                      { return v == neg_log2e; }))
+         {
+            mul_at = i;
+            break;
+         }
+         i += length;
+      }
+      if (temps_at == count || mul_at == count)
+         return {};
+
+      const uint32_t* mul = tokens + mul_at;
+      const auto is_plain_temp = [](uint32_t operand)
+      { return DECODE_D3D10_SB_OPERAND_TYPE(operand) == D3D10_SB_OPERAND_TYPE_TEMP && !DECODE_IS_D3D10_SB_OPERAND_EXTENDED(operand); };
+      const bool literal_is_curve = std::ranges::all_of(mul + 6, mul + 10, [](uint32_t v)
+         { return v == neg_log2e || v == 0; });
+      if (mul[0] != (ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(10)) || !is_plain_temp(mul[1]) || !is_plain_temp(mul[3]) || mul[2] != mul[4] ||
+          DECODE_D3D10_SB_OPERAND_TYPE(mul[5]) != D3D10_SB_OPERAND_TYPE_IMMEDIATE32 || !literal_is_curve)
+         return {};
+      const size_t exp_at = mul_at + 10;
+      const size_t add_at = exp_at + 5;
+      if (add_at >= count || DECODE_D3D10_SB_OPCODE_TYPE(tokens[exp_at]) != D3D10_SB_OPCODE_EXP || DECODE_D3D10_SB_OPCODE_TYPE(tokens[add_at]) != D3D10_SB_OPCODE_ADD)
+         return {};
+      const size_t add_end = add_at + DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(tokens[add_at]);
+      if (add_end > count || tokens[add_at + 2] != mul[2]) // The add writes rN back
+         return {};
+
+      // Operands are the mul's own tokens with another register index or literal: same write mask, swizzle and literal type.
+      const uint32_t n = mul[2];
+      const uint32_t t = tokens[temps_at + 1];
+      const auto op_literal = [&](D3D10_SB_OPCODE_TYPE opcode, uint32_t dst, uint32_t src, float value)
+      {
+         const uint32_t v = std::bit_cast<uint32_t>(value);
+         return std::array<uint32_t, 10>{uint32_t(ENCODE_D3D10_SB_OPCODE_TYPE(opcode) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(10)), mul[1], dst, mul[3], src, mul[5], v, v, v, v};
+      };
+      const auto add = op_literal(D3D10_SB_OPCODE_ADD, t, n, -y5_material_curve_pivot);
+      const auto max = op_literal(D3D10_SB_OPCODE_MAX, t, t, 0.f);
+      const auto min = op_literal(D3D10_SB_OPCODE_MIN, n, n, y5_material_curve_pivot);
+      const uint32_t slope = std::bit_cast<uint32_t>(y5_material_curve_slope);
+      const std::array<uint32_t, 12> mad = {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MAD) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(12), mul[1], n, mul[3], t, mul[5], slope, slope, slope, slope, mul[3], n};
+
+      std::vector<uint32_t> out;
+      out.reserve(count + add.size() * 3 + mad.size());
+      out.insert(out.end(), tokens, tokens + mul_at);
+      out[temps_at + 1] = t + 1;
+      out.insert(out.end(), add.begin(), add.end());
+      out.insert(out.end(), max.begin(), max.end());
+      out.insert(out.end(), min.begin(), min.end());
+      out.insert(out.end(), tokens + mul_at, tokens + add_end);
+      out.insert(out.end(), mad.begin(), mad.end());
+      out.insert(out.end(), tokens + add_end, tokens + count);
+      y5_material_curve_patches++;
+      return out;
+   }
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
@@ -252,7 +336,8 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    bool drew_ccr = false;
    bool drew_video = false;
    uint32_t ccr_hash = 0;
-   std::vector<std::array<float, 4>> exposure_samples; // Material cb2[14] (scale applied to every material output)
+   std::vector<std::array<float, 4>> exposure_samples; // Material cb2[6].x (Y5R curve exposure) and the output scale .xyz
+   uint32_t logged_material_curve_patches = 0;
    uint32_t exposure_reads = 0;
    // Across frames
    bool previous_frame_drew_ccr = true;
@@ -693,7 +778,7 @@ class GameYakuzaRC final : public Game
          return false;
       DrawStateStack<DrawStateStackType::FullGraphics> prefilter_state;
       prefilter_state.Cache(native_device_context, device_data.uav_max_count);
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, g_game_profile.glow_downsample_rms ? 1u : 0u);
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, g_game_profile.material_tone_curve ? 1u : 0u, g_game_profile.glow_downsample_rms ? 1u : 0u);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(), device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("YRC Glow Prefilter PS"_h).get(), source_srv.get(), game_device_data.glow_prefilter_rtv.get(), glow_prefilter_width, glow_prefilter_height, false);
       prefilter_state.Restore(native_device_context);
       return true;
@@ -741,7 +826,19 @@ public:
    std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
    {
       constexpr uint32_t ret_token = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1);
-      if (type != reshade::api::pipeline_subobject_type::pixel_shader || !unorm_clamped_effect_pixel_shaders.contains(uint32_t(shader_hash)) || size % sizeof(uint32_t) != 0 || size < sizeof(uint32_t) || reinterpret_cast<const uint32_t*>(code)[size / sizeof(uint32_t) - 1] != ret_token)
+      if (type != reshade::api::pipeline_subobject_type::pixel_shader || size % sizeof(uint32_t) != 0 || size < sizeof(uint32_t))
+         return nullptr;
+      if (!unorm_clamped_effect_pixel_shaders.contains(uint32_t(shader_hash)))
+      {
+         const std::vector<uint32_t> patched = PatchY5MaterialToneCurve(reinterpret_cast<const uint32_t*>(code), size / sizeof(uint32_t));
+         if (patched.empty())
+            return nullptr;
+         size = patched.size() * sizeof(uint32_t);
+         auto new_code = std::make_unique<std::byte[]>(size);
+         std::memcpy(new_code.get(), patched.data(), size);
+         return new_code;
+      }
+      if (reinterpret_cast<const uint32_t*>(code)[size / sizeof(uint32_t) - 1] != ret_token)
          return nullptr;
       // Encoded by hand rather than with ShaderPatching::GetSatInstruction, whose source operand uses the mask selection mode;
       // fxc encodes sources as swizzles (checked on a patched container with fxc /dumpbin).
@@ -1209,7 +1306,8 @@ public:
          com_ptr<ID3D11Buffer> cb_copy;
          if (cbs[0].get() && cbs[1].get() && cbs[2].get() && CopyBuffer(cbs[1], native_device_context, data, cb_copy) && data.size() >= 16 * 4)
          {
-            const std::array<float, 4> exposure = {data[56], data[57], data[58], data[59]};
+            const size_t scale = g_game_profile.material_tone_curve ? 60 : 56; // cb2[15], Y3R/Y4R cb2[14]
+            const std::array<float, 4> exposure = {data[24], data[scale], data[scale + 1], data[scale + 2]};
             if (std::find(game_device_data.exposure_samples.begin(), game_device_data.exposure_samples.end(), exposure) == game_device_data.exposure_samples.end())
                game_device_data.exposure_samples.push_back(exposure);
          }
@@ -1451,10 +1549,16 @@ public:
 
       if (!game_device_data.exposure_samples.empty()) // Only sampled on log frames
       {
-         std::string line = "[YRC] frame " + std::to_string(frame) + " material cb2[14]:";
+         std::string line = std::format("[YRC] frame {} material cb2[6].x, cb2[{}].xyz:", frame, g_game_profile.material_tone_curve ? 15 : 14);
          for (const auto& e : game_device_data.exposure_samples)
             line += std::format(" ({:.3f} {:.3f} {:.3f} {:.3f})", e[0], e[1], e[2], e[3]);
          reshade::log::message(reshade::log::level::info, line.c_str());
+      }
+
+      if (const uint32_t patches = y5_material_curve_patches; patches != game_device_data.logged_material_curve_patches)
+      {
+         game_device_data.logged_material_curve_patches = patches;
+         LogFormatted(reshade::log::level::info, "[YRC] frame %u: Y5R material tone curve extended in %u shaders", frame, patches);
       }
 
       game_device_data.previous_frame_drew_ccr = game_device_data.drew_ccr;

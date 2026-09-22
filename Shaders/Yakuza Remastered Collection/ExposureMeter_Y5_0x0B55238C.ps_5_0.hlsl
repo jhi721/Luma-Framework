@@ -1,7 +1,8 @@
 // ps_down_sample_4x4_with_glare (Y5R sh_devil_w64.par): the first step of the auto-exposure meter, a 5x6-tap RMS of the
 // scene (t0) plus the glow (t1) x cb5[0].x, reduced to BT.601 luma into an r32_float target and averaged down to 1x1.
 // Both inputs were 8-bit UNORM in vanilla and are fp16 now; the meter would read the HDR highlights and change the
-// exposure, so both are clamped per texel as vanilla stored them. Otherwise verbatim.
+// exposure, so both are taken per texel as vanilla stored them (the scene through the vanilla material curve, the glow
+// clamped). Otherwise verbatim.
 #include "Includes/Common.hlsl"
 
 cbuffer cb5 : register(b5)
@@ -26,7 +27,7 @@ void main(float2 v0 : TEXCOORD0, out float4 o0 : SV_Target0)
       for (int x = -2; x < 3; x++)
       {
          const float2 uv = v0.xy + stepX * x + stepY * y;
-         const float3 s = SampleSaturatedBilinear(t0, s0_s, uv).xyz;
+         const float3 s = SampleSaturatedBilinear(t0, s0_s, uv, true).xyz;
          scene += s * s;
          const float3 g = SampleSaturatedBilinear(t1, s1_s, uv).xyz * cb5[0].x;
          glow += g * g;

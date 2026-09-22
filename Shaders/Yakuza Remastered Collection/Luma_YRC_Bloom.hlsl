@@ -5,6 +5,7 @@
 // Runs at the glow downsample (Copy VS) into a 1024x512 target: every texel averages the 4K glow source over its own
 // footprint with the vanilla downsample's 5x6 tap pattern, each tap clamped per texel as the 8-bit source was.
 // LumaData.CustomData2 != 0 = root mean square (Y4R's downsample), else the mean (Y3R/Y5R's 2-tap average, unaliased).
+// LumaData.CustomData1 != 0 = Y5R: the source comes from the extended material tone curve (see SampleSaturatedBilinear).
 Texture2D<float4> source : register(t0); // the glow source (prefilter) or the Luma bloom with all its mips (composite)
 SamplerState linearSampler : register(s0);
 
@@ -18,7 +19,7 @@ float4 glow_prefilter_ps(float4 pos : SV_Position) : SV_Target
    {
       for (int x = -2; x < 3; x++)
       {
-         const float3 c = SampleSaturatedBilinear(source, linearSampler, uv + texel * float2(x * 0.2, y * (1.0 / 6.0))).rgb;
+         const float3 c = SampleSaturatedBilinear(source, linearSampler, uv + texel * float2(x * 0.2, y * (1.0 / 6.0)), LumaData.CustomData1 != 0u).rgb;
          sum += rms ? c * c : c;
       }
    }

@@ -6,6 +6,7 @@
 #define CCR_OF                        1
 #define CCR_MASK                      1
 #define CCR_COLLECTION                0
+#define CCR_MATERIAL_CURVE            1
 #define CCR_BRIGHTNESS_AFTER_CONTRAST 1
 #include "Includes/ColorCorrect.hlsl"
 

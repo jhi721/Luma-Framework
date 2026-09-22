@@ -17,16 +17,34 @@ float3 YRC_EncodeOutput(float3 color)
    return linear_to_gamma(color);
 }
 
+// Y5R lit materials end in the tone curve sqrt(1 - exp(-u)), which the addon continues past u = pivot along its tangent
+// (see "PatchY5MaterialToneCurve" in main.cpp, whose constants this mirrors). Maps the extended output back to the vanilla
+// one: with t = y^2 and t_p = 1 - slope, above the pivot t = t_p + slope * (u - p), so vanilla 1 - exp(-u) is
+// 1 - slope * exp(-(t - t_p) / slope). Exact for the materials; anything else above 1 (emissive, particles) lands just
+// under 1, near vanilla's UNORM clip. Per channel, like the curve.
+static const float YRC_Y5MaterialCurveSlope = 0.301194212; // exp(-1.2), pivot 1.2
+float4 YRC_Y5VanillaMaterialCurve(float4 y)
+{
+   const float4 t = sqr(max(0.0, y));
+   const float tPivot = 1.0 - YRC_Y5MaterialCurveSlope;
+   return sqrt(t > tPivot ? 1.0 - YRC_Y5MaterialCurveSlope * exp((tPivot - t) / YRC_Y5MaterialCurveSlope) : t);
+}
+
 // A bilinear sample of a texture that vanilla stored as 8-bit UNORM (every texel clamped to [0,1] before filtering) and
 // that is fp16 now: saturates the four texels, then filters. Sample() would blend values above 1 first. Mip 0; the sampler
-// only sets the footprint's addressing, the filter is assumed linear.
-float4 SampleSaturatedBilinear(Texture2D<float4> tex, SamplerState s, float2 uv)
+// only sets the footprint's addressing, the filter is assumed linear. `y5MaterialCurve` (a Y5R scene source) maps the
+// color texels back through the vanilla material curve instead, as vanilla stored them there.
+float4 SampleSaturatedBilinear(Texture2D<float4> tex, SamplerState s, float2 uv, bool y5MaterialCurve = false)
 {
    float2 size;
    tex.GetDimensions(size.x, size.y);
    const float2 f = frac(uv * size - 0.5);
    // Rows are the channels; Gather returns the texels (-,+), (+,+), (+,-), (-,-).
-   const float4x4 texels = float4x4(saturate(tex.GatherRed(s, uv)), saturate(tex.GatherGreen(s, uv)), saturate(tex.GatherBlue(s, uv)), saturate(tex.GatherAlpha(s, uv)));
+   float4 r = tex.GatherRed(s, uv), g = tex.GatherGreen(s, uv), b = tex.GatherBlue(s, uv);
+   r = y5MaterialCurve ? YRC_Y5VanillaMaterialCurve(r) : saturate(r);
+   g = y5MaterialCurve ? YRC_Y5VanillaMaterialCurve(g) : saturate(g);
+   b = y5MaterialCurve ? YRC_Y5VanillaMaterialCurve(b) : saturate(b);
+   const float4x4 texels = float4x4(r, g, b, saturate(tex.GatherAlpha(s, uv)));
    return mul(texels, float4((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y)));
 }
 
