@@ -57,7 +57,7 @@ namespace
    // slider, not persisted).
    float g_smaa_pred_tolerance = 0.02f;
    bool g_gtao_enable = true;
-   bool g_luma_bloom_enable = false;      // Off until calibrated against the vanilla glow in all three games
+   bool g_luma_bloom_enable = true;
    float g_gtao_final_value_power = 0.8f; // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
 #if DEVELOPMENT
