@@ -75,7 +75,7 @@ cbuffer LumaGTAO : register(b8)
 #endif
 
 #ifndef FINAL_VALUE_POWER
-#define FINAL_VALUE_POWER 1.0 // Default 2.2; shadow default for FinalValuePowerRT (the CB value is what actually applies)
+#define FINAL_VALUE_POWER 0.8 // Default 2.2; shadow default for FinalValuePowerRT (the CB value is what actually applies)
 #endif
 
 #ifndef DEPTH_MIP_SAMPLING_OFFSET

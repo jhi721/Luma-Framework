@@ -3,8 +3,13 @@
 #define DISABLE_AUTO_DEBUGGER 1
 // SMAA replaces the game's CMAA2 or FXAA (see "RunSMAA").
 #define ENABLE_SMAA 1
+// XeGTAO re-issues the ASSAO apply draw with its own pixel shader, so it needs "original_draw_dispatch_func".
+#define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
+// Effects that relied on the vanilla UNORM clamp get a saturate appended in place (see "PatchShaderBytecodeSync").
+#define LUMA_PATCH_BYTECODE_SYNC 1
 
 #include "..\..\Core\core.hpp"
+#include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 
 // The engine has no tone curve: materials write gamma-space `color * exposure` into an 8-bit scene RT whose UNORM clamp
 // is the only highlight limit. The whole post chain (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized
@@ -19,8 +24,8 @@ namespace
    // Plane deviation that counts as a full predication edge, as a fraction of view depth (TW2's validated value; DEV slider).
    float g_smaa_pred_tolerance = 0.02f;
    bool g_gtao_enable = true;
-   float g_gtao_final_value_power = 1.f; // DEV/TEST calibration knobs, not persisted
-   float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
+   float g_gtao_final_value_power = 0.8f; // DEV/TEST calibration knobs, not persisted
+   float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
 #if DEVELOPMENT
    bool g_smaa_predication = true;
    bool g_smaa_pred_debug = false;   // Show the predication mask (red) instead of the frame
@@ -42,6 +47,12 @@ namespace
    constexpr uint32_t cas_compute_shader = 0x491BAFA3;
    // Intel ASSAO (stock): prepare (also a depth reader above), depth mips, generate (High / Medium), smart blur / wide, all
    // skipped under XeGTAO; the apply multiply-blends the AO onto the scene mid material stream (see "RunXeGTAO").
+   // Effects drawn into targets that were UNORM in vanilla (the scene RT, the 512x512/512x256 offscreen buffers), which
+   // relied on that clamp: particles (ps_ptc_*, blood included), the hit flash and highlight masks, shockwave, aura, blood
+   // decals and pools, body damage marks. On the fp16 chain their colors went far above 1 (glowing blood) and alphas above
+   // 1 extrapolated the blend (black and white streaks). Every one has a single o0.xyzw output and a single final ret
+   // (checked on the disassembly); generated from tools/shaders.csv.
+   const std::unordered_set<uint32_t> unorm_clamped_effect_pixel_shaders = {0x024B22FC, 0x098F82BB, 0x0E0E3FDE, 0x0EA64B7C, 0x1233B2C0, 0x1490E21C, 0x15DBE648, 0x17153683, 0x179EC828, 0x1BFC5407, 0x1C9CF72D, 0x1E7304D2, 0x21F9EE5F, 0x233DF244, 0x23F5C577, 0x262029A4, 0x2707F90E, 0x2A75EC72, 0x2C018858, 0x2E5C72EF, 0x3019A9B8, 0x308E9227, 0x3468253F, 0x3533A116, 0x378AD557, 0x3A25DD61, 0x3BB5AE11, 0x3CCC13A9, 0x412945F3, 0x47F353EE, 0x47F97A40, 0x4A4CBF32, 0x4F656839, 0x5475205C, 0x581526D2, 0x6011CF50, 0x66F39F82, 0x6772EAB4, 0x6DBDDBAD, 0x6DDEF9B7, 0x71DF2C06, 0x747526C6, 0x75F2BE3E, 0x79B54068, 0x7AA982CE, 0x810027FF, 0x90BD986C, 0x9486446E, 0x9552AB8B, 0x96E88E1B, 0x9A735E6D, 0xA38D13EC, 0xA845CFD6, 0xA8E99745, 0xAD1EACD9, 0xB1C465A7, 0xB2EEF041, 0xB795066D, 0xB820683B, 0xB97E0BA0, 0xBEA87CEF, 0xC3F1CC7A, 0xC77EF0DF, 0xCF0DF8B9, 0xD0DF2846, 0xD2CB4337, 0xD939FD47, 0xDF16C6DB, 0xF24C81DF, 0xF2FA9571, 0xF3B188D2, 0xFA77FFFE, 0xFD4620B9};
    constexpr uint32_t assao_prepare_pixel_shader = 0x972BE5B5;
    const std::unordered_set<uint32_t> assao_pre_apply_pixel_shaders = {0x1DD919C4, 0x47BFF17F, 0xD18E0D3F, 0x8CE62D1E, 0x15EEFFAF};
    constexpr uint32_t assao_apply_pixel_shader = 0x6A73BA10;
@@ -82,7 +93,12 @@ namespace
    const std::unordered_map<uint32_t, const char*> watched_hashes = {{0x716ADB18, "focus_blur_pass1 (DoF)"}, {0x04359FA6, "focus_blur_pass2 (DoF)"},
       {0x74E5C6AC, "focus_blur_pass2_mask (DoF)"}, {0xFD02F404, "ps_sofdec"}, {0xC9782177, "ps_sofdec_qloc"}, {0xE1631197, "ps_haze"}, {0x3A7B40E4, "ps_afterimage01"},
       {0xFD4620B9, "fx_refraction"}, {0x7814519F, "fx_track_blur"}, {0xFBA57AE9, "CAS scaled (cs)"}, {0x82DA801B, "CMAA2 apply (cs)"}, {0x4A57A803, "fx_camera_blur"},
-      {0x0A4BB34E, "fx_rdiffusion"}, {0x24726E96, "ps_lerp"}, {0xCAEFD55C, "ps_grayscale"}, {0x495BB3CA, "fx_lens_flare"}};
+      {0x0A4BB34E, "fx_rdiffusion"}, {0x24726E96, "ps_lerp"}, {0xCAEFD55C, "ps_grayscale"}, {0x495BB3CA, "fx_lens_flare"},
+      {0x54A5E7AC, "ps_down_sample (glow source)"}, {0xB8414674, "glow_pass0"}, {0x9083BF34, "glow_pass2"}};
+   // Bloom ("glow"): the downsample of its swapchain-sized source, the build pass (cb5 thresholds/scales, cb11 flags), the sum.
+   constexpr uint32_t glow_downsample_pixel_shader = 0x54A5E7AC;
+   constexpr uint32_t glow_pass0_pixel_shader = 0xB8414674;
+   constexpr uint32_t glow_pass2_pixel_shader = 0x9083BF34;
    constexpr uint32_t log_interval_frames = 120;
    constexpr uint32_t max_exposure_reads = 16; // per log frame: each one is a staging copy and a GPU sync
 
@@ -160,6 +176,10 @@ struct Yakuza3DeviceData final : public GameDeviceData
    uint32_t last_logged_ccr_hash = 0;
    std::vector<float> last_logged_ccr_cb5;
    std::vector<float> last_logged_assao_cb0;
+   std::vector<float> last_logged_glow_cbs[2];              // glow_pass0, glow_pass2
+   com_ptr<ID3D11Resource> glow_source;                     // The glow downsample's swapchain-sized t0, from a previous frame
+   std::unordered_set<uint32_t> logged_glow_source_writers; // Pixel shaders seen rendering into it
+   std::unordered_set<uint32_t> seen_blend_hashes;          // Pixel shaders already checked by the blended-effect trap
    std::unordered_set<uint32_t> logged_watched_hashes;
    std::unordered_set<uint32_t> checked_custom_size_hashes;
    // Staging copy for the one-shot predication mask readback (see LogPredicationStats), allocated on first use.
@@ -541,6 +561,30 @@ class GameYakuza3 final : public Game
    }
 
 public:
+   // "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp the vanilla UNORM target applied to these effects.
+   std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
+   {
+      constexpr uint32_t ret_token = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1);
+      if (type != reshade::api::pipeline_subobject_type::pixel_shader || !unorm_clamped_effect_pixel_shaders.contains(uint32_t(shader_hash)) || size % sizeof(uint32_t) != 0 || size < sizeof(uint32_t) || reinterpret_cast<const uint32_t*>(code)[size / sizeof(uint32_t) - 1] != ret_token)
+         return nullptr;
+      // Encoded by hand rather than with ShaderPatching::GetSatInstruction, whose source operand uses the mask selection mode;
+      // fxc encodes sources as swizzles (checked on a patched container with fxc /dumpbin).
+      constexpr uint32_t operand_o0 = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_OUTPUT) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_1D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      constexpr uint32_t patch[] = {
+         ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(5) | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true),
+         operand_o0 | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) | D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL, 0,
+         operand_o0 | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | D3D10_SB_OPERAND_4_COMPONENT_NOSWIZZLE, 0};
+      static_assert(patch[0] == 0x05002036 && patch[1] == 0x001020F2 && patch[3] == 0x00102E46);
+      constexpr size_t patch_size = sizeof(patch);
+      const size_t ret_offset = size - sizeof(uint32_t);
+      auto new_code = std::make_unique<std::byte[]>(size + patch_size);
+      std::memcpy(new_code.get(), code, ret_offset);
+      std::memcpy(new_code.get() + ret_offset, patch, patch_size);
+      std::memcpy(new_code.get() + ret_offset + patch_size, code + ret_offset, sizeof(uint32_t));
+      size += patch_size;
+      return new_code;
+   }
+
    void OnInit(bool async) override
    {
       std::vector<ShaderDefineData> game_shader_defines_data = {
@@ -706,6 +750,11 @@ public:
          if (hash == assao_prepare_pixel_shader)
          {
             game_device_data.assao_replaced = g_gtao_enable && is_depth && RunXeGTAO(native_device, native_device_context, device_data, srv.get());
+#if DEVELOPMENT
+            // Keys 4/5 (no real shader hash): the first frame the ASSAO chain ran natively, and the first it ran as XeGTAO.
+            if (game_device_data.logged_watched_hashes.insert(game_device_data.assao_replaced ? 5u : 4u).second)
+               LogFormatted(reshade::log::level::info, "[Y3] frame %u ASSAO %s (XeGTAO enabled %d, depth %d)", cb_luma_global_settings.FrameIndex, game_device_data.assao_replaced ? "replaced by XeGTAO" : "ran natively", g_gtao_enable, is_depth);
+#endif
             if (game_device_data.assao_replaced)
                return DrawOrDispatchOverrideType::Replaced;
          }
@@ -885,6 +934,88 @@ public:
             if (std::find(game_device_data.exposure_samples.begin(), game_device_data.exposure_samples.end(), exposure) == game_device_data.exposure_samples.end())
                game_device_data.exposure_samples.push_back(exposure);
          }
+      }
+
+      // Bloom: what fills its source (materials don't: they have a single render target), and its live constants.
+      if (!is_compute && hash == glow_downsample_pixel_shader)
+      {
+         com_ptr<ID3D11ShaderResourceView> srv;
+         native_device_context->PSGetShaderResources(0, 1, &srv);
+         com_ptr<ID3D11Resource> source;
+         if (srv)
+            srv->GetResource(&source);
+         uint4 size;
+         DXGI_FORMAT format;
+         GetResourceInfo(source.get(), size, format);
+         if (size.x == uint32_t(device_data.output_resolution.x + 0.5f) && size.y == uint32_t(device_data.output_resolution.y + 0.5f))
+            game_device_data.glow_source = source;
+      }
+      else if (!is_compute && log_frame && game_device_data.glow_source && !game_device_data.logged_glow_source_writers.contains(hash))
+      {
+         com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+         native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], nullptr);
+         for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+         {
+            com_ptr<ID3D11Resource> target;
+            if (rtvs[i])
+               rtvs[i]->GetResource(&target);
+            if (target && target == game_device_data.glow_source)
+            {
+               game_device_data.logged_glow_source_writers.insert(hash);
+               LogFormatted(reshade::log::level::info, "[Y3] frame %u glow source written by PS 0x%08X (RT %u of the draw)", cb_luma_global_settings.FrameIndex, hash, i);
+               break;
+            }
+         }
+      }
+      if (!is_compute && (hash == glow_pass0_pixel_shader || hash == glow_pass2_pixel_shader) && log_frame && can_read)
+      {
+         // pass0: cb5[0] luma/rgb threshold, cb5[1] threshold scale, cb5[2] source scale, cb11[0].y & 8 = scene threshold on.
+         // pass2: cb5[0].x luma term, .yzw rgb scale of the 5-level sum.
+         com_ptr<ID3D11Buffer> cbs[2];
+         native_device_context->PSGetConstantBuffers(5, 1, &cbs[0]);
+         native_device_context->PSGetConstantBuffers(11, 1, &cbs[1]);
+         std::vector<float> data, cb11_data;
+         com_ptr<ID3D11Buffer> cb_copy;
+         if (cbs[0] && CopyBuffer(cbs[0], native_device_context, data, cb_copy) && data.size() >= 12)
+         {
+            data.resize(12);
+            if (hash == glow_pass0_pixel_shader && cbs[1] && CopyBuffer(cbs[1], native_device_context, cb11_data, cb_copy) && cb11_data.size() >= 4)
+               data.insert(data.end(), cb11_data.begin(), cb11_data.begin() + 4);
+            auto& last_logged = game_device_data.last_logged_glow_cbs[hash == glow_pass0_pixel_shader ? 0 : 1];
+            if (data != last_logged)
+            {
+               last_logged = data;
+               LogFormatted(reshade::log::level::info, "[Y3] frame %u %s cb5: (%f %f %f %f) (%f %f %f %f) (%f %f %f %f)", cb_luma_global_settings.FrameIndex, hash == glow_pass0_pixel_shader ? "glow_pass0" : "glow_pass2", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11]);
+               if (data.size() >= 16)
+               {
+                  uint32_t flags[4];
+                  std::memcpy(flags, &data[12], sizeof(flags));
+                  LogFormatted(reshade::log::level::info, "[Y3]   glow_pass0 cb11[0]: 0x%X 0x%X 0x%X 0x%X (scene threshold %s)", flags[0], flags[1], flags[2], flags[3], (flags[1] & 8u) ? "on" : "off");
+               }
+            }
+         }
+      }
+
+      // Blended-effect trap: the first draw of every pixel shader that blends into a swapchain-sized target, with the frame
+      // index. Effects that break on the fp16 chain (alpha above 1 extrapolates the blend) show up as new lines at the time
+      // they appear on screen; map the hashes offline through tools/shaders.csv.
+      if (!is_compute && game_device_data.seen_blend_hashes.insert(hash).second)
+      {
+         com_ptr<ID3D11BlendState> blend_state;
+         FLOAT blend_factor[4];
+         UINT sample_mask;
+         native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
+         D3D11_BLEND_DESC blend = {};
+         if (blend_state)
+            blend_state->GetDesc(&blend);
+         const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend.RenderTarget[0];
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         uint4 size;
+         DXGI_FORMAT format;
+         GetResourceInfo(rtv.get(), size, format);
+         if (rt_blend.BlendEnable && size.x == uint32_t(device_data.output_resolution.x + 0.5f) && size.y == uint32_t(device_data.output_resolution.y + 0.5f))
+            LogFormatted(reshade::log::level::info, "[Y3] frame %u blended PS 0x%08X: target format %u, color %d/%d op %d, alpha %d/%d, ccr drawn before: %d", cb_luma_global_settings.FrameIndex, hash, format, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.BlendOp, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
       }
 
       // Every pass writing the 512x512/512x256 targets upgraded for the DoF: each one now sees fp16 values above 1.
