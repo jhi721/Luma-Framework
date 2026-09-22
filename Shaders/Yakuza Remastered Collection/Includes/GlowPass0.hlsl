@@ -23,9 +23,30 @@ SamplerState s1_s : register(s1);
 Texture2D<float4> t0 : register(t0);
 Texture2D<float4> t1 : register(t1);
 
+static const float3 kGlowLumaWeights = float3(0.298912, 0.586611, 0.114478);
+
+// The scene term (cb11[0].y & 8): over the 5x6 taps, the RMS of the color above cb5[0].yzw and the mean of the luma above
+// cb5[0].x, both scaled by cb5[1]. Also Luma Bloom's (Luma_YRC_GlowGain.hlsl).
+float4 GlowSceneThreshold(float2 uv, float2 stepX, float2 stepY, bool materialCurve)
+{
+   float3 thresholdSum = 0.0;
+   float thresholdLuma = 0.0;
+   for (int y = -2; y < 4; y++)
+   {
+      for (int x = -2; x < 3; x++)
+      {
+         const float2 tapUV = uv + stepX * x + stepY * y;
+         float3 c = materialCurve ? SampleSaturatedBilinear(t0, s0_s, tapUV, true).rgb : saturate(t0.Sample(s0_s, tapUV).rgb);
+         float4 t = saturate(float4(saturate(dot(kGlowLumaWeights, c) - cb5[0].x), saturate(c - cb5[0].yzw)) * cb5[1]);
+         thresholdSum += t.yzw * t.yzw;
+         thresholdLuma += t.x;
+      }
+   }
+   return float4(sqrt(thresholdSum * (1.0 / 30.0)), thresholdLuma * (1.0 / 30.0));
+}
+
 float4 GlowPass0(float2 uv)
 {
-   const float3 weights = float3(0.298912, 0.586611, 0.114478);
    const float2 stepX = ddx_coarse(uv) * 0.2;
    const float2 stepY = ddy_coarse(uv) * (1.0 / 6.0);
 
@@ -39,28 +60,10 @@ float4 GlowPass0(float2 uv)
       }
    }
    float3 rms = sqrt(sum * (1.0 / 30.0));
-   float4 glow = float4(rms, dot(weights, rms)) * cb5[2];
+   float4 glow = float4(rms, dot(kGlowLumaWeights, rms)) * cb5[2];
 
    if ((cb11[0].y & 8u) != 0u)
-   {
-      float3 thresholdSum = 0.0;
-      float thresholdLuma = 0.0;
-      for (int y = -2; y < 4; y++)
-      {
-         for (int x = -2; x < 3; x++)
-         {
-#if GLOW_PASS0_MATERIAL_CURVE
-            float3 c = SampleSaturatedBilinear(t0, s0_s, uv + stepX * x + stepY * y, true).rgb;
-#else
-            float3 c = saturate(t0.Sample(s0_s, uv + stepX * x + stepY * y).rgb);
-#endif
-            float4 t = saturate(float4(saturate(dot(weights, c) - cb5[0].x), saturate(c - cb5[0].yzw)) * cb5[1]);
-            thresholdSum += t.yzw * t.yzw;
-            thresholdLuma += t.x;
-         }
-      }
-      glow += float4(sqrt(thresholdSum * (1.0 / 30.0)), thresholdLuma * (1.0 / 30.0));
-   }
+      glow += GlowSceneThreshold(uv, stepX, stepY, GLOW_PASS0_MATERIAL_CURVE != 0);
 
    return saturate(glow);
 }
