@@ -84,7 +84,7 @@ namespace
       {0xFD4620B9, "fx_refraction"}, {0x7814519F, "fx_track_blur"}, {0xFBA57AE9, "CAS scaled (cs)"}, {0x82DA801B, "CMAA2 apply (cs)"}, {0x4A57A803, "fx_camera_blur"},
       {0x0A4BB34E, "fx_rdiffusion"}, {0x24726E96, "ps_lerp"}, {0xCAEFD55C, "ps_grayscale"}, {0x495BB3CA, "fx_lens_flare"}};
    constexpr uint32_t log_interval_frames = 120;
-   constexpr size_t max_exposure_samples = 16;
+   constexpr uint32_t max_exposure_reads = 16; // per log frame: each one is a staging copy and a GPU sync
 
    void LogFormatted(reshade::log::level level, const char* format, auto... args)
    {
@@ -153,6 +153,7 @@ struct Yakuza3DeviceData final : public GameDeviceData
    bool drew_video = false;
    uint32_t ccr_hash = 0;
    std::vector<std::array<float, 4>> exposure_samples; // Material cb2[14] (scale applied to every material output)
+   uint32_t exposure_reads = 0;
    // Across frames
    bool previous_frame_drew_ccr = true;
    uint32_t frames_without_ccr = 0;
@@ -160,7 +161,7 @@ struct Yakuza3DeviceData final : public GameDeviceData
    std::vector<float> last_logged_ccr_cb5;
    std::vector<float> last_logged_assao_cb0;
    std::unordered_set<uint32_t> logged_watched_hashes;
-   std::unordered_set<uint32_t> logged_custom_size_hashes;
+   std::unordered_set<uint32_t> checked_custom_size_hashes;
    // Staging copy for the one-shot predication mask readback (see LogPredicationStats), allocated on first use.
    com_ptr<ID3D11Texture2D> pred_measure_staging;
    bool pred_measure_pending = false;
@@ -323,11 +324,10 @@ class GameYakuza3 final : public Game
          }
       }
 
-      D3D11_TEXTURE2D_DESC depth_desc = {};
-      com_ptr<ID3D11Resource> depth_resource;
-      if (game_device_data.depth_srv)
-         game_device_data.depth_srv->GetResource(&depth_resource);
-      bool predicate = game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "Y3 SMAA Predication CS"_h) && GetTextureDesc(depth_resource.get(), &depth_desc) && depth_desc.Width == color_desc.Width && depth_desc.Height == color_desc.Height;
+      uint4 depth_size;
+      DXGI_FORMAT depth_format;
+      GetResourceInfo(game_device_data.depth_srv.get(), depth_size, depth_format);
+      bool predicate = game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "Y3 SMAA Predication CS"_h) && depth_size.x == color_desc.Width && depth_size.y == color_desc.Height;
 #if DEVELOPMENT
       predicate = predicate && g_smaa_predication;
 #endif
@@ -443,14 +443,13 @@ class GameYakuza3 final : public Game
 
       com_ptr<ID3D11Buffer> assao_cb;
       native_device_context->PSGetConstantBuffers(0, 1, &assao_cb);
-      com_ptr<ID3D11Resource> depth;
-      if (depth_srv)
-         depth_srv->GetResource(&depth);
-      D3D11_TEXTURE2D_DESC depth_desc;
-      if (!assao_cb || !GetTextureDesc(depth.get(), &depth_desc))
+      uint4 depth_size;
+      DXGI_FORMAT depth_format;
+      GetResourceInfo(depth_srv, depth_size, depth_format);
+      const uint32_t width = depth_size.x;
+      const uint32_t height = depth_size.y;
+      if (!assao_cb || width == 0 || height == 0)
          return false;
-      const uint32_t width = depth_desc.Width;
-      const uint32_t height = depth_desc.Height;
 
       if (game_device_data.gtao_width != width || game_device_data.gtao_height != height)
       {
@@ -711,7 +710,7 @@ public:
                return DrawOrDispatchOverrideType::Replaced;
          }
       }
-      else if (!is_compute && assao_pre_apply_pixel_shaders.contains(hash) && game_device_data.assao_replaced)
+      else if (!is_compute && game_device_data.assao_replaced && assao_pre_apply_pixel_shaders.contains(hash))
       {
          return DrawOrDispatchOverrideType::Replaced;
       }
@@ -808,8 +807,7 @@ public:
             srv->GetResource(&source);
          if (uav)
             uav->GetResource(&target);
-         D3D11_TEXTURE2D_DESC source_desc, target_desc;
-         if (GetTextureDesc(source.get(), &source_desc) && GetTextureDesc(target.get(), &target_desc) && source_desc.Width == target_desc.Width && source_desc.Height == target_desc.Height && source_desc.Format == target_desc.Format)
+         if (source && target && AreResourcesEqual(source.get(), target.get()))
          {
             native_device_context->CopyResource(target.get(), source.get());
 #if DEVELOPMENT
@@ -852,7 +850,7 @@ public:
          game_device_data.drew_video = true;
       }
       // ASSAO prepare constants: depth unpack (cb0[1].x / (cb0[1].y - d), standard Z) and the effect settings to match.
-      else if (!is_compute && hash == 0x972BE5B5 && log_frame && can_read)
+      else if (!is_compute && hash == assao_prepare_pixel_shader && log_frame && can_read)
       {
          com_ptr<ID3D11Buffer> cb;
          native_device_context->PSGetConstantBuffers(0, 1, &cb);
@@ -874,7 +872,7 @@ public:
          }
       }
       // Materials: before the ccr, with the per-material cb1/cb2/cb11 set bound (post passes don't bind cb1).
-      else if (!is_compute && log_frame && can_read && !game_device_data.drew_ccr && game_device_data.exposure_samples.size() < max_exposure_samples)
+      else if (!is_compute && log_frame && can_read && !game_device_data.drew_ccr && game_device_data.exposure_reads++ < max_exposure_reads)
       {
          com_ptr<ID3D11Buffer> cbs[3];
          native_device_context->PSGetConstantBuffers(1, 2, &cbs[0]);
@@ -890,56 +888,43 @@ public:
       }
 
       // Every pass writing the 512x512/512x256 targets upgraded for the DoF: each one now sees fp16 values above 1.
-      if (!is_compute && log_frame && !game_device_data.logged_custom_size_hashes.contains(hash))
+      if (!is_compute && log_frame && game_device_data.checked_custom_size_hashes.insert(hash).second)
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-         com_ptr<ID3D11Resource> target;
-         if (rtv.get())
-            rtv->GetResource(&target);
-         D3D11_TEXTURE2D_DESC desc = {};
-         if (com_ptr<ID3D11Texture2D> texture; target.get() && SUCCEEDED(target->QueryInterface(&texture)))
-            texture->GetDesc(&desc);
-         if (desc.Width == 512 && (desc.Height == 512 || desc.Height == 256))
-         {
-            game_device_data.logged_custom_size_hashes.insert(hash);
-            LogFormatted(reshade::log::level::info, "[Y3] frame %u custom-size target %ux%u format %u written by PS 0x%08X", cb_luma_global_settings.FrameIndex, desc.Width, desc.Height, desc.Format, hash);
-         }
+         uint4 size;
+         DXGI_FORMAT format;
+         GetResourceInfo(rtv.get(), size, format);
+         if (size.x == 512 && (size.y == 512 || size.y == 256))
+            LogFormatted(reshade::log::level::info, "[Y3] frame %u custom-size target %ux%u format %u written by PS 0x%08X", cb_luma_global_settings.FrameIndex, size.x, size.y, format, hash);
       }
 
       if (const auto watched = watched_hashes.find(hash); watched != watched_hashes.end() && !game_device_data.logged_watched_hashes.contains(hash))
       {
          game_device_data.logged_watched_hashes.insert(hash);
-         com_ptr<ID3D11Resource> target;
+         uint4 size;
+         DXGI_FORMAT format;
          if (is_compute)
          {
             com_ptr<ID3D11UnorderedAccessView> uav;
             native_device_context->CSGetUnorderedAccessViews(0, 1, &uav);
-            if (uav.get())
-               uav->GetResource(&target);
+            GetResourceInfo(uav.get(), size, format);
          }
          else
          {
             com_ptr<ID3D11RenderTargetView> rtv;
             native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-            if (rtv.get())
-               rtv->GetResource(&target);
+            GetResourceInfo(rtv.get(), size, format);
          }
-         D3D11_TEXTURE2D_DESC desc = {};
-         if (com_ptr<ID3D11Texture2D> texture; target.get() && SUCCEEDED(target->QueryInterface(&texture)))
-            texture->GetDesc(&desc);
          // t0 is the color input of the DoF and video passes: an 8-bit source there clips before the pass even runs.
-         D3D11_TEXTURE2D_DESC source_desc = {};
+         uint4 source_size = {};
+         DXGI_FORMAT source_format = DXGI_FORMAT_UNKNOWN;
          D3D11_BLEND_DESC blend = {};
          if (!is_compute)
          {
             com_ptr<ID3D11ShaderResourceView> srv;
             native_device_context->PSGetShaderResources(0, 1, &srv);
-            com_ptr<ID3D11Resource> source;
-            if (srv.get())
-               srv->GetResource(&source);
-            if (com_ptr<ID3D11Texture2D> texture; source.get() && SUCCEEDED(source->QueryInterface(&texture)))
-               texture->GetDesc(&source_desc);
+            GetResourceInfo(srv.get(), source_size, source_format);
 
             com_ptr<ID3D11BlendState> blend_state;
             FLOAT blend_factor[4];
@@ -949,7 +934,7 @@ public:
                blend_state->GetDesc(&blend);
          }
          const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend.RenderTarget[0];
-         LogFormatted(reshade::log::level::info, "[Y3] frame %u first %s 0x%08X: target %ux%u format %u, t0 %ux%u format %u, blend %d (color %d/%d, alpha %d/%d), ccr drawn before: %d", cb_luma_global_settings.FrameIndex, watched->second, hash, desc.Width, desc.Height, desc.Format, source_desc.Width, source_desc.Height, source_desc.Format, rt_blend.BlendEnable, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
+         LogFormatted(reshade::log::level::info, "[Y3] frame %u first %s 0x%08X: target %ux%u format %u, t0 %ux%u format %u, blend %d (color %d/%d, alpha %d/%d), ccr drawn before: %d", cb_luma_global_settings.FrameIndex, watched->second, hash, size.x, size.y, format, source_size.x, source_size.y, source_format, rt_blend.BlendEnable, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
       }
 
 #endif
@@ -996,6 +981,7 @@ public:
       game_device_data.drew_ccr = false;
       game_device_data.drew_video = false;
       game_device_data.exposure_samples.clear();
+      game_device_data.exposure_reads = 0;
 #endif
    }
 

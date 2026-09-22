@@ -4,13 +4,13 @@
 //
 // Game specifics (NOTES.md "ASSAO disassembly"):
 // - The whole ASSAO chain (prepare 0x972BE5B5, depth mips 0x1DD919C4, generate 0x47BFF17F/0xD18E0D3F, blurs
-//   0x8CE62D1E/0x15EEFFAF) is skipped. At its apply 0x6A73BA10 these 4 dispatches run at the depth's full resolution
-//   (ASSAO's 4 half-res deinterleaved slices cover the same pixels), then the apply draw runs with Luma_Y3_GTAOApply.hlsl in
-//   place of the native PS, keeping its multiply blend onto the scene mid material stream.
+//   0x8CE62D1E/0x15EEFFAF) is skipped. These 4 dispatches run in place of the prepare, at the depth's full resolution
+//   (ASSAO's 4 half-res deinterleaved slices cover the same pixels); the apply 0x6A73BA10 then draws with
+//   Luma_Y3_GTAOApply.hlsl in place of the native PS, keeping its multiply blend onto the scene mid material stream.
 // - Depth = the prepare's t0: 4K r32 hardware depth, standard Z (sky = 1).
 // - Normals are generated from depth (XE_GTAO_GENERATE_NORMALS): ASSAO's own are depth-derived too, and the game has
 //   no normal buffer.
-// - NDC->view, depth unpack and the radius come from ASSAO's live cb0 (the apply's own b0, rebound PS -> CS), so the
+// - NDC->view, depth unpack and the radius come from ASSAO's live cb0 (the prepare's own b0, rebound PS -> CS), so the
 //   per-shot camera FOV (23..55 degrees measured) is this frame's.
 // - No TAA: NoiseIndex is FROZEN at 0 (a frame index would make the pattern boil) and denoise runs twice.
 

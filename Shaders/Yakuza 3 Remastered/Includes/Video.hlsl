@@ -16,9 +16,6 @@ float3 VideoToOutput(float3 color)
       const float peakNits = lerp(sRGB_WhiteLevelNits, VideoAutoHDRPeakNits, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
       lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
    }
-#if UI_DRAW_TYPE >= 2
-   // Drawn in the UI stage, so pre-scaled like the scene (see ColorCorrect.hlsl) to land at game paper white.
-   lin *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
-   return linear_to_gamma(lin);
+   // Drawn in the UI stage, so encoded like the scene to land at game paper white.
+   return Y3_EncodeOutput(lin);
 }

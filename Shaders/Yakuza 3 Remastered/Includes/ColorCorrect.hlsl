@@ -79,11 +79,10 @@ Texture2D<float4> t2 : register(t2); // mask (r)
 #endif
 
 // Shadow / midtone / highlight weights from the mean of the stage input.
-float3 ZoneWeights(float3 c, bool clampSDR)
+float3 ZoneWeights(float3 c)
 {
-   float m = dot(c, 1.0 / 3.0);
    // Above 1 (HDR only) the vanilla polynomials turn around ((1-m)^2 grows again): hold them at their m = 1 values.
-   m = clampSDR ? m : saturate(m);
+   float m = saturate(dot(c, 1.0 / 3.0));
    float im = 1.0 - m;
    return saturate(float3(im * im, 1.0 - im * im - m * m, m * m));
 }
@@ -130,7 +129,7 @@ float3 HLSStage(float3 c, float3 w)
 // The whole vanilla grade. `clampSDR` true = verbatim; false = the extended HDR function (see header).
 float3 Grade(float3 c, bool clampSDR)
 {
-   const float3 w = ZoneWeights(c, clampSDR);
+   const float3 w = ZoneWeights(c);
 
 #if CCR_HLS
    // HLS is only defined inside [0,1]: grade the color normalized by its max channel and restore the scale
@@ -195,14 +194,15 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
    const float3 sceneSDR = saturate(scene);
    float3 gradedSDR = Grade(sceneSDR, true);
 #if CCR_MASK
-   gradedSDR = (gradedSDR - sceneSDR) * (t2.Sample(s2_s, uv.zw).r * cb4[0].x) + sceneSDR;
+   const float maskWeight = t2.Sample(s2_s, uv.zw).r * cb4[0].x;
+   gradedSDR = (gradedSDR - sceneSDR) * maskWeight + sceneSDR;
 #endif
 
 #if TONEMAP_TYPE >= 1
    const float3 sceneHDR = max(0.0, scene);
    float3 gradedHDR = Grade(sceneHDR, false);
 #if CCR_MASK
-   gradedHDR = (gradedHDR - sceneHDR) * (t2.Sample(s2_s, uv.zw).r * cb4[0].x) + sceneHDR;
+   gradedHDR = (gradedHDR - sceneHDR) * maskWeight + sceneHDR;
 #endif
    float3 extendedBT2020 = BT709_To_BT2020(gamma_to_linear(gradedHDR, GCT_POSITIVE));
 
@@ -221,11 +221,6 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
    float3 color = gamma_to_linear(gradedSDR);
 #endif
 
-#if UI_DRAW_TYPE >= 2
-   // The HUD is drawn on top in gamma SDR; pre-scale so it lands at UI paper white after composition.
-   color *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
-   color = (color == color) ? color : 0.0; // NaN -> 0
-   color = max(0.0, color);
-   return float4(linear_to_gamma(color), colorAlpha);
+   // max also turns NaN into 0 (D3D10+ min/max return the non-NaN operand).
+   return float4(Y3_EncodeOutput(max(0.0, color)), colorAlpha);
 }
