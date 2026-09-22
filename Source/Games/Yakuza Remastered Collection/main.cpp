@@ -31,6 +31,7 @@ namespace
       bool grades_aliased_passthrough_ccr;   // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
       bool glow_downsample_rms;              // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
       bool material_tone_curve;              // Y5R: lit materials tone-compress in-shader (see "PatchY5MaterialToneCurve")
+      bool reversed_depth;                   // Y5R: reversed Z (sky = 0), ASSAO unpacks it as -0.10001 / (-0.0001 - d)
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
 
@@ -42,10 +43,10 @@ namespace
       for (auto& c : exe)
          c = (char)tolower((unsigned char)c);
       if (exe.find("yakuza5") != std::string::npos)
-         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true, false, true};
+         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true, false, true, true};
       if (exe.find("yakuza4") != std::string::npos)
-         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true, false};
-      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false, false, false};
+         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true, false, false};
+      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false, false, false, false};
    }
 
    // User settings, persisted in the [Luma] config section.
@@ -565,7 +566,7 @@ class GameYakuzaRC final : public Game
             if (!bound_depth_srv && game_device_data.FirstLog(SMAADepthRejected))
                LogFormatted(reshade::log::level::warning, "[YRC] frame %u SMAA predication: depth SRV rejected by the runtime", cb_luma_global_settings.FrameIndex);
 #endif
-            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData, 0, 0, g_smaa_pred_tolerance);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData, g_game_profile.reversed_depth ? 1u : 0u, 0, g_smaa_pred_tolerance);
             native_device_context->CSSetShader(device_data.native_compute_shaders.at("YRC SMAA Predication CS"_h).get(), nullptr, 0);
             native_device_context->Dispatch((color_desc.Width + 7) / 8, (color_desc.Height + 7) / 8, 1);
 

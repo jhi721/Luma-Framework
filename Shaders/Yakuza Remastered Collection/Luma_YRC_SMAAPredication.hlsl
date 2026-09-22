@@ -1,12 +1,13 @@
-// SMAA predication signal from the game's R32 scene depth (non-reversed, sky = 1: ASSAO unpacks it as
-// 0.10001 / (1.0001 - d), measured). Copied from Luma_SR3_SMAAPredication.hlsl (a port of Luma_TW2_DepthExtract.hlsl).
+// SMAA predication signal from the game's R32 scene depth (Y3R/Y4R standard, sky = 1: ASSAO unpacks it as
+// 0.10001 / (1.0001 - d); Y5R reversed, sky = 0: 0.10001 / (d + 0.0001), measured; LumaData.CustomData1 != 0).
+// Copied from Luma_SR3_SMAAPredication.hlsl (a port of Luma_TW2_DepthExtract.hlsl).
 //
 // SMAA predicates on a plain first difference between adjacent pixels, and on depth that cannot separate a silhouette
 // from a surface seen edge-on: a plane's own per-pixel change grows with distance, so no remap and no threshold fixes
 // the ratio. Instead this measures the deviation from the local tangent plane: a slope-adjusted second difference with
 // a depth-proportional tolerance, the same math as XeGTAO_CalculateEdges.
 //
-// Depth: with a standard projection 1 - d is about near / distance, so 1 / (1 - d) is proportional to linear view depth;
+// Depth: with a standard projection 1 - d is about near / distance (reversed: d itself), so its reciprocal is proportional to linear view depth;
 // the relative tolerance cancels the unknown near plane, so no camera constants are needed. Sky clamps at 2^-24.
 //
 // Output is edge-ness in [0,1] against the LEFT and TOP neighbours only: SMAA compares centre-vs-left on one axis and
@@ -20,7 +21,8 @@ RWTexture2D<float> edgeness : register(u0);
 
 float LinearDepth(int3 p)
 {
-   return rcp(max(1.0 - depth.Load(p), 1.0 / 16777216.0));
+   const float d = depth.Load(p);
+   return rcp(max(LumaData.CustomData1 != 0u ? d : 1.0 - d, 1.0 / 16777216.0));
 }
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {

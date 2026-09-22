@@ -7,7 +7,7 @@
 //   0x8CE62D1E/0x15EEFFAF) is skipped. These 4 dispatches run in place of the prepare, at the depth's full resolution
 //   (ASSAO's 4 half-res deinterleaved slices cover the same pixels); the apply 0x6A73BA10 then draws with
 //   Luma_YRC_GTAOApply.hlsl in place of the native PS, keeping its multiply blend onto the scene mid material stream.
-// - Depth = the prepare's t0: 4K r32 hardware depth, standard Z (sky = 1).
+// - Depth = the prepare's t0: 4K r32 hardware depth, standard Z (sky = 1) in Y3R/Y4R, reversed (sky = 0) in Y5R.
 // - Normals are generated from depth (XE_GTAO_GENERATE_NORMALS): ASSAO's own are depth-derived too, and the game has
 //   no normal buffer.
 // - NDC->view, depth unpack and the radius come from ASSAO's live cb0 (the prepare's own b0, rebound PS -> CS), so the
@@ -109,10 +109,13 @@ cbuffer LumaGTAO : register(b8)
 #define XE_GTAO_PI                   3.1415926535897932384626433832795
 #define XE_GTAO_PI_HALF              1.5707963267948966192313216916398
 
-// ASSAO's unpack: viewZ = DepthUnpackConsts.x / (DepthUnpackConsts.y - d), measured (0.10001, 1.0001): near 0.1, far 1000.
+// ASSAO's unpack: viewZ = DepthUnpackConsts.x / (DepthUnpackConsts.y - d), measured (0.10001, 1.0001) in Y3R/Y4R and
+// (-0.10001, -0.0001) in Y5R (reversed Z): near 0.1, far 1000. The divisor has the sign of DepthUnpackConsts.x; the guard
+// keeps it (an infinite far plane) so viewZ stays positive.
 float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
 {
-   return assao[1].x / max(assao[1].y - screenDepth, 1e-6);
+   const float divisor = assao[1].y - screenDepth;
+   return assao[1].x / (abs(divisor) > 1e-6 ? divisor : (assao[1].x < 0.0 ? -1e-6 : 1e-6));
 }
 
 // This is also a good place to do non-linear depth conversion for cases where one wants the 'radius' (effectively the threshold between near-field and far-field GI),
