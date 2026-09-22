@@ -31,7 +31,7 @@ namespace
       bool grades_aliased_passthrough_ccr;   // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
       bool glow_downsample_rms;              // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
       bool material_tone_curve;              // Y5R: lit materials tone-compress in-shader (see "PatchY5MaterialToneCurve")
-      bool reversed_depth;                   // Y5R: reversed Z (sky = 0), ASSAO unpacks it as -0.10001 / (-0.0001 - d)
+      bool reversed_depth;                   // Y4R/Y5R: reversed Z (sky = 0), ASSAO unpacks it as -0.1 / (-0.0001 - d)
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
 
@@ -45,7 +45,7 @@ namespace
       if (exe.find("yakuza5") != std::string::npos)
          return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true, false, true, true};
       if (exe.find("yakuza4") != std::string::npos)
-         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true, false, false};
+         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true, false, true};
       return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false, false, false, false};
    }
 

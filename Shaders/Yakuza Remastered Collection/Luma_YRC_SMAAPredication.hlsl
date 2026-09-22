@@ -1,5 +1,5 @@
-// SMAA predication signal from the game's R32 scene depth (Y3R/Y4R standard, sky = 1: ASSAO unpacks it as
-// 0.10001 / (1.0001 - d); Y5R reversed, sky = 0: 0.10001 / (d + 0.0001), measured; LumaData.CustomData1 != 0).
+// SMAA predication signal from the game's R32 scene depth (Y3R standard, sky = 1: ASSAO unpacks it as
+// 0.10001 / (1.0001 - d); Y4R/Y5R reversed, sky = 0: 0.1 / (d + 0.0001), measured; LumaData.CustomData1 != 0).
 // Copied from Luma_SR3_SMAAPredication.hlsl (a port of Luma_TW2_DepthExtract.hlsl).
 //
 // SMAA predicates on a plain first difference between adjacent pixels, and on depth that cannot separate a silhouette
