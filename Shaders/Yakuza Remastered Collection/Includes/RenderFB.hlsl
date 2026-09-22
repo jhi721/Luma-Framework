@@ -1,5 +1,5 @@
-// ps_render_fb, every game: the screen fade/tint, the last pass before the present blit. Vanilla multiplies in
-// linear 2.2 space: pow(pow(x, 2.2) * tint, 1/2.2). On the fp16 chain its input can exceed 1 or carry small negatives
+// ps_render_fb, every game: the screen fade/tint, the last pass before the present blit. Vanilla decodes with a
+// 2.2 power, multiplies by the tint in linear light and re-encodes: pow(pow(x, 2.2) * tint, 1/2.2). On the fp16 chain its input can exceed 1 or carry small negatives
 // (bicubic resample ringing), and pow() of a negative is NaN, so the transfer mirrors the sign.
 #include "Common.hlsl"
 

@@ -5,7 +5,8 @@
 #define ENABLE_SMAA 1
 // Luma Bloom replaces the glow pyramid (see "RunLumaBloom").
 #define ENABLE_BLOOM 1
-// XeGTAO re-issues the ASSAO apply draw with its own pixel shader, so it needs "original_draw_dispatch_func".
+// XeGTAO and Luma Bloom re-issue the game's ASSAO apply and glow_pass2 draws with their own pixel shaders, so they need
+// "original_draw_dispatch_func" (see "DrawWithLumaPixelShader").
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // Effects that relied on the vanilla UNORM clamp get a saturate appended in place, and the Y5R material tone curve is
 // extended in place (see "PatchShaderBytecodeSync").
@@ -26,13 +27,13 @@ namespace
    struct YakuzaGameProfile
    {
       const char* name;
-      std::vector<uint2> dof_custom_sizes;   // Offscreen DoF targets upgraded to fp16 besides the swapchain-sized ones
-      uint32_t glow_downsample_pixel_shader; // Flagged to clamp its source per texel; per game because Y3's 0x54A5E7AC is Y4's ps_cubic
-      bool grades_aliased_passthrough_ccr;   // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
-      bool glow_downsample_rms;              // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
-      bool material_tone_curve;              // Y5R: lit materials tone-compress in-shader (see "PatchY5MaterialToneCurve")
-      bool reversed_depth;                   // Y4R/Y5R: reversed Z (sky = 0), ASSAO unpacks it as -0.1 / (-0.0001 - d)
-      float glow_level0_sigma;               // Luma Bloom's first blur (1024 prefilter -> 512x256 level 0), see kBloomLevelSigma
+      std::vector<uint2> dof_custom_sizes;         // Offscreen DoF targets upgraded to fp16 besides the swapchain-sized ones
+      uint32_t glow_downsample_pixel_shader;       // Flagged to clamp its source per texel; per game because Y3's 0x54A5E7AC is Y4's ps_cubic
+      bool grades_aliased_passthrough_ccr = false; // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
+      bool glow_downsample_rms = false;            // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
+      bool material_tone_curve = false;            // Y5R: lit materials tone-compress in-shader (see "PatchY5MaterialToneCurve")
+      bool reversed_depth = false;                 // Y4R/Y5R: reversed Z (sky = 0), ASSAO unpacks it as -0.1 / (-0.0001 - d)
+      float glow_level0_sigma = 1.f;               // Luma Bloom's first blur (1024 prefilter -> 512x256 level 0), see kBloomLevelSigma
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
 
@@ -44,10 +45,10 @@ namespace
       for (auto& c : exe)
          c = (char)tolower((unsigned char)c);
       if (exe.find("yakuza5") != std::string::npos)
-         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true, false, true, true, 3.f};
+         return {.name = "Yakuza 5 Remastered", .dof_custom_sizes = {{512, 512}, {512, 256}, {256, 256}}, .glow_downsample_pixel_shader = 0x54D6A534, .grades_aliased_passthrough_ccr = true, .material_tone_curve = true, .reversed_depth = true, .glow_level0_sigma = 3.f};
       if (exe.find("yakuza4") != std::string::npos)
-         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true, false, true, 1.f};
-      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false, false, false, false, 1.f};
+         return {.name = "Yakuza 4 Remastered", .dof_custom_sizes = {{1024, 1024}, {512, 512}, {512, 256}}, .glow_downsample_pixel_shader = 0x66633BAD, .glow_downsample_rms = true, .reversed_depth = true};
+      return {.name = "Yakuza 3 Remastered", .dof_custom_sizes = {{512, 512}, {512, 256}}, .glow_downsample_pixel_shader = 0x54A5E7AC};
    }
 
    // User settings, persisted in the [Luma] config section.
@@ -78,8 +79,9 @@ namespace
    const std::unordered_set<uint32_t> glow_pass0_pixel_shaders = {0xB8414674, 0xD31A6374 /*Y5R*/};
    constexpr uint32_t glow_pass1_pixel_shader = 0x9DD96515;
    const std::unordered_set<uint32_t> glow_pass2_pixel_shaders = {0x9083BF34, 0x9E617E0A /*Y4R*/, 0x5F37CDE1 /*Y5R*/};
-   constexpr UINT glow_prefilter_width = 1024; // "glow_prefilter_ps" in Luma_YRC_Bloom.hlsl
-   constexpr UINT glow_prefilter_height = 512;
+   constexpr uint32_t glow_reexpand_pixel_shader = 0xFD753992;     // Y5R ps_down_sample_4x4 (see kBloomLevelSigma)
+   constexpr UINT glow_prefilter_width = YRC_GLOW_PREFILTER_WIDTH; // Includes/GameCBuffers.hlsl
+   constexpr UINT glow_prefilter_height = YRC_GLOW_PREFILTER_HEIGHT;
    constexpr int kBloomMips = 5; // 512x256 down to 32x16, the vanilla levels
    // Vanilla glow_pass1 (Y3 DEV log): 6 taps at +-0.5/1.5/2.5 source texels, near-flat weights 0.1676/0.1671/0.1653
    // (sum 0.5 per side, unit gain) -> sigma 1.70 per axis per level. Level 0 has no pass1 blur, only the 2:1 antialias
@@ -264,6 +266,7 @@ namespace
       GlowReexpandOffsets,
       SMAAReplacedFXAA,
       CASReplacedByCopy,
+      GlowPass2WeightsDiffer,
    };
    constexpr uint32_t log_interval_frames = 120;
    constexpr uint32_t max_exposure_reads = 16; // per log frame: each one is a staging copy and a GPU sync
@@ -1021,7 +1024,8 @@ public:
       if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
          reshade::set_config_value(nullptr, NAME, "BloomEnable", g_luma_bloom_enable);
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Replaces the game's bloom with a smoother HDR bloom.");
+         // Off the canon "wider, softer HDR bloom": its width is fitted to the vanilla glow and it stays within 1 per channel.
+         ImGui::SetTooltip("Replaces the game's bloom with a smoother version of the same glow.");
 
       ImGui::BeginDisabled(!g_luma_bloom_enable);
       if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
@@ -1256,6 +1260,18 @@ public:
       else if (!is_compute && game_device_data.glow_replaced && glow_pass2_pixel_shaders.contains(hash))
       {
          game_device_data.glow_replaced = false;
+#if DEVELOPMENT
+         // The composite applies one weight (cb5[0].yzw) to pass0's rgb + alpha: exact while cb5[0].x matches it.
+         if (cmd_list_data.is_primary && cb_luma_global_settings.FrameIndex % log_interval_frames == 0)
+         {
+            com_ptr<ID3D11Buffer> cb;
+            native_device_context->PSGetConstantBuffers(5, 1, &cb);
+            std::vector<float> data;
+            com_ptr<ID3D11Buffer> cb_copy;
+            if (CopyBuffer(cb, native_device_context, data, cb_copy) && data.size() >= 4 && (data[0] != data[1] || data[0] != data[2] || data[0] != data[3]) && game_device_data.FirstLog(GlowPass2WeightsDiffer))
+               LogFormatted(reshade::log::level::warning, "[YRC] frame %u glow_pass2 cb5[0] (%f %f %f %f): alpha and rgb weights differ, the Luma Bloom composite folds them", cb_luma_global_settings.FrameIndex, data[0], data[1], data[2], data[3]);
+         }
+#endif
          // Without the shader the frame goes without bloom: the native levels were never built.
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
@@ -1385,7 +1401,7 @@ public:
          }
       }
       // Y5R ps_down_sample_4x4: its tap offsets set how much it re-blurs the glow level (see kBloomLevelSigma).
-      if (!is_compute && hash == 0xFD753992 && can_read && game_device_data.FirstLog(GlowReexpandOffsets))
+      if (!is_compute && hash == glow_reexpand_pixel_shader && can_read && game_device_data.FirstLog(GlowReexpandOffsets))
       {
          com_ptr<ID3D11Buffer> vs_cb;
          native_device_context->VSGetConstantBuffers(7, 1, &vs_cb);
@@ -1611,8 +1627,8 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Yakuza 3 Remastered\", \"Yakuza 4 Remastered\" and \"Yakuza 5 Remastered\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR and replaces the game's CMAA2/FXAA with SMAA and its SSAO with XeGTAO.\n"
-         "Enable Anti-Aliasing and Ambient Occlusion in the game's video settings for SMAA and XeGTAO to apply.\n"
+         "It adds HDR and replaces the game's bloom with Luma Bloom, its CMAA2/FXAA with SMAA and its SSAO with XeGTAO.\n"
+         "Enable Anti-Aliasing and Ambient Occlusion in the game's graphics settings for SMAA and XeGTAO to apply.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");

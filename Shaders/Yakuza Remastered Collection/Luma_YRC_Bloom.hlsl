@@ -13,7 +13,7 @@ SamplerState linearSampler : register(s0);
 
 float4 glow_prefilter_ps(float4 pos : SV_Position) : SV_Target
 {
-   const float2 texel = 1.0 / float2(1024.0, 512.0);
+   const float2 texel = 1.0 / float2(YRC_GLOW_PREFILTER_WIDTH, YRC_GLOW_PREFILTER_HEIGHT);
    const float2 uv = pos.xy * texel;
    const bool rms = LumaData.CustomData2 != 0u;
    const float2 footprint = texel * (rms ? 3.0 : 1.0);

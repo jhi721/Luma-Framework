@@ -1,5 +1,5 @@
 // ps_sofdec_h264 (Y4R sh_soul_w64.par / Y5R sh_devil_w64.par; absent in Y3R): CRI Sofdec H.264 video, NV12 (t0 = Y,
-// t1 = interleaved CbCr), BT.601 limited-range YUV -> RGB with a radial 4x4 sinc(x) * sinc(x / 2) reconstruction (Lanczos-2
+// t1 = interleaved CbCr), BT.601 limited-range Y'CbCr -> R'G'B' with a radial 4x4 sinc(x) * sinc(x / 2) reconstruction (Lanczos-2
 // without its window), drawn opaque in the UI stage. Rewritten from the disassembly with the same taps, weights and matrix.
 // Kernel ringing and limited-range excursions leave [0,1] like the other two decoders; the only change is the final output
 // (Includes/Video.hlsl).

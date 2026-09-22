@@ -4,10 +4,10 @@
 // Video AutoHDR peak at full boost.
 static const float VideoAutoHDRPeakNits = 250.0;
 
-// Takes the gamma-space YUV->RGB result and returns it in the post-process space the UI stage expects.
+// Takes the gamma-space Y'CbCr->R'G'B' result and returns it in the post-process space the UI stage expects.
 float3 VideoToOutput(float3 color)
 {
-   // The YUV->RGB conversion overshoots [0,1]; the vanilla UNORM target clipped it.
+   // The Y'CbCr->R'G'B' conversion overshoots [0,1]; the vanilla UNORM target clipped it.
    float3 lin = gamma_to_linear(saturate(color));
    // Boost 0 = peak at sRGB white, where PumboAutoHDR no-ops; it also no-ops in SDR, where the peak is paper white. Kept
    // light because the videos are low bitrate and compression artifacts blow up when pushed hard.

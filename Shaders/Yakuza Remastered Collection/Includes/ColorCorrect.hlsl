@@ -106,7 +106,7 @@ float3 ZoneWeights(float3 sceneSDR)
 }
 
 #if CCR_SC
-// Contrast around 0.5 (lightAdjust) and the brightness offset cb5[0].y, applied to lightness or luma.
+// Contrast around 0.5 (lightAdjust) and the brightness offset cb5[0].y, applied to the HLS lightness coordinate (hls perms) or to luma.
 float ContrastBrightness(float l, float lightAdjust)
 {
    // Cutscene grades reach the pole at lightAdjust = 0.5: vanilla's inf saturated to white, but the extended HDR grade

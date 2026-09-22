@@ -6,6 +6,10 @@
 #include "../../../Source/Core/includes/shader_types.h"
 #endif
 
+// The Luma Bloom prefilter and glow_pass0 targets: main.cpp creates them, Luma_YRC_Bloom/GlowGain.hlsl address them.
+#define YRC_GLOW_PREFILTER_WIDTH  1024
+#define YRC_GLOW_PREFILTER_HEIGHT 512
+
 // Mirrors c++ name spaces.
 namespace CB
 {

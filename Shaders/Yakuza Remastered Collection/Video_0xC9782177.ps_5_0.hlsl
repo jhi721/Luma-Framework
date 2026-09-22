@@ -1,4 +1,4 @@
-// ps_sofdec_qloc (sh_ogre3_w64.par): CRI Sofdec video, BT.601 limited-range YUV -> RGB, drawn opaque in the UI stage. Decompiled
+// ps_sofdec_qloc (sh_ogre3_w64.par): CRI Sofdec video, BT.601 limited-range Y'CbCr -> R'G'B', drawn opaque in the UI stage. Decompiled
 // with 3Dmigoto. The conversion overshoots [0,1] (measured -0.27..1.35 on a real frame); the vanilla UNORM target
 // clipped that, the fp16 chain would keep it (out-of-gamut negatives, super-whites). The only change is the final
 // output: that clamp, then the optional light AutoHDR and the UI-stage paper-white pre-scale (Includes/Video.hlsl).
