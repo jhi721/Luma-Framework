@@ -138,7 +138,9 @@
       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
     </Link>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_4_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_4_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_5_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_5_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Publishing-Release|x64'">
@@ -167,7 +169,9 @@
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_4_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_4_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_5_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_5_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Test-Release|x64'">
@@ -196,7 +200,9 @@
       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
     </Link>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_4_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_4_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_5_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_5_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Development-Release|x64'">
@@ -225,7 +231,9 @@
       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
     </Link>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_YAKUZA_3_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_3_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_4_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_4_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_YAKUZA_5_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_YAKUZA_5_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>

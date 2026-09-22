@@ -1,4 +1,4 @@
-// Shared output of the Sofdec video replacements (Video_0xC9782177, VideoLegacy_0xFD02F404).
+// Shared output of the Sofdec video replacements (Video_0xC9782177, VideoLegacy_0xFD02F404, VideoH264_0xB09E517F).
 #include "Common.hlsl"
 
 // Video AutoHDR peak at full boost.

@@ -88,10 +88,10 @@ namespace
    const std::unordered_set<uint32_t> ccr_hashes = {0x00189B34, 0x085CB5DC, 0x0BD7E699, 0x0C663121, 0x0D70385F, 0x105A4974, 0x16366D61, 0x1A8B8E14, 0x1C68CAB4,
       0x299FC101, 0x2B9CB5CF, 0x2F9F68B6, 0x303C672B, 0x3B334605, 0x3F7303BE, 0x601ABB87, 0x62801D10, 0x653BBD8E, 0x65E3DED9, 0x66523C57, 0x70E5BEF5, 0x9B4BFD8A,
       0xAEE6B7E1, 0xB156D307, 0xC011BB2A, 0xC3458723, 0xC3925A82, 0xCF6F5FDB, 0xD05BC597, 0xD2AD713B, 0xD63B6BAF, 0xD66AFCDA, 0xF15A0660, 0xFB2C3B56};
-   const std::unordered_set<uint32_t> video_hashes = {0xFD02F404 /*ps_sofdec*/, 0xC9782177 /*ps_sofdec_qloc*/};
+   const std::unordered_set<uint32_t> video_hashes = {0xFD02F404 /*ps_sofdec*/, 0xC9782177 /*ps_sofdec_qloc*/, 0xB09E517F /*ps_sofdec_h264 (Y4R/Y5R)*/};
    // Passes whose HDR behavior depends on their target and blend state, which only runtime shows.
    const std::unordered_map<uint32_t, const char*> watched_hashes = {{0x716ADB18, "focus_blur_pass1 (DoF)"}, {0x04359FA6, "focus_blur_pass2 (DoF)"},
-      {0x74E5C6AC, "focus_blur_pass2_mask (DoF)"}, {0xFD02F404, "ps_sofdec"}, {0xC9782177, "ps_sofdec_qloc"}, {0xE1631197, "ps_haze"}, {0x3A7B40E4, "ps_afterimage01"},
+      {0x74E5C6AC, "focus_blur_pass2_mask (DoF)"}, {0xFD02F404, "ps_sofdec"}, {0xC9782177, "ps_sofdec_qloc"}, {0xB09E517F, "ps_sofdec_h264"}, {0xE1631197, "ps_haze"}, {0x3A7B40E4, "ps_afterimage01"},
       {0xFD4620B9, "fx_refraction"}, {0x7814519F, "fx_track_blur"}, {0xFBA57AE9, "CAS scaled (cs)"}, {0x82DA801B, "CMAA2 apply (cs)"}, {0x4A57A803, "fx_camera_blur"},
       {0x0A4BB34E, "fx_rdiffusion"}, {0x24726E96, "ps_lerp"}, {0xCAEFD55C, "ps_grayscale"}, {0x495BB3CA, "fx_lens_flare"},
       {0x54A5E7AC, "ps_down_sample (glow source)"}, {0xB8414674, "glow_pass0"}, {0x9083BF34, "glow_pass2"}};
