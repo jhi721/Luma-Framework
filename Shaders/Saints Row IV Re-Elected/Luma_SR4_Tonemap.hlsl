@@ -16,8 +16,8 @@
 // [final_diffracted], rl_hdr_06 0x9F1F6557 [final_no_lut_diffracted]: that path.
 // rl_hdr_05 0xC235DDDD [no_tonemapping] (PostProcess 0): no bloom, shoulder or LUT; the grain's saturate and the UNORM
 // swapchain were its only clip.
-// Left vanilla: rl_hdr_07 0xFEE7D6DC (no technique name, not seen) and the whole rl_hdr_prince family (never loaded by
-// the exe).
+// Left vanilla: rl_hdr_07 0xFEE7D6DC (no technique name, not seen; its Debug_bloom_buffer / Debug_lummap switches mark a
+// debug view) and the whole rl_hdr_prince family (never loaded by the exe).
 //
 // Scene peak and gamut containment are DICE's; nothing after it re-clamps.
 
@@ -147,7 +147,7 @@ float4 SR4_Output(float3 vanillaLinear, float recoveryGain, float2 uv, float alp
 // Onset in u, the curve's own input. F'(p) = 1.5(1 - p^2), and the tangent's intercept F(p) - p F'(p) = p^3 is positive
 // while F'' = -3u < 0, so every pivot in (0, 1) extends above the curve and the gain is >= 1. 0.35 transfers the
 // Mass Effect 2 recovery by its metrics (the onset at 43% of the curve's white gives 0.30, SDR white recovering 1.35x
-// gives 0.36): SDR white recovers 1.36x and scene 10 reaches ~8.9x paper white before DICE. MELE / RenoDX
+// gives 0.36): SDR white recovers 1.36x and a scene value of 10 reaches ~8.9x paper white before DICE. MELE / RenoDX
 // Hejl-Dawson pivot at mid-gray instead (0.12 here, 80% of a daytime frame) because they feed the continuation through
 // an unclamped LUT; this consumer is the Mass Effect 2 one. The vignette and grain after the shoulder scale the
 // vanilla output this multiplies, so they carry into the highlights.

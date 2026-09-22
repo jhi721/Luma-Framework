@@ -16,9 +16,9 @@
 // Saints Row IV (Volition CTG engine, the 2022 Re-Elected build sr_hv.exe), native D3D11, 64-bit.
 // Same engine and post chain as Saints Row: The Third; the final composite also carries distortion and DoF.
 //
-// Frame (DevKit): FP16 scene (MSAA from display.ini, resolved before the tonemap; no DevKit capture of this build has
-// shown a multisampled scene yet) -> rl_hdr final composite straight into the r8g8b8a8 swapchain -> [PostProcess 2: diffusion DoF on an 8-bit copy of it]
-// -> rl_prim_2d UI, all on display-encoded data.
+// Frame (DevKit): FP16 scene (MSAA from display.ini, resolved before the tonemap) -> rl_hdr final composite straight into
+// the r8g8b8a8 swapchain -> [PostProcess 2: diffusion DoF on an 8-bit copy of it] -> rl_prim_2d UI, all on
+// display-encoded data.
 
 namespace
 {

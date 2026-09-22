@@ -3,11 +3,12 @@
 //
 // The hardware resolve is a plain average of linear HDR samples, before the tonemap: a sample at 16 next to one at 0
 // averages to 8, which the tonemap still maps to white, so bright edges look un-antialiased. Each sample is weighted by
-// 1 / (1 + max3) before averaging (Karis; max3 rather than a weighted sum after AMD's reversible-tonemapper resolve, so edges
-// between two colours keep their hue), which makes bright edges erode instead of expand. The weight must see the displayed
-// exposure, which the scene does not have yet: the game's eye adaptation is Tint_color, applied only in the final composite
-// (measured 0.20-0.33 in Saints Row: The Third), so main.cpp binds last frame's copy of the composite's vc4 here. Without it (first frame) the
-// buffer reads 0 and the weight falls back to 1, a plain box resolve. Alpha keeps the plain average.
+// 1 / (1 + max3) before averaging (Karis; max3 rather than a weighted sum after AMD's reversible-tonemapper resolve, so
+// edges between two colours keep their hue), which makes bright edges erode instead of expand. The weight must see the
+// displayed exposure, which the scene does not have yet: the game's eye adaptation is Tint_color, applied only in the
+// final composite (measured 0.20-0.33 in Saints Row: The Third), so main.cpp binds last frame's copy of the composite's
+// vc4 here. Without it (first frame) the buffer reads 0 and the weight falls back to 1, a plain box resolve. Alpha keeps
+// the plain average.
 
 #include "../Includes/Math.hlsl"
 

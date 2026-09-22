@@ -1,9 +1,10 @@
 // rl_prim_2d_bink_s_01: Bink video, BT.601 limited-range Y'CbCr -> R'G'B', then the game's Tint_saturation around a
 // (0.30, 0.59, 0.11) weighted sum of R'G'B', straight onto the swapchain.
 // Vanilla relied on the r8g8b8a8 swapchain to clamp the conversion; on the upgraded FP16 swapchain it leaks negatives
-// (measured on Saints Row: The Third's same conversion: black bars and dark scenes, ~46% of a frame) and whites up to 1.25. saturate() restores exactly that clamp: a UNORM
-// target clamps the source colour before blending. In HDR, an optional light AutoHDR adds highlights on top; it stays
-// conservative because the videos are low bitrate and compression artifacts blow up when pushed hard.
+// (measured on Saints Row: The Third's same conversion: black bars and dark scenes, ~46% of a frame) and whites up to
+// 1.25. saturate() restores exactly that clamp: a UNORM target clamps the source colour before blending. In HDR, an
+// optional light AutoHDR adds highlights on top; it stays conservative because the videos are low bitrate and
+// compression artifacts blow up when pushed hard.
 
 #include "Includes/Common.hlsl"
 

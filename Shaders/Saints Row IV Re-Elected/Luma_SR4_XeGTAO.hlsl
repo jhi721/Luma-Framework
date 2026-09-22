@@ -5,8 +5,9 @@
 // blur and apply shaders byte-for-byte):
 // - Only rl_ssao_singleframe_calculate (PS 0x624BF56D, SSAO_Level 2/3) is replaced: the first of its 4 draws (one RGBA
 //   channel each) runs these 4 dispatches at the half-res target size, CopyResource'd into the game's target
-//   (r8g8b8a8_unorm in SR4, r16g16b16a16_float once Luma upgrades it), and the other 3 are skipped. Its blur (level 3) and apply (max(1 - avg(rgba), 0.05), multiplied into lighting) stay vanilla, so the
-//   output is AO AMOUNT (0 = open) in all four channels.
+//   (r8g8b8a8_unorm, r16g16b16a16_float once Luma upgrades it), and the other 3 are skipped. Its blur (level 3) and
+//   apply (max(1 - avg(rgba), 0.05), multiplied into lighting) stay vanilla, so the output is AO AMOUNT (0 = open) in
+//   all four channels.
 // - Depth = the calculate's t14 (full-res r24 hardware depth, standard Z), normals = its t13 (full-res r16g16_unorm
 //   Lambert azimuthal view-space normals), both read at the full-res pixel of each target pixel (DepthInputScaleRT).
 // - NDC->view and depth unpack from the game's live vc0 (the calculate's own b0, rebound PS -> CS), so the animated
