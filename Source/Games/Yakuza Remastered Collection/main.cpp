@@ -16,9 +16,10 @@
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 
 // The engine has no tone curve: materials write gamma-space `color * exposure` into an 8-bit scene RT whose UNORM clamp
-// is the only highlight limit (Y5R materials add their own curve, see "PatchY5MaterialToneCurve"). The whole post chain (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized
-// b8g8r8a8/r8g8b8a8 targets, upgraded to fp16 here. The HDR tonemap lives in the "color correct" replacements
-// (Shaders/Yakuza Remastered Collection/Includes/ColorCorrect.hlsl), the first full-screen pass reading the finished scene.
+// is the only highlight limit (Y5R materials add their own curve, see "PatchY5MaterialToneCurve"). The whole post chain
+// (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized b8g8r8a8/r8g8b8a8 targets, upgraded to fp16 here. The HDR
+// tonemap lives in the "color correct" replacements (Shaders/Yakuza Remastered Collection/Includes/ColorCorrect.hlsl),
+// the first full-screen pass reading the finished scene.
 // Hashes are Y3R's unless marked. A hash absent from the running game never matches, so the games' sets are merged;
 // only what is not keyed by a unique hash lives in the game profile.
 
@@ -107,12 +108,12 @@ namespace
    constexpr uint32_t aliased_passthrough_ccr_pixel_shader = 0x2DD46662;
    // Effects drawn into targets that were UNORM in vanilla (the scene RT, the DoF-sized offscreen buffers), which
    // relied on that clamp: particles (ps_ptc_*, blood included), the hit flashes, edges and highlight masks, shockwave,
-   // aura, blood decals, body damage marks, the Y5R haze mask, star glare and DoF alpha passes. On the fp16 chain their colors went far
-   // above 1 (glowing blood) and alphas above 1 extrapolated the blend (black and white streaks). glow_pass1 (0x9DD96515,
-   // every game) is here too: the 512x256 bloom level shares the fp16 DoF size, and the clamp keeps the vanilla bloom
-   // bound. The Y5R menu DoF blur2 (0x9BB484AC) divides by an alpha sum that can be 0: the clamp also turns its NaN into 0,
-   // as the vanilla UNORM store did. Every one has a single o0.xyzw output and a single final ret (checked on the
-   // disassembly); listed from the games' shader archives, the Y4R/Y5R recompiles of the same shaders last.
+   // aura, blood decals, body damage marks, the Y5R haze mask, star glare and DoF alpha passes. On the fp16 chain their
+   // colors went far above 1 (glowing blood) and alphas above 1 extrapolated the blend (black and white streaks).
+   // glow_pass1 (0x9DD96515, every game) is here too: the 512x256 bloom level shares the fp16 DoF size, and the clamp keeps
+   // the vanilla bloom bound. The Y5R menu DoF blur2 (0x9BB484AC) divides by an alpha sum that can be 0: the clamp also
+   // turns its NaN into 0, as the vanilla UNORM store did. Every one has a single o0.xyzw output and a single final ret
+   // (checked on the disassembly); listed from the games' shader archives, the Y4R/Y5R recompiles of the same shaders last.
    const std::unordered_set<uint32_t> unorm_clamped_effect_pixel_shaders = {0x024B22FC, 0x098F82BB, 0x0E0E3FDE, 0x0EA64B7C, 0x1233B2C0, 0x1490E21C, 0x15DBE648, 0x17153683, 0x179EC828, 0x1BFC5407, 0x1C9CF72D, 0x1E7304D2, 0x21F9EE5F, 0x233DF244, 0x23F5C577, 0x262029A4, 0x2707F90E, 0x2A75EC72, 0x2C018858, 0x2E5C72EF, 0x3019A9B8, 0x308E9227, 0x3468253F, 0x3533A116, 0x378AD557, 0x3A25DD61, 0x3BB5AE11, 0x3CCC13A9, 0x412945F3, 0x47F353EE, 0x47F97A40, 0x4A4CBF32, 0x4F656839, 0x5475205C, 0x581526D2, 0x6011CF50, 0x66F39F82, 0x6772EAB4, 0x6DBDDBAD, 0x6DDEF9B7, 0x71DF2C06, 0x747526C6, 0x75F2BE3E, 0x79B54068, 0x7AA982CE, 0x810027FF, 0x90BD986C, 0x9486446E, 0x9552AB8B, 0x96E88E1B, 0x9A735E6D, 0xA38D13EC, 0xA845CFD6, 0xA8E99745, 0xAD1EACD9, 0xB1C465A7, 0xB2EEF041, 0xB795066D, 0xB820683B, 0xB97E0BA0, 0xBEA87CEF, 0xC3F1CC7A, 0xC77EF0DF, 0xCF0DF8B9, 0xD0DF2846, 0xD2CB4337, 0xD939FD47, 0xDF16C6DB, 0xF24C81DF, 0xF2FA9571, 0xF3B188D2, 0xFA77FFFE, 0x9DD96515,
       /*Y4R*/ 0x0DEA8926, 0x13800646, 0x3E46D498, 0x46F3A3D5, 0x93E6D9B7, 0x9BEF0D68, 0xA5E4CDED, 0xA650D8FF,
       /*Y5R*/ 0x01CACE56, 0x03A09BCE, 0x04D2B65E, 0x08729A68, 0x0B3618F8, 0x12FE69CE, 0x22B445CB, 0x27C05456, 0x2A215145, 0x2DF42E11, 0x32895C4E, 0x39AE54DB, 0x39F4C5F7, 0x3B0A6B3A,
@@ -762,7 +763,8 @@ class GameYakuzaRC final : public Game
    }
 
    // At the glow downsample: the 4K glow source (its t0) into the 1024x512 prefilter, clamped per texel as the 8-bit source
-   // was, with the vanilla downsample's footprint. On success, records the level it writes, which glow_pass0 must read.
+   // was, with the vanilla downsample's 5x6 taps (Y4R: RMS over 3x the footprint, standing in for its two RMS stages).
+   // On success, records the level it writes, which glow_pass0 must read.
    static void PrefilterGlowSource(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1319,7 +1321,7 @@ public:
       {
          game_device_data.drew_video = true;
       }
-      // ASSAO prepare constants: depth unpack (cb0[1].x / (cb0[1].y - d), standard Z) and the effect settings to match.
+      // ASSAO prepare constants: depth unpack (cb0[1].x / (cb0[1].y - d); reversed Z in Y4R/Y5R) and the effect settings.
       // Only reached with XeGTAO off: the replaced prepare returns above.
       else if (!is_compute && hash == assao_prepare_pixel_shader && log_frame && can_read)
       {
@@ -1694,7 +1696,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       };
       // The DoF runs before the ccr on offscreen scene copies and blurs (sizes per game, see "DetectGame") that would clip
       // highlights inside the blurred area, so those sizes are upgraded too. The top bloom level shares 512x256, so
-      // glow_pass0/1 saturate to keep the vanilla bloom bound. (Hash-based mirrors don't help: they go through the same size filter.)
+      // glow_pass0/1 saturate to keep the vanilla bloom bound. Hash-based mirrors don't help: they go through the same
+      // size filter.
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomSize;
       g_game_profile = DetectGame();
       texture_format_upgrades_2d_custom_sizes = g_game_profile.dof_custom_sizes;

@@ -1,6 +1,6 @@
 // ps_down_sample_2x4 (Y5R sh_devil_w64.par): 2-tap average of the swapchain-sized glow source into the 512x256 bloom
 // level. The source is fp16 now and is drawn by the materials with the extended tone curve: every texel goes back through
-// the vanilla curve, as vanilla stored it, before this average (flagged draws only, see SampleGlowSource).
+// the vanilla curve, as vanilla stored it, before this average (flagged draws only, as in SampleGlowSource).
 #include "Includes/Common.hlsl"
 
 SamplerState s0_s : register(s0);

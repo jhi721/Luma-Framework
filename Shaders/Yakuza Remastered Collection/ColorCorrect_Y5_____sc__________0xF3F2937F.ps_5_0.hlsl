@@ -1,4 +1,4 @@
-// ps_ccr_____sc_________ (Y5R sh_devil_w64.par): UV in v0, alpha 1. See Includes/ColorCorrect.hlsl.
+// ps_ccr_____sc_________ (Y5R sh_devil_w64.par). See Includes/ColorCorrect.hlsl.
 #define CCR_HLS                       0
 #define CCR_SC                        1
 #define CCR_GM                        0

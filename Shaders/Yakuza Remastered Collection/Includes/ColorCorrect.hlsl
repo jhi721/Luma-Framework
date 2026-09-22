@@ -6,7 +6,7 @@
 //
 // One implementation serves every pixel shader of the family (Y3R/Y4R 34, Y5R 35), selected by defines:
 //   CCR_HLS  HLS hue/lightness/saturation stage (hue -> RGB through the gradient texture t1)
-//   CCR_SC   saturation/contrast stage (inside HLS when CCR_HLS, else in BT.601 YCbCr)
+//   CCR_SC   saturation/contrast stage (inside HLS when CCR_HLS, else in BT.601 Y'CbCr)
 //   CCR_GM   per-zone gamma (pow in the 2.2 domain, min 1)
 //   CCR_GI   per-zone gain (mul_sat)
 //   CCR_OF   per-zone offset (add_sat)

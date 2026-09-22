@@ -1,6 +1,7 @@
 // ps_render_fb, every game: the screen fade/tint, the last pass before the present blit. Vanilla decodes with a
-// 2.2 power, multiplies by the tint in linear light and re-encodes: pow(pow(x, 2.2) * tint, 1/2.2). On the fp16 chain its input can exceed 1 or carry small negatives
-// (bicubic resample ringing), and pow() of a negative is NaN, so the transfer mirrors the sign.
+// 2.2 power, multiplies by the tint in linear light and re-encodes: pow(pow(x, 2.2) * tint, 1/2.2). On the fp16 chain
+// its input can exceed 1 or carry small negatives (bicubic resample ringing), and pow() of a negative is NaN, so the
+// transfer mirrors the sign.
 #include "Common.hlsl"
 
 #ifndef RENDER_FB_SCALE_AND_GAMMA
@@ -20,7 +21,7 @@ float4 RenderFB(float2 uv)
    float4 result;
    float4 color = t0.Sample(s0_s, uv);
 #if RENDER_FB_SCALE_AND_GAMMA
-   // Y5R: a grey scale (x) and a gamma (z) applied in linear.
+   // Y5R: a uniform scale (x) and a power (z), both on linear light.
    result.rgb = linear_to_gamma(safePow(gamma_to_linear(color.rgb, GCT_MIRROR) * cb5[0].x, cb5[0].z), GCT_MIRROR);
 #else
    result.rgb = linear_to_gamma(gamma_to_linear(color.rgb, GCT_MIRROR) * cb5[0].rgb, GCT_MIRROR);

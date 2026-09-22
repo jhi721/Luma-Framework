@@ -333,7 +333,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
    const float3 pixCenterPos = XeGTAO_ComputeViewspacePosition(normalizedScreenPos, viewspaceZ);
    const float3 viewVec = normalize(-pixCenterPos);
 
-   // prevents normals that are facing away from the view vector - xeGTAO struggles with extreme cases, but in Vanilla it seems rare so it's disabled by default
+   // prevents normals that are facing away from the view vector - xeGTAO struggles with extreme cases (disabled in Intel's reference, enabled here)
    viewspaceNormal = normalize(viewspaceNormal + max(0, -dot(viewspaceNormal, viewVec)) * viewVec);
 
 #if DEVELOPMENT
@@ -704,7 +704,7 @@ uint HilbertIndex(uint posX, uint posY)
    return index;
 }
 
-// No TAA: temporalIndex is ALWAYS 0 (frozen pattern — static noise instead of boiling).
+// temporalIndex is always 0 here (no TAA, see the header).
 float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    float2 noise;

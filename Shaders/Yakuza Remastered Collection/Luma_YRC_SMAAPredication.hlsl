@@ -1,5 +1,5 @@
 // SMAA predication signal from the game's R32 scene depth (Y3R standard, sky = 1: ASSAO unpacks it as
-// 0.10001 / (1.0001 - d); Y4R/Y5R reversed, sky = 0: 0.1 / (d + 0.0001), measured; LumaData.CustomData1 != 0).
+// 0.10001 / (1.0001 - d); Y4R/Y5R reversed, sky = 0: about 0.1 / (d + 0.0001), measured; LumaData.CustomData1 != 0).
 // Copied from Luma_SR3_SMAAPredication.hlsl (a port of Luma_TW2_DepthExtract.hlsl).
 //
 // SMAA predicates on a plain first difference between adjacent pixels, and on depth that cannot separate a silhouette
@@ -7,8 +7,9 @@
 // the ratio. Instead this measures the deviation from the local tangent plane: a slope-adjusted second difference with
 // a depth-proportional tolerance, the same math as XeGTAO_CalculateEdges.
 //
-// Depth: with a standard projection 1 - d is about near / distance (reversed: d itself), so its reciprocal is proportional to linear view depth;
-// the relative tolerance cancels the unknown near plane, so no camera constants are needed. Sky clamps at 2^-24.
+// Depth: with a standard projection 1 - d is about near / distance (reversed: d itself), so its reciprocal is
+// proportional to linear view depth; the relative tolerance cancels the unknown near plane, so no camera constants
+// are needed. Sky clamps at 2^-24.
 //
 // Output is edge-ness in [0,1] against the LEFT and TOP neighbours only: SMAA compares centre-vs-left on one axis and
 // centre-vs-top on the other, so a one-sided measure jumps 0 -> 1 exactly ACROSS a silhouette, while a symmetric mask
