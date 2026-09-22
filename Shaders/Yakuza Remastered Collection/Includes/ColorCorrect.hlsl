@@ -4,7 +4,7 @@
 // b8g8r8a8_unorm scene RT, whose UNORM format hard-clips it at 1.0. The first full-screen pass that reads the finished
 // scene is this grade, so it is where Luma rebuilds SDR and HDR from the (now fp16) scene.
 //
-// One implementation serves all 34 pixel shaders of the family, selected by defines:
+// One implementation serves every pixel shader of the family (Y3R/Y4R 34, Y5R 35), selected by defines:
 //   CCR_HLS  HLS hue/lightness/saturation stage (hue -> RGB through the gradient texture t1)
 //   CCR_SC   saturation/contrast stage (inside HLS when CCR_HLS, else in BT.601 YCbCr)
 //   CCR_GM   per-zone gamma (pow in the 2.2 domain, min 1)
@@ -12,6 +12,8 @@
 //   CCR_OF   per-zone offset (add_sat)
 //   CCR_MASK fx_ccr_*_mask: alpha test + lerp to the graded color by the mask texture t2
 //   CCR_COLLECTION ps_color_collection: 5-tap cross blur-sharpen before the grade
+//   CCR_BRIGHTNESS_AFTER_CONTRAST (Y5R builds) the brightness offset cb5[0].y is added after the contrast stage, not before
+//   CCR_NO_ZONES   fx_ccr_*_mask_n (Y5R): no shadow/midtone/highlight terms, only the global cb5[0..3] controls
 // The zone weights (shadow/mid/highlight) always come from the mean of the stage input color. Every stage is
 // transcribed operand-for-operand from the disassembly (ps_ccr_* in data/shader/sh_ogre3_w64.par).
 //
@@ -51,6 +53,12 @@
 #ifndef CCR_COLLECTION
 #define CCR_COLLECTION 0
 #endif
+#ifndef CCR_BRIGHTNESS_AFTER_CONTRAST
+#define CCR_BRIGHTNESS_AFTER_CONTRAST 0
+#endif
+#ifndef CCR_NO_ZONES
+#define CCR_NO_ZONES 0
+#endif
 
 cbuffer cb5 : register(b5)
 {
@@ -81,10 +89,14 @@ Texture2D<float4> t2 : register(t2); // mask (r)
 // Shadow / midtone / highlight weights from the mean of the stage input.
 float3 ZoneWeights(float3 c)
 {
+#if CCR_NO_ZONES
+   return 0.0; // Folds every zone term away, leaving the global controls
+#else
    // Above 1 (HDR only) the vanilla polynomials turn around ((1-m)^2 grows again): hold them at their m = 1 values.
    float m = saturate(dot(c, 1.0 / 3.0));
    float im = 1.0 - m;
    return saturate(float3(im * im, 1.0 - im * im - m * m, m * m));
+#endif
 }
 
 #if CCR_HLS
@@ -106,14 +118,18 @@ float3 HLSStage(float3 c, float3 w)
 
    float satHigh = d / (2.0 - sum);
    float satLow = d / sum;
-   float lightness = sum * 0.5 + cb5[0].y;
 #if CCR_SC
    float satAdjust = dot(cb5[4].xyz, w) + cb5[0].z;
    float lightAdjust = dot(cb5[8].xyz, w) + cb5[0].w;
-   lightness = lightness * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
+#if CCR_BRIGHTNESS_AFTER_CONTRAST
+   float lightness = sum * 0.5 * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust + cb5[0].y;
+#else
+   float lightness = (sum * 0.5 + cb5[0].y) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
+#endif
    float saturation = (lightness < 0.5) ? satLow : satHigh;
    saturation = saturation * satAdjust + saturation;
 #else
+   float lightness = sum * 0.5 + cb5[0].y;
    float saturation = (lightness < 0.5) ? satLow : satHigh;
 #endif
    lightness = saturate(lightness);
@@ -139,8 +155,11 @@ float3 Grade(float3 c, bool clampSDR)
 #elif CCR_SC
    float satAdjust = dot(cb5[4].xyz, w) + cb5[0].z;
    float lightAdjust = dot(cb5[8].xyz, w) + cb5[0].w;
-   float y = dot(float3(0.299, 0.587, 0.114), c) + cb5[0].y;
-   y = y * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
+#if CCR_BRIGHTNESS_AFTER_CONTRAST
+   float y = dot(float3(0.299, 0.587, 0.114), c) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust + cb5[0].y;
+#else
+   float y = (dot(float3(0.299, 0.587, 0.114), c) + cb5[0].y) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
+#endif
    float cb = dot(float3(-0.16874, -0.33126, 0.5), c) * (satAdjust + 1.0);
    float cr = dot(float3(0.5, -0.41869, -0.08131), c) * (satAdjust + 1.0);
    c = float3(y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr, y + 1.772 * cb);
