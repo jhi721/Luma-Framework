@@ -1,7 +1,13 @@
 // ps_glow_pass0, the same math in every game (Y5R only moves the UV to v0): bloom build, a 5x6-tap RMS of the
-// downsampled glow source (t1) x cb5[2], plus (cb11[0].y & 8, unset at runtime) a thresholded term from t0. Vanilla read
-// and wrote 8-bit UNORM targets. The DoF-sized targets are now fp16, so every input and the output are saturated to keep
-// the vanilla bloom bounded. Otherwise verbatim.
+// downsampled glow source (t1) x cb5[2], plus (cb11[0].y & 8: unset in Y3R, set in Y5R) a thresholded term from the scene
+// (t0). Vanilla read and wrote 8-bit UNORM targets. The DoF-sized targets are now fp16, so every input and the output are
+// saturated to keep the vanilla bloom bounded. GLOW_PASS0_MATERIAL_CURVE (Y5R): the scene taps are taken per texel
+// through the vanilla material curve instead (see SampleSaturatedBilinear). Otherwise verbatim.
+#include "Common.hlsl"
+
+#ifndef GLOW_PASS0_MATERIAL_CURVE
+#define GLOW_PASS0_MATERIAL_CURVE 0
+#endif
 
 cbuffer cb5 : register(b5)
 {
@@ -43,7 +49,11 @@ float4 GlowPass0(float2 uv)
       {
          for (int x = -2; x < 3; x++)
          {
+#if GLOW_PASS0_MATERIAL_CURVE
+            float3 c = SampleSaturatedBilinear(t0, s0_s, uv + stepX * x + stepY * y, true).rgb;
+#else
             float3 c = saturate(t0.Sample(s0_s, uv + stepX * x + stepY * y).rgb);
+#endif
             float4 t = saturate(float4(saturate(dot(weights, c) - cb5[0].x), saturate(c - cb5[0].yzw)) * cb5[1]);
             thresholdSum += t.yzw * t.yzw;
             thresholdLuma += t.x;

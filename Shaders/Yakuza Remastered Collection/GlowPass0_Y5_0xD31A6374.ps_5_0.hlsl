@@ -1,4 +1,5 @@
 // ps_glow_pass0 (Y5R sh_devil_w64.par). See Includes/GlowPass0.hlsl.
+#define GLOW_PASS0_MATERIAL_CURVE 1
 #include "Includes/GlowPass0.hlsl"
 
 void main(float2 v0 : TEXCOORD0, out float4 o0 : SV_Target0)
