@@ -300,6 +300,7 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    com_ptr<ID3D11RenderTargetView> glow_prefilter_rtv;
    com_ptr<ID3D11Resource> bloom_resource;
    com_ptr<ID3D11ShaderResourceView> bloom_all_mips_srv;
+   com_ptr<ID3D11Buffer> glow_pass0_cb; // GPU copy of glow_pass0's b5 (its per-scene gains), read by the composite at b6
 
    // XeGTAO scratch, at the depth's size. The size is kept even when the allocation failed: a null set then means
    // "failed", and it is not retried every frame.
@@ -785,9 +786,9 @@ class GameYakuzaRC final : public Game
       return true;
    }
 
-   // At glow_pass0, in place of it: the shared pyramid on the prefilter, its bright pass reading pass0's own cb5 (still
-   // bound). Only when pass0 reads the level the glow downsample just wrote (Y5R downsamples twice; its first level may
-   // be something else), else the native pyramid runs.
+   // At glow_pass0, in place of it: the shared pyramid on the prefilter, and a copy of pass0's constants for the composite.
+   // Only when pass0 reads the level the glow downsample just wrote (Y5R downsamples twice; its first level may be
+   // something else), else the native pyramid runs.
    static bool RunLumaBloom(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -802,6 +803,27 @@ class GameYakuzaRC final : public Game
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       if (!HasShaders(device_data.native_vertex_shaders, "Bloom VS"_h) || !HasShaders(device_data.native_pixel_shaders, "Bloom Prefilter PS"_h, "Bloom Downsample PS"_h, "Bloom Upsample PS"_h, "YRC Bloom Composite PS"_h))
          return false;
+
+      // pass0's gains (cb5[2]) change per scene. The game refills the same dynamic buffer for pass1/pass2, so the composite
+      // gets a GPU-side copy made now.
+      com_ptr<ID3D11Buffer> pass0_cb;
+      native_device_context->PSGetConstantBuffers(5, 1, &pass0_cb);
+      if (!pass0_cb)
+         return false;
+      D3D11_BUFFER_DESC cb_desc;
+      pass0_cb->GetDesc(&cb_desc);
+      D3D11_BUFFER_DESC copy_desc = {};
+      if (game_device_data.glow_pass0_cb)
+         game_device_data.glow_pass0_cb->GetDesc(&copy_desc);
+      if (copy_desc.ByteWidth != cb_desc.ByteWidth)
+      {
+         game_device_data.glow_pass0_cb.reset();
+         copy_desc = {cb_desc.ByteWidth, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
+         if (FAILED(native_device->CreateBuffer(&copy_desc, nullptr, &game_device_data.glow_pass0_cb)))
+            return false;
+      }
+      native_device_context->CopyResource(game_device_data.glow_pass0_cb.get(), pass0_cb.get());
+
       DrawStateStack<DrawStateStackType::FullGraphics> bloom_state;
       bloom_state.Cache(native_device_context, device_data.uav_max_count);
       com_ptr<ID3D11ShaderResourceView> bloom_srv;
@@ -1217,7 +1239,7 @@ public:
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
-         if (original_draw_dispatch_func && composite_ps && game_device_data.bloom_all_mips_srv && size.x != 0 && size.y != 0)
+         if (original_draw_dispatch_func && composite_ps && game_device_data.bloom_all_mips_srv && game_device_data.glow_pass0_cb && size.x != 0 && size.y != 0)
          {
             com_ptr<ID3D11PixelShader> game_ps;
             native_device_context->PSGetShader(&game_ps, nullptr, nullptr);
@@ -1225,6 +1247,10 @@ public:
             native_device_context->PSGetShaderResources(0, 1, &game_srv);
             com_ptr<ID3D11SamplerState> game_sampler;
             native_device_context->PSGetSamplers(0, 1, &game_sampler);
+            com_ptr<ID3D11Buffer> game_cb6;
+            native_device_context->PSGetConstantBuffers(6, 1, &game_cb6);
+            ID3D11Buffer* const pass0_cb = game_device_data.glow_pass0_cb.get();
+            native_device_context->PSSetConstantBuffers(6, 1, &pass0_cb);
             ID3D11ShaderResourceView* const bloom_srv = game_device_data.bloom_all_mips_srv.get();
             ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get();
             native_device_context->PSSetShader(composite_ps.get(), nullptr, 0);
@@ -1236,6 +1262,8 @@ public:
             (*original_draw_dispatch_func)();
             ID3D11ShaderResourceView* const restored_srv = game_srv.get();
             ID3D11SamplerState* const restored_sampler = game_sampler.get();
+            ID3D11Buffer* const restored_cb6 = game_cb6.get();
+            native_device_context->PSSetConstantBuffers(6, 1, &restored_cb6);
             native_device_context->PSSetShaderResources(0, 1, &restored_srv);
             native_device_context->PSSetSamplers(0, 1, &restored_sampler);
             native_device_context->PSSetShader(game_ps.get(), nullptr, 0);
@@ -1528,6 +1556,7 @@ public:
          game_device_data.glow_prefilter_texture.reset();
          game_device_data.glow_prefilter_srv.reset();
          game_device_data.glow_prefilter_rtv.reset();
+         game_device_data.glow_pass0_cb.reset();
       }
       // Turning XeGTAO off gives its scratch back; it is rebuilt on demand.
       if (!g_gtao_enable && game_device_data.gtao_width != 0)

@@ -28,12 +28,18 @@ float4 glow_prefilter_ps(float4 pos : SV_Position) : SV_Target
 }
 
 // Runs as glow_pass2's pixel shader (swapped by main.cpp), keeping its VS, viewport, cb5 and additive blend onto the scene.
-// Vanilla: the 5 levels at 0.2 each, rgb * cb5[0].yzw plus their luma (glow_pass0's weights) * cb5[0].x, saturated.
-// DrawBloom accumulates a_k = 0.5 * m_k + 0.5 * a_k+1, so the equal-weight sum of its 5 levels is 2 * a0 + a1 + a2 + a3.
-// LumaData.CustomData3/4 = 1 / the target size.
+// Vanilla: glow_pass0 writes (glow, luma(glow)) x its cb5[2], per scene (e.g. (1,1,1,1), (0.8,1,1.1,0.2), (1.5,1.5,1,3)),
+// and pass2 takes the 5 levels at 0.2 each, rgb * cb5[0].yzw plus alpha * cb5[0].x, saturated. The blur is linear, so the
+// gains apply to the blurred glow here: rgb * pass0 cb5[2].rgb, alpha = its luma * pass0 cb5[2].w (a copy of pass0's b5
+// made at pass0, at b6). DrawBloom accumulates a_k = 0.5 * m_k + 0.5 * a_k+1, so the equal-weight sum of its 5 levels is
+// 2 * a0 + a1 + a2 + a3. LumaData.CustomData3/4 = 1 / the target size.
 cbuffer GlowPass2 : register(b5)
 {
    float4 cb5[1];
+}
+cbuffer GlowPass0Copy : register(b6)
+{
+   float4 pass0_cb5[3];
 }
 
 float4 bloom_composite_ps(float4 pos : SV_Position) : SV_Target
@@ -43,7 +49,7 @@ float4 bloom_composite_ps(float4 pos : SV_Position) : SV_Target
    for (int mip = 1; mip < 4; mip++)
       s += source.SampleLevel(linearSampler, uv, mip).rgb;
    s *= 0.2;
-   float3 c = saturate(s * cb5[0].yzw + dot(s, float3(0.298912, 0.586611, 0.114478)) * cb5[0].x);
+   float3 c = saturate(s * pass0_cb5[2].rgb * cb5[0].yzw + dot(s, float3(0.298912, 0.586611, 0.114478)) * pass0_cb5[2].w * cb5[0].x);
    c *= LumaSettings.GameSettings.BloomIntensity;
    return float4(c, max3(c));
 }
