@@ -262,6 +262,8 @@ namespace
       ASSAOReplaced,
       GlowDownsampleSampler,
       GlowReexpandOffsets,
+      SMAAReplacedFXAA,
+      CASReplacedByCopy,
    };
    constexpr uint32_t log_interval_frames = 120;
    constexpr uint32_t max_exposure_reads = 16; // per log frame: each one is a staging copy and a GPU sync
@@ -295,13 +297,11 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    bool cmaa2_replaced = false;                 // The CMAA2 chain of this frame is skipped, its apply runs SMAA
    bool smaa_ran = false;                       // The game's CAS becomes a copy (RCAS, when on, already sharpened)
    bool assao_replaced = false;                 // XeGTAO ran at the ASSAO prepare: the chain is skipped, its apply draws XeGTAO
-   com_ptr<ID3D11Resource> glow_level0;         // What the glow downsample wrote, the level glow_pass0 must read for Luma Bloom
-   bool glow_prefiltered = false;               // The Luma Bloom prefilter holds this frame's glow source
+   com_ptr<ID3D11Resource> glow_level0;         // The level the glow downsample wrote, set once the Luma Bloom prefilter ran on it
    bool glow_replaced = false;                  // Luma Bloom ran at glow_pass0: pass1 is skipped, pass2 composites it
 
    // Luma Bloom: the prefiltered glow source [0], glow_pass0's output from it [1] (DrawBloom's input), and a view with every
    // mip of DrawBloom's result (its SRV shows mip 0 only).
-   com_ptr<ID3D11Texture2D> glow_textures[2];
    com_ptr<ID3D11ShaderResourceView> glow_srvs[2];
    com_ptr<ID3D11RenderTargetView> glow_rtvs[2];
    com_ptr<ID3D11Resource> bloom_resource;
@@ -309,7 +309,6 @@ struct YakuzaRCDeviceData final : public GameDeviceData
 
    // XeGTAO scratch, at the depth's size. The size is kept even when the allocation failed: a null set then means
    // "failed", and it is not retried every frame.
-   com_ptr<ID3D11Texture2D> gtao_depth_mips_texture; // R32F view-space depth pyramid
    com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[gtao_depth_mip_count];
    com_ptr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
    com_ptr<ID3D11UnorderedAccessView> gtao_working_uavs[2]; // R8G8_UNORM AO + edges ping-pong
@@ -325,7 +324,6 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    {
       for (int i = 0; i < 2; i++)
       {
-         glow_textures[i].reset();
          glow_srvs[i].reset();
          glow_rtvs[i].reset();
       }
@@ -333,7 +331,6 @@ struct YakuzaRCDeviceData final : public GameDeviceData
 
    void ReleaseGTAOScratch()
    {
-      gtao_depth_mips_texture.reset();
       for (auto& uav : gtao_depth_mip_uavs)
          uav.reset();
       gtao_depth_mips_srv.reset();
@@ -406,16 +403,16 @@ class GameYakuzaRC final : public Game
    // numbers rather than screenshots. On a well-tuned frame the mask is 0 nearly everywhere, so this reports COVERAGE at
    // the level SMAA compares against (0.5) plus the shape either side of it, over every texel. Copies on the frame the
    // button is pressed and maps on a later one (non-blocking). Immediate context only.
-   static void LogPredicationStats(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, YakuzaRCDeviceData& game_device_data, ID3D11Texture2D* mask)
+   static void LogPredicationStats(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, YakuzaRCDeviceData* game_device_data, ID3D11Texture2D* mask)
    {
-      if (!g_smaa_pred_measure && !game_device_data.pred_measure_pending)
+      if (!g_smaa_pred_measure && !game_device_data->pred_measure_pending)
          return;
 
       D3D11_TEXTURE2D_DESC mask_desc;
       mask->GetDesc(&mask_desc);
       D3D11_TEXTURE2D_DESC staging_desc = {};
-      if (game_device_data.pred_measure_staging)
-         game_device_data.pred_measure_staging->GetDesc(&staging_desc);
+      if (game_device_data->pred_measure_staging)
+         game_device_data->pred_measure_staging->GetDesc(&staging_desc);
       if (staging_desc.Width != mask_desc.Width || staging_desc.Height != mask_desc.Height)
       {
          staging_desc = mask_desc;
@@ -423,22 +420,22 @@ class GameYakuzaRC final : public Game
          staging_desc.BindFlags = 0;
          staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
          staging_desc.MiscFlags = 0;
-         game_device_data.pred_measure_staging.reset();
-         game_device_data.pred_measure_pending = false;
-         if (FAILED(native_device->CreateTexture2D(&staging_desc, nullptr, &game_device_data.pred_measure_staging)))
+         game_device_data->pred_measure_staging.reset();
+         game_device_data->pred_measure_pending = false;
+         if (FAILED(native_device->CreateTexture2D(&staging_desc, nullptr, &game_device_data->pred_measure_staging)))
             return;
       }
 
-      if (!game_device_data.pred_measure_pending)
+      if (!game_device_data->pred_measure_pending)
       {
          g_smaa_pred_measure = false;
-         native_device_context->CopyResource(game_device_data.pred_measure_staging.get(), mask);
-         game_device_data.pred_measure_pending = true;
+         native_device_context->CopyResource(game_device_data->pred_measure_staging.get(), mask);
+         game_device_data->pred_measure_pending = true;
          return;
       }
 
       D3D11_MAPPED_SUBRESOURCE mapped = {};
-      if (FAILED(native_device_context->Map(game_device_data.pred_measure_staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) || mapped.pData == nullptr)
+      if (FAILED(native_device_context->Map(game_device_data->pred_measure_staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) || mapped.pData == nullptr)
          return; // Still in flight, retry next frame
 
       constexpr uint32_t bins = 256;
@@ -459,8 +456,8 @@ class GameYakuzaRC final : public Game
                histogram[uint32_t(v * float(bins - 1))]++;
          }
       }
-      native_device_context->Unmap(game_device_data.pred_measure_staging.get(), 0);
-      game_device_data.pred_measure_pending = false;
+      native_device_context->Unmap(game_device_data->pred_measure_staging.get(), 0);
+      game_device_data->pred_measure_pending = false;
 
       const auto fraction_above = [&](float level)
       {
@@ -489,7 +486,7 @@ class GameYakuzaRC final : public Game
 
    // SMAA from "color" into "target" (the same resource for CMAA2, separate for FXAA), then RCAS when sharpness > 0.
    // Returns false, leaving everything untouched, if SMAA can't run.
-   static bool RunSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool& updated_cbuffers, ID3D11Resource* color, ID3D11Resource* target)
+   static bool RunSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers, ID3D11Resource* color, ID3D11Resource* target)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       D3D11_TEXTURE2D_DESC color_desc;
@@ -604,7 +601,7 @@ class GameYakuzaRC final : public Game
          game_device_data.smaa_predication_srv->GetResource(&mask_resource);
          com_ptr<ID3D11Texture2D> mask;
          if (cmd_list_data.is_primary && SUCCEEDED(mask_resource->QueryInterface(&mask)))
-            LogPredicationStats(native_device, native_device_context, game_device_data, mask.get());
+            LogPredicationStats(native_device, native_device_context, &game_device_data, mask.get());
 
          // Calibration view: the single-channel mask lands in red, replacing the frame (black on flat surfaces, red across
          // silhouettes; all red = tolerance too low, all black = too high).
@@ -624,7 +621,7 @@ class GameYakuzaRC final : public Game
       // The SMAA shaders read the canvas size from the Luma settings and the predication scale from the Luma data, in both stages.
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, predicate ? 2.f : 1.f);
-      updated_cbuffers = true;
+      *updated_cbuffers = true;
       DrawSMAA(native_device, native_device_context, device_data, game_device_data.smaa_gamma_rtv.get(), game_device_data.smaa_linear_srv.get(), game_device_data.smaa_gamma_srv.get(), predicate ? game_device_data.smaa_predication_srv.get() : nullptr);
 
       ID3D11Texture2D* result = game_device_data.smaa_gamma_texture.get();
@@ -680,14 +677,15 @@ class GameYakuzaRC final : public Game
          desc.Format = DXGI_FORMAT_R32_FLOAT;
          desc.SampleDesc.Count = 1;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-         bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.gtao_depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(game_device_data.gtao_depth_mips_texture.get(), nullptr, &game_device_data.gtao_depth_mips_srv));
+         com_ptr<ID3D11Texture2D> depth_mips_texture; // R32F view-space depth pyramid
+         bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(depth_mips_texture.get(), nullptr, &game_device_data.gtao_depth_mips_srv));
          D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
          uav_desc.Format = desc.Format;
          uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
          for (UINT mip = 0; ok && mip < gtao_depth_mip_count; mip++)
          {
             uav_desc.Texture2D.MipSlice = mip;
-            ok = SUCCEEDED(native_device->CreateUnorderedAccessView(game_device_data.gtao_depth_mips_texture.get(), &uav_desc, &game_device_data.gtao_depth_mip_uavs[mip]));
+            ok = SUCCEEDED(native_device->CreateUnorderedAccessView(depth_mips_texture.get(), &uav_desc, &game_device_data.gtao_depth_mip_uavs[mip]));
          }
          desc.MipLevels = 1;
          desc.Format = DXGI_FORMAT_R8G8_UNORM;
@@ -761,17 +759,17 @@ class GameYakuzaRC final : public Game
    }
 
    // At the glow downsample: the 4K glow source (its t0) into the 1024x512 prefilter, clamped per texel as the 8-bit source
-   // was, with the vanilla downsample's footprint. Also records the level it writes, which glow_pass0 must read.
-   static bool PrefilterGlowSource(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data)
+   // was, with the vanilla downsample's footprint. On success, records the level it writes, which glow_pass0 must read.
+   static void PrefilterGlowSource(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+      game_device_data.glow_level0.reset();
       com_ptr<ID3D11ShaderResourceView> source_srv;
       native_device_context->PSGetShaderResources(0, 1, &source_srv);
       com_ptr<ID3D11RenderTargetView> level0_rtv;
       native_device_context->OMGetRenderTargets(1, &level0_rtv, nullptr);
       if (!source_srv || !level0_rtv)
-         return false;
-      level0_rtv->GetResource(&game_device_data.glow_level0);
+         return;
 
       if (!game_device_data.glow_rtvs[1])
       {
@@ -786,23 +784,59 @@ class GameYakuzaRC final : public Game
          // [1]'s view is made last: it marks the pair as complete.
          for (int i = 0; i < 2; i++)
          {
-            if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.glow_textures[i])) || FAILED(native_device->CreateShaderResourceView(game_device_data.glow_textures[i].get(), nullptr, &game_device_data.glow_srvs[i])) || FAILED(native_device->CreateRenderTargetView(game_device_data.glow_textures[i].get(), nullptr, &game_device_data.glow_rtvs[i])))
+            com_ptr<ID3D11Texture2D> texture;
+            if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &texture)) || FAILED(native_device->CreateShaderResourceView(texture.get(), nullptr, &game_device_data.glow_srvs[i])) || FAILED(native_device->CreateRenderTargetView(texture.get(), nullptr, &game_device_data.glow_rtvs[i])))
             {
                game_device_data.ReleaseGlowTextures();
-               return false;
+               return;
             }
          }
       }
 
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, "YRC Glow Prefilter PS"_h))
-         return false;
+         return;
       DrawStateStack<DrawStateStackType::FullGraphics> prefilter_state;
       prefilter_state.Cache(native_device_context, device_data.uav_max_count);
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, g_game_profile.material_tone_curve ? 1u : 0u, g_game_profile.glow_downsample_rms ? 1u : 0u);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(), device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("YRC Glow Prefilter PS"_h).get(), source_srv.get(), game_device_data.glow_rtvs[0].get(), glow_prefilter_width, glow_prefilter_height, false);
       prefilter_state.Restore(native_device_context);
-      return true;
+      level0_rtv->GetResource(&game_device_data.glow_level0);
+   }
+
+   // Replays the game's own draw (its VS, viewport, blend and other bindings) with a Luma pixel shader reading `srv` at t0
+   // (and `sampler` at s0, if given), then restores the game's shader and bindings. Draws nothing when the shader is missing
+   // (a reload since the pass that set this draw up).
+   static void DrawWithLumaPixelShader(ID3D11DeviceContext* native_device_context, const DeviceData& device_data, const std::function<void()>& draw, uint32_t ps_hash, ID3D11ShaderResourceView* srv, ID3D11SamplerState* sampler = nullptr)
+   {
+      com_ptr<ID3D11PixelShader> ps;
+      {
+         const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+         if (const auto it = device_data.native_pixel_shaders.find(ps_hash); it != device_data.native_pixel_shaders.end())
+            ps = it->second;
+      }
+      if (!ps)
+         return;
+      com_ptr<ID3D11PixelShader> game_ps;
+      native_device_context->PSGetShader(&game_ps, nullptr, nullptr);
+      com_ptr<ID3D11ShaderResourceView> game_srv;
+      native_device_context->PSGetShaderResources(0, 1, &game_srv);
+      com_ptr<ID3D11SamplerState> game_sampler;
+      if (sampler)
+         native_device_context->PSGetSamplers(0, 1, &game_sampler);
+      native_device_context->PSSetShader(ps.get(), nullptr, 0);
+      native_device_context->PSSetShaderResources(0, 1, &srv);
+      if (sampler)
+         native_device_context->PSSetSamplers(0, 1, &sampler);
+      draw();
+      ID3D11ShaderResourceView* const restored_srv = game_srv.get();
+      native_device_context->PSSetShaderResources(0, 1, &restored_srv);
+      if (sampler)
+      {
+         ID3D11SamplerState* const restored_sampler = game_sampler.get();
+         native_device_context->PSSetSamplers(0, 1, &restored_sampler);
+      }
+      native_device_context->PSSetShader(game_ps.get(), nullptr, 0);
    }
 
    // At glow_pass0, in place of it: pass0's gains and scene term on the prefilter (its constants, sampler and scene still
@@ -853,7 +887,8 @@ class GameYakuzaRC final : public Game
    }
 
 public:
-   // "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp the vanilla UNORM target applied to these effects.
+   // Listed effects get "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp their vanilla UNORM target applied.
+   // Every other Y5R pixel shader goes through "PatchY5MaterialToneCurve".
    std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
    {
       constexpr uint32_t ret_token = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1);
@@ -861,6 +896,8 @@ public:
          return nullptr;
       if (!unorm_clamped_effect_pixel_shaders.contains(uint32_t(shader_hash)))
       {
+         if (!g_game_profile.material_tone_curve)
+            return nullptr;
          const std::vector<uint32_t> patched = PatchY5MaterialToneCurve(reinterpret_cast<const uint32_t*>(code), size / sizeof(uint32_t));
          if (patched.empty())
             return nullptr;
@@ -1094,27 +1131,9 @@ public:
       // The game's apply draw (full-screen VS, viewport, multiply blend onto the scene RT) with the XeGTAO reader as its PS.
       else if (!is_compute && hash == assao_apply_pixel_shader && game_device_data.assao_replaced)
       {
-         com_ptr<ID3D11PixelShader> apply_ps;
-         {
-            const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-            if (const auto it = device_data.native_pixel_shaders.find("YRC GTAO Apply PS"_h); it != device_data.native_pixel_shaders.end())
-               apply_ps = it->second;
-         }
-         // Without it (a shader reload since the prepare) the frame goes without AO: the native inputs were never built.
-         if (original_draw_dispatch_func && apply_ps)
-         {
-            com_ptr<ID3D11PixelShader> game_ps;
-            native_device_context->PSGetShader(&game_ps, nullptr, nullptr);
-            com_ptr<ID3D11ShaderResourceView> game_srv;
-            native_device_context->PSGetShaderResources(0, 1, &game_srv);
-            ID3D11ShaderResourceView* const ao_srv = game_device_data.gtao_final_srv.get();
-            native_device_context->PSSetShader(apply_ps.get(), nullptr, 0);
-            native_device_context->PSSetShaderResources(0, 1, &ao_srv);
-            (*original_draw_dispatch_func)();
-            ID3D11ShaderResourceView* const restored_srv = game_srv.get();
-            native_device_context->PSSetShaderResources(0, 1, &restored_srv);
-            native_device_context->PSSetShader(game_ps.get(), nullptr, 0);
-         }
+         // Without the shader the frame goes without AO: the native inputs were never built.
+         if (original_draw_dispatch_func)
+            DrawWithLumaPixelShader(native_device_context, device_data, *original_draw_dispatch_func, "YRC GTAO Apply PS"_h, game_device_data.gtao_final_srv.get());
          return DrawOrDispatchOverrideType::Replaced;
       }
       else if (is_compute && cmaa2_pre_apply_compute_shaders.contains(hash))
@@ -1144,7 +1163,7 @@ public:
          if (uav)
             uav->GetResource(&canvas);
          if (canvas)
-            RunSMAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers, canvas.get(), canvas.get());
+            RunSMAA(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, canvas.get(), canvas.get());
          return DrawOrDispatchOverrideType::Replaced;
       }
       else if (!is_compute && hash == fxaa_pixel_shader)
@@ -1158,10 +1177,10 @@ public:
             srv->GetResource(&color);
          if (rtv)
             rtv->GetResource(&target);
-         if (color && target && RunSMAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers, color.get(), target.get()))
+         if (color && target && RunSMAA(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, color.get(), target.get()))
          {
 #if DEVELOPMENT
-            if (game_device_data.logged_watched_hashes.insert(hash).second)
+            if (game_device_data.FirstLog(SMAAReplacedFXAA))
                LogFormatted(reshade::log::level::info, "[YRC] frame %u SMAA replaced FXAA", cb_luma_global_settings.FrameIndex);
 #endif
             return DrawOrDispatchOverrideType::Replaced;
@@ -1187,13 +1206,14 @@ public:
          {
             native_device_context->CopyResource(target.get(), source.get());
 #if DEVELOPMENT
-            if (game_device_data.logged_watched_hashes.insert(hash).second)
+            if (game_device_data.FirstLog(CASReplacedByCopy))
                LogFormatted(reshade::log::level::info, "[YRC] frame %u game CAS replaced by a copy (RCAS ran with SMAA)", cb_luma_global_settings.FrameIndex);
 #endif
             return DrawOrDispatchOverrideType::Replaced;
          }
       }
-      // Where it never grades, Core binds the default Luma data (CustomData1 = 0) and the replacement stays a copy.
+      // Off the grade (and in games where it never grades) Core binds the default Luma data (CustomData1 = 0) and the
+      // replacement stays a copy.
       else if (!is_compute && hash == aliased_passthrough_ccr_pixel_shader && g_game_profile.grades_aliased_passthrough_ccr)
       {
          com_ptr<ID3D11RenderTargetView> rtv;
@@ -1201,28 +1221,28 @@ public:
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
-         const bool is_grade = IsOutputSized(device_data, size.x, size.y);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, is_grade ? 1u : 0u);
-         updated_cbuffers = true;
-#if DEVELOPMENT
-         if (is_grade)
+         if (IsOutputSized(device_data, size.x, size.y))
          {
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 1u);
+            updated_cbuffers = true;
+#if DEVELOPMENT
             game_device_data.drew_ccr = true;
             game_device_data.ccr_hash = hash;
-         }
 #endif
+         }
       }
       // The replacement clamps the glow source per texel only on this flag (see SampleGlowSource in Includes/Common.hlsl).
       // Luma Bloom prefilters the same source first; the native downsample still runs (Y5R's exposure meter reads it).
       else if (!is_compute && hash == g_game_profile.glow_downsample_pixel_shader)
       {
-         game_device_data.glow_prefiltered = g_luma_bloom_enable && PrefilterGlowSource(native_device, native_device_context, cmd_list_data, device_data);
+         if (g_luma_bloom_enable)
+            PrefilterGlowSource(native_device, native_device_context, cmd_list_data, device_data);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 1u);
          updated_cbuffers = true;
       }
-      else if (!is_compute && game_device_data.glow_prefiltered && glow_pass0_pixel_shaders.contains(hash))
+      else if (!is_compute && game_device_data.glow_level0 && glow_pass0_pixel_shaders.contains(hash))
       {
          game_device_data.glow_replaced = RunLumaBloom(native_device, native_device_context, cmd_list_data, device_data);
          if (game_device_data.glow_replaced)
@@ -1236,40 +1256,18 @@ public:
       else if (!is_compute && game_device_data.glow_replaced && glow_pass2_pixel_shaders.contains(hash))
       {
          game_device_data.glow_replaced = false;
-         com_ptr<ID3D11PixelShader> composite_ps;
-         {
-            const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-            if (const auto it = device_data.native_pixel_shaders.find("YRC Bloom Composite PS"_h); it != device_data.native_pixel_shaders.end())
-               composite_ps = it->second;
-         }
-         // Without it (a shader reload since glow_pass0) the frame goes without bloom: the native levels were never built.
+         // Without the shader the frame goes without bloom: the native levels were never built.
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
-         if (original_draw_dispatch_func && composite_ps && game_device_data.bloom_all_mips_srv && size.x != 0 && size.y != 0)
+         if (original_draw_dispatch_func && game_device_data.bloom_all_mips_srv && size.x != 0 && size.y != 0)
          {
-            com_ptr<ID3D11PixelShader> game_ps;
-            native_device_context->PSGetShader(&game_ps, nullptr, nullptr);
-            com_ptr<ID3D11ShaderResourceView> game_srv;
-            native_device_context->PSGetShaderResources(0, 1, &game_srv);
-            com_ptr<ID3D11SamplerState> game_sampler;
-            native_device_context->PSGetSamplers(0, 1, &game_sampler);
-            ID3D11ShaderResourceView* const bloom_srv = game_device_data.bloom_all_mips_srv.get();
-            ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get();
-            native_device_context->PSSetShader(composite_ps.get(), nullptr, 0);
-            native_device_context->PSSetShaderResources(0, 1, &bloom_srv);
-            native_device_context->PSSetSamplers(0, 1, &linear_sampler);
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, 1.f / float(size.x), 1.f / float(size.y));
             updated_cbuffers = true;
-            (*original_draw_dispatch_func)();
-            ID3D11ShaderResourceView* const restored_srv = game_srv.get();
-            ID3D11SamplerState* const restored_sampler = game_sampler.get();
-            native_device_context->PSSetShaderResources(0, 1, &restored_srv);
-            native_device_context->PSSetSamplers(0, 1, &restored_sampler);
-            native_device_context->PSSetShader(game_ps.get(), nullptr, 0);
+            DrawWithLumaPixelShader(native_device_context, device_data, *original_draw_dispatch_func, "YRC Bloom Composite PS"_h, game_device_data.bloom_all_mips_srv.get(), device_data.sampler_state_linear.get());
          }
          return DrawOrDispatchOverrideType::Replaced;
       }
@@ -1337,7 +1335,7 @@ public:
          std::vector<float> data;
          com_ptr<ID3D11Buffer> cb_copy;
          // Only material draws count toward the budget (shadow and depth passes come first and bind no cb1/cb2/cb11 set).
-         if (cbs[0].get() && cbs[1].get() && cbs[2].get() && game_device_data.exposure_reads++ < max_exposure_reads && CopyBuffer(cbs[1], native_device_context, data, cb_copy) && data.size() >= 16 * 4)
+         if (cbs[0].get() && cbs[1].get() && cbs[2].get() && ++game_device_data.exposure_reads && CopyBuffer(cbs[1], native_device_context, data, cb_copy) && data.size() >= 16 * 4)
          {
             const size_t scale = g_game_profile.material_tone_curve ? 60 : 56; // cb2[15], Y3R/Y4R cb2[14]
             const std::array<float, 4> exposure = {data[24], data[scale], data[scale + 1], data[scale + 2]};
@@ -1397,7 +1395,7 @@ public:
             LogFormatted(reshade::log::level::info, "[YRC] frame %u ps_down_sample_4x4 VS cb7[0]: (%f %f %f %f) (256x128 source texel = %f %f)", cb_luma_global_settings.FrameIndex, data[0], data[1], data[2], data[3], 1.f / 256.f, 1.f / 128.f);
       }
       const bool is_glow_pass0 = !is_compute && glow_pass0_pixel_shaders.contains(hash);
-      if ((is_glow_pass0 || (!is_compute && glow_pass2_pixel_shaders.contains(hash))) && log_frame && can_read)
+      if (log_frame && can_read && (is_glow_pass0 || (!is_compute && glow_pass2_pixel_shaders.contains(hash))))
       {
          // pass0: cb5[0] luma/rgb threshold, cb5[1] threshold scale, cb5[2] source scale, cb11[0].y & 8 = scene threshold on.
          // pass2: cb5[0].x luma term, .yzw rgb scale of the 5-level sum.
@@ -1428,7 +1426,7 @@ public:
 
       // glow_pass1 (8 draws: 4 levels, H then V): its 6 tap weights (PS cb5[1..3], taps at +-0.5/1.5/2.5 x VS cb7[0].xy)
       // and sizes, from which the Luma Bloom widths are set.
-      if (!is_compute && hash == glow_pass1_pixel_shader && can_read && game_device_data.glow_pass1_draws < 8)
+      if (!is_compute && hash == glow_pass1_pixel_shader && log_frame && can_read && game_device_data.glow_pass1_draws < 8)
       {
          const uint32_t draw = game_device_data.glow_pass1_draws++;
          com_ptr<ID3D11Buffer> ps_cb, vs_cb;
@@ -1444,7 +1442,7 @@ public:
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), target_size, format);
          GetResourceInfo(srv.get(), source_size, format);
-         if (log_frame && CopyBuffer(ps_cb, native_device_context, ps_data, cb_copy) && ps_data.size() >= 16 && CopyBuffer(vs_cb, native_device_context, vs_data, cb_copy) && vs_data.size() >= 4)
+         if (CopyBuffer(ps_cb, native_device_context, ps_data, cb_copy) && ps_data.size() >= 16 && CopyBuffer(vs_cb, native_device_context, vs_data, cb_copy) && vs_data.size() >= 4)
          {
             std::vector<float> data(ps_data.begin(), ps_data.begin() + 16);
             data.insert(data.end(), vs_data.begin(), vs_data.begin() + 4);
@@ -1459,7 +1457,7 @@ public:
 
       // DoF composites: alpha = saturate(depth term) * cb5[0].z (pass2_mask also * mask * cb5[1].x); a scale above 1 would
       // extrapolate the blend into the fp16 scene.
-      if (!is_compute && dof_composite_pixel_shaders.contains(hash) && log_frame && can_read)
+      if (!is_compute && log_frame && can_read && dof_composite_pixel_shaders.contains(hash))
       {
          com_ptr<ID3D11Buffer> cb;
          native_device_context->PSGetConstantBuffers(5, 1, &cb);
@@ -1560,11 +1558,10 @@ public:
       game_device_data.cmaa2_replaced = false;
       game_device_data.smaa_ran = false;
       game_device_data.assao_replaced = false;
-      game_device_data.glow_prefiltered = false;
       game_device_data.glow_replaced = false;
       game_device_data.glow_level0.reset();
       // Turning Luma Bloom off gives its textures back; they are rebuilt on demand.
-      if (!g_luma_bloom_enable && game_device_data.glow_textures[0])
+      if (!g_luma_bloom_enable && game_device_data.glow_srvs[0])
          game_device_data.ReleaseGlowTextures();
       // Turning XeGTAO off gives its scratch back; it is rebuilt on demand.
       if (!g_gtao_enable && game_device_data.gtao_width != 0)

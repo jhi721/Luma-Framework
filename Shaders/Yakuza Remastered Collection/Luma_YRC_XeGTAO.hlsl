@@ -74,10 +74,6 @@ cbuffer LumaGTAO : register(b8)
 #define THIN_OCCLUDER_COMPENSATION 0.0 // Default 0.0; > 0 causes more mistakes than it fixes on big geometry
 #endif
 
-#ifndef FINAL_VALUE_POWER
-#define FINAL_VALUE_POWER 0.8 // Default 2.2; shadow default for FinalValuePowerRT (the CB value is what actually applies)
-#endif
-
 #ifndef DEPTH_MIP_SAMPLING_OFFSET
 #define DEPTH_MIP_SAMPLING_OFFSET 3.3 // Default 3.3
 #endif
