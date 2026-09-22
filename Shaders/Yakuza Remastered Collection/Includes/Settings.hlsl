@@ -4,7 +4,7 @@
 // Include this after the global "Settings.hlsl" file
 
 /////////////////////////////////////////
-// Yakuza 3 Remastered LUMA advanced settings
+// Yakuza Remastered Collection LUMA advanced settings
 // (note that the defaults might be mirrored in c++, the shader values will be overridden anyway)
 /////////////////////////////////////////
 

@@ -1,4 +1,4 @@
-// Yakuza 3 Remastered — Luma HDR replacement for the engine's "color correct" family (CScreenEffectColorCorrect).
+// Yakuza Remastered Collection — Luma HDR replacement for the engine's "color correct" family (CScreenEffectColorCorrect).
 //
 // The engine has no tone curve: every material writes `color * exposure` (gamma space, 2.2) straight into the 8-bit
 // b8g8r8a8_unorm scene RT, whose UNORM format hard-clips it at 1.0. The first full-screen pass that reads the finished

@@ -1,4 +1,4 @@
-// XeGTAO adapted for Yakuza 3 Remastered (QLOC PC port, native D3D11): replaces the game's Intel ASSAO.
+// XeGTAO adapted for Yakuza Remastered Collection (QLOC PC port, native D3D11): replaces the game's Intel ASSAO.
 // Source: https://github.com/GameTechDev/XeGTAO
 // Forked from Luma_TW2_XeGTAO.hlsl (depth-derived normals); only the game-specific inputs differ.
 //

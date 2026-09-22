@@ -1,4 +1,4 @@
-#define GAME_YAKUZA_3 1
+#define GAME_YAKUZA_REMASTERED_COLLECTION 1
 
 #define DISABLE_AUTO_DEBUGGER 1
 // SMAA replaces the game's CMAA2 or FXAA (see "RunSMAA").
@@ -14,7 +14,7 @@
 // The engine has no tone curve: materials write gamma-space `color * exposure` into an 8-bit scene RT whose UNORM clamp
 // is the only highlight limit. The whole post chain (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized
 // b8g8r8a8/r8g8b8a8 targets, upgraded to fp16 here. The HDR tonemap lives in the "color correct" replacements
-// (Shaders/Yakuza 3 Remastered/Includes/ColorCorrect.hlsl), the first full-screen pass reading the finished scene.
+// (Shaders/Yakuza Remastered Collection/Includes/ColorCorrect.hlsl), the first full-screen pass reading the finished scene.
 
 namespace
 {
@@ -1118,7 +1118,7 @@ public:
 
    void PrintImGuiAbout() override
    {
-      ImGui::Text("Yakuza 3 Remastered Luma mod - about and credits section", "");
+      ImGui::Text("Yakuza Remastered Collection Luma mod - about and credits section", "");
    }
 };
 
@@ -1126,7 +1126,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 {
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
-      Globals::SetGlobals(PROJECT_NAME, "Yakuza 3 Remastered Luma mod", "", 1);
+      Globals::SetGlobals(PROJECT_NAME, "Yakuza Remastered Collection Luma mod", "", 1);
       Globals::DEVELOPMENT_STATE = Globals::ModDevelopmentState::WorkInProgress;
 
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;

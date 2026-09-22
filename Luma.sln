@@ -143,7 +143,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mass Effect", "Source\Games
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Snowbreak Containment Zone", "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj", "{FFBF1DD9-341B-4CFE-859D-F10F9620220E}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Yakuza 3 Remastered", "Source\Games\Yakuza 3 Remastered\Yakuza 3 Remastered.vcxproj", "{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Yakuza Remastered Collection", "Source\Games\Yakuza Remastered Collection\Yakuza Remastered Collection.vcxproj", "{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
