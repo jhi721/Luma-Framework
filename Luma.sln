@@ -143,6 +143,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mass Effect", "Source\Games
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Snowbreak Containment Zone", "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj", "{FFBF1DD9-341B-4CFE-859D-F10F9620220E}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Yakuza 3 Remastered", "Source\Games\Yakuza 3 Remastered\Yakuza 3 Remastered.vcxproj", "{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Development-Debug|Win32 = Development-Debug|Win32
@@ -871,6 +873,18 @@ Global
 		{33BB6556-9FBE-4F1A-880A-FE90DB1C2603}.Test-Release|Win32.ActiveCfg = Test-Release|x64
 		{33BB6556-9FBE-4F1A-880A-FE90DB1C2603}.Test-Release|x64.ActiveCfg = Test-Release|x64
 		{33BB6556-9FBE-4F1A-880A-FE90DB1C2603}.Test-Release|x64.Build.0 = Test-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Development-Debug|x64.Build.0 = Development-Debug|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Development-Release|Win32.ActiveCfg = Development-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Development-Release|x64.ActiveCfg = Development-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Development-Release|x64.Build.0 = Development-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Publishing-Release|x64.ActiveCfg = Publishing-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Publishing-Release|x64.Build.0 = Publishing-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Test-Release|Win32.ActiveCfg = Test-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Test-Release|x64.ActiveCfg = Test-Release|x64
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8}.Test-Release|x64.Build.0 = Test-Release|x64
 		{7D3E1C92-5A64-4B18-9F2A-1E8C4D6B0A37}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
 		{7D3E1C92-5A64-4B18-9F2A-1E8C4D6B0A37}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
 		{7D3E1C92-5A64-4B18-9F2A-1E8C4D6B0A37}.Development-Debug|x64.Build.0 = Development-Debug|x64
@@ -1064,6 +1078,7 @@ Global
 		{1180032D-8EEB-4A60-B120-E838393947DF} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{B0DE12A4-5C7A-4E91-9F3B-08891303C0DE} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{33BB6556-9FBE-4F1A-880A-FE90DB1C2603} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{3064F49A-0C9F-4FB3-B03A-94FF7604BBE8} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{7D3E1C92-5A64-4B18-9F2A-1E8C4D6B0A37} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{17FBB4FD-8E4E-4E61-AC32-BBEBA09B8D18} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{935A2A28-2CE7-4F7A-96AE-964AEDEDC952} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
