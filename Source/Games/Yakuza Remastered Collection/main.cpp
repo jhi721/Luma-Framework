@@ -77,8 +77,9 @@ namespace
    constexpr UINT glow_prefilter_width = 1024; // "glow_prefilter_ps" in Luma_YRC_Bloom.hlsl
    constexpr UINT glow_prefilter_height = 512;
    constexpr int kBloomMips = 5; // 512x256 down to 32x16, the vanilla levels
-   // Placeholders until the vanilla glow_pass1 weights are measured (DEV log).
-   constexpr float kBloomSigmas[kBloomMips] = {1.f, 1.3f, 1.3f, 1.3f, 1.3f};
+   // Vanilla glow_pass1 (Y3 DEV log): 6 taps at +-0.5/1.5/2.5 source texels, near-flat weights 0.1676/0.1671/0.1653
+   // (sum 0.5 per side, unit gain) -> sigma 1.70 per axis per level. Level 0 has no pass1 blur, only the 2:1 antialias.
+   constexpr float kBloomSigmas[kBloomMips] = {1.f, 1.7f, 1.7f, 1.7f, 1.7f};
    constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_YRC_XeGTAO.hlsl
    // Readers of the 4K r32 scene depth at t0: the ASSAO prepare, and a full-screen depth restore (also used by prepasses;
    // the last one before the AA, after ASSAO, reads the main depth). Captured for SMAA predication.
