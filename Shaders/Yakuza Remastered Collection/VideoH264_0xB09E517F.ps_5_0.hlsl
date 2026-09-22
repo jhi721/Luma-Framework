@@ -1,7 +1,8 @@
 // ps_sofdec_h264 (Y4R sh_soul_w64.par / Y5R sh_devil_w64.par; absent in Y3R): CRI Sofdec H.264 video, NV12 (t0 = Y,
-// t1 = interleaved CbCr), BT.601 limited-range YUV -> RGB with a radial 4x4 Lanczos-2 reconstruction, drawn opaque in the UI
-// stage. Rewritten from the disassembly with the same taps, weights and matrix. Lanczos ringing and limited-range excursions
-// leave [0,1] like the other two decoders; the only change is the final output (Includes/Video.hlsl).
+// t1 = interleaved CbCr), BT.601 limited-range YUV -> RGB with a radial 4x4 sinc(x) * sinc(x / 2) reconstruction (Lanczos-2
+// without its window), drawn opaque in the UI stage. Rewritten from the disassembly with the same taps, weights and matrix.
+// Kernel ringing and limited-range excursions leave [0,1] like the other two decoders; the only change is the final output
+// (Includes/Video.hlsl).
 #include "Includes/Video.hlsl"
 
 Texture2D<float4> t0 : register(t0);
@@ -29,7 +30,7 @@ void main(
       [unroll] for (int x = -1; x <= 2; x++)
       {
          const float2 tap = base + float2(x, y);
-         // Radial Lanczos-2, with its limit pi^2/2 at the center.
+         // Radial sinc(x) * sinc(x / 2), not windowed at 2, with its limit pi^2/2 at the center.
          const float d = length(tap - pos);
          const float weight = d == 0.0 ? 4.93480206 : sin(d * 1.57079637) * sin(d * 3.14159274) / (d * d);
          const float2 uv = (tap + 0.5) / size;
