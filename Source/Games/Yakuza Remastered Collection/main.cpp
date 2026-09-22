@@ -58,8 +58,8 @@ namespace
    constexpr uint32_t assao_prepare_pixel_shader = 0x972BE5B5;
    const std::unordered_set<uint32_t> assao_pre_apply_pixel_shaders = {0x1DD919C4, 0x47BFF17F, 0xD18E0D3F, 0x8CE62D1E, 0x15EEFFAF};
    constexpr uint32_t assao_apply_pixel_shader = 0x6A73BA10;
-   constexpr UINT gtao_knobs_cb_slot = 8;   // "register(b8)" in Luma_Y3_XeGTAO.hlsl
-   constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_Y3_XeGTAO.hlsl
+   constexpr UINT gtao_knobs_cb_slot = 8;   // "register(b8)" in Luma_YRC_XeGTAO.hlsl
+   constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_YRC_XeGTAO.hlsl
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
@@ -113,7 +113,7 @@ namespace
 } // namespace
 #endif
 
-struct Yakuza3DeviceData final : public GameDeviceData
+struct YakuzaRCDeviceData final : public GameDeviceData
 {
    // SMAA inputs: a snapshot of the gamma canvas (the target may be the canvas itself, so SMAA cannot also sample it) and
    // its linear-light decode. SMAA writes its output into the snapshot (only edge detection reads it, before that); RCAS
@@ -190,18 +190,18 @@ struct Yakuza3DeviceData final : public GameDeviceData
 #endif
 };
 
-class GameYakuza3 final : public Game
+class GameYakuzaRC final : public Game
 {
-   static Yakuza3DeviceData& GetGameDeviceData(DeviceData& device_data)
+   static YakuzaRCDeviceData& GetGameDeviceData(DeviceData& device_data)
    {
-      return *static_cast<Yakuza3DeviceData*>(device_data.game);
+      return *static_cast<YakuzaRCDeviceData*>(device_data.game);
    }
 
    // SMAA (+ RCAS) runs on the post-ccr fp16 canvas at output resolution; anything else (render scale below 100%, SDR
    // targets) keeps the game's own AA. The caller holds s_mutex_shader_objects.
    static bool CanRunSMAA(const DeviceData& device_data, const D3D11_TEXTURE2D_DESC& color_desc)
    {
-      return g_smaa_enable && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.SampleDesc.Count == 1 && color_desc.ArraySize == 1 && color_desc.Width == uint32_t(device_data.output_resolution.x + 0.5f) && color_desc.Height == uint32_t(device_data.output_resolution.y + 0.5f) && HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h, "Y3 Sharpen PS"_h) && HasShaders(device_data.native_compute_shaders, "Y3 SMAA Linearize CS"_h);
+      return g_smaa_enable && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.SampleDesc.Count == 1 && color_desc.ArraySize == 1 && color_desc.Width == uint32_t(device_data.output_resolution.x + 0.5f) && color_desc.Height == uint32_t(device_data.output_resolution.y + 0.5f) && HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h, "YRC Sharpen PS"_h) && HasShaders(device_data.native_compute_shaders, "YRC SMAA Linearize CS"_h);
    }
 
 #if DEVELOPMENT
@@ -209,7 +209,7 @@ class GameYakuza3 final : public Game
    // numbers rather than screenshots. On a well-tuned frame the mask is 0 nearly everywhere, so this reports COVERAGE at
    // the level SMAA compares against (0.5) plus the shape either side of it, over every texel. Copies on the frame the
    // button is pressed and maps on a later one (non-blocking). Immediate context only.
-   static void LogPredicationStats(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Yakuza3DeviceData& game_device_data, ID3D11Texture2D* mask)
+   static void LogPredicationStats(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, YakuzaRCDeviceData& game_device_data, ID3D11Texture2D* mask)
    {
       if (!g_smaa_pred_measure && !game_device_data.pred_measure_pending)
          return;
@@ -284,7 +284,7 @@ class GameYakuza3 final : public Game
          }
          return 1.f;
       };
-      LogFormatted(reshade::log::level::info, "[Y3-Pred] tol=%.4f | FIRES(>0.5)=%.3f%% | >0.1=%.3f%% >0.25=%.3f%% >0.75=%.3f%% >0.9=%.3f%% | flat(bin0)=%.2f%% | p50=%.3f p90=%.3f p99=%.3f p999=%.3f | nonfinite=%llu | %ux%u",
+      LogFormatted(reshade::log::level::info, "[YRC-Pred] tol=%.4f | FIRES(>0.5)=%.3f%% | >0.1=%.3f%% >0.25=%.3f%% >0.75=%.3f%% >0.9=%.3f%% | flat(bin0)=%.2f%% | p50=%.3f p90=%.3f p99=%.3f p999=%.3f | nonfinite=%llu | %ux%u",
          g_smaa_pred_tolerance, fraction_above(0.5f), fraction_above(0.1f), fraction_above(0.25f), fraction_above(0.75f), fraction_above(0.9f), 100.0 * double(histogram[0]) / double(total),
          percentile(0.5), percentile(0.9), percentile(0.99), percentile(0.999), (unsigned long long)non_finite, mask_desc.Width, mask_desc.Height);
    }
@@ -349,7 +349,7 @@ class GameYakuza3 final : public Game
       uint4 depth_size;
       DXGI_FORMAT depth_format;
       GetResourceInfo(game_device_data.depth_srv.get(), depth_size, depth_format);
-      bool predicate = game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "Y3 SMAA Predication CS"_h) && depth_size.x == color_desc.Width && depth_size.y == color_desc.Height;
+      bool predicate = game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "YRC SMAA Predication CS"_h) && depth_size.x == color_desc.Width && depth_size.y == color_desc.Height;
 #if DEVELOPMENT
       predicate = predicate && g_smaa_predication;
 #endif
@@ -362,7 +362,7 @@ class GameYakuza3 final : public Game
          ID3D11ShaderResourceView* const gamma_srv = game_device_data.smaa_gamma_srv.get();
          native_device_context->CSSetUnorderedAccessViews(0, 1, &linear_uav, nullptr);
          native_device_context->CSSetShaderResources(0, 1, &gamma_srv);
-         native_device_context->CSSetShader(device_data.native_compute_shaders.at("Y3 SMAA Linearize CS"_h).get(), nullptr, 0);
+         native_device_context->CSSetShader(device_data.native_compute_shaders.at("YRC SMAA Linearize CS"_h).get(), nullptr, 0);
          native_device_context->Dispatch((color_desc.Width + 7) / 8, (color_desc.Height + 7) / 8, 1);
          if (predicate)
          {
@@ -383,10 +383,10 @@ class GameYakuza3 final : public Game
             com_ptr<ID3D11ShaderResourceView> bound_depth_srv;
             native_device_context->CSGetShaderResources(0, 1, &bound_depth_srv);
             if (!bound_depth_srv && game_device_data.logged_watched_hashes.insert(2u).second)
-               LogFormatted(reshade::log::level::warning, "[Y3] frame %u SMAA predication: depth SRV rejected by the runtime", cb_luma_global_settings.FrameIndex);
+               LogFormatted(reshade::log::level::warning, "[YRC] frame %u SMAA predication: depth SRV rejected by the runtime", cb_luma_global_settings.FrameIndex);
 #endif
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData, 0, 0, g_smaa_pred_tolerance);
-            native_device_context->CSSetShader(device_data.native_compute_shaders.at("Y3 SMAA Predication CS"_h).get(), nullptr, 0);
+            native_device_context->CSSetShader(device_data.native_compute_shaders.at("YRC SMAA Predication CS"_h).get(), nullptr, 0);
             native_device_context->Dispatch((color_desc.Width + 7) / 8, (color_desc.Height + 7) / 8, 1);
 
             if (om_dsv)
@@ -436,7 +436,7 @@ class GameYakuza3 final : public Game
          DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
          sharpen_state.Cache(native_device_context, device_data.uav_max_count);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, g_rcas_sharpness);
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("Y3 Sharpen PS"_h).get(), game_device_data.smaa_gamma_srv.get(), game_device_data.smaa_linear_rtv.get(), color_desc.Width, color_desc.Height, false);
+         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("YRC Sharpen PS"_h).get(), game_device_data.smaa_gamma_srv.get(), game_device_data.smaa_linear_rtv.get(), color_desc.Width, color_desc.Height, false);
          sharpen_state.Restore(native_device_context);
          result = game_device_data.smaa_linear_texture.get();
       }
@@ -445,7 +445,7 @@ class GameYakuza3 final : public Game
 #if DEVELOPMENT
       // Keys 0/1 (no real shader hash) log the first SMAA run without and with predication.
       if (game_device_data.logged_watched_hashes.insert(predicate ? 1u : 0u).second)
-         LogFormatted(reshade::log::level::info, "[Y3] frame %u SMAA ran (predication %d, %ux%u)", cb_luma_global_settings.FrameIndex, predicate, color_desc.Width, color_desc.Height);
+         LogFormatted(reshade::log::level::info, "[YRC] frame %u SMAA ran (predication %d, %ux%u)", cb_luma_global_settings.FrameIndex, predicate, color_desc.Width, color_desc.Height);
 #endif
       return true;
    }
@@ -460,7 +460,7 @@ class GameYakuza3 final : public Game
       // Held through the passes so a shader reload cannot release them mid-use.
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       const auto& shaders = device_data.native_compute_shaders;
-      if (!HasShaders(shaders, "Y3 XeGTAO Prefilter Depths CS"_h, "Y3 XeGTAO Main Pass CS"_h, "Y3 XeGTAO Denoise Pass 1 CS"_h, "Y3 XeGTAO Denoise Pass 2 CS"_h) || !HasShaders(device_data.native_pixel_shaders, "Y3 GTAO Apply PS"_h))
+      if (!HasShaders(shaders, "YRC XeGTAO Prefilter Depths CS"_h, "YRC XeGTAO Main Pass CS"_h, "YRC XeGTAO Denoise Pass 1 CS"_h, "YRC XeGTAO Denoise Pass 2 CS"_h) || !HasShaders(device_data.native_pixel_shaders, "YRC GTAO Apply PS"_h))
          return false;
 
       com_ptr<ID3D11Buffer> assao_cb;
@@ -554,10 +554,10 @@ class GameYakuza3 final : public Game
       ID3D11UnorderedAccessView* const mip_uavs[gtao_depth_mip_count] = {game_device_data.gtao_depth_mip_uavs[0].get(), game_device_data.gtao_depth_mip_uavs[1].get(), game_device_data.gtao_depth_mip_uavs[2].get(), game_device_data.gtao_depth_mip_uavs[3].get(), game_device_data.gtao_depth_mip_uavs[4].get()};
       ID3D11UnorderedAccessView* const working_uavs[2] = {game_device_data.gtao_working_uavs[0].get(), game_device_data.gtao_working_uavs[1].get()};
       ID3D11UnorderedAccessView* const final_uav = game_device_data.gtao_final_uav.get();
-      pass("Y3 XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, depth_srv, (width + 15) / 16, (height + 15) / 16);
-      pass("Y3 XeGTAO Main Pass CS"_h, 1, &working_uavs[0], game_device_data.gtao_depth_mips_srv.get(), (width + 7) / 8, (height + 7) / 8);
-      pass("Y3 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], game_device_data.gtao_working_srvs[0].get(), (width + 15) / 16, (height + 7) / 8);
-      pass("Y3 XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, game_device_data.gtao_working_srvs[1].get(), (width + 15) / 16, (height + 7) / 8);
+      pass("YRC XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, depth_srv, (width + 15) / 16, (height + 15) / 16);
+      pass("YRC XeGTAO Main Pass CS"_h, 1, &working_uavs[0], game_device_data.gtao_depth_mips_srv.get(), (width + 7) / 8, (height + 7) / 8);
+      pass("YRC XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], game_device_data.gtao_working_srvs[0].get(), (width + 15) / 16, (height + 7) / 8);
+      pass("YRC XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, game_device_data.gtao_working_srvs[1].get(), (width + 15) / 16, (height + 7) / 8);
       compute_state.Restore(native_device_context);
       return true;
    }
@@ -612,15 +612,15 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = cb_luma_global_settings.GameSettings.VideoAutoHDRBoost = 0.5f; // peak ~165 nits
       default_luma_global_game_settings.Dithering = cb_luma_global_settings.GameSettings.Dithering = 1.f;
 
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 SMAA Linearize CS"), ShaderDefinition{"Luma_Y3_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 SMAA Predication CS"), ShaderDefinition{"Luma_Y3_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 Sharpen PS"), ShaderDefinition{"Luma_Y3_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
-      // XeGTAO passes (Luma_Y3_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Prefilter Depths CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Main Pass CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Denoise Pass 1 CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Denoise Pass 2 CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 GTAO Apply PS"), ShaderDefinition{"Luma_Y3_GTAOApply", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC SMAA Linearize CS"), ShaderDefinition{"Luma_YRC_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC SMAA Predication CS"), ShaderDefinition{"Luma_YRC_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC Sharpen PS"), ShaderDefinition{"Luma_YRC_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+      // XeGTAO passes (Luma_YRC_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC XeGTAO Prefilter Depths CS"), ShaderDefinition{"Luma_YRC_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC XeGTAO Main Pass CS"), ShaderDefinition{"Luma_YRC_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC XeGTAO Denoise Pass 1 CS"), ShaderDefinition{"Luma_YRC_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC XeGTAO Denoise Pass 2 CS"), ShaderDefinition{"Luma_YRC_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC GTAO Apply PS"), ShaderDefinition{"Luma_YRC_GTAOApply", reshade::api::pipeline_subobject_type::pixel_shader});
    }
 
    void LoadConfigs() override
@@ -729,7 +729,7 @@ public:
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
-      device_data.game = new Yakuza3DeviceData;
+      device_data.game = new YakuzaRCDeviceData;
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -755,7 +755,7 @@ public:
 #if DEVELOPMENT
             // Keys 4/5 (no real shader hash): the first frame the ASSAO chain ran natively, and the first it ran as XeGTAO.
             if (game_device_data.logged_watched_hashes.insert(game_device_data.assao_replaced ? 5u : 4u).second)
-               LogFormatted(reshade::log::level::info, "[Y3] frame %u ASSAO %s (XeGTAO enabled %d, depth %d)", cb_luma_global_settings.FrameIndex, game_device_data.assao_replaced ? "replaced by XeGTAO" : "ran natively", g_gtao_enable, is_depth);
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u ASSAO %s (XeGTAO enabled %d, depth %d)", cb_luma_global_settings.FrameIndex, game_device_data.assao_replaced ? "replaced by XeGTAO" : "ran natively", g_gtao_enable, is_depth);
 #endif
             if (game_device_data.assao_replaced)
                return DrawOrDispatchOverrideType::Replaced;
@@ -771,7 +771,7 @@ public:
          com_ptr<ID3D11PixelShader> apply_ps;
          {
             const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-            if (const auto it = device_data.native_pixel_shaders.find("Y3 GTAO Apply PS"_h); it != device_data.native_pixel_shaders.end())
+            if (const auto it = device_data.native_pixel_shaders.find("YRC GTAO Apply PS"_h); it != device_data.native_pixel_shaders.end())
                apply_ps = it->second;
          }
          // Without it (a shader reload since the prepare) the frame goes without AO: the native inputs were never built.
@@ -836,14 +836,14 @@ public:
          {
 #if DEVELOPMENT
             if (game_device_data.logged_watched_hashes.insert(hash).second)
-               LogFormatted(reshade::log::level::info, "[Y3] frame %u SMAA replaced FXAA", cb_luma_global_settings.FrameIndex);
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u SMAA replaced FXAA", cb_luma_global_settings.FrameIndex);
 #endif
             return DrawOrDispatchOverrideType::Replaced;
          }
 #if DEVELOPMENT
          // Key 3 (no real shader hash): the native FXAA ran instead.
          if (game_device_data.logged_watched_hashes.insert(3u).second)
-            LogFormatted(reshade::log::level::warning, "[Y3] frame %u native FXAA ran (SMAA off or unavailable)", cb_luma_global_settings.FrameIndex);
+            LogFormatted(reshade::log::level::warning, "[YRC] frame %u native FXAA ran (SMAA off or unavailable)", cb_luma_global_settings.FrameIndex);
 #endif
       }
       // RCAS already sharpened the SMAA output: the game's CAS only forwards its input (with the markers drawn since).
@@ -863,7 +863,7 @@ public:
             native_device_context->CopyResource(target.get(), source.get());
 #if DEVELOPMENT
             if (game_device_data.logged_watched_hashes.insert(hash).second)
-               LogFormatted(reshade::log::level::info, "[Y3] frame %u game CAS replaced by a copy (RCAS ran with SMAA)", cb_luma_global_settings.FrameIndex);
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u game CAS replaced by a copy (RCAS ran with SMAA)", cb_luma_global_settings.FrameIndex);
 #endif
             return DrawOrDispatchOverrideType::Replaced;
          }
@@ -890,9 +890,9 @@ public:
             {
                game_device_data.last_logged_ccr_cb5 = data;
                game_device_data.last_logged_ccr_hash = hash;
-               LogFormatted(reshade::log::level::info, "[Y3] frame %u ccr 0x%08X cb5 (%zu floats):", cb_luma_global_settings.FrameIndex, hash, data.size());
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u ccr 0x%08X cb5 (%zu floats):", cb_luma_global_settings.FrameIndex, hash, data.size());
                for (size_t i = 0; i + 3 < data.size() && i < 64; i += 4)
-                  LogFormatted(reshade::log::level::info, "[Y3]   c%zu = %.4f %.4f %.4f %.4f", i / 4, data[i], data[i + 1], data[i + 2], data[i + 3]);
+                  LogFormatted(reshade::log::level::info, "[YRC]   c%zu = %.4f %.4f %.4f %.4f", i / 4, data[i], data[i + 1], data[i + 2], data[i + 3]);
             }
          }
       }
@@ -917,9 +917,9 @@ public:
             if (data != game_device_data.last_logged_assao_cb0)
             {
                game_device_data.last_logged_assao_cb0 = data;
-               LogFormatted(reshade::log::level::info, "[Y3] frame %u ASSAO cb0:", cb_luma_global_settings.FrameIndex);
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u ASSAO cb0:", cb_luma_global_settings.FrameIndex);
                for (size_t i = 0; i < 36; i += 4)
-                  LogFormatted(reshade::log::level::info, "[Y3]   a%zu = %f %f %f %f", i / 4, data[i], data[i + 1], data[i + 2], data[i + 3]);
+                  LogFormatted(reshade::log::level::info, "[YRC]   a%zu = %f %f %f %f", i / 4, data[i], data[i + 1], data[i + 2], data[i + 3]);
             }
          }
       }
@@ -965,7 +965,7 @@ public:
             if (target && target == game_device_data.glow_source)
             {
                game_device_data.logged_glow_source_writers.insert(hash);
-               LogFormatted(reshade::log::level::info, "[Y3] frame %u glow source written by PS 0x%08X (RT %u of the draw)", cb_luma_global_settings.FrameIndex, hash, i);
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u glow source written by PS 0x%08X (RT %u of the draw)", cb_luma_global_settings.FrameIndex, hash, i);
                break;
             }
          }
@@ -988,12 +988,12 @@ public:
             if (data != last_logged)
             {
                last_logged = data;
-               LogFormatted(reshade::log::level::info, "[Y3] frame %u %s cb5: (%f %f %f %f) (%f %f %f %f) (%f %f %f %f)", cb_luma_global_settings.FrameIndex, hash == glow_pass0_pixel_shader ? "glow_pass0" : "glow_pass2", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11]);
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u %s cb5: (%f %f %f %f) (%f %f %f %f) (%f %f %f %f)", cb_luma_global_settings.FrameIndex, hash == glow_pass0_pixel_shader ? "glow_pass0" : "glow_pass2", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11]);
                if (data.size() >= 16)
                {
                   uint32_t flags[4];
                   std::memcpy(flags, &data[12], sizeof(flags));
-                  LogFormatted(reshade::log::level::info, "[Y3]   glow_pass0 cb11[0]: 0x%X 0x%X 0x%X 0x%X (scene threshold %s)", flags[0], flags[1], flags[2], flags[3], (flags[1] & 8u) ? "on" : "off");
+                  LogFormatted(reshade::log::level::info, "[YRC]   glow_pass0 cb11[0]: 0x%X 0x%X 0x%X 0x%X (scene threshold %s)", flags[0], flags[1], flags[2], flags[3], (flags[1] & 8u) ? "on" : "off");
                }
             }
          }
@@ -1018,7 +1018,7 @@ public:
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
          if (rt_blend.BlendEnable && size.x == uint32_t(device_data.output_resolution.x + 0.5f) && size.y == uint32_t(device_data.output_resolution.y + 0.5f))
-            LogFormatted(reshade::log::level::info, "[Y3] frame %u blended PS 0x%08X: target format %u, color %d/%d op %d, alpha %d/%d, ccr drawn before: %d", cb_luma_global_settings.FrameIndex, hash, format, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.BlendOp, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
+            LogFormatted(reshade::log::level::info, "[YRC] frame %u blended PS 0x%08X: target format %u, color %d/%d op %d, alpha %d/%d, ccr drawn before: %d", cb_luma_global_settings.FrameIndex, hash, format, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.BlendOp, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
       }
 
       // Every pass writing the 512x512/512x256 targets upgraded for the DoF: each one now sees fp16 values above 1.
@@ -1030,7 +1030,7 @@ public:
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
          if (size.x == 512 && (size.y == 512 || size.y == 256))
-            LogFormatted(reshade::log::level::info, "[Y3] frame %u custom-size target %ux%u format %u written by PS 0x%08X", cb_luma_global_settings.FrameIndex, size.x, size.y, format, hash);
+            LogFormatted(reshade::log::level::info, "[YRC] frame %u custom-size target %ux%u format %u written by PS 0x%08X", cb_luma_global_settings.FrameIndex, size.x, size.y, format, hash);
       }
 
       if (const auto watched = watched_hashes.find(hash); watched != watched_hashes.end() && !game_device_data.logged_watched_hashes.contains(hash))
@@ -1068,7 +1068,7 @@ public:
                blend_state->GetDesc(&blend);
          }
          const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend.RenderTarget[0];
-         LogFormatted(reshade::log::level::info, "[Y3] frame %u first %s 0x%08X: target %ux%u format %u, t0 %ux%u format %u, blend %d (color %d/%d, alpha %d/%d), ccr drawn before: %d", cb_luma_global_settings.FrameIndex, watched->second, hash, size.x, size.y, format, source_size.x, source_size.y, source_format, rt_blend.BlendEnable, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
+         LogFormatted(reshade::log::level::info, "[YRC] frame %u first %s 0x%08X: target %ux%u format %u, t0 %ux%u format %u, blend %d (color %d/%d, alpha %d/%d), ccr drawn before: %d", cb_luma_global_settings.FrameIndex, watched->second, hash, size.x, size.y, format, source_size.x, source_size.y, source_format, rt_blend.BlendEnable, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
       }
 
 #endif
@@ -1094,18 +1094,18 @@ public:
       if (!game_device_data.drew_ccr)
       {
          if (game_device_data.previous_frame_drew_ccr)
-            LogFormatted(reshade::log::level::warning, "[Y3] frame %u: no ccr pass (video %d) - scene not tonemapped", frame, game_device_data.drew_video);
+            LogFormatted(reshade::log::level::warning, "[YRC] frame %u: no ccr pass (video %d) - scene not tonemapped", frame, game_device_data.drew_video);
          game_device_data.frames_without_ccr++;
       }
       else if (!game_device_data.previous_frame_drew_ccr)
       {
-         LogFormatted(reshade::log::level::info, "[Y3] frame %u: ccr back (0x%08X) after %u frames without", frame, game_device_data.ccr_hash, game_device_data.frames_without_ccr);
+         LogFormatted(reshade::log::level::info, "[YRC] frame %u: ccr back (0x%08X) after %u frames without", frame, game_device_data.ccr_hash, game_device_data.frames_without_ccr);
          game_device_data.frames_without_ccr = 0;
       }
 
       if (!game_device_data.exposure_samples.empty()) // Only sampled on log frames
       {
-         std::string line = "[Y3] frame " + std::to_string(frame) + " material cb2[14]:";
+         std::string line = "[YRC] frame " + std::to_string(frame) + " material cb2[14]:";
          for (const auto& e : game_device_data.exposure_samples)
             line += std::format(" ({:.3f} {:.3f} {:.3f} {:.3f})", e[0], e[1], e[2], e[3]);
          reshade::log::message(reshade::log::level::info, line.c_str());
@@ -1149,7 +1149,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomSize;
       texture_format_upgrades_2d_custom_sizes = {{512, 512}, {512, 256}};
 
-      game = new GameYakuza3();
+      game = new GameYakuzaRC();
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);

@@ -222,5 +222,5 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
 #endif
 
    // max also turns NaN into 0 (D3D10+ min/max return the non-NaN operand).
-   return float4(Y3_EncodeOutput(max(0.0, color)), colorAlpha);
+   return float4(YRC_EncodeOutput(max(0.0, color)), colorAlpha);
 }

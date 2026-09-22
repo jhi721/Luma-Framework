@@ -17,5 +17,5 @@ float3 VideoToOutput(float3 color)
       lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
    }
    // Drawn in the UI stage, so encoded like the scene to land at game paper white.
-   return Y3_EncodeOutput(lin);
+   return YRC_EncodeOutput(lin);
 }

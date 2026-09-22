@@ -1,8 +1,8 @@
 // SMAA implementation for Yakuza Remastered Collection (copied from Saints Row: The Third). Reference: https://github.com/iryoku/smaa
 // ULTRA preset + color edge detection, in place of the game's CMAA2 or FXAA, on the post-ccr canvas (2.2 gamma, fp16,
 // 1.0 = UI paper white, >1 possible). Edge detection works in gamma, neighborhood blending in linear light
-// (Luma_Y3_SMAALinearize) and re-encodes.
-// Predication uses plane-deviation edge-ness in [0,1] of the game's R32 scene depth (Luma_Y3_SMAAPredication); main.cpp
+// (Luma_YRC_SMAALinearize) and re-encodes.
+// Predication uses plane-deviation edge-ness in [0,1] of the game's R32 scene depth (Luma_YRC_SMAAPredication); main.cpp
 // passes a null texture and scale 1 (plain ULTRA) without it. No SMAAGather: SMAA point-samples the three neighbours.
 
 #include "Includes/Common.hlsl"

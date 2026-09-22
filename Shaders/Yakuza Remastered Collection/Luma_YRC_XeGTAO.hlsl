@@ -6,7 +6,7 @@
 // - The whole ASSAO chain (prepare 0x972BE5B5, depth mips 0x1DD919C4, generate 0x47BFF17F/0xD18E0D3F, blurs
 //   0x8CE62D1E/0x15EEFFAF) is skipped. These 4 dispatches run in place of the prepare, at the depth's full resolution
 //   (ASSAO's 4 half-res deinterleaved slices cover the same pixels); the apply 0x6A73BA10 then draws with
-//   Luma_Y3_GTAOApply.hlsl in place of the native PS, keeping its multiply blend onto the scene mid material stream.
+//   Luma_YRC_GTAOApply.hlsl in place of the native PS, keeping its multiply blend onto the scene mid material stream.
 // - Depth = the prepare's t0: 4K r32 hardware depth, standard Z (sky = 1).
 // - Normals are generated from depth (XE_GTAO_GENERATE_NORMALS): ASSAO's own are depth-derived too, and the game has
 //   no normal buffer.
@@ -537,7 +537,7 @@ void XeGTAO_AddSample(float ssaoValue, float edgeValue, inout float sum, inout f
 
 void XeGTAO_Denoise(uint2 pixCoordBase, Texture2D sourceAOTermAndEdges, SamplerState texSampler,
 #if XE_GTAO_FINAL_APPLY
-                    RWTexture2D<unorm float> outputTexture // final AO (R8_UNORM), read by Luma_Y3_GTAOApply.hlsl
+                    RWTexture2D<unorm float> outputTexture // final AO (R8_UNORM), read by Luma_YRC_GTAOApply.hlsl
 #else
                     RWTexture2D<unorm float2> outputTexture
 #endif
