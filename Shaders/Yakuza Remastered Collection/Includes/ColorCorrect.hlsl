@@ -92,8 +92,9 @@ float3 ZoneWeights(float3 c)
 #if CCR_NO_ZONES
    return 0.0; // Folds every zone term away, leaving the global controls
 #else
-   // Above 1 (HDR only) the vanilla polynomials turn around ((1-m)^2 grows again): hold them at their m = 1 values.
-   float m = saturate(dot(c, 1.0 / 3.0));
+   // From the clamped color, as vanilla saw it: above 1 (HDR only) the mean of an over-range saturated color would pick
+   // highlight weights vanilla never applied (black under inverted cutscene contrast), and the polynomials turn around.
+   float m = saturate(dot(saturate(c), 1.0 / 3.0));
    float im = 1.0 - m;
    return saturate(float3(im * im, 1.0 - im * im - m * m, m * m));
 #endif
@@ -103,10 +104,14 @@ float3 ZoneWeights(float3 c)
 // Contrast around 0.5 (lightAdjust) and the brightness offset cb5[0].y, applied to lightness or luma.
 float ContrastBrightness(float l, float lightAdjust)
 {
+   // Cutscene grades reach the pole at lightAdjust = 0.5: vanilla's inf saturated to white, but the extended HDR grade
+   // would carry it into a NaN (black), so the divisor stops just short of 0.
+   float d = lightAdjust * -2.0 + 1.0;
+   d = abs(d) < 1e-4 ? (d < 0.0 ? -1e-4 : 1e-4) : d;
 #if CCR_BRIGHTNESS_AFTER_CONTRAST
-   return l * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust + cb5[0].y;
+   return l * (1.0 / d) - lightAdjust + cb5[0].y;
 #else
-   return (l + cb5[0].y) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
+   return (l + cb5[0].y) * (1.0 / d) - lightAdjust;
 #endif
 }
 #endif
@@ -172,8 +177,10 @@ float3 Grade(float3 c, bool clampSDR)
 
 #if CCR_GM
    float3 gamma = float3(dot(cb5[5].xyz, w), dot(cb5[9].xyz, w), dot(cb5[13].xyz, w)) + cb5[1].xyz;
-   c = exp2(log2(c) * (gamma * 0.454545));
-   c = clampSDR ? min(c, 1.0) : c;
+   const float3 powered = exp2(log2(c) * (gamma * 0.454545));
+   // Values up to 1 keep the vanilla clip. Above 1 (HDR only) a cutscene flash's non-positive exponent would pull them
+   // back down (or 0 up to inf): they are held at vanilla's white instead.
+   c = (clampSDR || c <= 1.0) ? min(powered, 1.0) : max(powered, 1.0);
 #endif
 
 #if CCR_GI
@@ -227,6 +234,8 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
 #if CCR_MASK
    gradedHDR = (gradedHDR - sceneHDR) * maskWeight + sceneHDR;
 #endif
+   // D3D min returns the non-NaN operand: a leftover NaN or inf lands at peak like vanilla's white store, not at black.
+   gradedHDR = min(gradedHDR, 1e4);
    float3 extendedBT2020 = BT709_To_BT2020(gamma_to_linear(gradedHDR, GCT_POSITIVE));
 
    // Soft hue reference: per-channel ReinhardPiecewise(5, 1.5) in BT.2020 bends saturated highlights the way the
