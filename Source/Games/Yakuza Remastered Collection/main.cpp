@@ -24,7 +24,7 @@ namespace
    {
       const char* name;
       std::vector<uint2> dof_custom_sizes;   // Offscreen DoF targets upgraded to fp16 besides the swapchain-sized ones
-      uint32_t glow_downsample_pixel_shader; // Per game because Y3's 0x54A5E7AC is Y4's ps_cubic
+      uint32_t glow_downsample_pixel_shader; // Flagged to clamp its source per texel; per game because Y3's 0x54A5E7AC is Y4's ps_cubic
       bool grades_aliased_passthrough_ccr;   // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
@@ -82,18 +82,20 @@ namespace
    // buffers, among others). Its replacement grades only the draws flagged here: swapchain-sized targets in Y5R.
    constexpr uint32_t aliased_passthrough_ccr_pixel_shader = 0x2DD46662;
    // Effects drawn into targets that were UNORM in vanilla (the scene RT, the DoF-sized offscreen buffers), which
-   // relied on that clamp: particles (ps_ptc_*, blood included), the hit flash and highlight masks, shockwave, aura, blood
-   // decals and pools, body damage marks. On the fp16 chain their colors went far above 1 (glowing blood) and alphas above
-   // 1 extrapolated the blend (black and white streaks). glow_pass1 (0x9DD96515, every game) is here too: the 512x256
-   // bloom level shares the fp16 DoF size, and the clamp keeps the vanilla bloom bound. Every one has a single o0.xyzw output and a single final ret
-   // (checked on the disassembly); listed from the games' shader archives, the Y4R/Y5R recompiles of the same shaders last.
-   const std::unordered_set<uint32_t> unorm_clamped_effect_pixel_shaders = {0x024B22FC, 0x098F82BB, 0x0E0E3FDE, 0x0EA64B7C, 0x1233B2C0, 0x1490E21C, 0x15DBE648, 0x17153683, 0x179EC828, 0x1BFC5407, 0x1C9CF72D, 0x1E7304D2, 0x21F9EE5F, 0x233DF244, 0x23F5C577, 0x262029A4, 0x2707F90E, 0x2A75EC72, 0x2C018858, 0x2E5C72EF, 0x3019A9B8, 0x308E9227, 0x3468253F, 0x3533A116, 0x378AD557, 0x3A25DD61, 0x3BB5AE11, 0x3CCC13A9, 0x412945F3, 0x47F353EE, 0x47F97A40, 0x4A4CBF32, 0x4F656839, 0x5475205C, 0x581526D2, 0x6011CF50, 0x66F39F82, 0x6772EAB4, 0x6DBDDBAD, 0x6DDEF9B7, 0x71DF2C06, 0x747526C6, 0x75F2BE3E, 0x79B54068, 0x7AA982CE, 0x810027FF, 0x90BD986C, 0x9486446E, 0x9552AB8B, 0x96E88E1B, 0x9A735E6D, 0xA38D13EC, 0xA845CFD6, 0xA8E99745, 0xAD1EACD9, 0xB1C465A7, 0xB2EEF041, 0xB795066D, 0xB820683B, 0xB97E0BA0, 0xBEA87CEF, 0xC3F1CC7A, 0xC77EF0DF, 0xCF0DF8B9, 0xD0DF2846, 0xD2CB4337, 0xD939FD47, 0xDF16C6DB, 0xF24C81DF, 0xF2FA9571, 0xF3B188D2, 0xFA77FFFE, 0xFD4620B9, 0x9DD96515,
-      /*Y4R*/ 0x0DEA8926, 0x3E46D498, 0x46F3A3D5, 0x93E6D9B7, 0x9BEF0D68, 0xA5E4CDED, 0xA650D8FF,
+   // relied on that clamp: particles (ps_ptc_*, blood included), the hit flashes, edges and highlight masks, shockwave,
+   // aura, blood decals, body damage marks, the Y5R haze mask and DoF alpha passes. On the fp16 chain their colors went far
+   // above 1 (glowing blood) and alphas above 1 extrapolated the blend (black and white streaks). glow_pass1 (0x9DD96515,
+   // every game) is here too: the 512x256 bloom level shares the fp16 DoF size, and the clamp keeps the vanilla bloom
+   // bound. The Y5R menu DoF blur2 (0x9BB484AC) divides by an alpha sum that can be 0: the clamp also turns its NaN into 0,
+   // as the vanilla UNORM store did. Every one has a single o0.xyzw output and a single final ret (checked on the
+   // disassembly); listed from the games' shader archives, the Y4R/Y5R recompiles of the same shaders last.
+   const std::unordered_set<uint32_t> unorm_clamped_effect_pixel_shaders = {0x024B22FC, 0x098F82BB, 0x0E0E3FDE, 0x0EA64B7C, 0x1233B2C0, 0x1490E21C, 0x15DBE648, 0x17153683, 0x179EC828, 0x1BFC5407, 0x1C9CF72D, 0x1E7304D2, 0x21F9EE5F, 0x233DF244, 0x23F5C577, 0x262029A4, 0x2707F90E, 0x2A75EC72, 0x2C018858, 0x2E5C72EF, 0x3019A9B8, 0x308E9227, 0x3468253F, 0x3533A116, 0x378AD557, 0x3A25DD61, 0x3BB5AE11, 0x3CCC13A9, 0x412945F3, 0x47F353EE, 0x47F97A40, 0x4A4CBF32, 0x4F656839, 0x5475205C, 0x581526D2, 0x6011CF50, 0x66F39F82, 0x6772EAB4, 0x6DBDDBAD, 0x6DDEF9B7, 0x71DF2C06, 0x747526C6, 0x75F2BE3E, 0x79B54068, 0x7AA982CE, 0x810027FF, 0x90BD986C, 0x9486446E, 0x9552AB8B, 0x96E88E1B, 0x9A735E6D, 0xA38D13EC, 0xA845CFD6, 0xA8E99745, 0xAD1EACD9, 0xB1C465A7, 0xB2EEF041, 0xB795066D, 0xB820683B, 0xB97E0BA0, 0xBEA87CEF, 0xC3F1CC7A, 0xC77EF0DF, 0xCF0DF8B9, 0xD0DF2846, 0xD2CB4337, 0xD939FD47, 0xDF16C6DB, 0xF24C81DF, 0xF2FA9571, 0xF3B188D2, 0xFA77FFFE, 0x9DD96515,
+      /*Y4R*/ 0x0DEA8926, 0x13800646, 0x3E46D498, 0x46F3A3D5, 0x93E6D9B7, 0x9BEF0D68, 0xA5E4CDED, 0xA650D8FF,
       /*Y5R*/ 0x01CACE56, 0x03A09BCE, 0x04D2B65E, 0x08729A68, 0x0B3618F8, 0x12FE69CE, 0x22B445CB, 0x27C05456, 0x2A215145, 0x2DF42E11, 0x32895C4E, 0x39AE54DB, 0x39F4C5F7, 0x3B0A6B3A,
       0x41CF9297, 0x520829D8, 0x5478E175, 0x5516C25C, 0x5C6FE9C1, 0x5CAB83C7, 0x5EA728DE, 0x6137472C, 0x61F61EFA, 0x6318F86D, 0x6A85F04B, 0x72A43180, 0x7B6B2E75, 0x7DFE4BEA,
       0x7FEC9B44, 0x8083C110, 0x82552855, 0x85D925A4, 0x8C90CF92, 0x92627902, 0x9AC1CDB0, 0x9BED49EA, 0xA156C6FA, 0xABB7BCA4, 0xAE62C507, 0xB2EA0E19, 0xB4C297E5, 0xB620DDFB,
       0xB68688F9, 0xB68FA494, 0xB78A1D16, 0xBA8283E5, 0xBB2C0F00, 0xC35158E3, 0xD0BEFEA7, 0xD333A633, 0xD3CB7109, 0xD6D2F14E, 0xD7ABB7B3, 0xDC481F4C, 0xE3E323BA, 0xEF5F306A,
-      0xF1D626DC, 0xF1E37C36, 0xF476B17D, 0xF7283DA8, 0xFCDB3E0E};
+      0xF1D626DC, 0xF476B17D, 0xF7283DA8, 0xFCDB3E0E, 0x4CC91AE4, 0x9BB484AC, 0xB0FBCECD, 0xE118D7F2, 0xED6A2631, 0xFF3FCF4D};
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
@@ -136,7 +138,7 @@ namespace
    // Passes whose HDR behavior depends on their target and blend state, which only runtime shows.
    const std::unordered_map<uint32_t, const char*> watched_hashes = {{0x716ADB18, "focus_blur_pass1 (DoF)"}, {0x04359FA6, "focus_blur_pass2 (DoF)"},
       {0x74E5C6AC, "focus_blur_pass2_mask (DoF)"}, {0xFD02F404, "ps_sofdec"}, {0xC9782177, "ps_sofdec_qloc"}, {0xB09E517F, "ps_sofdec_h264"}, {0xE1631197, "ps_haze"}, {0x3A7B40E4, "ps_afterimage01"},
-      {0xFD4620B9, "fx_refraction"}, {0x7814519F, "fx_track_blur"}, {0xFBA57AE9, "CAS scaled (cs)"}, {0x82DA801B, "CMAA2 apply (cs)"}, {0x4A57A803, "fx_camera_blur"},
+      {0xFD4620B9, "fx_refraction / fx_blood_floor_refraction"}, {0x7814519F, "fx_track_blur"}, {0xFBA57AE9, "CAS scaled (cs)"}, {0x82DA801B, "CMAA2 apply (cs)"}, {0x4A57A803, "fx_camera_blur"},
       {0x0A4BB34E, "fx_rdiffusion"}, {0x24726E96, "ps_lerp"}, {0xDB9BA88B, "ps_lerp (Y4R)"}, {0x716D6221, "fx_afterimage01 (Y4R)"}, {0xCAEFD55C, "ps_grayscale"}, {0x495BB3CA, "fx_lens_flare"},
       {0x54A5E7AC, "ps_down_sample (glow source) / ps_cubic (Y4R)"}, {0x66633BAD, "ps_down_sample (Y4R glow source)"},
       {0xB8414674, "glow_pass0"}, {0x9083BF34, "glow_pass2"}, {0x9E617E0A, "glow_pass2 (Y4R)"},
@@ -146,6 +148,8 @@ namespace
    // Bloom ("glow") build pass (cb5 thresholds/scales, cb11 flags) and sum (cb5 scales); the downsample is in the game profile.
    const std::unordered_set<uint32_t> glow_pass0_pixel_shaders = {0xB8414674, 0xD31A6374 /*Y5R*/};
    const std::unordered_set<uint32_t> glow_pass2_pixel_shaders = {0x9083BF34, 0x9E617E0A /*Y4R*/, 0x5F37CDE1 /*Y5R*/};
+   // DoF composites into the scene: focus_blur_pass2 and pass2_mask (Y3R/Y4R, then Y5R).
+   const std::unordered_set<uint32_t> dof_composite_pixel_shaders = {0x04359FA6, 0x74E5C6AC, 0x0014DD95, 0xEA4513EB};
    // One-time log lines that have no shader hash of their own.
    enum LoggedEvent : uint32_t
    {
@@ -155,6 +159,7 @@ namespace
       NativeFXAARan,
       ASSAORanNatively,
       ASSAOReplaced,
+      GlowDownsampleSampler,
    };
    constexpr uint32_t log_interval_frames = 120;
    constexpr uint32_t max_exposure_reads = 16; // per log frame: each one is a staging copy and a GPU sync
@@ -233,7 +238,8 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    uint32_t last_logged_ccr_hash = 0;
    std::vector<float> last_logged_ccr_cb5;
    std::vector<float> last_logged_assao_cb0;
-   std::vector<float> last_logged_glow_cbs[2];              // glow_pass0, glow_pass2
+   std::vector<float> last_logged_glow_cbs[2]; // glow_pass0, glow_pass2
+   std::vector<float> last_logged_dof_cb5;
    com_ptr<ID3D11Resource> glow_source;                     // The glow downsample's swapchain-sized t0, from a previous frame
    std::unordered_set<uint32_t> logged_glow_source_writers; // Pixel shaders seen rendering into it
    std::unordered_set<uint32_t> seen_blend_hashes;          // Pixel shaders already checked by the blended-effect trap
@@ -953,6 +959,13 @@ public:
          }
 #endif
       }
+      // The replacement clamps the glow source per texel only on this flag (see SampleGlowSource in Includes/Common.hlsl).
+      else if (!is_compute && hash == g_game_profile.glow_downsample_pixel_shader)
+      {
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 1u);
+         updated_cbuffers = true;
+      }
 
 #if DEVELOPMENT
       // Dev logger for values the DevKit can't show continuously: frames that skip the ccr (untonemapped scene), the active
@@ -1037,6 +1050,15 @@ public:
          GetResourceInfo(source.get(), size, format);
          if (IsOutputSized(device_data, size.x, size.y))
             game_device_data.glow_source = source;
+         if (game_device_data.FirstLog(GlowDownsampleSampler))
+         {
+            com_ptr<ID3D11SamplerState> sampler;
+            native_device_context->PSGetSamplers(0, 1, &sampler);
+            D3D11_SAMPLER_DESC sampler_desc = {};
+            if (sampler)
+               sampler->GetDesc(&sampler_desc);
+            LogFormatted(reshade::log::level::info, "[YRC] frame %u glow downsample sampler: filter 0x%X, address %d/%d (the per-texel clamp assumes linear)", cb_luma_global_settings.FrameIndex, sampler_desc.Filter, sampler_desc.AddressU, sampler_desc.AddressV);
+         }
       }
       else if (!is_compute && log_frame && game_device_data.glow_source && !game_device_data.logged_glow_source_writers.contains(hash))
       {
@@ -1081,6 +1103,25 @@ public:
                   std::memcpy(flags, &data[12], sizeof(flags));
                   LogFormatted(reshade::log::level::info, "[YRC]   glow_pass0 cb11[0]: 0x%X 0x%X 0x%X 0x%X (scene threshold %s)", flags[0], flags[1], flags[2], flags[3], (flags[1] & 8u) ? "on" : "off");
                }
+            }
+         }
+      }
+
+      // DoF composites: alpha = saturate(depth term) * cb5[0].z (pass2_mask also * mask * cb5[1].x); a scale above 1 would
+      // extrapolate the blend into the fp16 scene.
+      if (!is_compute && dof_composite_pixel_shaders.contains(hash) && log_frame && can_read)
+      {
+         com_ptr<ID3D11Buffer> cb;
+         native_device_context->PSGetConstantBuffers(5, 1, &cb);
+         std::vector<float> data;
+         com_ptr<ID3D11Buffer> cb_copy;
+         if (CopyBuffer(cb, native_device_context, data, cb_copy) && data.size() >= 8)
+         {
+            data.resize(8);
+            if (data != game_device_data.last_logged_dof_cb5)
+            {
+               game_device_data.last_logged_dof_cb5 = data;
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u DoF composite 0x%08X cb5: (%f %f %f %f) (%f %f %f %f)", cb_luma_global_settings.FrameIndex, hash, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
             }
          }
       }
