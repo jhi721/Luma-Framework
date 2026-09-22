@@ -15,7 +15,7 @@
 //   CCR_BRIGHTNESS_AFTER_CONTRAST (Y5R builds) the brightness offset cb5[0].y is added after the contrast stage, not before
 //   CCR_NO_ZONES   fx_ccr_*_mask_n (Y5R): no shadow/midtone/highlight terms, only the global cb5[0..3] controls
 // The zone weights (shadow/mid/highlight) always come from the mean of the stage input color. Every stage is
-// transcribed operand-for-operand from the disassembly (ps_ccr_* in data/shader/sh_ogre3_w64.par).
+// transcribed operand-for-operand from the disassembly (ps_ccr_* in the games' sh_* shader archives).
 //
 // SDR path: the exact vanilla grade on the saturated scene (the UNORM RT clamp, emulated).
 // HDR path (canon for hard-clip games, BL GOTY precedent): the same grade as an extended function (upper clamps
@@ -99,6 +99,18 @@ float3 ZoneWeights(float3 c)
 #endif
 }
 
+#if CCR_SC
+// Contrast around 0.5 (lightAdjust) and the brightness offset cb5[0].y, applied to lightness or luma.
+float ContrastBrightness(float l, float lightAdjust)
+{
+#if CCR_BRIGHTNESS_AFTER_CONTRAST
+   return l * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust + cb5[0].y;
+#else
+   return (l + cb5[0].y) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
+#endif
+}
+#endif
+
 #if CCR_HLS
 // RGB -> HLS, optional saturation/contrast, HLS -> RGB through t1. Input in [0,1].
 float3 HLSStage(float3 c, float3 w)
@@ -121,11 +133,7 @@ float3 HLSStage(float3 c, float3 w)
 #if CCR_SC
    float satAdjust = dot(cb5[4].xyz, w) + cb5[0].z;
    float lightAdjust = dot(cb5[8].xyz, w) + cb5[0].w;
-#if CCR_BRIGHTNESS_AFTER_CONTRAST
-   float lightness = sum * 0.5 * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust + cb5[0].y;
-#else
-   float lightness = (sum * 0.5 + cb5[0].y) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
-#endif
+   float lightness = ContrastBrightness(sum * 0.5, lightAdjust);
    float saturation = (lightness < 0.5) ? satLow : satHigh;
    saturation = saturation * satAdjust + saturation;
 #else
@@ -155,11 +163,7 @@ float3 Grade(float3 c, bool clampSDR)
 #elif CCR_SC
    float satAdjust = dot(cb5[4].xyz, w) + cb5[0].z;
    float lightAdjust = dot(cb5[8].xyz, w) + cb5[0].w;
-#if CCR_BRIGHTNESS_AFTER_CONTRAST
-   float y = dot(float3(0.299, 0.587, 0.114), c) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust + cb5[0].y;
-#else
-   float y = (dot(float3(0.299, 0.587, 0.114), c) + cb5[0].y) * (1.0 / (lightAdjust * -2.0 + 1.0)) - lightAdjust;
-#endif
+   float y = ContrastBrightness(dot(float3(0.299, 0.587, 0.114), c), lightAdjust);
    float cb = dot(float3(-0.16874, -0.33126, 0.5), c) * (satAdjust + 1.0);
    float cr = dot(float3(0.5, -0.41869, -0.08131), c) * (satAdjust + 1.0);
    c = float3(y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr, y + 1.772 * cb);

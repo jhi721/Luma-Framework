@@ -20,49 +20,27 @@
 
 namespace
 {
-   enum class YakuzaGame
-   {
-      Y3,
-      Y4,
-      Y5,
-   };
    struct YakuzaGameProfile
    {
       const char* name;
       std::vector<uint2> dof_custom_sizes;   // Offscreen DoF targets upgraded to fp16 besides the swapchain-sized ones
-      uint32_t glow_downsample_pixel_shader; // Y3's 0x54A5E7AC is Y4's ps_cubic
-      uint32_t glow_pass2_pixel_shader;
-      bool grades_aliased_passthrough_ccr; // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
+      uint32_t glow_downsample_pixel_shader; // Per game because Y3's 0x54A5E7AC is Y4's ps_cubic
+      bool grades_aliased_passthrough_ccr;   // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
 
-   YakuzaGame DetectGame()
+   // Y4 adds a 1024x1024 step to the DoF scene copy (4K -> 1024 -> 512), Y5 a 256x256 blur level. Y5 downsamples the glow
+   // source twice per frame; the second one (listed) feeds the bloom. An unknown executable is treated as Y3.
+   YakuzaGameProfile DetectGame()
    {
-      char path[MAX_PATH] = {};
-      GetModuleFileNameA(nullptr, path, MAX_PATH);
-      std::string exe(path);
+      std::string exe = System::GetProcessExecutableName();
       for (auto& c : exe)
          c = (char)tolower((unsigned char)c);
       if (exe.find("yakuza5") != std::string::npos)
-         return YakuzaGame::Y5;
+         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true};
       if (exe.find("yakuza4") != std::string::npos)
-         return YakuzaGame::Y4;
-      return YakuzaGame::Y3; // Treat an unknown executable as Y3
-   }
-
-   YakuzaGameProfile ProfileFor(YakuzaGame game)
-   {
-      // Y4 adds a 1024x1024 step to the DoF scene copy (4K -> 1024 -> 512), Y5 a 256x256 blur level. Y5 downsamples the
-      // glow source twice per frame; the second one (listed) feeds the bloom.
-      switch (game)
-      {
-      case YakuzaGame::Y4:
-         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, 0x9E617E0A, false};
-      case YakuzaGame::Y5:
-         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, 0x5F37CDE1, true};
-      default:
-         return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, 0x9083BF34, false};
-      }
+         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false};
+      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false};
    }
 
    // User settings, persisted in the [Luma] config section.
@@ -81,13 +59,20 @@ namespace
    int g_gtao_debug_view = 0;        // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
 #endif
 
-   // Readers of the 4K r32 scene depth at t0: ASSAO prepare, and a full-screen depth restore (also used by prepasses; the
-   // last one before the AA, after ASSAO, reads the main depth). Captured for SMAA predication.
-   const std::unordered_set<uint32_t> depth_reader_pixel_shaders = {0x972BE5B5, 0x87917E9E};
+   // Intel ASSAO (stock): prepare, depth mips, generate (High / Medium), smart blur / wide, all skipped under XeGTAO; the
+   // apply multiply-blends the AO onto the scene mid material stream (see "RunXeGTAO").
+   constexpr uint32_t assao_prepare_pixel_shader = 0x972BE5B5;
+   const std::unordered_set<uint32_t> assao_pre_apply_pixel_shaders = {0x1DD919C4, 0x47BFF17F, 0xD18E0D3F, 0x8CE62D1E, 0x15EEFFAF};
+   constexpr uint32_t assao_apply_pixel_shader = 0x6A73BA10;
+   constexpr UINT gtao_knobs_cb_slot = 8;   // "register(b8)" in Luma_YRC_XeGTAO.hlsl
+   constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_YRC_XeGTAO.hlsl
+   // Readers of the 4K r32 scene depth at t0: the ASSAO prepare, and a full-screen depth restore (also used by prepasses;
+   // the last one before the AA, after ASSAO, reads the main depth). Captured for SMAA predication.
+   const std::unordered_set<uint32_t> depth_reader_pixel_shaders = {assao_prepare_pixel_shader, 0x87917E9E};
    // QLOC's CMAA2: edges, candidates, dispatch args (these three skipped under SMAA), then the apply, which writes edge
    // pixels into u0, a copy of the post-ccr canvas that the game copies back afterwards.
-   const std::unordered_set<uint32_t> cmaa2_pre_apply_compute_shaders = {0x2E998140, 0x60E701EA, 0x79976116};
    constexpr uint32_t cmaa2_first_compute_shader = 0x2E998140;
+   const std::unordered_set<uint32_t> cmaa2_pre_apply_compute_shaders = {cmaa2_first_compute_shader, 0x60E701EA, 0x79976116};
    constexpr uint32_t cmaa2_apply_compute_shader = 0x82DA801B;
    // FXAA 3.11: one pass from the post-ccr canvas (t0) into its own swapchain-sized target.
    constexpr uint32_t fxaa_pixel_shader = 0xE7A1D308;
@@ -99,22 +84,16 @@ namespace
    // Effects drawn into targets that were UNORM in vanilla (the scene RT, the DoF-sized offscreen buffers), which
    // relied on that clamp: particles (ps_ptc_*, blood included), the hit flash and highlight masks, shockwave, aura, blood
    // decals and pools, body damage marks. On the fp16 chain their colors went far above 1 (glowing blood) and alphas above
-   // 1 extrapolated the blend (black and white streaks). Every one has a single o0.xyzw output and a single final ret
+   // 1 extrapolated the blend (black and white streaks). glow_pass1 (0x9DD96515, every game) is here too: the 512x256
+   // bloom level shares the fp16 DoF size, and the clamp keeps the vanilla bloom bound. Every one has a single o0.xyzw output and a single final ret
    // (checked on the disassembly); listed from the games' shader archives, the Y4R/Y5R recompiles of the same shaders last.
-   const std::unordered_set<uint32_t> unorm_clamped_effect_pixel_shaders = {0x024B22FC, 0x098F82BB, 0x0E0E3FDE, 0x0EA64B7C, 0x1233B2C0, 0x1490E21C, 0x15DBE648, 0x17153683, 0x179EC828, 0x1BFC5407, 0x1C9CF72D, 0x1E7304D2, 0x21F9EE5F, 0x233DF244, 0x23F5C577, 0x262029A4, 0x2707F90E, 0x2A75EC72, 0x2C018858, 0x2E5C72EF, 0x3019A9B8, 0x308E9227, 0x3468253F, 0x3533A116, 0x378AD557, 0x3A25DD61, 0x3BB5AE11, 0x3CCC13A9, 0x412945F3, 0x47F353EE, 0x47F97A40, 0x4A4CBF32, 0x4F656839, 0x5475205C, 0x581526D2, 0x6011CF50, 0x66F39F82, 0x6772EAB4, 0x6DBDDBAD, 0x6DDEF9B7, 0x71DF2C06, 0x747526C6, 0x75F2BE3E, 0x79B54068, 0x7AA982CE, 0x810027FF, 0x90BD986C, 0x9486446E, 0x9552AB8B, 0x96E88E1B, 0x9A735E6D, 0xA38D13EC, 0xA845CFD6, 0xA8E99745, 0xAD1EACD9, 0xB1C465A7, 0xB2EEF041, 0xB795066D, 0xB820683B, 0xB97E0BA0, 0xBEA87CEF, 0xC3F1CC7A, 0xC77EF0DF, 0xCF0DF8B9, 0xD0DF2846, 0xD2CB4337, 0xD939FD47, 0xDF16C6DB, 0xF24C81DF, 0xF2FA9571, 0xF3B188D2, 0xFA77FFFE, 0xFD4620B9,
+   const std::unordered_set<uint32_t> unorm_clamped_effect_pixel_shaders = {0x024B22FC, 0x098F82BB, 0x0E0E3FDE, 0x0EA64B7C, 0x1233B2C0, 0x1490E21C, 0x15DBE648, 0x17153683, 0x179EC828, 0x1BFC5407, 0x1C9CF72D, 0x1E7304D2, 0x21F9EE5F, 0x233DF244, 0x23F5C577, 0x262029A4, 0x2707F90E, 0x2A75EC72, 0x2C018858, 0x2E5C72EF, 0x3019A9B8, 0x308E9227, 0x3468253F, 0x3533A116, 0x378AD557, 0x3A25DD61, 0x3BB5AE11, 0x3CCC13A9, 0x412945F3, 0x47F353EE, 0x47F97A40, 0x4A4CBF32, 0x4F656839, 0x5475205C, 0x581526D2, 0x6011CF50, 0x66F39F82, 0x6772EAB4, 0x6DBDDBAD, 0x6DDEF9B7, 0x71DF2C06, 0x747526C6, 0x75F2BE3E, 0x79B54068, 0x7AA982CE, 0x810027FF, 0x90BD986C, 0x9486446E, 0x9552AB8B, 0x96E88E1B, 0x9A735E6D, 0xA38D13EC, 0xA845CFD6, 0xA8E99745, 0xAD1EACD9, 0xB1C465A7, 0xB2EEF041, 0xB795066D, 0xB820683B, 0xB97E0BA0, 0xBEA87CEF, 0xC3F1CC7A, 0xC77EF0DF, 0xCF0DF8B9, 0xD0DF2846, 0xD2CB4337, 0xD939FD47, 0xDF16C6DB, 0xF24C81DF, 0xF2FA9571, 0xF3B188D2, 0xFA77FFFE, 0xFD4620B9, 0x9DD96515,
       /*Y4R*/ 0x0DEA8926, 0x3E46D498, 0x46F3A3D5, 0x93E6D9B7, 0x9BEF0D68, 0xA5E4CDED, 0xA650D8FF,
       /*Y5R*/ 0x01CACE56, 0x03A09BCE, 0x04D2B65E, 0x08729A68, 0x0B3618F8, 0x12FE69CE, 0x22B445CB, 0x27C05456, 0x2A215145, 0x2DF42E11, 0x32895C4E, 0x39AE54DB, 0x39F4C5F7, 0x3B0A6B3A,
       0x41CF9297, 0x520829D8, 0x5478E175, 0x5516C25C, 0x5C6FE9C1, 0x5CAB83C7, 0x5EA728DE, 0x6137472C, 0x61F61EFA, 0x6318F86D, 0x6A85F04B, 0x72A43180, 0x7B6B2E75, 0x7DFE4BEA,
       0x7FEC9B44, 0x8083C110, 0x82552855, 0x85D925A4, 0x8C90CF92, 0x92627902, 0x9AC1CDB0, 0x9BED49EA, 0xA156C6FA, 0xABB7BCA4, 0xAE62C507, 0xB2EA0E19, 0xB4C297E5, 0xB620DDFB,
       0xB68688F9, 0xB68FA494, 0xB78A1D16, 0xBA8283E5, 0xBB2C0F00, 0xC35158E3, 0xD0BEFEA7, 0xD333A633, 0xD3CB7109, 0xD6D2F14E, 0xD7ABB7B3, 0xDC481F4C, 0xE3E323BA, 0xEF5F306A,
       0xF1D626DC, 0xF1E37C36, 0xF476B17D, 0xF7283DA8, 0xFCDB3E0E};
-   // Intel ASSAO (stock): prepare (also a depth reader above), depth mips, generate (High / Medium), smart blur / wide, all
-   // skipped under XeGTAO; the apply multiply-blends the AO onto the scene mid material stream (see "RunXeGTAO").
-   constexpr uint32_t assao_prepare_pixel_shader = 0x972BE5B5;
-   const std::unordered_set<uint32_t> assao_pre_apply_pixel_shaders = {0x1DD919C4, 0x47BFF17F, 0xD18E0D3F, 0x8CE62D1E, 0x15EEFFAF};
-   constexpr uint32_t assao_apply_pixel_shader = 0x6A73BA10;
-   constexpr UINT gtao_knobs_cb_slot = 8;   // "register(b8)" in Luma_YRC_XeGTAO.hlsl
-   constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_YRC_XeGTAO.hlsl
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
@@ -126,6 +105,11 @@ namespace
          return it != shaders.end() && it->second;
       };
       return (has(names) && ...);
+   }
+
+   bool IsOutputSized(const DeviceData& device_data, uint32_t width, uint32_t height)
+   {
+      return width == uint32_t(device_data.output_resolution.x + 0.5f) && height == uint32_t(device_data.output_resolution.y + 0.5f);
    }
 
    bool GetTextureDesc(ID3D11Resource* resource, D3D11_TEXTURE2D_DESC* desc)
@@ -159,8 +143,19 @@ namespace
       {0x54D6A534, "ps_down_sample_2x4 (Y5R glow source)"}, {0xD31A6374, "glow_pass0 (Y5R)"}, {0x5F37CDE1, "glow_pass2 (Y5R)"}, {0x0B55238C, "with_glare (Y5R exposure)"},
       {0x33E5746C, "fx_afterimage01 (Y5R)"}, {0x20D7E1BA, "ps_haze (Y5R)"}, {0xC389105B, "fx_track_blur (Y5R)"}, {0x0014DD95, "focus_blur_pass2 (Y5R DoF)"},
       {0xF9DF166D, "focus_blur_pass2_tex_a (Y5R DoF)"}, {0xE118D7F2, "focus_blur_pass1_5_blur (Y5R DoF)"}};
-   // Bloom ("glow") build pass (cb5 thresholds/scales, cb11 flags); its downsample and sum are in the game profile.
-   constexpr uint32_t glow_pass0_pixel_shader = 0xB8414674;
+   // Bloom ("glow") build pass (cb5 thresholds/scales, cb11 flags) and sum (cb5 scales); the downsample is in the game profile.
+   const std::unordered_set<uint32_t> glow_pass0_pixel_shaders = {0xB8414674, 0xD31A6374 /*Y5R*/};
+   const std::unordered_set<uint32_t> glow_pass2_pixel_shaders = {0x9083BF34, 0x9E617E0A /*Y4R*/, 0x5F37CDE1 /*Y5R*/};
+   // One-time log lines that have no shader hash of their own.
+   enum LoggedEvent : uint32_t
+   {
+      SMAARanUnpredicated,
+      SMAARanPredicated,
+      SMAADepthRejected,
+      NativeFXAARan,
+      ASSAORanNatively,
+      ASSAOReplaced,
+   };
    constexpr uint32_t log_interval_frames = 120;
    constexpr uint32_t max_exposure_reads = 16; // per log frame: each one is a staging copy and a GPU sync
 
@@ -243,10 +238,20 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    std::unordered_set<uint32_t> logged_glow_source_writers; // Pixel shaders seen rendering into it
    std::unordered_set<uint32_t> seen_blend_hashes;          // Pixel shaders already checked by the blended-effect trap
    std::unordered_set<uint32_t> logged_watched_hashes;
+   uint32_t logged_events = 0; // LoggedEvent bits
    std::unordered_set<uint32_t> checked_custom_size_hashes;
    // Staging copy for the one-shot predication mask readback (see LogPredicationStats), allocated on first use.
    com_ptr<ID3D11Texture2D> pred_measure_staging;
    bool pred_measure_pending = false;
+
+   // True the first time only.
+   bool FirstLog(LoggedEvent event)
+   {
+      const uint32_t bit = 1u << event;
+      const bool first = (logged_events & bit) == 0;
+      logged_events |= bit;
+      return first;
+   }
 #endif
 };
 
@@ -261,7 +266,7 @@ class GameYakuzaRC final : public Game
    // targets) keeps the game's own AA. The caller holds s_mutex_shader_objects.
    static bool CanRunSMAA(const DeviceData& device_data, const D3D11_TEXTURE2D_DESC& color_desc)
    {
-      return g_smaa_enable && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.SampleDesc.Count == 1 && color_desc.ArraySize == 1 && color_desc.Width == uint32_t(device_data.output_resolution.x + 0.5f) && color_desc.Height == uint32_t(device_data.output_resolution.y + 0.5f) && HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h, "YRC Sharpen PS"_h) && HasShaders(device_data.native_compute_shaders, "YRC SMAA Linearize CS"_h);
+      return g_smaa_enable && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.SampleDesc.Count == 1 && color_desc.ArraySize == 1 && IsOutputSized(device_data, color_desc.Width, color_desc.Height) && HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h, "YRC Sharpen PS"_h) && HasShaders(device_data.native_compute_shaders, "YRC SMAA Linearize CS"_h);
    }
 
 #if DEVELOPMENT
@@ -355,8 +360,8 @@ class GameYakuzaRC final : public Game
    static bool RunSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool& updated_cbuffers, ID3D11Resource* color, ID3D11Resource* target)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
-      D3D11_TEXTURE2D_DESC color_desc, target_desc;
-      if (!GetTextureDesc(color, &color_desc) || !GetTextureDesc(target, &target_desc) || target_desc.Width != color_desc.Width || target_desc.Height != color_desc.Height || target_desc.Format != color_desc.Format)
+      D3D11_TEXTURE2D_DESC color_desc;
+      if (!GetTextureDesc(color, &color_desc) || !AreResourcesEqual(color, target))
          return false;
 
       // Held through SMAA so a shader reload cannot release them mid-use; "DrawSMAA" looks its shaders up with "at".
@@ -439,10 +444,10 @@ class GameYakuzaRC final : public Game
             native_device_context->CSSetUnorderedAccessViews(0, 1, &predication_uav, nullptr);
             native_device_context->CSSetShaderResources(0, 1, &depth_srv);
 #if DEVELOPMENT
-            // Key 2 (no real shader hash): the runtime still rejected the depth SRV (another conflicting binding).
+            // The runtime can still reject the depth SRV (another conflicting binding).
             com_ptr<ID3D11ShaderResourceView> bound_depth_srv;
             native_device_context->CSGetShaderResources(0, 1, &bound_depth_srv);
-            if (!bound_depth_srv && game_device_data.logged_watched_hashes.insert(2u).second)
+            if (!bound_depth_srv && game_device_data.FirstLog(SMAADepthRejected))
                LogFormatted(reshade::log::level::warning, "[YRC] frame %u SMAA predication: depth SRV rejected by the runtime", cb_luma_global_settings.FrameIndex);
 #endif
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData, 0, 0, g_smaa_pred_tolerance);
@@ -503,8 +508,7 @@ class GameYakuzaRC final : public Game
       native_device_context->CopyResource(target, result);
       game_device_data.smaa_ran = true;
 #if DEVELOPMENT
-      // Keys 0/1 (no real shader hash) log the first SMAA run without and with predication.
-      if (game_device_data.logged_watched_hashes.insert(predicate ? 1u : 0u).second)
+      if (game_device_data.FirstLog(predicate ? SMAARanPredicated : SMAARanUnpredicated))
          LogFormatted(reshade::log::level::info, "[YRC] frame %u SMAA ran (predication %d, %ux%u)", cb_luma_global_settings.FrameIndex, predicate, color_desc.Width, color_desc.Height);
 #endif
       return true;
@@ -611,7 +615,9 @@ class GameYakuzaRC final : public Game
          native_device_context->Dispatch(groups_x, groups_y, 1);
          native_device_context->CSSetUnorderedAccessViews(0, uav_count, null_uavs, nullptr);
       };
-      ID3D11UnorderedAccessView* const mip_uavs[gtao_depth_mip_count] = {game_device_data.gtao_depth_mip_uavs[0].get(), game_device_data.gtao_depth_mip_uavs[1].get(), game_device_data.gtao_depth_mip_uavs[2].get(), game_device_data.gtao_depth_mip_uavs[3].get(), game_device_data.gtao_depth_mip_uavs[4].get()};
+      ID3D11UnorderedAccessView* mip_uavs[gtao_depth_mip_count];
+      for (UINT mip = 0; mip < gtao_depth_mip_count; mip++)
+         mip_uavs[mip] = game_device_data.gtao_depth_mip_uavs[mip].get();
       ID3D11UnorderedAccessView* const working_uavs[2] = {game_device_data.gtao_working_uavs[0].get(), game_device_data.gtao_working_uavs[1].get()};
       ID3D11UnorderedAccessView* const final_uav = game_device_data.gtao_final_uav.get();
       pass("YRC XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, depth_srv, (width + 15) / 16, (height + 15) / 16);
@@ -814,8 +820,7 @@ public:
          {
             game_device_data.assao_replaced = g_gtao_enable && is_depth && RunXeGTAO(native_device, native_device_context, device_data, srv.get());
 #if DEVELOPMENT
-            // Keys 4/5 (no real shader hash): the first frame the ASSAO chain ran natively, and the first it ran as XeGTAO.
-            if (game_device_data.logged_watched_hashes.insert(game_device_data.assao_replaced ? 5u : 4u).second)
+            if (game_device_data.FirstLog(game_device_data.assao_replaced ? ASSAOReplaced : ASSAORanNatively))
                LogFormatted(reshade::log::level::info, "[YRC] frame %u ASSAO %s (XeGTAO enabled %d, depth %d)", cb_luma_global_settings.FrameIndex, game_device_data.assao_replaced ? "replaced by XeGTAO" : "ran natively", g_gtao_enable, is_depth);
 #endif
             if (game_device_data.assao_replaced)
@@ -902,8 +907,7 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
          }
 #if DEVELOPMENT
-         // Key 3 (no real shader hash): the native FXAA ran instead.
-         if (game_device_data.logged_watched_hashes.insert(3u).second)
+         if (game_device_data.FirstLog(NativeFXAARan))
             LogFormatted(reshade::log::level::warning, "[YRC] frame %u native FXAA ran (SMAA off or unavailable)", cb_luma_global_settings.FrameIndex);
 #endif
       }
@@ -929,18 +933,15 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
          }
       }
-      else if (!is_compute && hash == aliased_passthrough_ccr_pixel_shader)
+      // Where it never grades, Core binds the default Luma data (CustomData1 = 0) and the replacement stays a copy.
+      else if (!is_compute && hash == aliased_passthrough_ccr_pixel_shader && g_game_profile.grades_aliased_passthrough_ccr)
       {
-         bool is_grade = false;
-         if (g_game_profile.grades_aliased_passthrough_ccr)
-         {
-            com_ptr<ID3D11RenderTargetView> rtv;
-            native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-            uint4 size;
-            DXGI_FORMAT format;
-            GetResourceInfo(rtv.get(), size, format);
-            is_grade = size.x == uint32_t(device_data.output_resolution.x + 0.5f) && size.y == uint32_t(device_data.output_resolution.y + 0.5f);
-         }
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         uint4 size;
+         DXGI_FORMAT format;
+         GetResourceInfo(rtv.get(), size, format);
+         const bool is_grade = IsOutputSized(device_data, size.x, size.y);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, is_grade ? 1u : 0u);
          updated_cbuffers = true;
@@ -970,7 +971,7 @@ public:
             native_device_context->PSGetConstantBuffers(5, 1, &cb);
             std::vector<float> data;
             com_ptr<ID3D11Buffer> cb_copy;
-            if (cb.get() && CopyBuffer(cb, native_device_context, data, cb_copy) && (data != game_device_data.last_logged_ccr_cb5 || hash != game_device_data.last_logged_ccr_hash))
+            if (CopyBuffer(cb, native_device_context, data, cb_copy) && (data != game_device_data.last_logged_ccr_cb5 || hash != game_device_data.last_logged_ccr_hash))
             {
                game_device_data.last_logged_ccr_cb5 = data;
                game_device_data.last_logged_ccr_hash = hash;
@@ -995,7 +996,7 @@ public:
          // Intel ASSAO layout: c0 viewport/half-viewport pixel size, c1 DepthUnpackConsts + CameraTanHalfFOV,
          // c2 NDCToViewMul/Add, c3 per-pass offsets, c4 Viewport2xPixelSize, c5 EffectRadius/ShadowStrength/ShadowPow/ShadowClamp,
          // c6 FadeOutMul/Add, HorizonAngleThreshold, SamplingRadiusNearLimitRec, c7-c8 the rest.
-         if (cb.get() && CopyBuffer(cb, native_device_context, data, cb_copy) && data.size() >= 36)
+         if (CopyBuffer(cb, native_device_context, data, cb_copy) && data.size() >= 36)
          {
             data.resize(36);
             if (data != game_device_data.last_logged_assao_cb0)
@@ -1034,7 +1035,7 @@ public:
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(source.get(), size, format);
-         if (size.x == uint32_t(device_data.output_resolution.x + 0.5f) && size.y == uint32_t(device_data.output_resolution.y + 0.5f))
+         if (IsOutputSized(device_data, size.x, size.y))
             game_device_data.glow_source = source;
       }
       else if (!is_compute && log_frame && game_device_data.glow_source && !game_device_data.logged_glow_source_writers.contains(hash))
@@ -1054,7 +1055,8 @@ public:
             }
          }
       }
-      if (!is_compute && (hash == glow_pass0_pixel_shader || hash == g_game_profile.glow_pass2_pixel_shader) && log_frame && can_read)
+      const bool is_glow_pass0 = !is_compute && glow_pass0_pixel_shaders.contains(hash);
+      if ((is_glow_pass0 || (!is_compute && glow_pass2_pixel_shaders.contains(hash))) && log_frame && can_read)
       {
          // pass0: cb5[0] luma/rgb threshold, cb5[1] threshold scale, cb5[2] source scale, cb11[0].y & 8 = scene threshold on.
          // pass2: cb5[0].x luma term, .yzw rgb scale of the 5-level sum.
@@ -1063,16 +1065,16 @@ public:
          native_device_context->PSGetConstantBuffers(11, 1, &cbs[1]);
          std::vector<float> data, cb11_data;
          com_ptr<ID3D11Buffer> cb_copy;
-         if (cbs[0] && CopyBuffer(cbs[0], native_device_context, data, cb_copy) && data.size() >= 12)
+         if (CopyBuffer(cbs[0], native_device_context, data, cb_copy) && data.size() >= 12)
          {
             data.resize(12);
-            if (hash == glow_pass0_pixel_shader && cbs[1] && CopyBuffer(cbs[1], native_device_context, cb11_data, cb_copy) && cb11_data.size() >= 4)
+            if (is_glow_pass0 && CopyBuffer(cbs[1], native_device_context, cb11_data, cb_copy) && cb11_data.size() >= 4)
                data.insert(data.end(), cb11_data.begin(), cb11_data.begin() + 4);
-            auto& last_logged = game_device_data.last_logged_glow_cbs[hash == glow_pass0_pixel_shader ? 0 : 1];
+            auto& last_logged = game_device_data.last_logged_glow_cbs[is_glow_pass0 ? 0 : 1];
             if (data != last_logged)
             {
                last_logged = data;
-               LogFormatted(reshade::log::level::info, "[YRC] frame %u %s cb5: (%f %f %f %f) (%f %f %f %f) (%f %f %f %f)", cb_luma_global_settings.FrameIndex, hash == glow_pass0_pixel_shader ? "glow_pass0" : "glow_pass2", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11]);
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u %s cb5: (%f %f %f %f) (%f %f %f %f) (%f %f %f %f)", cb_luma_global_settings.FrameIndex, is_glow_pass0 ? "glow_pass0" : "glow_pass2", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11]);
                if (data.size() >= 16)
                {
                   uint32_t flags[4];
@@ -1101,7 +1103,7 @@ public:
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
-         if (rt_blend.BlendEnable && size.x == uint32_t(device_data.output_resolution.x + 0.5f) && size.y == uint32_t(device_data.output_resolution.y + 0.5f))
+         if (rt_blend.BlendEnable && IsOutputSized(device_data, size.x, size.y))
             LogFormatted(reshade::log::level::info, "[YRC] frame %u blended PS 0x%08X: target format %u, color %d/%d op %d, alpha %d/%d, ccr drawn before: %d", cb_luma_global_settings.FrameIndex, hash, format, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.BlendOp, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
       }
 
@@ -1118,9 +1120,8 @@ public:
             LogFormatted(reshade::log::level::info, "[YRC] frame %u custom-size target %ux%u format %u written by PS 0x%08X", cb_luma_global_settings.FrameIndex, size.x, size.y, format, hash);
       }
 
-      if (const auto watched = watched_hashes.find(hash); watched != watched_hashes.end() && !game_device_data.logged_watched_hashes.contains(hash))
+      if (const auto watched = watched_hashes.find(hash); watched != watched_hashes.end() && game_device_data.logged_watched_hashes.insert(hash).second)
       {
-         game_device_data.logged_watched_hashes.insert(hash);
          uint4 size;
          DXGI_FORMAT format;
          if (is_compute)
@@ -1228,11 +1229,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          reshade::api::format::r8g8b8a8_unorm,
          reshade::api::format::r8g8b8a8_typeless,
       };
-      // The DoF runs before the ccr on a 512x512 scene copy (ps_texture) blurred into 512x256, which would clip highlights
-      // inside the blurred area. Those sizes (per game) are upgraded too. The top bloom level shares 512x256, so the glow_pass0/1
-      // replacements saturate to keep the vanilla bloom bound. (Hash-based mirrors don't help: they go through the same size filter.)
+      // The DoF runs before the ccr on offscreen scene copies and blurs (sizes per game, see "DetectGame") that would clip
+      // highlights inside the blurred area, so those sizes are upgraded too. The top bloom level shares 512x256, so
+      // glow_pass0/1 saturate to keep the vanilla bloom bound. (Hash-based mirrors don't help: they go through the same size filter.)
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomSize;
-      g_game_profile = ProfileFor(DetectGame());
+      g_game_profile = DetectGame();
       texture_format_upgrades_2d_custom_sizes = g_game_profile.dof_custom_sizes;
 
       game = new GameYakuzaRC();
