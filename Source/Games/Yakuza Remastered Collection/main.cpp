@@ -3,6 +3,8 @@
 #define DISABLE_AUTO_DEBUGGER 1
 // SMAA replaces the game's CMAA2 or FXAA (see "RunSMAA").
 #define ENABLE_SMAA 1
+// Luma Bloom replaces the glow pyramid (see "RunLumaBloom").
+#define ENABLE_BLOOM 1
 // XeGTAO re-issues the ASSAO apply draw with its own pixel shader, so it needs "original_draw_dispatch_func".
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // Effects that relied on the vanilla UNORM clamp get a saturate appended in place (see "PatchShaderBytecodeSync").
@@ -26,6 +28,7 @@ namespace
       std::vector<uint2> dof_custom_sizes;   // Offscreen DoF targets upgraded to fp16 besides the swapchain-sized ones
       uint32_t glow_downsample_pixel_shader; // Flagged to clamp its source per texel; per game because Y3's 0x54A5E7AC is Y4's ps_cubic
       bool grades_aliased_passthrough_ccr;   // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
+      bool glow_downsample_rms;              // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
 
@@ -37,10 +40,10 @@ namespace
       for (auto& c : exe)
          c = (char)tolower((unsigned char)c);
       if (exe.find("yakuza5") != std::string::npos)
-         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true};
+         return {"Yakuza 5 Remastered", {{512, 512}, {512, 256}, {256, 256}}, 0x54D6A534, true, false};
       if (exe.find("yakuza4") != std::string::npos)
-         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false};
-      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false};
+         return {"Yakuza 4 Remastered", {{1024, 1024}, {512, 512}, {512, 256}}, 0x66633BAD, false, true};
+      return {"Yakuza 3 Remastered", {{512, 512}, {512, 256}}, 0x54A5E7AC, false, false};
    }
 
    // User settings, persisted in the [Luma] config section.
@@ -50,6 +53,7 @@ namespace
    // slider, not persisted).
    float g_smaa_pred_tolerance = 0.02f;
    bool g_gtao_enable = true;
+   bool g_luma_bloom_enable = false;      // Off until calibrated against the vanilla glow in all three games
    float g_gtao_final_value_power = 0.8f; // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
 #if DEVELOPMENT
@@ -64,7 +68,17 @@ namespace
    constexpr uint32_t assao_prepare_pixel_shader = 0x972BE5B5;
    const std::unordered_set<uint32_t> assao_pre_apply_pixel_shaders = {0x1DD919C4, 0x47BFF17F, 0xD18E0D3F, 0x8CE62D1E, 0x15EEFFAF};
    constexpr uint32_t assao_apply_pixel_shader = 0x6A73BA10;
-   constexpr UINT gtao_knobs_cb_slot = 8;   // "register(b8)" in Luma_YRC_XeGTAO.hlsl
+   constexpr UINT gtao_knobs_cb_slot = 8; // "register(b8)" in Luma_YRC_XeGTAO.hlsl
+   // The glow pyramid: glow_pass0 builds its 512x256 level, 8x glow_pass1 blur it down to 32x16, glow_pass2 sums the 5
+   // levels onto the scene. Luma Bloom rebuilds the same 5 levels with the shared pyramid from a 1024x512 prefilter.
+   const std::unordered_set<uint32_t> glow_pass0_pixel_shaders = {0xB8414674, 0xD31A6374 /*Y5R*/};
+   constexpr uint32_t glow_pass1_pixel_shader = 0x9DD96515;
+   const std::unordered_set<uint32_t> glow_pass2_pixel_shaders = {0x9083BF34, 0x9E617E0A /*Y4R*/, 0x5F37CDE1 /*Y5R*/};
+   constexpr UINT glow_prefilter_width = 1024; // "glow_prefilter_ps" in Luma_YRC_Bloom.hlsl
+   constexpr UINT glow_prefilter_height = 512;
+   constexpr int kBloomMips = 5; // 512x256 down to 32x16, the vanilla levels
+   // Placeholders until the vanilla glow_pass1 weights are measured (DEV log).
+   constexpr float kBloomSigmas[kBloomMips] = {1.f, 1.3f, 1.3f, 1.3f, 1.3f};
    constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_YRC_XeGTAO.hlsl
    // Readers of the 4K r32 scene depth at t0: the ASSAO prepare, and a full-screen depth restore (also used by prepasses;
    // the last one before the AA, after ASSAO, reads the main depth). Captured for SMAA predication.
@@ -83,7 +97,7 @@ namespace
    constexpr uint32_t aliased_passthrough_ccr_pixel_shader = 0x2DD46662;
    // Effects drawn into targets that were UNORM in vanilla (the scene RT, the DoF-sized offscreen buffers), which
    // relied on that clamp: particles (ps_ptc_*, blood included), the hit flashes, edges and highlight masks, shockwave,
-   // aura, blood decals, body damage marks, the Y5R haze mask and DoF alpha passes. On the fp16 chain their colors went far
+   // aura, blood decals, body damage marks, the Y5R haze mask, star glare and DoF alpha passes. On the fp16 chain their colors went far
    // above 1 (glowing blood) and alphas above 1 extrapolated the blend (black and white streaks). glow_pass1 (0x9DD96515,
    // every game) is here too: the 512x256 bloom level shares the fp16 DoF size, and the clamp keeps the vanilla bloom
    // bound. The Y5R menu DoF blur2 (0x9BB484AC) divides by an alpha sum that can be 0: the clamp also turns its NaN into 0,
@@ -95,7 +109,7 @@ namespace
       0x41CF9297, 0x520829D8, 0x5478E175, 0x5516C25C, 0x5C6FE9C1, 0x5CAB83C7, 0x5EA728DE, 0x6137472C, 0x61F61EFA, 0x6318F86D, 0x6A85F04B, 0x72A43180, 0x7B6B2E75, 0x7DFE4BEA,
       0x7FEC9B44, 0x8083C110, 0x82552855, 0x85D925A4, 0x8C90CF92, 0x92627902, 0x9AC1CDB0, 0x9BED49EA, 0xA156C6FA, 0xABB7BCA4, 0xAE62C507, 0xB2EA0E19, 0xB4C297E5, 0xB620DDFB,
       0xB68688F9, 0xB68FA494, 0xB78A1D16, 0xBA8283E5, 0xBB2C0F00, 0xC35158E3, 0xD0BEFEA7, 0xD333A633, 0xD3CB7109, 0xD6D2F14E, 0xD7ABB7B3, 0xDC481F4C, 0xE3E323BA, 0xEF5F306A,
-      0xF1D626DC, 0xF476B17D, 0xF7283DA8, 0xFCDB3E0E, 0x4CC91AE4, 0x9BB484AC, 0xB0FBCECD, 0xE118D7F2, 0xED6A2631, 0xFF3FCF4D};
+      0xF1D626DC, 0xF476B17D, 0xF7283DA8, 0xFCDB3E0E, 0x4CC91AE4, 0x9BB484AC, 0xA8049B74, 0xB0FBCECD, 0xE118D7F2, 0xED6A2631, 0xFF3FCF4D};
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
@@ -145,9 +159,6 @@ namespace
       {0x54D6A534, "ps_down_sample_2x4 (Y5R glow source)"}, {0xD31A6374, "glow_pass0 (Y5R)"}, {0x5F37CDE1, "glow_pass2 (Y5R)"}, {0x0B55238C, "with_glare (Y5R exposure)"},
       {0x33E5746C, "fx_afterimage01 (Y5R)"}, {0x20D7E1BA, "ps_haze (Y5R)"}, {0xC389105B, "fx_track_blur (Y5R)"}, {0x0014DD95, "focus_blur_pass2 (Y5R DoF)"},
       {0xF9DF166D, "focus_blur_pass2_tex_a (Y5R DoF)"}, {0xE118D7F2, "focus_blur_pass1_5_blur (Y5R DoF)"}};
-   // Bloom ("glow") build pass (cb5 thresholds/scales, cb11 flags) and sum (cb5 scales); the downsample is in the game profile.
-   const std::unordered_set<uint32_t> glow_pass0_pixel_shaders = {0xB8414674, 0xD31A6374 /*Y5R*/};
-   const std::unordered_set<uint32_t> glow_pass2_pixel_shaders = {0x9083BF34, 0x9E617E0A /*Y4R*/, 0x5F37CDE1 /*Y5R*/};
    // DoF composites into the scene: focus_blur_pass2 and pass2_mask (Y3R/Y4R, then Y5R).
    const std::unordered_set<uint32_t> dof_composite_pixel_shaders = {0x04359FA6, 0x74E5C6AC, 0x0014DD95, 0xEA4513EB};
    // One-time log lines that have no shader hash of their own.
@@ -193,6 +204,16 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    bool cmaa2_replaced = false;                 // The CMAA2 chain of this frame is skipped, its apply runs SMAA
    bool smaa_ran = false;                       // The game's CAS becomes a copy (RCAS, when on, already sharpened)
    bool assao_replaced = false;                 // XeGTAO ran at the ASSAO prepare: the chain is skipped, its apply draws XeGTAO
+   com_ptr<ID3D11Resource> glow_level0;         // What the glow downsample wrote, the level glow_pass0 must read for Luma Bloom
+   bool glow_prefiltered = false;               // The Luma Bloom prefilter holds this frame's glow source
+   bool glow_replaced = false;                  // Luma Bloom ran at glow_pass0: pass1 is skipped, pass2 composites it
+
+   // Luma Bloom: the prefiltered glow source, and a view with every mip of DrawBloom's result (its SRV shows mip 0 only).
+   com_ptr<ID3D11Texture2D> glow_prefilter_texture;
+   com_ptr<ID3D11ShaderResourceView> glow_prefilter_srv;
+   com_ptr<ID3D11RenderTargetView> glow_prefilter_rtv;
+   com_ptr<ID3D11Resource> bloom_resource;
+   com_ptr<ID3D11ShaderResourceView> bloom_all_mips_srv;
 
    // XeGTAO scratch, at the depth's size. The size is kept even when the allocation failed: a null set then means
    // "failed", and it is not retried every frame.
@@ -240,6 +261,8 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    std::vector<float> last_logged_assao_cb0;
    std::vector<float> last_logged_glow_cbs[2]; // glow_pass0, glow_pass2
    std::vector<float> last_logged_dof_cb5;
+   uint32_t glow_pass1_draws = 0;                           // this frame
+   std::vector<float> last_logged_glow_pass1[8];            // PS cb5[0..3], VS cb7[0], target and source size per draw
    com_ptr<ID3D11Resource> glow_source;                     // The glow downsample's swapchain-sized t0, from a previous frame
    std::unordered_set<uint32_t> logged_glow_source_writers; // Pixel shaders seen rendering into it
    std::unordered_set<uint32_t> seen_blend_hashes;          // Pixel shaders already checked by the blended-effect trap
@@ -634,6 +657,84 @@ class GameYakuzaRC final : public Game
       return true;
    }
 
+   // At the glow downsample: the 4K glow source (its t0) into the 1024x512 prefilter, clamped per texel as the 8-bit source
+   // was, with the vanilla downsample's footprint. Also records the level it writes, which glow_pass0 must read.
+   static bool PrefilterGlowSource(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      com_ptr<ID3D11ShaderResourceView> source_srv;
+      native_device_context->PSGetShaderResources(0, 1, &source_srv);
+      com_ptr<ID3D11RenderTargetView> level0_rtv;
+      native_device_context->OMGetRenderTargets(1, &level0_rtv, nullptr);
+      if (!source_srv || !level0_rtv)
+         return false;
+      level0_rtv->GetResource(&game_device_data.glow_level0);
+
+      if (!game_device_data.glow_prefilter_texture)
+      {
+         D3D11_TEXTURE2D_DESC desc = {};
+         desc.Width = glow_prefilter_width;
+         desc.Height = glow_prefilter_height;
+         desc.MipLevels = 1;
+         desc.ArraySize = 1;
+         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+         desc.SampleDesc.Count = 1;
+         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.glow_prefilter_texture)) || FAILED(native_device->CreateShaderResourceView(game_device_data.glow_prefilter_texture.get(), nullptr, &game_device_data.glow_prefilter_srv)) || FAILED(native_device->CreateRenderTargetView(game_device_data.glow_prefilter_texture.get(), nullptr, &game_device_data.glow_prefilter_rtv)))
+         {
+            game_device_data.glow_prefilter_texture.reset();
+            return false;
+         }
+      }
+
+      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, "YRC Glow Prefilter PS"_h))
+         return false;
+      DrawStateStack<DrawStateStackType::FullGraphics> prefilter_state;
+      prefilter_state.Cache(native_device_context, device_data.uav_max_count);
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, g_game_profile.glow_downsample_rms ? 1u : 0u);
+      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(), device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("YRC Glow Prefilter PS"_h).get(), source_srv.get(), game_device_data.glow_prefilter_rtv.get(), glow_prefilter_width, glow_prefilter_height, false);
+      prefilter_state.Restore(native_device_context);
+      return true;
+   }
+
+   // At glow_pass0, in place of it: the shared pyramid on the prefilter, its bright pass reading pass0's own cb5 (still
+   // bound). Only when pass0 reads the level the glow downsample just wrote (Y5R downsamples twice; its first level may
+   // be something else), else the native pyramid runs.
+   static bool RunLumaBloom(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      com_ptr<ID3D11ShaderResourceView> level0_srv;
+      native_device_context->PSGetShaderResources(1, 1, &level0_srv);
+      com_ptr<ID3D11Resource> level0;
+      if (level0_srv)
+         level0_srv->GetResource(&level0);
+      if (!level0 || level0 != game_device_data.glow_level0)
+         return false;
+
+      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      if (!HasShaders(device_data.native_vertex_shaders, "Bloom VS"_h) || !HasShaders(device_data.native_pixel_shaders, "Bloom Prefilter PS"_h, "Bloom Downsample PS"_h, "Bloom Upsample PS"_h, "YRC Bloom Composite PS"_h))
+         return false;
+      DrawStateStack<DrawStateStackType::FullGraphics> bloom_state;
+      bloom_state.Cache(native_device_context, device_data.uav_max_count);
+      com_ptr<ID3D11ShaderResourceView> bloom_srv;
+      DrawBloom(native_device, native_device_context, device_data, game_device_data.glow_prefilter_srv.get(), kBloomMips, kBloomSigmas, &bloom_srv);
+      bloom_state.Restore(native_device_context);
+      if (!bloom_srv)
+         return false;
+
+      com_ptr<ID3D11Resource> bloom_resource;
+      bloom_srv->GetResource(&bloom_resource);
+      if (bloom_resource != game_device_data.bloom_resource)
+      {
+         game_device_data.bloom_all_mips_srv.reset();
+         game_device_data.bloom_resource = bloom_resource;
+         if (FAILED(native_device->CreateShaderResourceView(bloom_resource.get(), nullptr, &game_device_data.bloom_all_mips_srv)))
+            game_device_data.bloom_resource.reset();
+      }
+      return game_device_data.bloom_all_mips_srv != nullptr;
+   }
+
 public:
    // "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp the vanilla UNORM target applied to these effects.
    std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
@@ -683,6 +784,7 @@ public:
       default_luma_global_game_settings.VideoAutoHDREnable = cb_luma_global_settings.GameSettings.VideoAutoHDREnable = 1.f;
       default_luma_global_game_settings.VideoAutoHDRBoost = cb_luma_global_settings.GameSettings.VideoAutoHDRBoost = 0.5f; // peak ~165 nits
       default_luma_global_game_settings.Dithering = cb_luma_global_settings.GameSettings.Dithering = 1.f;
+      default_luma_global_game_settings.BloomIntensity = cb_luma_global_settings.GameSettings.BloomIntensity = 1.f;
 
       native_shaders_definitions.emplace(CompileTimeStringHash("YRC SMAA Linearize CS"), ShaderDefinition{"Luma_YRC_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("YRC SMAA Predication CS"), ShaderDefinition{"Luma_YRC_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
@@ -693,6 +795,8 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("YRC XeGTAO Denoise Pass 1 CS"), ShaderDefinition{"Luma_YRC_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("YRC XeGTAO Denoise Pass 2 CS"), ShaderDefinition{"Luma_YRC_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("YRC GTAO Apply PS"), ShaderDefinition{"Luma_YRC_GTAOApply", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC Glow Prefilter PS"), ShaderDefinition{"Luma_YRC_Bloom", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "glow_prefilter_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YRC Bloom Composite PS"), ShaderDefinition{"Luma_YRC_Bloom", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_composite_ps"});
    }
 
    void LoadConfigs() override
@@ -700,10 +804,12 @@ public:
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+      reshade::get_config_value(nullptr, NAME, "BloomEnable", g_luma_bloom_enable);
       auto& gs = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       reshade::get_config_value(nullptr, NAME, "Dithering", gs.Dithering);
+      reshade::get_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -741,6 +847,24 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Read the mask back and log its distribution to ReShade.log.\nStand still, set a tolerance, press; repeat per value and compare the lines.\nFIRES(>0.5) is the share of the frame that regains base sensitivity.");
 #endif
+      ImGui::EndDisabled();
+
+      ImGui::SeparatorText("Bloom");
+
+      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+         reshade::set_config_value(nullptr, NAME, "BloomEnable", g_luma_bloom_enable);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Replaces the game's bloom with a smoother HDR bloom.");
+
+      ImGui::BeginDisabled(!g_luma_bloom_enable);
+      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
+         device_data.cb_luma_global_settings_dirty = true;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
+      if (DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity"))
+         device_data.cb_luma_global_settings_dirty = true;
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Ambient Occlusion");
@@ -960,11 +1084,64 @@ public:
 #endif
       }
       // The replacement clamps the glow source per texel only on this flag (see SampleGlowSource in Includes/Common.hlsl).
+      // Luma Bloom prefilters the same source first; the native downsample still runs (Y5R's exposure meter reads it).
       else if (!is_compute && hash == g_game_profile.glow_downsample_pixel_shader)
       {
+         game_device_data.glow_prefiltered = g_luma_bloom_enable && PrefilterGlowSource(native_device, native_device_context, cmd_list_data, device_data);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 1u);
          updated_cbuffers = true;
+      }
+      else if (!is_compute && game_device_data.glow_prefiltered && glow_pass0_pixel_shaders.contains(hash))
+      {
+         game_device_data.glow_replaced = RunLumaBloom(native_device, native_device_context, device_data);
+         if (game_device_data.glow_replaced)
+            return DrawOrDispatchOverrideType::Replaced;
+      }
+      else if (!is_compute && game_device_data.glow_replaced && hash == glow_pass1_pixel_shader)
+      {
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+      // The game's sum draw (its VS, viewport, cb5 and additive blend onto the scene) with the Luma Bloom composite as its PS.
+      else if (!is_compute && game_device_data.glow_replaced && glow_pass2_pixel_shaders.contains(hash))
+      {
+         game_device_data.glow_replaced = false;
+         com_ptr<ID3D11PixelShader> composite_ps;
+         {
+            const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+            if (const auto it = device_data.native_pixel_shaders.find("YRC Bloom Composite PS"_h); it != device_data.native_pixel_shaders.end())
+               composite_ps = it->second;
+         }
+         // Without it (a shader reload since glow_pass0) the frame goes without bloom: the native levels were never built.
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         uint4 size;
+         DXGI_FORMAT format;
+         GetResourceInfo(rtv.get(), size, format);
+         if (original_draw_dispatch_func && composite_ps && game_device_data.bloom_all_mips_srv && size.x != 0 && size.y != 0)
+         {
+            com_ptr<ID3D11PixelShader> game_ps;
+            native_device_context->PSGetShader(&game_ps, nullptr, nullptr);
+            com_ptr<ID3D11ShaderResourceView> game_srv;
+            native_device_context->PSGetShaderResources(0, 1, &game_srv);
+            com_ptr<ID3D11SamplerState> game_sampler;
+            native_device_context->PSGetSamplers(0, 1, &game_sampler);
+            ID3D11ShaderResourceView* const bloom_srv = game_device_data.bloom_all_mips_srv.get();
+            ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get();
+            native_device_context->PSSetShader(composite_ps.get(), nullptr, 0);
+            native_device_context->PSSetShaderResources(0, 1, &bloom_srv);
+            native_device_context->PSSetSamplers(0, 1, &linear_sampler);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, 1.f / float(size.x), 1.f / float(size.y));
+            updated_cbuffers = true;
+            (*original_draw_dispatch_func)();
+            ID3D11ShaderResourceView* const restored_srv = game_srv.get();
+            ID3D11SamplerState* const restored_sampler = game_sampler.get();
+            native_device_context->PSSetShaderResources(0, 1, &restored_srv);
+            native_device_context->PSSetSamplers(0, 1, &restored_sampler);
+            native_device_context->PSSetShader(game_ps.get(), nullptr, 0);
+         }
+         return DrawOrDispatchOverrideType::Replaced;
       }
 
 #if DEVELOPMENT
@@ -1107,6 +1284,37 @@ public:
          }
       }
 
+      // glow_pass1 (8 draws: 4 levels, H then V): its 6 tap weights (PS cb5[1..3], taps at +-0.5/1.5/2.5 x VS cb7[0].xy)
+      // and sizes, from which the Luma Bloom widths are set.
+      if (!is_compute && hash == glow_pass1_pixel_shader && can_read && game_device_data.glow_pass1_draws < 8)
+      {
+         const uint32_t draw = game_device_data.glow_pass1_draws++;
+         com_ptr<ID3D11Buffer> ps_cb, vs_cb;
+         native_device_context->PSGetConstantBuffers(5, 1, &ps_cb);
+         native_device_context->VSGetConstantBuffers(7, 1, &vs_cb);
+         std::vector<float> ps_data, vs_data;
+         com_ptr<ID3D11Buffer> cb_copy;
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         com_ptr<ID3D11ShaderResourceView> srv;
+         native_device_context->PSGetShaderResources(0, 1, &srv);
+         uint4 target_size, source_size;
+         DXGI_FORMAT format;
+         GetResourceInfo(rtv.get(), target_size, format);
+         GetResourceInfo(srv.get(), source_size, format);
+         if (log_frame && CopyBuffer(ps_cb, native_device_context, ps_data, cb_copy) && ps_data.size() >= 16 && CopyBuffer(vs_cb, native_device_context, vs_data, cb_copy) && vs_data.size() >= 4)
+         {
+            std::vector<float> data(ps_data.begin(), ps_data.begin() + 16);
+            data.insert(data.end(), vs_data.begin(), vs_data.begin() + 4);
+            data.insert(data.end(), {float(target_size.x), float(target_size.y), float(source_size.x), float(source_size.y)});
+            if (data != game_device_data.last_logged_glow_pass1[draw])
+            {
+               game_device_data.last_logged_glow_pass1[draw] = data;
+               LogFormatted(reshade::log::level::info, "[YRC] frame %u glow_pass1 #%u %ux%u <- %ux%u: cb5 (%f %f %f %f) (%f %f %f %f) (%f %f %f %f) (%f %f %f %f), VS cb7[0] (%f %f %f %f)", cb_luma_global_settings.FrameIndex, draw, target_size.x, target_size.y, source_size.x, source_size.y, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19]);
+            }
+         }
+      }
+
       // DoF composites: alpha = saturate(depth term) * cb5[0].z (pass2_mask also * mask * cb5[1].x); a scale above 1 would
       // extrapolate the blend into the fp16 scene.
       if (!is_compute && dof_composite_pixel_shaders.contains(hash) && log_frame && can_read)
@@ -1210,6 +1418,16 @@ public:
       game_device_data.cmaa2_replaced = false;
       game_device_data.smaa_ran = false;
       game_device_data.assao_replaced = false;
+      game_device_data.glow_prefiltered = false;
+      game_device_data.glow_replaced = false;
+      game_device_data.glow_level0.reset();
+      // Turning Luma Bloom off gives its prefilter back; it is rebuilt on demand.
+      if (!g_luma_bloom_enable && game_device_data.glow_prefilter_texture)
+      {
+         game_device_data.glow_prefilter_texture.reset();
+         game_device_data.glow_prefilter_srv.reset();
+         game_device_data.glow_prefilter_rtv.reset();
+      }
       // Turning XeGTAO off gives its scratch back; it is rebuilt on demand.
       if (!g_gtao_enable && game_device_data.gtao_width != 0)
          game_device_data.ReleaseGTAOScratch();
@@ -1243,12 +1461,59 @@ public:
       game_device_data.drew_video = false;
       game_device_data.exposure_samples.clear();
       game_device_data.exposure_reads = 0;
+      game_device_data.glow_pass1_draws = 0;
 #endif
    }
 
    void PrintImGuiAbout() override
    {
-      ImGui::Text("Yakuza Remastered Collection Luma mod - about and credits section", "");
+      ImGui::PushTextWrapPos(0.f);
+      ImGui::Text(
+         "Luma for \"Yakuza 3 Remastered\", \"Yakuza 4 Remastered\" and \"Yakuza 5 Remastered\" is developed by DristoforColumb and is open source and free.\n"
+         "It adds HDR and replaces the game's CMAA2/FXAA with SMAA and its SSAO with XeGTAO.\n"
+         "Enable Anti-Aliasing and Ambient Occlusion in the game's video settings for SMAA and XeGTAO to apply.\n"
+         "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
+         "Thanks to the Luma team and contributors.\n"
+         "If you enjoy it, consider donating.");
+      ImGui::PopTextWrapPos();
+
+      ImGui::NewLine();
+      ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 134, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70 + 9, 134 + 9, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
+      static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
+      if (ImGui::Button(donation_link.c_str()))
+         ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+      ImGui::PopStyleColor(3);
+
+      ImGui::NewLine();
+      static const std::string social_link = std::string("Join our \"HDR Den\" Discord ") + std::string(ICON_FK_SEARCH);
+      if (ImGui::Button(social_link.c_str()))
+      {
+         // Unique link for Luma's HDR Den (tracks the origin of people joining); do not share for other purposes.
+         static const std::string discord_link = std::string("https://discord.gg/J9fM") + std::string("3EVuEZ");
+         ShellExecuteA(nullptr, "open", discord_link.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      }
+      static const std::string contributing_link = std::string("Contribute on Github ") + std::string(ICON_FK_FILE_CODE);
+      if (ImGui::Button(contributing_link.c_str()))
+         ShellExecuteA(nullptr, "open", "https://github.com/Filoppi/Luma-Framework", nullptr, nullptr, SW_SHOWNORMAL);
+
+      ImGui::NewLine();
+      ImGui::Text("Build Date: %s %s", __DATE__, __TIME__);
+
+      ImGui::NewLine();
+      ImGui::Text("Credits:"
+                  "\n\nMain:"
+                  "\nDristoforColumb"
+                  "\n\nThird Party:"
+                  "\nReShade"
+                  "\nImGui"
+                  "\nRenoDX (HDR tonemap method)"
+                  "\nDICE (HDR tonemapper)"
+                  "\nMacLeod-Boynton hue emulation (RenoDX)"
+                  "\nSMAA (Iryoku)"
+                  "\nXeGTAO (Intel)"
+                  "\nAMD FidelityFX (RCAS)");
    }
 };
 
