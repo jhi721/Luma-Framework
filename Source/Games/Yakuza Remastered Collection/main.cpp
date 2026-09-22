@@ -1298,14 +1298,15 @@ public:
          }
       }
       // Materials: before the ccr, with the per-material cb1/cb2/cb11 set bound (post passes don't bind cb1).
-      else if (!is_compute && log_frame && can_read && !game_device_data.drew_ccr && game_device_data.exposure_reads++ < max_exposure_reads)
+      else if (!is_compute && log_frame && can_read && !game_device_data.drew_ccr && game_device_data.exposure_reads < max_exposure_reads)
       {
          com_ptr<ID3D11Buffer> cbs[3];
          native_device_context->PSGetConstantBuffers(1, 2, &cbs[0]);
          native_device_context->PSGetConstantBuffers(11, 1, &cbs[2]);
          std::vector<float> data;
          com_ptr<ID3D11Buffer> cb_copy;
-         if (cbs[0].get() && cbs[1].get() && cbs[2].get() && CopyBuffer(cbs[1], native_device_context, data, cb_copy) && data.size() >= 16 * 4)
+         // Only material draws count toward the budget (shadow and depth passes come first and bind no cb1/cb2/cb11 set).
+         if (cbs[0].get() && cbs[1].get() && cbs[2].get() && game_device_data.exposure_reads++ < max_exposure_reads && CopyBuffer(cbs[1], native_device_context, data, cb_copy) && data.size() >= 16 * 4)
          {
             const size_t scale = g_game_profile.material_tone_curve ? 60 : 56; // cb2[15], Y3R/Y4R cb2[14]
             const std::array<float, 4> exposure = {data[24], data[scale], data[scale + 1], data[scale + 2]};
