@@ -18,10 +18,14 @@ namespace
    float g_rcas_sharpness = 0.f;
    // Plane deviation that counts as a full predication edge, as a fraction of view depth (TW2's validated value; DEV slider).
    float g_smaa_pred_tolerance = 0.02f;
+   bool g_gtao_enable = true;
+   float g_gtao_final_value_power = 1.f; // DEV/TEST calibration knobs, not persisted
+   float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
 #if DEVELOPMENT
    bool g_smaa_predication = true;
    bool g_smaa_pred_debug = false;   // Show the predication mask (red) instead of the frame
    bool g_smaa_pred_measure = false; // One-shot: read the mask back and log its distribution (UI button)
+   int g_gtao_debug_view = 0;        // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
 #endif
 
    // Readers of the 4K r32 scene depth at t0: ASSAO prepare, and a full-screen depth restore (also used by prepasses; the
@@ -36,6 +40,13 @@ namespace
    constexpr uint32_t fxaa_pixel_shader = 0xE7A1D308;
    // FidelityFX CAS (t0 -> u0, copied back by the game), after the AA and the world-anchored markers.
    constexpr uint32_t cas_compute_shader = 0x491BAFA3;
+   // Intel ASSAO (stock): prepare (also a depth reader above), depth mips, generate (High / Medium), smart blur / wide, all
+   // skipped under XeGTAO; the apply multiply-blends the AO onto the scene mid material stream (see "RunXeGTAO").
+   constexpr uint32_t assao_prepare_pixel_shader = 0x972BE5B5;
+   const std::unordered_set<uint32_t> assao_pre_apply_pixel_shaders = {0x1DD919C4, 0x47BFF17F, 0xD18E0D3F, 0x8CE62D1E, 0x15EEFFAF};
+   constexpr uint32_t assao_apply_pixel_shader = 0x6A73BA10;
+   constexpr UINT gtao_knobs_cb_slot = 8;   // "register(b8)" in Luma_Y3_XeGTAO.hlsl
+   constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_Y3_XeGTAO.hlsl
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
@@ -103,6 +114,38 @@ struct Yakuza3DeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> depth_srv; // Scene depth for predication, null if no reader ran
    bool cmaa2_replaced = false;                 // The CMAA2 chain of this frame is skipped, its apply runs SMAA
    bool smaa_ran = false;                       // RCAS replaced the game's CAS, which becomes a copy
+   bool assao_replaced = false;                 // XeGTAO ran at the ASSAO prepare: the chain is skipped, its apply draws XeGTAO
+
+   // XeGTAO scratch, at the depth's size. The size is kept even when the allocation failed: a null set then means
+   // "failed", and it is not retried every frame.
+   com_ptr<ID3D11Texture2D> gtao_depth_mips_texture; // R32F view-space depth pyramid
+   com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[gtao_depth_mip_count];
+   com_ptr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
+   com_ptr<ID3D11UnorderedAccessView> gtao_working_uavs[2]; // R8G8_UNORM AO + edges ping-pong
+   com_ptr<ID3D11ShaderResourceView> gtao_working_srvs[2];
+   com_ptr<ID3D11UnorderedAccessView> gtao_final_uav; // R8_UNORM AO, read by the apply
+   com_ptr<ID3D11ShaderResourceView> gtao_final_srv;
+   uint32_t gtao_width = 0;
+   uint32_t gtao_height = 0;
+   com_ptr<ID3D11Buffer> gtao_knobs_cb; // immutable, recreated when a knob changes
+   float gtao_knobs[8] = {};
+
+   void ReleaseGTAOScratch()
+   {
+      gtao_depth_mips_texture.reset();
+      for (auto& uav : gtao_depth_mip_uavs)
+         uav.reset();
+      gtao_depth_mips_srv.reset();
+      for (auto& uav : gtao_working_uavs)
+         uav.reset();
+      for (auto& srv : gtao_working_srvs)
+         srv.reset();
+      gtao_final_uav.reset();
+      gtao_final_srv.reset();
+      gtao_knobs_cb.reset();
+      gtao_width = 0;
+      gtao_height = 0;
+   }
 
 #if DEVELOPMENT
    // Per frame
@@ -115,6 +158,7 @@ struct Yakuza3DeviceData final : public GameDeviceData
    uint32_t frames_without_ccr = 0;
    uint32_t last_logged_ccr_hash = 0;
    std::vector<float> last_logged_ccr_cb5;
+   std::vector<float> last_logged_assao_cb0;
    std::unordered_set<uint32_t> logged_watched_hashes;
    std::unordered_set<uint32_t> logged_custom_size_hashes;
    // Staging copy for the one-shot predication mask readback (see LogPredicationStats), allocated on first use.
@@ -384,11 +428,125 @@ class GameYakuza3 final : public Game
       return true;
    }
 
+   // XeGTAO in place of the ASSAO prepare (where the depth is bound for reading, never as the DSV that would null its SRV):
+   // prefilter, main pass and two denoisers on the prepare's own depth (t0) and ASSAO constants (b0, for this frame's FOV).
+   // The apply then draws the result. Returns false, and the native chain runs, when a shader, an input or the scratch is
+   // missing.
+   bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11ShaderResourceView* depth_srv)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      // Held through the passes so a shader reload cannot release them mid-use.
+      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      const auto& shaders = device_data.native_compute_shaders;
+      if (!HasShaders(shaders, "Y3 XeGTAO Prefilter Depths CS"_h, "Y3 XeGTAO Main Pass CS"_h, "Y3 XeGTAO Denoise Pass 1 CS"_h, "Y3 XeGTAO Denoise Pass 2 CS"_h) || !HasShaders(device_data.native_pixel_shaders, "Y3 GTAO Apply PS"_h))
+         return false;
+
+      com_ptr<ID3D11Buffer> assao_cb;
+      native_device_context->PSGetConstantBuffers(0, 1, &assao_cb);
+      com_ptr<ID3D11Resource> depth;
+      if (depth_srv)
+         depth_srv->GetResource(&depth);
+      D3D11_TEXTURE2D_DESC depth_desc;
+      if (!assao_cb || !GetTextureDesc(depth.get(), &depth_desc))
+         return false;
+      const uint32_t width = depth_desc.Width;
+      const uint32_t height = depth_desc.Height;
+
+      if (game_device_data.gtao_width != width || game_device_data.gtao_height != height)
+      {
+         game_device_data.ReleaseGTAOScratch();
+         D3D11_TEXTURE2D_DESC desc = {};
+         desc.Width = width;
+         desc.Height = height;
+         desc.MipLevels = gtao_depth_mip_count;
+         desc.ArraySize = 1;
+         desc.Format = DXGI_FORMAT_R32_FLOAT;
+         desc.SampleDesc.Count = 1;
+         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+         bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.gtao_depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(game_device_data.gtao_depth_mips_texture.get(), nullptr, &game_device_data.gtao_depth_mips_srv));
+         D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+         uav_desc.Format = desc.Format;
+         uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+         for (UINT mip = 0; ok && mip < gtao_depth_mip_count; mip++)
+         {
+            uav_desc.Texture2D.MipSlice = mip;
+            ok = SUCCEEDED(native_device->CreateUnorderedAccessView(game_device_data.gtao_depth_mips_texture.get(), &uav_desc, &game_device_data.gtao_depth_mip_uavs[mip]));
+         }
+         desc.MipLevels = 1;
+         desc.Format = DXGI_FORMAT_R8G8_UNORM;
+         for (int i = 0; ok && i < 2; i++)
+         {
+            com_ptr<ID3D11Texture2D> working_texture;
+            ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &working_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(working_texture.get(), nullptr, &game_device_data.gtao_working_uavs[i])) && SUCCEEDED(native_device->CreateShaderResourceView(working_texture.get(), nullptr, &game_device_data.gtao_working_srvs[i]));
+         }
+         desc.Format = DXGI_FORMAT_R8_UNORM;
+         com_ptr<ID3D11Texture2D> final_texture;
+         ok = ok && SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &final_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(final_texture.get(), nullptr, &game_device_data.gtao_final_uav)) && SUCCEEDED(native_device->CreateShaderResourceView(final_texture.get(), nullptr, &game_device_data.gtao_final_srv));
+         if (!ok)
+            game_device_data.ReleaseGTAOScratch();
+         game_device_data.gtao_width = width;
+         game_device_data.gtao_height = height;
+      }
+      if (!game_device_data.gtao_final_srv)
+         return false;
+
+#if DEVELOPMENT
+      const float debug_view = float(g_gtao_debug_view);
+#else
+      const float debug_view = 0.f;
+#endif
+      const float knobs[8] = {g_gtao_final_value_power, g_gtao_radius_override, debug_view, 0.f, 1.f / float(width), 1.f / float(height), 0.f, 0.f};
+      if (!game_device_data.gtao_knobs_cb || std::memcmp(game_device_data.gtao_knobs, knobs, sizeof(knobs)) != 0)
+      {
+         game_device_data.gtao_knobs_cb.reset();
+         D3D11_BUFFER_DESC cb_desc = {};
+         cb_desc.ByteWidth = sizeof(knobs);
+         cb_desc.Usage = D3D11_USAGE_IMMUTABLE;
+         cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+         const D3D11_SUBRESOURCE_DATA cb_data = {knobs};
+         if (FAILED(native_device->CreateBuffer(&cb_desc, &cb_data, &game_device_data.gtao_knobs_cb)))
+            return false;
+         std::memcpy(game_device_data.gtao_knobs, knobs, sizeof(knobs));
+      }
+
+      DrawStateStack<DrawStateStackType::Compute> compute_state;
+      compute_state.Cache(native_device_context, device_data.uav_max_count);
+      ID3D11Buffer* const cbs[] = {assao_cb.get(), game_device_data.gtao_knobs_cb.get()};
+      native_device_context->CSSetConstantBuffers(0, 1, &cbs[0]);
+      native_device_context->CSSetConstantBuffers(gtao_knobs_cb_slot, 1, &cbs[1]);
+      ID3D11SamplerState* const point_sampler = device_data.sampler_state_point.get();
+      native_device_context->CSSetSamplers(0, 1, &point_sampler);
+
+      // Each pass binds its destination UAV before its source SRV: D3D11 otherwise nulls an SRV that still aliases the
+      // previous pass's bound UAV.
+      ID3D11ShaderResourceView* const null_srv = nullptr;
+      ID3D11UnorderedAccessView* const null_uavs[gtao_depth_mip_count] = {};
+      const auto pass = [&](uint32_t shader_name_hash, UINT uav_count, ID3D11UnorderedAccessView* const* uavs, ID3D11ShaderResourceView* srv, UINT groups_x, UINT groups_y)
+      {
+         native_device_context->CSSetShaderResources(0, 1, &null_srv);
+         native_device_context->CSSetUnorderedAccessViews(0, uav_count, uavs, nullptr);
+         native_device_context->CSSetShaderResources(0, 1, &srv);
+         native_device_context->CSSetShader(shaders.at(shader_name_hash).get(), nullptr, 0);
+         native_device_context->Dispatch(groups_x, groups_y, 1);
+         native_device_context->CSSetUnorderedAccessViews(0, uav_count, null_uavs, nullptr);
+      };
+      ID3D11UnorderedAccessView* const mip_uavs[gtao_depth_mip_count] = {game_device_data.gtao_depth_mip_uavs[0].get(), game_device_data.gtao_depth_mip_uavs[1].get(), game_device_data.gtao_depth_mip_uavs[2].get(), game_device_data.gtao_depth_mip_uavs[3].get(), game_device_data.gtao_depth_mip_uavs[4].get()};
+      ID3D11UnorderedAccessView* const working_uavs[2] = {game_device_data.gtao_working_uavs[0].get(), game_device_data.gtao_working_uavs[1].get()};
+      ID3D11UnorderedAccessView* const final_uav = game_device_data.gtao_final_uav.get();
+      pass("Y3 XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, depth_srv, (width + 15) / 16, (height + 15) / 16);
+      pass("Y3 XeGTAO Main Pass CS"_h, 1, &working_uavs[0], game_device_data.gtao_depth_mips_srv.get(), (width + 7) / 8, (height + 7) / 8);
+      pass("Y3 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], game_device_data.gtao_working_srvs[0].get(), (width + 15) / 16, (height + 7) / 8);
+      pass("Y3 XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, game_device_data.gtao_working_srvs[1].get(), (width + 15) / 16, (height + 7) / 8);
+      compute_state.Restore(native_device_context);
+      return true;
+   }
+
 public:
    void OnInit(bool async) override
    {
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", 1},
+         {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -412,12 +570,19 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("Y3 SMAA Linearize CS"), ShaderDefinition{"Luma_Y3_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("Y3 SMAA Predication CS"), ShaderDefinition{"Luma_Y3_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("Y3 Sharpen PS"), ShaderDefinition{"Luma_Y3_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+      // XeGTAO passes (Luma_Y3_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
+      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Prefilter Depths CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Main Pass CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Denoise Pass 1 CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 XeGTAO Denoise Pass 2 CS"), ShaderDefinition{"Luma_Y3_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Y3 GTAO Apply PS"), ShaderDefinition{"Luma_Y3_GTAOApply", reshade::api::pipeline_subobject_type::pixel_shader});
    }
 
    void LoadConfigs() override
    {
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
+      reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       auto& gs = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
@@ -460,6 +625,28 @@ public:
          ImGui::SetTooltip("Read the mask back and log its distribution to ReShade.log.\nStand still, set a tolerance, press; repeat per value and compare the lines.\nFIRES(>0.5) is the share of the frame that regains base sensitivity.");
 #endif
       ImGui::EndDisabled();
+
+      ImGui::SeparatorText("Ambient Occlusion");
+
+      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
+         reshade::set_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's graphics settings).");
+#if DEVELOPMENT || TEST
+      ImGui::BeginDisabled(!g_gtao_enable);
+      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Primary darkness dial (higher = darker AO).");
+      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("0 = the game's own SSAO radius (0.8); > 0 overrides it, in the same view units.");
+#if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
+      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Draws diagnostics through the game's SSAO apply (multiplied onto the scene). Depth gradient flat or blocky = wrong input;\nNormals: camera-facing surfaces bright; AO x8 = spot broad over-occlusion.");
+#endif
+      ImGui::EndDisabled();
+#endif
 
       ImGui::SeparatorText("Effects");
 
@@ -513,8 +700,46 @@ public:
          D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
          if (srv)
             srv->GetDesc(&srv_desc);
-         if (srv && srv_desc.Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS && srv_desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D)
+         const bool is_depth = srv && srv_desc.Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS && srv_desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D;
+         if (is_depth)
             game_device_data.depth_srv = srv;
+         // The ASSAO prepare decides for the whole chain: once skipped, the apply must draw XeGTAO (its inputs were never built).
+         if (hash == assao_prepare_pixel_shader)
+         {
+            game_device_data.assao_replaced = g_gtao_enable && is_depth && RunXeGTAO(native_device, native_device_context, device_data, srv.get());
+            if (game_device_data.assao_replaced)
+               return DrawOrDispatchOverrideType::Replaced;
+         }
+      }
+      else if (!is_compute && assao_pre_apply_pixel_shaders.contains(hash) && game_device_data.assao_replaced)
+      {
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+      // The game's apply draw (full-screen VS, viewport, multiply blend onto the scene RT) with the XeGTAO reader as its PS.
+      else if (!is_compute && hash == assao_apply_pixel_shader && game_device_data.assao_replaced)
+      {
+         com_ptr<ID3D11PixelShader> apply_ps;
+         {
+            const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+            if (const auto it = device_data.native_pixel_shaders.find("Y3 GTAO Apply PS"_h); it != device_data.native_pixel_shaders.end())
+               apply_ps = it->second;
+         }
+         // Without it (a shader reload since the prepare) the frame goes without AO: the native inputs were never built.
+         if (original_draw_dispatch_func && apply_ps)
+         {
+            com_ptr<ID3D11PixelShader> game_ps;
+            native_device_context->PSGetShader(&game_ps, nullptr, nullptr);
+            com_ptr<ID3D11ShaderResourceView> game_srv;
+            native_device_context->PSGetShaderResources(0, 1, &game_srv);
+            ID3D11ShaderResourceView* const ao_srv = game_device_data.gtao_final_srv.get();
+            native_device_context->PSSetShader(apply_ps.get(), nullptr, 0);
+            native_device_context->PSSetShaderResources(0, 1, &ao_srv);
+            (*original_draw_dispatch_func)();
+            ID3D11ShaderResourceView* const restored_srv = game_srv.get();
+            native_device_context->PSSetShaderResources(0, 1, &restored_srv);
+            native_device_context->PSSetShader(game_ps.get(), nullptr, 0);
+         }
+         return DrawOrDispatchOverrideType::Replaced;
       }
       else if (is_compute && cmaa2_pre_apply_compute_shaders.contains(hash))
       {
@@ -626,15 +851,27 @@ public:
       {
          game_device_data.drew_video = true;
       }
-      // ASSAO prepare linearizes depth as cb0[1].x / (cb0[1].y - d): y ~1 = standard Z, ~0 = reverse Z (SMAA predication).
+      // ASSAO prepare constants: depth unpack (cb0[1].x / (cb0[1].y - d), standard Z) and the effect settings to match.
       else if (!is_compute && hash == 0x972BE5B5 && log_frame && can_read)
       {
          com_ptr<ID3D11Buffer> cb;
          native_device_context->PSGetConstantBuffers(0, 1, &cb);
          std::vector<float> data;
          com_ptr<ID3D11Buffer> cb_copy;
-         if (cb.get() && CopyBuffer(cb, native_device_context, data, cb_copy) && data.size() >= 8)
-            LogFormatted(reshade::log::level::info, "[Y3] frame %u ASSAO depth unpack cb0[1]: %f %f %f %f", cb_luma_global_settings.FrameIndex, data[4], data[5], data[6], data[7]);
+         // Intel ASSAO layout: c0 viewport/half-viewport pixel size, c1 DepthUnpackConsts + CameraTanHalfFOV,
+         // c2 NDCToViewMul/Add, c3 per-pass offsets, c4 Viewport2xPixelSize, c5 EffectRadius/ShadowStrength/ShadowPow/ShadowClamp,
+         // c6 FadeOutMul/Add, HorizonAngleThreshold, SamplingRadiusNearLimitRec, c7-c8 the rest (XeGTAO calibration).
+         if (cb.get() && CopyBuffer(cb, native_device_context, data, cb_copy) && data.size() >= 36)
+         {
+            data.resize(36);
+            if (data != game_device_data.last_logged_assao_cb0)
+            {
+               game_device_data.last_logged_assao_cb0 = data;
+               LogFormatted(reshade::log::level::info, "[Y3] frame %u ASSAO cb0:", cb_luma_global_settings.FrameIndex);
+               for (size_t i = 0; i < 36; i += 4)
+                  LogFormatted(reshade::log::level::info, "[Y3]   a%zu = %f %f %f %f", i / 4, data[i], data[i + 1], data[i + 2], data[i + 3]);
+            }
+         }
       }
       // Materials: before the ccr, with the per-material cb1/cb2/cb11 set bound (post passes don't bind cb1).
       else if (!is_compute && log_frame && can_read && !game_device_data.drew_ccr && game_device_data.exposure_samples.size() < max_exposure_samples)
@@ -726,6 +963,10 @@ public:
       game_device_data.depth_srv.reset();
       game_device_data.cmaa2_replaced = false;
       game_device_data.smaa_ran = false;
+      game_device_data.assao_replaced = false;
+      // Turning XeGTAO off gives its scratch back; it is rebuilt on demand.
+      if (!g_gtao_enable && game_device_data.gtao_width != 0)
+         game_device_data.ReleaseGTAOScratch();
 
 #if DEVELOPMENT
       const uint32_t frame = cb_luma_global_settings.FrameIndex;
