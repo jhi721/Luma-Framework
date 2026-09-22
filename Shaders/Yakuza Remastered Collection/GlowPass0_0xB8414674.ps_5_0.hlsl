@@ -1,6 +1,7 @@
-// ps_glow_pass0 (sh_ogre3_w64.par): bloom build, a 5x6-tap RMS of the downsampled scene (t1) x cb5[2], plus (cb11[0].y & 8)
-// a thresholded scene term from t0. Vanilla read and wrote 8-bit UNORM targets. The 512x256/512x512 targets are now fp16
-// (for the DoF), so every input and the output are saturated to keep the vanilla bloom bounded. Otherwise verbatim.
+// ps_glow_pass0 (sh_ogre3_w64.par): bloom build, a 5x6-tap RMS of the downsampled glow source (t1) x cb5[2], plus
+// (cb11[0].y & 8, unset at runtime) a thresholded term from t0. Vanilla read and wrote 8-bit UNORM targets. The
+// 512x256/512x512 targets are now fp16 (for the DoF), so every input and the output are saturated to keep the vanilla
+// bloom bounded. Otherwise verbatim.
 
 cbuffer cb5 : register(b5)
 {

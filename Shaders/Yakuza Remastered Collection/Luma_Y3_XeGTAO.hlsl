@@ -2,7 +2,7 @@
 // Source: https://github.com/GameTechDev/XeGTAO
 // Forked from Luma_TW2_XeGTAO.hlsl (depth-derived normals); only the game-specific inputs differ.
 //
-// Game specifics (NOTES.md "ASSAO disassembly"):
+// Game specifics (from the ASSAO disassembly and its live cb0):
 // - The whole ASSAO chain (prepare 0x972BE5B5, depth mips 0x1DD919C4, generate 0x47BFF17F/0xD18E0D3F, blurs
 //   0x8CE62D1E/0x15EEFFAF) is skipped. These 4 dispatches run in place of the prepare, at the depth's full resolution
 //   (ASSAO's 4 half-res deinterleaved slices cover the same pixels); the apply 0x6A73BA10 then draws with
@@ -11,7 +11,7 @@
 // - Normals are generated from depth (XE_GTAO_GENERATE_NORMALS): ASSAO's own are depth-derived too, and the game has
 //   no normal buffer.
 // - NDC->view, depth unpack and the radius come from ASSAO's live cb0 (the prepare's own b0, rebound PS -> CS), so the
-//   per-shot camera FOV (23..55 degrees measured) is this frame's.
+//   per-shot camera FOV (vertical 22.9..55 degrees measured) is this frame's.
 // - No TAA: NoiseIndex is FROZEN at 0 (a frame index would make the pattern boil) and denoise runs twice.
 
 // --- Game constant buffer: ASSAO's ASSAOConstants (main.cpp binds it at CS b0) ---
@@ -23,11 +23,11 @@ cbuffer AssaoCB0 : register(b0)
    float4 assao[15];
 }
 
-// --- Luma runtime knobs (set from main.cpp; live-tunable via DEV sliders, no recompile) ---
+// --- Luma runtime knobs (set from main.cpp; live-tunable via DEV/TEST sliders, no recompile) ---
 // b8: b9/b10 are the Luma data/settings cbuffers in this game, and no game shader binds b8. Mirrored by gtao_knobs_cb_slot.
 cbuffer LumaGTAO : register(b8)
 {
-   float FinalValuePowerRT; // primary darkness dial, calibrated to the vanilla AO histogram
+   float FinalValuePowerRT; // primary darkness dial (0.8, chosen by eye against the native AO)
    float RadiusOverrideRT;  // > 0 overrides EFFECT_RADIUS (view units, same as ASSAO's)
    float DebugViewRT;       // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    float PaddingRT;
@@ -497,7 +497,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
          visibility += localVisibility;
       }
       visibility /= SLICE_COUNT;
-      visibility = pow(max(0.0, visibility), max(0.05, FinalValuePowerRT)); // runtime dial (calibrated to the vanilla AO histogram); max(0,) also satisfies fxc strict X3571
+      visibility = pow(max(0.0, visibility), max(0.05, FinalValuePowerRT)); // runtime dial; max(0,) also satisfies fxc strict X3571
       visibility = max(0.0, visibility);                                    // no occlusion floor (Intel's 0.03 floor exists for bent-normal packing, unused here)
       // ASSAO's distance fade (measured 50 -> 300 view units), part of the native look: no AO on far geometry.
       visibility = lerp(1.0, visibility, saturate(viewspaceZ * assao[6].x + assao[6].y));

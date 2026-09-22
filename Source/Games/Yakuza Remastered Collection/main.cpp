@@ -15,13 +15,15 @@
 // is the only highlight limit. The whole post chain (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized
 // b8g8r8a8/r8g8b8a8 targets, upgraded to fp16 here. The HDR tonemap lives in the "color correct" replacements
 // (Shaders/Yakuza Remastered Collection/Includes/ColorCorrect.hlsl), the first full-screen pass reading the finished scene.
+// Every hash below is Y3R's; Y4R/Y5R share part of them.
 
 namespace
 {
    // User settings, persisted in the [Luma] config section.
    bool g_smaa_enable = true;
    float g_rcas_sharpness = 0.f;
-   // Plane deviation that counts as a full predication edge, as a fraction of view depth (TW2's validated value; DEV slider).
+   // Plane deviation that counts as a full predication edge, as a fraction of view depth (TW2's validated value; DEV
+   // slider, not persisted).
    float g_smaa_pred_tolerance = 0.02f;
    bool g_gtao_enable = true;
    float g_gtao_final_value_power = 0.8f; // DEV/TEST calibration knobs, not persisted
@@ -45,14 +47,14 @@ namespace
    constexpr uint32_t fxaa_pixel_shader = 0xE7A1D308;
    // FidelityFX CAS (t0 -> u0, copied back by the game), after the AA and the world-anchored markers.
    constexpr uint32_t cas_compute_shader = 0x491BAFA3;
-   // Intel ASSAO (stock): prepare (also a depth reader above), depth mips, generate (High / Medium), smart blur / wide, all
-   // skipped under XeGTAO; the apply multiply-blends the AO onto the scene mid material stream (see "RunXeGTAO").
    // Effects drawn into targets that were UNORM in vanilla (the scene RT, the 512x512/512x256 offscreen buffers), which
    // relied on that clamp: particles (ps_ptc_*, blood included), the hit flash and highlight masks, shockwave, aura, blood
    // decals and pools, body damage marks. On the fp16 chain their colors went far above 1 (glowing blood) and alphas above
    // 1 extrapolated the blend (black and white streaks). Every one has a single o0.xyzw output and a single final ret
-   // (checked on the disassembly); generated from tools/shaders.csv.
+   // (checked on the disassembly); listed from the game's shader archives.
    const std::unordered_set<uint32_t> unorm_clamped_effect_pixel_shaders = {0x024B22FC, 0x098F82BB, 0x0E0E3FDE, 0x0EA64B7C, 0x1233B2C0, 0x1490E21C, 0x15DBE648, 0x17153683, 0x179EC828, 0x1BFC5407, 0x1C9CF72D, 0x1E7304D2, 0x21F9EE5F, 0x233DF244, 0x23F5C577, 0x262029A4, 0x2707F90E, 0x2A75EC72, 0x2C018858, 0x2E5C72EF, 0x3019A9B8, 0x308E9227, 0x3468253F, 0x3533A116, 0x378AD557, 0x3A25DD61, 0x3BB5AE11, 0x3CCC13A9, 0x412945F3, 0x47F353EE, 0x47F97A40, 0x4A4CBF32, 0x4F656839, 0x5475205C, 0x581526D2, 0x6011CF50, 0x66F39F82, 0x6772EAB4, 0x6DBDDBAD, 0x6DDEF9B7, 0x71DF2C06, 0x747526C6, 0x75F2BE3E, 0x79B54068, 0x7AA982CE, 0x810027FF, 0x90BD986C, 0x9486446E, 0x9552AB8B, 0x96E88E1B, 0x9A735E6D, 0xA38D13EC, 0xA845CFD6, 0xA8E99745, 0xAD1EACD9, 0xB1C465A7, 0xB2EEF041, 0xB795066D, 0xB820683B, 0xB97E0BA0, 0xBEA87CEF, 0xC3F1CC7A, 0xC77EF0DF, 0xCF0DF8B9, 0xD0DF2846, 0xD2CB4337, 0xD939FD47, 0xDF16C6DB, 0xF24C81DF, 0xF2FA9571, 0xF3B188D2, 0xFA77FFFE, 0xFD4620B9};
+   // Intel ASSAO (stock): prepare (also a depth reader above), depth mips, generate (High / Medium), smart blur / wide, all
+   // skipped under XeGTAO; the apply multiply-blends the AO onto the scene mid material stream (see "RunXeGTAO").
    constexpr uint32_t assao_prepare_pixel_shader = 0x972BE5B5;
    const std::unordered_set<uint32_t> assao_pre_apply_pixel_shaders = {0x1DD919C4, 0x47BFF17F, 0xD18E0D3F, 0x8CE62D1E, 0x15EEFFAF};
    constexpr uint32_t assao_apply_pixel_shader = 0x6A73BA10;
@@ -129,7 +131,7 @@ struct Yakuza3DeviceData final : public GameDeviceData
    // Per frame
    com_ptr<ID3D11ShaderResourceView> depth_srv; // Scene depth for predication, null if no reader ran
    bool cmaa2_replaced = false;                 // The CMAA2 chain of this frame is skipped, its apply runs SMAA
-   bool smaa_ran = false;                       // RCAS replaced the game's CAS, which becomes a copy
+   bool smaa_ran = false;                       // The game's CAS becomes a copy (RCAS, when on, already sharpened)
    bool assao_replaced = false;                 // XeGTAO ran at the ASSAO prepare: the chain is skipped, its apply draws XeGTAO
 
    // XeGTAO scratch, at the depth's size. The size is kept even when the allocation failed: a null set then means
@@ -899,6 +901,7 @@ public:
          game_device_data.drew_video = true;
       }
       // ASSAO prepare constants: depth unpack (cb0[1].x / (cb0[1].y - d), standard Z) and the effect settings to match.
+      // Only reached with XeGTAO off: the replaced prepare returns above.
       else if (!is_compute && hash == assao_prepare_pixel_shader && log_frame && can_read)
       {
          com_ptr<ID3D11Buffer> cb;
@@ -907,7 +910,7 @@ public:
          com_ptr<ID3D11Buffer> cb_copy;
          // Intel ASSAO layout: c0 viewport/half-viewport pixel size, c1 DepthUnpackConsts + CameraTanHalfFOV,
          // c2 NDCToViewMul/Add, c3 per-pass offsets, c4 Viewport2xPixelSize, c5 EffectRadius/ShadowStrength/ShadowPow/ShadowClamp,
-         // c6 FadeOutMul/Add, HorizonAngleThreshold, SamplingRadiusNearLimitRec, c7-c8 the rest (XeGTAO calibration).
+         // c6 FadeOutMul/Add, HorizonAngleThreshold, SamplingRadiusNearLimitRec, c7-c8 the rest.
          if (cb.get() && CopyBuffer(cb, native_device_context, data, cb_copy) && data.size() >= 36)
          {
             data.resize(36);
@@ -936,7 +939,7 @@ public:
          }
       }
 
-      // Bloom: what fills its source (materials don't: they have a single render target), and its live constants.
+      // Bloom: which pixel shaders render into its swapchain-sized source (a pooled target), and its live constants.
       if (!is_compute && hash == glow_downsample_pixel_shader)
       {
          com_ptr<ID3D11ShaderResourceView> srv;
@@ -998,7 +1001,7 @@ public:
 
       // Blended-effect trap: the first draw of every pixel shader that blends into a swapchain-sized target, with the frame
       // index. Effects that break on the fp16 chain (alpha above 1 extrapolates the blend) show up as new lines at the time
-      // they appear on screen; map the hashes offline through tools/shaders.csv.
+      // they appear on screen; name the hashes offline from the game's shader archives.
       if (!is_compute && game_device_data.seen_blend_hashes.insert(hash).second)
       {
          com_ptr<ID3D11BlendState> blend_state;

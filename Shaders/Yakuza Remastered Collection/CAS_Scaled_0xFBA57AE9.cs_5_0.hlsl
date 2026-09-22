@@ -1,5 +1,6 @@
-// QLOC's FidelityFX CAS with scaling (sys_cas_shader, used when the render scale differs from 100%), decompiled with
-// 3Dmigoto from the DevKit dump. Changes against the decompiler output, all verified against the original DXBC:
+// QLOC's FidelityFX CAS with scaling (sys_cas_shader, presumably used when the render scale differs from 100%),
+// decompiled with 3Dmigoto from the DevKit dump. Changes against the decompiler output, all verified against the
+// original DXBC:
 //  - FFX's integer approximations (rcp 0x7ef07ebb / 0x7ef19fff, sqrt 0x1fbc4639) restored as asfloat/asint bit
 //    reinterpretation (the decompiler emitted numeric int casts);
 //  - UAV, thread group and the 4 stores written out by hand;

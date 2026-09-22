@@ -13,7 +13,7 @@ namespace CB
 struct LumaGameSettings
 {
    float VideoAutoHDREnable; // 0/1. Light AutoHDR on the Sofdec videos (HDR only).
-   float VideoAutoHDRBoost;  // 0..1 highlight-expansion strength. 0 = peak at paper white (off).
+   float VideoAutoHDRBoost;  // 0..1 highlight-expansion strength. 0 = peak at sRGB white (off).
    float Dithering;          // 0/1. One output code value of noise on the final image (8-bit SDR, 10-bit PQ HDR).
 };
 
