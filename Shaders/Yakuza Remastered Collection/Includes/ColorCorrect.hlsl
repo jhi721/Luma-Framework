@@ -24,7 +24,7 @@
 // become max(0); HLS runs on the color normalized by its max channel since HLS is undefined above 1; zone weights
 // from the saturated mean) -> linear -> soft ReinhardPiecewise hue reference in BT.2020 (Y5R: the gated vanilla SDR) -> MacLeod-Boynton hue
 // emulation -> DICE to peak. Output stays in gamma space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white) so the HUD,
-// CMAA2, CAS and render_fb downstream behave as in vanilla.
+// the AA (CMAA2/FXAA or Luma's SMAA), CAS and render_fb downstream behave as in vanilla.
 
 // clang-format off
 #include "Common.hlsl"
@@ -143,20 +143,20 @@ float3 HLSStage(float3 c, float3 w)
 #if CCR_SC
    float satAdjust = dot(cb5[4].xyz, w) + cb5[0].z;
    float lightAdjust = dot(cb5[8].xyz, w) + cb5[0].w;
-   float lightness = ContrastBrightness(sum * 0.5, lightAdjust);
-   float saturation = (lightness < 0.5) ? satLow : satHigh;
-   saturation = saturation * satAdjust + saturation;
+   float hlsLightness = ContrastBrightness(sum * 0.5, lightAdjust);
+   float hlsSaturation = (hlsLightness < 0.5) ? satLow : satHigh;
+   hlsSaturation = hlsSaturation * satAdjust + hlsSaturation;
 #else
-   float lightness = sum * 0.5 + cb5[0].y;
-   float saturation = (lightness < 0.5) ? satLow : satHigh;
+   float hlsLightness = sum * 0.5 + cb5[0].y;
+   float hlsSaturation = (hlsLightness < 0.5) ? satLow : satHigh;
 #endif
-   lightness = saturate(lightness);
-   saturation = saturate(saturation);
+   hlsLightness = saturate(hlsLightness);
+   hlsSaturation = saturate(hlsSaturation);
 
-   float3 hueColor = t1.Sample(s1_s, float2(hue * (1.0 / 6.0), saturation)).rgb;
-   float3 high = (1.0 - hueColor) * ((lightness - 0.5) * 2.0) + hueColor;
-   float3 low = -hueColor * ((0.5 - lightness) * 2.0) + hueColor;
-   return saturate((0.5 >= lightness) ? low : high);
+   float3 hueColor = t1.Sample(s1_s, float2(hue * (1.0 / 6.0), hlsSaturation)).rgb;
+   float3 high = (1.0 - hueColor) * ((hlsLightness - 0.5) * 2.0) + hueColor;
+   float3 low = -hueColor * ((0.5 - hlsLightness) * 2.0) + hueColor;
+   return saturate((0.5 >= hlsLightness) ? low : high);
 }
 #endif
 
@@ -208,9 +208,7 @@ float3 Grade(float3 c, float3 w, bool clampSDR)
 float4 ColorCorrect(float colorAlpha, float4 uv)
 {
 #if CCR_MASK
-   // Alpha test (engine-wide material convention: cb11[0].z = reference in 1/255 units, 0 = off).
-   if (cb11[0].z > 0u && (colorAlpha - float(cb11[0].z) * 0.00392156886) < 0.0)
-      discard;
+   YRC_AlphaTest(colorAlpha, cb11[0].z);
 #endif
 
    float3 scene = t0.Sample(s0_s, uv.xy).rgb;
@@ -250,7 +248,8 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
 #if CCR_MATERIAL_CURVE
    // Y5R's highlights never clipped: its materials bend each channel through the soft vanilla curve, so the vanilla graded
    // SDR is the exact hue reference. Where it whitens its hue is unstable, so it fades to this color's own hue by its HSV
-   // saturation (0.05..0.3, a BotW-style gate); both are max-normalized so the lerp blends hues, not magnitudes.
+   // saturation coordinate, (max - min) / max of the gamma-encoded color (0.05..0.3, a BotW-style gate); both are
+   // max-normalized so the lerp blends hues, not magnitudes.
    const float3 vanillaSDR = max(0.0, gradedSDR);
    const float vanillaMax = max3(vanillaSDR);
    const float hueGate = smoothstep(0.05, 0.3, vanillaMax > 0.0 ? (vanillaMax - min3(vanillaSDR)) / vanillaMax : 0.0);

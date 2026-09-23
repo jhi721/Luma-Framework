@@ -34,7 +34,8 @@ namespace
       bool glow_downsample_rms = false;            // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
       bool material_tone_curve = false;            // Y5R: lit materials tone-compress in-shader (see "PatchY5MaterialToneCurve")
       bool reversed_depth = false;                 // Y4R/Y5R: reversed Z (sky = 0), ASSAO unpacks it as -0.1 / (-0.0001 - d)
-      float glow_level0_sigma = 1.f;               // Luma Bloom's first blur (1024 prefilter -> 512x256 level 0), see kBloomLevelSigma
+      float glow_level0_sigma = 1.f;               // Luma Bloom's first blur (1024 prefilter -> 512x256 level 0), see bloom_level_sigma
+      uint32_t material_scale_register = 14;       // The materials' PS cb2 exposure scale (cb2[14]; Y5R cb2[15]), DEV logs
    };
    YakuzaGameProfile g_game_profile; // Selected once in DllMain
 
@@ -46,7 +47,7 @@ namespace
       for (auto& c : exe)
          c = (char)tolower((unsigned char)c);
       if (exe.find("yakuza5") != std::string::npos)
-         return {.name = "Yakuza 5 Remastered", .dof_custom_sizes = {{512, 512}, {512, 256}, {256, 256}}, .glow_downsample_pixel_shader = 0x54D6A534, .grades_aliased_passthrough_ccr = true, .material_tone_curve = true, .reversed_depth = true, .glow_level0_sigma = 3.f};
+         return {.name = "Yakuza 5 Remastered", .dof_custom_sizes = {{512, 512}, {512, 256}, {256, 256}}, .glow_downsample_pixel_shader = 0x54D6A534, .grades_aliased_passthrough_ccr = true, .material_tone_curve = true, .reversed_depth = true, .glow_level0_sigma = 3.f, .material_scale_register = 15};
       if (exe.find("yakuza4") != std::string::npos)
          return {.name = "Yakuza 4 Remastered", .dof_custom_sizes = {{1024, 1024}, {512, 512}, {512, 256}}, .glow_downsample_pixel_shader = 0x66633BAD, .glow_downsample_rms = true, .reversed_depth = true};
       return {.name = "Yakuza 3 Remastered", .dof_custom_sizes = {{512, 512}, {512, 256}}, .glow_downsample_pixel_shader = 0x54A5E7AC};
@@ -81,16 +82,16 @@ namespace
    const std::unordered_set<uint32_t> glow_pass0_pixel_shaders = {0xB8414674, 0xD31A6374 /*Y5R*/};
    constexpr uint32_t glow_pass1_pixel_shader = 0x9DD96515;
    const std::unordered_set<uint32_t> glow_pass2_pixel_shaders = {0x9083BF34, 0x9E617E0A /*Y4R*/, 0x5F37CDE1 /*Y5R*/};
-   constexpr uint32_t glow_reexpand_pixel_shader = 0xFD753992;     // Y5R ps_down_sample_4x4 (see kBloomLevelSigma)
+   constexpr uint32_t glow_reexpand_pixel_shader = 0xFD753992;     // Y5R ps_down_sample_4x4 (see bloom_level_sigma)
    constexpr UINT glow_prefilter_width = YRC_GLOW_PREFILTER_WIDTH; // Includes/GameCBuffers.hlsl
    constexpr UINT glow_prefilter_height = YRC_GLOW_PREFILTER_HEIGHT;
-   constexpr int kBloomMips = 5; // 512x256 down to 32x16, the vanilla levels
+   constexpr int bloom_mips = 5; // 512x256 down to 32x16, the vanilla levels
    // Vanilla glow_pass1 (Y3 DEV log): 6 taps at +-0.5/1.5/2.5 source texels, near-flat weights 0.1676/0.1671/0.1653
    // (sum 0.5 per side, unit gain) -> sigma 1.70 per axis per level. Level 0 has no pass1 blur, only the 2:1 antialias
    // (sigma 1), except in Y5R: after its exposure meter, ps_down_sample_4x4 0xFD753992 re-expands a 256x128 8-bit copy of
    // the level over itself before glow_pass0 (4 bilinear taps at +-VS cb7[0].xy = (1/512, 1/256), 0.5 source texel, DEV log):
    // sigma 3 fits a model of that chain.
-   constexpr float kBloomLevelSigma = 1.7f;
+   constexpr float bloom_level_sigma = 1.7f;
    constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_YRC_XeGTAO.hlsl
    // Readers of the 4K r32 scene depth at t0: the ASSAO prepare, and a full-screen depth restore (also used by prepasses;
    // the last one before the AA, after ASSAO, reads the main depth). Captured for SMAA predication.
@@ -771,7 +772,7 @@ class GameYakuzaRC final : public Game
    }
 
    // At the glow downsample: the 4K glow source (its t0) into the 1024x512 prefilter, clamped per texel as the 8-bit source
-   // was, with the vanilla downsample's 5x6 taps (Y4R: RMS over 3x the footprint, standing in for its two RMS stages).
+   // was, averaging 5x6 taps per texel (Y4R: RMS over 3x the footprint, standing in for its two RMS stages).
    // On success, records the level it writes, which glow_pass0 must read.
    static void PrefilterGlowSource(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data)
    {
@@ -883,8 +884,8 @@ class GameYakuzaRC final : public Game
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, g_game_profile.material_tone_curve ? 1u : 0u, 0, g_game_profile.glow_level0_sigma);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("YRC Glow Gain PS"_h).get(), scene_srv.get(), game_device_data.glow_rtvs[1].get(), glow_prefilter_width, glow_prefilter_height, false);
       com_ptr<ID3D11ShaderResourceView> bloom_srv;
-      const float sigmas[kBloomMips] = {g_game_profile.glow_level0_sigma, kBloomLevelSigma, kBloomLevelSigma, kBloomLevelSigma, kBloomLevelSigma};
-      DrawBloom(native_device, native_device_context, device_data, game_device_data.glow_srvs[1].get(), kBloomMips, sigmas, &bloom_srv);
+      const float sigmas[bloom_mips] = {g_game_profile.glow_level0_sigma, bloom_level_sigma, bloom_level_sigma, bloom_level_sigma, bloom_level_sigma};
+      DrawBloom(native_device, native_device_context, device_data, game_device_data.glow_srvs[1].get(), bloom_mips, sigmas, &bloom_srv);
       bloom_state.Restore(native_device_context);
       if (!bloom_srv)
          return false;
@@ -1115,6 +1116,13 @@ public:
    {
       device_data.game = new YakuzaRCDeviceData;
       reshade::log::message(reshade::log::level::info, (std::string("[YRC] game profile: ") + g_game_profile.name).c_str());
+   }
+
+   void OnDestroyDeviceData(DeviceData& device_data) override
+   {
+      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
+      delete static_cast<YakuzaRCDeviceData*>(device_data.game);
+      device_data.game = nullptr;
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -1382,7 +1390,7 @@ public:
          // Only material draws count toward the budget (shadow and depth passes come first and bind no cb1/cb2/cb11 set).
          if (cbs[0].get() && cbs[1].get() && cbs[2].get() && ++game_device_data.exposure_reads && CopyBuffer(cbs[1], native_device_context, data, cb_copy) && data.size() >= 16 * 4)
          {
-            const size_t scale = g_game_profile.material_tone_curve ? 60 : 56; // cb2[15], Y3R/Y4R cb2[14]
+            const size_t scale = g_game_profile.material_scale_register * 4;
             const std::array<float, 4> exposure = {data[24], data[scale], data[scale + 1], data[scale + 2]};
             if (std::find(game_device_data.exposure_samples.begin(), game_device_data.exposure_samples.end(), exposure) == game_device_data.exposure_samples.end())
                game_device_data.exposure_samples.push_back(exposure);
@@ -1429,7 +1437,7 @@ public:
             }
          }
       }
-      // Y5R ps_down_sample_4x4: its tap offsets set how much it re-blurs the glow level (see kBloomLevelSigma).
+      // Y5R ps_down_sample_4x4: its tap offsets set how much it re-blurs the glow level (see bloom_level_sigma).
       if (!is_compute && hash == glow_reexpand_pixel_shader && game_device_data.FirstLog(GlowReexpandOffsets))
       {
          com_ptr<ID3D11Buffer> vs_cb;
@@ -1630,7 +1638,7 @@ public:
 
       if (!game_device_data.exposure_samples.empty()) // Only sampled on log frames
       {
-         std::string line = std::format("[YRC] frame {} material cb2[6].x, cb2[{}].xyz:", frame, g_game_profile.material_tone_curve ? 15 : 14);
+         std::string line = std::format("[YRC] frame {} material cb2[6].x, cb2[{}].xyz:", frame, g_game_profile.material_scale_register);
          for (const auto& e : game_device_data.exposure_samples)
             line += std::format(" ({:.3f} {:.3f} {:.3f} {:.3f})", e[0], e[1], e[2], e[3]);
          reshade::log::message(reshade::log::level::info, line.c_str());

@@ -1,6 +1,6 @@
 // RCAS sharpening for the SMAA output (same shape as the SR3, TW2 and BL2/TPS passes). It stands in for the game's
-// FidelityFX CAS, which is skipped while SMAA runs. Runs on the gamma canvas color after the SMAA neighborhood blend.
-// The sharpness slider (LumaData.CustomData3) is the tuning knob.
+// FidelityFX CAS, which only copies its input while SMAA runs. Runs on the gamma canvas color after the SMAA
+// neighborhood blend. LumaData.CustomData3 = the RCAS Sharpness slider.
 
 #include "../Includes/RCAS.hlsl"
 #include "Includes/Common.hlsl"

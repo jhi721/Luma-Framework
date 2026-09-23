@@ -17,14 +17,21 @@ float3 YRC_EncodeOutput(float3 color)
    return linear_to_gamma(color);
 }
 
+// The engine-wide material alpha test: `reference` (cb11[0].z) in 1/255 units, 0 = off.
+void YRC_AlphaTest(float alpha, uint reference)
+{
+   if (reference > 0u && (alpha - float(reference) * 0.00392156886) < 0.0)
+      discard;
+}
+
 // Y5R lit materials end in the tone curve sqrt(1 - exp(-u)), which the addon continues past u = pivot along its tangent
 // (see "PatchY5MaterialToneCurve" in main.cpp; constants in GameCBuffers.hlsl). Maps the extended output back to the
-// vanilla one: with t = y^2 and t_p = 1 - slope, above the pivot t = t_p + slope * (u - p), so vanilla 1 - exp(-u) is
+// vanilla one: with t = curved^2 and t_p = 1 - slope, above the pivot t = t_p + slope * (u - p), so vanilla 1 - exp(-u) is
 // 1 - slope * exp(-(t - t_p) / slope). Exact for the materials; anything else above 1 (emissive, particles) lands just
 // under 1, near vanilla's UNORM clip. Per channel, like the curve.
-float4 YRC_Y5VanillaMaterialCurve(float4 y)
+float4 YRC_Y5VanillaMaterialCurve(float4 curved)
 {
-   const float4 t = sqr(max(0.0, y));
+   const float4 t = sqr(max(0.0, curved));
    const float tPivot = 1.0 - YRC_Y5_MATERIAL_CURVE_SLOPE;
    return sqrt(t > tPivot ? 1.0 - YRC_Y5_MATERIAL_CURVE_SLOPE * exp((tPivot - t) / YRC_Y5_MATERIAL_CURVE_SLOPE) : t);
 }
@@ -47,8 +54,9 @@ float4 SampleSaturatedBilinear(Texture2D<float4> tex, SamplerState s, float2 uv,
    return mul(texels, float4((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y)));
 }
 
-// The glow downsamples clamp their source like vanilla only on the draws the addon flags (LumaData.CustomData1): Y3's
-// downsample hash is also Y4's ps_cubic resample, which must stay unclamped. `y5MaterialCurve`: see SampleSaturatedBilinear.
+// The glow downsamples clamp their source like vanilla only on the draws the addon flags (LumaData.CustomData1):
+// Y3R's downsample hash 0x54A5E7AC is also Y4R's ps_cubic resample, which must stay unclamped. `y5MaterialCurve`: see
+// SampleSaturatedBilinear.
 float4 SampleGlowSource(Texture2D<float4> tex, SamplerState s, float2 uv, bool y5MaterialCurve = false)
 {
    return LumaData.CustomData1 != 0u ? SampleSaturatedBilinear(tex, s, uv, y5MaterialCurve) : tex.Sample(s, uv);

@@ -1,7 +1,7 @@
 // QLOC's FidelityFX CAS (sharpen only, no scaling; sys_cas_shader_sharpen_only), transcribed from the disassembly.
 // Vanilla ends every pixel with mul_sat and alpha 1, which clips the HDR chain back to [0,1]. The only change here is
 // that the output keeps its range (max(0) instead of saturate). The sharpening amplitude still comes from the vanilla
-// min(min, 2 - max) / max term, so pixels whose neighborhood exceeds 1 get no sharpening, as CAS was designed for SDR.
+// min(min, 2 - max) / max term, so pixels whose neighborhood reaches 1 get little or no sharpening (CAS targets SDR).
 
 cbuffer cb0 : register(b0)
 {

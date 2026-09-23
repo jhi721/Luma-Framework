@@ -1,5 +1,6 @@
 // fx_track_blur, the same math in every game (Y5R reorders the inputs): 12-tap motion trail over the scene. Vanilla
 // ends with add_sat(+0.2), which clips the HDR scene inside the trail. Verbatim except max(0) there.
+#include "Common.hlsl"
 
 cbuffer cb11 : register(b11)
 {
@@ -16,8 +17,7 @@ float4 TrackBlur(float alphaScale, float4 taps[6], float2 maskUV)
    float4 result;
    float alpha = t1.Sample(s1_s, maskUV).w * alphaScale;
    result.w = alpha;
-   if (cb11[0].z > 0u && (alpha - float(cb11[0].z) * 0.00392156886) < 0.0)
-      discard;
+   YRC_AlphaTest(alpha, cb11[0].z);
 
    float3 c = t0.Sample(s0_s, taps[0].zw).xyz * 0.133;
    c = t0.Sample(s0_s, taps[0].xy).xyz * 0.143 + c;
