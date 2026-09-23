@@ -69,8 +69,6 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Titanfall 2", "Source\Games
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Shenmue I & II", "Source\Games\Shenmue I & II\Shenmue I & II.vcxproj", "{039E634A-718A-4C4A-AE7C-706BABC5212B}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Saints Row The Third Remastered", "Source\Games\Saints Row The Third Remastered\Saints Row The Third Remastered.vcxproj", "{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}"
-EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Nioh", "Source\Games\Nioh\Nioh.vcxproj", "{597555CF-7003-4B06-8409-C3A0AC818E59}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NieR Automata", "Source\Games\NieR Automata\NieR Automata.vcxproj", "{457A69B6-422F-4E49-9EC0-111BF35941E1}"
@@ -102,6 +100,8 @@ EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Metaphor ReFantazio", "Source\Games\Metaphor ReFantazio\Metaphor ReFantazio.vcxproj", "{6CC6AE7C-9E02-4497-B397-897332ED4805}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mortal Kombat 11", "Source\Games\Mortal Kombat 11\Mortal Kombat 11.vcxproj", "{8066E72F-C800-45D1-ADE9-F40D23430505}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Saints Row The Third Remastered", "Source\Games\Saints Row The Third Remastered\Saints Row The Third Remastered.vcxproj", "{AA3CD558-93AD-4159-A551-0A4041E4066A}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Monster Hunter World", "Source\Games\Monster Hunter World\Monster Hunter World.vcxproj", "{5A0992EF-93A2-4565-86C1-11610EC27193}"
 EndProject
@@ -567,18 +567,6 @@ Global
 		{039E634A-718A-4C4A-AE7C-706BABC5212B}.Test-Release|Win32.ActiveCfg = Test-Release|x64
 		{039E634A-718A-4C4A-AE7C-706BABC5212B}.Test-Release|x64.ActiveCfg = Test-Release|x64
 		{039E634A-718A-4C4A-AE7C-706BABC5212B}.Test-Release|x64.Build.0 = Test-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Development-Debug|x64.Build.0 = Development-Debug|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Development-Release|Win32.ActiveCfg = Development-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Development-Release|x64.ActiveCfg = Development-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Development-Release|x64.Build.0 = Development-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Publishing-Release|x64.ActiveCfg = Publishing-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Publishing-Release|x64.Build.0 = Publishing-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Test-Release|Win32.ActiveCfg = Test-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Test-Release|x64.ActiveCfg = Test-Release|x64
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}.Test-Release|x64.Build.0 = Test-Release|x64
 		{597555CF-7003-4B06-8409-C3A0AC818E59}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
 		{597555CF-7003-4B06-8409-C3A0AC818E59}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
 		{597555CF-7003-4B06-8409-C3A0AC818E59}.Development-Debug|x64.Build.0 = Development-Debug|x64
@@ -771,6 +759,18 @@ Global
 		{8066E72F-C800-45D1-ADE9-F40D23430505}.Test-Release|Win32.ActiveCfg = Test-Release|x64
 		{8066E72F-C800-45D1-ADE9-F40D23430505}.Test-Release|x64.ActiveCfg = Test-Release|x64
 		{8066E72F-C800-45D1-ADE9-F40D23430505}.Test-Release|x64.Build.0 = Test-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Development-Debug|x64.Build.0 = Development-Debug|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Development-Release|Win32.ActiveCfg = Development-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Development-Release|x64.ActiveCfg = Development-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Development-Release|x64.Build.0 = Development-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Publishing-Release|x64.ActiveCfg = Publishing-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Publishing-Release|x64.Build.0 = Publishing-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Test-Release|Win32.ActiveCfg = Test-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Test-Release|x64.ActiveCfg = Test-Release|x64
+		{AA3CD558-93AD-4159-A551-0A4041E4066A}.Test-Release|x64.Build.0 = Test-Release|x64
 		{5A0992EF-93A2-4565-86C1-11610EC27193}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
 		{5A0992EF-93A2-4565-86C1-11610EC27193}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
 		{5A0992EF-93A2-4565-86C1-11610EC27193}.Development-Debug|x64.Build.0 = Development-Debug|x64
@@ -1011,7 +1011,6 @@ Global
 		{67E4754D-609A-4713-B686-DBF6FBBBFC38} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{BFB6DD83-885E-4B08-A71F-BC0F90DD090E} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{039E634A-718A-4C4A-AE7C-706BABC5212B} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
-		{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{597555CF-7003-4B06-8409-C3A0AC818E59} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{457A69B6-422F-4E49-9EC0-111BF35941E1} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{51BFC834-EC5F-4F25-90DC-A2001E88B491} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
@@ -1028,6 +1027,7 @@ Global
 		{3FAC4E39-0051-42AC-89D5-CA74C3D5961B} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{6CC6AE7C-9E02-4497-B397-897332ED4805} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{8066E72F-C800-45D1-ADE9-F40D23430505} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{AA3CD558-93AD-4159-A551-0A4041E4066A} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{5A0992EF-93A2-4565-86C1-11610EC27193} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{7FC545FF-0D9A-4F33-B0D2-7AF72239FBD4} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{96A3B33A-40CB-4FD0-9EBB-0A85E437A1DC} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
