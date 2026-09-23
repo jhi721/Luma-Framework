@@ -129,10 +129,13 @@ namespace
    // with u = color * cb2[6].x (exposure). Their highlights never pass 1, so the fp16 scene alone gives Y5R no HDR. The curve
    // is continued past u = pivot along its tangent, E(u) = F(min(u, p)) + exp(-p) * max(u - p, 0) inside the sqrt: vanilla
    // bit for bit below p, rising instead of saturating above. The grade rebuilds the vanilla SDR scene from it
-   // (YRC_Y5VanillaMaterialCurve, mirrors these constants). Pivot 1.2 keeps vanilla up to 0.84 of white.
-   constexpr float y5_material_curve_pivot = 1.2f;
-   constexpr float y5_material_curve_slope = 0.301194212f; // exp(-pivot)
-   std::atomic<uint32_t> y5_material_curve_patches = 0;    // Shaders patched so far (logged in DEVELOPMENT)
+   // (YRC_Y5VanillaMaterialCurve; both take the constants from Includes/GameCBuffers.hlsl). Pivot 1.2 keeps vanilla up to
+   // 0.84 of white.
+   constexpr float y5_material_curve_pivot = YRC_Y5_MATERIAL_CURVE_PIVOT;
+   constexpr float y5_material_curve_slope = YRC_Y5_MATERIAL_CURVE_SLOPE;
+#if DEVELOPMENT
+   std::atomic<uint32_t> y5_material_curve_patches = 0; // Shaders patched so far
+#endif
 
    // All 294 Y5R shaders with the curve (292 lit materials, fx_rigid_snow, the unused ps_tonemap) compile it in place on one
    // temp register rN, with no modifiers: "mul rN, rN, l(-1.442695)", "exp rN, rN", "add rN, -rN, l(1)", then max and sqrt.
@@ -203,7 +206,9 @@ namespace
       out.insert(out.end(), tokens + mul_at, tokens + add_end);
       out.insert(out.end(), mad.begin(), mad.end());
       out.insert(out.end(), tokens + add_end, tokens + count);
+#if DEVELOPMENT
       y5_material_curve_patches++;
+#endif
       return out;
    }
 
@@ -379,14 +384,6 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    // Staging copy for the one-shot predication mask readback (see LogPredicationStats), allocated on first use.
    com_ptr<ID3D11Texture2D> pred_measure_staging;
    bool pred_measure_pending = false;
-   // Threading probe (see HookThreadProbe): D3D11 lets each deferred context record on its own thread, so these hooks can
-   // run concurrently while the members above are unsynchronized.
-   std::atomic<uint32_t> hooks_in_flight = 0;
-   std::atomic<DWORD> last_hook_thread = 0;
-   std::mutex thread_probe_mutex; // guards the three below
-   uint32_t logged_hook_overlaps = 0;
-   std::set<std::pair<DWORD, ID3D11DeviceContext*>> logged_deferred_recorders;
-   std::unordered_set<uint32_t> logged_deferred_hashes;
 
    // True the first time only.
    bool FirstLog(LoggedEvent event)
@@ -398,51 +395,6 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    }
 #endif
 };
-
-#if DEVELOPMENT
-namespace
-{
-   // Scoped to one OnDrawOrDispatch call. Logs each deferred-context recorder (thread + context) and each shader hash
-   // drawn on one, once, and every call that starts while another is still running (capped). Any code on the path of a
-   // deferred draw must not write the per-device state.
-   class HookThreadProbe
-   {
-   public:
-      HookThreadProbe(YakuzaRCDeviceData* data, ID3D11DeviceContext* native_device_context, bool is_primary, uint32_t hash, bool is_compute) : data(data)
-      {
-         constexpr uint32_t max_logged_overlaps = 32;
-         constexpr size_t max_logged_deferred_hashes = 256;
-         const DWORD thread = GetCurrentThreadId();
-         const DWORD previous_thread = data->last_hook_thread.exchange(thread);
-         const uint32_t others = data->hooks_in_flight++;
-         if (others == 0 && is_primary)
-            return;
-         const char* const stage = is_compute ? "CS" : "PS";
-         const std::lock_guard lock(data->thread_probe_mutex);
-         if (others != 0 && data->logged_hook_overlaps < max_logged_overlaps)
-         {
-            data->logged_hook_overlaps++;
-            LogFormatted(reshade::log::level::warning, "[YRC] frame %u hook overlap: thread %lu (%s ctx %p) entered with %u other hook(s) running, previous entry by thread %lu; %s 0x%08X", cb_luma_global_settings.FrameIndex, thread, is_primary ? "immediate" : "deferred", native_device_context, others, previous_thread, stage, hash);
-         }
-         if (is_primary)
-            return;
-         if (data->logged_deferred_recorders.emplace(thread, native_device_context).second)
-            LogFormatted(reshade::log::level::info, "[YRC] frame %u deferred ctx %p records on thread %lu", cb_luma_global_settings.FrameIndex, native_device_context, thread);
-         if (data->logged_deferred_hashes.size() < max_logged_deferred_hashes && data->logged_deferred_hashes.insert(hash).second)
-            LogFormatted(reshade::log::level::info, "[YRC] frame %u deferred draw on thread %lu (ctx %p): %s 0x%08X", cb_luma_global_settings.FrameIndex, thread, native_device_context, stage, hash);
-      }
-      ~HookThreadProbe()
-      {
-         data->hooks_in_flight--;
-      }
-      HookThreadProbe(const HookThreadProbe&) = delete;
-      HookThreadProbe& operator=(const HookThreadProbe&) = delete;
-
-   private:
-      YakuzaRCDeviceData* data;
-   };
-} // namespace
-#endif
 
 class GameYakuzaRC final : public Game
 {
@@ -660,7 +612,7 @@ class GameYakuzaRC final : public Game
          com_ptr<ID3D11Resource> mask_resource;
          game_device_data.smaa_predication_srv->GetResource(&mask_resource);
          com_ptr<ID3D11Texture2D> mask;
-         if (cmd_list_data.is_primary && SUCCEEDED(mask_resource->QueryInterface(&mask)))
+         if (SUCCEEDED(mask_resource->QueryInterface(&mask)))
             LogPredicationStats(native_device, native_device_context, &game_device_data, mask.get());
 
          // Calibration view: the single-channel mask lands in red, replacing the frame (black on flat surfaces, red across
@@ -1170,15 +1122,15 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       const bool is_compute = (stages & reshade::api::shader_stage::compute) != 0;
       const uint32_t hash = is_compute ? original_shader_hashes.compute_shaders[0] : original_shader_hashes.pixel_shaders[0];
-#if DEVELOPMENT
-      const HookThreadProbe thread_probe(&game_device_data, native_device_context, cmd_list_data.is_primary, hash, is_compute);
-#endif
 
       // Y4R/Y5R also record draws (materials, depth prepasses) on deferred contexts from other threads. Every hook below
       // keeps unsynchronized per-device state and relies on the immediate context's order (a deferred draw reaches the GPU
       // only at ExecuteCommandList), and the DEV readbacks need the immediate context too.
       if (!cmd_list_data.is_primary)
          return DrawOrDispatchOverrideType::None;
+#if DEVELOPMENT
+      const bool log_frame = cb_luma_global_settings.FrameIndex % log_interval_frames == 0;
+#endif
 
       if (!is_compute && depth_reader_pixel_shaders.contains(hash))
       {
@@ -1343,7 +1295,7 @@ public:
          game_device_data.glow_replaced = false;
 #if DEVELOPMENT
          // The composite applies one weight (cb5[0].yzw) to pass0's rgb + alpha: exact while cb5[0].x matches it.
-         if (cmd_list_data.is_primary && cb_luma_global_settings.FrameIndex % log_interval_frames == 0)
+         if (log_frame)
          {
             com_ptr<ID3D11Buffer> cb;
             native_device_context->PSGetConstantBuffers(5, 1, &cb);
@@ -1372,8 +1324,6 @@ public:
 #if DEVELOPMENT
       // Dev logger for values the DevKit can't show continuously: frames that skip the ccr (untonemapped scene), the active
       // ccr perm and its grade constants, the material exposure scale, and the first target/blend state of watched passes.
-      const bool log_frame = cb_luma_global_settings.FrameIndex % log_interval_frames == 0;
-
       if (!is_compute && ccr_hashes.contains(hash))
       {
          game_device_data.drew_ccr = true;

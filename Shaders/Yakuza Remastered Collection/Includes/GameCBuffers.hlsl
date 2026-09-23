@@ -10,6 +10,11 @@
 #define YRC_GLOW_PREFILTER_WIDTH  1024
 #define YRC_GLOW_PREFILTER_HEIGHT 512
 
+// The Y5R material tone curve's tangent continuation: main.cpp patches it in (PatchY5MaterialToneCurve), Common.hlsl maps
+// it back (YRC_Y5VanillaMaterialCurve). The slope is exp(-pivot).
+#define YRC_Y5_MATERIAL_CURVE_PIVOT 1.2f
+#define YRC_Y5_MATERIAL_CURVE_SLOPE 0.301194212f
+
 // Mirrors c++ name spaces.
 namespace CB
 {

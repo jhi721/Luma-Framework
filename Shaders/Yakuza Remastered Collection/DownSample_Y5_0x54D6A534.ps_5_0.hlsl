@@ -8,8 +8,5 @@ Texture2D<float4> t0 : register(t0);
 
 void main(float4 v0 : TEXCOORD0, out float4 o0 : SV_Target0)
 {
-   if (LumaData.CustomData1 != 0u)
-      o0 = SampleSaturatedBilinear(t0, s0_s, v0.zw, true) * 0.5 + SampleSaturatedBilinear(t0, s0_s, v0.xy, true) * 0.5;
-   else
-      o0 = t0.Sample(s0_s, v0.zw) * 0.5 + t0.Sample(s0_s, v0.xy) * 0.5;
+   o0 = SampleGlowSource(t0, s0_s, v0.zw, true) * 0.5 + SampleGlowSource(t0, s0_s, v0.xy, true) * 0.5;
 }
