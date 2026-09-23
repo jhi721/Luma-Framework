@@ -22,10 +22,19 @@ float4 RenderFB(float2 uv)
    float4 color = t0.Sample(s0_s, uv);
 #if RENDER_FB_SCALE_AND_GAMMA
    // Y5R: a uniform scale (x) and a power (z), both on linear light.
-   result.rgb = linear_to_gamma(safePow(gamma_to_linear(color.rgb, GCT_MIRROR) * cb5[0].x, cb5[0].z), GCT_MIRROR);
+   float3 linearColor = safePow(gamma_to_linear(color.rgb, GCT_MIRROR) * cb5[0].x, cb5[0].z);
 #else
-   result.rgb = linear_to_gamma(gamma_to_linear(color.rgb, GCT_MIRROR) * cb5[0].rgb, GCT_MIRROR);
+   float3 linearColor = gamma_to_linear(color.rgb, GCT_MIRROR) * cb5[0].rgb;
 #endif
+   // Vanilla's input never passed 1, so a brightening tint (a scale or power above 1, e.g. Y5R's hit flashes) never passed
+   // white. The HDR input reaches the peak already, and nothing tonemaps after this pass: the brightest channel is held at
+   // the peak (the composition scales this image by UIPaperWhite), keeping the hue.
+   if (LumaSettings.DisplayMode != 0)
+   {
+      const float peak = LumaSettings.PeakWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
+      linearColor *= min(1.0, peak / max(max3(linearColor), 1e-6));
+   }
+   result.rgb = linear_to_gamma(linearColor, GCT_MIRROR);
    result.a = color.a;
 
    // Anti-banding dither on the last pass (after CAS and the HUD), one step of the output quantizer: the 8-bit code in
