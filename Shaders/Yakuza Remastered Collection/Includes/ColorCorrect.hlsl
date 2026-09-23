@@ -22,7 +22,7 @@
 // SDR path: the exact vanilla grade on the saturated scene (the UNORM RT clamp, emulated).
 // HDR path (canon for hard-clip games, BL GOTY precedent): the same grade as an extended function (upper clamps
 // become max(0); HLS runs on the color normalized by its max channel since HLS is undefined above 1; zone weights
-// from the saturated mean) -> linear -> soft ReinhardPiecewise hue reference in BT.2020 -> MacLeod-Boynton hue
+// from the saturated mean) -> linear -> soft ReinhardPiecewise hue reference in BT.2020 (Y5R: the gated vanilla SDR) -> MacLeod-Boynton hue
 // emulation -> DICE to peak. Output stays in gamma space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white) so the HUD,
 // CMAA2, CAS and render_fb downstream behave as in vanilla.
 
@@ -247,9 +247,20 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
    gradedHDR = min(gradedHDR, 1e4);
    float3 extendedBT2020 = BT709_To_BT2020(gamma_to_linear(gradedHDR, GCT_POSITIVE));
 
+#if CCR_MATERIAL_CURVE
+   // Y5R's highlights never clipped: its materials bend each channel through the soft vanilla curve, so the vanilla graded
+   // SDR is the exact hue reference. Where it whitens its hue is unstable, so it fades to this color's own hue by its HSV
+   // saturation (0.05..0.3, a BotW-style gate); both are max-normalized so the lerp blends hues, not magnitudes.
+   const float3 vanillaSDR = max(0.0, gradedSDR);
+   const float vanillaMax = max3(vanillaSDR);
+   const float hueGate = smoothstep(0.05, 0.3, vanillaMax > 0.0 ? (vanillaMax - min3(vanillaSDR)) / vanillaMax : 0.0);
+   const float3 vanillaBT2020 = BT709_To_BT2020(gamma_to_linear(vanillaSDR, GCT_POSITIVE));
+   float3 hueReferenceBT2020 = lerp(extendedBT2020 / max(max3(extendedBT2020), 1e-6), vanillaBT2020 / max(max3(vanillaBT2020), 1e-6), hueGate);
+#else
    // Soft hue reference: per-channel ReinhardPiecewise(5, 1.5) in BT.2020 bends saturated highlights the way the
    // vanilla per-channel clip did, without its whitening; MacLeod-Boynton keeps only its hue direction.
    float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
+#endif
    float3 diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
 
    const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
