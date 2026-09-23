@@ -63,6 +63,7 @@ namespace
    bool g_luma_bloom_enable = true;
    float g_gtao_final_value_power = 1.f; // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
+   bool g_hide_ui = false;               // Session-only, so a restart never comes back without a HUD
 #if DEVELOPMENT
    bool g_smaa_predication = true;
    bool g_smaa_pred_debug = false;   // Show the predication mask (red) instead of the frame
@@ -103,6 +104,11 @@ namespace
    constexpr uint32_t cmaa2_apply_compute_shader = 0x82DA801B;
    // FXAA 3.11: one pass from the post-ccr canvas (t0) into its own scene-sized target.
    constexpr uint32_t fxaa_pixel_shader = 0xE7A1D308;
+   // The HUD: the exe's sprite shaders (Y3R/Y4R sys_modulatealpha_lanczos 0xBB31B137, ui2 0xCCF77328, 0x80C378A8; Y5R's
+   // Lanczos 0x3EA58102 / 0x2C439929, solid fill 0x9B3FB6FA, circles 0x590EF3E9 / 0xECA886BD) and the world-anchored
+   // markers and name tags (p_dvtx/p_nvtx, Y3R 0xD66497C5, Y4R/Y5R 0x3574C123), all drawn onto the scene-sized canvas
+   // after the scene (the markers before CAS, the rest after the resample).
+   const std::unordered_set<uint32_t> ui_pixel_shaders = {0xBB31B137, 0xCCF77328, 0x80C378A8, 0x3EA58102, 0x2C439929, 0x9B3FB6FA, 0x590EF3E9, 0xECA886BD, 0xD66497C5, 0x3574C123};
    // FidelityFX CAS (t0 -> u0, copied back by the game), after the AA and the world-anchored markers.
    constexpr uint32_t cas_compute_shader = 0x491BAFA3;
    // Its scaling variant, the resample to the swapchain when the render scale is not 100% (with CAS on).
@@ -316,6 +322,7 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    bool assao_replaced = false;                 // XeGTAO ran at the ASSAO prepare: the chain is skipped, its apply draws XeGTAO
    com_ptr<ID3D11Resource> glow_level0;         // The level the glow downsample wrote, set once the Luma Bloom prefilter ran on it
    bool glow_replaced = false;                  // Luma Bloom ran at glow_pass0: pass1 is skipped, pass2 composites it
+   bool scene_done = false;                     // The glow downsample (the first post pass) ran: the UI shaders draw the HUD
 
    // Luma Bloom: the prefiltered glow source [0], glow_pass0's output from it [1] (DrawBloom's input), and a view with every
    // mip of DrawBloom's result (its SRV shows mip 0 only).
@@ -1114,6 +1121,11 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");
+
+      ImGui::SeparatorText("UI");
+      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Disables the in-game UI.");
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
@@ -1143,6 +1155,19 @@ public:
 #if DEVELOPMENT
       const bool log_frame = cb_luma_global_settings.FrameIndex % log_interval_frames == 0;
 #endif
+
+      // Before the scene is done the same shaders draw in-world geometry (p_dvtx) or off-screen targets: left alone.
+      if (g_hide_ui && !is_compute && game_device_data.scene_done && ui_pixel_shaders.contains(hash))
+      {
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         uint4 size = {};
+         DXGI_FORMAT format;
+         if (rtv)
+            GetResourceInfo(rtv.get(), size, format);
+         if (IsSceneSized(device_data, size.x, size.y))
+            return DrawOrDispatchOverrideType::Replaced;
+      }
 
       if (!is_compute && depth_reader_pixel_shaders.contains(hash))
       {
@@ -1292,6 +1317,7 @@ public:
       // Luma Bloom prefilters the same source first; the native downsample still runs (Y5R's exposure meter reads it).
       else if (!is_compute && hash == g_game_profile.glow_downsample_pixel_shader)
       {
+         game_device_data.scene_done = true;
          if (g_luma_bloom_enable)
             PrefilterGlowSource(native_device, native_device_context, cmd_list_data, device_data);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
@@ -1624,6 +1650,7 @@ public:
       game_device_data.assao_replaced = false;
       game_device_data.glow_replaced = false;
       game_device_data.glow_level0.reset();
+      game_device_data.scene_done = false;
       // Turning Luma Bloom off gives its textures back; they are rebuilt on demand.
       if (!g_luma_bloom_enable && game_device_data.glow_srvs[0])
          game_device_data.ReleaseGlowTextures();
