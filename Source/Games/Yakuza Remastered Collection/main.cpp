@@ -376,6 +376,14 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    // Staging copy for the one-shot predication mask readback (see LogPredicationStats), allocated on first use.
    com_ptr<ID3D11Texture2D> pred_measure_staging;
    bool pred_measure_pending = false;
+   // Threading probe (see HookThreadProbe): D3D11 lets each deferred context record on its own thread, so these hooks can
+   // run concurrently while the members above are unsynchronized.
+   std::atomic<uint32_t> hooks_in_flight = 0;
+   std::atomic<DWORD> last_hook_thread = 0;
+   std::mutex thread_probe_mutex; // guards the three below
+   uint32_t logged_hook_overlaps = 0;
+   std::set<std::pair<DWORD, ID3D11DeviceContext*>> logged_deferred_recorders;
+   std::unordered_set<uint32_t> logged_deferred_hashes;
 
    // True the first time only.
    bool FirstLog(LoggedEvent event)
@@ -387,6 +395,51 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    }
 #endif
 };
+
+#if DEVELOPMENT
+namespace
+{
+   // Scoped to one OnDrawOrDispatch call. Logs each deferred-context recorder (thread + context) and each shader hash
+   // drawn on one, once, and every call that starts while another is still running (capped). Any code on the path of a
+   // deferred draw must not write the per-device state.
+   class HookThreadProbe
+   {
+   public:
+      HookThreadProbe(YakuzaRCDeviceData* data, ID3D11DeviceContext* native_device_context, bool is_primary, uint32_t hash, bool is_compute) : data(data)
+      {
+         constexpr uint32_t max_logged_overlaps = 32;
+         constexpr size_t max_logged_deferred_hashes = 256;
+         const DWORD thread = GetCurrentThreadId();
+         const DWORD previous_thread = data->last_hook_thread.exchange(thread);
+         const uint32_t others = data->hooks_in_flight++;
+         if (others == 0 && is_primary)
+            return;
+         const char* const stage = is_compute ? "CS" : "PS";
+         const std::lock_guard lock(data->thread_probe_mutex);
+         if (others != 0 && data->logged_hook_overlaps < max_logged_overlaps)
+         {
+            data->logged_hook_overlaps++;
+            LogFormatted(reshade::log::level::warning, "[YRC] frame %u hook overlap: thread %lu (%s ctx %p) entered with %u other hook(s) running, previous entry by thread %lu; %s 0x%08X", cb_luma_global_settings.FrameIndex, thread, is_primary ? "immediate" : "deferred", native_device_context, others, previous_thread, stage, hash);
+         }
+         if (is_primary)
+            return;
+         if (data->logged_deferred_recorders.emplace(thread, native_device_context).second)
+            LogFormatted(reshade::log::level::info, "[YRC] frame %u deferred ctx %p records on thread %lu", cb_luma_global_settings.FrameIndex, native_device_context, thread);
+         if (data->logged_deferred_hashes.size() < max_logged_deferred_hashes && data->logged_deferred_hashes.insert(hash).second)
+            LogFormatted(reshade::log::level::info, "[YRC] frame %u deferred draw on thread %lu (ctx %p): %s 0x%08X", cb_luma_global_settings.FrameIndex, thread, native_device_context, stage, hash);
+      }
+      ~HookThreadProbe()
+      {
+         data->hooks_in_flight--;
+      }
+      HookThreadProbe(const HookThreadProbe&) = delete;
+      HookThreadProbe& operator=(const HookThreadProbe&) = delete;
+
+   private:
+      YakuzaRCDeviceData* data;
+   };
+} // namespace
+#endif
 
 class GameYakuzaRC final : public Game
 {
@@ -1107,6 +1160,15 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       const bool is_compute = (stages & reshade::api::shader_stage::compute) != 0;
       const uint32_t hash = is_compute ? original_shader_hashes.compute_shaders[0] : original_shader_hashes.pixel_shaders[0];
+#if DEVELOPMENT
+      const HookThreadProbe thread_probe(&game_device_data, native_device_context, cmd_list_data.is_primary, hash, is_compute);
+#endif
+
+      // Y4R/Y5R also record draws (materials, depth prepasses) on deferred contexts from other threads. Every hook below
+      // keeps unsynchronized per-device state and relies on the immediate context's order (a deferred draw reaches the GPU
+      // only at ExecuteCommandList), and the DEV readbacks need the immediate context too.
+      if (!cmd_list_data.is_primary)
+         return DrawOrDispatchOverrideType::None;
 
       if (!is_compute && depth_reader_pixel_shaders.contains(hash))
       {
@@ -1294,14 +1356,12 @@ public:
       // Dev logger for values the DevKit can't show continuously: frames that skip the ccr (untonemapped scene), the active
       // ccr perm and its grade constants, the material exposure scale, and the first target/blend state of watched passes.
       const bool log_frame = cb_luma_global_settings.FrameIndex % log_interval_frames == 0;
-      // Readbacks map staging copies, which only works on the immediate context.
-      const bool can_read = cmd_list_data.is_primary;
 
       if (!is_compute && ccr_hashes.contains(hash))
       {
          game_device_data.drew_ccr = true;
          game_device_data.ccr_hash = hash;
-         if (log_frame && can_read)
+         if (log_frame)
          {
             com_ptr<ID3D11Buffer> cb;
             native_device_context->PSGetConstantBuffers(5, 1, &cb);
@@ -1323,7 +1383,7 @@ public:
       }
       // ASSAO prepare constants: depth unpack (cb0[1].x / (cb0[1].y - d); reversed Z in Y4R/Y5R) and the effect settings.
       // Only reached with XeGTAO off: the replaced prepare returns above.
-      else if (!is_compute && hash == assao_prepare_pixel_shader && log_frame && can_read)
+      else if (!is_compute && hash == assao_prepare_pixel_shader && log_frame)
       {
          com_ptr<ID3D11Buffer> cb;
          native_device_context->PSGetConstantBuffers(0, 1, &cb);
@@ -1345,7 +1405,7 @@ public:
          }
       }
       // Materials: before the ccr, with the per-material cb1/cb2/cb11 set bound (post passes don't bind cb1).
-      else if (!is_compute && log_frame && can_read && !game_device_data.drew_ccr && game_device_data.exposure_reads < max_exposure_reads)
+      else if (!is_compute && log_frame && !game_device_data.drew_ccr && game_device_data.exposure_reads < max_exposure_reads)
       {
          com_ptr<ID3D11Buffer> cbs[3];
          native_device_context->PSGetConstantBuffers(1, 2, &cbs[0]);
@@ -1403,7 +1463,7 @@ public:
          }
       }
       // Y5R ps_down_sample_4x4: its tap offsets set how much it re-blurs the glow level (see kBloomLevelSigma).
-      if (!is_compute && hash == glow_reexpand_pixel_shader && can_read && game_device_data.FirstLog(GlowReexpandOffsets))
+      if (!is_compute && hash == glow_reexpand_pixel_shader && game_device_data.FirstLog(GlowReexpandOffsets))
       {
          com_ptr<ID3D11Buffer> vs_cb;
          native_device_context->VSGetConstantBuffers(7, 1, &vs_cb);
@@ -1413,7 +1473,7 @@ public:
             LogFormatted(reshade::log::level::info, "[YRC] frame %u ps_down_sample_4x4 VS cb7[0]: (%f %f %f %f) (256x128 source texel = %f %f)", cb_luma_global_settings.FrameIndex, data[0], data[1], data[2], data[3], 1.f / 256.f, 1.f / 128.f);
       }
       const bool is_glow_pass0 = !is_compute && glow_pass0_pixel_shaders.contains(hash);
-      if (log_frame && can_read && (is_glow_pass0 || (!is_compute && glow_pass2_pixel_shaders.contains(hash))))
+      if (log_frame && (is_glow_pass0 || (!is_compute && glow_pass2_pixel_shaders.contains(hash))))
       {
          // pass0: cb5[0] luma/rgb threshold, cb5[1] threshold scale, cb5[2] source scale, cb11[0].y & 8 = scene threshold on.
          // pass2: cb5[0].x luma term, .yzw rgb scale of the 5-level sum.
@@ -1444,7 +1504,7 @@ public:
 
       // glow_pass1 (8 draws: 4 levels, H then V): its 6 tap weights (PS cb5[1..3], taps at +-0.5/1.5/2.5 x VS cb7[0].xy)
       // and sizes, from which the Luma Bloom widths are set.
-      if (!is_compute && hash == glow_pass1_pixel_shader && log_frame && can_read && game_device_data.glow_pass1_draws < 8)
+      if (!is_compute && hash == glow_pass1_pixel_shader && log_frame && game_device_data.glow_pass1_draws < 8)
       {
          const uint32_t draw = game_device_data.glow_pass1_draws++;
          com_ptr<ID3D11Buffer> ps_cb, vs_cb;
@@ -1475,7 +1535,7 @@ public:
 
       // DoF composites: alpha = saturate(depth term) * cb5[0].z (pass2_mask also * mask * cb5[1].x); a scale above 1 would
       // extrapolate the blend into the fp16 scene.
-      if (!is_compute && log_frame && can_read && dof_composite_pixel_shaders.contains(hash))
+      if (!is_compute && log_frame && dof_composite_pixel_shaders.contains(hash))
       {
          com_ptr<ID3D11Buffer> cb;
          native_device_context->PSGetConstantBuffers(5, 1, &cb);
