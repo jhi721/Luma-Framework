@@ -20,12 +20,12 @@
 // is the only display rolloff. No path takes chroma from the working value.
 //
 // The continuation is the tangent of the LINEAR-LIGHT curve G(x) = F(x)^2.2 over the curve's own input x, the
-// construction of ME2 FilmicRecovery and SR3 `SR_RecoveryGain`. The pivot is scene mid-gray 0.18 (post-exposure,
-// pre-BiasScale), as in MELE. G has an inflection at scene 0.40, below which the tangent falls under vanilla, so
-// values between the pivot and the point where the tangent re-crosses G come out darker than the native curve.
+// construction of ME2 FilmicRecovery and SR3 `SR_RecoveryGain`. The pivot is the inflection of G, scene 0.40
+// (post-exposure, pre-BiasScale; G 0.25 of white): G is convex below it, so a lower pivot (e.g. mid-gray 0.18) puts
+// the tangent under vanilla, and G is steepest there, so a higher one gives dimmer highlights.
 // Derived for the default_district.xtbl curve (Toe 0.1, Shoulder 0.9, Steep 0.36, BiasScale 3); see NOTES.md.
 
-#define SRTTR_HDR_PIVOT                  0.18
+#define SRTTR_HDR_PIVOT                  0.40
 #define SRTTR_HDR_BRIDGE_SHOULDER        0.75
 #define SRTTR_HDR_PROXY_EPS              1e-4
 #define SRTTR_NATIVE_COLOR_MIN_LUMINANCE 1e-6
