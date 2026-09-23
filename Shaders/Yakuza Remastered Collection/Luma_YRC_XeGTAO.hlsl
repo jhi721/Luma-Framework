@@ -27,7 +27,7 @@ cbuffer AssaoCB0 : register(b0)
 // b8: b9/b10 are the Luma data/settings cbuffers in this game, and no game shader binds b8. Mirrored by gtao_knobs_cb_slot.
 cbuffer LumaGTAO : register(b8)
 {
-   float FinalValuePowerRT; // primary darkness dial (0.8, chosen by eye against the native AO)
+   float FinalValuePowerRT; // primary darkness dial (1.0)
    float RadiusOverrideRT;  // > 0 overrides EFFECT_RADIUS (view units, same as ASSAO's)
    float DebugViewRT;       // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    float PaddingRT;

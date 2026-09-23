@@ -60,13 +60,14 @@ namespace
    float g_smaa_pred_tolerance = 0.02f;
    bool g_gtao_enable = true;
    bool g_luma_bloom_enable = true;
-   float g_gtao_final_value_power = 0.8f; // DEV/TEST calibration knobs, not persisted
-   float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
+   float g_gtao_final_value_power = 1.f; // DEV/TEST calibration knobs, not persisted
+   float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (ASSAO's own radius, view units)
 #if DEVELOPMENT
    bool g_smaa_predication = true;
    bool g_smaa_pred_debug = false;   // Show the predication mask (red) instead of the frame
    bool g_smaa_pred_measure = false; // One-shot: read the mask back and log its distribution (UI button)
    int g_gtao_debug_view = 0;        // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
+   bool g_gtao_skip_apply = false;   // Calibration: frame without any AO (native or XeGTAO)
 #endif
 
    // Intel ASSAO (stock): prepare, depth mips, generate (High / Medium), smart blur / wide, all skipped under XeGTAO; the
@@ -1118,6 +1119,11 @@ public:
 #endif
       ImGui::EndDisabled();
 #endif
+#if DEVELOPMENT
+      ImGui::Checkbox("Skip AO Apply", &g_gtao_skip_apply);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Calibration reference: the frame without any AO, whether XeGTAO or the game's SSAO is active.");
+#endif
 
       ImGui::SeparatorText("Effects");
 
@@ -1200,6 +1206,13 @@ public:
       {
          return DrawOrDispatchOverrideType::Replaced;
       }
+#if DEVELOPMENT
+      // The "no AO" calibration reference, native or XeGTAO: the apply is a plain multiply, so skipping it removes all AO.
+      else if (!is_compute && hash == assao_apply_pixel_shader && g_gtao_skip_apply)
+      {
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+#endif
       // The game's apply draw (full-screen VS, viewport, multiply blend onto the scene RT) with the XeGTAO reader as its PS.
       else if (!is_compute && hash == assao_apply_pixel_shader && game_device_data.assao_replaced)
       {
