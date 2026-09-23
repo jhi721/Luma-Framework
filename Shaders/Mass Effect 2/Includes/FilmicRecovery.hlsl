@@ -24,13 +24,13 @@ float ME2_NativeToneCurveSlope(float scene)
 // white stays neutral, black stays black, and a channel the vanilla grade zeroed gets no light back.
 float3 ME2_RecoverFilmicBrightness(float3 scene, float3 curved, float3 sdrRef)
 {
-   // Tuned HDR-extension onset, in the scene light the curve takes as INPUT - not paper white, nits, or a post-grade
-   // value. A chosen constant, not a property of the curve: its own landmarks (inflection 0.065, the tangent through
-   // the origin 0.145, mid-gray 0.18) each give a brighter extension, and none of them says what brightness the game
-   // meant. Two hard bounds: below 0.145 the tangent's intercept F(p) - p*F'(p) turns negative and the extension
-   // crosses zero; below 0.065 the curve is still convex and the tangent would dip under it. At 0.35, SDR white
-   // recovers 1.35x, scene 4 -> 3.7x, scene 16 -> 13.3x.
-   const float pivot = 0.35;
+   // HDR-extension onset, in the scene light the curve takes as INPUT - not paper white, nits, or a post-grade value.
+   // Scene mid-gray 0.18, the pivot RenoDX Zelda: Echoes of Wisdom uses on this same Hejl-Dawson curve with the same
+   // 0.004 offset (there raised to 2.2, here squared). The one hard bound is the inflection at 0.065: below it the curve
+   // is still convex and the tangent would dip under it. The tangent's intercept goes negative below 0.145, but only
+   // the part above the pivot is used, where the extension exceeds F(p) > 0. At 0.18 the point where vanilla reaches
+   // 0.9 of white recovers 4.3x (0.35 gave 2.8x) and scene 10 reaches 13.4x white.
+   const float pivot = 0.18;
    // The source EXCURSION, not luminance: the native curve is per channel, so its hottest channel is the one the
    // shoulder compresses first - and F is monotone, so max3(F(scene)) == F(max3(scene)) below.
    const float sourcePeak = max3(scene);
@@ -43,11 +43,11 @@ float3 ME2_RecoverFilmicBrightness(float3 scene, float3 curved, float3 sdrRef)
    const float slope = ME2_NativeToneCurveSlope(pivot);
    const float extended = pivotValue + slope * (sourcePeak - pivot); // the curve continued along its own tangent
 
-   // No denominator floor: this branch only runs above the pivot, where F(sourcePeak) >= F(0.35) = 0.433. In real
+   // No denominator floor: this branch only runs above the pivot, where F(sourcePeak) >= F(0.18) = 0.258. In real
    // arithmetic the ratio needs no floor either - F is concave from its inflection at 0.065 up (F'' < 0, checked to
    // 200), so the tangent sits above the curve and the extension can only brighten. max(1, ...) stays regardless:
    // `extended` and `max3(curved)` are evaluated independently in float32, and right at the pivot, where they
-   // coincide, rounding lands the ratio a few ULP under 1 (measured 1 - 1.2e-7 at 0.350001). The floor enforces
+   // coincide, rounding lands the ratio a few ULP under 1 (measured 1 - 1.2e-7 at 0.350001 with the former 0.35 pivot). The floor enforces
    // the invariant the maths promises, HDR never darker than vanilla, after that rounding; it is not an artistic
    // clamp. It also turns a NaN ratio into vanilla, since max() returns its non-NaN operand. No saturate on the
    // result: the display map owns the roll-off.
