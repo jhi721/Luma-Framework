@@ -1,4 +1,4 @@
-// QLOC's FidelityFX CAS with scaling (sys_cas_shader, presumably used when the render scale differs from 100%),
+// QLOC's FidelityFX CAS with scaling (sys_cas_shader, the resample to the swapchain when the render scale is not 100%),
 // decompiled with 3Dmigoto from the DevKit dump. Changes against the decompiler output, all verified against the
 // original DXBC:
 //  - FFX's integer approximations (rcp 0x7ef07ebb / 0x7ef19fff, sqrt 0x1fbc4639) restored as asfloat/asint bit
@@ -7,6 +7,9 @@
 //  - the 4 per-pixel output saturate()s (mul_sat) replaced by max(0), as in CAS_0x491BAFA3: vanilla clipped the HDR
 //    chain back to [0,1] here. Opcode histogram vs. the original differs only by those 4 saturates and int<->float
 //    conversions of the (small) pixel coordinates.
+//  - the sharpening peak cb0[1].x becomes 0 on the dispatches the addon flags (LumaData.CustomData1: SMAA ran, RCAS
+//    stands in for the game's sharpening): the pass then only resamples, as the unscaled CAS becomes a copy.
+#include "Includes/Common.hlsl"
 Texture2D<float4> t0 : register(t0);
 
 cbuffer cb0 : register(b0)
@@ -20,6 +23,7 @@ cbuffer cb0 : register(b0)
 RWTexture2D<float4> u0 : register(u0);
 
 [numthreads(64, 1, 1)] void main(uint3 vThreadIDInGroup : SV_GroupThreadID, uint3 vThreadGroupID : SV_GroupID) {
+   const float casPeak = LumaData.CustomData1 != 0u ? 0.0 : cb0[1].x;
    float4 r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18;
    uint4 bitmask, uiDest;
    float4 fDest;
@@ -96,7 +100,7 @@ RWTexture2D<float4> u0 : register(u0);
    r2.z = asfloat(0x7ef07ebb - asint(r2.z));
    r2.z = saturate(r2.w * r2.z);
    r2.z = asfloat((asuint(r2.z) >> 1) + 0x1fbc4639);
-   r2.z = cb0[1].x * r2.z;
+   r2.z = casPeak * r2.z;
    r0.x = 0.03125 + r0.x;
    r0.x = asfloat(0x7ef07ebb - asint(r0.x));
    r3.zw = float2(1, 1) + -r2.yx;
@@ -140,7 +144,7 @@ RWTexture2D<float4> u0 : register(u0);
    r3.y = asfloat(0x7ef07ebb - asint(r3.y));
    r3.y = saturate(r4.x * r3.y);
    r3.y = asfloat((asuint(r3.y) >> 1) + 0x1fbc4639);
-   r3.y = cb0[1].x * r3.y;
+   r3.y = casPeak * r3.y;
    r3.x = 0.03125 + r3.x;
    r3.x = asfloat(0x7ef07ebb - asint(r3.x));
    r4.x = r3.z * r3.x;
@@ -179,7 +183,7 @@ RWTexture2D<float4> u0 : register(u0);
    r4.z = asfloat(0x7ef07ebb - asint(r4.z));
    r4.z = saturate(r5.y * r4.z);
    r4.z = asfloat((asuint(r4.z) >> 1) + 0x1fbc4639);
-   r4.z = cb0[1].x * r4.z;
+   r4.z = casPeak * r4.z;
    r4.w = 0.03125 + r4.w;
    r4.w = asfloat(0x7ef07ebb - asint(r4.w));
    r5.y = r4.w * r3.w;
@@ -212,7 +216,7 @@ RWTexture2D<float4> u0 : register(u0);
    r5.y = asfloat(0x7ef07ebb - asint(r5.y));
    r5.y = saturate(r7.w * r5.y);
    r5.y = asfloat((asuint(r5.y) >> 1) + 0x1fbc4639);
-   r5.y = cb0[1].x * r5.y;
+   r5.y = casPeak * r5.y;
    r6.w = 0.03125 + r6.w;
    r6.w = asfloat(0x7ef07ebb - asint(r6.w));
    r7.w = r6.w * r2.x;
@@ -302,7 +306,7 @@ RWTexture2D<float4> u0 : register(u0);
    r1.z = asfloat(0x7ef07ebb - asint(r1.z));
    r1.z = saturate(r4.z * r1.z);
    r1.z = asfloat((asuint(r1.z) >> 1) + 0x1fbc4639);
-   r1.z = cb0[1].x * r1.z;
+   r1.z = casPeak * r1.z;
    r0.x = 0.03125 + r0.x;
    r0.x = asfloat(0x7ef07ebb - asint(r0.x));
    r16.xyzw = float4(1, 1, 1, 1) + -r2.yxwz;
@@ -346,7 +350,7 @@ RWTexture2D<float4> u0 : register(u0);
    r4.y = asfloat(0x7ef07ebb - asint(r4.y));
    r4.y = saturate(r5.y * r4.y);
    r4.y = asfloat((asuint(r4.y) >> 1) + 0x1fbc4639);
-   r4.y = cb0[1].x * r4.y;
+   r4.y = casPeak * r4.y;
    r4.x = 0.03125 + r4.x;
    r4.x = asfloat(0x7ef07ebb - asint(r4.x));
    r5.y = r16.x * r4.x;
@@ -385,7 +389,7 @@ RWTexture2D<float4> u0 : register(u0);
    r5.x = asfloat(0x7ef07ebb - asint(r5.x));
    r5.x = saturate(r5.w * r5.x);
    r5.x = asfloat((asuint(r5.x) >> 1) + 0x1fbc4639);
-   r5.x = cb0[1].x * r5.x;
+   r5.x = casPeak * r5.x;
    r5.z = 0.03125 + r5.z;
    r5.z = asfloat(0x7ef07ebb - asint(r5.z));
    r5.w = r16.y * r5.z;
@@ -418,7 +422,7 @@ RWTexture2D<float4> u0 : register(u0);
    r6.y = asfloat(0x7ef07ebb - asint(r6.y));
    r6.y = saturate(r7.w * r6.y);
    r6.y = asfloat((asuint(r6.y) >> 1) + 0x1fbc4639);
-   r6.y = cb0[1].x * r6.y;
+   r6.y = casPeak * r6.y;
    r5.w = 0.03125 + r5.w;
    r5.w = asfloat(0x7ef07ebb - asint(r5.w));
    r7.w = r5.w * r2.x;
@@ -501,7 +505,7 @@ RWTexture2D<float4> u0 : register(u0);
    r1.z = asfloat(0x7ef07ebb - asint(r1.z));
    r1.z = saturate(r1.w * r1.z);
    r1.z = asfloat((asuint(r1.z) >> 1) + 0x1fbc4639);
-   r1.z = cb0[1].x * r1.z;
+   r1.z = casPeak * r1.z;
    r0.x = 0.03125 + r0.x;
    r0.x = asfloat(0x7ef07ebb - asint(r0.x));
    r1.w = r4.w * r0.x;
@@ -541,7 +545,7 @@ RWTexture2D<float4> u0 : register(u0);
    r2.x = asfloat(0x7ef07ebb - asint(r2.x));
    r2.x = saturate(r2.w * r2.x);
    r2.x = asfloat((asuint(r2.x) >> 1) + 0x1fbc4639);
-   r2.x = cb0[1].x * r2.x;
+   r2.x = casPeak * r2.x;
    r2.z = 0.03125 + r2.z;
    r2.z = asfloat(0x7ef07ebb - asint(r2.z));
    r2.w = r16.z * r2.z;
@@ -580,7 +584,7 @@ RWTexture2D<float4> u0 : register(u0);
    r4.x = asfloat(0x7ef07ebb - asint(r4.x));
    r4.x = saturate(r4.y * r4.x);
    r4.x = asfloat((asuint(r4.x) >> 1) + 0x1fbc4639);
-   r4.x = cb0[1].x * r4.x;
+   r4.x = casPeak * r4.x;
    r4.y = 0.03125 + r4.z;
    r4.y = asfloat(0x7ef07ebb - asint(r4.y));
    r4.z = r16.w * r4.y;
@@ -613,7 +617,7 @@ RWTexture2D<float4> u0 : register(u0);
    r4.z = asfloat(0x7ef07ebb - asint(r4.z));
    r4.z = saturate(r6.w * r4.z);
    r4.z = asfloat((asuint(r4.z) >> 1) + 0x1fbc4639);
-   r4.z = cb0[1].x * r4.z;
+   r4.z = casPeak * r4.z;
    r5.w = 0.03125 + r5.w;
    r5.w = asfloat(0x7ef07ebb - asint(r5.w));
    r6.w = r5.w * r2.y;
@@ -704,7 +708,7 @@ RWTexture2D<float4> u0 : register(u0);
    r1.z = asfloat(0x7ef07ebb - asint(r1.z));
    r1.z = saturate(r1.w * r1.z);
    r1.z = asfloat((asuint(r1.z) >> 1) + 0x1fbc4639);
-   r1.z = cb0[1].x * r1.z;
+   r1.z = casPeak * r1.z;
    r0.x = 0.03125 + r0.x;
    r0.x = asfloat(0x7ef07ebb - asint(r0.x));
    r2.zw = float2(1, 1) + -r1.yx;
@@ -748,7 +752,7 @@ RWTexture2D<float4> u0 : register(u0);
    r2.y = asfloat(0x7ef07ebb - asint(r2.y));
    r2.y = saturate(r4.x * r2.y);
    r2.y = asfloat((asuint(r2.y) >> 1) + 0x1fbc4639);
-   r2.y = cb0[1].x * r2.y;
+   r2.y = casPeak * r2.y;
    r2.x = 0.03125 + r2.x;
    r2.x = asfloat(0x7ef07ebb - asint(r2.x));
    r4.x = r2.z * r2.x;
@@ -787,7 +791,7 @@ RWTexture2D<float4> u0 : register(u0);
    r4.z = asfloat(0x7ef07ebb - asint(r4.z));
    r4.z = saturate(r5.y * r4.z);
    r4.z = asfloat((asuint(r4.z) >> 1) + 0x1fbc4639);
-   r4.z = cb0[1].x * r4.z;
+   r4.z = casPeak * r4.z;
    r4.w = 0.03125 + r4.w;
    r4.w = asfloat(0x7ef07ebb - asint(r4.w));
    r5.y = r4.w * r2.w;
@@ -820,7 +824,7 @@ RWTexture2D<float4> u0 : register(u0);
    r5.y = asfloat(0x7ef07ebb - asint(r5.y));
    r5.y = saturate(r7.x * r5.y);
    r5.y = asfloat((asuint(r5.y) >> 1) + 0x1fbc4639);
-   r5.y = cb0[1].x * r5.y;
+   r5.y = casPeak * r5.y;
    r6.w = 0.03125 + r6.w;
    r6.w = asfloat(0x7ef07ebb - asint(r6.w));
    r7.x = r6.w * r1.x;

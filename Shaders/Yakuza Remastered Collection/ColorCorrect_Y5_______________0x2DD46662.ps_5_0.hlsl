@@ -1,5 +1,5 @@
 // ps_ccr________________ (Y5R sh_devil_w64.par): the passthrough grade, byte-identical to ps_texture_a255 (a copy with
-// alpha 1) in every game. Only the draw the addon flags (LumaData.CustomData1, the swapchain-sized Y5R grade) is graded.
+// alpha 1) in every game. Only the draw the addon flags (LumaData.CustomData1, the scene-sized Y5R grade) is graded.
 #define CCR_HLS            0
 #define CCR_SC             0
 #define CCR_GM             0

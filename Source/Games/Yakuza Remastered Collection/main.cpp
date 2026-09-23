@@ -17,7 +17,7 @@
 
 // The engine has no tone curve: materials write gamma-space `color * exposure` into an 8-bit scene RT whose UNORM clamp
 // is the only highlight limit (Y5R materials add their own curve, see "PatchY5MaterialToneCurve"). The whole post chain
-// (scene, CMAA2, CAS, resample, fade) runs on swapchain-sized b8g8r8a8/r8g8b8a8 targets, upgraded to fp16 here. The HDR
+// (scene, CMAA2, CAS, resample, fade) runs on scene-sized b8g8r8a8/r8g8b8a8 targets, upgraded to fp16 here. The HDR
 // tonemap lives in the "color correct" replacements (Shaders/Yakuza Remastered Collection/Includes/ColorCorrect.hlsl),
 // the first full-screen pass reading the finished scene.
 // Hashes are Y3R's unless marked. A hash absent from the running game never matches, so the games' sets are merged;
@@ -28,7 +28,7 @@ namespace
    struct YakuzaGameProfile
    {
       const char* name;
-      std::vector<uint2> dof_custom_sizes;         // Offscreen DoF targets upgraded to fp16 besides the swapchain-sized ones
+      std::vector<uint2> dof_custom_sizes;         // Offscreen DoF targets upgraded to fp16 besides the scene-sized ones
       uint32_t glow_downsample_pixel_shader;       // Flagged to clamp its source per texel; per game because Y3's 0x54A5E7AC is Y4's ps_cubic
       bool grades_aliased_passthrough_ccr = false; // Y5R: its passthrough ccr is byte-identical to ps_texture_a255 (see below)
       bool glow_downsample_rms = false;            // Y4R's downsample is a 5x6-tap root mean square, Y3R/Y5R's a 2-tap average
@@ -101,12 +101,14 @@ namespace
    constexpr uint32_t cmaa2_first_compute_shader = 0x2E998140;
    const std::unordered_set<uint32_t> cmaa2_pre_apply_compute_shaders = {cmaa2_first_compute_shader, 0x60E701EA, 0x79976116};
    constexpr uint32_t cmaa2_apply_compute_shader = 0x82DA801B;
-   // FXAA 3.11: one pass from the post-ccr canvas (t0) into its own swapchain-sized target.
+   // FXAA 3.11: one pass from the post-ccr canvas (t0) into its own scene-sized target.
    constexpr uint32_t fxaa_pixel_shader = 0xE7A1D308;
    // FidelityFX CAS (t0 -> u0, copied back by the game), after the AA and the world-anchored markers.
    constexpr uint32_t cas_compute_shader = 0x491BAFA3;
+   // Its scaling variant, the resample to the swapchain when the render scale is not 100% (with CAS on).
+   constexpr uint32_t cas_scaled_compute_shader = 0xFBA57AE9;
    // Y5R's passthrough ccr compiles byte-identical to ps_texture_a255, a copy with alpha 1 that every game uses (DoF
-   // buffers, among others). Its replacement grades only the draws flagged here: swapchain-sized targets in Y5R.
+   // buffers, among others). Its replacement grades only the draws flagged here: scene-sized targets in Y5R.
    constexpr uint32_t aliased_passthrough_ccr_pixel_shader = 0x2DD46662;
    // Effects drawn into targets that were UNORM in vanilla (the scene RT, the DoF-sized offscreen buffers), which
    // relied on that clamp: particles (ps_ptc_*, blood included), the hit flashes, edges and highlight masks, shockwave,
@@ -225,9 +227,11 @@ namespace
       return (has(names) && ...);
    }
 
-   bool IsOutputSized(const DeviceData& device_data, uint32_t width, uint32_t height)
+   // The scene chain's targets: swapchain-sized, or scaled by the game's render scale (Y5R also by its dynamic resolution),
+   // which keeps the output aspect ratio up to a pixel of rounding (as Core's SwapchainAspectRatio upgrade filter).
+   bool IsSceneSized(const DeviceData& device_data, uint32_t width, uint32_t height)
    {
-      return width == uint32_t(device_data.output_resolution.x + 0.5f) && height == uint32_t(device_data.output_resolution.y + 0.5f);
+      return height > 1 && std::abs(float(width) - float(height) * device_data.output_resolution.x / device_data.output_resolution.y) <= 1.f;
    }
 
    bool GetTextureDesc(ID3D11Resource* resource, D3D11_TEXTURE2D_DESC* desc)
@@ -308,7 +312,7 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    // Per frame
    com_ptr<ID3D11ShaderResourceView> depth_srv; // Scene depth for predication, null if no reader ran
    bool cmaa2_replaced = false;                 // The CMAA2 chain of this frame is skipped, its apply runs SMAA
-   bool smaa_ran = false;                       // The game's CAS becomes a copy (RCAS, when on, already sharpened)
+   bool smaa_ran = false;                       // The game's CAS becomes a copy, its scaling CAS a plain resample (RCAS sharpens)
    bool assao_replaced = false;                 // XeGTAO ran at the ASSAO prepare: the chain is skipped, its apply draws XeGTAO
    com_ptr<ID3D11Resource> glow_level0;         // The level the glow downsample wrote, set once the Luma Bloom prefilter ran on it
    bool glow_replaced = false;                  // Luma Bloom ran at glow_pass0: pass1 is skipped, pass2 composites it
@@ -376,7 +380,7 @@ struct YakuzaRCDeviceData final : public GameDeviceData
    std::vector<float> last_logged_dof_cb5;
    uint32_t glow_pass1_draws = 0;                           // this frame
    std::vector<float> last_logged_glow_pass1[8];            // PS cb5[0..3], VS cb7[0], target and source size per draw
-   com_ptr<ID3D11Resource> glow_source;                     // The glow downsample's swapchain-sized t0, from a previous frame
+   com_ptr<ID3D11Resource> glow_source;                     // The glow downsample's scene-sized t0, from a previous frame
    std::unordered_set<uint32_t> logged_glow_source_writers; // Pixel shaders seen rendering into it
    std::unordered_set<uint32_t> seen_blend_hashes;          // Pixel shaders already checked by the blended-effect trap
    std::unordered_set<uint32_t> logged_watched_hashes;
@@ -404,11 +408,11 @@ class GameYakuzaRC final : public Game
       return *static_cast<YakuzaRCDeviceData*>(device_data.game);
    }
 
-   // SMAA (+ RCAS) runs on the post-ccr fp16 canvas at output resolution; anything else (render scale below 100%, SDR
+   // SMAA (+ RCAS) runs on the post-ccr fp16 canvas at its scene size (before the render scale resample); anything else (SDR
    // targets) keeps the game's own AA. The caller holds s_mutex_shader_objects.
    static bool CanRunSMAA(const DeviceData& device_data, const D3D11_TEXTURE2D_DESC& color_desc)
    {
-      return g_smaa_enable && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.SampleDesc.Count == 1 && color_desc.ArraySize == 1 && IsOutputSized(device_data, color_desc.Width, color_desc.Height) && HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h, "YRC Sharpen PS"_h) && HasShaders(device_data.native_compute_shaders, "YRC SMAA Linearize CS"_h);
+      return g_smaa_enable && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.SampleDesc.Count == 1 && color_desc.ArraySize == 1 && IsSceneSized(device_data, color_desc.Width, color_desc.Height) && HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h, "YRC Sharpen PS"_h) && HasShaders(device_data.native_compute_shaders, "YRC SMAA Linearize CS"_h);
    }
 
 #if DEVELOPMENT
@@ -1257,6 +1261,13 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
          }
       }
+      // The scaling CAS (render scale other than 100%) also resamples to the swapchain, so it can't become a copy: flagged,
+      // its replacement drops the sharpening and only resamples.
+      else if (is_compute && hash == cas_scaled_compute_shader && game_device_data.smaa_ran)
+      {
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData, 1u);
+         updated_cbuffers = true;
+      }
       // Off the grade (and in games where it never grades) Core binds the default Luma data (CustomData1 = 0) and the
       // replacement stays a copy.
       else if (!is_compute && hash == aliased_passthrough_ccr_pixel_shader && g_game_profile.grades_aliased_passthrough_ccr)
@@ -1266,7 +1277,7 @@ public:
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
-         if (IsOutputSized(device_data, size.x, size.y))
+         if (IsSceneSized(device_data, size.x, size.y))
          {
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 1u);
@@ -1397,7 +1408,7 @@ public:
          }
       }
 
-      // Bloom: which pixel shaders render into its swapchain-sized source (a pooled target), and its live constants.
+      // Bloom: which pixel shaders render into its scene-sized source (a pooled target), and its live constants.
       if (!is_compute && hash == g_game_profile.glow_downsample_pixel_shader)
       {
          com_ptr<ID3D11ShaderResourceView> srv;
@@ -1408,7 +1419,7 @@ public:
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(source.get(), size, format);
-         if (IsOutputSized(device_data, size.x, size.y))
+         if (IsSceneSized(device_data, size.x, size.y))
             game_device_data.glow_source = source;
          if (game_device_data.FirstLog(GlowDownsampleSampler))
          {
@@ -1527,7 +1538,7 @@ public:
          }
       }
 
-      // Blended-effect trap: the first draw of every pixel shader that blends into a swapchain-sized target, with the frame
+      // Blended-effect trap: the first draw of every pixel shader that blends into a scene-sized target, with the frame
       // index. Effects that break on the fp16 chain (alpha above 1 extrapolates the blend) show up as new lines at the time
       // they appear on screen; name the hashes offline from the game's shader archives.
       if (!is_compute && game_device_data.seen_blend_hashes.insert(hash).second)
@@ -1545,7 +1556,7 @@ public:
          uint4 size;
          DXGI_FORMAT format;
          GetResourceInfo(rtv.get(), size, format);
-         if (rt_blend.BlendEnable && IsOutputSized(device_data, size.x, size.y))
+         if (rt_blend.BlendEnable && IsSceneSized(device_data, size.x, size.y))
             LogFormatted(reshade::log::level::info, "[YRC] frame %u blended PS 0x%08X: target format %u, color %d/%d op %d, alpha %d/%d, ccr drawn before: %d", cb_luma_global_settings.FrameIndex, hash, format, rt_blend.SrcBlend, rt_blend.DestBlend, rt_blend.BlendOp, rt_blend.SrcBlendAlpha, rt_blend.DestBlendAlpha, game_device_data.drew_ccr);
       }
 
@@ -1721,8 +1732,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // b8g8r8a8_unorm backbuffer -> r16g16b16a16_float
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-      // The scene RT and every swapchain-sized post target (CMAA2/CAS/resample/fade) are 8-bit UNORM. The lower bloom
-      // levels (256x128 and smaller) stay 8-bit on purpose: the vanilla [0,1] bound is part of the look.
+      // The scene RT and every scene-sized post target (CMAA2/CAS/resample/fade) are 8-bit UNORM. The lower bloom levels
+      // (256x128 and smaller) stay 8-bit on purpose: the vanilla [0,1] bound is part of the look.
       texture_upgrade_formats = {
          reshade::api::format::b8g8r8a8_unorm,
          reshade::api::format::b8g8r8a8_typeless,
@@ -1733,7 +1744,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // highlights inside the blurred area, so those sizes are upgraded too. The top bloom level shares 512x256, so
       // glow_pass0/1 saturate to keep the vanilla bloom bound. Hash-based mirrors don't help: they go through the same
       // size filter.
-      texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomSize;
+      // Below 100% render scale (and under Y5R's dynamic resolution) the scene chain runs at a scaled size up to the AA and a
+      // resample (Y3R 0xFC6DEC24) brings it to the swapchain: the aspect ratio filter catches every scale (see
+      // IsSceneSized). The engine's fixed-size targets (512x256, 512x512, 1024x1024, 256x256) are not 16:9.
+      texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px | (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomSize;
       g_game_profile = DetectGame();
       texture_format_upgrades_2d_custom_sizes = g_game_profile.dof_custom_sizes;
 

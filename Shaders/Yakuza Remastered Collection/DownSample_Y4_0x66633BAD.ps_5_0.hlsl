@@ -1,4 +1,4 @@
-// ps_down_sample (Y4R sh_soul_w64.par, also in Y5R): 5x6-tap RMS of the swapchain-sized glow source into the 512x256
+// ps_down_sample (Y4R sh_soul_w64.par, also in Y5R): 5x6-tap RMS of the scene-sized glow source into the 512x256
 // bloom level. The source is fp16 now; vanilla clamped every texel to 1 before this sum. See SampleGlowSource.
 #include "Includes/Common.hlsl"
 

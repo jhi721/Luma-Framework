@@ -1,4 +1,4 @@
-// ps_down_sample (Y3R sh_ogre3_w64.par; the same bytecode is Y4R's ps_cubic): 2-tap average of the swapchain-sized glow
+// ps_down_sample (Y3R sh_ogre3_w64.par; the same bytecode is Y4R's ps_cubic): 2-tap average of the scene-sized glow
 // source into the 512x256 bloom level. The source is fp16 now; vanilla clamped every texel to 1 before this average.
 // See SampleGlowSource.
 #include "Includes/Common.hlsl"
