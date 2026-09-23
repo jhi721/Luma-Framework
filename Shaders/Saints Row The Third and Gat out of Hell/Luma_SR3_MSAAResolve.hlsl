@@ -1,4 +1,4 @@
-// Saints Row: The Third - HDR-weighted MSAA resolve, drawn instead of the game's single ResolveSubresource of the FP16
+// Saints Row: The Third and Gat out of Hell (same grab_scene_color path) - HDR-weighted MSAA resolve, drawn instead of the game's single ResolveSubresource of the FP16
 // scene (rl_pc_scene_renderer::grab_scene_color).
 //
 // The hardware resolve is a plain average of linear HDR samples, before the tonemap: a sample at 16 next to one at 0

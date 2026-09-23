@@ -1,4 +1,4 @@
-// SMAA implementation for Saints Row: The Third. Reference: https://github.com/iryoku/smaa
+// SMAA implementation for Saints Row: The Third and Saints Row: Gat out of Hell. Reference: https://github.com/iryoku/smaa
 // ULTRA preset + color edge detection, run right after the rl_hdr final composite on the gamma canvas (the
 // swapchain), before DoF, distortion and the UI. It adds to the game's MSAA rather than replacing an AA pass.
 // The canvas is gamma and carries display-mapped HDR values, so >1 is possible; edge detection works in gamma,

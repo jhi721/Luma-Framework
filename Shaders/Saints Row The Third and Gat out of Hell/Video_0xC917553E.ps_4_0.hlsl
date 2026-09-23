@@ -50,5 +50,5 @@ void main(float4 pos : SV_Position, float2 uv : TEXCOORD0, float4 vertexColor : 
       lin = PumboAutoHDR(lin, peakNits, GamePaperWhiteNits);
    }
    // Drawn with the UI, so pre-scaled like the scene to land at the scene paper white.
-   o0.rgb = SR3_EncodeOutput(lin);
+   o0.rgb = SR_EncodeOutput(lin);
 }

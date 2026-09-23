@@ -69,7 +69,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Titanfall 2", "Source\Games
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Shenmue I & II", "Source\Games\Shenmue I & II\Shenmue I & II.vcxproj", "{039E634A-718A-4C4A-AE7C-706BABC5212B}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Saints Row The Third", "Source\Games\Saints Row The Third\Saints Row The Third.vcxproj", "{D5FC2D39-9270-4281-B68E-92EAF35B3E25}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Saints Row The Third and Gat out of Hell", "Source\Games\Saints Row The Third and Gat out of Hell\Saints Row The Third and Gat out of Hell.vcxproj", "{D5FC2D39-9270-4281-B68E-92EAF35B3E25}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Saints Row The Third Remastered", "Source\Games\Saints Row The Third Remastered\Saints Row The Third Remastered.vcxproj", "{E4CDFCCC-A554-41E7-ADC8-CEC5B43BD144}"
 EndProject

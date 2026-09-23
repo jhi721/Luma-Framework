@@ -13,14 +13,20 @@
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 
-// Saints Row: The Third (2011, Volition CTG engine), native D3D11, 32-bit.
+// Saints Row: The Third (2011) and Saints Row: Gat out of Hell (2015), Volition CTG engine, native D3D11, both 32-bit.
 // Not the 2020 Remastered (separate project, different engine revision).
 //
-// Frame (DevKit): FP16 scene (MSAA up to 8x, resolved before the tonemap) -> rl_hdr final composite
+// Frame (DevKit, SR3): FP16 scene (MSAA up to 8x, resolved before the tonemap) -> rl_hdr final composite
 // straight into the r8g8b8a8 swapchain -> [diffusion DoF] -> distortion -> rl_prim_2d UI, all on display-encoded data.
+// Gat out of Hell is a Saints Row IV engine build: it ships Saints Row IV's rl_hdr finals, brightpass, UI and Bink shaders
+// byte-for-byte (distortion and DoF moved into the final). Game-specific shaders have distinct hashes, so their lists are
+// merged, and each final's table row carries its own bindings; the executable only selects what must be known before
+// any draw (g_gat_out_of_hell).
 
 namespace
 {
+   bool g_gat_out_of_hell = false; // From the executable name, in DllMain
+
    // User settings, persisted in the [Luma] config section.
    bool g_luma_msaa_enable = true; // HDR-aware MSAA resolve + alpha to coverage on alpha-tested materials
    bool g_smaa_enable = true;
@@ -30,14 +36,29 @@ namespace
    bool g_hide_ui = false; // Session-only, so a restart never comes back without a HUD.
 
    // The Volition "vint" UI draws through these rl_prim_2d / rl_prim_2d_tex pixel shaders (both variants of each); the
-   // Bink video has its own rl_prim_2d_bink shaders and stays visible.
-   const std::unordered_set<uint32_t> ui_pixel_shaders = {0xDF5FED78, 0x1606534E, 0xD62DC04B, 0x7F4E5237};
+   // Bink video has its own rl_prim_2d_bink shaders and stays visible. rl_prim_2d is shared, rl_prim_2d_tex differs (SR3, GooH).
+   const std::unordered_set<uint32_t> ui_pixel_shaders = {0xDF5FED78, 0x1606534E, 0xD62DC04B, 0x7F4E5237, 0x901E0D91, 0x079F6BD4};
 
-   // The rl_hdr final composites (_13, _08, _09), which write the swapchain: SMAA runs right after them.
-   constexpr uint32_t tonemap_lut_pixel_shader = 0xDD93F990;     // _13 composite_final
-   constexpr uint32_t tonemap_no_lut_pixel_shader = 0x8829E2EA;  // _09 composite_final_no_lut
-   constexpr uint32_t tonemap_no_post_pixel_shader = 0x7B539B2E; // _08 composite_no_tonemapping (PostProcess 0), no bloom input
-   const std::unordered_set<uint32_t> tonemap_pixel_shaders = {tonemap_lut_pixel_shader, tonemap_no_post_pixel_shader, tonemap_no_lut_pixel_shader};
+   // The rl_hdr final composites (exe technique names in brackets), which write the swapchain: SMAA runs right after them.
+   // bloom_slot: the native bloom input Luma bloom is bound over (0 = none, PostProcess 0). depth_slot: the single-sample R24
+   // scene depth for SMAA predication, which SR3 leaves bound through its finals and Gat out of Hell's read for their DoF.
+   struct TonemapPixelShader
+   {
+      uint32_t hash;
+      const char* name;
+      UINT bloom_slot;
+      UINT depth_slot;
+   };
+   constexpr TonemapPixelShader tonemap_pixel_shaders[] = {
+      {0xDD93F990, "SR3 rl_hdr_13 [composite_final] (LUT)", 5, 14},
+      {0x8829E2EA, "SR3 rl_hdr_09 [composite_final_no_lut]", 5, 14},
+      {0x7B539B2E, "SR3 rl_hdr_08 [composite_no_tonemapping] (PostProcess 0)", 0, 14},
+      {0xED6DDA24, "GooH rl_hdr_09 [final] (PostProcess 1/2)", 6, 5},
+      {0xD742C62C, "GooH rl_hdr_10 [final_no_lut]", 6, 5},
+      {0x966367E4, "GooH rl_hdr_08 [final_diffracted]", 6, 5},
+      {0x9F1F6557, "GooH rl_hdr_06 [final_no_lut_diffracted]", 6, 5},
+      {0xC235DDDD, "GooH rl_hdr_05 [no_tonemapping] (PostProcess 0)", 0, 5},
+   };
 
    // Luma bloom pyramid (MELE's widths). No energy constant: the native combine sums three levels and the finals divide
    // bloom by 3, so vanilla shows their mean, and the pyramid's mips are energy-preserving means too.
@@ -46,8 +67,9 @@ namespace
 
    // The native bloom passes whose constants the Luma prefilter replays (Luma_Bloom_impl.hlsl), after the source
    // downsample below.
-   constexpr uint32_t bloom_brightpass_pixel_shader = 0x87F73DF4; // rl_hdr_12: vc0 c26 Bloom_curve_values, vc4 c1 Tint_color
-   constexpr uint32_t bloom_combine_pixel_shader = 0x52563AB4;    // rl_hdr_11: vc4 c1 Tint_color
+   // The brightpasses: SR3 rl_hdr_12 (vc0 c26 Bloom_curve_values) and GooH rl_hdr_prep_08 (vc0 c22), both vc4 c1 Tint_color.
+   constexpr uint32_t bloom_brightpass_pixel_shaders[] = {0x87F73DF4, 0x12F9FD30};
+   constexpr uint32_t bloom_combine_pixel_shader = 0x52563AB4; // SR3 rl_hdr_11, GooH rl_hdr_prep_07: vc4 c1 Tint_color
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
@@ -93,9 +115,11 @@ namespace
    constexpr uint32_t downsample_pixel_shader = 0x27064754;
    constexpr uint32_t blur_pixel_shader = 0x378BA268; // rl_gaussian_blur_01, the bloom levels' separable blur
 
-   // XeGTAO over rl_ssao_singleframe_calculate (SSAO_Level 2/3, Ambient Occlusion Medium/High). Its 4 draws (one AO channel each, into a
-   // half-res r16g16b16a16_float target) become one run of the 4 compute passes at the target's size, copied into the
-   // target (created without UAV bind); the native blur and apply stay. Level 1 (multiframe) stays native.
+   // XeGTAO over rl_ssao_singleframe_calculate (SSAO_Level 2/3, Ambient Occlusion Medium/High), the same shader in both
+   // games. Its 4 draws (one AO channel each, into a half-res target: r16g16b16a16_float in SR3, r8g8b8a8_unorm in the
+   // Saints Row IV engine until Luma's format upgrade reaches it) become one run of the 4 compute passes at the target's
+   // size, copied into the target (created without UAV bind); the native blur and apply stay. Level 1 (multiframe) stays
+   // native.
    constexpr uint32_t ssao_singleframe_calculate_pixel_shader = 0x624BF56D;
    constexpr UINT gtao_knobs_cb_slot = 9; // "register(b9)" in Luma_SR3_XeGTAO.hlsl; b11 is core DrawBloom's
    float g_gtao_final_value_power = 2.2f; // DEV/TEST calibration knobs, not persisted
@@ -105,57 +129,80 @@ namespace
 #endif
 
    // The material-pass pixel shaders that alpha test (discard on "Alpha_Threshold", one render target: the MSAA scene) and end
-   // in "mul o0.xyzw, rX.xyzw, cb4[1].xyzw", from a census of every shader in the game's packfile: grass, tree cards,
-   // billboards, windows, decals, cloth. Stipple-only discards (inferred-lighting translucency), the G-buffer pass and the
-   // 6 alpha tests that output black are left out.
+   // in "mul o0.xyzw, rX.xyzw, cb4[1].xyzw", from a census of every shader in each game's packfile: grass, tree cards,
+   // billboards, windows, decals, cloth (and Gat's wings). Stipple-only discards (inferred-lighting translucency), the
+   // G-buffer pass and the alpha tests that output black are left out. SR3 has 87, Gat out of Hell 96, 53 of them shared;
+   // all keep Alpha_Threshold at cb4[8].x.
    const std::unordered_set<uint32_t> alpha_test_material_pixel_shaders = {
       0x010DDE81,
       0x0699750F,
       0x071F8026,
       0x082A8803,
+      0x09BDCB94,
       0x0A6A298B,
       0x0B0E36DF,
       0x0DAC0BB0,
       0x0EE9D694,
       0x0F84B0E3,
       0x10559F48,
+      0x17C86D7C,
+      0x187B6D2D,
       0x1BA845B8,
       0x1D3989CD,
       0x1E9AF93B,
       0x1FC6A4F0,
+      0x2329F8C9,
       0x28E33A73,
       0x34512637,
       0x348A19F8,
       0x34DD8FFA,
       0x36361FCD,
       0x3926C52C,
+      0x3927F339,
+      0x3D396FFC,
       0x436AA234,
       0x43CFBFEB,
       0x45B82576,
+      0x460DF859,
       0x488AB704,
       0x4F9F1C2B,
       0x50F49B4B,
+      0x50FFA155,
       0x54C8D58A,
       0x55681AE7,
       0x57BE3F86,
       0x5EAE4FD3,
       0x5F2800D7,
       0x61DF4BD4,
+      0x64F26798,
       0x65B338A4,
+      0x672D46C7,
       0x69ED87C0,
+      0x6B2E5D5B,
       0x6F3A0FE7,
+      0x70C2F157,
       0x71FC661A,
       0x72517A56,
       0x74270DA5,
       0x742F80EA,
+      0x76E1E768,
       0x77724E60,
       0x780F8B04,
+      0x79E37859,
+      0x809B0300,
+      0x80D33059,
+      0x833CD6A5,
       0x84287F32,
+      0x84FAC0DF,
       0x85EC8716,
       0x8A0C53E5,
       0x8A3FC234,
+      0x8DC4AF69,
       0x918A9AC1,
+      0x91CAD2FE,
+      0x923D49AD,
       0x92BC1987,
+      0x940E7C28,
       0x9701DA6B,
       0x98A636E4,
       0x9A0A0553,
@@ -163,39 +210,60 @@ namespace
       0x9DB4E43A,
       0xA020BA98,
       0xA0480456,
+      0xA41B183F,
       0xA5094A75,
       0xA54A6B81,
       0xA6A30C1E,
+      0xA843D80F,
       0xA8A4A7B3,
+      0xA902D17F,
       0xA9514F36,
+      0xAA272E4B,
+      0xAD5FCF8A,
+      0xAD7FF76B,
       0xAF992C34,
+      0xAFB33818,
+      0xB6D050A7,
       0xB8C52156,
       0xB9838FF5,
       0xBBDA187A,
+      0xC0D0F0D3,
       0xC69A47EA,
       0xC791FDC5,
       0xC9C139B8,
       0xCA348258,
       0xCDEACE0D,
+      0xCE4B50AE,
       0xD04D05A1,
       0xD1C75010,
       0xD2F109D8,
       0xD3611545,
+      0xD415EE68,
+      0xD79D6A07,
       0xD7CFEE76,
       0xD8650F52,
+      0xDB03C7EE,
       0xDE2A1AE0,
       0xDFD02DBF,
       0xE07333BF,
+      0xE22569C5,
       0xE27142E3,
+      0xE600CCBE,
       0xE60D4E15,
+      0xE833B238,
       0xE84D2FA2,
+      0xE84FE71D,
       0xEA0D8390,
+      0xED3EC9C6,
       0xF0966B85,
       0xF2EFDC51,
       0xF355F7F4,
       0xF4759E94,
+      0xF677A415,
       0xF8041F13,
+      0xF808D65F,
       0xF88CA20F,
+      0xFC5E882F,
    };
 #if DEVELOPMENT
    bool g_smaa_predication = true;
@@ -258,18 +326,20 @@ struct SaintsRowTheThirdGameDeviceData final : public GameDeviceData
    bool bloom_source_downsampled = false;
 
    // XeGTAO scratch.
-   bool gtao_ran_this_frame = false;                 // the first calculate draw wrote all four channels, skip the other three
+   bool gtao_tried_this_frame = false;               // the frame's first calculate draw has run
+   bool gtao_ran_this_frame = false;                 // ... and XeGTAO wrote all four channels, skip the other three
    com_ptr<ID3D11Texture2D> gtao_depth_mips_texture; // R32F view-space depth pyramid, 5 mips
    com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5];
    com_ptr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
    com_ptr<ID3D11UnorderedAccessView> gtao_working_uavs[2]; // R8G8_UNORM AO + edges ping-pong
    com_ptr<ID3D11ShaderResourceView> gtao_working_srvs[2];
-   com_ptr<ID3D11Texture2D> gtao_final_texture; // copy source for the game's target
+   com_ptr<ID3D11Texture2D> gtao_final_texture; // copy source for the game's target, in the target's format
    com_ptr<ID3D11UnorderedAccessView> gtao_final_uav;
-   // The size the set was built for, kept even when the allocation failed: a null set then means "failed", and a 32-bit
-   // process does not retry (and fragment its address space) every frame.
+   // The size and format the set was built for, kept even when the allocation failed: a null set then means "failed", and
+   // a 32-bit process does not retry (and fragment its address space) every frame.
    uint32_t gtao_width = 0;
    uint32_t gtao_height = 0;
+   DXGI_FORMAT gtao_format = DXGI_FORMAT_UNKNOWN;
    com_ptr<ID3D11Buffer> gtao_knobs_cb; // immutable, recreated when a knob changes
    float gtao_knobs[8] = {};
 
@@ -288,6 +358,7 @@ struct SaintsRowTheThirdGameDeviceData final : public GameDeviceData
       gtao_knobs_cb.reset();
       gtao_width = 0;
       gtao_height = 0;
+      gtao_format = DXGI_FORMAT_UNKNOWN;
    }
 
 #if DEVELOPMENT
@@ -303,7 +374,7 @@ struct SaintsRowTheThirdGameDeviceData final : public GameDeviceData
    };
    BloomConstantReadout bloom_readouts[6] = {
       {"Source downsample Tint_color (vc4 c1)", &SaintsRowTheThirdGameDeviceData::bloom_source_downsample_vc4_cb, 1},
-      {"Brightpass Bloom_curve_values (vc0 c26)", &SaintsRowTheThirdGameDeviceData::bloom_brightpass_vc0_cb, 26},
+      {"Brightpass Bloom_curve_values (vc0 c26 / GooH c22)", &SaintsRowTheThirdGameDeviceData::bloom_brightpass_vc0_cb, g_gat_out_of_hell ? 22u : 26u},
       {"Brightpass Tint_color (vc4 c1)", &SaintsRowTheThirdGameDeviceData::bloom_brightpass_vc4_cb, 1},
       {"Blur Tint_color (vc4 c1)", &SaintsRowTheThirdGameDeviceData::bloom_blur_vc4_cb, 1},
       {"Downsample Tint_color (vc4 c1)", &SaintsRowTheThirdGameDeviceData::bloom_downsample_vc4_cb, 1},
@@ -433,7 +504,7 @@ public:
 
    // Draws the final composite, then SMAA on the canvas it wrote (the swapchain), before DoF, distortion and the UI read it.
    // Anything missing (shaders still compiling, an unexpected target) leaves the composite alone and skips SMAA.
-   DrawOrDispatchOverrideType DrawTonemapWithSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool& updated_cbuffers, const std::function<void()>& original_draw_dispatch_func)
+   DrawOrDispatchOverrideType DrawTonemapWithSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool& updated_cbuffers, const std::function<void()>& original_draw_dispatch_func, UINT depth_slot)
    {
       com_ptr<ID3D11RenderTargetView> canvas_rtv;
       native_device_context->OMGetRenderTargets(1, &canvas_rtv, nullptr);
@@ -495,26 +566,23 @@ public:
          }
       }
 
-      // Predication depth: the single-sample R24 scene depth the game leaves bound at t14 through the final composite.
-      // Anything else (another format or size, or nothing bound) falls back to plain ULTRA.
+      // Predication depth: the final's scene depth at "depth_slot". Anything else (another format or size, or nothing bound)
+      // falls back to plain ULTRA.
       com_ptr<ID3D11ShaderResourceView> depth_srv;
       bool predication_available = game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "SR3 SMAA Predication CS"_h);
 #if DEVELOPMENT
       predication_available = predication_available && g_smaa_predication;
 #endif
       if (predication_available)
-         native_device_context->PSGetShaderResources(14, 1, &depth_srv);
+         native_device_context->PSGetShaderResources(depth_slot, 1, &depth_srv);
       if (depth_srv)
       {
          D3D11_SHADER_RESOURCE_VIEW_DESC depth_srv_desc;
          depth_srv->GetDesc(&depth_srv_desc);
-         com_ptr<ID3D11Resource> depth_resource;
-         depth_srv->GetResource(&depth_resource);
-         com_ptr<ID3D11Texture2D> depth_texture;
-         D3D11_TEXTURE2D_DESC depth_desc = {};
-         if (SUCCEEDED(depth_resource->QueryInterface(&depth_texture)))
-            depth_texture->GetDesc(&depth_desc);
-         if (depth_srv_desc.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS || depth_srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || depth_desc.Width != canvas_desc.Width || depth_desc.Height != canvas_desc.Height)
+         uint4 depth_size;
+         DXGI_FORMAT unused_format;
+         GetResourceInfo(depth_srv.get(), depth_size, unused_format);
+         if (depth_srv_desc.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS || depth_srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || depth_size.x != canvas_desc.Width || depth_size.y != canvas_desc.Height)
             depth_srv.reset();
       }
 
@@ -594,14 +662,17 @@ public:
          return false;
       com_ptr<ID3D11Resource> target;
       target_rtv->GetResource(&target);
+      D3D11_RENDER_TARGET_VIEW_DESC target_rtv_desc;
+      target_rtv->GetDesc(&target_rtv_desc);
       uint4 target_size, depth_size, normals_size;
-      DXGI_FORMAT target_format, depth_format, normals_format;
-      GetResourceInfo(target.get(), target_size, target_format);
-      GetResourceInfo(depth_srv.get(), depth_size, depth_format);
-      GetResourceInfo(normals_srv.get(), normals_size, normals_format);
+      DXGI_FORMAT unused_format;
+      GetResourceInfo(target.get(), target_size, unused_format);
+      GetResourceInfo(depth_srv.get(), depth_size, unused_format);
+      GetResourceInfo(normals_srv.get(), normals_size, unused_format);
       const uint32_t width = target_size.x;
       const uint32_t height = target_size.y;
-      if (width == 0 || height == 0 || reshade::api::format_to_default_typed(reshade::api::format(target_format)) != reshade::api::format::r16g16b16a16_float)
+      // The final denoiser stores through a typed UAV in the target's own view format, so the copy stays within its format group.
+      if (width == 0 || height == 0 || (target_rtv_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM && target_rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT))
          return false;
       auto& game_device_data = GetGameDeviceData(device_data);
       // Full-res depth and normals per target pixel (2 at every level; rounded, as a half-res target of an odd size rounds).
@@ -609,7 +680,7 @@ public:
       if (input_scale == 0 || (depth_size.y + height / 2) / height != input_scale || normals_size.x != depth_size.x || normals_size.y != depth_size.y)
          return false;
 
-      if (game_device_data.gtao_width != width || game_device_data.gtao_height != height)
+      if (game_device_data.gtao_width != width || game_device_data.gtao_height != height || game_device_data.gtao_format != target_rtv_desc.Format)
       {
          game_device_data.ReleaseGTAOScratch();
          D3D11_TEXTURE2D_DESC desc = {};
@@ -636,12 +707,13 @@ public:
             com_ptr<ID3D11Texture2D> working_texture;
             ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &working_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(working_texture.get(), nullptr, &game_device_data.gtao_working_uavs[i])) && SUCCEEDED(native_device->CreateShaderResourceView(working_texture.get(), nullptr, &game_device_data.gtao_working_srvs[i]));
          }
-         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+         desc.Format = target_rtv_desc.Format;
          ok = ok && SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.gtao_final_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(game_device_data.gtao_final_texture.get(), nullptr, &game_device_data.gtao_final_uav));
          if (!ok)
             game_device_data.ReleaseGTAOScratch();
          game_device_data.gtao_width = width;
          game_device_data.gtao_height = height;
+         game_device_data.gtao_format = target_rtv_desc.Format;
       }
       if (!game_device_data.gtao_final_uav)
          return false;
@@ -710,7 +782,7 @@ public:
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
       // The native bloom constants only feed Luma bloom (and the DEV readout).
       const bool copy_bloom_constants = g_luma_bloom_enable || DEVELOPMENT;
-      if (copy_bloom_constants && pixel_shader_hash == bloom_brightpass_pixel_shader)
+      if (copy_bloom_constants && std::ranges::contains(bloom_brightpass_pixel_shaders, pixel_shader_hash))
       {
          CopyBoundPSConstantBuffer(native_device, native_device_context, 0, game_device_data.bloom_brightpass_vc0_cb);
          CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.bloom_brightpass_vc4_cb);
@@ -751,12 +823,13 @@ public:
 #endif
       if (g_gtao_enable && pixel_shader_hash == ssao_singleframe_calculate_pixel_shader)
       {
-         if (game_device_data.gtao_ran_this_frame)
-            return DrawOrDispatchOverrideType::Skip;
+         // Decided on the frame's first draw, so the four AO channels never mix XeGTAO and native.
+         if (std::exchange(game_device_data.gtao_tried_this_frame, true))
+            return game_device_data.gtao_ran_this_frame ? DrawOrDispatchOverrideType::Skip : DrawOrDispatchOverrideType::None;
          game_device_data.gtao_ran_this_frame = RunXeGTAO(native_device, native_device_context, device_data);
          return game_device_data.gtao_ran_this_frame ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
       }
-      if (tonemap_pixel_shaders.contains(pixel_shader_hash))
+      if (const auto tonemap = std::ranges::find(tonemap_pixel_shaders, pixel_shader_hash, &TonemapPixelShader::hash); tonemap != std::end(tonemap_pixel_shaders))
       {
 #if DEVELOPMENT
          g_final_perm = pixel_shader_hash;
@@ -765,11 +838,11 @@ public:
          if (g_luma_msaa_enable) // only the weighted resolve reads it
             CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.composite_tint_cb);
 
-         // Luma bloom from the final's own scene input (t0), bound over the game's Bloom_stage_0 (t5). The native chain
+         // Luma bloom from the final's own scene input (t0), bound over the game's Bloom_stage_0 (SR3) / Final_bloom (GooH). The native chain
          // still runs and is simply not read. The prefilter replays the native brightpass and combine on their own
          // constants (copies bound at b0/b4/b5/b6; DrawBloom itself binds only b11). The state stack gives the final back
          // its cbuffers, RT and SRVs.
-         if (g_luma_bloom_enable && pixel_shader_hash != tonemap_no_post_pixel_shader && game_device_data.bloom_source_downsample_vc4_cb && game_device_data.bloom_brightpass_vc0_cb && game_device_data.bloom_brightpass_vc4_cb && game_device_data.bloom_combine_vc4_cb)
+         if (g_luma_bloom_enable && tonemap->bloom_slot != 0 && game_device_data.bloom_source_downsample_vc4_cb && game_device_data.bloom_brightpass_vc0_cb && game_device_data.bloom_brightpass_vc4_cb && game_device_data.bloom_combine_vc4_cb)
          {
             com_ptr<ID3D11ShaderResourceView> scene_srv;
             native_device_context->PSGetShaderResources(0, 1, &scene_srv);
@@ -790,13 +863,13 @@ public:
                if (bloom_srv)
                {
                   ID3D11ShaderResourceView* const bloom = bloom_srv.get();
-                  native_device_context->PSSetShaderResources(5, 1, &bloom);
+                  native_device_context->PSSetShaderResources(tonemap->bloom_slot, 1, &bloom);
                }
             }
          }
 
          if (g_smaa_enable && original_draw_dispatch_func != nullptr)
-            return DrawTonemapWithSMAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers, *original_draw_dispatch_func);
+            return DrawTonemapWithSMAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers, *original_draw_dispatch_func, tonemap->depth_slot);
          return DrawOrDispatchOverrideType::None;
       }
       // Hide the UI: drop its draws, but only those onto the swapchain, so any off-screen use of the same shaders survives.
@@ -966,6 +1039,9 @@ public:
       default_luma_global_game_settings.HighlightDechroma = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
+      // Gat out of Hell's brightpass keeps Bloom_curve_values at c22 and caps its input (Luma_Bloom_impl.hlsl).
+      if (g_gat_out_of_hell)
+         native_shaders_definitions.at("Bloom Prefilter PS"_h).defines_data.push_back({"GAT_OUT_OF_HELL", "1"});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR3 MSAA Resolve PS"), ShaderDefinition{"Luma_SR3_MSAAResolve", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR3 SMAA Linearize CS"), ShaderDefinition{"Luma_SR3_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR3 SMAA Predication CS"), ShaderDefinition{"Luma_SR3_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
@@ -1103,6 +1179,7 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.bloom_source_downsampled = false;
+      game_device_data.gtao_tried_this_frame = false;
       game_device_data.gtao_ran_this_frame = false;
       // Turning XeGTAO off gives its scratch back to the 32-bit address space; it is rebuilt on demand.
       if (!g_gtao_enable && game_device_data.gtao_width != 0)
@@ -1154,7 +1231,7 @@ public:
          const auto& c = g_ssao_vc0;
          const bool multiframe = g_ssao_perm == ssao_multiframe_calculate_pixel_shader;
          int length = std::snprintf(g_ssao_readout, sizeof(g_ssao_readout),
-            "SR3 SSAO vc0 (%s 0x%08X): fade %g, radius_reference %g, projection_scales %g %g, temporal_falloff %g %g, hFOV %.3f vFOV %.3f deg, view z at depth 0 / 1: %g / %g\n"
+            "SSAO vc0 (%s 0x%08X): fade %g, radius_reference %g, projection_scales %g %g, temporal_falloff %g %g, hFOV %.3f vFOV %.3f deg, view z at depth 0 / 1: %g / %g\n"
             "  inv_proj c1 %g %g %g %g | c2 %g %g %g %g | c3 %g %g %g %g | c4 %g %g %g %g",
             multiframe ? "multiframe" : "singleframe", g_ssao_perm, c[0][0], multiframe ? c[14][0] : c[18][0], c[5][0], c[5][1], multiframe ? c[19][0] : 0.f, multiframe ? c[19][1] : 0.f,
             2.f * std::atan(c[1][0]) * 57.29578f, 2.f * std::atan(c[2][1]) * 57.29578f, c[4][2] / c[4][3], (c[3][2] + c[4][2]) / (c[3][3] + c[4][3]),
@@ -1208,8 +1285,7 @@ public:
          ImGui::Text("no rl_hdr final seen yet");
       else
       {
-         const char* const perm_name = g_final_perm == tonemap_lut_pixel_shader ? "rl_hdr_13 composite_final (LUT)" : (g_final_perm == tonemap_no_lut_pixel_shader ? "rl_hdr_09 composite_final_no_lut" : "rl_hdr_08 composite_no_tonemapping (PostProcess 0)");
-         ImGui::Text("perm 0x%08X %s  (draws last frame: %u)", g_final_perm, perm_name, g_finals_last_frame);
+         ImGui::Text("perm 0x%08X %s  (draws last frame: %u)", g_final_perm, std::ranges::find(tonemap_pixel_shaders, g_final_perm, &TonemapPixelShader::hash)->name, g_finals_last_frame);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("The rl_hdr final the game drew last; its HDR path is in the matching Tonemap*_0x<hash> shader. Two draws in a frame mean two finals (e.g. a menu over the scene).");
       }
@@ -1228,7 +1304,7 @@ public:
    {
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
-         "Luma for \"Saints Row: The Third\" is developed by DristoforColumb and is open source and free.\n"
+         "Luma for \"Saints Row: The Third\" and \"Saints Row: Gat out of Hell\" is developed by DristoforColumb and is open source and free.\n"
          "It adds HDR, HDR bloom and SMAA anti-aliasing, and replaces the game's SSAO with XeGTAO.\n"
          "Set Ambient Occlusion to Medium or High in the game's display settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
@@ -1279,8 +1355,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 {
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
-      Globals::SetGlobals(PROJECT_NAME, "Saints Row: The Third Luma mod", "", 1);
+      Globals::SetGlobals(PROJECT_NAME, "Saints Row: The Third and Gat out of Hell Luma mod", "", 1);
       Globals::DEVELOPMENT_STATE = Globals::ModDevelopmentState::Finished;
+
+      g_gat_out_of_hell = System::GetProcessExecutableName() == "SaintsRowGatOutOfHell.exe"; // Anything else is SR3
 
       // The game boots into exclusive fullscreen (display.ini "Fullscreen = true"); Core blocks FSE, this makes the window borderless instead.
       force_borderless = true;
@@ -1288,12 +1366,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-      // The swapchain copy the post passes read (4K r8g8b8a8_unorm) and the distortion blur (quarter res _srgb).
-      texture_upgrade_formats = {
-         reshade::api::format::r8g8b8a8_unorm,
-         reshade::api::format::r8g8b8a8_unorm_srgb,
-      };
-      texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio;
+      // The swapchain copy the post passes read (swapchain-sized r8g8b8a8_unorm) and, in SR3, the distortion blur (quarter
+      // res _srgb; Gat out of Hell's distortion runs inside the final).
+      texture_upgrade_formats = {reshade::api::format::r8g8b8a8_unorm};
+      if (!g_gat_out_of_hell)
+         texture_upgrade_formats.insert(reshade::api::format::r8g8b8a8_unorm_srgb);
+      // "No1Px": the Saints Row IV engine presents at 1x1 for a few frames while booting, which also matches the aspect ratio filter.
+      texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
 
       game = new SaintsRowTheThird();
    }
