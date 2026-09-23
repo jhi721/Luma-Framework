@@ -86,14 +86,13 @@ float4 SR_Output(float3 vanillaLinear, float recoveryGain, float2 uv, float alph
 
 // HDR brightness recovery: how much brighter the clamped vanilla output gets, one scalar for all channels.
 // Onset in u, the curve's own input. F'(p) = 1.5(1 - p^2), and the tangent's intercept F(p) - p F'(p) = p^3 is positive
-// while F'' = -3u < 0, so every pivot in (0, 1) extends above the curve and the gain is >= 1. 0.35 transfers the
-// Mass Effect 2 recovery by its metrics (the onset at 43% of the curve's white gives 0.30, SDR white recovering 1.35x
-// gives 0.36): SDR white recovers 1.36x and a scene value of 10 reaches ~8.9x paper white before DICE. MELE / RenoDX
-// Hejl-Dawson pivot at mid-gray instead (0.12 here, 80% of a daytime frame) because they feed the continuation through
-// an unclamped LUT; this consumer is the Mass Effect 2 one.
+// while F'' = -3u < 0, so every pivot in (0, 1) extends above the curve and the gain is >= 1. With no inflection the
+// pivot only sets brightness, lower is brighter up to the u -> 0 limit (SDR white 1.5x). Scene mid-gray 0.18, u 0.121,
+// as Mass Effect 2 and RenoDX Zelda: Echoes of Wisdom: SDR white recovers 1.48x and a scene value of 10 reaches ~9.9x
+// paper white before DICE (0.35 gave 1.36x and 8.9x).
 float SR_RecoveryGain(float3 u)
 {
-   const float pivot = 0.35;
+   const float pivot = 0.18 / 1.49;
    // The hottest channel is the one the per-channel shoulder compresses first; F is monotone, so max3(F(u)) == F(max3(u)).
    const float sourcePeak = max3(u);
    if (sourcePeak <= pivot)
