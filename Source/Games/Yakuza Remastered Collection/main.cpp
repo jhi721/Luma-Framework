@@ -923,7 +923,9 @@ class GameYakuzaRC final : public Game
       bloom_state.Cache(native_device_context, device_data.uav_max_count);
       ID3D11ShaderResourceView* const prefilter_srv = game_device_data.glow_srvs[0].get();
       native_device_context->PSSetShaderResources(1, 1, &prefilter_srv);
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, g_game_profile.material_tone_curve ? 1u : 0u);
+      ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get();
+      native_device_context->PSSetSamplers(2, 1, &linear_sampler); // Luma_YRC_GlowGain.hlsl: the level-0 blur for its clamp
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, g_game_profile.material_tone_curve ? 1u : 0u, 0, g_game_profile.glow_level0_sigma);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("YRC Glow Gain PS"_h).get(), scene_srv.get(), game_device_data.glow_rtvs[1].get(), glow_prefilter_width, glow_prefilter_height, false);
       com_ptr<ID3D11ShaderResourceView> bloom_srv;
       const float sigmas[kBloomMips] = {g_game_profile.glow_level0_sigma, kBloomLevelSigma, kBloomLevelSigma, kBloomLevelSigma, kBloomLevelSigma};
