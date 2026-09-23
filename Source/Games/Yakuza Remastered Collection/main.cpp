@@ -138,8 +138,8 @@ namespace
    // with u = color * cb2[6].x (exposure). Their highlights never pass 1, so the fp16 scene alone gives Y5R no HDR. The curve
    // is continued past u = pivot along its tangent, E(u) = F(min(u, p)) + exp(-p) * max(u - p, 0) inside the sqrt: vanilla
    // bit for bit below p, rising instead of saturating above. The grade rebuilds the vanilla SDR scene from it
-   // (YRC_Y5VanillaMaterialCurve; both take the constants from Includes/GameCBuffers.hlsl). Pivot 1.2 keeps vanilla up to
-   // 0.84 of white.
+   // (YRC_Y5VanillaMaterialCurve; both take the constants from Includes/GameCBuffers.hlsl). Pivot 0.18 keeps vanilla up to
+   // 0.41 of white.
    constexpr float y5_material_curve_pivot = YRC_Y5_MATERIAL_CURVE_PIVOT;
    constexpr float y5_material_curve_slope = YRC_Y5_MATERIAL_CURVE_SLOPE;
 #if DEVELOPMENT

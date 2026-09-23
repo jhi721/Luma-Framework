@@ -11,9 +11,11 @@
 #define YRC_GLOW_PREFILTER_HEIGHT 512
 
 // The Y5R material tone curve's tangent continuation: main.cpp patches it in (PatchY5MaterialToneCurve), Common.hlsl maps
-// it back (YRC_Y5VanillaMaterialCurve). The slope is exp(-pivot).
-#define YRC_Y5_MATERIAL_CURVE_PIVOT 1.2f
-#define YRC_Y5_MATERIAL_CURVE_SLOPE 0.301194212f
+// it back (YRC_Y5VanillaMaterialCurve). The slope is exp(-pivot). The curve is 1 - exp(-u) in linear light, concave with no
+// inflection, so any pivot is valid and a lower one is brighter: 0.18, the pivot RenoDX Breath of the Wild uses on the same
+// curve (0.165 of white).
+#define YRC_Y5_MATERIAL_CURVE_PIVOT 0.18f
+#define YRC_Y5_MATERIAL_CURVE_SLOPE 0.835270211f
 
 // Mirrors c++ name spaces.
 namespace CB
