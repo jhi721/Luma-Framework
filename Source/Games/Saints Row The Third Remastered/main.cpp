@@ -28,7 +28,7 @@ namespace
 
    // TAA jitter pattern (int, .data, static 1): 0 none, 1 D3D 2x MSAA, 2 4x, 3 8x (switch at 0x14089B886, indexed by the camera's +0x59C counter).
    // The counter starts near -2^24, and the pattern index is taken with a signed modulo ("and reg, 0x8000000N" + sign fixup), so the index is 0 or
-   // negative and only entry 0 of each pattern is ever used, every N frames (every other frame for the vanilla 2x pattern).
+   // negative and only entry 0 of each pattern is ever used, once per pattern length (every other frame for the vanilla 2x pattern).
    constexpr uintptr_t jitter_mode_rva = 0x11ADBB0;
    constexpr int32_t vanilla_jitter_mode = 1;
    constexpr int32_t halton_jitter_mode = 3; // SR, see "InstallHaltonJitterPattern()"
@@ -224,7 +224,7 @@ namespace
    bool g_gtao_enable = true;
    // Calibration knobs, development builds tune them (not persisted)
 #if DEVELOPMENT
-   float g_gtao_final_value_power = 1.4f; // Matched to the vanilla SSAO with EFFECT_RADIUS 0.4 and depth normals (_tools/srttr/gtao_sim.py over 5 scenes)
+   float g_gtao_final_value_power = 1.4f; // Matched to the vanilla SSAO with EFFECT_RADIUS 0.4 and depth normals (offline sim over 5 scenes)
    float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (metres)
    int g_gtao_debug_view = 0;             // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges
 #else

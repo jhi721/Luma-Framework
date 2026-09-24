@@ -18,13 +18,13 @@
 // Tonemap_MELE_HDRBridge.hlsli) as ported to Borderlands 2 (Luma_BL2TPS_Tonemap.hlsl): the native SDR grade is the
 // complete colour reference, a continuation of the native curve passes through a reversible bounded copy of the
 // real LUT to give HDR luminance, only that luminance is projected onto the native graded RGB ratios, and DICE
-// is the only display rolloff. No path takes chroma from the working value.
+// is the only display rolloff. No path takes RGB ratios from the working value.
 //
 // The continuation is the tangent of the LINEAR-LIGHT curve G(x) = F(x)^2.2 over the curve's own input x, the
 // construction of ME2 FilmicRecovery and SR3 `SR_RecoveryGain`. The pivot is the inflection of G, scene 0.40
 // (post-exposure, pre-BiasScale; G 0.25 of white): G is convex below it, so a lower pivot (e.g. mid-gray 0.18) puts
 // the tangent under vanilla, and G is steepest there, so a higher one gives dimmer highlights.
-// Derived for the default_district.xtbl curve (Toe 0.1, Shoulder 0.9, Steep 0.36, BiasScale 3); see NOTES.md.
+// Derived for the default_district.xtbl curve (Toe 0.1, Shoulder 0.9, Steep 0.36, BiasScale 3).
 
 #define SRTTR_HDR_PIVOT                  0.40
 #define SRTTR_HDR_BRIDGE_SHOULDER        0.75

@@ -48,17 +48,17 @@ static float2 ViewportPixelSize; // 1 / AO resolution, set by each entry point t
 //
 
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.4 // Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant). With FinalValuePowerRT 1.4 and depth normals it matches the vanilla SSAO on 5 scenes (offline sim of this shader, _tools/srttr/gtao_sim.py): darkening 0.99-1.10x, contacts 0.71-0.80x, coverage +1-7 pp. RadiusOverrideRT > 0 wins.
+#define EFFECT_RADIUS 0.4 // Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant). With FinalValuePowerRT 1.4 and depth normals it matches the vanilla SSAO on 5 scenes (offline sim of this shader): darkening 0.99-1.10x, contacts 0.71-0.80x, coverage +1-7 pp. RadiusOverrideRT > 0 wins.
+#endif
+
+#ifndef XE_GTAO_GENERATE_NORMALS
+#define XE_GTAO_GENERATE_NORMALS 1 // Mirrors the Luma define's default
 #endif
 
 // The vanilla SSAO (MiniEngine) has a screen-space radius (10 px at 1920 wide per hierarchy level), so its world radius grows with
 // distance. A constant world radius matched it only at mid range: on the SSAO texture dumps of two scenes it was 1.9-3.2x darker at
 // 3-6 m and 0.8-1.3x at 12-25 m. So the radius scales with view depth, pivoting at the scenes' median depth, within limits (Prey's
 // heuristic only grows it with distance; here it also shrinks near the camera, as the vanilla one does).
-#ifndef XE_GTAO_GENERATE_NORMALS
-#define XE_GTAO_GENERATE_NORMALS 1 // Mirrors the Luma define's default
-#endif
-
 #ifndef RADIUS_REFERENCE_DEPTH
 #define RADIUS_REFERENCE_DEPTH 8.0 // Metres
 #endif
@@ -484,7 +484,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
             shc0 = lerp(lowHorizonCos0, shc0, weight0); // this would be more correct but too expensive: cos(lerp( acos(lowHorizonCos0), acos(shc0), weight0 ));
             shc1 = lerp(lowHorizonCos1, shc1, weight1); // this would be more correct but too expensive: cos(lerp( acos(lowHorizonCos1), acos(shc1), weight1 ));
 
-            // thickness heuristic disabled (THIN_OCCLUDER_COMPENSATION == 0)
+            // this is a version where Intel's optional thickness heuristic is completely disabled
             horizonCos0 = max(horizonCos0, shc0);
             horizonCos1 = max(horizonCos1, shc1);
          }
