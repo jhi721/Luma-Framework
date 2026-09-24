@@ -3,6 +3,7 @@
 // (reached through DICE.hlsl) declares the LumaSettings cbuffer.
 #include "Includes/Common.hlsl"
 #include "../Includes/DICE.hlsl"
+#include "../Includes/Reinhard.hlsl"
 // clang-format on
 
 // Saints Row: The Third Remastered - hdr_filter tonemap CS, shared body. Included by the per-hash wrappers
@@ -81,14 +82,6 @@ bool SRTTR_IsFiniteNonNegative(float3 v)
    return all(v >= 0.0) && all(v <= FLT_MAX);
 }
 
-// Reinhard::ReinhardRange(peak, k) for In_Peak = -1, Out_Peak = 1, peak > k: identity below k, C1, asymptotic to 1.
-float SRTTR_CompressWorkingPeak(float peak)
-{
-   const float k = SRTTR_HDR_BRIDGE_SHOULDER;
-   const float x = peak - k;
-   return k + x / (x / (1.0 - k) + 1.0);
-}
-
 // The native curve F and its slope dF/dln(x) at one natural-log input, analytic per segment. Only ever evaluated
 // at the pivot, which is built from cbuffer constants, so the continuation cannot depend on the pixel (it's computed
 // once per thread group).
@@ -158,7 +151,8 @@ bool SRTTR_TryBuildWorkingLuminance(float3 curveInput, float3 nativeCode, float3
    float q = 1.0;
    if (m > SRTTR_HDR_BRIDGE_SHOULDER)
    {
-      q = SRTTR_CompressWorkingPeak(m) / m;
+      // Identity below the shoulder, C1, asymptotic to 1
+      q = Reinhard::ReinhardRange(m.xxx, SRTTR_HDR_BRIDGE_SHOULDER).x / m;
    }
    const float3 proxyLinear = workLinear * q;
    if (q <= 0.0 || q > 1.0 || !all(proxyLinear <= 1.0 + SRTTR_HDR_PROXY_EPS))
@@ -255,7 +249,8 @@ groupshared float3 gContinuation;
       const float3 sdrLinear = gamma_to_linear(SRTTR_Grade(curveCode), GCT_MIRROR);
       float3 recovered = sdrLinear;
       float workLuminance;
-      if (SRTTR_TryBuildWorkingLuminance(curveInput, curveCode, gContinuation, workLuminance))
+      // At or below the pivot the working value is the native response, whose graded luminance is the reference's own
+      if (any(curveInput > gContinuation.x) && SRTTR_TryBuildWorkingLuminance(curveInput, curveCode, gContinuation, workLuminance))
       {
          recovered = SRTTR_NativeColorAtLuminance(sdrLinear, workLuminance);
       }

@@ -25,11 +25,8 @@ SamplerState PointSampler : register(s1);
 #define SMAASampleLevelZeroOffset(tex, coord, offset) tex.SampleLevel(LinearSampler, coord, 0, offset)
 #define SMAASample(tex, coord)                        tex.Sample(LinearSampler, coord)
 #define SMAASamplePoint(tex, coord)                   tex.Sample(PointSampler, coord)
-#define SMAASampleOffset(tex, coord, offset)          tex.Sample(LinearSampler, coord, offset)
 #define SMAA_FLATTEN                                  [flatten]
 #define SMAA_BRANCH                                   [branch]
-#define SMAATexture2DMS2(tex)                         Texture2DMS<float4, 2> tex
-#define SMAALoad(tex, pos, sample)                    tex.Load(pos, sample)
 #include "../Includes/SMAA.hlsl"
 
 Texture2D tex0 : register(t0);

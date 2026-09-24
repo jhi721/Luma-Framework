@@ -55,12 +55,11 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
    const uint2 noisePos = uint2(float2(NoiseOffset << 3) + pos.xy) & 63u;
    scene += (abs(NoiseTexture.Load(int3(noisePos, 0)).x) * 2.0 - 1.0) * NoiseLevel * LumaSettings.GameSettings.FilmGrainIntensity;
 
-   float3 color = scene;
    if (LumaSettings.GameSettings.HideGameplayUI <= 0.5)
    {
       const float4 gui = GuiImage.SampleLevel(Sampler_Linear_CC, uv, 0);
-      color = gui.a * (gui.rgb - color) + color;
+      scene = gui.a * (gui.rgb - scene) + scene;
    }
-   SRTTR_DitherOutput(color, uv);
-   return float4(color, 1.0);
+   SRTTR_DitherOutput(scene, uv);
+   return float4(scene, 1.0);
 }

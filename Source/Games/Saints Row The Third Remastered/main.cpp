@@ -13,10 +13,15 @@ namespace
    // SRTTR.exe addresses, valid only for the analysed build (PE TimeDateStamp 0x60EE85F4; image base 0x140000000)
    uint8_t* GetGameAddress(uintptr_t rva)
    {
-      auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-      const auto* dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-      const auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos_header->e_lfanew);
-      return nt_headers->FileHeader.TimeDateStamp == 0x60EE85F4 ? base + rva : nullptr;
+      // Null for any other build; the PE header is only read once
+      static uint8_t* const base = []() -> uint8_t*
+      {
+         auto* image = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+         const auto* dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+         const auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos_header->e_lfanew);
+         return nt_headers->FileHeader.TimeDateStamp == 0x60EE85F4 ? image : nullptr;
+      }();
+      return base ? base + rva : nullptr;
    }
 
    // The camera's TAA jitter counter starts near -2^24, and the pattern index is taken with a signed modulo ("and reg, 0x8000000N" + sign fixup),
@@ -254,7 +259,7 @@ namespace
    {
       com_ptr<ID3D11DeviceContext1> native_device_context1;
       if (FAILED(native_device_context->QueryInterface(&native_device_context1)))
-         return false;
+         return 0;
       com_ptr<ID3D11Buffer> cb;
       UINT first = 0, count = 0;
       if (stage == reshade::api::shader_stage::vertex)
@@ -623,12 +628,12 @@ public:
       }
 
       // Predication depth: the ambient pass' R24 scene depth at FXAA's size. Anything else falls back to plain ULTRA.
-      com_ptr<ID3D11ShaderResourceView> depth_srv = game_device_data.smaa_depth_srv;
       bool predication_available = game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, smaa_predication_shader_hash);
 #if DEVELOPMENT
       predication_available = predication_available && g_smaa_predication;
 #endif
-      if (depth_srv && predication_available)
+      com_ptr<ID3D11ShaderResourceView> depth_srv = predication_available ? game_device_data.smaa_depth_srv : nullptr;
+      if (depth_srv)
       {
          D3D11_SHADER_RESOURCE_VIEW_DESC depth_srv_desc;
          depth_srv->GetDesc(&depth_srv_desc);
@@ -636,10 +641,6 @@ public:
          GetResourceInfo(depth_srv.get(), depth_size, format);
          if (depth_srv_desc.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS || depth_srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || depth_size.x != size.x || depth_size.y != size.y)
             depth_srv = nullptr;
-      }
-      else
-      {
-         depth_srv = nullptr;
       }
 
       {
@@ -719,11 +720,13 @@ public:
 #if DEVELOPMENT
          if (dlaa_log_frames_left > 0 && !dlaa_log_gbuffer_done)
             LogGBufferInputs(native_device, native_device_context, original_shader_hashes);
-         if (xegtao_log_frames_left > 0 && original_shader_hashes.Contains(ambient_hash, reshade::api::shader_stage::pixel))
-            LogAmbientInputs(native_device, native_device_context);
 #endif
          if (original_shader_hashes.Contains(ambient_hash, reshade::api::shader_stage::pixel))
          {
+#if DEVELOPMENT
+            if (xegtao_log_frames_left > 0)
+               LogAmbientInputs(native_device, native_device_context);
+#endif
             com_ptr<ID3D11ShaderResourceView> depth_srv;
             native_device_context->PSGetShaderResources(0, 1, &depth_srv);
             GetGameDeviceData(device_data).smaa_depth_srv = depth_srv;
@@ -972,7 +975,8 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");
       DrawResetButton(g_smaa_enable, true, "SMAAEnable");
-      slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, defaults.RCASSharpness, 1.f, "Sharpening applied on top of anti-aliasing, not to the UI (0 = off). Replaces the game's Sharpen setting.");
+      // Not the canon "on top of SMAA": it sharpens the scene after any anti-aliasing (SMAA, TAA, DLAA, FSR 3), and the game's own sharpen is disabled
+      slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, defaults.RCASSharpness, 1.f, "Sharpening applied on top of anti-aliasing (0 = off). Replaces the game's Sharpen setting.");
 
       ImGui::SeparatorText("Grade");
       slider("Exposure", "Exposure", &settings.Exposure, defaults.Exposure, 2.f, "Overall image brightness (1 = vanilla).");
@@ -981,27 +985,20 @@ public:
       slider("Highlights Desaturation", "HighlightsDesaturation", &settings.HighlightsDesaturation, defaults.HighlightsDesaturation, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       slider("Color Grading Intensity", "ColorGradingIntensity", &settings.ColorGradingIntensity, defaults.ColorGradingIntensity, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
-      // Returns whether the toggle is on
-      const auto toggle = [&](const char* label, const char* key, float* value, float default_value, const char* tooltip)
-      {
-         bool enabled = *value > 0.5f;
-         if (ImGui::Checkbox(label, &enabled))
-         {
-            *value = enabled ? 1.f : 0.f;
-            device_data.cb_luma_global_settings_dirty = true;
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", tooltip);
-         if (DrawResetButton(*value, default_value, key))
-            device_data.cb_luma_global_settings_dirty = true;
-         return *value > 0.5f;
-      };
-
       ImGui::SeparatorText("Effects");
       slider("Vignette Intensity", "VignetteIntensity", &settings.VignetteIntensity, defaults.VignetteIntensity, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
       slider("Film Grain Intensity", "FilmGrainIntensity", &settings.FilmGrainIntensity, defaults.FilmGrainIntensity, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
-      toggle("Dithering", "Dithering", &settings.Dithering, defaults.Dithering, "Reduces gradient banding.");
+      bool dithering = settings.Dithering > 0.5f;
+      if (ImGui::Checkbox("Dithering", &dithering))
+      {
+         settings.Dithering = dithering ? 1.f : 0.f;
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, NAME, "Dithering", settings.Dithering);
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Reduces gradient banding.");
+      if (DrawResetButton(settings.Dithering, defaults.Dithering, "Dithering"))
+         device_data.cb_luma_global_settings_dirty = true;
 
       ImGui::SeparatorText("UI");
       // Session only, so a restart never comes back without a HUD
@@ -1067,7 +1064,7 @@ public:
       ImGui::Checkbox("SMAA Predication", &g_smaa_predication);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Finds edges by geometry (plane deviation of the scene depth) as well as by colour, so texture detail stays sharp while silhouettes are antialiased. Not saved.");
-      ImGui::Combo("SMAA Debug View", &g_smaa_debug_view, "Off\0Edges\0Predication\0");
+      ImGui::Combo("SMAA Predication Debug View", &g_smaa_debug_view, "Off\0Edges\0Predication\0");
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the frame with SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red).\nToggle SMAA Predication to compare: texture detail should lose edges, silhouettes keep them.");
 
@@ -1092,7 +1089,52 @@ public:
 
    void PrintImGuiAbout() override
    {
-      ImGui::Text("Saints Row: The Third Remastered Luma mod - about and credits section", "");
+      ImGui::PushTextWrapPos(0.f);
+      ImGui::Text(
+         "Luma for \"Saints Row: The Third Remastered\" is developed by DristoforColumb and is open source and free.\n"
+         "It adds HDR, replaces the game's TAA with DLAA or FSR 3 native anti-aliasing and its FXAA with SMAA, plus 16x anisotropic filtering.\n"
+         "Set Anti-Aliasing in the game's display settings to TAA for DLAA and FSR 3, or to FXAA for SMAA.\n"
+         "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
+         "Thanks to the Luma team and contributors.\n"
+         "If you enjoy it, consider donating.");
+      ImGui::PopTextWrapPos();
+
+      ImGui::NewLine();
+      ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 134, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70 + 9, 134 + 9, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
+      static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
+      if (ImGui::Button(donation_link.c_str()))
+         ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+      ImGui::PopStyleColor(3);
+
+      ImGui::NewLine();
+      static const std::string social_link = std::string("Join our \"HDR Den\" Discord ") + std::string(ICON_FK_SEARCH);
+      if (ImGui::Button(social_link.c_str()))
+      {
+         // Unique link for Luma's HDR Den (tracks the origin of people joining); do not share for other purposes.
+         static const std::string discord_link = std::string("https://discord.gg/J9fM") + std::string("3EVuEZ");
+         ShellExecuteA(nullptr, "open", discord_link.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      }
+      static const std::string contributing_link = std::string("Contribute on Github ") + std::string(ICON_FK_FILE_CODE);
+      if (ImGui::Button(contributing_link.c_str()))
+         ShellExecuteA(nullptr, "open", "https://github.com/Filoppi/Luma-Framework", nullptr, nullptr, SW_SHOWNORMAL);
+
+      ImGui::NewLine();
+      ImGui::Text("Build Date: %s %s", __DATE__, __TIME__);
+
+      ImGui::NewLine();
+      ImGui::Text("Credits:"
+                  "\n\nMain:"
+                  "\nDristoforColumb"
+                  "\n\nThird Party:"
+                  "\nReShade"
+                  "\nImGui"
+                  "\nRenoDX (HDR tonemap method)"
+                  "\nDICE (HDR tonemapper)"
+                  "\nSMAA (Iryoku)"
+                  "\nAMD FidelityFX (RCAS + FSR Native AA)"
+                  "\nNVIDIA NGX (DLSS)");
    }
 };
 

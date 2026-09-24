@@ -7,7 +7,7 @@
 
 namespace CB
 {
-// Mirrored from main.cpp. Exposure, ColorGradingIntensity, VignetteIntensity and FilmGrainIntensity act in SDR and
+// Shared with main.cpp. Exposure, ColorGradingIntensity, VignetteIntensity and FilmGrainIntensity act in SDR and
 // HDR; Contrast, Saturation and HighlightsDesaturation only on the HDR display path; Dithering in both compose passes.
 struct LumaGameSettings
 {
