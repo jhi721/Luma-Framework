@@ -192,9 +192,9 @@ namespace
 
    // hdr_filter compose perms, the last draw of the frame (scene and GUI layer onto the swapchain). Every HDR_DISPLAY one is replaced by the SDR perm's math,
    // so the game's HDR setting does not change the output. The first ones compose the scene, the GUI only ones run in menus (the SDR GUI only one,
-   // 0xA283B6FB, is redirected too, to add the menu video layer).
+   // 0xA283B6FB, stays vanilla).
    constexpr uint32_t compose_hashes[] = {0xFCCD77CD, 0xADB2056B, 0xEB9D7036, 0x50DC2D70, 0x7083C926, 0xCE7FF710, 0xA11A22A3, 0x681958CA, 0x3D126636};
-   constexpr uint32_t compose_gui_hashes[] = {0x79D0B6FF, 0x8DFF00F4, 0x3EA6C5A9, 0x1AD38FF6, 0xDEEDDD60, 0x281056F7, 0x818B5759, 0xC165ACD1, 0xA283B6FB};
+   constexpr uint32_t compose_gui_hashes[] = {0x79D0B6FF, 0x8DFF00F4, 0x3EA6C5A9, 0x1AD38FF6, 0xDEEDDD60, 0x281056F7, 0x818B5759, 0xC165ACD1};
 
    // hdr_filter tonemap CS perms (LUT and no LUT, with and without luminance output), run in every frame with a scene
    constexpr uint32_t tonemap_hashes[] = {0x941A9154, 0x835784B0, 0xAB466B4A, 0xFEDD50B7};
@@ -208,10 +208,8 @@ namespace
    // SMAA's predication
    constexpr uint32_t ambient_hash = 0xFD45DCA7;
    // rl_prim_2d_bink_s_01, the Bink video: fullscreen movies draw it straight into the swapchain (the frame's only draw), where its
-   // replacement adds AutoHDR. Menu backgrounds draw it into the RGBA8 GUI layer before the UI; with AutoHDR on, those draws go
-   // to a Luma FP16 video layer instead, which the GUI-only compose puts under the GUI layer (t8).
+   // replacement adds AutoHDR. Menu backgrounds draw it into the RGBA8 GUI layer, which can't hold it, so they stay vanilla.
    constexpr uint32_t video_hash = 0xE85564EB;
-   constexpr UINT video_layer_compose_slot = 8;
    constexpr uint32_t smaa_linearize_shader_hash = CompileTimeStringHash("SRTTR SMAA Linearize CS");
    constexpr uint32_t smaa_predication_shader_hash = CompileTimeStringHash("SRTTR SMAA Predication CS");
    bool g_smaa_enable = true;
@@ -249,6 +247,23 @@ namespace
          return it != shaders.end() && it->second;
       };
       return (has(names) && ...);
+   }
+
+   // A 2D texture with a UAV and, if asked, an SRV (and the texture itself). The outputs are only written when everything was created.
+   // com_ptr overloads "&" (it yields the raw out pointer), so callers pass the members with std::addressof.
+   bool CreateTextureWithViews(ID3D11Device* native_device, const D3D11_TEXTURE2D_DESC& desc, com_ptr<ID3D11UnorderedAccessView>* uav, com_ptr<ID3D11ShaderResourceView>* srv = nullptr, com_ptr<ID3D11Texture2D>* texture = nullptr)
+   {
+      com_ptr<ID3D11Texture2D> new_texture;
+      com_ptr<ID3D11UnorderedAccessView> new_uav;
+      com_ptr<ID3D11ShaderResourceView> new_srv;
+      if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &new_texture)) || FAILED(native_device->CreateUnorderedAccessView(new_texture.get(), nullptr, &new_uav)) || (srv && FAILED(native_device->CreateShaderResourceView(new_texture.get(), nullptr, &new_srv))))
+         return false;
+      *uav = new_uav;
+      if (srv)
+         *srv = new_srv;
+      if (texture)
+         *texture = new_texture;
+      return true;
    }
 
 #if ENABLE_SR
@@ -542,16 +557,6 @@ struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
    bool gtao_succeeded = false;         // on the last try: the vanilla chain is skipped while true
    bool temporal_aa_this_frame = false; // the game's TAA pass ran (vanilla, DLAA or FSR 3)
 
-   // The menu Bink video layer, cleared by the first video draw of each frame
-   com_ptr<ID3D11Texture2D> video_layer;
-   com_ptr<ID3D11RenderTargetView> video_layer_rtv;
-   com_ptr<ID3D11ShaderResourceView> video_layer_srv;
-   bool video_drawn = false;
-   com_ptr<ID3D11Resource> video_gui_layer; // The GUI layer the video left
-   // The game's UI blend states with "over" alpha (A = a + A * (1 - a)) instead of added alpha, by original state (held, so its
-   // address can't be reused)
-   std::unordered_map<ID3D11BlendState*, std::pair<com_ptr<ID3D11BlendState>, com_ptr<ID3D11BlendState>>> over_alpha_blend_states;
-
 #if ENABLE_SR
    // SR inputs converted from the game's TAA ones
    com_ptr<ID3D11Texture2D> sr_motion_vectors;
@@ -658,21 +663,11 @@ public:
          desc.SampleDesc.Count = 1;
          desc.Usage = D3D11_USAGE_DEFAULT;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-         com_ptr<ID3D11Texture2D> linear_texture;
-         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &linear_texture)) || FAILED(native_device->CreateUnorderedAccessView(linear_texture.get(), nullptr, &game_device_data.smaa_linear_uav)) || FAILED(native_device->CreateShaderResourceView(linear_texture.get(), nullptr, &game_device_data.smaa_linear_srv)))
-         {
-            game_device_data.smaa_linear_uav = nullptr;
-            game_device_data.smaa_linear_srv = nullptr;
+         if (!CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.smaa_linear_uav), std::addressof(game_device_data.smaa_linear_srv)))
             return false;
-         }
          // Without it SMAA simply runs unpredicated
          desc.Format = DXGI_FORMAT_R16_FLOAT;
-         com_ptr<ID3D11Texture2D> predication_texture;
-         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &predication_texture)) || FAILED(native_device->CreateUnorderedAccessView(predication_texture.get(), nullptr, &game_device_data.smaa_predication_uav)) || FAILED(native_device->CreateShaderResourceView(predication_texture.get(), nullptr, &game_device_data.smaa_predication_srv)))
-         {
-            game_device_data.smaa_predication_uav = nullptr;
-            game_device_data.smaa_predication_srv = nullptr;
-         }
+         CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.smaa_predication_uav), std::addressof(game_device_data.smaa_predication_srv));
          game_device_data.smaa_width = size.x;
          game_device_data.smaa_height = size.y;
       }
@@ -812,10 +807,7 @@ public:
          desc.MipLevels = 1;
          desc.Format = DXGI_FORMAT_R8G8_UNORM;
          for (int i = 0; ok && i < 2; i++)
-         {
-            com_ptr<ID3D11Texture2D> working_texture;
-            ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &working_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(working_texture.get(), nullptr, &scratch.working_uavs[i])) && SUCCEEDED(native_device->CreateShaderResourceView(working_texture.get(), nullptr, &scratch.working_srvs[i]));
-         }
+            ok = CreateTextureWithViews(native_device, desc, std::addressof(scratch.working_uavs[i]), std::addressof(scratch.working_srvs[i]));
          if (!ok)
          {
             scratch = {};
@@ -878,193 +870,12 @@ public:
       return true;
    }
 
-   // Draws a menu Bink video into the FP16 video layer (the GUI layer's size, same blend and viewport) instead of the GUI layer, then
-   // gives the game its render target back. Returns false, and the video draws vanilla, when the layer can't be made.
-   bool DrawMenuVideoInVideoLayer(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, ID3D11RenderTargetView* gui_rtv, ID3D11DepthStencilView* dsv, std::function<void()>* original_draw_dispatch_func)
-   {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      com_ptr<ID3D11Resource> gui_layer;
-      gui_rtv->GetResource(&gui_layer);
-      game_device_data.video_gui_layer = gui_layer;
-      if (!game_device_data.video_layer || !AreResourcesEqual(game_device_data.video_layer.get(), gui_layer.get(), false))
-      {
-         game_device_data.video_layer_rtv = nullptr;
-         game_device_data.video_layer_srv = nullptr;
-         game_device_data.video_layer = CloneTexture<ID3D11Texture2D>(native_device, gui_layer.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, false, false);
-         if (!game_device_data.video_layer || FAILED(native_device->CreateRenderTargetView(game_device_data.video_layer.get(), nullptr, &game_device_data.video_layer_rtv)) || FAILED(native_device->CreateShaderResourceView(game_device_data.video_layer.get(), nullptr, &game_device_data.video_layer_srv)))
-         {
-            game_device_data.video_layer = nullptr; // The views are reset before the next creation
-            return false;
-         }
-      }
-      if (!game_device_data.video_drawn)
-      {
-         constexpr float transparent[4] = {};
-         native_device_context->ClearRenderTargetView(game_device_data.video_layer_rtv.get(), transparent);
-         game_device_data.video_drawn = true;
-      }
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 1);
-      ID3D11RenderTargetView* const video_layer_rtv = game_device_data.video_layer_rtv.get();
-      native_device_context->OMSetRenderTargets(1, &video_layer_rtv, dsv);
-      (*original_draw_dispatch_func)();
-      native_device_context->OMSetRenderTargets(1, &gui_rtv, dsv);
-      return true;
-   }
-
-   // The UI drawn into the GUI layer after a menu video moved to the video layer. Its blend adds up alpha (ONE, ONE), which vanilla
-   // saturated over the opaque video; without the video, compose needs the real coverage, 1 - prod(1 - a), to put the video back
-   // under the UI as vanilla blended it. So these draws run with "over" alpha. Returns false, and the draw runs vanilla, otherwise.
-   bool DrawUIWithOverAlpha(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, std::function<void()>* original_draw_dispatch_func)
-   {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      com_ptr<ID3D11RenderTargetView> rtv;
-      native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-      if (!rtv)
-         return false;
-      com_ptr<ID3D11Resource> target;
-      rtv->GetResource(&target);
-      if (target != game_device_data.video_gui_layer)
-         return false;
-      com_ptr<ID3D11BlendState> blend_state;
-      float blend_factor[4];
-      UINT sample_mask;
-      native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
-      if (!blend_state)
-         return false;
-
-      auto& over_alpha = game_device_data.over_alpha_blend_states[blend_state.get()];
-      if (!over_alpha.first)
-      {
-         over_alpha.first = blend_state;
-         D3D11_BLEND_DESC desc;
-         blend_state->GetDesc(&desc);
-         auto& rt = desc.RenderTarget[0];
-         // Only the UI's "over" colour with added alpha; anything else stays vanilla (null)
-         if (rt.BlendEnable && rt.SrcBlendAlpha == D3D11_BLEND_ONE && rt.DestBlendAlpha == D3D11_BLEND_ONE && rt.BlendOpAlpha == D3D11_BLEND_OP_ADD)
-         {
-            rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-            native_device->CreateBlendState(&desc, &over_alpha.second);
-         }
-      }
-      if (!over_alpha.second)
-         return false;
-      native_device_context->OMSetBlendState(over_alpha.second.get(), blend_factor, sample_mask);
-      (*original_draw_dispatch_func)();
-      native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
-      return true;
-   }
-
-   void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
-   {
-      device_data.game = new SaintsRowTheThirdRemasteredGameDeviceData;
-   }
-
-   void OnDestroyDeviceData(DeviceData& device_data) override
-   {
-      // GameDeviceData has no virtual destructor
-      delete static_cast<SaintsRowTheThirdRemasteredGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
-   }
-
-   DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
-   {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      if ((stages & reshade::api::shader_stage::compute) != reshade::api::shader_stage::compute)
-      {
-         const auto is_pixel_shader = [&](uint32_t hash)
-         { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); };
-         // Whether this draw can be run by the game file (around state changes) instead of by Core
-         const bool can_redraw = original_draw_dispatch_func && *original_draw_dispatch_func;
-#if DEVELOPMENT
-         if (dlaa_log_frames_left > 0 && !dlaa_log_gbuffer_done)
-            LogGBufferInputs(native_device, native_device_context, original_shader_hashes);
-#endif
-         if (is_pixel_shader(ambient_hash))
-         {
-            // Once per frame, and only when the game's SSAO is on
-            if (g_gtao_enable && game_device_data.ssao_chain_ran_this_frame && !std::exchange(game_device_data.gtao_tried_this_frame, true))
-               game_device_data.gtao_succeeded = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && RunXeGTAO(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers);
-#if DEVELOPMENT
-            if (xegtao_log_frames_left > 0)
-               LogAmbientInputs(native_device, native_device_context);
-#endif
-            com_ptr<ID3D11ShaderResourceView> depth_srv;
-            native_device_context->PSGetShaderResources(0, 1, &depth_srv);
-            game_device_data.smaa_depth_srv = depth_srv;
-         }
-         else if (is_pixel_shader(video_hash))
-         {
-            com_ptr<ID3D11RenderTargetView> rtv;
-            com_ptr<ID3D11DepthStencilView> dsv;
-            native_device_context->OMGetRenderTargets(1, &rtv, &dsv);
-            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-            if (rtv)
-               rtv->GetDesc(&rtv_desc);
-            // Core only binds the Luma settings itself when the game leaves both cbuffers to it
-            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-            updated_cbuffers = true;
-            // A menu video (GUI layer, no scene this frame) moves to the video layer, where AutoHDR highlights survive. The flag tells
-            // the shader its target keeps values above 1.
-            const bool menu_video_auto_hdr = rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && !device_data.has_drawn_main_post_processing && cb_luma_global_settings.DisplayMode == DisplayModeType::HDR && cb_luma_global_settings.GameSettings.VideoAutoHDREnable > 0.5f && can_redraw;
-            if (!menu_video_auto_hdr || !DrawMenuVideoInVideoLayer(native_device, native_device_context, cmd_list_data, device_data, rtv.get(), dsv.get(), original_draw_dispatch_func))
-            {
-               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0);
-               return DrawOrDispatchOverrideType::None;
-            }
-            return DrawOrDispatchOverrideType::Replaced;
-         }
-         else if (game_device_data.video_drawn && can_redraw && std::any_of(std::begin(compose_gui_hashes), std::end(compose_gui_hashes), is_pixel_shader))
-         {
-            ID3D11ShaderResourceView* const video_layer_srv = game_device_data.video_layer_srv.get();
-            native_device_context->PSSetShaderResources(video_layer_compose_slot, 1, &video_layer_srv);
-            (*original_draw_dispatch_func)();
-            ID3D11ShaderResourceView* const null_srv = nullptr;
-            native_device_context->PSSetShaderResources(video_layer_compose_slot, 1, &null_srv);
-            return DrawOrDispatchOverrideType::Replaced;
-         }
-         else if (game_device_data.video_drawn && can_redraw && DrawUIWithOverAlpha(native_device, native_device_context, device_data, original_draw_dispatch_func))
-         {
-            return DrawOrDispatchOverrideType::Replaced;
-         }
-         else if (g_smaa_enable && is_pixel_shader(fxaa_pixel_shader_hash) && DrawSMAAInPlaceOfFXAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers))
-         {
-            return DrawOrDispatchOverrideType::Replaced;
-         }
-         return DrawOrDispatchOverrideType::None;
-      }
-
-      const auto is_compute_shader = [&](uint32_t hash)
-      { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::compute); };
-#if DEVELOPMENT
-      if (xegtao_log_frames_left > 0)
-      {
-         if (const auto ssao_hash = std::find_if(std::begin(ssao_chain_hashes), std::end(ssao_chain_hashes), is_compute_shader); ssao_hash != std::end(ssao_chain_hashes))
-            LogSSAOPass(native_device, native_device_context, *ssao_hash);
-      }
-#endif
-      // XeGTAO writes the chain's only output at the ambient draw. While it works, the chain is skipped.
-      if (is_compute_shader(ssao_prepare_1_hash))
-         game_device_data.ssao_chain_ran_this_frame = true;
-      if (g_gtao_enable && game_device_data.gtao_succeeded && std::any_of(std::begin(ssao_chain_hashes), std::end(ssao_chain_hashes), is_compute_shader))
-         return DrawOrDispatchOverrideType::Skip;
-      // The tonemap runs in every frame with a scene, whatever the anti-aliasing setting
-      if (std::any_of(std::begin(tonemap_hashes), std::end(tonemap_hashes), is_compute_shader))
-      {
-         device_data.has_drawn_main_post_processing = true;
-         return DrawOrDispatchOverrideType::None;
-      }
-      const auto taa_hash = std::find_if(std::begin(taa_hashes), std::end(taa_hashes), is_compute_shader);
-      if (taa_hash == std::end(taa_hashes))
-         return DrawOrDispatchOverrideType::None;
-
-#if DEVELOPMENT
-      if (dlaa_log_frames_left > 0)
-         LogTAAInputs(native_device, native_device_context, *taa_hash);
-#endif
-
-      game_device_data.temporal_aa_this_frame = true; // OnPresent turns it into device_data.taa_detected
-
 #if ENABLE_SR
+   // DLAA / FSR 3 in place of the game's TAA dispatch, on its inputs (t0 color, t1 depth, t3 motion vectors, u0 output) converted to what SR takes.
+   // Returns None, and the game's TAA runs, when SR is off or an input, the shader or the scratch is missing.
+   DrawOrDispatchOverrideType DrawSRInPlaceOfTAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
       // The jitter comes from the camera built on this thread (the render thread), and SR needs the game's 8x jitter pattern to be active
       const CameraData camera = last_built_camera;
       const int32_t* jitter_mode = GetJitterMode();
@@ -1112,16 +923,11 @@ public:
          desc.Usage = D3D11_USAGE_DEFAULT;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
          desc.Format = DXGI_FORMAT_R32G32_FLOAT;
-         HRESULT hr = native_device->CreateTexture2D(&desc, nullptr, &game_device_data.sr_motion_vectors);
-         if (SUCCEEDED(hr))
-            hr = native_device->CreateUnorderedAccessView(game_device_data.sr_motion_vectors.get(), nullptr, &game_device_data.sr_motion_vectors_uav);
+         bool created = CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_motion_vectors_uav), nullptr, std::addressof(game_device_data.sr_motion_vectors));
          desc.Format = DXGI_FORMAT_R32_FLOAT;
-         if (SUCCEEDED(hr))
-            hr = native_device->CreateTexture2D(&desc, nullptr, &game_device_data.sr_depth);
-         if (SUCCEEDED(hr))
-            hr = native_device->CreateUnorderedAccessView(game_device_data.sr_depth.get(), nullptr, &game_device_data.sr_depth_uav);
-         ASSERT_ONCE(SUCCEEDED(hr));
-         if (FAILED(hr))
+         created = created && CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_depth_uav), nullptr, std::addressof(game_device_data.sr_depth));
+         ASSERT_ONCE(created);
+         if (!created)
          {
             CleanExtraSRResources(device_data);
             return DrawOrDispatchOverrideType::None;
@@ -1182,9 +988,105 @@ public:
       }
       device_data.has_drawn_sr = true;
       return DrawOrDispatchOverrideType::Replaced; // The game's TAA history isn't updated, it's only read again if SR is turned off
+   }
+#endif
+
+   void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
+   {
+      device_data.game = new SaintsRowTheThirdRemasteredGameDeviceData;
+   }
+
+   void OnDestroyDeviceData(DeviceData& device_data) override
+   {
+      // GameDeviceData has no virtual destructor
+      delete static_cast<SaintsRowTheThirdRemasteredGameDeviceData*>(device_data.game);
+      device_data.game = nullptr;
+   }
+
+   DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      if ((stages & reshade::api::shader_stage::compute) != reshade::api::shader_stage::compute)
+      {
+         const auto is_pixel_shader = [&](uint32_t hash)
+         { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); };
+#if DEVELOPMENT
+         if (dlaa_log_frames_left > 0 && !dlaa_log_gbuffer_done)
+            LogGBufferInputs(native_device, native_device_context, original_shader_hashes);
+#endif
+         if (is_pixel_shader(ambient_hash))
+         {
+            // Once per frame, and only when the game's SSAO is on
+            if (g_gtao_enable && game_device_data.ssao_chain_ran_this_frame && !std::exchange(game_device_data.gtao_tried_this_frame, true))
+               game_device_data.gtao_succeeded = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && RunXeGTAO(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers);
+#if DEVELOPMENT
+            if (xegtao_log_frames_left > 0)
+               LogAmbientInputs(native_device, native_device_context);
+#endif
+            game_device_data.smaa_depth_srv = nullptr;
+            native_device_context->PSGetShaderResources(0, 1, &game_device_data.smaa_depth_srv);
+         }
+         else if (is_pixel_shader(video_hash))
+         {
+            com_ptr<ID3D11RenderTargetView> rtv;
+            native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+            if (rtv)
+               rtv->GetDesc(&rtv_desc);
+            // Core only binds the Luma settings itself when the game leaves both cbuffers to it. The flag tells the shader its target
+            // (the swapchain) keeps AutoHDR highlights above 1.
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0);
+            updated_cbuffers = true;
+         }
+         else if (g_smaa_enable && is_pixel_shader(fxaa_pixel_shader_hash) && DrawSMAAInPlaceOfFXAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers))
+         {
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         return DrawOrDispatchOverrideType::None;
+      }
+
+      const auto is_compute_shader = [&](uint32_t hash)
+      { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::compute); };
+#if DEVELOPMENT
+      if (xegtao_log_frames_left > 0)
+      {
+         if (const auto ssao_hash = std::find_if(std::begin(ssao_chain_hashes), std::end(ssao_chain_hashes), is_compute_shader); ssao_hash != std::end(ssao_chain_hashes))
+            LogSSAOPass(native_device, native_device_context, *ssao_hash);
+      }
+#endif
+      // XeGTAO writes the chain's only output at the ambient draw. While it works, the chain is skipped.
+      if (is_compute_shader(ssao_prepare_1_hash))
+         game_device_data.ssao_chain_ran_this_frame = true;
+      if (g_gtao_enable && game_device_data.gtao_succeeded && std::any_of(std::begin(ssao_chain_hashes), std::end(ssao_chain_hashes), is_compute_shader))
+      {
+         // Only while XeGTAO can still run at the ambient: a shader reload would otherwise leave the previous frame's AO
+         const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+         if (HasShaders(device_data.native_compute_shaders, "SRTTR XeGTAO Prefilter Depths CS"_h, "SRTTR XeGTAO Main Pass CS"_h, "SRTTR XeGTAO Denoise Pass 1 CS"_h, "SRTTR XeGTAO Denoise Pass 2 CS"_h))
+            return DrawOrDispatchOverrideType::Skip;
+      }
+      // The tonemap runs in every frame with a scene, whatever the anti-aliasing setting
+      if (std::any_of(std::begin(tonemap_hashes), std::end(tonemap_hashes), is_compute_shader))
+      {
+         device_data.has_drawn_main_post_processing = true;
+         return DrawOrDispatchOverrideType::None;
+      }
+      const auto taa_hash = std::find_if(std::begin(taa_hashes), std::end(taa_hashes), is_compute_shader);
+      if (taa_hash == std::end(taa_hashes))
+         return DrawOrDispatchOverrideType::None;
+
+#if DEVELOPMENT
+      if (dlaa_log_frames_left > 0)
+         LogTAAInputs(native_device, native_device_context, *taa_hash);
+#endif
+
+      game_device_data.temporal_aa_this_frame = true; // OnPresent turns it into device_data.taa_detected
+
+#if ENABLE_SR
+      return DrawSRInPlaceOfTAA(native_device, native_device_context, device_data);
 #else
       return DrawOrDispatchOverrideType::None;
-#endif // ENABLE_SR
+#endif
    }
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
@@ -1202,7 +1104,12 @@ public:
 
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.smaa_depth_srv = nullptr;
-      game_device_data.video_drawn = false;
+      // Turning XeGTAO off gives its scratch back
+      if (!g_gtao_enable && game_device_data.gtao_scratch.width != 0)
+      {
+         game_device_data.gtao_scratch = {};
+         game_device_data.gtao_ssao_uav = nullptr;
+      }
       game_device_data.ssao_chain_ran_this_frame = false;
       game_device_data.gtao_tried_this_frame = false;
       device_data.taa_detected = std::exchange(game_device_data.temporal_aa_this_frame, false);

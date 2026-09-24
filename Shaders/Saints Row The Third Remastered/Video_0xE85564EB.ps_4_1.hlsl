@@ -1,7 +1,7 @@
 // rl_prim_2d_bink_s_01: Bink video, BT.601 limited-range Y'CbCr -> R'G'B'.
 // Fullscreen movies draw it straight into the swapchain as the frame's only draw (no compose runs), where 1 = UI paper white
-// like the GUI layer; menu videos go into the RGBA8 GUI layer, from which main.cpp moves them to an FP16 video layer when AutoHDR
-// is on. main.cpp sets LumaData.CustomData1 to 1 only for those FP16 targets, the only ones that keep highlights above 1.
+// like the GUI layer; menu videos go into the RGBA8 GUI layer and stay vanilla. main.cpp sets LumaData.CustomData1 to 1 only for the
+// swapchain (FP16) target, the only one that keeps AutoHDR highlights above 1.
 // The AutoHDR stays conservative because the videos are low bitrate and compression artifacts blow up when pushed hard.
 
 #include "Includes/Common.hlsl"
