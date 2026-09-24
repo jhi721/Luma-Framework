@@ -23,7 +23,8 @@
 // HDR path (canon for hard-clip games, BL GOTY precedent): the same grade as an extended function (upper clamps
 // become max(0); HLS runs on the color normalized by its max channel since HLS is undefined above 1; zone weights
 // from the saturated mean) -> linear -> soft ReinhardPiecewise hue reference in BT.2020 (Y5R: the gated vanilla SDR) -> MacLeod-Boynton hue
-// emulation -> DICE to peak. Output stays in gamma space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white) so the HUD,
+// emulation -> DICE to peak. The user grade (Exposure, Contrast before DICE, Highlights Desaturation inside it,
+// Saturation after it) is HDR only. Output stays in gamma space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white) so the HUD,
 // the AA (CMAA2/FXAA or Luma's SMAA), CAS and render_fb downstream behave as in vanilla.
 
 // clang-format off
@@ -243,7 +244,14 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
 #endif
    // D3D min returns the non-NaN operand: a leftover NaN or inf lands at peak like vanilla's white store, not at black.
    gradedHDR = min(gradedHDR, 1e4);
-   float3 extendedBT2020 = BT709_To_BT2020(gamma_to_linear(gradedHDR, GCT_POSITIVE));
+   float3 extendedLinear = gamma_to_linear(gradedHDR, GCT_POSITIVE) * LumaSettings.GameSettings.Exposure;
+   // User contrast before the display map so DICE contains what it pushes up (BL GOTY form). [branch] keeps 1.0 a
+   // bit-exact no-op; the floored log2 keeps Contrast 0 on black at 0 instead of pow(0, 0) = NaN.
+   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
+   {
+      extendedLinear = exp2(LumaSettings.GameSettings.Contrast * log2(max(extendedLinear / MidGray, 1e-30))) * MidGray;
+   }
+   float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
 
 #if CCR_MATERIAL_CURVE
    // Y5R's highlights never clipped: its materials bend each channel through the soft vanilla curve, so the vanilla graded
@@ -266,8 +274,9 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
    const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
    DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
    ds.InOutColorSpace = CS_BT2020; // already BT.2020: the default BT.709 would convert a second time
+   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
    float3 color = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
-   color = BT2020_To_BT709(SimpleGamutClip(color, true));
+   color = Saturation(BT2020_To_BT709(SimpleGamutClip(color, true)), LumaSettings.GameSettings.Saturation);
 #else
    float3 color = gamma_to_linear(gradedSDR);
 #endif

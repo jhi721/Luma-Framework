@@ -27,6 +27,10 @@ struct LumaGameSettings
    float VideoAutoHDRBoost;  // 0..1 highlight-expansion strength. 0 = peak at sRGB white (off).
    float Dithering;          // 0/1. One output code value of noise on the final image (8-bit SDR, 10-bit PQ HDR).
    float BloomIntensity;     // Luma Bloom strength (1 = vanilla, 0 = none).
+   float Exposure;           // 1 = vanilla. Linear multiplier on the graded HDR color, before the display map.
+   float Contrast;           // 1 = vanilla. Power around 18% mid-gray on the graded HDR color, before the display map.
+   float Saturation;         // 1 = vanilla. Luminance-relative saturation multiplier on the final HDR color.
+   float HighlightDechroma;  // 0 = off (default). DICE highlight desaturation above a third of peak.
 };
 
 // Define the game specific cbuffer (instance/pass) data here

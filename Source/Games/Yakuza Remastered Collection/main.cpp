@@ -978,6 +978,10 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = cb_luma_global_settings.GameSettings.VideoAutoHDRBoost = 0.5f; // peak ~165 nits
       default_luma_global_game_settings.Dithering = cb_luma_global_settings.GameSettings.Dithering = 1.f;
       default_luma_global_game_settings.BloomIntensity = cb_luma_global_settings.GameSettings.BloomIntensity = 1.f;
+      default_luma_global_game_settings.Exposure = cb_luma_global_settings.GameSettings.Exposure = 1.f;
+      default_luma_global_game_settings.Contrast = cb_luma_global_settings.GameSettings.Contrast = 1.f;
+      default_luma_global_game_settings.Saturation = cb_luma_global_settings.GameSettings.Saturation = 1.f;
+      default_luma_global_game_settings.HighlightDechroma = cb_luma_global_settings.GameSettings.HighlightDechroma = 0.f;
 
       native_shaders_definitions.emplace(CompileTimeStringHash("YRC SMAA Linearize CS"), ShaderDefinition{"Luma_YRC_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("YRC SMAA Predication CS"), ShaderDefinition{"Luma_YRC_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
@@ -1004,6 +1008,10 @@ public:
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       reshade::get_config_value(nullptr, NAME, "Dithering", gs.Dithering);
       reshade::get_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
+      reshade::get_config_value(nullptr, NAME, "Exposure", gs.Exposure);
+      reshade::get_config_value(nullptr, NAME, "Contrast", gs.Contrast);
+      reshade::get_config_value(nullptr, NAME, "Saturation", gs.Saturation);
+      reshade::get_config_value(nullptr, NAME, "HighlightDechroma", gs.HighlightDechroma);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -1042,6 +1050,48 @@ public:
          ImGui::SetTooltip("Read the mask back and log its distribution to ReShade.log.\nStand still, set a tolerance, press; repeat per value and compare the lines.\nFIRES(>0.5) is the share of the frame that regains base sensitivity.");
 #endif
       ImGui::EndDisabled();
+
+      // The grade sliders act on the HDR tonemap only.
+      if (cb_luma_global_settings.DisplayMode != DisplayModeType::SDR)
+      {
+         ImGui::SeparatorText("Grade");
+
+         if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
+            device_data.cb_luma_global_settings_dirty = true;
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Overall image brightness (1 = vanilla).");
+         if (DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure"))
+            device_data.cb_luma_global_settings_dirty = true;
+
+         if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
+            device_data.cb_luma_global_settings_dirty = true;
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Overall image contrast (1 = vanilla).");
+         if (DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast"))
+            device_data.cb_luma_global_settings_dirty = true;
+
+         if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
+            device_data.cb_luma_global_settings_dirty = true;
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Color saturation (1 = vanilla).");
+         if (DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation"))
+            device_data.cb_luma_global_settings_dirty = true;
+
+         if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
+            device_data.cb_luma_global_settings_dirty = true;
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(nullptr, NAME, "HighlightDechroma", gs.HighlightDechroma);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How far the brightest sources fade to neutral white (0 = keep color at any brightness).");
+         if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightDechroma"))
+            device_data.cb_luma_global_settings_dirty = true;
+      }
 
       ImGui::SeparatorText("Bloom");
 
