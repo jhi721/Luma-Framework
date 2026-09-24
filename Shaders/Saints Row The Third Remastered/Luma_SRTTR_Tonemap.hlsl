@@ -211,7 +211,7 @@ groupshared float3 gContinuation;
    // The HDR continuation only depends on cbuffer values, so one thread builds it for the whole group
    if (groupIndex == 0)
    {
-      gContinuation = LumaSettings.DisplayMode == 1 ? SRTTR_BuildContinuation(toeMatch, shoulderMatch) : 0.0;
+      gContinuation = SRTTR_HDR_SCENE ? SRTTR_BuildContinuation(toeMatch, shoulderMatch) : 0.0;
    }
    GroupMemoryBarrierWithGroupSync();
 
@@ -234,7 +234,7 @@ groupshared float3 gContinuation;
    float3 color = max(0.0, SourceHdrImage.Load(int3(vThreadID.xy, 0)).rgb);
    color = color * KeyValue / (exp2(LuminanceOutput[0]) + 6.103515625e-05);
    const float2 centered = uv * 2.0 - 1.0;
-   color *= 1.0 / (dot(centered, centered) * VignetteAmount + 1.0);
+   color *= 1.0 / (dot(centered, centered) * VignetteAmount * LumaSettings.GameSettings.VignetteIntensity + 1.0);
    color = BloomAmount * (bloomSum * 0.2 - color) + color;
    color = bloomSum * 0.2 * BloomBoost + color;
    color *= TintColor.rgb;
@@ -249,7 +249,7 @@ groupshared float3 gContinuation;
    const float3 curveCode = lx < toeMatch ? toe : (lx < shoulderMatch ? straight : shoulder);
 
    float3 outputCode;
-   if (LumaSettings.DisplayMode == 1) // HDR
+   if (SRTTR_HDR_SCENE)
    {
       // The reference skips the Bayer multiply: the compose replacement no longer divides it back out in HDR.
       const float3 sdrLinear = gamma_to_linear(SRTTR_Grade(curveCode), GCT_MIRROR);
@@ -283,7 +283,7 @@ groupshared float3 gContinuation;
    }
    else
    {
-      outputCode = SRTTR_Grade(curveCode * (SRTTR_Bayer(vThreadID.xy) * kBayerScale + 1.0));
+      outputCode = SRTTR_Grade(SRTTR_BAYER_IN_SCENE ? curveCode * (SRTTR_Bayer(vThreadID.xy) * kBayerScale + 1.0) : curveCode);
 #if UI_DRAW_TYPE >= 2
       [branch] if (LumaSettings.GamePaperWhiteNits != LumaSettings.UIPaperWhiteNits)
       {

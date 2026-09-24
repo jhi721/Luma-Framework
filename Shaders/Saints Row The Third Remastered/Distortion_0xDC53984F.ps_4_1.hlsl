@@ -44,7 +44,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
    const float ratio = saturate(base.x / green);
    const float2 shift = min(ratio * float2(2.5, 3.333333), 1.0);
    float3 tv = float3(split.x, split.y - 0.2 + shift.x * 0.2, split.z) * (shift.y * float3(0.1, 0.25, 0.0) + float3(0.9, 0.75, 1.0));
-   tv = LumaSettings.DisplayMode == 1 ? max(0.0, tv) : saturate(tv);
+   tv = SRTTR_HDR_SCENE ? max(0.0, tv) : saturate(tv);
 
    const float3 color = signalMask * (tv - split) + split;
    return float4(blurAmount * (blurred - color) + color, base.w);

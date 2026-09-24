@@ -5,6 +5,18 @@
 #include "../../Includes/Common.hlsl"
 // clang-format on
 
+#ifndef TONEMAP_TYPE
+#define TONEMAP_TYPE 1
+#endif
+
+// Whether the scene takes the Luma HDR path. TONEMAP_TYPE 0 keeps the vanilla SDR output (dither and clips included) on HDR displays too.
+#define SRTTR_HDR_SCENE (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
+// Whether the vanilla SDR 4x4 Bayer dither runs at all: the Luma output dither replaces it when enabled.
+#define SRTTR_VANILLA_BAYER (!SRTTR_HDR_SCENE && LumaSettings.GameSettings.Dithering <= 0.5)
+// Whether the tonemap writes that dither into the scene. Not when compose sharpens the scene (RCAS would amplify the
+// pattern): compose applies it after sharpening instead, on the graded colour rather than before the LUT.
+#define SRTTR_BAYER_IN_SCENE (SRTTR_VANILLA_BAYER && LumaSettings.GameSettings.RCASSharpness <= 0.0)
+
 // The vanilla 4x4 Bayer dither: the tonemap multiplies its SDR output by "Bayer * scale + 1", compose divides it back out in the darks.
 static const float kBayer4x4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 static const float3 kBayerScale = float3(1.0 / 32.0, 1.0 / 32.0, 1.0 / 16.0);

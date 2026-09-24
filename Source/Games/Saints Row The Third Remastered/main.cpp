@@ -2,8 +2,6 @@
 
 #define GEOMETRY_SHADER_SUPPORT 0
 #define DISABLE_AUTO_DEBUGGER 1
-// Development builds otherwise swallow focus loss, so the game keeps the cursor and can't be minimized
-#define DISABLE_FOCUS_LOSS_SUPPRESSION 1
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\reshade\deps\minhook\include\MinHook.h"
@@ -194,12 +192,10 @@ namespace
    constexpr uint32_t taa_hashes[] = {0xAB470526, 0x629C161F, 0x8E309763, 0x7D190953};
 
    // hdr_filter compose perms, the last draw of the frame (scene and GUI layer onto the swapchain). Every HDR_DISPLAY one is replaced by the SDR perm's math,
-   // so the game's HDR setting does not change the output. The first ones compose the scene, the GUI only ones run in menus (the SDR one is 09 and 13).
+   // so the game's HDR setting does not change the output. The first ones compose the scene, the GUI only ones run in menus (the SDR GUI only one,
+   // 0xA283B6FB, stays vanilla).
    constexpr uint32_t compose_hashes[] = {0xFCCD77CD, 0xADB2056B, 0xEB9D7036, 0x50DC2D70, 0x7083C926, 0xCE7FF710, 0xA11A22A3, 0x681958CA, 0x3D126636};
-   constexpr uint32_t compose_gui_hashes[] = {0xA283B6FB, 0x79D0B6FF, 0x8DFF00F4, 0x3EA6C5A9, 0x1AD38FF6, 0xDEEDDD60, 0x281056F7, 0x818B5759, 0xC165ACD1};
-   // rl_prim_2d_bink_s_01, the Bink video, drawn into the RGBA8 GUI layer: it's redirected to an FP16 video layer (for its AutoHDR), which compose reads at t8
-   constexpr uint32_t video_hash = 0xE85564EB;
-   constexpr UINT video_layer_compose_slot = 8;
+   constexpr uint32_t compose_gui_hashes[] = {0x79D0B6FF, 0x8DFF00F4, 0x3EA6C5A9, 0x1AD38FF6, 0xDEEDDD60, 0x281056F7, 0x818B5759, 0xC165ACD1};
 
    // hdr_filter tonemap CS perms (LUT and no LUT, with and without luminance output), run in every frame with a scene
    constexpr uint32_t tonemap_hashes[] = {0x941A9154, 0x835784B0, 0xAB466B4A, 0xFEDD50B7};
@@ -223,8 +219,9 @@ namespace
    uint32_t dlaa_log_frame = 0;
    bool dlaa_log_gbuffer_done = false;
 
-   // The game binds ranges of one large constant buffer (*SetConstantBuffers1), so only the bound range is copied
-   bool ReadBoundConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, reshade::api::shader_stage stage, UINT slot, UINT registers, float* data)
+   // The game binds ranges of one large constant buffer (*SetConstantBuffers1), so only the bound range is copied.
+   // Reads up to "registers" float4s, fewer if the bound range is smaller; returns how many were read (0 on failure).
+   UINT ReadBoundConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, reshade::api::shader_stage stage, UINT slot, UINT registers, float* data)
    {
       com_ptr<ID3D11DeviceContext1> native_device_context1;
       if (FAILED(native_device_context->QueryInterface(&native_device_context1)))
@@ -238,13 +235,16 @@ namespace
       else
          native_device_context1->CSGetConstantBuffers1(slot, 1, &cb, &first, &count);
       if (!cb)
-         return false;
+         return 0;
       D3D11_BUFFER_DESC desc = {};
       cb->GetDesc(&desc);
+      if (count == 0 && first == 0) // Bound with the non range API
+         count = desc.ByteWidth / 16;
+      registers = (std::min)(registers, count);
       const UINT offset = first * 16;
       const UINT bytes = registers * 16;
-      if (count < registers || offset + bytes > desc.ByteWidth)
-         return false;
+      if (registers == 0 || offset + bytes > desc.ByteWidth)
+         return 0;
 
       D3D11_BUFFER_DESC staging_desc = {};
       staging_desc.ByteWidth = bytes;
@@ -252,19 +252,20 @@ namespace
       staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
       com_ptr<ID3D11Buffer> staging;
       if (FAILED(native_device->CreateBuffer(&staging_desc, nullptr, &staging)))
-         return false;
+         return 0;
       const D3D11_BOX box = {offset, 0, 0, offset + bytes, 1, 1};
       native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, cb.get(), 0, &box);
       D3D11_MAPPED_SUBRESOURCE mapped = {};
       if (FAILED(native_device_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
-         return false;
+         return 0;
       std::memcpy(data, mapped.pData, bytes);
       native_device_context->Unmap(staging.get(), 0);
-      return true;
+      return registers;
    }
 
-   // Raw texture dump for offline analysis (formats the DevKit cannot read back): header {width, height, dxgi_format}, then tight rows of 4 bytes per pixel
-   void DumpTexture(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, ID3D11ShaderResourceView* srv, const char* name)
+   // Raw texture dump for offline analysis (formats the DevKit cannot read back): header {width, height, dxgi_format}, then tight rows of 1 or 4 bytes
+   // per pixel. Written to %TEMP%\srttr_<file_prefix>_<name>_<frame>.bin.
+   void DumpTexture(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, ID3D11ShaderResourceView* srv, const char* file_prefix, const char* name, uint32_t frame)
    {
       if (!srv)
          return;
@@ -275,7 +276,10 @@ namespace
          return;
       D3D11_TEXTURE2D_DESC desc = {};
       texture->GetDesc(&desc);
-      if (desc.Format != DXGI_FORMAT_R16G16_UNORM && desc.Format != DXGI_FORMAT_R24G8_TYPELESS)
+      UINT pixel_bytes = 4;
+      if (desc.Format == DXGI_FORMAT_R8_UNORM)
+         pixel_bytes = 1;
+      else if (desc.Format != DXGI_FORMAT_R16G16_UNORM && desc.Format != DXGI_FORMAT_R24G8_TYPELESS)
          return;
       desc.Usage = D3D11_USAGE_STAGING;
       desc.BindFlags = 0;
@@ -289,34 +293,36 @@ namespace
       D3D11_MAPPED_SUBRESOURCE mapped = {};
       if (FAILED(native_device_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
          return;
-      const auto path = std::filesystem::temp_directory_path() / (std::string("srttr_dlaa_") + name + "_" + std::to_string(dlaa_log_frame) + ".bin");
+      const auto path = std::filesystem::temp_directory_path() / (std::string("srttr_") + file_prefix + "_" + name + "_" + std::to_string(frame) + ".bin");
       if (FILE* file = _wfopen(path.c_str(), L"wb"))
       {
          const uint32_t header[3] = {desc.Width, desc.Height, uint32_t(desc.Format)};
          fwrite(header, sizeof(header), 1, file);
          for (UINT y = 0; y < desc.Height; y++)
-            fwrite(static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, desc.Width * 4, 1, file);
+            fwrite(static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, desc.Width * pixel_bytes, 1, file);
          fclose(file);
-         reshade::log::message(reshade::log::level::info, ("[SRTTR DLAA] frame=" + std::to_string(dlaa_log_frame) + " dump " + path.string()).c_str());
+         reshade::log::message(reshade::log::level::info, ("[SRTTR] dump " + path.string()).c_str());
       }
       native_device_context->Unmap(staging.get(), 0);
    }
 
-   void LogRegisters(const char* tag, const float* data, UINT first_register, UINT last_register)
+   // "prefix" starts the log line, e.g. "[SRTTR DLAA] frame=3"
+   void LogRegisters(const char* prefix, const char* tag, const float* data, UINT first_register, UINT last_register)
    {
       char line[256];
       for (UINT i = first_register; i <= last_register; i++)
       {
-         std::snprintf(line, sizeof(line), "[SRTTR DLAA] frame=%u %s c%u=%.9g,%.9g,%.9g,%.9g", dlaa_log_frame, tag, i, data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]);
+         std::snprintf(line, sizeof(line), "%s %s c%u=%.9g,%.9g,%.9g,%.9g", prefix, tag, i, data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]);
          reshade::log::message(reshade::log::level::info, line);
       }
    }
 
    void LogTAAInputs(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, uint32_t taa_hash)
    {
+      const std::string prefix = "[SRTTR DLAA] frame=" + std::to_string(dlaa_log_frame);
       // TAA_PARAMS cb10: c0-c3 matReprojection, c4 screenSize (uint2) + texelSize, c5 sharpness/neighbour_threshold/impulse_reduce/key_value, c6 max_weight/min_weight/frame_id (int)
       float taa[7 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 10, 7, taa))
+      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 10, 7, taa) == 7)
       {
          uint32_t screen_size[2];
          int32_t frame_id;
@@ -327,19 +333,19 @@ namespace
          // The jitter SR gets (last camera built on this thread), to compare against the pattern entry of the GPU frame_id
          std::snprintf(line, sizeof(line), "[SRTTR DLAA] frame=%u TAA 0x%08X screenSize=%u,%u frame_id=%d jitter_mode=%d sr_camera_valid=%d sr_camera_jitter_px=%.4f,%.4f tid=%lu", dlaa_log_frame, taa_hash, screen_size[0], screen_size[1], frame_id, jitter_mode ? *jitter_mode : -1, int(last_built_camera.valid), last_built_camera.jitter_x * screen_size[0] * 0.5f, -last_built_camera.jitter_y * screen_size[1] * 0.5f, GetCurrentThreadId());
          reshade::log::message(reshade::log::level::info, line);
-         LogRegisters("TAA cb10", taa, 0, 6);
+         LogRegisters(prefix.c_str(), "TAA cb10", taa, 0, 6);
       }
       // CB_COMMON as bound for the post chain, to compare against the G-buffer one
       float common[42 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 1, 42, common))
-         LogRegisters("TAA cb1", common, 34, 41);
+      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 1, 42, common) == 42)
+         LogRegisters(prefix.c_str(), "TAA cb1", common, 34, 41);
       // Depth (t1) and motion vectors (t3) of the first two logged frames, to check the object MVs against the camera reprojection
       if (dlaa_log_frame < 2)
       {
          com_ptr<ID3D11ShaderResourceView> srvs[3];
          native_device_context->CSGetShaderResources(1, 3, &srvs[0]);
-         DumpTexture(native_device, native_device_context, srvs[0].get(), "depth");
-         DumpTexture(native_device, native_device_context, srvs[2].get(), "mv");
+         DumpTexture(native_device, native_device_context, srvs[0].get(), "dlaa", "depth", dlaa_log_frame);
+         DumpTexture(native_device, native_device_context, srvs[2].get(), "dlaa", "mv", dlaa_log_frame);
       }
 
       dlaa_log_frame++;
@@ -360,6 +366,7 @@ namespace
       if (rtv_desc.Format != DXGI_FORMAT_R16G16_UNORM)
          return;
       dlaa_log_gbuffer_done = true;
+      const std::string prefix = "[SRTTR DLAA] frame=" + std::to_string(dlaa_log_frame);
 
       D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
       if (dsv)
@@ -377,30 +384,88 @@ namespace
 
       // CB_COMMON cb1: c1 Target_dimensions, c9 Velocity_calculation_data, c34-c37 projTM, c38-c41 unknown (not the previous camera the MVs use)
       float common[42 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::vertex, 1, 42, common))
+      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::vertex, 1, 42, common) == 42)
       {
-         LogRegisters("GBuffer VS cb1", common, 1, 1);
-         LogRegisters("GBuffer VS cb1", common, 9, 9);
-         LogRegisters("GBuffer VS cb1", common, 34, 41);
+         LogRegisters(prefix.c_str(), "GBuffer VS cb1", common, 1, 1);
+         LogRegisters(prefix.c_str(), "GBuffer VS cb1", common, 9, 9);
+         LogRegisters(prefix.c_str(), "GBuffer VS cb1", common, 34, 41);
       }
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::pixel, 1, 10, common))
-         LogRegisters("GBuffer PS cb1", common, 9, 9);
+      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::pixel, 1, 10, common) == 10)
+         LogRegisters(prefix.c_str(), "GBuffer PS cb1", common, 9, 9);
       // CB_VERTEX cb2: c10-c13 curr_to_prev_clip (per object, static meshes only)
       float vertex[14 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::vertex, 2, 14, vertex))
-         LogRegisters("GBuffer VS cb2", vertex, 10, 13);
+      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::vertex, 2, 14, vertex) == 14)
+         LogRegisters(prefix.c_str(), "GBuffer VS cb2", vertex, 10, 13);
+   }
+
+   // XeGTAO research: the ssao_miniengine chain (cbuffers and bindings of every pass) and the ambient pass that consumes its AO
+   constexpr uint32_t ssao_hashes[] = {0x2F4B251B, 0xAC38984B, 0x1DEB634A, 0xDE09F597, 0x23EF0DBA, 0x7378361E};
+   constexpr uint32_t ambient_hash = 0xFD45DCA7;
+   std::atomic<int> xegtao_log_frames_left = 0;
+   uint32_t xegtao_log_frame = 0;
+
+   void LogViewTexture(const std::string& prefix, const std::string& slot, ID3D11View* view)
+   {
+      if (!view)
+         return;
+      com_ptr<ID3D11Resource> resource;
+      view->GetResource(&resource);
+      com_ptr<ID3D11Texture2D> texture;
+      if (FAILED(resource->QueryInterface(&texture)))
+         return;
+      D3D11_TEXTURE2D_DESC desc = {};
+      texture->GetDesc(&desc);
+      char line[256];
+      std::snprintf(line, sizeof(line), "%s %s res=%p %ux%u array=%u mips=%u format=%d", prefix.c_str(), slot.c_str(), resource.get(), desc.Width, desc.Height, desc.ArraySize, desc.MipLevels, int(desc.Format));
+      reshade::log::message(reshade::log::level::info, line);
+   }
+
+   void LogSSAOPass(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, uint32_t hash)
+   {
+      const std::string prefix = std::format("[SRTTR XeGTAO] frame={} SSAO 0x{:08X}", xegtao_log_frame, hash);
+      float params[64 * 4];
+      if (const UINT registers = ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 10, 64, params))
+         LogRegisters(prefix.c_str(), "cb10", params, 0, registers - 1);
+      com_ptr<ID3D11ShaderResourceView> srvs[4];
+      native_device_context->CSGetShaderResources(0, 4, &srvs[0]);
+      com_ptr<ID3D11UnorderedAccessView> uavs[5];
+      native_device_context->CSGetUnorderedAccessViews(0, 5, &uavs[0]);
+      for (UINT i = 0; i < 4; i++)
+         LogViewTexture(prefix, "t" + std::to_string(i), srvs[i].get());
+      for (UINT i = 0; i < 5; i++)
+         LogViewTexture(prefix, "u" + std::to_string(i), uavs[i].get());
+   }
+
+   void LogAmbientInputs(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context)
+   {
+      const std::string prefix = std::format("[SRTTR XeGTAO] frame={} ambient", xegtao_log_frame);
+      // AMBIENT_PARAMS cb10 (52 registers): c0-c3 Projection, c4-c7 ViewInverse, c8-c11 ShadowMatrix, c12 RenderOffset, c13 LightDir,
+      // c14/c15 AmbientLevelHigh/Low, c16-c22 ZonePos, c23 AmountInv/Normals/Power/Intensity, c24 _unused0/IntensityDiffuse/MaxIterations/NumberOfInteriors
+      float params[52 * 4];
+      if (const UINT registers = ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::pixel, 10, 52, params))
+         LogRegisters(prefix.c_str(), "cb10", params, 0, (std::min)(registers, 25u) - 1);
+      char line[256];
+      std::snprintf(line, sizeof(line), "%s camera valid=%d projection_y_scale=%.9g near=%.9g far=%.9g jitter=%.9g,%.9g", prefix.c_str(), int(last_built_camera.valid), last_built_camera.projection_y_scale, last_built_camera.near_plane, last_built_camera.far_plane, last_built_camera.jitter_x, last_built_camera.jitter_y);
+      reshade::log::message(reshade::log::level::info, line);
+      // t0 depth, t1 view space normals, t2 SSAO
+      com_ptr<ID3D11ShaderResourceView> srvs[3];
+      native_device_context->PSGetShaderResources(0, 3, &srvs[0]);
+      for (UINT i = 0; i < 3; i++)
+         LogViewTexture(prefix, "t" + std::to_string(i), srvs[i].get());
+      if (xegtao_log_frames_left == 2) // The first frame of each button press; the frame number keeps the files apart
+      {
+         DumpTexture(native_device, native_device_context, srvs[0].get(), "xegtao", "depth", xegtao_log_frame);
+         DumpTexture(native_device, native_device_context, srvs[1].get(), "xegtao", "normals", xegtao_log_frame);
+         DumpTexture(native_device, native_device_context, srvs[2].get(), "xegtao", "ao", xegtao_log_frame);
+      }
+      xegtao_log_frame++;
+      xegtao_log_frames_left--;
    }
 } // namespace
 #endif
 
 struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
 {
-   // The Bink video layer, cleared by the first video draw of each frame
-   com_ptr<ID3D11Texture2D> video_layer;
-   com_ptr<ID3D11RenderTargetView> video_layer_rtv;
-   com_ptr<ID3D11ShaderResourceView> video_layer_srv;
-   bool video_drawn = false;
-
 #if ENABLE_SR
    // SR inputs converted from the game's TAA ones
    com_ptr<ID3D11Texture2D> sr_motion_vectors;
@@ -421,6 +486,12 @@ class SaintsRowTheThirdRemastered final : public Game
 public:
    void OnInit(bool async) override
    {
+      std::vector<ShaderDefineData> game_shader_defines_data = {
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (reference)\n1 - HDR: native grade + reconstructed luminance + DICE display map", 1},
+      };
+      shader_defines_data.append_range(game_shader_defines_data);
+      assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
+
       // The tonemap CS writes display encoded (gamma 2.2) values into a float texture, compose copies them to the swapchain through a UNORM view
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('1');
@@ -432,14 +503,15 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
+      default_luma_global_game_settings.RCASSharpness = 0.f;
       default_luma_global_game_settings.Exposure = 1.f;
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
       default_luma_global_game_settings.HighlightsDesaturation = 0.f;
       default_luma_global_game_settings.ColorGradingIntensity = 1.f;
+      default_luma_global_game_settings.VignetteIntensity = 1.f;
+      default_luma_global_game_settings.FilmGrainIntensity = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;
-      default_luma_global_game_settings.VideoAutoHDREnable = 1.f;
-      default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f; // Peak ~165 nits
       default_luma_global_game_settings.HideGameplayUI = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
@@ -469,67 +541,21 @@ public:
 #if DEVELOPMENT
          if (dlaa_log_frames_left > 0 && !dlaa_log_gbuffer_done)
             LogGBufferInputs(native_device, native_device_context, original_shader_hashes);
+         if (xegtao_log_frames_left > 0 && original_shader_hashes.Contains(ambient_hash, reshade::api::shader_stage::pixel))
+            LogAmbientInputs(native_device, native_device_context);
 #endif
-         if (!original_draw_dispatch_func || !*original_draw_dispatch_func)
-            return DrawOrDispatchOverrideType::None;
-         auto& game_device_data = GetGameDeviceData(device_data);
-
-         if (original_shader_hashes.Contains(video_hash, reshade::api::shader_stage::pixel))
-         {
-            com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-            com_ptr<ID3D11DepthStencilView> dsv;
-            native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
-            if (!rtvs[0])
-               return DrawOrDispatchOverrideType::None;
-            com_ptr<ID3D11Resource> gui_layer;
-            rtvs[0]->GetResource(&gui_layer);
-            if (!game_device_data.video_layer || !AreResourcesEqual(game_device_data.video_layer.get(), gui_layer.get(), false))
-            {
-               game_device_data.video_layer_rtv = nullptr;
-               game_device_data.video_layer_srv = nullptr;
-               game_device_data.video_layer = CloneTexture<ID3D11Texture2D>(native_device, gui_layer.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, false, false);
-               HRESULT hr = game_device_data.video_layer ? native_device->CreateRenderTargetView(game_device_data.video_layer.get(), nullptr, &game_device_data.video_layer_rtv) : E_FAIL;
-               if (SUCCEEDED(hr))
-                  hr = native_device->CreateShaderResourceView(game_device_data.video_layer.get(), nullptr, &game_device_data.video_layer_srv);
-               ASSERT_ONCE(SUCCEEDED(hr));
-               if (FAILED(hr))
-               {
-                  game_device_data.video_layer = nullptr; // The views are reset before the next creation
-                  return DrawOrDispatchOverrideType::None;
-               }
-            }
-
-            if (!game_device_data.video_drawn)
-            {
-               constexpr float transparent[4] = {};
-               native_device_context->ClearRenderTargetView(game_device_data.video_layer_rtv.get(), transparent);
-               game_device_data.video_drawn = true;
-            }
-            // Same blend state and viewport as the GUI layer, which gets the UI drawn on top later
-            ID3D11RenderTargetView* const video_layer_rtv = game_device_data.video_layer_rtv.get();
-            native_device_context->OMSetRenderTargets(1, &video_layer_rtv, dsv.get());
-            (*original_draw_dispatch_func)();
-            ID3D11RenderTargetView* const* original_rtvs = reinterpret_cast<ID3D11RenderTargetView* const*>(&rtvs[0]);
-            native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, original_rtvs, dsv.get());
-            return DrawOrDispatchOverrideType::Replaced;
-         }
-
-         const auto is_compose = [&](uint32_t hash)
-         { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); };
-         if (std::any_of(std::begin(compose_hashes), std::end(compose_hashes), is_compose) || std::any_of(std::begin(compose_gui_hashes), std::end(compose_gui_hashes), is_compose))
-         {
-            ID3D11ShaderResourceView* const video_layer_srv = game_device_data.video_drawn ? game_device_data.video_layer_srv.get() : nullptr;
-            native_device_context->PSSetShaderResources(video_layer_compose_slot, 1, &video_layer_srv);
-            (*original_draw_dispatch_func)();
-            ID3D11ShaderResourceView* const null_srv = nullptr;
-            native_device_context->PSSetShaderResources(video_layer_compose_slot, 1, &null_srv);
-            return DrawOrDispatchOverrideType::Replaced;
-         }
          return DrawOrDispatchOverrideType::None;
       }
 
       const auto is_compute_shader = [&](uint32_t hash)
       { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::compute); };
+#if DEVELOPMENT
+      if (xegtao_log_frames_left > 0)
+      {
+         if (const auto ssao_hash = std::find_if(std::begin(ssao_hashes), std::end(ssao_hashes), is_compute_shader); ssao_hash != std::end(ssao_hashes))
+            LogSSAOPass(native_device, native_device_context, *ssao_hash);
+      }
+#endif
       // The tonemap runs in every frame with a scene, whatever the anti-aliasing setting
       if (std::any_of(std::begin(tonemap_hashes), std::end(tonemap_hashes), is_compute_shader))
       {
@@ -684,10 +710,9 @@ public:
          InstallCameraHooks();
       }
 
-      auto& game_device_data = GetGameDeviceData(device_data);
-      game_device_data.video_drawn = false;
       device_data.has_drawn_main_post_processing = false;
 #if ENABLE_SR
+      auto& game_device_data = GetGameDeviceData(device_data);
       // SR resolves more detail than the game's TAA, so sharpen texture sampling while it draws (-1 at native resolution).
       // The offset is added to the game's own sampler bias, which is unknown, so the game's TAA keeps it unchanged.
       if (enable_samplers_upgrade && !custom_texture_mip_lod_bias_offset)
@@ -724,14 +749,15 @@ public:
    void LoadConfigs() override
    {
       auto& settings = cb_luma_global_settings.GameSettings;
+      reshade::get_config_value(nullptr, NAME, "RCASSharpness", settings.RCASSharpness);
       reshade::get_config_value(nullptr, NAME, "Exposure", settings.Exposure);
       reshade::get_config_value(nullptr, NAME, "Contrast", settings.Contrast);
       reshade::get_config_value(nullptr, NAME, "Saturation", settings.Saturation);
       reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", settings.HighlightsDesaturation);
       reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", settings.ColorGradingIntensity);
+      reshade::get_config_value(nullptr, NAME, "VignetteIntensity", settings.VignetteIntensity);
+      reshade::get_config_value(nullptr, NAME, "FilmGrainIntensity", settings.FilmGrainIntensity);
       reshade::get_config_value(nullptr, NAME, "Dithering", settings.Dithering);
-      reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", settings.VideoAutoHDREnable);
-      reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", settings.VideoAutoHDRBoost);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -749,6 +775,9 @@ public:
          if (DrawResetButton(*value, default_value, key))
             device_data.cb_luma_global_settings_dirty = true;
       };
+
+      ImGui::SeparatorText("Anti-Aliasing");
+      slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, defaults.RCASSharpness, 1.f, "Sharpening applied on top of anti-aliasing, not to the UI (0 = off). Replaces the game's Sharpen setting.");
 
       ImGui::SeparatorText("Grade");
       slider("Exposure", "Exposure", &settings.Exposure, defaults.Exposure, 2.f, "Overall image brightness (1 = vanilla).");
@@ -775,9 +804,8 @@ public:
       };
 
       ImGui::SeparatorText("Effects");
-      ImGui::BeginDisabled(!toggle("Video AutoHDR", "VideoAutoHDREnable", &settings.VideoAutoHDREnable, defaults.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only)."));
-      slider("Video HDR Boost", "VideoAutoHDRBoost", &settings.VideoAutoHDRBoost, defaults.VideoAutoHDRBoost, 1.f, "Video highlight strength (0 = off).");
-      ImGui::EndDisabled();
+      slider("Vignette Intensity", "VignetteIntensity", &settings.VignetteIntensity, defaults.VignetteIntensity, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
+      slider("Film Grain Intensity", "FilmGrainIntensity", &settings.FilmGrainIntensity, defaults.FilmGrainIntensity, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
       toggle("Dithering", "Dithering", &settings.Dithering, defaults.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
@@ -795,18 +823,15 @@ public:
 #if DEVELOPMENT
    void DrawImGuiDevSettings(DeviceData& device_data) override
    {
-      if (ImGui::Button("Log DLAA Inputs"))
-      {
-         dlaa_log_frames_left = 16;
-         camera_log_calls_left = 200;
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Writes TAA cbuffers, camera matrices and depth state of the next 16 frames, and the next 200 camera projection builds, to ReShade.log.");
+      ImGui::SeparatorText("TAA Jitter");
       if (int32_t* jitter_mode = GetJitterMode())
       {
-         ImGui::SliderInt("TAA Jitter Pattern", jitter_mode, 0, 3);
+         ImGui::Combo("TAA Jitter Pattern", jitter_mode, "None\0"
+                                                         "2x (vanilla)\0"
+                                                         "4x\0"
+                                                         "8x (SR, Halton if enabled)\0");
          if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Game TAA jitter: 0 none, 1 2x (vanilla), 2 4x, 3 8x (D3D MSAA patterns, 3 is replaced by Halton and required by SR). Not saved.");
+            ImGui::SetTooltip("Game TAA jitter, D3D MSAA sample patterns. SR requires 8x. Not saved.");
          bool jitter_index_fixed = IsJitterIndexFixed();
          if (ImGui::Checkbox("Fix TAA Jitter Index", &jitter_index_fixed))
             SetJitterIndexFix(jitter_index_fixed);
@@ -815,7 +840,7 @@ public:
       }
       else
       {
-         ImGui::TextUnformatted("TAA Jitter Pattern: unsupported SRTTR.exe build");
+         ImGui::TextDisabled("Unsupported SRTTR.exe build: jitter controls unavailable");
       }
 #if ENABLE_SR
       bool jitter_pattern_halton_enabled = jitter_pattern_halton;
@@ -833,12 +858,28 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's 8x (D3D MSAA) jitter pattern, used by SR, with a Halton (2, 3) sequence of %i phases. Not saved.", SR::GetDefaultJitterPhases());
-      ImGui::Checkbox("SR Flip Jitter X", &sr_flip_jitter_x);
-      ImGui::Checkbox("SR Flip Jitter Y", &sr_flip_jitter_y);
-      if (ImGui::Checkbox("SR MVs Jittered", &sr_mvs_jittered))
+
+      ImGui::SeparatorText("Super Resolution");
+      ImGui::Checkbox("Flip Jitter X", &sr_flip_jitter_x);
+      ImGui::SameLine();
+      ImGui::Checkbox("Flip Jitter Y", &sr_flip_jitter_y);
+      if (ImGui::Checkbox("MVs Jittered", &sr_mvs_jittered))
          device_data.force_reset_sr = true;
-      ImGui::Text("SR camera: jitter %.6f %.6f NDC, fov %.2f deg, near %.3f, far %.1f", last_built_camera.jitter_x, last_built_camera.jitter_y, last_built_camera.projection_y_scale > 0.f ? 2.f * std::atan(1.f / last_built_camera.projection_y_scale) * 180.f / float(M_PI) : 0.f, last_built_camera.near_plane, last_built_camera.far_plane);
+      ImGui::TextDisabled("Camera: jitter %.6f %.6f NDC, fov %.2f deg, near %.3f, far %.1f", last_built_camera.jitter_x, last_built_camera.jitter_y, last_built_camera.projection_y_scale > 0.f ? 2.f * std::atan(1.f / last_built_camera.projection_y_scale) * 180.f / float(M_PI) : 0.f, last_built_camera.near_plane, last_built_camera.far_plane);
 #endif
+
+      ImGui::SeparatorText("Diagnostics");
+      if (ImGui::Button("Log DLAA Inputs"))
+      {
+         dlaa_log_frames_left = 16;
+         camera_log_calls_left = 200;
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Writes TAA cbuffers, camera matrices and depth state of the next 16 frames, and the next 200 camera projection builds, to ReShade.log.");
+      if (ImGui::Button("Log XeGTAO Inputs"))
+         xegtao_log_frames_left = 2;
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Writes the cbuffers and bindings of every SSAO pass and of the ambient pass, and the camera, of the next 2 frames to ReShade.log. The first frame also dumps the ambient depth, normals and AO to %%TEMP%%\\srttr_xegtao_*.bin.");
    }
 #endif
 
