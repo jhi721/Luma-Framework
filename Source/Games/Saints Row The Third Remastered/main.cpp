@@ -1528,8 +1528,8 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Saints Row: The Third Remastered\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, replaces the game's TAA with DLAA or FSR 3 native anti-aliasing, its FXAA with SMAA and its SSAO with XeGTAO, plus 16x anisotropic filtering.\n"
-         "Set Anti-Aliasing in the game's display settings to TAA for DLAA and FSR 3, or to FXAA for SMAA.\n"
+         "It adds HDR, replaces the game's TAA with DLAA or FSR 3 native anti-aliasing, its FXAA with SMAA and its SSAO with XeGTAO, plus 16x anisotropic filtering and a fix for the game's TAA jitter.\n"
+         "Set Anti-Aliasing in the game's display settings to TAA for DLAA and FSR 3, or to FXAA for SMAA, and enable Ambient Occlusion for XeGTAO.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
