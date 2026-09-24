@@ -45,14 +45,25 @@ namespace
          // call taa_gate at +0x11B, cmp [rip+?], -1 (jitter_gate) at +0x128, mov ecx, [rip+?] (jitter_mode) at +0x146
          if (function[0x11B] != 0xE8 || function[0x128] != 0x83 || function[0x129] != 0x3D || function[0x12E] != 0xFF || function[0x146] != 0x8B || function[0x147] != 0x0D)
             return result;
+         // The 8x pattern block: mov eax, [rsi+0x59C]; and eax, 0x80000007 ... ja (+0x17) to the shared scaling code
+         constexpr uint8_t jitter_pattern_8x_start[] = {0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, 0x25, 0x07, 0x00, 0x00, 0x80};
+         uint8_t* jitter_pattern_8x = function + 0x175;
+         if (std::memcmp(jitter_pattern_8x, jitter_pattern_8x_start, sizeof(jitter_pattern_8x_start)) != 0 || jitter_pattern_8x[0x17] != 0x0F || jitter_pattern_8x[0x18] != 0x87)
+            return result;
+         // The 2x and 4x mask high bytes, 0x00 if a previous load of the addon already patched them
+         uint8_t* jitter_index_mask_high_bytes[] = {function + 0x2C6, function + 0x252};
+         for (const uint8_t* byte : jitter_index_mask_high_bytes)
+         {
+            if (*byte != 0x80 && *byte != 0x00)
+               return result;
+         }
          // Target of the rel32 at "offset", in an instruction that has "trailing_bytes" after it
          const auto rip_target = [function](size_t offset, size_t trailing_bytes)
          { return function + offset + sizeof(int32_t) + trailing_bytes + *reinterpret_cast<const int32_t*>(function + offset); };
          result.camera_build = function;
          result.camera_counter_increment = function - 0x2D0;
-         result.jitter_pattern_8x = function + 0x175;
-         result.jitter_index_mask_high_bytes[0] = function + 0x2C6;
-         result.jitter_index_mask_high_bytes[1] = function + 0x252;
+         result.jitter_pattern_8x = jitter_pattern_8x;
+         std::copy(std::begin(jitter_index_mask_high_bytes), std::end(jitter_index_mask_high_bytes), result.jitter_index_mask_high_bytes);
          result.taa_gate = reinterpret_cast<bool (*)()>(rip_target(0x11C, 0));
          result.jitter_gate = reinterpret_cast<const int32_t*>(rip_target(0x12A, 1));
          result.jitter_mode = reinterpret_cast<int32_t*>(rip_target(0x148, 0));
@@ -69,11 +80,6 @@ namespace
    constexpr int32_t vanilla_jitter_mode = 1;
    constexpr int32_t halton_jitter_mode = 3; // SR, see "InstallHaltonJitterPattern()"
 
-   int32_t* GetJitterMode()
-   {
-      return GetGameAddresses().jitter_mode;
-   }
-
    // "Fix Native TAA Jitter": clearing the sign bit of the 2x and 4x masks (their high bytes, 0x14089BA06 and 0x14089B992) makes the index "counter & N",
    // so every offset of the pattern cycles. The game's TAA is tuned for its 2x pattern: the 8x Halton one of SR makes it flicker.
    bool g_fix_native_taa_jitter = true;
@@ -82,14 +88,9 @@ namespace
    void SetJitterIndexFix(bool enable)
    {
       const uint8_t mask_high_byte = enable ? 0x00 : 0x80;
-      for (const uint8_t* byte : GetGameAddresses().jitter_index_mask_high_bytes)
-      {
-         if (!byte || (*byte != 0x80 && *byte != 0x00))
-            return;
-      }
       for (uint8_t* byte : GetGameAddresses().jitter_index_mask_high_bytes)
       {
-         if (*byte != mask_high_byte)
+         if (byte && *byte != mask_high_byte)
             System::PatchMemory(byte, &mask_high_byte, 1);
       }
    }
@@ -105,11 +106,7 @@ namespace
    void InstallHaltonJitterPattern()
    {
       uint8_t* block = GetGameAddresses().jitter_pattern_8x;
-      constexpr uint8_t expected[] = {0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, 0x25, 0x07, 0x00, 0x00, 0x80}; // mov eax, [rsi+0x59C]; and eax, 0x80000007
-      if (!block || std::memcmp(block, expected, sizeof(expected)) != 0)
-         return;
-      // The block's "ja" (at +0x17) must lead to the shared code the patch jumps to
-      if (block[0x17] != 0x0F || block[0x18] != 0x87 || block + 0x1D + *reinterpret_cast<const int32_t*>(block + 0x19) != block + 0x20 + 0x166)
+      if (!block)
          return;
       std::array<uint8_t, jitter_pattern_8x_size> bytes;
       std::memcpy(bytes.data(), block, jitter_pattern_8x_size); // The rest of the block stays original
@@ -120,10 +117,13 @@ namespace
          0x48, 0x8D, 0x15, 0x10, 0x00, 0x00, 0x00, // lea rdx, [rip+0x10] (the table, right after this code)
          0xF3, 0x0F, 0x10, 0x0C, 0xC2,       // movss xmm1, [rdx+rax*8] (x)
          0xF3, 0x0F, 0x10, 0x74, 0xC2, 0x04, // movss xmm6, [rdx+rax*8+4] (y)
-         0xE9, 0x66, 0x01, 0x00, 0x00,       // jmp 0x14089BA3B
+         0xE9, 0x00, 0x00, 0x00, 0x00,       // jmp to the block's "ja" target (0x14089BA3B), set below
       };
       // clang-format on
       std::memcpy(bytes.data(), code, sizeof(code));
+      const uint8_t* ja_target = block + 0x1D + *reinterpret_cast<const int32_t*>(block + 0x19);
+      const int32_t jmp_offset = static_cast<int32_t>(ja_target - (block + sizeof(code)));
+      std::memcpy(bytes.data() + sizeof(code) - sizeof(jmp_offset), &jmp_offset, sizeof(jmp_offset));
       for (unsigned int i = 0; i < 16; i++)
       {
          const unsigned int phase = i % SR::GetDefaultJitterPhases();
@@ -201,9 +201,7 @@ namespace
    void InstallCameraHooks()
    {
       uint8_t* camera_build = GetGameAddresses().camera_build;
-      // mov rax, rsp; push rbx; push rbp; push rsi; push rdi
-      constexpr uint8_t camera_build_prologue[] = {0x48, 0x8B, 0xC4, 0x53, 0x55, 0x56, 0x57};
-      if (!camera_build || std::memcmp(camera_build, camera_build_prologue, sizeof(camera_build_prologue)) != 0 || MH_Initialize() != MH_OK)
+      if (!camera_build || MH_Initialize() != MH_OK)
          return;
       if (MH_CreateHook(camera_build, reinterpret_cast<void*>(&CameraBuildDetour), reinterpret_cast<void**>(&camera_build_original)) == MH_OK)
          MH_EnableHook(camera_build);
@@ -422,7 +420,7 @@ namespace
          int32_t frame_id;
          std::memcpy(screen_size, &taa[16], sizeof(screen_size));
          std::memcpy(&frame_id, &taa[26], sizeof(frame_id));
-         const int32_t* jitter_mode = GetJitterMode();
+         const int32_t* jitter_mode = GetGameAddresses().jitter_mode;
          char line[256];
          // The jitter SR gets (last camera built on this thread), to compare against the pattern entry of the GPU frame_id
          std::snprintf(line, sizeof(line), "[SRTTR DLAA] frame=%u TAA 0x%08X screenSize=%u,%u frame_id=%d jitter_mode=%d sr_camera_valid=%d sr_camera_jitter_px=%.4f,%.4f tid=%lu", dlaa_log_frame, taa_hash, screen_size[0], screen_size[1], frame_id, jitter_mode ? *jitter_mode : -1, int(last_built_camera.valid), last_built_camera.jitter_x * screen_size[0] * 0.5f, -last_built_camera.jitter_y * screen_size[1] * 0.5f, GetCurrentThreadId());
@@ -826,8 +824,7 @@ public:
       native_shaders_definitions.emplace("SRTTR XeGTAO Denoise Pass 2 CS"_h, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
 #if ENABLE_SR
       native_shaders_definitions.emplace(sr_inputs_shader_hash, ShaderDefinition{"Luma_SRTTR_SRInputs", reshade::api::pipeline_subobject_type::compute_shader});
-      // SR takes its jitter from the patched game code, found in the Steam, GOG and Epic builds
-      sr_game_tooltip = GetGameAddresses().camera_build ? "Requires \"Anti-Aliasing\" set to \"TAA\" in the game's display settings.\n" : "Unsupported game executable version: Super Resolution can't engage.\n";
+      sr_game_tooltip = "Requires \"Anti-Aliasing\" set to \"TAA\" in the game's display settings.\n";
 #endif
    }
 
@@ -1088,7 +1085,7 @@ public:
 #endif
       // The jitter comes from the camera built on this thread (the render thread), and SR needs the game's 8x jitter pattern to be active
       const CameraData camera = last_built_camera;
-      const int32_t* jitter_mode = GetJitterMode();
+      const int32_t* jitter_mode = GetGameAddresses().jitter_mode;
       if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed || native_device_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !camera.valid || !jitter_mode || *jitter_mode != halton_jitter_mode)
       {
          device_data.force_reset_sr = true;
@@ -1313,6 +1310,9 @@ public:
       {
          game_patches_applied = true;
 #if ENABLE_SR
+         // SR takes its jitter from the patched game code, found in the Steam, GOG and Epic builds (scanned here, once the game code is unpacked)
+         if (!GetGameAddresses().camera_build)
+            sr_game_tooltip = "Unsupported game executable version: Super Resolution can't engage.\n";
          InstallHaltonJitterPattern();
 #endif
          InstallCameraHooks();
@@ -1346,7 +1346,7 @@ public:
       device_data.has_drawn_sr = false;
       // Only switched on changes, so the development combo stays usable
       const bool sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
-      if (int32_t* jitter_mode = GetJitterMode(); jitter_mode && sr_active != halton_jitter_mode_applied)
+      if (int32_t* jitter_mode = GetGameAddresses().jitter_mode; jitter_mode && sr_active != halton_jitter_mode_applied)
       {
          halton_jitter_mode_applied = sr_active;
          *jitter_mode = sr_active ? halton_jitter_mode : vanilla_jitter_mode;
@@ -1486,7 +1486,7 @@ public:
    void DrawImGuiDevSettings(DeviceData& device_data) override
    {
       ImGui::SeparatorText("TAA Jitter");
-      if (int32_t* jitter_mode = GetJitterMode())
+      if (int32_t* jitter_mode = GetGameAddresses().jitter_mode)
       {
          ImGui::Combo("TAA Jitter Pattern", jitter_mode, "None\0"
                                                          "2x\0"
