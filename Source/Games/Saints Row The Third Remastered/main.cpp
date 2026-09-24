@@ -2,6 +2,8 @@
 
 #define GEOMETRY_SHADER_SUPPORT 0
 #define DISABLE_AUTO_DEBUGGER 1
+// Development builds otherwise swallow focus loss, so the game keeps the cursor and can't be minimized
+#define DISABLE_FOCUS_LOSS_SUPPRESSION 1
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\reshade\deps\minhook\include\MinHook.h"
