@@ -25,10 +25,10 @@ cbuffer AmbientParams : register(b10)
 }
 
 // --- Luma runtime knobs (LumaData custom data, set by main.cpp; live-tunable via DEV sliders, no recompile) ---
-#define NoiseIndexRT      LumaData.CustomData1        // temporal noise index (0 = frozen)
-#define DebugViewRT       float(LumaData.CustomData2) // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
-#define FinalValuePowerRT LumaData.CustomData3        // primary darkness dial
-#define RadiusOverrideRT  LumaData.CustomData4        // > 0 overrides EFFECT_RADIUS (metres)
+#define NoiseIndexRT      LumaData.CustomData1 // temporal noise index (0 = frozen)
+#define DebugViewRT       LumaData.CustomData2 // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
+#define FinalValuePowerRT LumaData.CustomData3 // primary darkness dial
+#define RadiusOverrideRT  LumaData.CustomData4 // > 0 overrides EFFECT_RADIUS (metres)
 
 static float2 ViewportPixelSize; // 1 / AO resolution, set by each entry point that uses it
 
@@ -317,14 +317,14 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
 #endif
 
 #if DEVELOPMENT
-   // Debug views (visible on screen through the game's own AO blur/apply chain; the final denoise passes
-   // raw values through when DebugViewRT > 0).
-   if (DebugViewRT > 0.5 && DebugViewRT < 1.5) // 1 = depth gradient (proves live depth + linearization/scale)
+   // Debug views (visible on screen through the ambient light, which multiplies the SSAO texture; the final denoise
+   // passes raw values through when DebugViewRT > 0).
+   if (DebugViewRT == 1) // 1 = depth gradient (proves live depth + linearization/scale)
    {
       outWorkingAOTermAndEdges[pixCoord] = float2(saturate(frac(log2(max(viewspaceZ, 1e-6)))), 1.0);
       return;
    }
-   if (DebugViewRT >= 3.5 && DebugViewRT < 4.5) // 4 = edges
+   if (DebugViewRT == 4) // 4 = edges
    {
       outWorkingAOTermAndEdges[pixCoord] = float2(dot(edgesLRTB, 0.25), 1.0);
       return;
@@ -340,7 +340,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
 #if DEVELOPMENT
    // 2 = normals view-facing term, before the correction below: surfaces facing the camera are bright,
    // black everywhere means the normal z convention is inverted.
-   if (DebugViewRT >= 1.5 && DebugViewRT < 2.5)
+   if (DebugViewRT == 2)
    {
       outWorkingAOTermAndEdges[pixCoord] = float2(saturate(dot(viewspaceNormal, viewVec)), 1.0);
       return;
@@ -548,14 +548,14 @@ void XeGTAO_Denoise(uint2 pixCoordBase, Texture2D sourceAOTermAndEdges, SamplerS
 {
 #if DEVELOPMENT
    // Debug views: pass the raw working value through unblurred so the on-screen viz is exact.
-   if (DebugViewRT > 0.5)
+   if (DebugViewRT != 0)
    {
       for (int dside = 0; dside < 2; dside++)
       {
          const uint2 dpix = uint2(pixCoordBase.x + dside, pixCoordBase.y);
          float v = sourceAOTermAndEdges.Load(int3(dpix, 0)).x;
 #if XE_GTAO_FINAL_APPLY
-         if (DebugViewRT >= 2.5 && DebugViewRT < 3.5) // 3 = AO x8 amplification (spot broad over-occlusion)
+         if (DebugViewRT == 3) // 3 = AO x8 amplification (spot broad over-occlusion)
             v = saturate(1.0 - (1.0 - v * XE_GTAO_OCCLUSION_TERM_SCALE) * 8.0);
          outputTexture[dpix] = v; // the ambient multiplies its lighting by it, so the ambient light shows v
 #else
