@@ -433,8 +433,10 @@ public:
       luma_data_cbuffer_index = 12;
 
       default_luma_global_game_settings.Exposure = 1.f;
+      default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
       default_luma_global_game_settings.HighlightsDesaturation = 0.f;
+      default_luma_global_game_settings.ColorGradingIntensity = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f; // Peak ~165 nits
@@ -723,8 +725,10 @@ public:
    {
       auto& settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, NAME, "Exposure", settings.Exposure);
+      reshade::get_config_value(nullptr, NAME, "Contrast", settings.Contrast);
       reshade::get_config_value(nullptr, NAME, "Saturation", settings.Saturation);
       reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", settings.HighlightsDesaturation);
+      reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", settings.ColorGradingIntensity);
       reshade::get_config_value(nullptr, NAME, "Dithering", settings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", settings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", settings.VideoAutoHDRBoost);
@@ -748,8 +752,10 @@ public:
 
       ImGui::SeparatorText("Grade");
       slider("Exposure", "Exposure", &settings.Exposure, defaults.Exposure, 2.f, "Overall image brightness (1 = vanilla).");
+      slider("Contrast", "Contrast", &settings.Contrast, defaults.Contrast, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
       slider("Saturation", "Saturation", &settings.Saturation, defaults.Saturation, 2.f, "Color saturation, HDR only (1 = vanilla).");
       slider("Highlights Desaturation", "HighlightsDesaturation", &settings.HighlightsDesaturation, defaults.HighlightsDesaturation, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+      slider("Color Grading Intensity", "ColorGradingIntensity", &settings.ColorGradingIntensity, defaults.ColorGradingIntensity, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       // Returns whether the toggle is on
       const auto toggle = [&](const char* label, const char* key, float* value, float default_value, const char* tooltip)

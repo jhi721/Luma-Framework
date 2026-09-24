@@ -56,15 +56,16 @@ Texture3D<float4> ColorGradingLUT : register(t4);
 RWTexture2D<float4> TonemappedOutput : register(u0);
 SamplerState Sampler_Linear_CC : register(s2);
 
-// Saturation (TintColor.w) and LUT, on curve output code values.
+// Saturation (TintColor.w) and LUT, on curve output code values. ColorGradingIntensity 0 leaves the curve output
+// ungraded; the HDR working value goes through here too, so it stays consistent with the reference.
 float3 SRTTR_Grade(float3 code)
 {
    const float grey = dot(float3(0.3, 0.59, 0.11), code);
-   code = TintColor.w * (code - grey) + grey;
+   float3 graded = TintColor.w * (code - grey) + grey;
 #if SRTTR_TM_HAS_LUT
-   code = ColorGradingLUT.SampleLevel(Sampler_Linear_CC, code, 0).rgb;
+   graded = ColorGradingLUT.SampleLevel(Sampler_Linear_CC, graded, 0).rgb;
 #endif
-   return code;
+   return lerp(code, graded, LumaSettings.GameSettings.ColorGradingIntensity);
 }
 
 // ====================== HDR luminance reconstruction ======================
@@ -257,6 +258,13 @@ groupshared float3 gContinuation;
       if (SRTTR_TryBuildWorkingLuminance(curveInput, curveCode, gContinuation, workLuminance))
       {
          recovered = SRTTR_NativeColorAtLuminance(sdrLinear, workLuminance);
+      }
+
+      // Contrast before DICE so the rolloff contains what it pushes up; [branch] keeps 1.0 bit-exact, and the floored
+      // log2 makes Contrast 0 on black 0 rather than pow(0, 0) = NaN (as Luma_BL2TPS_Tonemap.hlsl).
+      [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
+      {
+         recovered = exp2(LumaSettings.GameSettings.Contrast * log2(max(recovered / MidGray, 1e-30))) * MidGray;
       }
 
       const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
