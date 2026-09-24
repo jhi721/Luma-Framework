@@ -6,11 +6,16 @@
 // - Runs right before the ambient draw, on its own inputs: t0 full-res D24 hardware depth (standard Z), t1 full-res
 //   r16g16_unorm Lambert azimuthal view-space normals, and its cb10 AMBIENT_PARAMS (rebound PS -> CS b10).
 // - The final denoise writes the ambient's t2 (the game's full-res r8_unorm SSAO texture) in place of the vanilla
-//   chain, which is skipped. The ambient multiplies its lighting by the value, so it is VISIBILITY (1 = open), scaled
-//   by the vanilla white point.
+//   chain, which is skipped. The ambient multiplies its lighting by the value, so it is VISIBILITY (1 = open, as the
+//   vanilla chain's unoccluded output measures).
 // - Depth and NDC->view use the ambient's own formulas: viewZ = P._43 / (d - P._33),
 //   view.xy = (ndc - (P._31, P._32)) * viewZ / (P._11, P._22) (P._31/P._32 carry the TAA jitter, so it is removed).
+// - Normals: XE_GTAO_GENERATE_NORMALS 1 (default) derives them from depth, like the depth-only vanilla SSAO. The G-buffer ones
+//   carry the normal maps, so fine surface detail (gravel, slats, rivets) got occluded too: 1.6-1.7x the vanilla darkening in
+//   detailed scenes against ~1.1x in plain ones. 0 uses the G-buffer normals.
 // - NoiseIndexRT is the frame index while a temporal AA (TAA, DLAA, FSR) accumulates, 0 (frozen pattern) otherwise.
+
+#include "Includes/Common.hlsl"
 
 // --- Game constant buffer: the ambient's AMBIENT_PARAMS (main.cpp binds its range at CS b10) ---
 
@@ -19,17 +24,13 @@ cbuffer AmbientParams : register(b10)
    float4 Projection[4]; // Rows: c0.x P._11, c1.y P._22, c2.xyz P._31 P._32 P._33, c3.z P._43
 }
 
-// --- Luma runtime knobs (set from main.cpp; live-tunable via DEV sliders, no recompile) ---
-// b9, not b11: core's DrawBloom owns b11 for its own constants. Mirrored by gtao_knobs_cb_slot.
-cbuffer LumaGTAO : register(b9)
-{
-   float FinalValuePowerRT;    // primary darkness dial
-   float NoiseIndexRT;         // temporal noise index (0 = frozen)
-   float RadiusOverrideRT;     // > 0 overrides EFFECT_RADIUS (metres)
-   float DebugViewRT;          // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
-   float2 ViewportPixelSizeRT; // 1 / AO resolution, set by main.cpp
-   float2 PaddingRT;
-}
+// --- Luma runtime knobs (LumaData custom data, set by main.cpp; live-tunable via DEV sliders, no recompile) ---
+#define NoiseIndexRT      LumaData.CustomData1        // temporal noise index (0 = frozen)
+#define DebugViewRT       float(LumaData.CustomData2) // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
+#define FinalValuePowerRT LumaData.CustomData3        // primary darkness dial
+#define RadiusOverrideRT  LumaData.CustomData4        // > 0 overrides EFFECT_RADIUS (metres)
+
+static float2 ViewportPixelSize; // 1 / AO resolution, set by each entry point that uses it
 
 #if XE_GTAO_QUALITY == 0 // Low
 #define SLICE_COUNT 4.0
@@ -46,16 +47,28 @@ cbuffer LumaGTAO : register(b9)
 // User configurable
 //
 
-#ifndef NORMAL_Z_SIGN
-#define NORMAL_Z_SIGN 1.0 // the game's decoded normal as is; -1 flips z if the Normals debug view proves the convention inverted
-#endif
-
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.5 // Intel default, metres (near plane 0.15). The native AO has a screen-space radius (MiniEngine, 10 px at 1920 wide per hierarchy level), so there is no world radius to anchor to. RadiusOverrideRT > 0 wins.
+#define EFFECT_RADIUS 0.4 // Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant). With FinalValuePowerRT 1.4 and depth normals it matches the vanilla SSAO on 5 scenes (offline sim of this shader, _tools/srttr/gtao_sim.py): darkening 0.99-1.10x, contacts 0.71-0.80x, coverage +1-7 pp. RadiusOverrideRT > 0 wins.
 #endif
 
-#ifndef VANILLA_WHITE_POINT
-#define VANILLA_WHITE_POINT 0.929 // The native chain's unoccluded output (0.9756^3: accentuation 0.025 through three blend-upsamples), which the vanilla ambient levels are balanced against
+// The vanilla SSAO (MiniEngine) has a screen-space radius (10 px at 1920 wide per hierarchy level), so its world radius grows with
+// distance. A constant world radius matched it only at mid range: on the SSAO texture dumps of two scenes it was 1.9-3.2x darker at
+// 3-6 m and 0.8-1.3x at 12-25 m. So the radius scales with view depth, pivoting at the scenes' median depth, within limits (Prey's
+// heuristic only grows it with distance; here it also shrinks near the camera, as the vanilla one does).
+#ifndef XE_GTAO_GENERATE_NORMALS
+#define XE_GTAO_GENERATE_NORMALS 1 // Mirrors the Luma define's default
+#endif
+
+#ifndef RADIUS_REFERENCE_DEPTH
+#define RADIUS_REFERENCE_DEPTH 8.0 // Metres
+#endif
+
+#ifndef RADIUS_DEPTH_SCALE_MIN
+#define RADIUS_DEPTH_SCALE_MIN 0.25 // Below 2 m the radius stays at 1/4
+#endif
+
+#ifndef RADIUS_DEPTH_SCALE_MAX
+#define RADIUS_DEPTH_SCALE_MAX 8.0 // Beyond 64 m the radius stays at 8x
 #endif
 
 #ifndef RADIUS_MULTIPLIER
@@ -74,16 +87,8 @@ cbuffer LumaGTAO : register(b9)
 #define THIN_OCCLUDER_COMPENSATION 0.0 // Default 0.0; > 0 causes more mistakes than it fixes on big geometry
 #endif
 
-#ifndef FINAL_VALUE_POWER
-#define FINAL_VALUE_POWER 2.2 // Default 2.2; shadow default for FinalValuePowerRT (the CB value is what actually applies)
-#endif
-
 #ifndef DEPTH_MIP_SAMPLING_OFFSET
 #define DEPTH_MIP_SAMPLING_OFFSET 3.3 // Default 3.3
-#endif
-
-#ifndef SLICE_COUNT
-#define SLICE_COUNT 3.0 // Default 3.0
 #endif
 
 #ifndef STEPS_PER_SLICE
@@ -96,7 +101,7 @@ cbuffer LumaGTAO : register(b9)
 
 //
 
-#define VIEWPORT_PIXEL_SIZE ViewportPixelSizeRT
+#define VIEWPORT_PIXEL_SIZE ViewportPixelSize
 
 // Transcribed from the ambient: ndc = (uv.x*2-1, 1-2*uv.y), view.xy = (ndc - (P._31, P._32)) * viewZ / (P._11, P._22).
 // Expressed as the XeGTAO mul/add pair over raw uv: viewPos.xy = (uv * MUL + ADD) * viewZ.
@@ -123,9 +128,10 @@ float XeGTAO_ClampDepth(float depth)
    return clamp(depth, 0.0, 3.402823466e+38);
 }
 
-float XeGTAO_EffectRadius()
+float XeGTAO_EffectRadius(float viewspaceZ)
 {
-   return (RadiusOverrideRT > 0.0 ? RadiusOverrideRT : EFFECT_RADIUS) * RADIUS_MULTIPLIER;
+   const float depthScale = clamp(viewspaceZ / RADIUS_REFERENCE_DEPTH, RADIUS_DEPTH_SCALE_MIN, RADIUS_DEPTH_SCALE_MAX);
+   return (RadiusOverrideRT > 0.0 ? RadiusOverrideRT : EFFECT_RADIUS) * RADIUS_MULTIPLIER * depthScale;
 }
 
 // weighted average depth filter
@@ -134,7 +140,7 @@ float XeGTAO_DepthMIPFilter(float depth0, float depth1, float depth2, float dept
    float maxDepth = max(max(depth0, depth1), max(depth2, depth3));
 
    const float depthRangeScaleFactor = 0.75; // found empirically :)
-   const float effectRadius = depthRangeScaleFactor * XeGTAO_EffectRadius();
+   const float effectRadius = depthRangeScaleFactor * XeGTAO_EffectRadius(maxDepth);
    const float falloffRange = EFFECT_FALLOFF_RANGE * effectRadius;
    const float falloffFrom = effectRadius * (1.0 - EFFECT_FALLOFF_RANGE);
 
@@ -249,6 +255,22 @@ float3 XeGTAO_ComputeViewspacePosition(float2 screenPos, float viewspaceDepth)
    return ret;
 }
 
+float3 XeGTAO_CalculateNormal(const float4 edgesLRTB, const float3 pixCenterPos, float3 pixLPos, float3 pixRPos, float3 pixTPos, float3 pixBPos)
+{
+   // Get this pixel's viewspace normal
+   float4 acceptedNormals = saturate(float4(edgesLRTB.x * edgesLRTB.z, edgesLRTB.z * edgesLRTB.y, edgesLRTB.y * edgesLRTB.w, edgesLRTB.w * edgesLRTB.x) + 0.01);
+
+   pixLPos = normalize(pixLPos - pixCenterPos);
+   pixRPos = normalize(pixRPos - pixCenterPos);
+   pixTPos = normalize(pixTPos - pixCenterPos);
+   pixBPos = normalize(pixBPos - pixCenterPos);
+
+   float3 pixelNormal = acceptedNormals.x * cross(pixLPos, pixTPos) + acceptedNormals.y * cross(pixTPos, pixRPos) + acceptedNormals.z * cross(pixRPos, pixBPos) + acceptedNormals.w * cross(pixBPos, pixLPos);
+   pixelNormal = normalize(pixelNormal);
+
+   return pixelNormal;
+}
+
 // http://h14s.p5r.org/2012/09/0x5f3759df.html, [Drobot2014a] Low Level Optimizations for GCN, https://blog.selfshadow.com/publications/s2016-shading-course/activision/s2016_pbs_activision_occlusion.pdf slide 63
 float XeGTAO_FastSqrt(float x)
 {
@@ -285,6 +307,15 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
    float4 edgesLRTB = XeGTAO_CalculateEdges(viewspaceZ, pixLZ, pixRZ, pixTZ, pixBZ);
    const float edges = XeGTAO_PackEdges(edgesLRTB);
 
+#if XE_GTAO_GENERATE_NORMALS
+   const float3 CENTER = XeGTAO_ComputeViewspacePosition(normalizedScreenPos, viewspaceZ);
+   const float3 LEFT = XeGTAO_ComputeViewspacePosition(normalizedScreenPos + float2(-1.0, 0.0) * VIEWPORT_PIXEL_SIZE, pixLZ);
+   const float3 RIGHT = XeGTAO_ComputeViewspacePosition(normalizedScreenPos + float2(1.0, 0.0) * VIEWPORT_PIXEL_SIZE, pixRZ);
+   const float3 TOP = XeGTAO_ComputeViewspacePosition(normalizedScreenPos + float2(0.0, -1.0) * VIEWPORT_PIXEL_SIZE, pixTZ);
+   const float3 BOTTOM = XeGTAO_ComputeViewspacePosition(normalizedScreenPos + float2(0.0, 1.0) * VIEWPORT_PIXEL_SIZE, pixBZ);
+   viewspaceNormal = XeGTAO_CalculateNormal(edgesLRTB, CENTER, LEFT, RIGHT, TOP, BOTTOM);
+#endif
+
 #if DEVELOPMENT
    // Debug views (visible on screen through the game's own AO blur/apply chain; the final denoise passes
    // raw values through when DebugViewRT > 0).
@@ -308,7 +339,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
 
 #if DEVELOPMENT
    // 2 = normals view-facing term, before the correction below: surfaces facing the camera are bright,
-   // black everywhere means NORMAL_Z_SIGN is inverted.
+   // black everywhere means the normal z convention is inverted.
    if (DebugViewRT >= 1.5 && DebugViewRT < 2.5)
    {
       outWorkingAOTermAndEdges[pixCoord] = float2(saturate(dot(viewspaceNormal, viewVec)), 1.0);
@@ -319,7 +350,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
    // prevents normals that are facing away from the view vector - xeGTAO struggles with extreme cases
    viewspaceNormal = normalize(viewspaceNormal + max(0, -dot(viewspaceNormal, viewVec)) * viewVec);
 
-   const float effectRadius = XeGTAO_EffectRadius();
+   const float effectRadius = XeGTAO_EffectRadius(viewspaceZ);
    const float sampleDistributionPower = SAMPLE_DISTRIBUTION_POWER;
    const float thinOccluderCompensation = THIN_OCCLUDER_COMPENSATION;
    const float falloffRange = EFFECT_FALLOFF_RANGE * effectRadius;
@@ -620,7 +651,7 @@ void XeGTAO_Denoise(uint2 pixCoordBase, Texture2D sourceAOTermAndEdges, SamplerS
       aoTerm[side] = sum / sumWeight;
 
 #if XE_GTAO_FINAL_APPLY
-      outputTexture[pixCoord] = saturate(aoTerm[side] * XE_GTAO_OCCLUSION_TERM_SCALE) * VANILLA_WHITE_POINT;
+      outputTexture[pixCoord] = saturate(aoTerm[side] * XE_GTAO_OCCLUSION_TERM_SCALE);
 #else
       outputTexture[pixCoord] = float2(aoTerm[side], side == 0 ? edgesQ0.y : edgesQ1.x);
 #endif
@@ -697,17 +728,27 @@ float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
         [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void main_pass_cs(uint2 dtid : SV_DispatchThreadID)
 {
    // tex0 = prefiltered viewspace depth MIP pyramid (our R32F), smp = point-clamp.
+   float2 size;
+   tex0.GetDimensions(size.x, size.y);
+   ViewportPixelSize = rcp(size);
+#if XE_GTAO_GENERATE_NORMALS
+   const float3 viewspaceNormal = 0.0; // Generated from depth in the main pass
+#else
    // The game's Lambert azimuthal decode (the ambient's): e = t*2-1, f = |e|^2,
    // n = (e * 2*sqrt(1-f), 2f-1), in the same view space as the positions.
    const float2 e = normals.Load(int3(dtid, 0)) * 2.0 - 1.0;
    const float f = min(dot(e, e), 1.0);
-   const float3 viewspaceNormal = float3(e * (2.0 * sqrt(1.0 - f)), (2.0 * f - 1.0) * NORMAL_Z_SIGN);
-   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, uint(NoiseIndexRT)), viewspaceNormal, tex0, smp, ao_term_and_edges);
+   const float3 viewspaceNormal = float3(e * (2.0 * sqrt(1.0 - f)), 2.0 * f - 1.0);
+#endif
+   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, NoiseIndexRT), viewspaceNormal, tex0, smp, ao_term_and_edges);
 }
 
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void denoise_pass_cs(uint2 dtid : SV_DispatchThreadID) {
    // tex0 = g_srcWorkingAOTerm and g_srcWorkingEdges, packed
    // smp = point-clamp
+   float2 size;
+   tex0.GetDimensions(size.x, size.y);
+   ViewportPixelSize = rcp(size);
    const uint2 pix_coord_base = dtid * uint2(2, 1); // we're computing 2 horizontal pixels at a time (performance optimization)
    XeGTAO_Denoise(pix_coord_base, tex0, smp, final_output);
 }

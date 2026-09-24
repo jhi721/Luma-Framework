@@ -33,14 +33,14 @@ float SRTTR_SceneToUIScale()
 }
 
 // Anti-banding dither at the last scene pass, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020
-// PQ in HDR. The input is gamma code with 1 = UI paper white (UI_DRAW_TYPE 2).
+// PQ in HDR and SDR on HDR (as the other Luma mods). The input is gamma code with 1 = UI paper white (UI_DRAW_TYPE 2).
 void SRTTR_DitherOutput(inout float3 color, float2 uv)
 {
    if (LumaSettings.GameSettings.Dithering <= 0.5)
    {
       return;
    }
-   if (LumaSettings.DisplayMode != 1)
+   if (LumaSettings.DisplayMode == 0)
    {
       ApplyDithering(color, uv, true, 1.0, 8u, LumaSettings.FrameIndex, true);
       return;

@@ -20,6 +20,8 @@ struct LumaGameSettings
    float VignetteIntensity;      // 1 = vanilla, 0 = none. Scales the tonemap's VignetteAmount.
    float FilmGrainIntensity;     // 1 = vanilla, 0 = off. Scales the compose's NoiseLevel.
    float Dithering;              // 0/1. Output dither in the compose passes; replaces the vanilla SDR Bayer dither.
+   float VideoAutoHDREnable;     // 0/1. AutoHDR on the fullscreen Bink movies (HDR only).
+   float VideoAutoHDRBoost;      // 0-1. Video AutoHDR peak, from SDR white to its maximum.
    float HideGameplayUI;         // 0/1. The scene compose skips the GUI layer (menus keep it). Not saved.
 };
 

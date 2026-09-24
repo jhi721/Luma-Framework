@@ -200,9 +200,9 @@ namespace
 
    // hdr_filter compose perms, the last draw of the frame (scene and GUI layer onto the swapchain). Every HDR_DISPLAY one is replaced by the SDR perm's math,
    // so the game's HDR setting does not change the output. The first ones compose the scene, the GUI only ones run in menus (the SDR GUI only one,
-   // 0xA283B6FB, stays vanilla).
+   // 0xA283B6FB, is redirected too, to add the menu video layer).
    constexpr uint32_t compose_hashes[] = {0xFCCD77CD, 0xADB2056B, 0xEB9D7036, 0x50DC2D70, 0x7083C926, 0xCE7FF710, 0xA11A22A3, 0x681958CA, 0x3D126636};
-   constexpr uint32_t compose_gui_hashes[] = {0x79D0B6FF, 0x8DFF00F4, 0x3EA6C5A9, 0x1AD38FF6, 0xDEEDDD60, 0x281056F7, 0x818B5759, 0xC165ACD1};
+   constexpr uint32_t compose_gui_hashes[] = {0x79D0B6FF, 0x8DFF00F4, 0x3EA6C5A9, 0x1AD38FF6, 0xDEEDDD60, 0x281056F7, 0x818B5759, 0xC165ACD1, 0xA283B6FB};
 
    // hdr_filter tonemap CS perms (LUT and no LUT, with and without luminance output), run in every frame with a scene
    constexpr uint32_t tonemap_hashes[] = {0x941A9154, 0x835784B0, 0xAB466B4A, 0xFEDD50B7};
@@ -215,6 +215,11 @@ namespace
    // ambient, the pass that applies the SSAO: its t0 is the scene depth (R24), which is no longer bound at the FXAA draw, so it's kept for
    // SMAA's predication
    constexpr uint32_t ambient_hash = 0xFD45DCA7;
+   // rl_prim_2d_bink_s_01, the Bink video: fullscreen movies draw it straight into the swapchain (the frame's only draw), where its
+   // replacement adds AutoHDR. Menu backgrounds draw it into the RGBA8 GUI layer before the UI; with AutoHDR on, those draws go
+   // to a Luma FP16 video layer instead, which the GUI-only compose puts under the GUI layer (t8).
+   constexpr uint32_t video_hash = 0xE85564EB;
+   constexpr UINT video_layer_compose_slot = 8;
    constexpr uint32_t smaa_linearize_shader_hash = CompileTimeStringHash("SRTTR SMAA Linearize CS");
    constexpr uint32_t smaa_predication_shader_hash = CompileTimeStringHash("SRTTR SMAA Predication CS");
    bool g_smaa_enable = true;
@@ -230,12 +235,16 @@ namespace
    constexpr uint32_t ssao_prepare_1_hash = 0x2F4B251B;
    constexpr uint32_t ssao_chain_hashes[] = {ssao_prepare_1_hash, 0xAC38984B, 0x1DEB634A, 0xDE09F597, 0x23EF0DBA, 0x7378361E, 0x07B179C3, 0x7281BC27};
    constexpr UINT ambient_params_cb_slot = 10; // AMBIENT_PARAMS, rebound PS -> CS for XeGTAO
-   constexpr UINT gtao_knobs_cb_slot = 9;      // "register(b9)" in Luma_SRTTR_XeGTAO.hlsl; b11 is core DrawBloom's
    bool g_gtao_enable = true;
+   // Calibration knobs, development builds tune them (not persisted)
 #if DEVELOPMENT
-   float g_gtao_final_value_power = 2.2f; // Calibration knobs, not persisted
+   float g_gtao_final_value_power = 1.4f; // Matched to the vanilla SSAO with EFFECT_RADIUS 0.4 and depth normals (_tools/srttr/gtao_sim.py over 5 scenes)
    float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (metres)
    int g_gtao_debug_view = 0;             // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges
+#else
+   constexpr float g_gtao_final_value_power = 1.4f;
+   constexpr float g_gtao_radius_override = 0.f;
+   constexpr int g_gtao_debug_view = 0;
 #endif
 
    // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
@@ -524,38 +533,33 @@ struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
    // This frame's scene depth, from the ambient pass (reset every present)
    com_ptr<ID3D11ShaderResourceView> smaa_depth_srv;
 
-   // XeGTAO scratch at the SSAO texture's size, and a UAV on the game's SSAO texture (the resource is held so its address can't be reused)
-   com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5]; // R32F view space depth pyramid
-   com_ptr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
-   com_ptr<ID3D11UnorderedAccessView> gtao_working_uavs[2]; // R8G8_UNORM AO + edges ping-pong
-   com_ptr<ID3D11ShaderResourceView> gtao_working_srvs[2];
+   // XeGTAO scratch at the SSAO texture's size
+   struct GTAOScratch
+   {
+      com_ptr<ID3D11UnorderedAccessView> depth_mip_uavs[5]; // R32F view space depth pyramid
+      com_ptr<ID3D11ShaderResourceView> depth_mips_srv;
+      com_ptr<ID3D11UnorderedAccessView> working_uavs[2]; // R8G8_UNORM AO + edges ping-pong
+      com_ptr<ID3D11ShaderResourceView> working_srvs[2];
+      UINT width = 0;
+      UINT height = 0;
+   } gtao_scratch;
+   // A UAV on the game's SSAO texture (the resource is held so its address can't be reused)
    com_ptr<ID3D11Resource> gtao_ssao_texture;
    com_ptr<ID3D11UnorderedAccessView> gtao_ssao_uav;
-   UINT gtao_width = 0;
-   UINT gtao_height = 0;
-   com_ptr<ID3D11Buffer> gtao_knobs_cb; // immutable, recreated when a knob changes
-   float gtao_knobs[8] = {};
    bool ssao_chain_ran_this_frame = false; // the game's SSAO is on (any level but Off)
    bool gtao_tried_this_frame = false;
    bool gtao_succeeded = false;         // on the last try: the vanilla chain is skipped while true
    bool temporal_aa_this_frame = false; // the game's TAA pass ran (vanilla, DLAA or FSR 3)
-   bool temporal_aa_last_frame = false;
 
-   void ReleaseGTAOScratch()
-   {
-      for (auto& uav : gtao_depth_mip_uavs)
-         uav = nullptr;
-      gtao_depth_mips_srv = nullptr;
-      for (auto& uav : gtao_working_uavs)
-         uav = nullptr;
-      for (auto& srv : gtao_working_srvs)
-         srv = nullptr;
-      gtao_ssao_texture = nullptr;
-      gtao_ssao_uav = nullptr;
-      gtao_knobs_cb = nullptr;
-      gtao_width = 0;
-      gtao_height = 0;
-   }
+   // The menu Bink video layer, cleared by the first video draw of each frame
+   com_ptr<ID3D11Texture2D> video_layer;
+   com_ptr<ID3D11RenderTargetView> video_layer_rtv;
+   com_ptr<ID3D11ShaderResourceView> video_layer_srv;
+   bool video_drawn = false;
+   com_ptr<ID3D11Resource> video_gui_layer; // The GUI layer the video left
+   // The game's UI blend states with "over" alpha (A = a + A * (1 - a)) instead of added alpha, by original state (held, so its
+   // address can't be reused)
+   std::unordered_map<ID3D11BlendState*, std::pair<com_ptr<ID3D11BlendState>, com_ptr<ID3D11BlendState>>> over_alpha_blend_states;
 
 #if ENABLE_SR
    // SR inputs converted from the game's TAA ones
@@ -580,6 +584,7 @@ public:
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (reference)\n1 - HDR: native grade + reconstructed luminance + DICE display map", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
+         {"XE_GTAO_GENERATE_NORMALS", '1', true, false, "XeGTAO normals\n0 - G-buffer (includes normal maps: fine surface detail gets occluded too)\n1 - From depth (geometry only, like the vanilla SSAO)", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -604,6 +609,8 @@ public:
       default_luma_global_game_settings.VignetteIntensity = 1.f;
       default_luma_global_game_settings.FilmGrainIntensity = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;
+      default_luma_global_game_settings.VideoAutoHDREnable = 1.f;
+      default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       default_luma_global_game_settings.HideGameplayUI = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
@@ -756,7 +763,7 @@ public:
    // XeGTAO right before the ambient draw, on its inputs (t0 depth, t1 view space normals, cb10 AMBIENT_PARAMS for this frame's projection):
    // prefilter, main pass and two denoisers, the last one writing the ambient's t2 (the game's SSAO texture) through a UAV. Returns false,
    // and the SSAO keeps its previous content, when an input, a shader or the scratch is missing.
-   bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool& updated_cbuffers)
    {
       // Held through the dispatches so a shader reload cannot release them mid-use
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
@@ -789,41 +796,42 @@ public:
          return false;
 
       auto& game_device_data = GetGameDeviceData(device_data);
-      if (game_device_data.gtao_width != width || game_device_data.gtao_height != height)
+      auto& scratch = game_device_data.gtao_scratch;
+      if (scratch.width != width || scratch.height != height)
       {
-         game_device_data.ReleaseGTAOScratch();
+         scratch = {};
          D3D11_TEXTURE2D_DESC desc = {};
          desc.Width = width;
          desc.Height = height;
-         desc.MipLevels = ARRAYSIZE(game_device_data.gtao_depth_mip_uavs); // XE_GTAO_DEPTH_MIP_LEVELS
+         desc.MipLevels = ARRAYSIZE(scratch.depth_mip_uavs); // XE_GTAO_DEPTH_MIP_LEVELS
          desc.ArraySize = 1;
          desc.Format = DXGI_FORMAT_R32_FLOAT;
          desc.SampleDesc.Count = 1;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
          com_ptr<ID3D11Texture2D> depth_mips_texture;
-         bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(depth_mips_texture.get(), nullptr, &game_device_data.gtao_depth_mips_srv));
+         bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(depth_mips_texture.get(), nullptr, &scratch.depth_mips_srv));
          D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
          uav_desc.Format = desc.Format;
          uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
          for (UINT mip = 0; ok && mip < desc.MipLevels; mip++)
          {
             uav_desc.Texture2D.MipSlice = mip;
-            ok = SUCCEEDED(native_device->CreateUnorderedAccessView(depth_mips_texture.get(), &uav_desc, &game_device_data.gtao_depth_mip_uavs[mip]));
+            ok = SUCCEEDED(native_device->CreateUnorderedAccessView(depth_mips_texture.get(), &uav_desc, &scratch.depth_mip_uavs[mip]));
          }
          desc.MipLevels = 1;
          desc.Format = DXGI_FORMAT_R8G8_UNORM;
          for (int i = 0; ok && i < 2; i++)
          {
             com_ptr<ID3D11Texture2D> working_texture;
-            ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &working_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(working_texture.get(), nullptr, &game_device_data.gtao_working_uavs[i])) && SUCCEEDED(native_device->CreateShaderResourceView(working_texture.get(), nullptr, &game_device_data.gtao_working_srvs[i]));
+            ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &working_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(working_texture.get(), nullptr, &scratch.working_uavs[i])) && SUCCEEDED(native_device->CreateShaderResourceView(working_texture.get(), nullptr, &scratch.working_srvs[i]));
          }
          if (!ok)
          {
-            game_device_data.ReleaseGTAOScratch();
+            scratch = {};
             return false;
          }
-         game_device_data.gtao_width = width;
-         game_device_data.gtao_height = height;
+         scratch.width = width;
+         scratch.height = height;
       }
       // The vanilla final upsample writes the SSAO texture as a UAV, so it has the bind flag
       if (game_device_data.gtao_ssao_texture != ssao_texture)
@@ -839,52 +847,21 @@ public:
       if (!game_device_data.gtao_ssao_uav)
          return false;
 
-#if DEVELOPMENT
-      const float final_value_power = g_gtao_final_value_power;
-      const float radius_override = g_gtao_radius_override;
-      const float debug_view = float(g_gtao_debug_view);
-#else
-      const float final_value_power = 2.2f;
-      const float radius_override = 0.f;
-      const float debug_view = 0.f;
-#endif
-      // The noise pattern cycles only when a temporal AA accumulates it, otherwise it would boil
-      const float noise_index = game_device_data.temporal_aa_last_frame ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f;
-      const float knobs[8] = {final_value_power, noise_index, radius_override, debug_view, 1.f / float(width), 1.f / float(height), 0.f, 0.f};
-      if (!game_device_data.gtao_knobs_cb)
-      {
-         D3D11_BUFFER_DESC cb_desc = {};
-         cb_desc.ByteWidth = sizeof(knobs);
-         cb_desc.Usage = D3D11_USAGE_DYNAMIC;
-         cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-         cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-         if (FAILED(native_device->CreateBuffer(&cb_desc, nullptr, &game_device_data.gtao_knobs_cb)))
-            return false;
-         game_device_data.gtao_knobs[0] = -1.f; // Force the first upload
-      }
-      if (std::memcmp(game_device_data.gtao_knobs, knobs, sizeof(knobs)) != 0)
-      {
-         D3D11_MAPPED_SUBRESOURCE mapped = {};
-         if (FAILED(native_device_context->Map(game_device_data.gtao_knobs_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-            return false;
-         std::memcpy(mapped.pData, knobs, sizeof(knobs));
-         native_device_context->Unmap(game_device_data.gtao_knobs_cb.get(), 0);
-         std::memcpy(game_device_data.gtao_knobs, knobs, sizeof(knobs));
-      }
-
       {
          DrawStateStack<DrawStateStackType::Compute> compute_state;
          compute_state.Cache(native_device_context, device_data.uav_max_count);
          ID3D11Buffer* const ambient_params_cb = ambient_params.get();
          native_device_context1->CSSetConstantBuffers1(ambient_params_cb_slot, 1, &ambient_params_cb, &ambient_params_first, &ambient_params_count);
-         ID3D11Buffer* const knobs_cb = game_device_data.gtao_knobs_cb.get();
-         native_device_context->CSSetConstantBuffers(gtao_knobs_cb_slot, 1, &knobs_cb);
+         // The noise pattern cycles only when a temporal AA accumulated last frame (the ambient runs before this frame's TAA), otherwise it would boil
+         const uint32_t noise_index = device_data.taa_detected ? cb_luma_global_settings.FrameIndex % 64 : 0;
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData, noise_index, uint32_t(g_gtao_debug_view), g_gtao_final_value_power, g_gtao_radius_override);
+         updated_cbuffers = true;
          ID3D11SamplerState* const point_sampler = device_data.sampler_state_point.get();
          native_device_context->CSSetSamplers(0, 1, &point_sampler);
 
          // Each pass binds its destination UAV before its source SRVs: D3D11 otherwise nulls an SRV that still aliases the previous pass's bound UAV
          ID3D11ShaderResourceView* const null_srvs[2] = {};
-         ID3D11UnorderedAccessView* const null_uavs[ARRAYSIZE(game_device_data.gtao_depth_mip_uavs)] = {};
+         ID3D11UnorderedAccessView* const null_uavs[ARRAYSIZE(scratch.depth_mip_uavs)] = {};
          const auto pass = [&](uint32_t shader_name_hash, UINT uav_count, ID3D11UnorderedAccessView* const* uavs, ID3D11ShaderResourceView* const(&pass_srvs)[2], UINT groups_x, UINT groups_y)
          {
             native_device_context->CSSetShaderResources(0, 2, null_srvs);
@@ -894,19 +871,93 @@ public:
             native_device_context->Dispatch(groups_x, groups_y, 1);
             native_device_context->CSSetUnorderedAccessViews(0, uav_count, null_uavs, nullptr);
          };
-         ID3D11UnorderedAccessView* const mip_uavs[] = {game_device_data.gtao_depth_mip_uavs[0].get(), game_device_data.gtao_depth_mip_uavs[1].get(), game_device_data.gtao_depth_mip_uavs[2].get(), game_device_data.gtao_depth_mip_uavs[3].get(), game_device_data.gtao_depth_mip_uavs[4].get()};
-         ID3D11UnorderedAccessView* const working_uavs[] = {game_device_data.gtao_working_uavs[0].get(), game_device_data.gtao_working_uavs[1].get()};
+         ID3D11UnorderedAccessView* const mip_uavs[] = {scratch.depth_mip_uavs[0].get(), scratch.depth_mip_uavs[1].get(), scratch.depth_mip_uavs[2].get(), scratch.depth_mip_uavs[3].get(), scratch.depth_mip_uavs[4].get()};
+         ID3D11UnorderedAccessView* const working_uavs[] = {scratch.working_uavs[0].get(), scratch.working_uavs[1].get()};
          ID3D11UnorderedAccessView* const ssao_uav = game_device_data.gtao_ssao_uav.get();
          pass("SRTTR XeGTAO Prefilter Depths CS"_h, ARRAYSIZE(mip_uavs), mip_uavs, {srvs[0].get(), nullptr}, (width + 15) / 16, (height + 15) / 16);
-         pass("SRTTR XeGTAO Main Pass CS"_h, 1, &working_uavs[0], {game_device_data.gtao_depth_mips_srv.get(), srvs[1].get()}, (width + 7) / 8, (height + 7) / 8);
-         pass("SRTTR XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
-         pass("SRTTR XeGTAO Denoise Pass 2 CS"_h, 1, &ssao_uav, {game_device_data.gtao_working_srvs[1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+         pass("SRTTR XeGTAO Main Pass CS"_h, 1, &working_uavs[0], {scratch.depth_mips_srv.get(), srvs[1].get()}, (width + 7) / 8, (height + 7) / 8);
+         pass("SRTTR XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {scratch.working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+         pass("SRTTR XeGTAO Denoise Pass 2 CS"_h, 1, &ssao_uav, {scratch.working_srvs[1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
          compute_state.Restore(native_device_context);
       }
 
       // Binding the SSAO as a UAV unbound it from the ambient's t2
       ID3D11ShaderResourceView* const ambient_srvs[] = {srvs[0].get(), srvs[1].get(), srvs[2].get()};
       native_device_context->PSSetShaderResources(0, ARRAYSIZE(ambient_srvs), ambient_srvs);
+      return true;
+   }
+
+   // Draws a menu Bink video into the FP16 video layer (the GUI layer's size, same blend and viewport) instead of the GUI layer, then
+   // gives the game its render target back. Returns false, and the video draws vanilla, when the layer can't be made.
+   bool DrawMenuVideoInVideoLayer(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, ID3D11RenderTargetView* gui_rtv, ID3D11DepthStencilView* dsv, std::function<void()>* original_draw_dispatch_func)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      com_ptr<ID3D11Resource> gui_layer;
+      gui_rtv->GetResource(&gui_layer);
+      game_device_data.video_gui_layer = gui_layer;
+      if (!game_device_data.video_layer || !AreResourcesEqual(game_device_data.video_layer.get(), gui_layer.get(), false))
+      {
+         game_device_data.video_layer_rtv = nullptr;
+         game_device_data.video_layer_srv = nullptr;
+         game_device_data.video_layer = CloneTexture<ID3D11Texture2D>(native_device, gui_layer.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, false, false);
+         if (!game_device_data.video_layer || FAILED(native_device->CreateRenderTargetView(game_device_data.video_layer.get(), nullptr, &game_device_data.video_layer_rtv)) || FAILED(native_device->CreateShaderResourceView(game_device_data.video_layer.get(), nullptr, &game_device_data.video_layer_srv)))
+         {
+            game_device_data.video_layer = nullptr; // The views are reset before the next creation
+            return false;
+         }
+      }
+      if (!game_device_data.video_drawn)
+      {
+         constexpr float transparent[4] = {};
+         native_device_context->ClearRenderTargetView(game_device_data.video_layer_rtv.get(), transparent);
+         game_device_data.video_drawn = true;
+      }
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 1);
+      ID3D11RenderTargetView* const video_layer_rtv = game_device_data.video_layer_rtv.get();
+      native_device_context->OMSetRenderTargets(1, &video_layer_rtv, dsv);
+      (*original_draw_dispatch_func)();
+      native_device_context->OMSetRenderTargets(1, &gui_rtv, dsv);
+      return true;
+   }
+
+   // The UI drawn into the GUI layer after a menu video moved to the video layer. Its blend adds up alpha (ONE, ONE), which vanilla
+   // saturated over the opaque video; without the video, compose needs the real coverage, 1 - prod(1 - a), to put the video back
+   // under the UI as vanilla blended it. So these draws run with "over" alpha. Returns false, and the draw runs vanilla, otherwise.
+   bool DrawUIWithOverAlpha(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, std::function<void()>* original_draw_dispatch_func)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      com_ptr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+      if (!rtv)
+         return false;
+      com_ptr<ID3D11Resource> target;
+      rtv->GetResource(&target);
+      com_ptr<ID3D11BlendState> blend_state;
+      float blend_factor[4];
+      UINT sample_mask;
+      native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
+      if (target != game_device_data.video_gui_layer || !blend_state)
+         return false;
+
+      auto& over_alpha = game_device_data.over_alpha_blend_states[blend_state.get()];
+      if (!over_alpha.first)
+      {
+         over_alpha.first = blend_state;
+         D3D11_BLEND_DESC desc;
+         blend_state->GetDesc(&desc);
+         auto& rt = desc.RenderTarget[0];
+         // Only the UI's "over" colour with added alpha; anything else stays vanilla (null)
+         if (rt.BlendEnable && rt.SrcBlendAlpha == D3D11_BLEND_ONE && rt.DestBlendAlpha == D3D11_BLEND_ONE && rt.BlendOpAlpha == D3D11_BLEND_OP_ADD)
+         {
+            rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+            native_device->CreateBlendState(&desc, &over_alpha.second);
+         }
+      }
+      if (!over_alpha.second)
+         return false;
+      native_device_context->OMSetBlendState(over_alpha.second.get(), blend_factor, sample_mask);
+      (*original_draw_dispatch_func)();
+      native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
       return true;
    }
 
@@ -935,7 +986,7 @@ public:
             auto& game_device_data = GetGameDeviceData(device_data);
             // Once per frame, and only when the game's SSAO is on
             if (g_gtao_enable && game_device_data.ssao_chain_ran_this_frame && !std::exchange(game_device_data.gtao_tried_this_frame, true))
-               game_device_data.gtao_succeeded = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && RunXeGTAO(native_device, native_device_context, device_data);
+               game_device_data.gtao_succeeded = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && RunXeGTAO(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers);
 #if DEVELOPMENT
             if (xegtao_log_frames_left > 0)
                LogAmbientInputs(native_device, native_device_context);
@@ -943,6 +994,41 @@ public:
             com_ptr<ID3D11ShaderResourceView> depth_srv;
             native_device_context->PSGetShaderResources(0, 1, &depth_srv);
             game_device_data.smaa_depth_srv = depth_srv;
+         }
+         else if (original_shader_hashes.Contains(video_hash, reshade::api::shader_stage::pixel))
+         {
+            com_ptr<ID3D11RenderTargetView> rtv;
+            com_ptr<ID3D11DepthStencilView> dsv;
+            native_device_context->OMGetRenderTargets(1, &rtv, &dsv);
+            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+            if (rtv)
+               rtv->GetDesc(&rtv_desc);
+            // Core only binds the Luma settings itself when the game leaves both cbuffers to it
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            updated_cbuffers = true;
+            // A menu video (GUI layer, no scene this frame) moves to the video layer, where AutoHDR highlights survive. The flag tells
+            // the shader its target keeps values above 1.
+            const bool menu_video_auto_hdr = rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && !device_data.has_drawn_main_post_processing && cb_luma_global_settings.DisplayMode == DisplayModeType::HDR && cb_luma_global_settings.GameSettings.VideoAutoHDREnable > 0.5f && original_draw_dispatch_func && *original_draw_dispatch_func;
+            if (!menu_video_auto_hdr || !DrawMenuVideoInVideoLayer(native_device, native_device_context, cmd_list_data, device_data, rtv.get(), dsv.get(), original_draw_dispatch_func))
+            {
+               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0);
+               return DrawOrDispatchOverrideType::None;
+            }
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         else if (GetGameDeviceData(device_data).video_drawn && original_draw_dispatch_func && *original_draw_dispatch_func && std::any_of(std::begin(compose_gui_hashes), std::end(compose_gui_hashes), [&](uint32_t hash)
+                                                                                                                                  { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); }))
+         {
+            ID3D11ShaderResourceView* const video_layer_srv = GetGameDeviceData(device_data).video_layer_srv.get();
+            native_device_context->PSSetShaderResources(video_layer_compose_slot, 1, &video_layer_srv);
+            (*original_draw_dispatch_func)();
+            ID3D11ShaderResourceView* const null_srv = nullptr;
+            native_device_context->PSSetShaderResources(video_layer_compose_slot, 1, &null_srv);
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         else if (GetGameDeviceData(device_data).video_drawn && original_draw_dispatch_func && *original_draw_dispatch_func && DrawUIWithOverAlpha(native_device, native_device_context, device_data, original_draw_dispatch_func))
+         {
+            return DrawOrDispatchOverrideType::Replaced;
          }
          else if (g_smaa_enable && original_shader_hashes.Contains(fxaa_pixel_shader_hash, reshade::api::shader_stage::pixel) && DrawSMAAInPlaceOfFXAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers))
          {
@@ -1122,9 +1208,10 @@ public:
 
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.smaa_depth_srv = nullptr;
+      game_device_data.video_drawn = false;
       game_device_data.ssao_chain_ran_this_frame = false;
       game_device_data.gtao_tried_this_frame = false;
-      game_device_data.temporal_aa_last_frame = std::exchange(game_device_data.temporal_aa_this_frame, false);
+      device_data.taa_detected = std::exchange(game_device_data.temporal_aa_this_frame, false);
       device_data.has_drawn_main_post_processing = false;
 #if ENABLE_SR
       // SR resolves more detail than the game's TAA, so sharpen texture sampling while it draws (-1 at native resolution).
@@ -1174,6 +1261,8 @@ public:
       reshade::get_config_value(nullptr, NAME, "VignetteIntensity", settings.VignetteIntensity);
       reshade::get_config_value(nullptr, NAME, "FilmGrainIntensity", settings.FilmGrainIntensity);
       reshade::get_config_value(nullptr, NAME, "Dithering", settings.Dithering);
+      reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", settings.VideoAutoHDREnable);
+      reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", settings.VideoAutoHDRBoost);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -1218,6 +1307,20 @@ public:
       ImGui::SeparatorText("Effects");
       slider("Vignette Intensity", "VignetteIntensity", &settings.VignetteIntensity, defaults.VignetteIntensity, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
       slider("Film Grain Intensity", "FilmGrainIntensity", &settings.FilmGrainIntensity, defaults.FilmGrainIntensity, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
+      bool video_auto_hdr = settings.VideoAutoHDREnable > 0.5f;
+      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
+      {
+         settings.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", settings.VideoAutoHDREnable);
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
+      if (DrawResetButton(settings.VideoAutoHDREnable, defaults.VideoAutoHDREnable, "VideoAutoHDREnable"))
+         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::BeginDisabled(!video_auto_hdr);
+      slider("Video HDR Boost", "VideoAutoHDRBoost", &settings.VideoAutoHDRBoost, defaults.VideoAutoHDRBoost, 1.f, "Video highlight strength (0 = off).");
+      ImGui::EndDisabled();
       bool dithering = settings.Dithering > 0.5f;
       if (ImGui::Checkbox("Dithering", &dithering))
       {
@@ -1302,10 +1405,10 @@ public:
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Midtone darkness of the occlusion (2.2 = Intel default). Not saved.");
+         ImGui::SetTooltip("Midtone darkness of the occlusion (1.4 = vanilla match, 2.2 = Intel default). Not saved.");
       ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("World radius in metres (0 = the shader's EFFECT_RADIUS). Not saved.");
+         ImGui::SetTooltip("Radius in metres at 8 m view depth, scaled with depth (0 = the shader's EFFECT_RADIUS). Not saved.");
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Written to the game's SSAO texture, so it shows through the ambient light. Not saved.");
