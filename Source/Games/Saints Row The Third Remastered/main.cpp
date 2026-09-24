@@ -24,35 +24,40 @@ namespace
       return base ? base + rva : nullptr;
    }
 
-   // The camera's TAA jitter counter starts near -2^24, and the pattern index is taken with a signed modulo ("and reg, 0x8000000N" + sign fixup),
-   // so the index is 0 or negative and only entry 0 of each pattern is ever used, every N frames (every other frame for the vanilla 2x pattern).
-   // Clearing the sign bit of each mask makes the index "counter & N", so every offset of the pattern cycles. High bytes of the 2x and 4x masks
-   // (the 8x pattern is replaced as a whole, see "SetHaltonJitterPattern()"):
-   constexpr uintptr_t jitter_index_mask_high_byte_rvas[] = {0x89BA06, 0x89B992};
    bool game_patches_applied = false;
 
-   // Always on, development builds can toggle it
+   // TAA jitter pattern (int, .data, static 1): 0 none, 1 D3D 2x MSAA, 2 4x, 3 8x (switch at 0x14089B886, indexed by the camera's +0x59C counter).
+   // The counter starts near -2^24, and the pattern index is taken with a signed modulo ("and reg, 0x8000000N" + sign fixup), so the index is 0 or
+   // negative and only entry 0 of each pattern is ever used, every N frames (every other frame for the vanilla 2x pattern).
+   constexpr uintptr_t jitter_mode_rva = 0x11ADBB0;
+   constexpr int32_t vanilla_jitter_mode = 1;
+   constexpr int32_t halton_jitter_mode = 3; // SR, see "InstallHaltonJitterPattern()"
+
+   int32_t* GetJitterMode()
+   {
+      return reinterpret_cast<int32_t*>(GetGameAddress(jitter_mode_rva));
+   }
+
+   // "Fix Native TAA Jitter": clearing the sign bit of the 2x and 4x masks (their high bytes) makes the index "counter & N", so every offset of the
+   // pattern cycles. The game's TAA is tuned for its 2x pattern: the 8x Halton one of SR makes it flicker.
+   constexpr uintptr_t jitter_index_mask_high_byte_rvas[] = {0x89BA06, 0x89B992};
+   bool g_fix_native_taa_jitter = true;
+
+   // Cheap when the bytes already match, so it can run every frame
    void SetJitterIndexFix(bool enable)
    {
+      const uint8_t mask_high_byte = enable ? 0x00 : 0x80;
       for (const uintptr_t rva : jitter_index_mask_high_byte_rvas)
       {
          const uint8_t* byte = GetGameAddress(rva);
          if (!byte || (*byte != 0x80 && *byte != 0x00))
             return;
       }
-      const uint8_t mask_high_byte = enable ? 0x00 : 0x80;
       for (const uintptr_t rva : jitter_index_mask_high_byte_rvas)
-         System::PatchMemory(GetGameAddress(rva), &mask_high_byte, 1);
-   }
-
-   // TAA jitter pattern (int, .data, static 1): 0 none, 1 D3D 2x MSAA, 2 4x, 3 8x (switch at 0x14089B886, indexed by the camera's +0x59C counter)
-   constexpr uintptr_t jitter_mode_rva = 0x11ADBB0;
-   constexpr int32_t vanilla_jitter_mode = 1;
-   constexpr int32_t sr_jitter_mode = 3;
-
-   int32_t* GetJitterMode()
-   {
-      return reinterpret_cast<int32_t*>(GetGameAddress(jitter_mode_rva));
+      {
+         if (uint8_t* byte = GetGameAddress(rva); *byte != mask_high_byte)
+            System::PatchMemory(byte, &mask_high_byte, 1);
+      }
    }
 
 #if ENABLE_SR
@@ -61,44 +66,35 @@ namespace
    // Offsets are in 1/16 pixels like the game's patterns (x right, y up). SR reads the resulting projection jitter back from the camera.
    constexpr uintptr_t jitter_pattern_8x_rva = 0x89B8B5;
    constexpr size_t jitter_pattern_8x_size = 0xD2;
-   std::array<uint8_t, jitter_pattern_8x_size> jitter_pattern_8x_original = {};
-   bool jitter_pattern_halton = false;
+   bool halton_jitter_mode_applied = false; // The game's current state: the mode is process wide, not per device
 
-   void SetHaltonJitterPattern(bool enable)
+   // Installed once, while the game still uses the 2x pattern, as the other camera thread might run the 8x one
+   void InstallHaltonJitterPattern()
    {
       uint8_t* block = GetGameAddress(jitter_pattern_8x_rva);
-      if (!block || enable == jitter_pattern_halton)
+      constexpr uint8_t expected[] = {0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, 0x25, 0x07, 0x00, 0x00, 0x80}; // mov eax, [rsi+0x59C]; and eax, 0x80000007
+      if (!block || std::memcmp(block, expected, sizeof(expected)) != 0)
          return;
-      if (enable)
+      std::array<uint8_t, jitter_pattern_8x_size> bytes;
+      std::memcpy(bytes.data(), block, jitter_pattern_8x_size); // The rest of the block stays original
+      // clang-format off
+      constexpr uint8_t code[] = {
+         0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, // mov eax, [rsi+0x59C]
+         0x83, 0xE0, 0x0F,                   // and eax, 15
+         0x48, 0x8D, 0x15, 0x10, 0x00, 0x00, 0x00, // lea rdx, [rip+0x10] (the table, right after this code)
+         0xF3, 0x0F, 0x10, 0x0C, 0xC2,       // movss xmm1, [rdx+rax*8] (x)
+         0xF3, 0x0F, 0x10, 0x74, 0xC2, 0x04, // movss xmm6, [rdx+rax*8+4] (y)
+         0xE9, 0x66, 0x01, 0x00, 0x00,       // jmp 0x14089BA3B
+      };
+      // clang-format on
+      std::memcpy(bytes.data(), code, sizeof(code));
+      for (unsigned int i = 0; i < 16; i++)
       {
-         constexpr uint8_t expected[] = {0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, 0x25, 0x07, 0x00, 0x00, 0x80}; // mov eax, [rsi+0x59C]; and eax, 0x80000007
-         if (std::memcmp(block, expected, sizeof(expected)) != 0)
-            return;
-         std::memcpy(jitter_pattern_8x_original.data(), block, jitter_pattern_8x_size);
+         const unsigned int phase = i % SR::GetDefaultJitterPhases();
+         const float offset[2] = {SR::HaltonSequence(phase, 2) * 16.f, SR::HaltonSequence(phase, 3) * -16.f};
+         std::memcpy(bytes.data() + sizeof(code) + i * sizeof(offset), offset, sizeof(offset));
       }
-      std::array<uint8_t, jitter_pattern_8x_size> bytes = jitter_pattern_8x_original;
-      if (enable)
-      {
-         // clang-format off
-         constexpr uint8_t code[] = {
-            0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, // mov eax, [rsi+0x59C]
-            0x83, 0xE0, 0x0F,                   // and eax, 15
-            0x48, 0x8D, 0x15, 0x10, 0x00, 0x00, 0x00, // lea rdx, [rip+0x10] (the table, right after this code)
-            0xF3, 0x0F, 0x10, 0x0C, 0xC2,       // movss xmm1, [rdx+rax*8] (x)
-            0xF3, 0x0F, 0x10, 0x74, 0xC2, 0x04, // movss xmm6, [rdx+rax*8+4] (y)
-            0xE9, 0x66, 0x01, 0x00, 0x00,       // jmp 0x14089BA3B
-         };
-         // clang-format on
-         std::memcpy(bytes.data(), code, sizeof(code));
-         for (unsigned int i = 0; i < 16; i++)
-         {
-            const unsigned int phase = i % SR::GetDefaultJitterPhases();
-            const float offset[2] = {SR::HaltonSequence(phase, 2) * 16.f, SR::HaltonSequence(phase, 3) * -16.f};
-            std::memcpy(bytes.data() + sizeof(code) + i * sizeof(offset), offset, sizeof(offset));
-         }
-      }
-      if (System::PatchMemory(block, bytes.data(), jitter_pattern_8x_size))
-         jitter_pattern_halton = enable;
+      System::PatchMemory(block, bytes.data(), jitter_pattern_8x_size);
    }
 #endif
 
@@ -525,7 +521,184 @@ namespace
       xegtao_log_frame++;
       xegtao_log_frames_left--;
    }
+
+#if ENABLE_SR
+   // SR per-step timings, accumulated since the last log. CPU = submission time on the render thread. GPU = execution time, from timestamp
+   // queries read back frames later without flushing; only the inputs CS and the SR draw record GPU work, the other steps only change states.
+   enum SRStep : size_t
+   {
+      SRStepPrepare, // gates, bindings, inputs (re)creation
+      SRStepUpdateSettings,
+      SRStepStateCache,
+      SRStepInputsCS,
+      SRStepDraw,
+      SRStepStateRestore,
+      SRStepCount
+   };
+   constexpr const char* sr_step_names[SRStepCount + 1] = {"Prepare", "UpdateSettings", "State cache", "Inputs CS", "SR Draw", "State restore", "Total"};
+   constexpr size_t sr_gpu_step_count = SRStepDraw - SRStepStateCache; // Inputs CS, SR Draw
+   std::atomic<bool> sr_timings_log_requested = false;
+
+   struct SRTimings
+   {
+      struct Stat
+      {
+         double sum = 0.0;
+         double min = (std::numeric_limits<double>::max)();
+         double max = 0.0;
+         void Add(double ms)
+         {
+            sum += ms;
+            min = (std::min)(min, ms);
+            max = (std::max)(max, ms);
+         }
+      };
+      Stat cpu[SRStepCount + 1]; // + total
+      Stat gpu[sr_gpu_step_count + 1];
+      uint32_t cpu_samples = 0;
+      uint32_t gpu_samples = 0;
+      uint32_t gpu_dropped = 0; // no free query slot: the GPU is too many frames behind
+      uint32_t gpu_invalid = 0; // disjoint (e.g. a GPU clock change) or failed
+
+      struct Queries
+      {
+         com_ptr<ID3D11Query> disjoint;
+         com_ptr<ID3D11Query> timestamps[sr_gpu_step_count + 1];
+         bool pending = false;
+      };
+      Queries queries[8];
+      bool queries_failed = false;
+   };
+
+   // Lives through one SR call, which only counts once it reaches the last step
+   class SRTimingScope
+   {
+      using Clock = std::chrono::steady_clock;
+
+   public:
+      SRTimingScope(SRTimings& timings, ID3D11Device* native_device, ID3D11DeviceContext* native_device_context)
+          : timings(timings), native_device(native_device), native_device_context(native_device_context)
+      {
+         marks[0] = Clock::now();
+         if (native_device_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+            return;
+         for (auto& queries : timings.queries)
+         {
+            if (!queries.pending)
+               continue;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+            UINT64 ticks[sr_gpu_step_count + 1] = {};
+            HRESULT hr = native_device_context->GetData(queries.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            for (size_t i = 0; i < ARRAYSIZE(ticks) && hr == S_OK; i++)
+               hr = native_device_context->GetData(queries.timestamps[i].get(), &ticks[i], sizeof(ticks[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (hr == S_FALSE)
+               continue;
+            queries.pending = false;
+            if (FAILED(hr) || disjoint.Disjoint || disjoint.Frequency == 0 || !std::is_sorted(std::begin(ticks), std::end(ticks)))
+            {
+               timings.gpu_invalid++;
+               continue;
+            }
+            const double ms_per_tick = 1000.0 / double(disjoint.Frequency);
+            for (size_t i = 0; i < sr_gpu_step_count; i++)
+               timings.gpu[i].Add(double(ticks[i + 1] - ticks[i]) * ms_per_tick);
+            timings.gpu[sr_gpu_step_count].Add(double(ticks[sr_gpu_step_count] - ticks[0]) * ms_per_tick);
+            timings.gpu_samples++;
+         }
+         if (sr_timings_log_requested.exchange(false))
+         {
+            const auto log_stats = [](const std::string& prefix, const SRTimings::Stat* stats, size_t first_name, size_t count, uint32_t samples)
+            {
+               for (size_t i = 0; i < count; i++)
+               {
+                  const size_t name = i + 1 == count ? SRStepCount : first_name + i; // The last is the total
+                  reshade::log::message(reshade::log::level::info, std::format("{} {:<14} avg {:.3f} min {:.3f} max {:.3f} ms", prefix, sr_step_names[name], stats[i].sum / samples, stats[i].min, stats[i].max).c_str());
+               }
+            };
+            reshade::log::message(reshade::log::level::info, std::format("[SRTTR SR] timings since the last log: CPU submission over {} frames, GPU execution over {} frames ({} dropped, {} invalid)", timings.cpu_samples, timings.gpu_samples, timings.gpu_dropped, timings.gpu_invalid).c_str());
+            if (timings.cpu_samples)
+               log_stats("[SRTTR SR] CPU", timings.cpu, 0, SRStepCount + 1, timings.cpu_samples);
+            if (timings.gpu_samples)
+               log_stats("[SRTTR SR] GPU", timings.gpu, SRStepInputsCS, sr_gpu_step_count + 1, timings.gpu_samples);
+            for (auto& stat : timings.cpu)
+               stat = {};
+            for (auto& stat : timings.gpu)
+               stat = {};
+            timings.cpu_samples = timings.gpu_samples = timings.gpu_dropped = timings.gpu_invalid = 0;
+         }
+      }
+      SRTimingScope(const SRTimingScope&) = delete;
+      SRTimingScope& operator=(const SRTimingScope&) = delete;
+
+      // Call at the end of each step. The GPU steps are bracketed by timestamps from the end of the state cache to the end of the SR draw.
+      void Mark(SRStep step)
+      {
+         marks[step + 1] = Clock::now();
+         if (step < SRStepStateCache || step > SRStepDraw)
+            return;
+         if (step == SRStepStateCache)
+            queries = BeginQueries();
+         if (!queries)
+            return;
+         native_device_context->End(queries->timestamps[step - SRStepStateCache].get());
+         if (step == SRStepDraw)
+            native_device_context->End(queries->disjoint.get());
+      }
+
+      ~SRTimingScope()
+      {
+         if (marks[SRStepCount] == Clock::time_point{})
+            return;
+         const auto ms = [](Clock::duration duration)
+         { return std::chrono::duration<double, std::milli>(duration).count(); };
+         for (size_t i = 0; i < SRStepCount; i++)
+            timings.cpu[i].Add(ms(marks[i + 1] - marks[i]));
+         timings.cpu[SRStepCount].Add(ms(marks[SRStepCount] - marks[0]));
+         timings.cpu_samples++;
+      }
+
+   private:
+      SRTimings::Queries* BeginQueries()
+      {
+         if (timings.queries_failed)
+            return nullptr;
+         for (auto& free_queries : timings.queries)
+         {
+            if (free_queries.pending)
+               continue;
+            if (!free_queries.disjoint)
+            {
+               D3D11_QUERY_DESC desc = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+               bool created = SUCCEEDED(native_device->CreateQuery(&desc, &free_queries.disjoint));
+               desc.Query = D3D11_QUERY_TIMESTAMP;
+               for (auto& timestamp : free_queries.timestamps)
+                  created = created && SUCCEEDED(native_device->CreateQuery(&desc, &timestamp));
+               if (!created)
+               {
+                  timings.queries_failed = true;
+                  return nullptr;
+               }
+            }
+            free_queries.pending = true;
+            native_device_context->Begin(free_queries.disjoint.get());
+            return &free_queries;
+         }
+         timings.gpu_dropped++;
+         return nullptr;
+      }
+
+      SRTimings& timings;
+      ID3D11Device* native_device;
+      ID3D11DeviceContext* native_device_context;
+      SRTimings::Queries* queries = nullptr;
+      Clock::time_point marks[SRStepCount + 1] = {};
+   };
+#define SR_TIMING_MARK(step) sr_timing.Mark(step)
+#endif
 } // namespace
+#endif
+#if ENABLE_SR && !DEVELOPMENT
+#define SR_TIMING_MARK(step)
 #endif
 
 struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
@@ -563,7 +736,9 @@ struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11UnorderedAccessView> sr_motion_vectors_uav;
    com_ptr<ID3D11Texture2D> sr_depth;
    com_ptr<ID3D11UnorderedAccessView> sr_depth_uav;
-   bool sr_jitter_mode_set = false;
+#if DEVELOPMENT
+   SRTimings sr_timings;
+#endif
 #endif
 };
 
@@ -876,10 +1051,13 @@ public:
    DrawOrDispatchOverrideType DrawSRInPlaceOfTAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+#if DEVELOPMENT
+      SRTimingScope sr_timing(game_device_data.sr_timings, native_device, native_device_context);
+#endif
       // The jitter comes from the camera built on this thread (the render thread), and SR needs the game's 8x jitter pattern to be active
       const CameraData camera = last_built_camera;
       const int32_t* jitter_mode = GetJitterMode();
-      if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed || native_device_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !camera.valid || !jitter_mode || *jitter_mode != sr_jitter_mode)
+      if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed || native_device_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !camera.valid || !jitter_mode || *jitter_mode != halton_jitter_mode)
       {
          device_data.force_reset_sr = true;
          return DrawOrDispatchOverrideType::None;
@@ -934,6 +1112,8 @@ public:
          }
       }
 
+      SR_TIMING_MARK(SRStepPrepare);
+
       SR::SettingsData settings_data;
       settings_data.output_width = output_desc.Width;
       settings_data.output_height = output_desc.Height;
@@ -945,11 +1125,13 @@ public:
       settings_data.auto_exposure = device_data.sr_type != SR::Type::FSR;
       settings_data.render_preset = dlss_render_preset;
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+      SR_TIMING_MARK(SRStepUpdateSettings);
 
       DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
       DrawStateStack<DrawStateStackType::Compute> compute_state_stack;
       draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
       compute_state_stack.Cache(native_device_context, device_data.uav_max_count);
+      SR_TIMING_MARK(SRStepStateCache);
 
       // Convert the motion vectors and depth, the game's cb10, t1 and t3 are still bound
       ID3D11UnorderedAccessView* const sr_inputs_uavs[] = {game_device_data.sr_motion_vectors_uav.get(), game_device_data.sr_depth_uav.get()};
@@ -958,6 +1140,7 @@ public:
       native_device_context->Dispatch((output_desc.Width + 7) / 8, (output_desc.Height + 7) / 8, 1);
       ID3D11UnorderedAccessView* const null_uavs[ARRAYSIZE(sr_inputs_uavs)] = {};
       native_device_context->CSSetUnorderedAccessViews(0, ARRAYSIZE(null_uavs), null_uavs, nullptr);
+      SR_TIMING_MARK(SRStepInputsCS);
 
       SR::SuperResolutionImpl::DrawData draw_data;
       draw_data.source_color = source_color.get();
@@ -979,8 +1162,10 @@ public:
       device_data.force_reset_sr = false;
 
       const bool sr_succeeded = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data);
+      SR_TIMING_MARK(SRStepDraw);
       draw_state_stack.Restore(native_device_context);
       compute_state_stack.Restore(native_device_context);
+      SR_TIMING_MARK(SRStepStateRestore);
       if (!sr_succeeded)
       {
          device_data.force_reset_sr = true;
@@ -1095,12 +1280,12 @@ public:
       if (!game_patches_applied)
       {
          game_patches_applied = true;
-         SetJitterIndexFix(true);
 #if ENABLE_SR
-         SetHaltonJitterPattern(true); // Before SR switches to the 8x pattern
+         InstallHaltonJitterPattern();
 #endif
          InstallCameraHooks();
       }
+      SetJitterIndexFix(g_fix_native_taa_jitter);
 
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.smaa_depth_srv = nullptr;
@@ -1127,12 +1312,12 @@ public:
          }
       }
       device_data.has_drawn_sr = false;
-      // SR needs the 8x jitter pattern, vanilla TAA uses the 2x one. Only switched on changes, so the development slider stays usable.
+      // Only switched on changes, so the development combo stays usable
       const bool sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
-      if (int32_t* jitter_mode = GetJitterMode(); jitter_mode && sr_active != game_device_data.sr_jitter_mode_set)
+      if (int32_t* jitter_mode = GetJitterMode(); jitter_mode && sr_active != halton_jitter_mode_applied)
       {
-         game_device_data.sr_jitter_mode_set = sr_active;
-         *jitter_mode = sr_active ? sr_jitter_mode : vanilla_jitter_mode;
+         halton_jitter_mode_applied = sr_active;
+         *jitter_mode = sr_active ? halton_jitter_mode : vanilla_jitter_mode;
       }
 #endif
    }
@@ -1152,6 +1337,7 @@ public:
    {
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       reshade::get_config_value(nullptr, NAME, "XeGTAOEnable", g_gtao_enable);
+      reshade::get_config_value(nullptr, NAME, "FixNativeTAAJitter", g_fix_native_taa_jitter);
       auto& settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", settings.RCASSharpness);
       reshade::get_config_value(nullptr, NAME, "Exposure", settings.Exposure);
@@ -1244,6 +1430,24 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
+
+      ImGui::SeparatorText("Fixes");
+#if ENABLE_SR
+      // SR uses its own jitter, the fix is shown as always on
+      const bool sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+#else
+      constexpr bool sr_active = false;
+#endif
+      ImGui::BeginDisabled(sr_active);
+      bool fix_native_taa_jitter = g_fix_native_taa_jitter || sr_active;
+      if (ImGui::Checkbox("Fix Native TAA Jitter", &fix_native_taa_jitter))
+         reshade::set_config_value(nullptr, NAME, "FixNativeTAAJitter", fix_native_taa_jitter);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("The game's TAA jitter only ever uses one of its two sample offsets, every other frame. This makes both alternate, for a sharper, more stable TAA.\nDLAA / FSR 3 always use a fixed jitter of their own.");
+      DrawResetButton(fix_native_taa_jitter, true, "FixNativeTAAJitter"); // Hidden while forced on
+      if (!sr_active)
+         g_fix_native_taa_jitter = fix_native_taa_jitter;
+      ImGui::EndDisabled();
    }
 
 #if DEVELOPMENT
@@ -1253,39 +1457,17 @@ public:
       if (int32_t* jitter_mode = GetJitterMode())
       {
          ImGui::Combo("TAA Jitter Pattern", jitter_mode, "None\0"
-                                                         "2x (vanilla)\0"
+                                                         "2x\0"
                                                          "4x\0"
-                                                         "8x (SR, Halton if enabled)\0");
+                                                         "8x Halton (SR)\0");
          if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Game TAA jitter, D3D MSAA sample patterns. SR requires 8x. Not saved.");
-         const uint8_t* jitter_index_mask_high_byte = GetGameAddress(jitter_index_mask_high_byte_rvas[0]);
-         bool jitter_index_fixed = jitter_index_mask_high_byte && *jitter_index_mask_high_byte == 0x00;
-         if (ImGui::Checkbox("Fix TAA Jitter Index", &jitter_index_fixed))
-            SetJitterIndexFix(jitter_index_fixed);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The game's jitter counter is negative, so only the first offset of the pattern is ever used. This makes every offset cycle. Always on outside of development builds. Not saved.");
+            ImGui::SetTooltip("Game TAA jitter: D3D MSAA sample patterns, with 8x replaced by Halton. SR requires 8x. Reset when SR changes. Not saved.");
       }
       else
       {
          ImGui::TextDisabled("Unsupported SRTTR.exe build: jitter controls unavailable");
       }
 #if ENABLE_SR
-      bool jitter_pattern_halton_enabled = jitter_pattern_halton;
-      if (ImGui::Checkbox("Halton Jitter", &jitter_pattern_halton_enabled))
-      {
-         // Patched while the 8x pattern isn't in use, as the other camera thread might run it
-         int32_t* jitter_mode = GetJitterMode();
-         const int32_t previous_jitter_mode = jitter_mode ? *jitter_mode : 0;
-         if (jitter_mode)
-            *jitter_mode = vanilla_jitter_mode;
-         SetHaltonJitterPattern(jitter_pattern_halton_enabled);
-         if (jitter_mode)
-            *jitter_mode = previous_jitter_mode;
-         device_data.force_reset_sr = true;
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Replaces the game's 8x (D3D MSAA) jitter pattern, used by SR, with a Halton (2, 3) sequence of %i phases. Not saved.", SR::GetDefaultJitterPhases());
-
       ImGui::SeparatorText("Super Resolution");
       ImGui::Checkbox("Flip Jitter X", &sr_flip_jitter_x);
       ImGui::SameLine();
@@ -1332,6 +1514,12 @@ public:
          xegtao_log_frames_left = 2;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Writes the cbuffers and bindings of every SSAO pass and of the ambient pass, and the camera, of the next 2 frames to ReShade.log. The first frame also dumps the ambient depth, normals and AO to %%TEMP%%\\srttr_xegtao_*.bin.");
+#if ENABLE_SR
+      if (ImGui::Button("Log SR Timings"))
+         sr_timings_log_requested = true;
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Writes the average, min and max time of every DLAA / FSR 3 step since the last log to ReShade.log, on the next SR frame.\nCPU = submission time on the render thread. GPU = execution time of the inputs conversion CS and the SR draw.");
+#endif
    }
 #endif
 
