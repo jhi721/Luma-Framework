@@ -10,18 +10,55 @@
 
 namespace
 {
-   // SRTTR.exe addresses, valid only for the analysed build (PE TimeDateStamp 0x60EE85F4; image base 0x140000000)
-   uint8_t* GetGameAddress(uintptr_t rva)
+   // SRTTR.exe code and data the jitter patches and SR use. The Steam (PE TimeDateStamp 0x60EE85F4), GOG (0x608DDEF7) and Epic (0x617A5EF9) builds
+   // have the same camera projection build function (see "CameraBuildDetour()") at different addresses, so it's found by signature and everything else
+   // is an offset into it or the target of one of its RIP relative operands. "0x14..." addresses in comments are from the Steam build.
+   struct GameAddresses
    {
-      // Null for any other build; the PE header is only read once
-      static uint8_t* const base = []() -> uint8_t*
+      uint8_t* camera_build = nullptr;
+      uint8_t* camera_counter_increment = nullptr; // inc [rcx+0x59C]
+      uint8_t* jitter_pattern_8x = nullptr;
+      uint8_t* jitter_index_mask_high_bytes[2] = {};
+      int32_t* jitter_mode = nullptr;
+      const int32_t* jitter_gate = nullptr;
+      bool (*taa_gate)() = nullptr;
+   };
+
+   // All null for an unknown build; only scanned once
+   const GameAddresses& GetGameAddresses()
+   {
+      static const GameAddresses addresses = []()
       {
-         auto* image = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-         const auto* dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
-         const auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos_header->e_lfanew);
-         return nt_headers->FileHeader.TimeDateStamp == 0x60EE85F4 ? image : nullptr;
+         GameAddresses result;
+         // mov rax, rsp; push rbx; push rbp; push rsi; push rdi; sub rsp, 0xA8; mov edx, [rip+?]; lea rdi, [rip+?];
+         // movaps [rax-0x38], xmm6; mov rsi, rcx; movaps [rax-0x48], xmm7; movaps [rax-0x58], xmm8
+         // clang-format off
+         constexpr std::array<System::BytePattern, 43> camera_build_pattern = {{
+            0x48, 0x8B, 0xC4, 0x53, 0x55, 0x56, 0x57, 0x48, 0x81, 0xEC, 0xA8, 0x00, 0x00, 0x00, 0x8B, 0x15, System::ANY, System::ANY, System::ANY, System::ANY, 0x48, 0x8D,
+            0x3D, System::ANY, System::ANY, System::ANY, System::ANY, 0x0F, 0x29, 0x70, 0xC8, 0x48, 0x8B, 0xF1, 0x0F, 0x29, 0x78, 0xB8, 0x44, 0x0F, 0x29, 0x40, 0xA8
+         }};
+         // clang-format on
+         const std::vector<std::byte*> matches = System::ScanModuleForPattern(camera_build_pattern);
+         if (matches.size() != 1)
+            return result;
+         uint8_t* function = reinterpret_cast<uint8_t*>(matches[0]);
+         // call taa_gate at +0x11B, cmp [rip+?], -1 (jitter_gate) at +0x128, mov ecx, [rip+?] (jitter_mode) at +0x146
+         if (function[0x11B] != 0xE8 || function[0x128] != 0x83 || function[0x129] != 0x3D || function[0x12E] != 0xFF || function[0x146] != 0x8B || function[0x147] != 0x0D)
+            return result;
+         // Target of the rel32 at "offset", in an instruction that has "trailing_bytes" after it
+         const auto rip_target = [function](size_t offset, size_t trailing_bytes)
+         { return function + offset + sizeof(int32_t) + trailing_bytes + *reinterpret_cast<const int32_t*>(function + offset); };
+         result.camera_build = function;
+         result.camera_counter_increment = function - 0x2D0;
+         result.jitter_pattern_8x = function + 0x175;
+         result.jitter_index_mask_high_bytes[0] = function + 0x2C6;
+         result.jitter_index_mask_high_bytes[1] = function + 0x252;
+         result.taa_gate = reinterpret_cast<bool (*)()>(rip_target(0x11C, 0));
+         result.jitter_gate = reinterpret_cast<const int32_t*>(rip_target(0x12A, 1));
+         result.jitter_mode = reinterpret_cast<int32_t*>(rip_target(0x148, 0));
+         return result;
       }();
-      return base ? base + rva : nullptr;
+      return addresses;
    }
 
    bool game_patches_applied = false;
@@ -29,33 +66,30 @@ namespace
    // TAA jitter pattern (int, .data, static 1): 0 none, 1 D3D 2x MSAA, 2 4x, 3 8x (switch at 0x14089B886, indexed by the camera's +0x59C counter).
    // The counter starts near -2^24, and the pattern index is taken with a signed modulo ("and reg, 0x8000000N" + sign fixup), so the index is 0 or
    // negative and only entry 0 of each pattern is ever used, once per pattern length (every other frame for the vanilla 2x pattern).
-   constexpr uintptr_t jitter_mode_rva = 0x11ADBB0;
    constexpr int32_t vanilla_jitter_mode = 1;
    constexpr int32_t halton_jitter_mode = 3; // SR, see "InstallHaltonJitterPattern()"
 
    int32_t* GetJitterMode()
    {
-      return reinterpret_cast<int32_t*>(GetGameAddress(jitter_mode_rva));
+      return GetGameAddresses().jitter_mode;
    }
 
-   // "Fix Native TAA Jitter": clearing the sign bit of the 2x and 4x masks (their high bytes) makes the index "counter & N", so every offset of the
-   // pattern cycles. The game's TAA is tuned for its 2x pattern: the 8x Halton one of SR makes it flicker.
-   constexpr uintptr_t jitter_index_mask_high_byte_rvas[] = {0x89BA06, 0x89B992};
+   // "Fix Native TAA Jitter": clearing the sign bit of the 2x and 4x masks (their high bytes, 0x14089BA06 and 0x14089B992) makes the index "counter & N",
+   // so every offset of the pattern cycles. The game's TAA is tuned for its 2x pattern: the 8x Halton one of SR makes it flicker.
    bool g_fix_native_taa_jitter = true;
 
    // Cheap when the bytes already match, so it can run every frame
    void SetJitterIndexFix(bool enable)
    {
       const uint8_t mask_high_byte = enable ? 0x00 : 0x80;
-      for (const uintptr_t rva : jitter_index_mask_high_byte_rvas)
+      for (const uint8_t* byte : GetGameAddresses().jitter_index_mask_high_bytes)
       {
-         const uint8_t* byte = GetGameAddress(rva);
          if (!byte || (*byte != 0x80 && *byte != 0x00))
             return;
       }
-      for (const uintptr_t rva : jitter_index_mask_high_byte_rvas)
+      for (uint8_t* byte : GetGameAddresses().jitter_index_mask_high_bytes)
       {
-         if (uint8_t* byte = GetGameAddress(rva); *byte != mask_high_byte)
+         if (*byte != mask_high_byte)
             System::PatchMemory(byte, &mask_high_byte, 1);
       }
    }
@@ -64,16 +98,18 @@ namespace
    // The 8x pattern code (only reached in jitter mode 3, from 0x14089B8B5 up to the 4x one at 0x14089B987) is replaced with a Halton (2, 3) table lookup,
    // indexed by the camera counter (& 15, which is fine for its negative values), then jumps to the shared code that scales the offset by 0.125 / resolution.
    // Offsets are in 1/16 pixels like the game's patterns (x right, y up). SR reads the resulting projection jitter back from the camera.
-   constexpr uintptr_t jitter_pattern_8x_rva = 0x89B8B5;
    constexpr size_t jitter_pattern_8x_size = 0xD2;
    bool halton_jitter_mode_applied = false; // The game's current state: the mode is process wide, not per device
 
    // Installed once, while the game still uses the 2x pattern, as the other camera thread might run the 8x one
    void InstallHaltonJitterPattern()
    {
-      uint8_t* block = GetGameAddress(jitter_pattern_8x_rva);
+      uint8_t* block = GetGameAddresses().jitter_pattern_8x;
       constexpr uint8_t expected[] = {0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, 0x25, 0x07, 0x00, 0x00, 0x80}; // mov eax, [rsi+0x59C]; and eax, 0x80000007
       if (!block || std::memcmp(block, expected, sizeof(expected)) != 0)
+         return;
+      // The block's "ja" (at +0x17) must lead to the shared code the patch jumps to
+      if (block[0x17] != 0x0F || block[0x18] != 0x87 || block + 0x1D + *reinterpret_cast<const int32_t*>(block + 0x19) != block + 0x20 + 0x166)
          return;
       std::array<uint8_t, jitter_pattern_8x_size> bytes;
       std::memcpy(bytes.data(), block, jitter_pattern_8x_size); // The rest of the block stays original
@@ -102,7 +138,6 @@ namespace
    // It writes the projection at camera+0xE0 (row major): row 1 y scale (cot(fov_y/2)) at +0xF4, row 2 jitter (NDC) at +0x100/+0x104.
    // Near and far are at +0x530/+0x534. The jitter pattern index is the camera's +0x59C counter.
    // Only jitters if TAA passes the gate (0x140908A90) and [0x1411DCF40] == -1.
-   constexpr uintptr_t camera_build_rva = 0x89B740;
    using CameraBuildFunc = uint64_t (*)(uint8_t* camera, void* rdx, void* r8, void* r9);
    CameraBuildFunc camera_build_original = nullptr;
 
@@ -120,9 +155,6 @@ namespace
 
 #if DEVELOPMENT
    // Camera jitter trace
-   constexpr uintptr_t camera_counter_increment_rva = 0x89B470; // inc [rcx+0x59C]
-   constexpr uintptr_t taa_gate_rva = 0x908A90;
-   constexpr uintptr_t jitter_gate_rva = 0x11DCF40;
    std::atomic<int> camera_log_calls_left = 0;
    using CameraCounterIncrementFunc = void (*)(uint8_t* camera);
    CameraCounterIncrementFunc camera_counter_increment_original = nullptr;
@@ -144,8 +176,8 @@ namespace
 #if DEVELOPMENT
       const bool log = camera_log_calls_left > 0 && camera_log_calls_left.fetch_sub(1) > 0;
       const int32_t counter = log ? *reinterpret_cast<const int32_t*>(camera + 0x59C) : 0;
-      const bool taa_gate = log && reinterpret_cast<bool (*)()>(GetGameAddress(taa_gate_rva))();
-      const int32_t jitter_gate = log ? *reinterpret_cast<const int32_t*>(GetGameAddress(jitter_gate_rva)) : 0;
+      const bool taa_gate = log && GetGameAddresses().taa_gate();
+      const int32_t jitter_gate = log ? *GetGameAddresses().jitter_gate : 0;
 #endif
       const uint64_t result = camera_build_original(camera, rdx, r8, r9);
       last_built_camera.jitter_x = *reinterpret_cast<const float*>(camera + 0x100);
@@ -168,7 +200,7 @@ namespace
 
    void InstallCameraHooks()
    {
-      uint8_t* camera_build = GetGameAddress(camera_build_rva);
+      uint8_t* camera_build = GetGameAddresses().camera_build;
       // mov rax, rsp; push rbx; push rbp; push rsi; push rdi
       constexpr uint8_t camera_build_prologue[] = {0x48, 0x8B, 0xC4, 0x53, 0x55, 0x56, 0x57};
       if (!camera_build || std::memcmp(camera_build, camera_build_prologue, sizeof(camera_build_prologue)) != 0 || MH_Initialize() != MH_OK)
@@ -176,7 +208,7 @@ namespace
       if (MH_CreateHook(camera_build, reinterpret_cast<void*>(&CameraBuildDetour), reinterpret_cast<void**>(&camera_build_original)) == MH_OK)
          MH_EnableHook(camera_build);
 #if DEVELOPMENT
-      uint8_t* camera_counter_increment = GetGameAddress(camera_counter_increment_rva);
+      uint8_t* camera_counter_increment = GetGameAddresses().camera_counter_increment;
       constexpr uint8_t camera_counter_increment_prologue[] = {0xFF, 0x81, 0x9C, 0x05, 0x00, 0x00}; // inc dword ptr [rcx+0x59C]
       if (std::memcmp(camera_counter_increment, camera_counter_increment_prologue, sizeof(camera_counter_increment_prologue)) == 0 && MH_CreateHook(camera_counter_increment, reinterpret_cast<void*>(&CameraCounterIncrementDetour), reinterpret_cast<void**>(&camera_counter_increment_original)) == MH_OK)
          MH_EnableHook(camera_counter_increment);
@@ -794,8 +826,8 @@ public:
       native_shaders_definitions.emplace("SRTTR XeGTAO Denoise Pass 2 CS"_h, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
 #if ENABLE_SR
       native_shaders_definitions.emplace(sr_inputs_shader_hash, ShaderDefinition{"Luma_SRTTR_SRInputs", reshade::api::pipeline_subobject_type::compute_shader});
-      // SR takes its jitter from the patched game code, which only exists in the analysed build
-      sr_game_tooltip = GetGameAddress(0) ? "Requires \"Anti-Aliasing\" set to \"TAA\" in the game's display settings.\n" : "Unsupported game executable version: Super Resolution can't engage.\n";
+      // SR takes its jitter from the patched game code, found in the Steam, GOG and Epic builds
+      sr_game_tooltip = GetGameAddresses().camera_build ? "Requires \"Anti-Aliasing\" set to \"TAA\" in the game's display settings.\n" : "Unsupported game executable version: Super Resolution can't engage.\n";
 #endif
    }
 
