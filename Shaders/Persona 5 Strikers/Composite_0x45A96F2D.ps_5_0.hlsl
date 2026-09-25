@@ -1,5 +1,5 @@
-// Katana engine PostEffect3 composite: scene exposure, radial blur, sun/lens flare, vignette ("limb darkening"),
-// then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) through an ARRI LogC EI1000 (no cut) shaper, an optional LDR LUT, brightness and fade.
+// Katana engine PostEffect3 composite: scene exposure, chromatic aberration, sun/lens flare, vignette ("limb darkening"),
+// then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) through an ARRI LogC EI1000 (no cut) shaper, an optional LDR LUT, an output power curve (g_vGammaCorrection) and fade.
 // Writes linear colors to the swapchain (through an sRGB view), UI and FXAA follow.
 // Luma: in HDR, the LUT output is extended above mid gray by matching the untonemapped scene color to the LUT's mid gray slope
 // (same method as "Unreal Engine/Luma_UpgradeTonemapLUT.hlsl", run per pixel as the LUT is a static asset).
@@ -7,24 +7,8 @@
 #include "Includes/Common.hlsl"
 #include "../Includes/DICE.hlsl"
 #include "../Includes/ColorGradingLUT.hlsl"
+#include "Includes/cbComposite.hlsl"
 // clang-format on
-
-cbuffer cbComposite : register(b2)
-{
-   float4 g_vSceneTexSize : packoffset(c0);
-   float4 g_vCompositeInfo : packoffset(c1);
-   float4 g_vSun2dInfo : packoffset(c2);
-   float4 g_vEtcEffect : packoffset(c3);
-   float4 g_vBloomInfo : packoffset(c4);
-   float4 g_vLimbDarkenningInfo : packoffset(c5);
-   float4 g_vFxaaParams : packoffset(c6);
-   float4 g_vGammaCorrection : packoffset(c7);
-   float4 g_vRadialBlurCenter : packoffset(c8);
-   float4 g_vRadialBlurInfo : packoffset(c9);
-   float4 g_vFxaaQualityParams : packoffset(c10);
-   float4 g_vCompositeLastViewport : packoffset(c11);
-   float4 g_vMaxUV : packoffset(c12);
-}
 
 SamplerState sampleLinear_s : register(s7);
 Texture2D<float4> g_tSceneMap : register(t0);
@@ -51,17 +35,38 @@ float3 DecodeLUTInput(float3 encodedColor)
    return (exp2((encodedColor - 0.386036009) / 0.0734997839) - 0.0479959995) / 5.55555582;
 }
 
-// The LUT's slope (in linear scene input) on its grey diagonal where it crosses "targetValue", as a line through the previous texel.
+// Luma: "Color Grading Intensity" fades the LUT's color grading out towards its gray tone curve alone (0), applied by luminance
+float3 SampleGradedLUT(float3 color)
+{
+   float3 graded = g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(color), 0).rgb;
+   [branch] if (LumaSettings.GameSettings.ColorGradingIntensity != 1.0)
+   {
+      const float luminance = GetLuminance(color);
+      const float grayOutput = average(g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(luminance), 0).rgb);
+      const float3 neutral = luminance > 0.0 ? color * (grayOutput / luminance) : 0.0;
+      graded = lerp(neutral, graded, LumaSettings.GameSettings.ColorGradingIntensity);
+   }
+   return graded;
+}
+
+// The gray diagonal texel's output with its tint faded as in "SampleGradedLUT" (a gray input's neutral output is its average)
+float3 LoadGradedLUTGray(int i)
+{
+   const float3 graded = g_tHdrLut.Load(int4(i, i, i, 0)).rgb;
+   return lerp(average(graded), graded, LumaSettings.GameSettings.ColorGradingIntensity);
+}
+
+// The LUT's slope (in linear scene input) on its gray diagonal where it crosses "targetValue", as a line through the previous texel.
 // The LUT output is linear (the composite writes through an sRGB view). All the texels are loaded unconditionally so the loads don't serialize.
 void FindLUTSlope(float targetValue, out float3 slope, out float3 offset)
 {
    slope = 1.0;
    offset = 0.0;
    bool found = false;
-   float3 prevOutput = g_tHdrLut.Load(int4(0, 0, 0, 0)).rgb;
+   float3 prevOutput = LoadGradedLUTGray(0);
    [unroll] for (int i = 1; i < (int)LUTSize; ++i)
    {
-      float3 output = g_tHdrLut.Load(int4(i, i, i, 0)).rgb;
+      float3 output = LoadGradedLUTGray(i);
       if (!found && average(output) >= targetValue)
       {
          found = true;
@@ -103,9 +108,11 @@ void main(
    r1.xy = cmp(float2(0, 0) < g_vCompositeInfo.zy);
    r1.x = r1.x ? g_vCompositeInfo.z : 1;
    r0.z = r0.z ? r0.w : r1.x;
+   r0.z *= LumaSettings.GameSettings.Exposure; // Luma: exposure slider (also scales the sun flare, as the vanilla exposure does)
    r1.xz = v1.xy * g_vCompositeLastViewport.zw + g_vCompositeLastViewport.xy;
    r2.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r1.xz, 0).xyz;
-   r2.xyz = min(float3(65024, 65024, 65024), r2.xyz);
+   // Luma: the scene is upgraded from R11G11B10_FLOAT, which could not hold negatives
+   r2.xyz = clamp(r2.xyz, 0.0, 65024.0);
    r0.w = cmp(0 < g_vEtcEffect.x);
    if (r0.w != 0)
    {
@@ -138,7 +145,7 @@ void main(
             break;
          r9.xy = r9.xy + r3.xy;
          r10.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r9.xy, 0).xyz;
-         r10.xyz = min(float3(65024, 65024, 65024), r10.xyz);
+         r10.xyz = clamp(r10.xyz, 0.0, 65024.0);
          r4.w = (int)r3.w;
          r4.w = r4.w / r2.w;
          r5.w = cmp(r4.w < 0.5);
@@ -162,7 +169,7 @@ void main(
    if (r0.x != 0)
    {
       r3.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, g_vSun2dInfo.xy, 0).xyz;
-      r3.xyz = min(float3(65024, 65024, 65024), r3.xyz);
+      r3.xyz = clamp(r3.xyz, 0.0, 65024.0);
       r0.xzw = r3.xyz * r0.zzz;
       r3.xyz = g_tLensFlareMap.SampleLevel(sampleLinear_s, r1.xz, 0).xyz;
       r3.xyz = min(float3(65024, 65024, 65024), r3.xyz);
@@ -170,7 +177,7 @@ void main(
       r1.w = cmp(g_vEtcEffect.w < r1.w);
       r1.w = r1.w ? g_vEtcEffect.z : 0;
       r0.xzw = r3.xyz * r0.xzw;
-      r2.xyz = r0.xzw * r1.www + r2.xyz;
+      r2.xyz = r0.xzw * r1.www * LumaSettings.GameSettings.LensFlareIntensity + r2.xyz; // Luma: flare intensity slider
    }
    if (r0.y != 0)
    {
@@ -188,13 +195,13 @@ void main(
       r0.x = r0.x * r0.x;
       r0.x = r0.z ? r0.x : 1;
       r0.x = r0.x * r0.y;
-      r0.y = 1 + -g_vLimbDarkenningInfo.w;
-      r0.x = r0.x * g_vLimbDarkenningInfo.w + r0.y;
+      // Luma: vignette intensity slider scales the vignette's blend weight
+      r0.w = g_vLimbDarkenningInfo.w * LumaSettings.GameSettings.VignetteIntensity;
+      r0.x = r0.x * r0.w + (1.0 - r0.w);
       r2.xyz = r2.xyz * r0.xxx;
    }
    const float3 untonemappedColor = r2.xyz;
-   r0.xyz = EncodeLUTInput(r2.xyz);
-   r0.xyz = g_tHdrLut.SampleLevel(sampleLinear_s, r0.xyz, 0).xyz;
+   r0.xyz = SampleGradedLUT(r2.xyz);
 
    if (r1.y != 0)
    {
@@ -206,7 +213,7 @@ void main(
       r1.xyz = r1.xyz + -r0.xyz;
       r0.xyz = g_vCompositeInfo.yyy * r1.xyz + r0.xyz;
    }
-   if (LumaSettings.DisplayMode != 1) // Luma: the brightness curve only applies to SDR, Luma has its own
+   if (!P5S_HDR_SCENE) // Luma: the output power curve only applies to SDR, Luma has its own
    {
       r0.w = cmp(g_vGammaCorrection.x != 1.000000);
       r1.xyz = log2(abs(r0.xyz));
@@ -233,7 +240,7 @@ void main(
 
       // Above mid gray, restore the hue of a LUT sample at a lower exposure, which isn't yet desaturated by the LUT's shoulder
       float tonemapHalveScale = lerp(1.0, 0.667, highlightsProgress); // Exposure of the hue reference (unrelated to the hue preservation amount)
-      float3 hueSourceTonemappedColor = g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(untonemappedColor * tonemapHalveScale), 0).rgb / tonemapHalveScale;
+      float3 hueSourceTonemappedColor = SampleGradedLUT(untonemappedColor * tonemapHalveScale) / tonemapHalveScale;
       remappedHDRColor = RestoreHueAndChrominance(remappedHDRColor, hueSourceTonemappedColor, HighlightsHuePreservation, 1.0 - highlightsProgress);
       // Towards white, restore part of the vanilla chrominance
       remappedHDRColor = RestoreHueAndChrominance(remappedHDRColor, tonemappedColor, 0.0, sqrt(maxMidGrayToWhiteProgress) * HighlightsChrominancePreservation);
@@ -244,7 +251,10 @@ void main(
       const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
       DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
       settings.DesaturationVsDarkeningRatio = 0.5;
+      settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightsDesaturation;
       r0.xyz = DICETonemap(r0.xyz * paperWhite, peakWhite, settings) / paperWhite;
+      // User saturation last, after the display map (repository convention)
+      r0.xyz = Saturation(r0.xyz, LumaSettings.GameSettings.Saturation);
    }
 
    o0.xyz = g_vRadialBlurCenter.zzz * r0.xyz;
@@ -256,21 +266,9 @@ void main(
    ColorGradingLUTTransferFunctionInOutCorrected(o0.rgb, GAMMA_CORRECTION_TYPE, VANILLA_ENCODING_TYPE, true);
 #endif
 
-   // Luma: anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR and SDR on HDR.
-   // The color is linear here, with 1 = UI paper white (UI_DRAW_TYPE 2). The UI draws after this, undithered.
-   if (LumaSettings.GameSettings.Dithering > 0.5)
-   {
-      if (LumaSettings.DisplayMode == 0)
-      {
-         ApplyDithering(o0.rgb, v1.xy, false, 1.0, 8u, LumaSettings.FrameIndex, true);
-      }
-      else
-      {
-         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(o0.rgb * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, v1.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         o0.rgb = BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale;
-      }
-   }
+   // Luma: when SMAA follows (it sets LumaData.CustomData3), the dither runs at its end instead (SMAA neighborhood blending, or Luma_P5S_SMAAFinalize.hlsl with RCAS).
+   // The UI draws after this, undithered.
+   if (LumaData.CustomData3 == 0.0)
+      P5S_DitherOutput(o0.rgb, v1.xy);
    return;
 }
