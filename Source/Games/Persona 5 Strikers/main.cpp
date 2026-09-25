@@ -22,7 +22,7 @@ namespace
    // PostEffect3 ApplyFxaa{,Repair,Console,Quality}PS: the engine's own FXAA, which also carries the radial blur. When one of them runs, the
    // composite goes to an intermediate target and this pass draws it into the swapchain. Never seen in a capture yet.
    const ShaderHashesList shader_hashes_apply_fxaa = {.pixel_shaders = {0x0B6569A5, 0xC8A7BA1C, 0x95F3321A, 0xED7941FD}};
-   // The SSAO depth downsample, whose t0 is the full resolution D32 depth (a copy the game makes right before post): the SMAA predication input
+   // The SSAO depth downsample, whose t0 is the full res D32_FLOAT_S8X24 depth (a copy the game makes right before post): the SMAA predication input
    constexpr uint32_t ssao_depth_downsample_hash = 0x6E15840A;
    // The native SSAO calculate (half res R8 visibility), replaced by XeGTAO. Its two depth aware blurs, which upsample to full
    // res, and the merge into the G-buffer AO (gbuf0.a = min(material AO, SSAO), read by the deferred lighting) stay vanilla.
@@ -80,8 +80,8 @@ namespace
 struct Persona5StrikersGameDeviceData final : public GameDeviceData
 {
    // SMAA scratch, recreated when the canvas size changes: a linear copy of the canvas (SMAA writes the canvas, so it cannot
-   // also sample it), its gamma encode (edge detection input, then SMAA's output for the RCAS finalize pass, which only edge
-   // detection read before that) and the predication edge-ness.
+   // also sample it), its gamma encode (the edge detection input; with RCAS also SMAA's output, read by the finalize pass) and
+   // the predication edge-ness.
    com_ptr<ID3D11Texture2D> smaa_linear_texture;
    com_ptr<ID3D11ShaderResourceView> smaa_linear_srv;
    com_ptr<ID3D11ShaderResourceView> smaa_gamma_srv;
@@ -963,10 +963,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
       // FXAA reads a BGRA8 copy of the swapchain (after UI), which has to hold HDR too.
-      // The HDR scene (deferred lighting, the refraction grab copy) and the bloom and flare mips (16:9) are R11G11B10_FLOAT, upgraded for
+      // The HDR scene (deferred lighting, the refraction grab copy) and the bloom and flare mips (swapchain aspect ratio) are R11G11B10_FLOAT, upgraded for
       // precision as in Nioh: the bloom chain requantizes through 11 passes, and R11G11B10's 5 bit blue mantissa tints the halos.
       // Arrays are never upgraded, so the R11G11B10 G-buffer array stays.
-      // This also upgrades every other 16:9 BGRA8 target (e.g. the G-buffer albedo); upgrading only the FXAA copy would save VRAM.
+      // This also upgrades every other swapchain aspect ratio BGRA8 target (e.g. the G-buffer albedo); upgrading only the FXAA copy would save VRAM.
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       texture_upgrade_formats = {reshade::api::format::b8g8r8a8_typeless, reshade::api::format::r11g11b10_float};
       texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;

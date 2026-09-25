@@ -11,7 +11,7 @@
 // - Depth unpack and uv->view from the calculate's own live $Globals (rebound PS -> CS b0), in centimetres:
 //   viewZ = 1 / (d * vDepthParam.x + vDepthParam.y), view.xy = (uv * vViewParam.xy + vViewParam.zw) * viewZ, view.z = -viewZ
 //   (right handed, y up). XeGTAO's view space is the same with +z forward, so only the normal's z flips.
-// - No TAA: NoiseIndex is FROZEN at 0 (a frame index would make the pattern boil) and denoise runs twice.
+// - No TAA: the noise's temporal index is FROZEN at 0 (a frame index would make the pattern boil) and denoise runs twice.
 
 // --- Game constant buffer: the SSAO calculate's $Globals (main.cpp binds it at CS b0) ---
 
@@ -25,7 +25,7 @@ cbuffer GameGlobals : register(b0)
    float4 vOccParam;        // strength, max occlusion, noise tiling
 }
 
-// --- Luma runtime knobs (set from main.cpp; live-tunable via DEV sliders, no recompile) ---
+// --- Luma runtime knobs (set from main.cpp; power and radius are live DEV/TEST sliders, no recompile) ---
 // b9, not b11: core's DrawBloom owns b11 for its own constants. Mirrored by gtao_knobs_cb_slot.
 cbuffer LumaGTAO : register(b9)
 {
@@ -33,7 +33,7 @@ cbuffer LumaGTAO : register(b9)
    float NormalInputScaleRT;   // full res normal pixels per AO target pixel (2 = half res)
    float RadiusOverrideRT;     // > 0 overrides the native radius (centimetres)
    float DebugViewRT;          // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
-   float2 ViewportPixelSizeRT; // 1 / AO target resolution, set by main.cpp
+   float2 ViewportPixelSizeRT; // 1 / AO target resolution
    float2 PaddingRT;
 }
 
@@ -60,7 +60,7 @@ cbuffer LumaGTAO : register(b9)
 #define EFFECT_RADIUS sqrt(vRadiusParam.x)
 
 #ifndef RADIUS_MULTIPLIER
-#define RADIUS_MULTIPLIER 1.0 // Default 1.457; 1 reaches exactly the native radius (it drops samples beyond r, weighted 1 - d^2/r^2)
+#define RADIUS_MULTIPLIER 1.0 // Default 1.457; 1 reaches exactly the native radius (the native term drops samples beyond r, weighted 1 - d^2/r^2)
 #endif
 
 #ifndef EFFECT_FALLOFF_RANGE
@@ -281,7 +281,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
    const float edges = XeGTAO_PackEdges(edgesLRTB);
 
 #if DEVELOPMENT
-   // Debug views (visible on screen through the game's own AO blur/apply chain; the final denoise passes
+   // Debug views (visible on screen through the native SSAO blurs into the G-buffer AO; the final denoise passes
    // raw values through when DebugViewRT > 0).
    if (DebugViewRT > 0.5 && DebugViewRT < 1.5) // 1 = depth gradient (proves live depth + linearization/scale)
    {

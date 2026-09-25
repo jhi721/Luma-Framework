@@ -11,7 +11,8 @@
 #define TONEMAP_TYPE 1
 #endif
 
-// Whether the composite takes the Luma HDR path. TONEMAP_TYPE 0 keeps the vanilla SDR output on HDR displays too, with nothing added.
+// Whether the composite and ApplyFxaa passes take the Luma HDR path (HDR display mode only). TONEMAP_TYPE 0 keeps the vanilla SDR output
+// on HDR displays too: no extension, DICE or dither (the scene sliders still apply).
 #define P5S_HDR_SCENE (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
 
 // Luma anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR and SDR on HDR.

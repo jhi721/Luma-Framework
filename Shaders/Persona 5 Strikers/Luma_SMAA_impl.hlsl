@@ -4,7 +4,8 @@
 // The canvas is linear (1 = UI paper white, HDR above it), so edge detection reads a gamma copy (Luma_P5S_SMAAEncode),
 // neighborhood blending reads the linear copy and re-encodes to gamma for Luma_P5S_SMAAFinalize (RCAS), or writes the canvas.
 // Predication uses plane-deviation edge-ness in [0,1] of the scene depth (Luma_P5S_SMAAPredication); main.cpp passes a
-// null texture and scale 1 (plain ULTRA) without it. No SMAAGather: SMAA point-samples the three neighbours.
+// null texture and scale 1 (plain ULTRA) without it.
+// No SMAAGather: SMAA point-samples the center and its left and top neighbours.
 
 #include "Includes/Common.hlsl"
 

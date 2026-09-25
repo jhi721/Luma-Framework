@@ -1,6 +1,7 @@
-// Katana engine PostEffect3 "ApplyFxaa*PS": optional FXAA over the composite's output, drawn after it when the engine enables its own
-// FXAA or a radial blur. The four FXAA types (ApplyFxaaPS, ApplyFxaaRepairPS, ApplyFxaaConsolePS, ApplyFxaaQualityPS) differ only in
-// the antialiasing; this is their shared tail: the radial blur (it only exists here, not in the composite), the output power curve (g_vGammaCorrection) and the fade.
+// Katana engine PostEffect3 "ApplyFxaa*PS": optional FXAA over the composite's output, drawn into the swapchain. Never seen drawn;
+// presumably used when the engine's own FXAA or its radial blur is on. The four FXAA types (ApplyFxaaPS, ApplyFxaaRepairPS,
+// ApplyFxaaConsolePS, ApplyFxaaQualityPS) differ only in the antialiasing; this is their shared tail: the radial blur (it only exists
+// here, not in the composite), the output power curve (g_vGammaCorrection) and the fade.
 
 #include "cbComposite.hlsl"
 

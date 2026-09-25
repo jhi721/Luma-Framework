@@ -1,4 +1,5 @@
-// Katana engine bloom prefilter (Unity/Kino style): exposure, a per source max channel cap of 5, an optional 5 tap median
+// Katana engine bloom prefilter (Unity/Kino style): exposure, each tap capped at 5 (scaled by its max channel in max channel mode, else
+// clamped per channel), an optional 5 tap median
 // (anti-flicker), then the quadratic soft knee threshold. The first downsample after it is a Karis average.
 // Luma: the scene samples are clamped >= 0, as the scene is upgraded from R11G11B10_FLOAT.
 // clang-format off

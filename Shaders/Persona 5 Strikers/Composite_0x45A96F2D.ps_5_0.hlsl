@@ -1,10 +1,10 @@
 // Katana engine PostEffect3 composite: scene exposure, chromatic aberration, sun/lens flare, vignette ("limb darkening"),
 // then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) through an ARRI LogC EI1000 (no cut) shaper, an optional LDR LUT, an output power curve (g_vGammaCorrection) and fade.
 // Writes linear colors to the swapchain (through an sRGB view), UI and FXAA follow.
-// Luma: in HDR, the vanilla LUT output is scaled by one scalar of the scene luminance: the LUT's gray tone curve continued past mid gray
-// by its tangent there, over the curve itself. Only luminance crosses into the output (as in BL2/TPS), a scalar can't rotate hue, so the
-// grade and its path to white stay vanilla, and below mid gray the output is exactly vanilla. The LUT is a per area asset, so the tangent
-// is found per pixel.
+// Luma: in HDR, the vanilla LUT output is multiplied by one scalar of the pre-LUT relative luminance Y: E(Y) / G(Y), where G is the LUT's
+// gray tone curve and E is G continued by its tangent past the pivot where G's output reaches mid gray. Only luminance crosses into the
+// output (as in BL2/TPS), a scalar can't rotate hue, so the grade and its path to white stay vanilla, and below the pivot the output is
+// exactly vanilla. DICE then maps it to the peak. The LUT is a per area asset, so the tangent is found per pixel.
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "../Includes/DICE.hlsl"
@@ -107,7 +107,7 @@ void main(
    r0.z *= LumaSettings.GameSettings.Exposure; // Luma: exposure slider (also scales the sun flare, as the vanilla exposure does)
    r1.xz = v1.xy * g_vCompositeLastViewport.zw + g_vCompositeLastViewport.xy;
    r2.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r1.xz, 0).xyz;
-   // Luma: the scene is upgraded from R11G11B10_FLOAT, which could not hold negatives
+   // Luma: the scene is upgraded from R11G11B10_FLOAT, which could not hold negatives (65024, the vanilla cap, is its max)
    r2.xyz = clamp(r2.xyz, 0.0, 65024.0);
    r0.w = cmp(0 < g_vEtcEffect.x);
    if (r0.w != 0)

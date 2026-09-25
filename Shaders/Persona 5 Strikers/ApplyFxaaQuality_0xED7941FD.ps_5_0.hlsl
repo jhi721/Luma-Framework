@@ -365,7 +365,7 @@ void main(
          r0.z = r0.z * r0.z;
          r0.y = r0.y * -r2.y + 0.5;
          r0.z = g_vFxaaQualityParams.z * r0.z;
-         r0.x = r0.x ? r0.y : 0; // 3Dmigoto: "and" of a float with a comparison mask
+         r0.x = r0.x ? r0.y : 0; // The bytecode "and"s a comparison mask with a float; 3Dmigoto's integer "&" would truncate the float
          r0.x = max(r0.x, r0.z);
          r0.xy = r0.xx * r2.xx + v1.xy;
          r2.x = r3.w ? v1.x : r0.x;

@@ -6,7 +6,7 @@
 // the ratio. Instead this measures the deviation from the local tangent plane: a slope-adjusted second difference with a
 // depth-proportional tolerance, the same math as XeGTAO_CalculateEdges.
 //
-// Depth: 1 / d (reversed Z, sky = 0) is proportional to linear view depth;
+// Depth: 1 / d (reversed Z, sky = 0) is about proportional to linear view depth;
 // the relative tolerance cancels the unknown near plane, so no camera constants are needed. Sky clamps at 2^-24.
 //
 // Output is edge-ness in [0,1] against the LEFT and TOP neighbors only: SMAA compares center-vs-left on one axis and

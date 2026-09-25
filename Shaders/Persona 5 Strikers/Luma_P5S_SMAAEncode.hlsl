@@ -1,5 +1,5 @@
 // Gamma copy of the linear canvas for SMAA's edge detection, whose thresholds are tuned for perceptual input.
-// HDR values above 1 go through the mirrored curve.
+// Values above 1 (HDR) take the same power curve; GCT_MIRROR mirrors negative ones around 0.
 #include "../Includes/Color.hlsl"
 
 Texture2D<float4> linear_in : register(t0);
