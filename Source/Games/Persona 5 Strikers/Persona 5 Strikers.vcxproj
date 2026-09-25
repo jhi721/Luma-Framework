@@ -65,6 +65,10 @@
       <Context>Project</Context>
     </PropertyPageSchema>
   </ItemGroup>
+  <PropertyGroup>
+    <UseLumaNGX>true</UseLumaNGX>
+    <UseLumaFSR>true</UseLumaFSR>
+  </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <ImportGroup Label="PropertySheets">
