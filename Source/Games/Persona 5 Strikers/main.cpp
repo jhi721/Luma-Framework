@@ -32,7 +32,7 @@ namespace
 
    bool g_gtao_enable = true;
    constexpr UINT gtao_knobs_cb_slot = 9; // "register(b9)" in Luma_P5S_XeGTAO.hlsl; b11 is core DrawBloom's
-   float g_gtao_final_value_power = 0.6f; // DEV/TEST calibration knobs, not persisted. 0.6 matches the native SSAO mean and coverage (camper van hub)
+   float g_gtao_final_value_power = 1.f;  // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;    // > 0 overrides the native radius (centimetres)
 #if DEVELOPMENT
    int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
