@@ -172,7 +172,7 @@ void main(
       r3.xyz = clamp(r3.xyz, 0.0, 65024.0);
       r0.xzw = r3.xyz * r0.zzz;
       r3.xyz = g_tLensFlareMap.SampleLevel(sampleLinear_s, r1.xz, 0).xyz;
-      r3.xyz = min(float3(65024, 65024, 65024), r3.xyz);
+      r3.xyz = clamp(r3.xyz, 0.0, 65024.0); // Luma: the flare target is upgraded from R11G11B10_FLOAT too
       r1.w = dot(r0.xzw, float3(0.222014993, 0.706655025, 0.0713300034));
       r1.w = cmp(g_vEtcEffect.w < r1.w);
       r1.w = r1.w ? g_vEtcEffect.z : 0;

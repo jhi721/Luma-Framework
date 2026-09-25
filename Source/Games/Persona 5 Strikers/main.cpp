@@ -965,14 +965,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
       // FXAA reads a BGRA8 copy of the swapchain (after UI), which has to hold HDR too.
-      // The full resolution HDR scene (deferred lighting, bloom's additive target, the refraction grab copy) is R11G11B10_FLOAT, upgraded
-      // for precision, as in Nioh. The lower resolution bloom and flare targets stay R11G11B10 (size filter); their 65024 max is also
-      // the level "Uncap Bloom" lifts the cap to.
+      // The HDR scene (deferred lighting, the refraction grab copy) and the bloom and flare mips (16:9) are R11G11B10_FLOAT, upgraded for
+      // precision as in Nioh: the bloom chain requantizes through 11 passes, and R11G11B10's 5 bit blue mantissa tints the halos.
       // Arrays are never upgraded, so the R11G11B10 G-buffer array stays.
-      // This also upgrades every other swapchain sized BGRA8 target (e.g. the G-buffer albedo); upgrading only the FXAA copy would save VRAM.
+      // This also upgrades every other 16:9 BGRA8 target (e.g. the G-buffer albedo); upgrading only the FXAA copy would save VRAM.
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       texture_upgrade_formats = {reshade::api::format::b8g8r8a8_typeless, reshade::api::format::r11g11b10_float};
-      texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution;
+      texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
 
 #if DEVELOPMENT
       forced_shader_names.emplace(composite_hash, "Composite");
