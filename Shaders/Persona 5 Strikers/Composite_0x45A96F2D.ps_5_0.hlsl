@@ -1,8 +1,10 @@
 // Katana engine PostEffect3 composite: scene exposure, chromatic aberration, sun/lens flare, vignette ("limb darkening"),
 // then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) through an ARRI LogC EI1000 (no cut) shaper, an optional LDR LUT, an output power curve (g_vGammaCorrection) and fade.
 // Writes linear colors to the swapchain (through an sRGB view), UI and FXAA follow.
-// Luma: in HDR, the LUT output is extended above mid gray by matching the untonemapped scene color to the LUT's mid gray slope
-// (same method as "Unreal Engine/Luma_UpgradeTonemapLUT.hlsl", run per pixel as the LUT is a static asset).
+// Luma: in HDR, the vanilla LUT output is scaled by one scalar of the scene luminance: the LUT's gray tone curve continued past mid gray
+// by its tangent there, over the curve itself. Only luminance crosses into the output (as in BL2/TPS), a scalar can't rotate hue, so the
+// grade and its path to white stay vanilla, and below mid gray the output is exactly vanilla. The LUT is a per area asset, so the tangent
+// is found per pixel.
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "../Includes/DICE.hlsl"
@@ -21,9 +23,6 @@ Texture3D<float4> g_tLdrLut : register(t4);
 #define cmp -
 
 static const float LUTSize = 32.0;
-// Fixed values from the Unreal Engine LUT upgrade defaults
-static const float HighlightsHuePreservation = 0.667;
-static const float HighlightsChrominancePreservation = 0.333;
 
 // The vanilla log shaper. Its output is directly the LUT UV (no half texel remapping).
 float3 EncodeLUTInput(float3 color)
@@ -35,6 +34,12 @@ float3 DecodeLUTInput(float3 encodedColor)
    return (exp2((encodedColor - 0.386036009) / 0.0734997839) - 0.0479959995) / 5.55555582;
 }
 
+// The LUT's gray tone curve: the average of its gray diagonal (unaffected by "Color Grading Intensity"), linear output over linear scene input
+float LUTGrayCurve(float x)
+{
+   return average(g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(x), 0).rgb);
+}
+
 // Luma: "Color Grading Intensity" fades the LUT's color grading out towards its gray tone curve alone (0), applied by luminance
 float3 SampleGradedLUT(float3 color)
 {
@@ -42,39 +47,30 @@ float3 SampleGradedLUT(float3 color)
    [branch] if (LumaSettings.GameSettings.ColorGradingIntensity != 1.0)
    {
       const float luminance = GetLuminance(color);
-      const float grayOutput = average(g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(luminance), 0).rgb);
-      const float3 neutral = luminance > 0.0 ? color * (grayOutput / luminance) : 0.0;
+      const float3 neutral = luminance > 0.0 ? color * (LUTGrayCurve(luminance) / luminance) : 0.0;
       graded = lerp(neutral, graded, LumaSettings.GameSettings.ColorGradingIntensity);
    }
    return graded;
 }
 
-// The gray diagonal texel's output with its tint faded as in "SampleGradedLUT" (a gray input's neutral output is its average)
-float3 LoadGradedLUTGray(int i)
+// The gray tone curve's tangent where it crosses "targetValue": the first gray diagonal texel center at or above it, and the secant from the
+// previous texel. If the curve never gets there, the pivot stays out of reach (no extension, the other outputs are unused). The LUT output
+// is linear (the composite writes through an sRGB view). All the texels are loaded unconditionally so the loads don't serialize.
+void FindLUTTangent(float targetValue, out float pivot, out float pivotOutput, out float slope)
 {
-   const float3 graded = g_tHdrLut.Load(int4(i, i, i, 0)).rgb;
-   return lerp(average(graded), graded, LumaSettings.GameSettings.ColorGradingIntensity);
-}
-
-// The LUT's slope (in linear scene input) on its gray diagonal where it crosses "targetValue", as a line through the previous texel.
-// The LUT output is linear (the composite writes through an sRGB view). All the texels are loaded unconditionally so the loads don't serialize.
-void FindLUTSlope(float targetValue, out float3 slope, out float3 offset)
-{
-   slope = 1.0;
-   offset = 0.0;
-   bool found = false;
-   float3 prevOutput = LoadGradedLUTGray(0);
+   pivot = FLT_MAX;
+   pivotOutput = 0.0;
+   slope = 0.0;
+   float prevOutput = average(g_tHdrLut.Load(int4(0, 0, 0, 0)).rgb);
    [unroll] for (int i = 1; i < (int)LUTSize; ++i)
    {
-      float3 output = LoadGradedLUTGray(i);
-      if (!found && average(output) >= targetValue)
+      float output = average(g_tHdrLut.Load(int4(i, i, i, 0)).rgb);
+      if (pivot == FLT_MAX && output >= targetValue)
       {
-         found = true;
          // Texel centers, the log shaper is strictly monotonic so the step is never 0
-         float x1 = DecodeLUTInput((i - 0.5) / LUTSize).x;
-         float x2 = DecodeLUTInput((i + 0.5) / LUTSize).x;
-         slope = (output - prevOutput) / (x2 - x1);
-         offset = prevOutput - slope * x1;
+         pivot = DecodeLUTInput((i + 0.5) / LUTSize).x;
+         pivotOutput = output;
+         slope = (output - prevOutput) / (pivot - DecodeLUTInput((i - 0.5) / LUTSize).x);
       }
       prevOutput = output;
    }
@@ -223,29 +219,17 @@ void main(
    }
    else
    {
-      const float3 tonemappedColor = r0.xyz;
-      float3 midGraySlope;
-      float3 midGrayOffset;
-      FindLUTSlope(MidGray, midGraySlope, midGrayOffset);
-
-      float3 midGrayProgress = saturate(tonemappedColor / MidGray);
-      float maxMidGrayProgress = max3(midGrayProgress);
-      float highlightsProgress = sqrt(maxMidGrayProgress);
-      float maxMidGrayToWhiteProgress = max3(saturate((tonemappedColor - MidGray) / (1.0 - MidGray)));
-
-      // Match the untonemapped color's slope with the LUT's on mid gray, which also carries the grade around it
-      float3 remappedHDRColor = (untonemappedColor * midGraySlope) + midGrayOffset;
-      // Keep the vanilla shadows, per channel
-      remappedHDRColor = lerp(tonemappedColor, remappedHDRColor, sqrt(midGrayProgress));
-
-      // Above mid gray, restore the hue of a LUT sample at a lower exposure, which isn't yet desaturated by the LUT's shoulder
-      float tonemapHalveScale = lerp(1.0, 0.667, highlightsProgress); // Exposure of the hue reference (unrelated to the hue preservation amount)
-      float3 hueSourceTonemappedColor = SampleGradedLUT(untonemappedColor * tonemapHalveScale) / tonemapHalveScale;
-      remappedHDRColor = RestoreHueAndChrominance(remappedHDRColor, hueSourceTonemappedColor, HighlightsHuePreservation, 1.0 - highlightsProgress);
-      // Towards white, restore part of the vanilla chrominance
-      remappedHDRColor = RestoreHueAndChrominance(remappedHDRColor, tonemappedColor, 0.0, sqrt(maxMidGrayToWhiteProgress) * HighlightsChrominancePreservation);
-
-      r0.xyz = lerp(tonemappedColor, remappedHDRColor, sqr(maxMidGrayProgress));
+      const float luminance = GetLuminance(untonemappedColor);
+      const float grayOutput = LUTGrayCurve(luminance);
+      // The curve is monotonic, so pixels it maps below mid gray are under the pivot and skip the 32 texel search
+      [branch] if (grayOutput >= MidGray)
+      {
+         float pivot, pivotOutput, slope;
+         FindLUTTangent(MidGray, pivot, pivotOutput, slope);
+         // Never below vanilla, in case the curve is still convex past the pivot
+         if (luminance > pivot)
+            r0.xyz *= max(1.0, (pivotOutput + slope * (luminance - pivot)) / grayOutput);
+      }
 
       const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
       const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
