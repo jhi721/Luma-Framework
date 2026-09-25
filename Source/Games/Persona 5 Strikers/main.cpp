@@ -8,8 +8,11 @@
 // SMAA runs right after the composite, through "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 #define ENABLE_SMAA 1
+// The UI shaders get a saturate appended in place (see "PatchShaderBytecodeSync")
+#define LUMA_PATCH_BYTECODE_SYNC 1
 
 #include "..\..\Core\core.hpp"
+#include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 
 namespace
 {
@@ -27,6 +30,12 @@ namespace
    // The native SSAO calculate (half res R8 visibility), replaced by XeGTAO. Its two depth aware blurs, which upsample to full
    // res, and the merge into the G-buffer AO (gbuf0.a = min(material AO, SSAO), read by the deferred lighting) stay vanilla.
    constexpr uint32_t ssao_hash = 0x63435B03;
+   // The UI pixel shaders, drawing into the swapchain (vanilla BGRA8 UNORM), which clamped their output before blending. Their texture
+   // times vertex color, blend mode and saturation control (grey + k * (color - grey), grey a 0.299/0.587/0.114 weighted RGB sum, k a
+   // cb0 scalar) go outside 0-1, which the fp16 swapchain no longer clamps. The whole family ends in that saturation tail; found by
+   // disassembling all the dumped pixel shaders.
+   // Each has a single o0.xyzw write and a single final ret.
+   const std::unordered_set<uint32_t> ui_pixel_shaders = {0x90C6B12E, 0xEE9FC290, 0x07378D54, 0x4A0CB253, 0x8BA60D22, 0xD1BEFD65, 0xF0863953, 0x76C3BC5E, 0xA4DFC750, 0xBEF2C79E};
 
    bool g_hide_ui = false; // Session only, so a restart never comes back without a HUD
 
@@ -42,7 +51,9 @@ namespace
    bool g_smaa_predication = true;
    int g_smaa_debug_view = 0; // 0 off, 1 edges, 2 predication
    std::atomic<bool> g_smaa_dump = false;
-   std::atomic<bool> g_xegtao_log = false; // Consumed at the next present, which opens the logged frame
+   std::atomic<bool> g_xegtao_log = false;                          // Consumed at the next present, which opens the logged frame
+   std::atomic<bool> g_ui_dump = false;                             // Consumed at the next present too
+   constexpr D3D11_BOX ui_dump_box = {2200, 700, 0, 3400, 1600, 1}; // Around the menu cursor at 3840x2160
 
    // XeGTAO research: the native SSAO chain (snapshot order) and the passes after it that may consume its AO, all on a deferred context.
    // Their bindings are logged when drawn, their PS constants and outputs (and the SSAO inputs) are read back.
@@ -98,6 +109,10 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // Set when SMAA ran after this frame's composite, so the vanilla FXAA is skipped
    std::atomic<bool> smaa_drawn = false;
 
+   // MIN blends, to clamp the swapchain (all channels, or alpha only) to 1 under a UI draw's own geometry (see "OnDrawOrDispatch")
+   com_ptr<ID3D11BlendState> ui_clamp_blend_state;
+   com_ptr<ID3D11BlendState> ui_clamp_alpha_blend_state;
+
    // XeGTAO scratch, recreated when the SSAO target size changes. The SSAO records on worker threads (deferred contexts), so
    // everything below is guarded by the mutex.
    std::mutex gtao_mutex;
@@ -144,6 +159,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::atomic<bool> readbacks_queued = false;
    int readback_presents_left = 0;           // Present thread only
    std::atomic<bool> xegtao_logging = false; // The frame whose SSAO chain is logged
+   std::atomic<bool> ui_dumping = false;     // The frame whose UI draws are dumped
+   std::atomic<uint32_t> ui_dump_index = 0;
 #endif
 };
 
@@ -161,8 +178,8 @@ class Persona5Strikers final : public Game
    }
 
 #if DEVELOPMENT
-   // Queues a copy of the view's texture (subresource 0, so layer 0 of arrays), if its format can be written out
-   static void QueueTextureReadback(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Persona5StrikersGameDeviceData* game_device_data, ID3D11View* view, std::string name)
+   // Queues a copy of the view's texture (subresource 0, so layer 0 of arrays, optionally a box of it), if its format can be written out
+   static void QueueTextureReadback(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Persona5StrikersGameDeviceData* game_device_data, ID3D11View* view, std::string name, D3D11_BOX box = {0, 0, 0, UINT_MAX, UINT_MAX, 1})
    {
       if (!view)
          return;
@@ -175,6 +192,12 @@ class Persona5Strikers final : public Game
       texture->GetDesc(&desc);
       if (reshade::api::format_row_pitch(reshade::api::format(desc.Format), 1) == 0 || desc.SampleDesc.Count != 1)
          return;
+      box.right = (std::min)(box.right, desc.Width);
+      box.bottom = (std::min)(box.bottom, desc.Height);
+      if (box.left >= box.right || box.top >= box.bottom)
+         return;
+      desc.Width = box.right - box.left;
+      desc.Height = box.bottom - box.top;
       desc.Usage = D3D11_USAGE_STAGING;
       desc.BindFlags = 0;
       desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -184,7 +207,7 @@ class Persona5Strikers final : public Game
       com_ptr<ID3D11Texture2D> staging;
       if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &staging)))
          return;
-      native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, texture.get(), 0, nullptr);
+      native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, texture.get(), 0, &box);
       const std::lock_guard lock(game_device_data->readback_mutex);
       game_device_data->readbacks.push_back({std::move(name), std::move(staging), nullptr});
       game_device_data->readbacks_queued = true;
@@ -340,7 +363,36 @@ class Persona5Strikers final : public Game
 public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
-      device_data.game = new Persona5StrikersGameDeviceData;
+      auto* game_device_data = new Persona5StrikersGameDeviceData;
+      device_data.game = game_device_data;
+      D3D11_BLEND_DESC blend_desc = {};
+      blend_desc.RenderTarget[0] = {TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, D3D11_COLOR_WRITE_ENABLE_ALL};
+      native_device->CreateBlendState(&blend_desc, &game_device_data->ui_clamp_blend_state);
+      blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALPHA;
+      native_device->CreateBlendState(&blend_desc, &game_device_data->ui_clamp_alpha_blend_state);
+   }
+
+   // "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp the vanilla UNORM swapchain applied to the UI (as in Yakuza 3 Remastered)
+   std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
+   {
+      constexpr uint32_t ret_token = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1);
+      if (type != reshade::api::pipeline_subobject_type::pixel_shader || !ui_pixel_shaders.contains(uint32_t(shader_hash)) || size % sizeof(uint32_t) != 0 || size < sizeof(uint32_t) || reinterpret_cast<const uint32_t*>(code)[size / sizeof(uint32_t) - 1] != ret_token)
+         return nullptr;
+      // Encoded by hand rather than with ShaderPatching::GetSatInstruction, whose source operand uses the mask selection mode;
+      // fxc encodes sources as swizzles.
+      constexpr uint32_t operand_o0 = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_OUTPUT) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_1D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      constexpr uint32_t patch[] = {
+         ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(5) | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true),
+         operand_o0 | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) | D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL, 0,
+         operand_o0 | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | D3D10_SB_OPERAND_4_COMPONENT_NOSWIZZLE, 0};
+      static_assert(patch[0] == 0x05002036 && patch[1] == 0x001020F2 && patch[3] == 0x00102E46);
+      const size_t ret_offset = size - sizeof(uint32_t);
+      auto new_code = std::make_unique<std::byte[]>(size + sizeof(patch));
+      std::memcpy(new_code.get(), code, ret_offset);
+      std::memcpy(new_code.get() + ret_offset, patch, sizeof(patch));
+      std::memcpy(new_code.get() + ret_offset + sizeof(patch), code + ret_offset, sizeof(uint32_t));
+      size += sizeof(patch);
+      return new_code;
    }
 
    void OnDestroyDeviceData(DeviceData& device_data) override
@@ -382,6 +434,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA Encode CS"), ShaderDefinition{"Luma_P5S_SMAAEncode", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA Predication CS"), ShaderDefinition{"Luma_P5S_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA Finalize PS"), ShaderDefinition{"Luma_P5S_SMAAFinalize", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw White PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(1.0, 1.0, 1.0, 1.0)"}}});
       // XeGTAO passes (Luma_P5S_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S XeGTAO Prefilter Depths CS"), ShaderDefinition{"Luma_P5S_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S XeGTAO Main Pass CS"), ShaderDefinition{"Luma_P5S_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
@@ -750,7 +803,7 @@ public:
 
       // Everything the game draws onto the swapchain after the composite is UI (HUD, menus, dialogue boxes, fades), except the FXAA passes.
       // Checked after the composite, so a flag left over from the previous frame can never stop the scene from drawing.
-      if (g_hide_ui && device_data.has_drawn_main_post_processing && (stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel && !original_shader_hashes.Contains(fxaa_hash, reshade::api::shader_stage::pixel) && !original_shader_hashes.Contains(shader_hashes_apply_fxaa))
+      if (device_data.has_drawn_main_post_processing && (stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel && !original_shader_hashes.Contains(fxaa_hash, reshade::api::shader_stage::pixel) && !original_shader_hashes.Contains(shader_hashes_apply_fxaa))
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
@@ -758,7 +811,63 @@ public:
          if (rtv)
             rtv->GetResource(&rtv_resource);
          if (rtv_resource && IsBackBuffer(&device_data, rtv_resource.get()))
-            return DrawOrDispatchOverrideType::Skip;
+         {
+            if (g_hide_ui)
+               return DrawOrDispatchOverrideType::Skip;
+
+            // UI draws that depend on the swapchain's magnitude through their blend saw it clamped to 0-1 by the vanilla UNORM target, while
+            // the additive UI before them (e.g. the menu cursor's RGB cards, alpha 1 + 1 + 1) now accumulates above 1 on the fp16 one: the
+            // cursor's reverse subtracted option text vanished, and destination alpha masks (HUD, main menu) read alphas up to 2. Clamp first, under the
+            // draw's own geometry and stencil: the same draw with a white pixel shader and a MIN blend. Colors only before a color subtract;
+            // destination alpha factors only need the (never displayed) alpha, and destination color factors are left alone, so the HDR scene
+            // under the UI keeps its range.
+            if (original_draw_dispatch_func && *original_draw_dispatch_func && game_device_data.ui_clamp_blend_state && game_device_data.ui_clamp_alpha_blend_state)
+            {
+               com_ptr<ID3D11BlendState> blend_state;
+               FLOAT blend_factor[4];
+               UINT sample_mask;
+               native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
+               D3D11_BLEND_DESC blend_desc = {};
+               if (blend_state)
+                  blend_state->GetDesc(&blend_desc);
+               const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend_desc.RenderTarget[0];
+               const auto subtracts = [](D3D11_BLEND_OP op)
+               { return op == D3D11_BLEND_OP_SUBTRACT || op == D3D11_BLEND_OP_REV_SUBTRACT; };
+               const auto reads_destination_alpha = [](D3D11_BLEND blend)
+               { return blend == D3D11_BLEND_DEST_ALPHA || blend == D3D11_BLEND_INV_DEST_ALPHA || blend == D3D11_BLEND_SRC_ALPHA_SAT; };
+               const bool clamp_colors = rt_blend.BlendEnable && subtracts(rt_blend.BlendOp);
+               const bool clamp_alpha = rt_blend.BlendEnable && (subtracts(rt_blend.BlendOpAlpha) || reads_destination_alpha(rt_blend.SrcBlend) || reads_destination_alpha(rt_blend.DestBlend) || reads_destination_alpha(rt_blend.SrcBlendAlpha) || reads_destination_alpha(rt_blend.DestBlendAlpha));
+               if (clamp_colors || clamp_alpha)
+               {
+                  com_ptr<ID3D11PixelShader> white_pixel_shader;
+                  {
+                     const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+                     if (HasShaders(device_data.native_pixel_shaders, "P5S Draw White PS"_h))
+                        white_pixel_shader = device_data.native_pixel_shaders.at("P5S Draw White PS"_h);
+                  }
+                  if (white_pixel_shader)
+                  {
+                     com_ptr<ID3D11PixelShader> pixel_shader;
+                     native_device_context->PSGetShader(&pixel_shader, nullptr, nullptr);
+                     native_device_context->PSSetShader(white_pixel_shader.get(), nullptr, 0);
+                     native_device_context->OMSetBlendState(clamp_colors ? game_device_data.ui_clamp_blend_state.get() : game_device_data.ui_clamp_alpha_blend_state.get(), blend_factor, sample_mask);
+                     (*original_draw_dispatch_func)();
+                     native_device_context->PSSetShader(pixel_shader.get(), nullptr, 0);
+                     native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
+                  }
+               }
+            }
+
+#if DEVELOPMENT
+            // "Dump UI Steps": the swapchain around the menu cursor after every UI draw (up to 128, each copy is ~9 MB until it's written out)
+            if (game_device_data.ui_dumping && game_device_data.ui_dump_index < 128 && original_draw_dispatch_func && *original_draw_dispatch_func)
+            {
+               (*original_draw_dispatch_func)();
+               QueueTextureReadback(native_device, native_device_context, &game_device_data, rtv.get(), std::format("ui_{:03}_{:08X}", game_device_data.ui_dump_index++, original_shader_hashes.pixel_shaders[0]), ui_dump_box);
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+#endif
+         }
       }
 
       // SMAA already antialiased the scene, before the UI
@@ -776,6 +885,8 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       // "Log XeGTAO Inputs" logs the frame between this present and the next
       game_device_data.xegtao_logging = g_xegtao_log.exchange(false);
+      game_device_data.ui_dumping = g_ui_dump.exchange(false);
+      game_device_data.ui_dump_index = 0;
       // Readbacks are written three presents after the first one queued: deferred command lists recorded around a present can
       // execute a frame later, and the map waits for the GPU anyway
       if (game_device_data.readbacks_queued.exchange(false) && game_device_data.readback_presents_left == 0)
@@ -894,6 +1005,12 @@ public:
          g_smaa_dump = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Dumps the next SMAA frame's depth, predication and edges to %%TEMP%%\\p5s_smaa_*_<frame>.bin.");
+
+      ImGui::SeparatorText("UI");
+      if (ImGui::Button("Dump UI Steps"))
+         g_ui_dump = true;
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Dumps the swapchain around the menu cursor (x %u-%u, y %u-%u) after every UI draw of the next frame (up to 128),\nto %%TEMP%%\\p5s_ui_<index>_<pixel shader>.bin.", ui_dump_box.left, ui_dump_box.right, ui_dump_box.top, ui_dump_box.bottom);
 
       ImGui::SeparatorText("XeGTAO");
       if (ImGui::Button("Log XeGTAO Inputs"))
