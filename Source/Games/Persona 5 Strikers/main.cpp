@@ -109,9 +109,9 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // Set when SMAA ran after this frame's composite, so the vanilla FXAA is skipped
    std::atomic<bool> smaa_drawn = false;
 
-   // MIN blends, to clamp the swapchain (all channels, or alpha only) to 1 under a UI draw's own geometry (see "OnDrawOrDispatch")
-   com_ptr<ID3D11BlendState> ui_clamp_blend_state;
-   com_ptr<ID3D11BlendState> ui_clamp_alpha_blend_state;
+   // MIN and MAX blends (all channels, alpha only), to clamp the swapchain to 0-1 under a UI draw's own geometry (see "OnDrawOrDispatch")
+   com_ptr<ID3D11BlendState> ui_min_blend_states[2];
+   com_ptr<ID3D11BlendState> ui_max_blend_states[2];
 
    // XeGTAO scratch, recreated when the SSAO target size changes. The SSAO records on worker threads (deferred contexts), so
    // everything below is guarded by the mutex.
@@ -365,11 +365,16 @@ public:
    {
       auto* game_device_data = new Persona5StrikersGameDeviceData;
       device_data.game = game_device_data;
-      D3D11_BLEND_DESC blend_desc = {};
-      blend_desc.RenderTarget[0] = {TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, D3D11_COLOR_WRITE_ENABLE_ALL};
-      native_device->CreateBlendState(&blend_desc, &game_device_data->ui_clamp_blend_state);
-      blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALPHA;
-      native_device->CreateBlendState(&blend_desc, &game_device_data->ui_clamp_alpha_blend_state);
+      for (int i = 0; i < 2; i++)
+      {
+         const UINT8 write_mask = i == 0 ? D3D11_COLOR_WRITE_ENABLE_ALL : D3D11_COLOR_WRITE_ENABLE_ALPHA;
+         D3D11_BLEND_DESC blend_desc = {};
+         blend_desc.RenderTarget[0] = {TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, write_mask};
+         native_device->CreateBlendState(&blend_desc, &game_device_data->ui_min_blend_states[i]);
+         blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_MAX;
+         blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_MAX;
+         native_device->CreateBlendState(&blend_desc, &game_device_data->ui_max_blend_states[i]);
+      }
    }
 
    // "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp the vanilla UNORM swapchain applied to the UI (as in Yakuza 3 Remastered)
@@ -435,6 +440,8 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA Predication CS"), ShaderDefinition{"Luma_P5S_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA Finalize PS"), ShaderDefinition{"Luma_P5S_SMAAFinalize", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw White PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(1.0, 1.0, 1.0, 1.0)"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw Black PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(0.0, 0.0, 0.0, 0.0)"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S UI Peak Clamp PS"), ShaderDefinition{"Luma_P5S_UIPeakClamp", reshade::api::pipeline_subobject_type::pixel_shader});
       // XeGTAO passes (Luma_P5S_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S XeGTAO Prefilter Depths CS"), ShaderDefinition{"Luma_P5S_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S XeGTAO Main Pass CS"), ShaderDefinition{"Luma_P5S_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
@@ -817,11 +824,14 @@ public:
 
             // UI draws that depend on the swapchain's magnitude through their blend saw it clamped to 0-1 by the vanilla UNORM target, while
             // the additive UI before them (e.g. the menu cursor's RGB cards, alpha 1 + 1 + 1) now accumulates above 1 on the fp16 one: the
-            // cursor's reverse subtracted option text vanished, and destination alpha masks (HUD, main menu) read alphas up to 2. Clamp first, under the
-            // draw's own geometry and stencil: the same draw with a white pixel shader and a MIN blend. Colors only before a color subtract;
-            // destination alpha factors only need the (never displayed) alpha, and destination color factors are left alone, so the HDR scene
-            // under the UI keeps its range.
-            if (original_draw_dispatch_func && *original_draw_dispatch_func && game_device_data.ui_clamp_blend_state && game_device_data.ui_clamp_alpha_blend_state)
+            // cursor's reverse subtracted option text vanished, and destination alpha masks (HUD, main menu) read alphas up to 2. Clamp first,
+            // under the draw's own geometry and stencil: the same draw with a white pixel shader and a MIN blend. Colors only before a color
+            // subtract; destination alpha factors only need the (never displayed) alpha, and destination color factors are left alone, so the
+            // HDR scene under the UI keeps its range. A subtract's own result went below 0 too (the dialogue bubbles, -1.5), so it's floored
+            // after, likewise with a black pixel shader and a MAX blend. Additive UI over a bright scene went beyond the display's peak
+            // (vanilla clipped it at 1), so it's clamped after to the peak, likewise.
+            bool drawn = false;
+            if (original_draw_dispatch_func && *original_draw_dispatch_func)
             {
                com_ptr<ID3D11BlendState> blend_state;
                FLOAT blend_factor[4];
@@ -835,25 +845,50 @@ public:
                { return op == D3D11_BLEND_OP_SUBTRACT || op == D3D11_BLEND_OP_REV_SUBTRACT; };
                const auto reads_destination_alpha = [](D3D11_BLEND blend)
                { return blend == D3D11_BLEND_DEST_ALPHA || blend == D3D11_BLEND_INV_DEST_ALPHA || blend == D3D11_BLEND_SRC_ALPHA_SAT; };
-               const bool clamp_colors = rt_blend.BlendEnable && subtracts(rt_blend.BlendOp);
-               const bool clamp_alpha = rt_blend.BlendEnable && (subtracts(rt_blend.BlendOpAlpha) || reads_destination_alpha(rt_blend.SrcBlend) || reads_destination_alpha(rt_blend.DestBlend) || reads_destination_alpha(rt_blend.SrcBlendAlpha) || reads_destination_alpha(rt_blend.DestBlendAlpha));
-               if (clamp_colors || clamp_alpha)
+               const bool subtracts_colors = rt_blend.BlendEnable && subtracts(rt_blend.BlendOp);
+               const bool subtracts_alpha = rt_blend.BlendEnable && subtracts(rt_blend.BlendOpAlpha);
+               const bool clamp_alpha = subtracts_alpha || (rt_blend.BlendEnable && (reads_destination_alpha(rt_blend.SrcBlend) || reads_destination_alpha(rt_blend.DestBlend) || reads_destination_alpha(rt_blend.SrcBlendAlpha) || reads_destination_alpha(rt_blend.DestBlendAlpha)));
+               const bool adds_colors = rt_blend.BlendEnable && rt_blend.BlendOp == D3D11_BLEND_OP_ADD && rt_blend.DestBlend == D3D11_BLEND_ONE;
+               if (subtracts_colors || clamp_alpha || adds_colors)
                {
                   com_ptr<ID3D11PixelShader> white_pixel_shader;
+                  com_ptr<ID3D11PixelShader> black_pixel_shader;
+                  com_ptr<ID3D11PixelShader> peak_pixel_shader;
                   {
                      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-                     if (HasShaders(device_data.native_pixel_shaders, "P5S Draw White PS"_h))
+                     if (HasShaders(device_data.native_pixel_shaders, "P5S Draw White PS"_h, "P5S Draw Black PS"_h, "P5S UI Peak Clamp PS"_h))
+                     {
                         white_pixel_shader = device_data.native_pixel_shaders.at("P5S Draw White PS"_h);
+                        black_pixel_shader = device_data.native_pixel_shaders.at("P5S Draw Black PS"_h);
+                        peak_pixel_shader = device_data.native_pixel_shaders.at("P5S UI Peak Clamp PS"_h);
+                     }
                   }
-                  if (white_pixel_shader)
+                  // Index 0 all channels, 1 alpha only
+                  const int channels = subtracts_colors ? 0 : 1;
+                  if (white_pixel_shader && black_pixel_shader && peak_pixel_shader && game_device_data.ui_min_blend_states[0] && game_device_data.ui_min_blend_states[1] && game_device_data.ui_max_blend_states[channels])
                   {
                      com_ptr<ID3D11PixelShader> pixel_shader;
                      native_device_context->PSGetShader(&pixel_shader, nullptr, nullptr);
-                     native_device_context->PSSetShader(white_pixel_shader.get(), nullptr, 0);
-                     native_device_context->OMSetBlendState(clamp_colors ? game_device_data.ui_clamp_blend_state.get() : game_device_data.ui_clamp_alpha_blend_state.get(), blend_factor, sample_mask);
-                     (*original_draw_dispatch_func)();
+                     const auto draw = [&](ID3D11PixelShader* draw_pixel_shader, ID3D11BlendState* draw_blend_state)
+                     {
+                        native_device_context->PSSetShader(draw_pixel_shader, nullptr, 0);
+                        native_device_context->OMSetBlendState(draw_blend_state, blend_factor, sample_mask);
+                        (*original_draw_dispatch_func)();
+                     };
+                     if (subtracts_colors || clamp_alpha)
+                        draw(white_pixel_shader.get(), game_device_data.ui_min_blend_states[channels].get());
+                     draw(pixel_shader.get(), blend_state.get());
+                     if (subtracts_colors || subtracts_alpha)
+                        draw(black_pixel_shader.get(), game_device_data.ui_max_blend_states[channels].get());
+                     if (adds_colors)
+                     {
+                        SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+                        updated_cbuffers = true;
+                        draw(peak_pixel_shader.get(), game_device_data.ui_min_blend_states[0].get());
+                     }
                      native_device_context->PSSetShader(pixel_shader.get(), nullptr, 0);
                      native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
+                     drawn = true;
                   }
                }
             }
@@ -862,11 +897,14 @@ public:
             // "Dump UI Steps": the swapchain around the menu cursor after every UI draw (up to 128, each copy is ~9 MB until it's written out)
             if (game_device_data.ui_dumping && game_device_data.ui_dump_index < 128 && original_draw_dispatch_func && *original_draw_dispatch_func)
             {
-               (*original_draw_dispatch_func)();
+               if (!drawn)
+                  (*original_draw_dispatch_func)();
+               drawn = true;
                QueueTextureReadback(native_device, native_device_context, &game_device_data, rtv.get(), std::format("ui_{:03}_{:08X}", game_device_data.ui_dump_index++, original_shader_hashes.pixel_shaders[0]), ui_dump_box);
-               return DrawOrDispatchOverrideType::Replaced;
             }
 #endif
+            if (drawn)
+               return DrawOrDispatchOverrideType::Replaced;
          }
       }
 
