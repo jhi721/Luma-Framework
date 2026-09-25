@@ -797,7 +797,6 @@ public:
       reshade::get_config_value(nullptr, NAME, "Saturation", settings.Saturation);
       reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", settings.HighlightsDesaturation);
       reshade::get_config_value(nullptr, NAME, "BloomIntensity", settings.BloomIntensity);
-      reshade::get_config_value(nullptr, NAME, "UncapBloom", settings.UncapBloom);
       reshade::get_config_value(nullptr, NAME, "Dithering", settings.Dithering);
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
    }
@@ -847,7 +846,6 @@ public:
       settings_slider("Color Grading Intensity", "ColorGradingIntensity", &settings.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       ImGui::SeparatorText("Bloom");
-      settings_toggle("Uncap Bloom", "UncapBloom", &settings.UncapBloom, default_luma_global_game_settings.UncapBloom, "Removes the game's bloom brightness cap, so the brightest sources (sun, neon) glow in proportion to their brightness.");
       settings_slider("Bloom Intensity", "BloomIntensity", &settings.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");

@@ -19,7 +19,6 @@ struct LumaGameSettings
    float Saturation;             // 1 = vanilla. After the display map, HDR only
    float HighlightsDesaturation; // 0 = off. DICE highlight desaturation, HDR only
    float BloomIntensity;         // 1 = vanilla, 0 = none. Scales the bloom combine (SDR + HDR)
-   float UncapBloom;             // 0/1. 1 = the bloom prefilter's 5.0 source cap removed
 };
 
 struct LumaGameData

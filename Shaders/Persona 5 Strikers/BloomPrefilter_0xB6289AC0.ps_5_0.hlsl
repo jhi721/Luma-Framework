@@ -1,6 +1,6 @@
 // Katana engine bloom prefilter (Unity/Kino style): exposure, a per source max channel cap of 5, an optional 5 tap median
 // (anti-flicker), then the quadratic soft knee threshold. The first downsample after it is a Karis average.
-// Luma: "Uncap Bloom" lifts the cap, so the brightest sources glow in proportion to their HDR value.
+// Luma: the scene samples are clamped >= 0, as the scene is upgraded from R11G11B10_FLOAT.
 // clang-format off
 #include "Includes/Common.hlsl"
 // clang-format on
@@ -21,17 +21,15 @@ Texture2D<float4> g_tSceneMap : register(t0);
 Texture2D<float4> g_tExposureScaleInfo : register(t1);
 
 static const float3 ThresholdWeights = float3(0.222015, 0.706655, 0.071330);
+static const float SourceCap = 5.0;
 
 float3 Tap(float2 uv, float exposure)
 {
-   // Luma: also >= 0, the scene is upgraded from R11G11B10_FLOAT, which could not hold negatives.
-   // 65024 is the vanilla R11G11B10 guard, so with "Uncap Bloom" the hue preserving rescale never fires.
-   const float cap = LumaSettings.GameSettings.UncapBloom > 0.5 ? 65024.0 : 5.0;
-   float3 color = clamp(g_tSceneMap.SampleLevel(sampleLinear_s, uv, 0).rgb, 0.0, 65024.0) * exposure;
+   float3 color = clamp(g_tSceneMap.SampleLevel(sampleLinear_s, uv, 0).rgb, 0.0, 65024.0) * exposure; // Luma: >= 0 too
    const float maxChannel = max3(color);
-   if (g_vBloomInfo1.w > 0.0 && maxChannel > cap)
-      color *= cap / maxChannel;
-   return min(color, cap);
+   if (g_vBloomInfo1.w > 0.0 && maxChannel > SourceCap)
+      color *= SourceCap / maxChannel;
+   return min(color, SourceCap);
 }
 
 float3 Median(float3 a, float3 b, float3 c)
