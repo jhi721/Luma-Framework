@@ -52,7 +52,10 @@ namespace
    // coordinates from its vertices, and the stretch of a layer's render resolution corner over its whole target
    constexpr uint32_t quad_vertex_shader_hash = 0x2B6CA9A0;
    constexpr uint32_t layer_stretch_hash = 0x99A76DC2;
-   constexpr UINT layer_uv_scale_cb_slot = 5; // "register(b5)" in Luma_P5S_LayerQuad.hlsl; the quads only read b0
+   constexpr UINT layer_uv_scale_cb_slot = 5; // "register(b5)" in Includes/LayerCorner.hlsl; the quads and sprites only read b0
+   // The UI sprite vertex shader, which also puts the 3D layers' composites on the swapchain, and the exposure histogram that reads a layer
+   constexpr uint32_t ui_sprite_vertex_shader_hash = 0x8B19022A;
+   constexpr uint32_t exposure_histogram_hash = 0xCC8D4849;
 
    bool g_hide_ui = false; // Session only, so a restart never comes back without a HUD
 
@@ -309,6 +312,21 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    float layer_uv_scale[2] = {};
    std::atomic<uint32_t> layer_draws = 0;
    std::atomic<uint32_t> layer_uncopied_draws = 0; // No CPU copy of their $Globals yet: light clusters at the render resolution's scale
+   // The layer's stretch targets, then the composite outputs made from them (only compared): the pause screen's composite reads its
+   // stretch target whole, and a UI sprite scales up the render resolution corner of its output, and the exposure reads that corner.
+   struct LayerOutput
+   {
+      float scale = 1.f; // Render resolution / output resolution
+      uint32_t frame_index = 0;
+   };
+   std::unordered_map<ID3D11Resource*, LayerOutput> layer_outputs;
+   std::unordered_map<ID3D11Resource*, LayerOutput> layer_composed;
+   com_ptr<ID3D11RenderTargetView> layer_histogram_rtv; // The stretch target scaled down to the render resolution, for the exposure
+   com_ptr<ID3D11ShaderResourceView> layer_histogram_srv;
+   std::atomic<uint32_t> layer_sprite_draws = 0;
+   std::atomic<uint32_t> layer_composites = 0;
+   std::atomic<uint32_t> layer_alpha_copies = 0;
+   std::atomic<uint32_t> layer_histogram_downsamples = 0;
    std::atomic<uint32_t> sr_render_height = 1;
    std::atomic<uint32_t> sr_output_height = 1;
    std::atomic<uint32_t> sr_splits = 0;
@@ -1178,6 +1196,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Downsample VS"), ShaderDefinition{"Luma_P5S_Downsample", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "vs_main"});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Downsample PS"), ShaderDefinition{"Luma_P5S_Downsample", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "ps_main"});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Layer Quad VS"), ShaderDefinition{"Luma_P5S_LayerQuad", reshade::api::pipeline_subobject_type::vertex_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S Layer Sprite VS"), ShaderDefinition{"Luma_P5S_LayerSprite", reshade::api::pipeline_subobject_type::vertex_shader});
       // XeGTAO passes (Luma_P5S_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S XeGTAO Prefilter Depths CS"), ShaderDefinition{"Luma_P5S_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S XeGTAO Main Pass CS"), ShaderDefinition{"Luma_P5S_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
@@ -1648,6 +1667,31 @@ public:
       return game_device_data.layer_cluster_scale_offsets.try_emplace(hash, offset).first->second;
    }
 
+   // The render scale of a layer output of this frame (a deferred context can record just past the present), 0 otherwise (a stale one from a
+   // previous pause screen, or anything else). The caller holds "layer_mutex".
+   static float GetRecentLayerScale(const std::unordered_map<ID3D11Resource*, Persona5StrikersGameDeviceData::LayerOutput>& outputs, ID3D11Resource* resource)
+   {
+      const auto it = outputs.find(resource);
+      return it != outputs.end() && cb_luma_global_settings.FrameIndex - it->second.frame_index <= 1 ? it->second.scale : 0.f;
+   }
+
+   // The uv scale (1 / render scale) of the layer vertex shaders ("Includes/LayerCorner.hlsl"), at "layer_uv_scale_cb_slot"
+   static com_ptr<ID3D11Buffer> GetLayerUVScaleBuffer(ID3D11Device* native_device, Persona5StrikersGameDeviceData* game_device_data, const float scale[2])
+   {
+      const std::lock_guard lock(game_device_data->layer_mutex);
+      if (!game_device_data->layer_uv_scale_buffer || game_device_data->layer_uv_scale[0] != scale[0] || game_device_data->layer_uv_scale[1] != scale[1])
+      {
+         const float uv_scale[4] = {1.f / scale[0], 1.f / scale[1], 0.f, 0.f};
+         const D3D11_BUFFER_DESC desc = {sizeof(uv_scale), D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER};
+         const D3D11_SUBRESOURCE_DATA data = {uv_scale};
+         game_device_data->layer_uv_scale_buffer.reset();
+         if (FAILED(native_device->CreateBuffer(&desc, &data, &game_device_data->layer_uv_scale_buffer)))
+            return nullptr;
+         std::copy_n(scale, 2, game_device_data->layer_uv_scale);
+      }
+      return game_device_data->layer_uv_scale_buffer;
+   }
+
    // Upscaling: the 3D layers the game draws outside the scene frame (the main menu and pause screen characters, their outlines and
    // translucents) go into output sized targets through a render resolution viewport, then a stretch (0x99A76DC2) scales that corner
    // over the whole target, so DLSS/FSR never sees them. Their draws get the whole target instead, and the stretch copies it 1:1. What
@@ -1681,6 +1725,13 @@ public:
             return false;
          std::copy_n(it->second.scale, 2, scale);
          game_device_data.layer_frames.erase(it);
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         com_ptr<ID3D11Resource> stretch_target;
+         if (rtv)
+            rtv->GetResource(&stretch_target);
+         if (stretch_target)
+            game_device_data.layer_outputs[stretch_target.get()] = {scale[0], cb_luma_global_settings.FrameIndex};
       }
       else
       {
@@ -1722,18 +1773,9 @@ public:
       com_ptr<ID3D11Buffer> uv_scale_buffer;
       if (quad_vertex_shader)
       {
-         const std::lock_guard lock(game_device_data.layer_mutex);
-         if (!game_device_data.layer_uv_scale_buffer || game_device_data.layer_uv_scale[0] != scale[0] || game_device_data.layer_uv_scale[1] != scale[1])
-         {
-            const float uv_scale[4] = {1.f / scale[0], 1.f / scale[1], 0.f, 0.f};
-            const D3D11_BUFFER_DESC desc = {sizeof(uv_scale), D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER};
-            const D3D11_SUBRESOURCE_DATA data = {uv_scale};
-            game_device_data.layer_uv_scale_buffer.reset();
-            if (FAILED(native_device->CreateBuffer(&desc, &data, &game_device_data.layer_uv_scale_buffer)))
-               return false;
-            std::copy_n(scale, 2, game_device_data.layer_uv_scale);
-         }
-         uv_scale_buffer = game_device_data.layer_uv_scale_buffer;
+         uv_scale_buffer = GetLayerUVScaleBuffer(native_device, &game_device_data, scale);
+         if (!uv_scale_buffer)
+            return false;
       }
 
       // The lit pixel shaders' $Globals with the cluster scale matching the pixel positions. Until the buffer has a CPU copy (its first
@@ -2034,6 +2076,78 @@ public:
       if (IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_draw_dispatch_func && *original_draw_dispatch_func && DrawLayerAtOutputResolution(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
+      // The exposure histogram of a 3D layer's stretch target reads its render resolution corner by pixel: it gets the target (drawn at the
+      // output resolution) scaled down to the render resolution instead
+      if (original_shader_hashes.Contains(exposure_histogram_hash, reshade::api::shader_stage::compute) && original_draw_dispatch_func && *original_draw_dispatch_func)
+      {
+         com_ptr<ID3D11ShaderResourceView> layer_srv;
+         native_device_context->CSGetShaderResources(0, 1, &layer_srv);
+         com_ptr<ID3D11Resource> layer;
+         if (layer_srv)
+            layer_srv->GetResource(&layer);
+         com_ptr<ID3D11RenderTargetView> histogram_rtv;
+         com_ptr<ID3D11ShaderResourceView> histogram_srv;
+         UINT width = 0;
+         UINT height = 0;
+         if (layer)
+         {
+            const std::lock_guard lock(game_device_data.layer_mutex);
+            if (const float scale = GetRecentLayerScale(game_device_data.layer_outputs, layer.get()); scale > 0.f && scale < 1.f)
+            {
+               uint4 layer_size;
+               DXGI_FORMAT layer_format;
+               GetResourceInfo(layer.get(), layer_size, layer_format);
+               width = UINT(float(layer_size.x) * scale + 0.5f);
+               height = UINT(float(layer_size.y) * scale + 0.5f);
+               uint4 histogram_size = {};
+               DXGI_FORMAT histogram_format;
+               if (game_device_data.layer_histogram_srv)
+                  GetResourceInfo(game_device_data.layer_histogram_srv.get(), histogram_size, histogram_format);
+               if (histogram_size.x != width || histogram_size.y != height)
+               {
+                  game_device_data.layer_histogram_rtv.reset();
+                  game_device_data.layer_histogram_srv.reset();
+                  const D3D11_TEXTURE2D_DESC desc = {width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET};
+                  com_ptr<ID3D11Texture2D> texture;
+                  if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &texture)) || FAILED(native_device->CreateRenderTargetView(texture.get(), nullptr, &game_device_data.layer_histogram_rtv)) || FAILED(native_device->CreateShaderResourceView(texture.get(), nullptr, &game_device_data.layer_histogram_srv)))
+                  {
+                     game_device_data.layer_histogram_rtv.reset();
+                     game_device_data.layer_histogram_srv.reset();
+                  }
+               }
+               histogram_rtv = game_device_data.layer_histogram_rtv;
+               histogram_srv = game_device_data.layer_histogram_srv;
+            }
+         }
+         com_ptr<ID3D11VertexShader> downsample_vertex_shader;
+         com_ptr<ID3D11PixelShader> downsample_pixel_shader;
+         if (histogram_srv)
+         {
+            const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+            if (HasShaders(device_data.native_vertex_shaders, "P5S Downsample VS"_h) && HasShaders(device_data.native_pixel_shaders, "P5S Downsample PS"_h))
+            {
+               downsample_vertex_shader = device_data.native_vertex_shaders.at("P5S Downsample VS"_h);
+               downsample_pixel_shader = device_data.native_pixel_shaders.at("P5S Downsample PS"_h);
+            }
+         }
+         if (downsample_pixel_shader)
+         {
+            {
+               DrawStateStack<DrawStateStackType::FullGraphics> state;
+               state.Cache(native_device_context, device_data.uav_max_count);
+               DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(), downsample_vertex_shader.get(), downsample_pixel_shader.get(), layer_srv.get(), histogram_rtv.get(), width, height);
+               state.Restore(native_device_context);
+            }
+            ID3D11ShaderResourceView* srv = histogram_srv.get();
+            native_device_context->CSSetShaderResources(0, 1, &srv);
+            (*original_draw_dispatch_func)();
+            srv = layer_srv.get();
+            native_device_context->CSSetShaderResources(0, 1, &srv);
+            game_device_data.layer_histogram_downsamples++;
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+      }
+
       if (g_gtao_enable && original_shader_hashes.Contains(ssao_hash, reshade::api::shader_stage::pixel))
          return RunXeGTAO(native_device, native_device_context, device_data) ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
 
@@ -2160,6 +2274,45 @@ public:
                GetResourceInfo(target.get(), target_size, target_format);
                if (target_size.x < uint32_t(device_data.output_resolution.x + 0.5f))
                   game_device_data.render_resolution_composite = true;
+
+               // A 3D layer's composite, from its stretch target: see "layer_composed"
+               com_ptr<ID3D11ShaderResourceView> scene_srv;
+               native_device_context->PSGetShaderResources(0, 1, &scene_srv);
+               com_ptr<ID3D11Resource> scene;
+               if (scene_srv)
+                  scene_srv->GetResource(&scene);
+               float layer_scale = 0.f;
+               if (scene)
+               {
+                  const std::lock_guard lock(game_device_data.layer_mutex);
+                  layer_scale = GetRecentLayerScale(game_device_data.layer_outputs, scene.get());
+                  if (layer_scale > 0.f && layer_scale < 1.f)
+                     game_device_data.layer_composed[target.get()] = {layer_scale, cb_luma_global_settings.FrameIndex};
+               }
+               // It draws the render resolution corner (which the sprite then scales up), cut by its scissor (or viewport): the whole target,
+               // from the whole scene. A corner viewport also had corner scene coordinates: those get scaled ("LumaData.CustomData4" in the
+               // composite, the scene samples only, the rest keeps its coordinates).
+               D3D11_VIEWPORT viewport = {};
+               UINT viewports = 1;
+               native_device_context->RSGetViewports(&viewports, &viewport);
+               D3D11_RECT scissor = {};
+               UINT scissors = 1;
+               native_device_context->RSGetScissorRects(&scissors, &scissor);
+               if (layer_scale > 0.f && layer_scale < 1.f && viewports != 0 && viewport.Width > 0.f && (viewport.Width < float(target_size.x) || (scissors != 0 && scissor.right < LONG(target_size.x))) && original_draw_dispatch_func && *original_draw_dispatch_func)
+               {
+                  const D3D11_VIEWPORT full_viewport = {0.f, 0.f, float(target_size.x), float(target_size.y), viewport.MinDepth, viewport.MaxDepth};
+                  const D3D11_RECT full_scissor = {0, 0, LONG(target_size.x), LONG(target_size.y)};
+                  native_device_context->RSSetViewports(1, &full_viewport);
+                  native_device_context->RSSetScissorRects(1, &full_scissor);
+                  SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+                  SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, 0.f, float(target_size.x) / viewport.Width);
+                  updated_cbuffers = true;
+                  (*original_draw_dispatch_func)();
+                  native_device_context->RSSetViewports(1, &viewport);
+                  native_device_context->RSSetScissorRects(scissors, &scissor);
+                  game_device_data.layer_composites++;
+                  return DrawOrDispatchOverrideType::Replaced;
+               }
             }
          }
          // Upscaled: from the upscaler's output, at the output resolution, into the canvas (RCAS included), which the stretch then copies 1:1
@@ -2193,6 +2346,62 @@ public:
          if (game_device_data.scene_antialiased && cb_luma_global_settings.GameSettings.RCASSharpness > 0.f)
             return DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, false);
          return DrawOrDispatchOverrideType::None;
+      }
+
+      // The copy of a 3D layer's alpha into its composite's output (the pause screen's), after the composite: its quad covers the render
+      // resolution corner through its vertex positions (a full viewport) and texture coordinates. The whole target instead, like the composite.
+      if (original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && original_shader_hashes.Contains(quad_vertex_shader_hash, reshade::api::shader_stage::vertex) && original_draw_dispatch_func && *original_draw_dispatch_func)
+      {
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         com_ptr<ID3D11Resource> target;
+         if (rtv)
+            rtv->GetResource(&target);
+         float scale[2] = {};
+         if (target)
+         {
+            const std::lock_guard lock(game_device_data.layer_mutex);
+            scale[0] = scale[1] = GetRecentLayerScale(game_device_data.layer_composed, target.get());
+         }
+         com_ptr<ID3D11VertexShader> quad_vertex_shader;
+         if (scale[0] > 0.f && scale[0] < 1.f)
+         {
+            const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+            if (HasShaders(device_data.native_vertex_shaders, "P5S Layer Quad VS"_h))
+               quad_vertex_shader = device_data.native_vertex_shaders.at("P5S Layer Quad VS"_h);
+         }
+         const com_ptr<ID3D11Buffer> uv_scale_buffer = quad_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr;
+         D3D11_VIEWPORT viewport = {};
+         UINT viewports = 1;
+         native_device_context->RSGetViewports(&viewports, &viewport);
+         if (uv_scale_buffer && viewports != 0)
+         {
+            uint4 target_size;
+            DXGI_FORMAT target_format;
+            GetResourceInfo(target.get(), target_size, target_format);
+            D3D11_RECT scissor = {};
+            UINT scissors = 1;
+            native_device_context->RSGetScissorRects(&scissors, &scissor);
+            com_ptr<ID3D11VertexShader> vertex_shader;
+            native_device_context->VSGetShader(&vertex_shader, nullptr, nullptr);
+            com_ptr<ID3D11Buffer> original_uv_scale_buffer;
+            native_device_context->VSGetConstantBuffers(layer_uv_scale_cb_slot, 1, &original_uv_scale_buffer);
+            const D3D11_VIEWPORT whole_viewport = {viewport.TopLeftX / scale[0], viewport.TopLeftY / scale[1], viewport.Width / scale[0], viewport.Height / scale[1], viewport.MinDepth, viewport.MaxDepth};
+            const D3D11_RECT whole_scissor = {0, 0, LONG(target_size.x), LONG(target_size.y)};
+            native_device_context->RSSetViewports(1, &whole_viewport);
+            native_device_context->RSSetScissorRects(1, &whole_scissor);
+            ID3D11Buffer* buffer = uv_scale_buffer.get();
+            native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
+            native_device_context->VSSetShader(quad_vertex_shader.get(), nullptr, 0);
+            (*original_draw_dispatch_func)();
+            buffer = original_uv_scale_buffer.get();
+            native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
+            native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
+            native_device_context->RSSetViewports(1, &viewport);
+            native_device_context->RSSetScissorRects(scissors, &scissor);
+            game_device_data.layer_alpha_copies++;
+            return DrawOrDispatchOverrideType::Replaced;
+         }
       }
 
       // The game's stretch of the composite's target onto the swapchain (render scales below 1) is the scene, never UI. Upscaled, it copies the canvas 1:1.
@@ -2231,6 +2440,46 @@ public:
          {
             if (g_hide_ui)
                return DrawOrDispatchOverrideType::Skip;
+
+            // The sprite that puts a 3D layer's composite on the swapchain scales up its render resolution corner: all of it instead
+            if (original_shader_hashes.Contains(ui_sprite_vertex_shader_hash, reshade::api::shader_stage::vertex) && original_draw_dispatch_func && *original_draw_dispatch_func)
+            {
+               com_ptr<ID3D11ShaderResourceView> layer_srv;
+               native_device_context->PSGetShaderResources(0, 1, &layer_srv);
+               com_ptr<ID3D11Resource> layer;
+               if (layer_srv)
+                  layer_srv->GetResource(&layer);
+               float scale[2] = {};
+               if (layer)
+               {
+                  const std::lock_guard lock(game_device_data.layer_mutex);
+                  scale[0] = scale[1] = GetRecentLayerScale(game_device_data.layer_composed, layer.get());
+               }
+               com_ptr<ID3D11VertexShader> sprite_vertex_shader;
+               if (scale[0] > 0.f)
+               {
+                  const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+                  if (HasShaders(device_data.native_vertex_shaders, "P5S Layer Sprite VS"_h))
+                     sprite_vertex_shader = device_data.native_vertex_shaders.at("P5S Layer Sprite VS"_h);
+               }
+               const com_ptr<ID3D11Buffer> uv_scale_buffer = sprite_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr;
+               if (uv_scale_buffer)
+               {
+                  com_ptr<ID3D11VertexShader> vertex_shader;
+                  native_device_context->VSGetShader(&vertex_shader, nullptr, nullptr);
+                  com_ptr<ID3D11Buffer> original_uv_scale_buffer;
+                  native_device_context->VSGetConstantBuffers(layer_uv_scale_cb_slot, 1, &original_uv_scale_buffer);
+                  ID3D11Buffer* buffer = uv_scale_buffer.get();
+                  native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
+                  native_device_context->VSSetShader(sprite_vertex_shader.get(), nullptr, 0);
+                  (*original_draw_dispatch_func)();
+                  buffer = original_uv_scale_buffer.get();
+                  native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
+                  native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
+                  game_device_data.layer_sprite_draws++;
+                  return DrawOrDispatchOverrideType::Replaced;
+               }
+            }
 
             // UI draws that depend on the swapchain's magnitude through their blend saw it clamped to 0-1 by the vanilla UNORM target, while
             // the additive UI before them (e.g. the menu cursor's RGB cards, alpha 1 + 1 + 1) now accumulates above 1 on the fp16 one: the
@@ -2480,7 +2729,7 @@ public:
                anisotropic_samplers += desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC;
             }
          }
-         reshade::log::message(reshade::log::level::info, std::format("[P5S MV] frame={} per 60 frames: patched_draws={} forward_draws={} jitter_only_draws={} skipped_draws={} uncopied_draws={} matched_draws={} ambiguous_draws={} other_camera_draws={} sr_splits={} sr_draws={} no_overwrite_maps={} samplers={} anisotropic_samplers={} mip_bias={} resource_copies={} fills={} layer_draws={} layer_uncopied_draws={}", cb_luma_global_settings.FrameIndex, game_device_data.mv_patched_draws.exchange(0), game_device_data.mv_forward_draws.exchange(0), game_device_data.mv_jitter_only_draws.exchange(0), game_device_data.mv_skipped_draws.exchange(0), game_device_data.mv_uncopied_draws.exchange(0), game_device_data.mv_matched_draws.exchange(0), game_device_data.mv_ambiguous_draws.exchange(0), game_device_data.mv_other_camera_draws.exchange(0), game_device_data.sr_splits.exchange(0), game_device_data.sr_draws.exchange(0), game_device_data.sr_no_overwrite_maps.exchange(0), samplers, anisotropic_samplers, float(device_data.texture_mip_lod_bias_offset), game_device_data.mv_resource_copies.exchange(0), game_device_data.mv_fills.exchange(0), game_device_data.layer_draws.exchange(0), game_device_data.layer_uncopied_draws.exchange(0)).c_str());
+         reshade::log::message(reshade::log::level::info, std::format("[P5S MV] frame={} per 60 frames: patched_draws={} forward_draws={} jitter_only_draws={} skipped_draws={} uncopied_draws={} matched_draws={} ambiguous_draws={} other_camera_draws={} sr_splits={} sr_draws={} no_overwrite_maps={} samplers={} anisotropic_samplers={} mip_bias={} resource_copies={} fills={} layer_draws={} layer_uncopied_draws={} layer_composites={} layer_alpha_copies={} layer_sprite_draws={} layer_histogram_downsamples={}", cb_luma_global_settings.FrameIndex, game_device_data.mv_patched_draws.exchange(0), game_device_data.mv_forward_draws.exchange(0), game_device_data.mv_jitter_only_draws.exchange(0), game_device_data.mv_skipped_draws.exchange(0), game_device_data.mv_uncopied_draws.exchange(0), game_device_data.mv_matched_draws.exchange(0), game_device_data.mv_ambiguous_draws.exchange(0), game_device_data.mv_other_camera_draws.exchange(0), game_device_data.sr_splits.exchange(0), game_device_data.sr_draws.exchange(0), game_device_data.sr_no_overwrite_maps.exchange(0), samplers, anisotropic_samplers, float(device_data.texture_mip_lod_bias_offset), game_device_data.mv_resource_copies.exchange(0), game_device_data.mv_fills.exchange(0), game_device_data.layer_draws.exchange(0), game_device_data.layer_uncopied_draws.exchange(0), game_device_data.layer_composites.exchange(0), game_device_data.layer_alpha_copies.exchange(0), game_device_data.layer_sprite_draws.exchange(0), game_device_data.layer_histogram_downsamples.exchange(0)).c_str());
       }
 #endif
    }

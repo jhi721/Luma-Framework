@@ -106,7 +106,10 @@ void main(
    r0.z = r0.z ? r0.w : r1.x;
    r0.z *= LumaSettings.GameSettings.Exposure; // Luma: exposure slider (also scales the sun flare, as the vanilla exposure does)
    r1.xz = v1.xy * g_vCompositeLastViewport.zw + g_vCompositeLastViewport.xy;
-   r2.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r1.xz, 0).xyz;
+   // Luma: a 3D layer drawn at the output resolution (the pause screen's; LumaData.CustomData4 = target / vanilla viewport width): its scene is
+   // the whole target, not the render resolution corner. Only the scene samples: the flare, vignette and aberration keep the vanilla UV.
+   const float sceneUVScale = LumaData.CustomData4 > 0.0 ? LumaData.CustomData4 : 1.0;
+   r2.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r1.xz * sceneUVScale, 0).xyz;
    // Luma: the scene is upgraded from R11G11B10_FLOAT, which could not hold negatives (65024, the vanilla cap, is its max)
    r2.xyz = clamp(r2.xyz, 0.0, 65024.0);
    r0.w = cmp(0 < g_vEtcEffect.x);
@@ -140,7 +143,7 @@ void main(
          if (r4.w != 0)
             break;
          r9.xy = r9.xy + r3.xy;
-         r10.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r9.xy, 0).xyz;
+         r10.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r9.xy * sceneUVScale, 0).xyz;
          r10.xyz = clamp(r10.xyz, 0.0, 65024.0);
          r4.w = (int)r3.w;
          r4.w = r4.w / r2.w;
@@ -164,7 +167,7 @@ void main(
    r2.xyz = r2.xyz * r0.zzz;
    if (r0.x != 0)
    {
-      r3.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, g_vSun2dInfo.xy, 0).xyz;
+      r3.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, g_vSun2dInfo.xy * sceneUVScale, 0).xyz;
       r3.xyz = clamp(r3.xyz, 0.0, 65024.0);
       r0.xzw = r3.xyz * r0.zzz;
       r3.xyz = g_tLensFlareMap.SampleLevel(sampleLinear_s, r1.xz, 0).xyz;
