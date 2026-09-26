@@ -4,25 +4,22 @@
 
 #include "..\..\Core\includes\shader_patching.h"
 
-// Motion vectors for a game that renders none, by patching its DXBC shaders (whole containers, as the signatures change, which
-// Core's patch module can't do).
-// Vertex shaders: the program runs a second time, reading the previous frame's $Globals (cb0: view projection, world matrix or bone
-// palette) and resources from other slots, and only that run's SV_Position survives, as an extra output. The first run's SV_Position is copied
-// to an extra output too, as outputs can't be read back.
-// Pixel shaders: an extra render target gets the UV space delta from the current to the previous position.
+// Motion vectors for a game that renders none, by patching whole DXBC containers (signatures change, which Core's patch module can't do).
+// Vertex shaders run twice: the second run reads the previous frame's $Globals (cb0: view projection, world matrix or bone palette)
+// and resources from other slots, and only its SV_Position is kept, as an extra output. The first run's SV_Position is also copied to
+// an extra output, as outputs can't be read back.
+// Pixel shaders write the UV space delta from the current to the previous position to an extra target.
 namespace MotionVectorPatches
 {
-   // The cbuffer the second run reads from the previous frame's copy ($Globals), and that copy's slot
+   // $Globals, and the slot of the previous frame's copy the second run reads
    constexpr uint32_t globals_slot = 0;
    constexpr uint32_t previous_globals_slot = 10;
-   // The projection jitter for temporal upscalers, in NDC (c0.xy), added to the current position after its unjittered copy (so the
-   // motion vectors never contain it)
+   // Upscaler projection jitter in NDC (c0.xy), added to SV_Position after its unjittered copy, so motion vectors never contain it
    constexpr uint32_t jitter_slot = 9;
-   // The second run reads the shader's resources (t0 to t15: wind and interaction buffers, ocean maps...) from these slots
-   // instead, where the previous frame's copies go
+   // The second run reads t0-t15 (wind and interaction buffers, ocean maps...) from these slots, which hold the previous frame's copies
    constexpr uint32_t resource_slots = 16;
    constexpr uint32_t previous_resources_slot = 64;
-   // Past every register the game's shaders use (vertex outputs end at o12, and the pixel shaders' system value inputs follow their interpolants)
+   // Past every register the game uses (vertex outputs end at o12; pixel shader system value inputs follow the interpolants)
    constexpr uint32_t current_position_register = 30;
    constexpr uint32_t previous_position_register = 31;
    // The G-buffer writes 5 targets (the water 6), the forward redraws 1
@@ -62,7 +59,7 @@ namespace MotionVectorPatches
       return true;
    }
 
-   // A new container (sizes, offsets and checksum included)
+   // A new container (sizes, offsets, checksum)
    inline std::vector<uint8_t> WriteChunks(const std::vector<Chunk>& chunks)
    {
       size_t size = sizeof(Shader::DXBCHeader) + chunks.size() * sizeof(uint32_t);
@@ -151,8 +148,8 @@ namespace MotionVectorPatches
       D3D10_SB_OPCODE_TYPE opcode;
    };
 
-   // The SHEX/SHDR tokens split into instructions (lengths from the opcode tokens, or the second token for custom data), after the
-   // version and length tokens. False if the lengths don't add up.
+   // Splits the SHEX/SHDR tokens after the version and length into instructions (length from the opcode token, or the second token
+   // for custom data). False if the lengths don't add up.
    inline bool SplitInstructions(const std::vector<uint32_t>& tokens, std::vector<Instruction>* instructions)
    {
       if (tokens.size() < 2 || tokens[1] != tokens.size())
@@ -170,12 +167,11 @@ namespace MotionVectorPatches
       return true;
    }
 
-   // Where an operand's register index sits (the first index of an immediate or immediate plus relative index), or none
+   // Position of an operand's first index when immediate (or immediate plus relative), or none
    constexpr size_t no_index = SIZE_MAX;
 
-   // Walks the operand at "i" (relative index operands included, after the operand that owns them), calling
-   // "visit(operand_token_position, first_index_position)". Returns the position after the operand, or 0 for an encoding this
-   // doesn't handle (64 bit immediates and indices).
+   // Calls "visit(operand_token_position, first_index_position)" on the operand at "i" and on its relative index operands (which
+   // follow it). Returns the position after the operand, or 0 for unhandled encodings (64 bit immediates and indices).
    template <typename Visit>
    size_t WalkOperand(const std::vector<uint32_t>& tokens, size_t i, size_t end, Visit&& visit)
    {
@@ -183,7 +179,7 @@ namespace MotionVectorPatches
          return 0;
       const size_t token_position = i;
       const uint32_t token = tokens[i++];
-      // Extended operand tokens (modifiers, min precision) chain through their top bit too
+      // Extended operand tokens (modifiers, min precision) chain via their top bit
       for (uint32_t extended = token; DECODE_IS_D3D10_SB_OPERAND_EXTENDED(extended); extended = tokens[i++])
       {
          if (i >= end)
@@ -252,7 +248,7 @@ namespace MotionVectorPatches
       return opcode == D3D10_SB_OPCODE_CUSTOMDATA || ShaderPatching::opcodes_dcl.contains(opcode);
    }
 
-   // Operand tokens for the few instructions this writes
+   // Operand tokens for the instructions added here
    constexpr uint32_t RegisterOperand(D3D10_SB_OPERAND_TYPE type)
    {
       return ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(type) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_1D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
@@ -268,9 +264,9 @@ namespace MotionVectorPatches
    constexpr uint32_t mask_xy = D3D10_SB_OPERAND_4_COMPONENT_MASK_X | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y;
    constexpr uint32_t mask_xyw = mask_xy | D3D10_SB_OPERAND_4_COMPONENT_MASK_W;
 
-   // The version and length tokens and the declarations, with "added_temps" more temps ("first_temp" gets the first added one;
-   // a temps declaration is appended if there was none), and the tokens "after(index)" returns inserted after each declaration,
-   // so new declarations join their group, as fxc orders them.
+   // Copies the version, length and declaration tokens with "added_temps" more temps ("first_temp" gets the first; a temps
+   // declaration is appended if none), inserting "after(index)"'s tokens after each declaration so new ones join their group, as
+   // fxc orders them.
    template <typename After>
    std::vector<uint32_t> CopyDeclarations(const std::vector<uint32_t>& tokens, const std::vector<Instruction>& instructions, size_t first_body, uint32_t added_temps, uint32_t* first_temp, After&& after)
    {
@@ -296,7 +292,7 @@ namespace MotionVectorPatches
       return declarations;
    }
 
-   // The index of the last declaration (before "first_body") with one of the opcodes, or "first_body" if none
+   // Index of the last declaration with one of the opcodes, or "first_body" if none
    inline size_t FindLastDeclaration(const std::vector<Instruction>& instructions, size_t first_body, std::initializer_list<D3D10_SB_OPCODE_TYPE> opcodes)
    {
       size_t last = first_body;
@@ -308,7 +304,7 @@ namespace MotionVectorPatches
       return last;
    }
 
-   // The vertex shader with the second run added, or empty if it can't be patched (the draw then keeps the original shaders)
+   // The vertex shader with the second run, or empty if unpatchable (the draw then keeps the original shaders)
    inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, std::string* error)
    {
       std::vector<Chunk> chunks;
@@ -345,8 +341,8 @@ namespace MotionVectorPatches
                                                                                                        { return instruction.opcode == D3D10_SB_OPCODE_RET; }) != 1)
          return (*error = "returns", std::vector<uint8_t>());
 
-      // Declarations: the globals cbuffer again at the previous frame's slot (same size and immediate or dynamic indexing), each
-      // resource again at the previous frame's slots, the two outputs, one more temp
+      // Added declarations: $Globals (same size and indexing) and each resource again at the previous frame's slots, the two
+      // outputs, one temp
       const auto is_resource_declaration = [](D3D10_SB_OPCODE_TYPE opcode)
       { return opcode == D3D10_SB_OPCODE_DCL_RESOURCE || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_RAW || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED; };
       size_t globals_index = first_body;
@@ -422,8 +418,8 @@ namespace MotionVectorPatches
                      if (index_position == no_index || DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, token) != D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
                         return supported = false;
                      uint32_t& index = body[offset + index_position - instruction.begin];
-                     // SV_Position: into the scratch temp in the first run (copied to its output and ours after), into ours in the
-                     // second. The second run's other outputs go to the scratch temp, dead.
+                     // SV_Position goes to the scratch temp in the first run (copied to its output and ours after), to ours in
+                     // the second. The second run's other outputs go to the scratch temp, dead.
                      if (previous && index == position_register)
                      {
                         index = previous_position_register;
@@ -456,7 +452,7 @@ namespace MotionVectorPatches
          }
          if (!previous)
          {
-            // Our current position output (unjittered), then SV_Position with the jitter: xy += jitter * w
+            // Our unjittered current position output, then SV_Position with xy += jitter * w
             constexpr uint32_t mov = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(5);
             constexpr uint32_t jitter_operand = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(0, 1, 0, 0) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
             body.insert(body.end(), {
@@ -498,7 +494,7 @@ namespace MotionVectorPatches
       return WriteChunks(chunks);
    }
 
-   // The pixel shader with the motion vector target added, or empty if it can't be patched
+   // The pixel shader with the motion vector target, or empty if unpatchable
    inline std::vector<uint8_t> PatchPixelShader(const uint8_t* code, size_t size, std::string* error)
    {
       std::vector<Chunk> chunks;
@@ -541,7 +537,7 @@ namespace MotionVectorPatches
                                                                                                        { return instruction.opcode == D3D10_SB_OPCODE_RET || instruction.opcode == D3D10_SB_OPCODE_RETC; }))
          return (*error = "returns", std::vector<uint8_t>());
 
-      // The two inputs after the last input declaration (or right before the outputs), the target after the last output
+      // The two inputs after the last input (or before the outputs), the target after the last output
       const size_t first_output = size_t(std::ranges::find_if(instructions.begin(), instructions.begin() + first_body, [](const Instruction& instruction)
                                             { return instruction.opcode == D3D10_SB_OPCODE_DCL_OUTPUT; }) -
                                          instructions.begin());
@@ -564,7 +560,7 @@ namespace MotionVectorPatches
                added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), target_slot});
             return added; });
 
-      // Before the final ret: (previous.xy / previous.w - current.xy / current.w) * (0.5, -0.5), UV space
+      // Before the final ret, in UV space: (previous.xy / previous.w - current.xy / current.w) * (0.5, -0.5)
       const uint32_t current = temp;
       const uint32_t previous = temp + 1;
       constexpr uint32_t div = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DIV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7);

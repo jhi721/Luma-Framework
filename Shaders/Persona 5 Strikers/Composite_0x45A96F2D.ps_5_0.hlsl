@@ -1,10 +1,10 @@
 // Katana engine PostEffect3 composite: scene exposure, chromatic aberration, sun/lens flare, vignette ("limb darkening"),
-// then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) through an ARRI LogC EI1000 (no cut) shaper, an optional LDR LUT, an output power curve (g_vGammaCorrection) and fade.
-// Writes linear colors to the swapchain (through an sRGB view), UI and FXAA follow.
-// Luma: in HDR, the vanilla LUT output is multiplied by one scalar of the pre-LUT relative luminance Y: E(Y) / G(Y), where G is the LUT's
-// gray tone curve and E is G continued by its tangent past the pivot where G's output reaches mid gray. Only luminance crosses into the
-// output (as in BL2/TPS), a scalar can't rotate hue, so the grade and its path to white stay vanilla, and below the pivot the output is
-// exactly vanilla. DICE then maps it to the peak. The LUT is a per area asset, so the tangent is found per pixel.
+// then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) via an ARRI LogC EI1000 (no cut) shaper, an optional LDR LUT, an output power curve (g_vGammaCorrection) and fade.
+// Writes linear colors to the swapchain through an sRGB view; UI and FXAA follow.
+// Luma: in HDR, the vanilla LUT output is scaled by E(Y) / G(Y) of the pre-LUT relative luminance Y, where G is the LUT's gray tone
+// curve and E is G continued by its tangent past the pivot where G reaches mid gray. Only luminance crosses into the output (as in
+// BL2/TPS); a scalar can't rotate hue, so the grade and its path to white stay vanilla, and output below the pivot is exactly vanilla.
+// DICE then maps it to the peak. The LUT is a per area asset, so the tangent is found per pixel.
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "../Includes/DICE.hlsl"
@@ -24,7 +24,7 @@ Texture3D<float4> g_tLdrLut : register(t4);
 
 static const float LUTSize = 32.0;
 
-// The vanilla log shaper. Its output is directly the LUT UV (no half texel remapping).
+// The vanilla log shaper; its output is the LUT UV directly (no half texel remap).
 float3 EncodeLUTInput(float3 color)
 {
    return saturate(log2(color * 5.55555582 + 0.0479959995) * 0.0734997839 + 0.386036009);
@@ -34,15 +34,15 @@ float3 DecodeLUTInput(float3 encodedColor)
    return (exp2((encodedColor - 0.386036009) / 0.0734997839) - 0.0479959995) / 5.55555582;
 }
 
-// The LUT's gray tone curve: the average of its gray diagonal (unaffected by "Color Grading Intensity"), linear output over linear scene input
+// The LUT's gray tone curve (average of its gray diagonal, unaffected by "Color Grading Intensity"): linear scene input to linear output
 float LUTGrayCurve(float x)
 {
    return average(g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(x), 0).rgb);
 }
 
-// The gray tone curve's tangent where it crosses "targetValue": the first gray diagonal texel center at or above it, and the secant from the
-// previous texel. If the curve never gets there, the pivot stays out of reach (no extension, the other outputs are unused). The LUT output
-// is linear (the composite writes through an sRGB view). All the texels are loaded unconditionally so the loads don't serialize.
+// The gray tone curve's tangent where it crosses "targetValue": the first gray diagonal texel center at or above it, with the secant
+// from the previous texel. If never reached, the pivot stays out of reach (no extension; the other outputs are unused). All texels are
+// loaded unconditionally so the loads don't serialize.
 void FindLUTTangent(float targetValue, out float pivot, out float pivotOutput, out float slope)
 {
    pivot = FLT_MAX;
@@ -93,11 +93,11 @@ void main(
    r0.z = r0.z ? r0.w : r1.x;
    r0.z *= LumaSettings.GameSettings.Exposure; // Luma: exposure slider (also scales the sun flare, as the vanilla exposure does)
    r1.xz = v1.xy * g_vCompositeLastViewport.zw + g_vCompositeLastViewport.xy;
-   // Luma: a 3D layer drawn at the output resolution (the pause screen's; LumaData.CustomData4 = target / vanilla viewport width): its scene is
-   // the whole target, not the render resolution corner. Only the scene samples: the flare, vignette and aberration keep the vanilla UV.
+   // Luma: in a 3D layer drawn at the output resolution (the pause screen's; LumaData.CustomData4 = target / vanilla viewport width) the
+   // scene fills the whole target. Only scene samples are rescaled; flare, vignette and aberration keep the vanilla UV.
    const float sceneUVScale = LumaData.CustomData4 > 0.0 ? LumaData.CustomData4 : 1.0;
    r2.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r1.xz * sceneUVScale, 0).xyz;
-   // Luma: the scene is upgraded from R11G11B10_FLOAT, which could not hold negatives (65024, the vanilla cap, is its max)
+   // Luma: the scene is upgraded from R11G11B10_FLOAT: no negatives, max 65024 (the vanilla cap)
    r2.xyz = clamp(r2.xyz, 0.0, FLT11_MAX);
    r0.w = cmp(0 < g_vEtcEffect.x);
    if (r0.w != 0)
@@ -181,14 +181,14 @@ void main(
       r0.x = r0.x * r0.x;
       r0.x = r0.z ? r0.x : 1;
       r0.x = r0.x * r0.y;
-      // Luma: vignette intensity slider scales the vignette's blend weight
+      // Luma: vignette intensity slider scales its blend weight
       r0.w = g_vLimbDarkenningInfo.w * LumaSettings.GameSettings.VignetteIntensity;
       r0.x = r0.x * r0.w + (1.0 - r0.w);
       r2.xyz = r2.xyz * r0.xxx;
    }
    const float3 untonemappedColor = r2.xyz;
    r0.xyz = g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(r2.xyz), 0).rgb;
-   // Luma: "Color Grading Intensity" fades the LUT's color grading out towards its gray tone curve alone (0), applied by luminance
+   // Luma: "Color Grading Intensity" fades the grade towards the LUT's gray tone curve alone (0), applied by luminance
    [branch] if (LumaSettings.GameSettings.ColorGradingIntensity != 1.0)
    {
       const float luminance = GetLuminance(r2.xyz);
@@ -206,7 +206,7 @@ void main(
       r1.xyz = r1.xyz + -r0.xyz;
       r0.xyz = g_vCompositeInfo.yyy * r1.xyz + r0.xyz;
    }
-   if (!P5S_HDR_SCENE) // Luma: the output power curve only applies to SDR, Luma has its own
+   if (!P5S_HDR_SCENE) // Luma: SDR only, Luma has its own
    {
       r0.w = cmp(g_vGammaCorrection.x != 1.000000);
       r1.xyz = log2(abs(r0.xyz));
@@ -218,7 +218,7 @@ void main(
    {
       const float luminance = GetLuminance(untonemappedColor);
       const float grayOutput = LUTGrayCurve(luminance);
-      // The curve is monotonic, so pixels it maps below mid gray are under the pivot and skip the 32 texel search
+      // The curve is monotonic: pixels mapped below mid gray are under the pivot and skip the 32 texel search
       [branch] if (grayOutput >= MidGray)
       {
          float pivot, pivotOutput, slope;
@@ -247,8 +247,7 @@ void main(
    ColorGradingLUTTransferFunctionInOutCorrected(o0.rgb, GAMMA_CORRECTION_TYPE, VANILLA_ENCODING_TYPE, true);
 #endif
 
-   // Luma: when SMAA follows (it sets LumaData.CustomData3), the dither runs at its end instead (SMAA neighborhood blending, or Luma_P5S_SMAAFinalize.hlsl with RCAS).
-   // The UI draws after this, undithered.
+   // Luma: when the SMAA/RCAS chain follows (it sets LumaData.CustomData3), it dithers at its end instead. The UI draws after, undithered.
    if (LumaData.CustomData3 == 0.0)
       P5S_DitherOutput(o0.rgb, v1.xy);
    return;

@@ -1,5 +1,5 @@
-// Katana engine PostEffect3 "ApplyFxaaRepairPS" (0xC8A7BA1C): ApplyFxaaPS with the blend taps bilinearly sampled instead of loaded, over the composite's output.
-// Luma: the shared tail (radial blur, output power curve in SDR only, fade) is in "Includes/ApplyFxaa.hlsl".
+// Katana engine PostEffect3 "ApplyFxaaRepairPS" (0xC8A7BA1C): ApplyFxaaPS with the blend taps bilinearly sampled instead of loaded.
+// Luma: the shared tail is in "Includes/ApplyFxaa.hlsl".
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "Includes/ApplyFxaa.hlsl"

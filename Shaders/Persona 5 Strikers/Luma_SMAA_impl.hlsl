@@ -1,10 +1,9 @@
 // SMAA implementation for Persona 5 Strikers. Reference: https://github.com/iryoku/smaa
-// ULTRA preset + color edge detection, run right after the composite on the swapchain canvas and before the UI, in place of
-// the game's FXAA (which runs after the UI).
-// The canvas is linear (1 = UI paper white, HDR above it), so edge detection reads a gamma copy (Luma_P5S_SMAAEncode),
-// neighborhood blending reads the linear copy and re-encodes to gamma for Luma_P5S_SMAAFinalize (RCAS), or writes the canvas.
-// Predication uses plane-deviation edge-ness in [0,1] of the scene depth (Luma_P5S_SMAAPredication); main.cpp passes a
-// null texture and scale 1 (plain ULTRA) without it.
+// ULTRA preset + color edge detection on the swapchain canvas after the composite and before the UI, replacing the game's FXAA
+// (which runs after the UI).
+// The canvas is linear (1 = UI paper white, HDR above), so edge detection reads a gamma copy (Luma_P5S_SMAAEncode); neighborhood
+// blending reads the linear copy and re-encodes to gamma for Luma_P5S_SMAAFinalize (RCAS), or writes the canvas.
+// Predication reads the depth edge-ness of Luma_P5S_SMAAPredication; without it main.cpp passes null and scale 1 (plain ULTRA).
 // No SMAAGather: SMAA point-samples the center and its left and top neighbours.
 
 #include "Includes/Common.hlsl"
@@ -78,8 +77,8 @@ void smaa_neighborhood_blending_vs(uint id : SV_VertexID, out float4 position : 
 
 float4 smaa_neighborhood_blending_ps(float4 position : SV_Position, float2 texcoord : TEXCOORD0, float4 offset : TEXCOORD1) : SV_Target
 {
-   // tex0 = colorTex (linear copy), tex1 = blendTex. With RCAS, encoded to gamma for the finalize pass; without, this writes
-   // the canvas directly, so it also applies the dither the finalize pass would have.
+   // tex0 = colorTex (linear copy), tex1 = blendTex. With RCAS, gamma encoded for the finalize pass; without, this writes the
+   // canvas, so it applies the finalize pass's dither.
    float4 color = SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1);
    [branch] if (LumaSettings.GameSettings.RCASSharpness > 0.0)
        color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);

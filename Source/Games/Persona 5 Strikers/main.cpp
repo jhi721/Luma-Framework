@@ -1,6 +1,6 @@
 #define GAME_PERSONA_5_STRIKERS 1
 
-// Core only checks whether this is defined (any value skips the "attach the debugger" popup)
+// Skips the "attach the debugger" popup (Core only checks that it's defined)
 #define DISABLE_AUTO_DEBUGGER 1
 
 // Movies play through a separate DX9 device (Media Foundation), same as Nioh
@@ -8,9 +8,9 @@
 // SMAA runs right after the composite, through "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 #define ENABLE_SMAA 1
-// The UI shaders get a saturate appended in place (see "PatchShaderBytecodeSync")
+// Appends a saturate to the UI shaders (see "PatchShaderBytecodeSync")
 #define LUMA_PATCH_BYTECODE_SYNC 1
-// The motion vector draw key reads the draw arguments ("last_draw_dispatch_data")
+// The motion vector draw key reads "last_draw_dispatch_data"
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
 
 #include "..\..\Core\core.hpp"
@@ -19,47 +19,44 @@
 
 namespace
 {
-   // Katana engine PostEffect3 composite: exposure, lens effects, vignette, then the baked HDR 3D LUT (tonemap + grade).
-   // Every captured scene (menus, dialogue, hub, field) runs it once, writing straight into the swapchain.
-   // The main menu runs it a second time into an off-screen RGBA8 target.
+   // Katana PostEffect3 composite: exposure, lens effects, vignette, baked HDR 3D LUT (tonemap + grade). Once per captured scene
+   // (menus, dialogue, hub, field) into the swapchain; the main menu adds one into an off-screen RGBA8 target.
    constexpr uint32_t composite_hash = 0x45A96F2D;
-   // FXAA 3: the game copies the swapchain (after the UI) and FXAAs the copy back into it
+   // FXAA 3 from a swapchain copy (after the UI) back into it
    constexpr uint32_t fxaa_hash = 0xED2D9823;
-   // PostEffect3 ApplyFxaa{,Repair,Console,Quality}PS: the engine's own FXAA, which also carries the radial blur. When one of them runs, the
-   // composite goes to an intermediate target and this pass draws it into the swapchain. Never seen in a capture yet.
+   // PostEffect3 ApplyFxaa{,Repair,Console,Quality}PS: the engine's FXAA (plus radial blur), from an intermediate composite target into
+   // the swapchain. Never captured yet.
    const ShaderHashesList shader_hashes_apply_fxaa = {.pixel_shaders = {0x0B6569A5, 0xC8A7BA1C, 0x95F3321A, 0xED7941FD}};
-   // The SSAO depth downsample, whose t0 is the full res D32_FLOAT_S8X24 depth (a copy the game makes right before post): the SMAA predication input
+   // SSAO depth downsample; its t0 (full res D32_FLOAT_S8X24 depth, copied before post) feeds SMAA predication
    constexpr uint32_t ssao_depth_downsample_hash = 0x6E15840A;
-   // The native SSAO calculate (half res R8 visibility), replaced by XeGTAO. Its two depth aware blurs, which upsample to full
-   // res, and the merge into the G-buffer AO (gbuf0.a = min(material AO, SSAO), read by the deferred lighting) stay vanilla.
+   // Native SSAO calculate (half res R8 visibility), replaced by XeGTAO. Its two depth aware upsampling blurs and the G-buffer AO
+   // merge (gbuf0.a = min(material AO, SSAO), read by the deferred lighting) stay vanilla.
    constexpr uint32_t ssao_hash = 0x63435B03;
-   // The UI pixel shaders, drawing into the swapchain (vanilla BGRA8 UNORM), which clamped their output before blending. Their texture
-   // times vertex color, blend mode and saturation control (grey + k * (color - grey), grey a 0.299/0.587/0.114 weighted RGB sum, k a
-   // cb0 scalar) go outside 0-1, which the fp16 swapchain no longer clamps. The whole family ends in that saturation tail; found by
-   // disassembling all the dumped pixel shaders.
-   // Each has a single o0.xyzw write and a single final ret.
+   // UI pixel shaders whose output (texture * vertex color, blend mode, saturation control: grey + k * (color - grey), grey a
+   // 0.299/0.587/0.114 weighted RGB sum, k a cb0 scalar) exceeds 0-1: every dumped one ending in that tail, each with one o0.xyzw write and
+   // final ret (see "PatchShaderBytecodeSync")
    const std::unordered_set<uint32_t> ui_pixel_shaders = {0x90C6B12E, 0xEE9FC290, 0x07378D54, 0x4A0CB253, 0x8BA60D22, 0xD1BEFD65, 0xF0863953, 0x76C3BC5E, 0xA4DFC750, 0xBEF2C79E};
-   // The first post process pass of a scene frame, each reading the scene at t0: DOF (E0DB2D7E), else the bloom prefilter, else the
-   // composite. It ends the scene frame (the next G-buffer draw starts a new one), and DLSS runs right before it. The lighting before it
-   // varies by scene (691D080F, or 4376F855 twice).
+   // A scene frame's first post pass (scene at t0): DOF (E0DB2D7E), else bloom prefilter, else composite. It ends the scene frame;
+   // DLSS/FSR run right before it. The preceding lighting varies by scene (691D080F, or 4376F855 twice).
    const ShaderHashesList post_process_start_shader_hashes = {.pixel_shaders = {0xE0DB2D7E, 0xD65ABD25, 0x3D7CAD40, 0xB6289AC0, composite_hash}};
-   // The post passes that blend into the scene in place, all sampling their inputs by UV: the DOF merges (5 sample, 9 sample,
-   // reduction) and the bloom adds (5 and 9 sample, and their sub-rect clamped "ForViewport" twins)
+   // Post passes blending into the scene in place, by UV: DOF merges (5 sample, 9 sample, reduction) and bloom adds (5 and 9 sample,
+   // plus sub-rect clamped "ForViewport" twins)
    const ShaderHashesList scene_post_writer_shader_hashes = {.pixel_shaders = {0x409590F7, 0x42D664E0, 0xAA4F82B2, 0x619045C8, 0xB5F3F656, 0x88C4EC12, 0x4CE014A2}};
-   // A generic copy: text glyphs into their atlas, and at render scales below 1, the composite's output stretched onto the swapchain
+   // Generic copy: glyphs into their atlas, a 3D layer's alpha into its composite's output, and (render scale below 1) the composite's
+   // stretch onto the swapchain
    constexpr uint32_t copy_hash = 0x987DC89C;
-   // The 3D layers outside the scene (main menu and pause screen characters): the quad vertex shader, which takes its texture
-   // coordinates from its vertices, and the stretch of a layer's render resolution corner over its whole target
+   // 3D layers outside the scene (main menu and pause screen characters): the quad vertex shader (texture coordinates from vertices)
+   // and the stretch of a layer's render resolution corner over its target
    constexpr uint32_t quad_vertex_shader_hash = 0x2B6CA9A0;
    constexpr uint32_t layer_stretch_hash = 0x99A76DC2;
    constexpr UINT layer_uv_scale_cb_slot = 5; // "register(b5)" in Includes/LayerCorner.hlsl; the quads and sprites only read b0
-   // The UI sprite vertex shader, which also puts the 3D layers' composites on the swapchain, and the exposure histogram that reads a layer
+   // UI sprite vertex shader (also puts 3D layer composites on the swapchain) and the exposure histogram reading a layer
    constexpr uint32_t ui_sprite_vertex_shader_hash = 0x8B19022A;
    constexpr uint32_t exposure_histogram_hash = 0xCC8D4849;
 
-   bool g_hide_ui = false; // Session only, so a restart never comes back without a HUD
+   bool g_hide_ui = false; // Session only, so a restart always has a HUD
 
-   // The game's render scale (its "RenderScale" setting, 5 = 50% ... 10 = 100%), overriding the game's own option; 0 leaves it to the game
+   // Overrides the game's "RenderScale" (5 = 50% ... 10 = 100%); 0 keeps the game's option
    int g_render_scale = 0;
    bool g_render_scale_custom = false; // A 10% step slider instead of the presets
 
@@ -92,7 +89,7 @@ namespace
       return (bool(FindShader(shaders, names)) && ...);
    }
 
-   // The resource a view is of, null without a view
+   // The view's resource, null without a view
    com_ptr<ID3D11Resource> GetViewResource(ID3D11View* view)
    {
       com_ptr<ID3D11Resource> resource;
@@ -117,8 +114,8 @@ namespace
       return true;
    }
 
-   // Draws with a Luma clone of a layer's vertex shader (see "Includes/LayerCorner.hlsl") and its uv scale, or as is without one. Set
-   // directly, so Core's tracking of the bound state never sees them: the game's are put back after.
+   // Draws with a Luma clone of a layer's vertex shader (see "Includes/LayerCorner.hlsl") and uv scale, or as is without one, bypassing
+   // Core's state tracking.
    void DrawWithLayerVertexShader(ID3D11DeviceContext* native_device_context, ID3D11VertexShader* vertex_shader, ID3D11Buffer* uv_scale_buffer, const std::function<void()>& draw)
    {
       if (!vertex_shader)
@@ -140,12 +137,11 @@ namespace
 
 } // namespace
 
-// Everything that holds a device object, so it is released with its device.
+// Holds the device objects, so they are released with the device.
 struct Persona5StrikersGameDeviceData final : public GameDeviceData
 {
-   // SMAA scratch, recreated when the canvas size changes: a linear copy of the canvas (SMAA writes the canvas, so it cannot
-   // also sample it), its gamma encode (the edge detection input; with RCAS also SMAA's output, read by the finalize pass) and
-   // the predication edge-ness.
+   // SMAA scratch, recreated on canvas resize: a linear canvas copy (SMAA can't sample the canvas it writes), its gamma encode (edge
+   // detection input; with RCAS also SMAA's output for finalize) and the predication edge-ness.
    com_ptr<ID3D11Texture2D> smaa_linear_texture;
    com_ptr<ID3D11ShaderResourceView> smaa_linear_srv;
    com_ptr<ID3D11ShaderResourceView> smaa_gamma_srv;
@@ -154,23 +150,22 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> smaa_predication_srv;
    com_ptr<ID3D11UnorderedAccessView> smaa_predication_uav;
 
-   // The scene depth for predication, from the SSAO depth downsample. The texture is persistent and written by the game before post
-   // every frame, so the view is kept (the SSAO and post passes record on different deferred contexts, so per frame resets would race).
+   // Full res scene depth (SSAO depth downsample's t0) for predication, and for motion vectors when the G-buffer's is unreadable.
+   // Kept across frames (the texture persists, rewritten before post): SSAO and post record on different deferred contexts, so per frame
+   // resets would race.
    std::mutex smaa_depth_mutex;
    com_ptr<ID3D11ShaderResourceView> smaa_depth_srv;
 
-   // Set when SMAA ran after this frame's composite, or DLSS/FSR before its post process, so the vanilla FXAA is skipped
+   // SMAA ran after this frame's composite, or DLSS/FSR before its post: skip the vanilla FXAA
    std::atomic<bool> scene_antialiased = false;
-   // Set when a 3D layer outside the scene was drawn (main menu, pause screen): the UI composes it after the scene's SMAA, so the
-   // vanilla FXAA still runs
+   // A 3D layer outside the scene was drawn (main menu, pause screen), composed by the UI after SMAA: FXAA still runs
    std::atomic<bool> layer_drawn = false;
 
    // MIN and MAX blends (all channels, alpha only), to clamp the swapchain to 0-1 under a UI draw's own geometry (see "OnDrawOrDispatch")
    com_ptr<ID3D11BlendState> ui_min_blend_states[2];
    com_ptr<ID3D11BlendState> ui_max_blend_states[2];
 
-   // XeGTAO scratch, recreated when the SSAO target size changes. The SSAO records on worker threads (deferred contexts), so
-   // everything below is guarded by the mutex.
+   // XeGTAO scratch, recreated on SSAO target resize; mutex guarded, as SSAO records on worker threads (deferred contexts)
    std::mutex gtao_mutex;
    com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5]; // R32F view space depth pyramid, 5 mips
    com_ptr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
@@ -198,39 +193,40 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       gtao_height = 0;
    }
 
-   // Motion vectors: the patched shaders by original hash (null when the patch failed), patched on first use, and the target
+   // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target
    std::shared_mutex mv_mutex;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> mv_vertex_shaders;
    std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_pixel_shaders;
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
-   // The game's G-buffer blend states blend each target independently: copies that also write the MV target, by original (and its
-   // description, in case the address gets reused)
+   // G-buffer blend state copies (independent blending) that also write the MV target, by original, with its description in case the
+   // address is reused
    std::unordered_map<ID3D11BlendState*, std::pair<D3D11_BLEND_DESC, com_ptr<ID3D11BlendState>>> mv_blend_states;
-   // Byte offsets in each patched vertex shader's $Globals, by original hash: "mW2P" (the camera's view projection) and "mL2W" (the
-   // world matrix, or the bone palette), 3 rows with the translation in .w
+   // Byte offsets in each patched vertex shader's $Globals, by original hash: "mW2P" (camera view projection) and "mL2W" (world
+   // matrix or bone palette, 3 rows with the translation in .w)
    struct GlobalsLayout
    {
       UINT view_projection = UINT_MAX;
       UINT world = UINT_MAX;
    };
    std::unordered_map<uint32_t, GlobalsLayout> mv_globals_layouts;
-   // The scene records on a single deferred context: after its first post process pass, the next G-buffer draw starts a frame (clears the target)
+   // The scene records on one deferred context: after its first post pass, the next scene depth draw (depth prepass, else G-buffer)
+   // starts a frame and clears the target
    bool mv_frame_ended = true;
    com_ptr<ID3D11Resource> mv_scene_depth;          // The G-buffer's depth, which the forward redraws share
    ID3D11DeviceContext* mv_scene_context = nullptr; // Only compared
 
-   // CPU copies of the $Globals buffers the patched draws bind (the game maps them with discard before about every draw, and some draws
-   // reuse the last contents): the pointer from each Map, copied at its Unmap
+   // CPU copies of the $Globals buffers patched draws bind (mapped with discard before nearly every draw; some draws reuse the last
+   // contents): each Map's pointer, copied at Unmap
    std::mutex mv_globals_mutex;
    std::unordered_set<uint64_t> mv_globals_buffers;
    std::unordered_map<uint64_t, void*> mv_mapped_globals;
    std::unordered_map<uint64_t, std::vector<uint8_t>> mv_globals_copies;
-   // Scene context only: the previous frame's $Globals uploads, one dynamic buffer per size, and the camera's view projection
+   // Scene context only: the previous frame's $Globals uploads, one dynamic buffer per size
    std::unordered_map<UINT, com_ptr<ID3D11Buffer>> mv_previous_globals_buffers;
-   // Scene context only: two copies of each resource the patched vertex shaders read (wind and interaction buffers, ocean maps), taken
-   // at its first use in a frame, by resource (held, so its address can't be reused, until a frame goes by without it). The one from
-   // the previous frame goes to the vertex shader's second run.
+   // Scene context only: this and last frame's copies of each resource the patched vertex shaders read (wind and interaction buffers,
+   // ocean maps), taken at first use in a frame; the latter feeds the vertex shader's second run. Held until a frame passes without it,
+   // so its address can't be reused.
    struct PreviousResource
    {
       com_ptr<ID3D11Resource> resource;
@@ -241,8 +237,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       bool has_previous = false;
    };
    std::unordered_map<ID3D11Resource*, PreviousResource> mv_previous_resources;
-   // Every patched draw of a frame, by draw key (shaders, buffers, arguments), with its translation and $Globals. A draw takes the
-   // previous frame's $Globals of the draw with its key nearest to it (same object, a frame earlier).
+   // Patched draws by draw key (shaders, buffers, arguments), with translation and $Globals. A draw takes the previous frame's
+   // $Globals of its key's nearest draw (same object, a frame earlier).
    struct MotionVectorObject
    {
       std::array<float, 3> translation;
@@ -253,8 +249,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // This frame's projection jitter (pixels, +y down) and its VS cbuffer ("MotionVectorPatches::jitter_slot": NDC offset)
    std::array<float, 2> mv_jitter = {};
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
-   // The camera motion fill of the pixels no patched draw wrote (see "Luma_P5S_MotionVectorFill.hlsl"), which clears the target to FLT_MAX:
-   // the target's UAV (if the GPU loads R32G32_FLOAT from UAVs), its constants, and the frame's depth (also the upscaler's)
+   // Camera motion fill of pixels no patched draw wrote (see "Luma_P5S_MotionVectorFill.hlsl"; frame start marks them FLT_MAX): the
+   // target's UAV (if the GPU loads R32G32_FLOAT from UAVs), its constants, and the frame's depth (also the upscaler's)
    com_ptr<ID3D11UnorderedAccessView> mv_uav;
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    bool mv_fill_pending = false;
@@ -267,27 +263,27 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    uint32_t mv_frame_present = 0;
    std::atomic<uint32_t> mv_presents = 0;
 
-   // DLSS/FSR run on the immediate context, but the scene records on a deferred one: its command list is split right before the post
-   // process, and the first part is executed before the upscaler when the game executes the rest (see "OnExecuteSecondaryCommandList").
+   // DLSS/FSR run on the immediate context but the scene records on a deferred one, so its command list is split before post; the
+   // first part runs before the upscaler when the game executes the rest (see "OnExecuteSecondaryCommandList").
    struct SRSplit
    {
       com_ptr<ID3D11CommandList> partial;
-      com_ptr<ID3D11CommandList> remainder;  // Held, so its address (the pending split's key) can't be reused by another command list
-      com_ptr<ID3D11Texture2D> source_color; // Also the output at native resolution (DLAA): the post process reads it
-      com_ptr<ID3D11Texture2D> output_color; // Upscaling (the game's render scale below 1) only: the output, which the post process then reads
+      com_ptr<ID3D11CommandList> remainder;  // Held so its address (the pending split's key) can't be reused
+      com_ptr<ID3D11Texture2D> source_color; // Also the output at native resolution (DLAA), read by the post process
+      com_ptr<ID3D11Texture2D> output_color; // Upscaling only (render scale below 1): the output, read by the post process
       com_ptr<ID3D11Resource> depth;
       std::array<float, 2> jitter;
       float vertical_fov = 0.7330383f; // Radians (FSR needs it), 42 degrees as measured in dialogue until the frame's camera is known
    };
    std::mutex sr_mutex;
-   bool sr_split_ready = false;                                // Scene context only: this frame's G-buffer drew and the command list isn't split yet
+   bool sr_split_ready = false;                                // Scene context only: this frame's G-buffer drew, not split yet
    uint64_t sr_split_context = 0;                              // The context split last, until the game finishes its command list
-   SRSplit sr_split;                                           // Split last, until the game finishes its command list
-   std::unordered_map<uint64_t, SRSplit> sr_pending_splits;    // By the game's command list, the remainder, until it's executed
-   std::vector<com_ptr<ID3D11Buffer>> sr_no_overwrite_buffers; // The dynamic buffers the game appends to with "D3D11_MAP_WRITE_NO_OVERWRITE"
-   // Upscaling: the game renders the scene and its post process at its render scale into their own textures, the composite included,
-   // then stretches that onto the swapchain. The upscaler writes the output resolution instead, the post passes that blend into the
-   // scene also blend into it, and the composite draws from it at the output resolution into the canvas, which the stretch copies 1:1.
+   SRSplit sr_split;                                           // The last split, likewise
+   std::unordered_map<uint64_t, SRSplit> sr_pending_splits;    // By the game's command list (the remainder), until executed
+   std::vector<com_ptr<ID3D11Buffer>> sr_no_overwrite_buffers; // Dynamic buffers the game appends to ("D3D11_MAP_WRITE_NO_OVERWRITE")
+   // Upscaling: the game renders scene and post (composite included) at render scale, then stretches onto the swapchain. Instead the
+   // upscaler writes the output resolution, scene blending post passes also blend into it, and the composite draws from it into an
+   // output sized canvas that the stretch copies 1:1.
    ID3D11DeviceContext* sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_output_rtv;
@@ -295,15 +291,15 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11RenderTargetView> sr_upscaled_canvas_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_canvas_srv;
    com_ptr<ID3D11Resource> composite_target; // This frame's composite target when it isn't the swapchain (render scales below 1)
-   // The game's render scale setting in its settings block (see "FindRenderScaleSetting"), null if not found. Present thread only.
+   // The game's "RenderScale" in memory (see "FindRenderScaleSetting"), null if not found. Present thread only.
    int32_t* render_scale_setting = nullptr;
    bool render_scale_searched = false;
-   int32_t render_scale_game = 0;         // The game's own value (its option), restored without an override
-   int32_t render_scale_applied = 0;      // The value the game last rebuilt its targets at, as far as known
+   int32_t render_scale_game = 0;         // The game's own option, restored without an override
+   int32_t render_scale_applied = 0;      // The value the game last rebuilt its targets at (as known)
    int32_t render_scale_memory = 0;       // The value Luma last left in the setting
    int render_scale_restore_presents = 0; // Until a temporary value (the main menu's 100%) is replaced by the kept one
-   // The main menu: presents without a scene frame whose composite draws into a render resolution target (its background). The
-   // pause screen has neither, so it never counts. Reset by any scene frame.
+   // The main menu: presents without a scene frame whose composite draws into a render resolution target (its background); the
+   // pause screen has neither. Reset by any scene frame.
    std::atomic<bool> scene_drawn = false;
    std::atomic<bool> render_resolution_composite = false;
    uint32_t menu_presents = 0;
@@ -319,8 +315,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::unordered_map<UINT, com_ptr<ID3D11Buffer>> layer_globals_buffers; // The patched $Globals uploads, one dynamic buffer per size
    com_ptr<ID3D11Buffer> layer_uv_scale_buffer;
    float layer_uv_scale[2] = {};
-   // The layer's stretch targets, then the composite outputs made from them (only compared): the pause screen's composite reads its
-   // stretch target whole, and a UI sprite scales up the render resolution corner of its output, and the exposure reads that corner.
+   // Layer stretch targets, then the composites made from them (only compared): the pause screen's composite reads its stretch target
+   // whole; a UI sprite scales up, and the exposure reads, its output's render resolution corner.
    struct LayerOutput
    {
       float scale = 1.f; // Render resolution / output resolution
@@ -328,7 +324,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<ID3D11Resource*, LayerOutput> layer_outputs;
    std::unordered_map<ID3D11Resource*, LayerOutput> layer_composed;
-   com_ptr<ID3D11RenderTargetView> layer_histogram_rtv; // The stretch target scaled down to the render resolution, for the exposure
+   com_ptr<ID3D11RenderTargetView> layer_histogram_rtv; // The stretch target downscaled to render resolution, for the exposure
    com_ptr<ID3D11ShaderResourceView> layer_histogram_srv;
    std::atomic<uint32_t> sr_render_height = 1;
    std::atomic<uint32_t> sr_output_height = 1;
@@ -358,7 +354,7 @@ class Persona5Strikers final : public Game
       return device_data && device_data->game ? device_data : nullptr;
    }
 
-   // Motion vectors: remembers where the game writes a $Globals buffer a patched draw binds, to copy it at its Unmap
+   // Motion vectors: the mapped pointer of a $Globals buffer a patched draw binds, copied at Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
       DeviceData* const device_data = GetDeviceData(device);
@@ -390,7 +386,7 @@ class Persona5Strikers final : public Game
       }
    }
 
-   // Motion vectors: the CPU copy of a $Globals buffer, before its Unmap (the game has written it). Reads the mapped memory back.
+   // Motion vectors: copies a written $Globals buffer's mapped memory to the CPU at Unmap
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = GetDeviceData(device);
@@ -409,7 +405,7 @@ class Persona5Strikers final : public Game
       game_device_data->mv_mapped_globals.erase(mapped);
    }
 
-   // The motion vector version of the bound shader, patched from Core's copy of its bytecode on first use (null if it can't be)
+   // The bound shader's motion vector version, patched from Core's bytecode copy on first use (null if it can't be)
    template <typename T>
    static com_ptr<T> GetMotionVectorShader(ID3D11Device* native_device, DeviceData& device_data, std::unordered_map<uint32_t, com_ptr<T>>* shaders, uint32_t hash, reshade::api::pipeline pipeline)
    {
@@ -463,8 +459,8 @@ class Persona5Strikers final : public Game
       return shaders->try_emplace(hash, shader).first->second;
    }
 
-   // A scene frame starts at its first draw into the scene depth (a depth prepass, else the G-buffer): cleared motion vectors, the object
-   // history moved to the previous frame, and this frame's jitter
+   // A scene frame starts at its first draw into the scene depth (depth prepass, else G-buffer): clears the motion vectors, moves the
+   // object history to the previous frame, and sets the jitter
    static void StartMotionVectorFrame(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, const uint4& depth_size)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -481,7 +477,7 @@ class Persona5Strikers final : public Game
       game_device_data.scene_drawn = true;
       game_device_data.sr_upscaling_context = nullptr; // Until this frame's split decides
       game_device_data.composite_target.reset();
-      // Last frame's camera is the previous one, unless frames without a scene (menus) came in between
+      // Last frame's camera is the previous one, unless scene-less frames (menus) came between
       game_device_data.mv_previous_view_projection = game_device_data.mv_view_projection;
       game_device_data.mv_previous_view_projection_valid = game_device_data.mv_view_projection_valid && game_device_data.mv_presents - game_device_data.mv_frame_present <= 1;
       game_device_data.mv_view_projection_valid = false;
@@ -494,9 +490,8 @@ class Persona5Strikers final : public Game
       std::erase_if(game_device_data.mv_previous_resources, [&](const auto& entry)
          { return entry.second.frame + 1 < game_device_data.mv_frame_present; });
 
-      // Halton (2, 3) over the upscaler's phases
+      // Halton (2, 3) over the upscaler's phase count (from its last settings; more at lower render scales)
       const bool jitter = IsSRActive(device_data);
-      // More phases the lower the render scale (the upscaler's own count, from its last settings)
       const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
       game_device_data.mv_jitter = jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{};
@@ -505,7 +500,7 @@ class Persona5Strikers final : public Game
       WriteConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter));
    }
 
-   // The $Globals byte offsets of a patched vertex shader, by original hash (none until it's patched)
+   // A patched vertex shader's $Globals byte offsets, by original hash (none until patched)
    static Persona5StrikersGameDeviceData::GlobalsLayout GetGlobalsLayout(Persona5StrikersGameDeviceData* game_device_data, uint32_t hash)
    {
       const std::shared_lock lock(game_device_data->mv_mutex);
@@ -513,7 +508,7 @@ class Persona5Strikers final : public Game
       return it != game_device_data->mv_globals_layouts.end() ? it->second : Persona5StrikersGameDeviceData::GlobalsLayout{};
    }
 
-   // The CPU copy of a $Globals buffer (empty until its first Unmap is seen), which from now on gets copied at every Unmap
+   // A $Globals buffer's CPU copy (empty until its first Unmap); registers it for a copy at every Unmap
    static std::vector<uint8_t> GetGlobalsCopy(Persona5StrikersGameDeviceData* game_device_data, ID3D11Buffer* buffer)
    {
       const std::lock_guard lock(game_device_data->mv_globals_mutex);
@@ -523,14 +518,13 @@ class Persona5Strikers final : public Game
       return copy != game_device_data->mv_globals_copies.end() ? copy->second : std::vector<uint8_t>{};
    }
 
-   // A scene frame ends at its first post process pass: the frame's depth (the upscaler's), and the camera motion fill of the pixels no
-   // patched draw wrote
+   // A scene frame ends at its first post pass: picks the frame's depth (the upscaler's) and fills camera motion where no patched draw wrote
    static void EndMotionVectorFrame(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.mv_frame_ended = true;
 
-      // The G-buffer's depth, if it can be read (a shader resource), otherwise the copy the game makes before post
+      // The G-buffer's depth if it's a shader resource, else the game's pre-post copy
       com_ptr<ID3D11ShaderResourceView> depth_srv;
       D3D11_TEXTURE2D_DESC depth_desc = {};
       if (com_ptr<ID3D11Texture2D> depth_texture; game_device_data.mv_scene_depth && SUCCEEDED(game_device_data.mv_scene_depth->QueryInterface(&depth_texture)))
@@ -540,7 +534,7 @@ class Persona5Strikers final : public Game
          if (GetViewResource(game_device_data.mv_scene_depth_srv.get()) != game_device_data.mv_scene_depth)
          {
             game_device_data.mv_scene_depth_srv.reset();
-            // The depth channel of the depth formats
+            // The depth formats' depth channel
             const DXGI_FORMAT format = depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : (depth_desc.Format == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_R32_FLOAT : (depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : depth_desc.Format));
             D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {format, D3D11_SRV_DIMENSION_TEXTURE2D};
             view_desc.Texture2D.MipLevels = 1;
@@ -555,12 +549,11 @@ class Persona5Strikers final : public Game
       }
       game_device_data.mv_frame_depth = GetViewResource(depth_srv.get());
 
-      // Camera motion where no patched draw wrote
       if (game_device_data.mv_fill_pending)
       {
          game_device_data.mv_fill_pending = false;
-         // Current clip space to the previous frame's, for row vectors: inverse(current) * previous. In double, the world
-         // translation (centimetres) cancels out between the two.
+         // Current clip space to the previous frame's, for row vectors: inverse(current) * previous, in double so the world translation
+         // (centimetres) cancels out.
          double reprojection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
          if (game_device_data.mv_view_projection_valid && game_device_data.mv_previous_view_projection_valid)
          {
@@ -635,14 +628,14 @@ class Persona5Strikers final : public Game
       }
    }
 
-   // Scene draws the motion vector paths don't take still need the jitter (patched vertex shader, game pixel shader, no motion vectors):
-   // the depth prepass, which the G-buffer then depth tests with GREATER_EQUAL (unjittered, sloped floors lost pixels to the jittered
-   // G-buffer: black flicker), and depth tested geometry that doesn't write depth. False if it can't (the draw then goes ahead untouched).
+   // Jitter for scene draws without motion vectors (patched vertex shader, game pixel shader): the depth prepass, which the G-buffer
+   // tests with GREATER_EQUAL (unjittered, sloped floors lost pixels to the jittered G-buffer: black flicker), and depth tested geometry
+   // not writing depth. False if it can't (the draw runs untouched).
    static bool DrawWithJitter(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, ID3D11DepthStencilView* dsv, bool depth_prepass, const std::function<void()>& draw)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       const com_ptr<ID3D11Resource> depth = GetViewResource(dsv);
-      // Into the last G-buffer's depth; only a depth prepass starts a frame, other draws join the started one
+      // Into the last G-buffer's depth; only a depth prepass starts a frame, others join it
       if (!depth || depth != game_device_data.mv_scene_depth || !game_device_data.mv_rtv || (game_device_data.mv_frame_ended ? !depth_prepass : native_device_context != game_device_data.mv_scene_context))
          return false;
       const com_ptr<ID3D11VertexShader> vertex_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_vertex_shaders, original_shader_hashes.vertex_shaders[0], cmd_list_data.pipeline_state_original_vertex_shader);
@@ -667,21 +660,21 @@ class Persona5Strikers final : public Game
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
       native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
       draw();
-      // Set directly, so Core's tracking of the bound state never sees them: put the game's back
+      // Set directly, bypassing Core's state tracking: restore the game's
       native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
       ID3D11Buffer* const restored_jitter = original_jitter.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &restored_jitter);
       return true;
    }
 
-   // Draws a G-buffer draw, or a forward redraw of the scene into the same depth (outlines, sky), with the patched shaders, also into
-   // the motion vector target (at "target_slot", past the game's targets), with the previous frame's $Globals at "previous_globals_slot".
-   // False if it can't (the draw then goes ahead untouched).
+   // Draws a G-buffer draw, or a forward scene redraw into its depth (outlines, sky), with the patched shaders, adding the motion vector
+   // target ("target_slot", past the game's) and the previous frame's $Globals ("previous_globals_slot"). False if it can't (the draw
+   // runs untouched).
    static bool DrawWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, ID3D11RenderTargetView* const (&rtvs)[8], ID3D11DepthStencilView* dsv, bool gbuffer, const std::function<void()>& draw)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       const com_ptr<ID3D11Resource> depth = GetViewResource(dsv);
-      // Forward draws: after this frame's G-buffer (and before its post process), into its depth
+      // Forward draws: into this frame's G-buffer depth, before its post
       if (!gbuffer && (game_device_data.mv_frame_ended || native_device_context != game_device_data.mv_scene_context || !depth || depth != game_device_data.mv_scene_depth || !game_device_data.mv_rtv))
          return false;
       com_ptr<ID3D11BlendState> blend_state;
@@ -693,10 +686,10 @@ class Persona5Strikers final : public Game
          blend_state->GetDesc(&blend_desc);
       const com_ptr<ID3D11VertexShader> vertex_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_vertex_shaders, original_shader_hashes.vertex_shaders[0], cmd_list_data.pipeline_state_original_vertex_shader);
       const com_ptr<ID3D11PixelShader> pixel_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_pixel_shaders, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader);
-      // Without independent blending the MV target takes RT0's blend, which must be off; with it, a copy of the state writes it unblended
+      // Without independent blending the MV target takes RT0's blend, which must be off; with it, a state copy writes it unblended
       if ((!blend_desc.IndependentBlendEnable && blend_desc.RenderTarget[0].BlendEnable) || !vertex_shader || !pixel_shader || !dsv)
          return false;
-      // Forward draws that aren't objects (full screen passes) have no camera
+      // Forward full screen passes have no camera
       const Persona5StrikersGameDeviceData::GlobalsLayout layout = GetGlobalsLayout(&game_device_data, original_shader_hashes.vertex_shaders[0]);
       if (!gbuffer && layout.view_projection == UINT_MAX)
          return false;
@@ -718,7 +711,7 @@ class Persona5Strikers final : public Game
             return false;
       }
 
-      // The G-buffer owns the target (sized like the scene depth) and starts the frames; forward draws only add to it
+      // The G-buffer owns the target (scene depth sized) and starts frames; forward draws only add to it
       if (gbuffer)
       {
          uint4 depth_size = {};
@@ -772,8 +765,8 @@ class Persona5Strikers final : public Game
       std::copy_n(rtvs, MotionVectorPatches::target_slot, targets);
       targets[MotionVectorPatches::target_slot] = game_device_data.mv_rtv.get();
       native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
-      // The previous frame's $Globals: last frame's copy of the same object's if found, otherwise this draw's with last frame's camera
-      // (no object motion). Until a buffer has a CPU copy, its draws get the current data (zero motion).
+      // The previous frame's $Globals: the same object's from last frame, else this draw's with last frame's camera (no object motion).
+      // Draws of a buffer without a CPU copy yet get the current data (zero motion).
       std::vector<uint8_t> previous_globals_data = GetGlobalsCopy(&game_device_data, globals.get());
       ID3D11Buffer* previous_globals = globals.get();
       if (!previous_globals_data.empty() && layout.view_projection != UINT_MAX && layout.view_projection + 64 <= previous_globals_data.size())
@@ -786,7 +779,7 @@ class Persona5Strikers final : public Game
             game_device_data.mv_view_projection_valid = true;
          }
 
-         // The draw key: the same mesh drawn by the same shaders. Several objects can share it (e.g. props), the translation tells them apart.
+         // Draw key: same mesh, same shaders. Objects sharing it (e.g. props) are told apart by translation.
          com_ptr<ID3D11Buffer> vertex_buffer;
          UINT vertex_stride = 0, vertex_offset = 0;
          native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vertex_offset);
@@ -821,9 +814,9 @@ class Persona5Strikers final : public Game
                }
             }
          }
-         // Kept as drawn for the next frame (moved when the match's own is uploaded)
+         // Kept as drawn for the next frame (moved when the match's is uploaded)
          game_device_data.mv_objects[key].push_back({translation, match ? std::move(previous_globals_data) : previous_globals_data});
-         // Not found: last frame's camera, if this is the frame's (another view projection is left as is)
+         // Not found: last frame's camera, if this is the frame's view projection (others are left as is)
          if (!match && game_device_data.mv_previous_view_projection_valid && std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) == 0)
             std::memcpy(view_projection, game_device_data.mv_previous_view_projection.data(), sizeof(game_device_data.mv_previous_view_projection));
 
@@ -833,8 +826,7 @@ class Persona5Strikers final : public Game
             previous_globals = upload.get();
       }
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_globals_slot, 1, &previous_globals);
-      // The vertex shader's resources for its second run: the previous frame's copies, or the current ones (immutable, or nothing from
-      // the previous frame)
+      // Second run resources: the previous frame's copies, else the current ones (immutable, or no previous copy)
       com_ptr<ID3D11ShaderResourceView> srvs[MotionVectorPatches::resource_slots];
       native_device_context->VSGetShaderResources(0, MotionVectorPatches::resource_slots, &srvs[0]);
       ID3D11ShaderResourceView* previous_srvs[MotionVectorPatches::resource_slots] = {};
@@ -869,7 +861,7 @@ class Persona5Strikers final : public Game
             usage = texture_3d_desc.Usage;
             break;
          }
-         // Immutable resources (or none) are the same every frame
+         // Immutable resources (or none) never change
          if (usage == D3D11_USAGE_IMMUTABLE)
             continue;
 
@@ -937,7 +929,7 @@ class Persona5Strikers final : public Game
       draw();
       if (motion_vector_blend_state)
          native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
-      // Set directly, so Core's tracking of the bound state never sees them: put the game's back
+      // Set directly, bypassing Core's state tracking: restore the game's
       native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
       native_device_context->PSSetShader(original_pixel_shader.get(), nullptr, 0);
       ID3D11Buffer* const restored_globals = original_previous_globals.get();
@@ -969,7 +961,7 @@ public:
       }
    }
 
-   // "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp the vanilla UNORM swapchain applied to the UI (as in Yakuza 3 Remastered)
+   // "mov_sat o0.xyzw, o0.xyzw" before the final ret: the clamp the vanilla UNORM swapchain applied to the UI
    std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
    {
       constexpr uint32_t ret_token = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1);
@@ -1012,7 +1004,7 @@ public:
       GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('0'); // sRGB (implicit, through the swapchain views)
       GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).SetDefaultValue('1');
-      GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2'); // The UI blends straight onto the swapchain after the composite
+      GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2'); // The UI blends onto the swapchain after the composite
 
       // The game binds b0-b4
       luma_settings_cbuffer_index = 13;
@@ -1055,23 +1047,23 @@ public:
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
    }
 
-   // Draws the composite, then SMAA on the canvas it wrote (the swapchain), before the UI: copy, gamma encode, predication,
-   // SMAA into the gamma copy, then the finalize pass (RCAS, decode, dither) back into the canvas; without RCAS, SMAA straight into the canvas.
-   // Without "smaa" (DLSS/FSR already antialiased the scene) only RCAS runs: copy, gamma encode, finalize.
-   // Anything missing (shaders still compiling, an unexpected target) leaves the composite alone, and the vanilla FXAA runs (not after DLSS/FSR).
+   // Draws the composite, then SMAA on its canvas (swapchain or upscaled canvas) before the UI: copy, gamma encode, predication, SMAA
+   // into the gamma copy, finalize (RCAS, decode, dither) into the canvas; without RCAS, SMAA writes the canvas. With "smaa" false
+   // (DLSS/FSR antialiased) only RCAS: copy, gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
+   // composite is left alone and the vanilla FXAA runs (not after DLSS/FSR).
    static DrawOrDispatchOverrideType DrawCompositeWithSMAAAndRCAS(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers, const std::function<void()>& original_draw_dispatch_func, bool smaa)
    {
+      auto& game_device_data = GetGameDeviceData(device_data);
       com_ptr<ID3D11RenderTargetView> canvas_rtv;
       native_device_context->OMGetRenderTargets(1, &canvas_rtv, nullptr);
       const com_ptr<ID3D11Resource> canvas_resource = GetViewResource(canvas_rtv.get());
       com_ptr<ID3D11Texture2D> canvas_texture;
-      // Not the main menu's second composite, into an off-screen target
-      if (!canvas_resource || FAILED(canvas_resource->QueryInterface(&canvas_texture)) || !IsBackBuffer(&device_data, canvas_resource.get()))
+      // Not the main menu's second, off-screen composite
+      if (!canvas_resource || FAILED(canvas_resource->QueryInterface(&canvas_texture)) || (!IsBackBuffer(&device_data, canvas_resource.get()) && canvas_rtv != game_device_data.sr_upscaled_canvas_rtv))
          return DrawOrDispatchOverrideType::None;
-      auto& game_device_data = GetGameDeviceData(device_data);
       D3D11_TEXTURE2D_DESC canvas_desc;
       canvas_texture->GetDesc(&canvas_desc);
-      // The upgraded (linear fp16) swapchain, which the SMAA copies are in
+      // The upgraded (linear fp16) swapchain, the SMAA copies' format
       if (canvas_desc.SampleDesc.Count != 1 || canvas_desc.ArraySize != 1 || (canvas_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && canvas_desc.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS))
          return DrawOrDispatchOverrideType::None;
 
@@ -1122,7 +1114,7 @@ public:
          }
       }
 
-      // Predication depth, if captured and canvas sized. Anything else falls back to plain ULTRA.
+      // Predication depth, if captured and canvas sized; else plain ULTRA.
       com_ptr<ID3D11ShaderResourceView> depth_srv;
       if (smaa && g_smaa_predication && game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "P5S SMAA Predication CS"_h))
       {
@@ -1138,9 +1130,9 @@ public:
             depth_srv.reset();
       }
 
-      // The replaced composite reads the Luma cbuffers, which Core only binds after this callback returns. They stay bound for
-      // SMAA and the finalize pass: the settings for the canvas size, the data for the predication scale (CustomData3, never 0
-      // here, which also tells the composite to leave the dither to the end of the chain, so RCAS doesn't sharpen it).
+      // The replaced composite reads the Luma cbuffers, which Core binds only after this callback; they stay bound for SMAA and finalize
+      // (settings for the canvas size). The data's CustomData3 is the predication scale, never 0 here, which also defers the composite's
+      // dither to the chain's end so RCAS doesn't sharpen it.
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, depth_srv ? 2.f : 1.f);
       *updated_cbuffers = true;
@@ -1168,7 +1160,7 @@ public:
          compute_state.Restore(native_device_context);
       }
 
-      // Without RCAS, SMAA writes (and dithers) the canvas directly: it only samples the linear copy, and the finalize pass would just decode
+      // Without RCAS, SMAA writes (and dithers) the canvas directly, only sampling the linear copy; finalize would only decode
       const bool sharpen = cb_luma_global_settings.GameSettings.RCASSharpness > 0.f;
       if (smaa)
          DrawSMAA(native_device, native_device_context, device_data, sharpen ? game_device_data.smaa_gamma_rtv.get() : canvas_rtv.get(), game_device_data.smaa_linear_srv.get(), game_device_data.smaa_gamma_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
@@ -1194,9 +1186,9 @@ public:
       return DrawOrDispatchOverrideType::Replaced;
    }
 
-   // XeGTAO in place of the SSAO calculate draw: prefilter, main pass and two denoisers on the draw's own inputs (t0 half res
-   // depth, t1 full res normals, its $Globals at b0 for this frame's projection and radius), then a copy into its render target.
-   // Returns false, and the native draw runs, when an input, a shader or the scratch is missing.
+   // XeGTAO in place of the SSAO calculate draw: prefilter, main pass and two denoisers on its inputs (t0 half res depth, t1 full res
+   // normals, b0 $Globals with this frame's projection and radius), then a copy into its render target. False (the native draw runs) if
+   // an input, shader or scratch is missing.
    static bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
       // Held through the dispatches so a shader reload cannot release them mid-use.
@@ -1228,7 +1220,7 @@ public:
       GetResourceInfo(normals_srv.get(), normals_size, unused_format);
       const uint32_t width = target_size.x;
       const uint32_t height = target_size.y;
-      // The final denoiser's R8_UNORM output is copied into the target, so its format must match
+      // The final denoiser's R8_UNORM output is copied into the target, so the formats must match
       if (width == 0 || height == 0 || target_format != DXGI_FORMAT_R8_UNORM || depth_size.x != width || depth_size.y != height)
          return false;
       // Full res normals per target pixel (2, the SSAO is half res)
@@ -1292,7 +1284,7 @@ public:
 
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       compute_state.Cache(native_device_context, device_data.uav_max_count);
-      // The game may bind $Globals as a range of a bigger buffer; a zero count means a plain binding
+      // $Globals may be a range of a bigger buffer; a zero count means a plain binding
       ID3D11Buffer* const cbs[] = {globals_cb.get(), game_device_data.gtao_knobs_cb.get()};
       if (globals_count != 0)
          native_device_context1->CSSetConstantBuffers1(0, 1, &cbs[0], &globals_first, &globals_count);
@@ -1324,8 +1316,8 @@ public:
       pass("P5S XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
       compute_state.Restore(native_device_context);
 
-      // The target is still bound as the draw's render target, and a copy into an OM bound resource is a hazard the runtime
-      // does not resolve: unbind around the copy, then give the game its binding back.
+      // The target is still the draw's render target, and the runtime doesn't resolve copies into OM bound resources: unbind around the
+      // copy.
       native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
       native_device_context->CopyResource(target.get(), game_device_data.gtao_final_texture.get());
       ID3D11RenderTargetView* const rtv = target_rtv.get();
@@ -1333,9 +1325,9 @@ public:
       return true;
    }
 
-   // For the game's "FinishCommandList" (a command list, then its deferred context) and "ExecuteCommandList" (the immediate context,
-   // then the command list; before it executes). A command list finished after a split is the scene's remainder: when it's executed, the
-   // split's first part is executed first, then DLSS/FSR writes the scene the remainder's post process reads.
+   // For the game's "FinishCommandList" (command list, then deferred context) and "ExecuteCommandList" (immediate context, then command
+   // list, before it runs). A list finished after a split is the scene's remainder: on its execution the split's first part runs, then
+   // DLSS/FSR writes the scene its post process reads.
    static void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
    {
       DeviceData* const device_data = GetDeviceData(cmd_list->get_device());
@@ -1377,14 +1369,14 @@ public:
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       draw_state.Cache(native_device_context.get(), device_data->uav_max_count);
       compute_state.Cache(native_device_context.get(), device_data->uav_max_count);
-      // Always, even with the upscaler gone meanwhile: it's the start of the game's frame
+      // Always, even if the upscaler went away meanwhile: it starts the game's frame
       native_device_context->ExecuteCommandList(split.partial.get(), FALSE);
 
       D3D11_TEXTURE2D_DESC desc;
       split.source_color->GetDesc(&desc);
       if (IsSRActive(*device_data) && game_device_data.mv_texture)
       {
-         // The output is written as a UAV. Upscaling: into the split's output, which the post process reads; else (DLAA) copied back into the scene.
+         // Written as a UAV. Upscaling: into the split's output, read by the post process; DLAA: copied back into the scene.
          D3D11_TEXTURE2D_DESC output_desc = {};
          if (!split.output_color)
          {
@@ -1425,7 +1417,7 @@ public:
          draw_data.depth_buffer = split.depth.get();
          draw_data.render_width = desc.Width;
          draw_data.render_height = desc.Height;
-         // As applied (pixels, +y down): found with the developer DLSS's jitter configs, the opposite shook upscaled frames
+         // As applied (pixels, +y down): the opposite sign shakes upscaled frames
          draw_data.jitter_x = split.jitter[0];
          draw_data.jitter_y = split.jitter[1];
          draw_data.vert_fov = split.vertical_fov;
@@ -1441,8 +1433,8 @@ public:
             }
             else
             {
-               // Also scaled back down into the scene: the post passes that read it at the render resolution (DOF, bloom, exposure) would
-               // otherwise see the raw jittered frame, and the DOF merge would blend a shaking blur into the output (blurry and shaking)
+               // Also scaled down into the scene, else post passes reading it at render resolution (DOF, bloom, exposure) see the raw jittered
+               // frame and the DOF merge blends a shaking blur into the output
                com_ptr<ID3D11ShaderResourceView> output_srv;
                com_ptr<ID3D11RenderTargetView> scene_rtv;
                const D3D11_RENDER_TARGET_VIEW_DESC scene_rtv_desc = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_RTV_DIMENSION_TEXTURE2D};
@@ -1464,7 +1456,7 @@ public:
       compute_state.Restore(native_device_context.get());
    }
 
-   // Byte offset of "fClstScl" in a pixel shader's $Globals (b0), UINT_MAX if it has none, by original hash
+   // Byte offset of "fClstScl" in a pixel shader's $Globals (b0) by original hash, UINT_MAX if none
    static UINT GetClusterScaleOffset(DeviceData& device_data, uint32_t hash, reshade::api::pipeline pipeline)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1491,15 +1483,15 @@ public:
       return game_device_data.layer_cluster_scale_offsets.try_emplace(hash, offset).first->second;
    }
 
-   // The render scale of a layer output of this frame (a deferred context can record just past the present), 0 otherwise (a stale one from a
-   // previous pause screen, or anything else). The caller holds "layer_mutex".
+   // Render scale of a layer output from this frame (a deferred context can record just past the present), else 0 (e.g. stale from a
+   // previous pause screen). The caller holds "layer_mutex".
    static float GetRecentLayerScale(const std::unordered_map<ID3D11Resource*, Persona5StrikersGameDeviceData::LayerOutput>& outputs, ID3D11Resource* resource)
    {
       const auto it = outputs.find(resource);
       return it != outputs.end() && cb_luma_global_settings.FrameIndex - it->second.frame_index <= 1 ? it->second.scale : 0.f;
    }
 
-   // The uv scale (1 / render scale) of the layer vertex shaders ("Includes/LayerCorner.hlsl"), at "layer_uv_scale_cb_slot"
+   // The layer vertex shaders' uv scale (1 / render scale) at "layer_uv_scale_cb_slot" (see "Includes/LayerCorner.hlsl")
    static com_ptr<ID3D11Buffer> GetLayerUVScaleBuffer(ID3D11Device* native_device, Persona5StrikersGameDeviceData* game_device_data, const float scale[2])
    {
       const std::lock_guard lock(game_device_data->layer_mutex);
@@ -1516,11 +1508,11 @@ public:
       return game_device_data->layer_uv_scale_buffer;
    }
 
-   // Upscaling: the 3D layers the game draws outside the scene frame (the main menu and pause screen characters, their outlines and
-   // translucents) go into output sized targets through a render resolution viewport, then a stretch (0x99A76DC2) scales that corner
-   // over the whole target, so DLSS/FSR never sees them. Their draws get the whole target instead, and the stretch copies it 1:1. What
-   // depends on the render resolution is scaled back: the quads' texture coordinates (from their vertices), and the light cluster index
-   // of the lit pixel shaders (pixel position * "fClstScl" / 64). False if the draw isn't one (it then goes ahead untouched).
+   // Upscaling: 3D layers outside the scene frame (main menu and pause screen characters, outlines, translucents) draw through a render
+   // resolution viewport into output sized targets, then a stretch (0x99A76DC2) scales that corner over the target, bypassing DLSS/FSR.
+   // Their draws get the whole target instead, and the stretch copies 1:1. Rescaled to match: the quads' texture coordinates (from their
+   // vertices) and the lit pixel shaders' light cluster index (pixel position * "fClstScl" / 64). False if not such a draw (it then runs
+   // untouched).
    static bool DrawLayerAtOutputResolution(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1529,8 +1521,7 @@ public:
       UINT viewports = 1;
       native_device_context->RSGetViewports(&viewports, &viewport);
       const uint2 output_size = {uint32_t(device_data.output_resolution.x + 0.5f), uint32_t(device_data.output_resolution.y + 0.5f)};
-      // Most draws (the scene's included) stop here. The target must be output sized, so this is the render scale: the same in both axes
-      // (not a panel).
+      // Most draws (the scene's included) stop here. With an output sized target this is the render scale, equal in both axes (not a panel).
       float scale[2] = {viewport.Width / float(output_size.x), viewport.Height / float(output_size.y)};
       if (!stretch && (viewports == 0 || viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f || viewport.Width >= float(output_size.x) || scale[0] <= 0.f || std::abs(scale[0] - scale[1]) > 0.01f))
          return false;
@@ -1574,7 +1565,7 @@ public:
          }
       }
 
-      // All or nothing: without them, the layer's quads, its sprite onto the swapchain and its exposure would read a corner of what it drew
+      // All or nothing: otherwise the layer's quads, swapchain sprite and exposure would read a corner of what it drew
       com_ptr<ID3D11VertexShader> quad_vertex_shader;
       {
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
@@ -1592,8 +1583,8 @@ public:
             return false;
       }
 
-      // The lit pixel shaders' $Globals with the cluster scale matching the pixel positions. Until the buffer has a CPU copy (its first
-      // draw), the draw keeps the game's, so its point lights come from the wrong clusters for a frame.
+      // The lit pixel shaders' $Globals with the cluster scale matching the pixel positions. Until the buffer's first CPU copy the game's is
+      // kept, so point lights use the wrong clusters for a frame.
       com_ptr<ID3D11Buffer> original_globals;
       com_ptr<ID3D11Buffer> patched_globals;
       const UINT cluster_scale_offset = stretch ? UINT_MAX : GetClusterScaleOffset(device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader);
@@ -1623,7 +1614,7 @@ public:
          std::copy_n(scale, 2, frame.scale);
       }
 
-      // Set directly, so Core's tracking of the bound state never sees them: the game's are put back after
+      // Set directly (bypassing Core's state tracking), then restored
       D3D11_RECT scissor = {};
       UINT scissors = 1;
       native_device_context->RSGetScissorRects(&scissors, &scissor);
@@ -1683,12 +1674,12 @@ public:
             com_ptr<ID3D11RenderTargetView> rtvs[8];
             com_ptr<ID3D11DepthStencilView> dsv;
             native_device_context->OMGetRenderTargets(8, &rtvs[0], &dsv);
-            // The G-buffer (5 targets), or an opaque forward draw of a mesh into the scene (outlines, sky: 1 target, depth written)
+            // The G-buffer (5 targets), or an opaque forward mesh draw into the scene (outlines, sky: 1 target, depth written)
             const bool gbuffer = std::all_of(rtvs, rtvs + 5, [](const auto& rtv)
                { return rtv.get() != nullptr; });
             D3D11_DEPTH_STENCIL_DESC depth_desc = {};
             com_ptr<ID3D11Buffer> vertex_buffer;
-            // Forward draws join a started frame on the scene context; out of a frame only a depth prepass (no targets) can start one
+            // Forward draws join a started frame on the scene context; outside a frame only a depth prepass (no targets) starts one
             const bool scene_draw = game_device_data.mv_frame_ended ? !rtvs[0] : native_device_context == game_device_data.mv_scene_context;
             if (!gbuffer && dsv && scene_draw)
             {
@@ -1708,7 +1699,7 @@ public:
                if (DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, bound_rtvs, dsv.get(), gbuffer, *original_draw_dispatch_func))
                   return DrawOrDispatchOverrideType::Replaced;
             }
-            // Any other mesh depth tested against the scene: the depth prepass (no targets), or geometry that only tests depth
+            // Any other mesh depth tested against the scene: the depth prepass (no targets), or depth test only geometry
             const bool depth_prepass = !rtvs[0] && depth_write;
             if (!gbuffer && depth_desc.DepthEnable && vertex_buffer && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, dsv.get(), depth_prepass, *original_draw_dispatch_func))
                return DrawOrDispatchOverrideType::Replaced;
@@ -1720,8 +1711,8 @@ public:
       if (IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_draw_dispatch_func && *original_draw_dispatch_func && DrawLayerAtOutputResolution(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
-      // The exposure histogram of a 3D layer's stretch target reads its render resolution corner by pixel: it gets the target (drawn at the
-      // output resolution) scaled down to the render resolution instead
+      // The exposure histogram reads a layer stretch target's render resolution corner by pixel: give it the target downscaled to render
+      // resolution
       if (original_shader_hashes.Contains(exposure_histogram_hash, reshade::api::shader_stage::compute) && original_draw_dispatch_func && *original_draw_dispatch_func)
       {
          com_ptr<ID3D11ShaderResourceView> layer_srv;
@@ -1789,7 +1780,7 @@ public:
       if (g_gtao_enable && original_shader_hashes.Contains(ssao_hash, reshade::api::shader_stage::pixel))
          return RunXeGTAO(native_device, native_device_context, device_data) ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
 
-      // DLSS/FSR before the scene's first post process pass: split its command list here, the upscaler runs between the two parts
+      // DLSS/FSR before the scene's first post pass: split its command list here, the upscaler runs between the parts
       if (game_device_data.sr_split_ready && native_device_context == game_device_data.mv_scene_context && IsSRActive(device_data) && original_shader_hashes.Contains(post_process_start_shader_hashes))
       {
          game_device_data.sr_split_ready = false;
@@ -1812,7 +1803,7 @@ public:
             const auto& view_projection = game_device_data.mv_view_projection;
             split.vertical_fov = 2.f * std::atan(1.f / std::sqrt(view_projection[1] * view_projection[1] + view_projection[5] * view_projection[5] + view_projection[9] * view_projection[9]));
          }
-         // Upscaling when the game renders below the output resolution (its render scale option): the output and the canvas at the output resolution
+         // Upscaling when the game renders below output resolution (its render scale option): output and canvas at output resolution
          const uint2 output_size = {uint32_t(device_data.output_resolution.x + 0.5f), uint32_t(device_data.output_resolution.y + 0.5f)};
          if (scene_desc.Width < output_size.x || scene_desc.Height < output_size.y)
          {
@@ -1831,7 +1822,7 @@ public:
                output_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
                com_ptr<ID3D11Texture2D> canvas;
                created = created && SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, &canvas)) && SUCCEEDED(native_device->CreateRenderTargetView(canvas.get(), nullptr, &game_device_data.sr_upscaled_canvas_rtv)) && SUCCEEDED(native_device->CreateShaderResourceView(canvas.get(), nullptr, &game_device_data.sr_upscaled_canvas_srv));
-               // Retried next frame (the size check above sees no output); meanwhile the upscaler runs at the render resolution, which the game stretches
+               // Retried next frame (the size check sees no output); meanwhile the upscaler runs at render resolution and the game stretches it
                if (!created)
                {
                   game_device_data.sr_upscaled_output.reset();
@@ -1844,12 +1835,12 @@ public:
             if (game_device_data.sr_upscaled_canvas_srv)
                split.output_color = game_device_data.sr_upscaled_output;
          }
-         // The upgraded scene, the motion vectors' size, not multisampled
+         // The upgraded scene: motion vector sized, not multisampled
          if (split.depth && native_device_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED && scene_desc.Width == mv_size.x && scene_desc.Height == mv_size.y && scene_desc.SampleDesc.Count == 1 && (scene_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || scene_desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) && SUCCEEDED(native_device_context->FinishCommandList(TRUE, &split.partial)))
          {
             const std::lock_guard lock(game_device_data.sr_mutex);
-            // The game doesn't know its command list restarted: its next "D3D11_MAP_WRITE_NO_OVERWRITE" map would fail without a discard
-            // first (the dialogue text went missing). Data it appended before the split isn't carried over, like in the sibling mods.
+            // The game doesn't know its command list restarted: its next "D3D11_MAP_WRITE_NO_OVERWRITE" map fails without a discard first
+            // (dialogue text went missing). Data appended before the split is lost, as in other mods that split command lists.
             for (const auto& buffer : game_device_data.sr_no_overwrite_buffers)
             {
                D3D11_MAPPED_SUBRESOURCE mapped;
@@ -1866,8 +1857,8 @@ public:
          }
       }
 
-      // Upscaled: the post passes that blend into the scene also blend into the upscaler's output, at the output resolution. The render
-      // resolution scene stays vanilla for the passes that read it after them (the bloom prefilter, the exposure histogram by pixel).
+      // Upscaled: scene blending post passes also blend into the upscaler's output. The render resolution scene stays vanilla for later
+      // readers (bloom prefilter, exposure histogram by pixel).
       if (native_device_context == game_device_data.sr_upscaling_context && original_shader_hashes.Contains(scene_post_writer_shader_hashes) && original_draw_dispatch_func && *original_draw_dispatch_func)
       {
          // The replaced bloom add reads its intensity
@@ -1895,7 +1886,7 @@ public:
          device_data.has_drawn_main_post_processing = true;
          if (!original_draw_dispatch_func || !*original_draw_dispatch_func)
             return DrawOrDispatchOverrideType::None;
-         // Below render scale 1 the composite draws into its own target, which the game then stretches onto the swapchain
+         // Below render scale 1 the composite draws into its own target, which the game stretches onto the swapchain
          {
             com_ptr<ID3D11RenderTargetView> rtv;
             native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
@@ -1921,9 +1912,8 @@ public:
                   if (layer_scale > 0.f)
                      game_device_data.layer_composed[target.get()] = {layer_scale, cb_luma_global_settings.FrameIndex};
                }
-               // It draws the render resolution corner (which the sprite then scales up), cut by its scissor (or viewport): the whole target,
-               // from the whole scene. A corner viewport also had corner scene coordinates: those get scaled ("LumaData.CustomData4" in the
-               // composite, the scene samples only, the rest keeps its coordinates).
+               // It draws the render resolution corner (for the sprite to scale up), cut by scissor or viewport: draw the whole target from the
+               // whole scene instead, rescaling a corner viewport's scene coordinates by "LumaData.CustomData4" (scene samples only).
                D3D11_VIEWPORT viewport = {};
                UINT viewports = 1;
                native_device_context->RSGetViewports(&viewports, &viewport);
@@ -1946,7 +1936,7 @@ public:
                }
             }
          }
-         // Upscaled: from the upscaler's output, at the output resolution, into the canvas (RCAS included), which the stretch then copies 1:1
+         // Upscaled: from the upscaler's output into the output resolution canvas (RCAS included), which the stretch copies 1:1
          if (native_device_context == game_device_data.sr_upscaling_context)
          {
             DrawStateStack<DrawStateStackType::FullGraphics> state;
@@ -1979,8 +1969,8 @@ public:
          return DrawOrDispatchOverrideType::None;
       }
 
-      // The copy of a 3D layer's alpha into its composite's output (the pause screen's), after the composite: its quad covers the render
-      // resolution corner through its vertex positions (a full viewport) and texture coordinates. The whole target instead, like the composite.
+      // The copy of a 3D layer's alpha into its (pause screen) composite's output: its quad covers the render resolution corner (full
+      // viewport, corner positions and texture coordinates). Drawn over the whole target instead, like the composite.
       if (original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && original_shader_hashes.Contains(quad_vertex_shader_hash, reshade::api::shader_stage::vertex) && original_draw_dispatch_func && *original_draw_dispatch_func)
       {
          com_ptr<ID3D11RenderTargetView> rtv;
@@ -2021,7 +2011,7 @@ public:
          }
       }
 
-      // The game's stretch of the composite's target onto the swapchain (render scales below 1) is the scene, never UI. Upscaled, it copies the canvas 1:1.
+      // The game's stretch of the composite target onto the swapchain (render scales below 1) is scene, not UI. Upscaled, it copies the canvas 1:1.
       if (game_device_data.composite_target && original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && original_draw_dispatch_func && *original_draw_dispatch_func)
       {
          com_ptr<ID3D11ShaderResourceView> game_srv;
@@ -2041,8 +2031,8 @@ public:
          }
       }
 
-      // Everything the game draws onto the swapchain after the composite is UI (HUD, menus, dialogue boxes, fades), except the FXAA passes.
-      // Checked after the composite, so a flag left over from the previous frame can never stop the scene from drawing.
+      // Everything drawn onto the swapchain after the composite is UI (HUD, menus, dialogue boxes, fades), except FXAA. Checked after the
+      // composite, so a stale flag can't stop the scene drawing.
       if (device_data.has_drawn_main_post_processing && (stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel && !original_shader_hashes.Contains(fxaa_hash, reshade::api::shader_stage::pixel) && !original_shader_hashes.Contains(shader_hashes_apply_fxaa))
       {
          com_ptr<ID3D11RenderTargetView> rtv;
@@ -2052,7 +2042,7 @@ public:
             if (g_hide_ui)
                return DrawOrDispatchOverrideType::Skip;
 
-            // The sprite that puts a 3D layer's composite on the swapchain scales up its render resolution corner: all of it instead
+            // The sprite putting a 3D layer's composite on the swapchain scales up its render resolution corner: draw all of it instead
             if (original_shader_hashes.Contains(ui_sprite_vertex_shader_hash, reshade::api::shader_stage::vertex) && original_draw_dispatch_func && *original_draw_dispatch_func)
             {
                com_ptr<ID3D11ShaderResourceView> layer_srv;
@@ -2077,14 +2067,12 @@ public:
                }
             }
 
-            // UI draws that depend on the swapchain's magnitude through their blend saw it clamped to 0-1 by the vanilla UNORM target, while
-            // the additive UI before them (e.g. the menu cursor's RGB cards, alpha 1 + 1 + 1) now accumulates above 1 on the fp16 one: the
-            // cursor's reverse subtracted option text vanished, and destination alpha masks (HUD, main menu) read alphas up to 2. Clamp first,
-            // under the draw's own geometry and stencil: the same draw with a white pixel shader and a MIN blend. Colors only before a color
-            // subtract; destination alpha factors only need the (never displayed) alpha, and destination color factors are left alone, so the
-            // HDR scene under the UI keeps its range. A subtract's own result went below 0 too (the dialogue bubbles, -1.5), so it's floored
-            // after, likewise with a black pixel shader and a MAX blend. Additive UI over a bright scene went beyond the display's peak
-            // (vanilla clipped it at 1), so it's clamped after to the peak, likewise.
+            // UI blends reading the swapchain saw it clamped to 0-1 by the vanilla UNORM target; in fp16, earlier additive UI (e.g. the menu
+            // cursor's RGB cards, alpha 1 + 1 + 1) exceeds 1: the cursor's reverse subtracted text vanished and destination alpha masks (HUD,
+            // main menu) read alphas up to 2. So clamp first with the same draw (own geometry and stencil), a white pixel shader and a MIN blend:
+            // all channels before a color subtract, else only the never displayed alpha, keeping the HDR scene's color range. Subtracts are floored
+            // after (dialogue bubbles reached -1.5) with a black pixel shader and a MAX blend; additive UI is clamped after to the display's peak
+            // (vanilla clipped at 1), likewise.
             bool drawn = false;
             if (original_draw_dispatch_func && *original_draw_dispatch_func)
             {
@@ -2150,18 +2138,17 @@ public:
          }
       }
 
-      // SMAA already antialiased the scene, before the UI. Unless a 3D layer (main menu, pause screen) was composed in the UI after it:
-      // the vanilla FXAA then runs, which suits its thin line art better than SMAA (tried on the finished frame: more visible stairs),
-      // and SMAA on the layer itself, before its composite's tone curve, left fringes on its semi-transparent edges
+      // SMAA already antialiased the scene, unless the UI then composed a 3D layer (main menu, pause screen): the vanilla FXAA then runs,
+      // suiting its thin line art better (SMAA on the finished frame left more stairs; on the layer before its tone curve, fringes on
+      // semi-transparent edges). Bitwise "&" so both flags reset every frame.
       if (original_shader_hashes.Contains(fxaa_hash, reshade::api::shader_stage::pixel) && (game_device_data.scene_antialiased.exchange(false) & !game_device_data.layer_drawn.exchange(false)))
          return DrawOrDispatchOverrideType::Skip;
 
       return DrawOrDispatchOverrideType::None;
    }
 
-   // The game's "RenderScale" setting in memory: its settings block is a run of int32 in config.xml's order, in game.exe's writable
-   // data, which the game fills from config.xml before add-ons load. Found by the Resolution, RenderScale, FPS and VSync run; null
-   // unless exactly one matches.
+   // The game's "RenderScale" in memory: its settings block is a run of int32 in config.xml's order in game.exe's writable data,
+   // filled from config.xml before add-ons load. Found by the Resolution, RenderScale, FPS, VSync run; null unless exactly one matches.
    static int32_t* FindRenderScaleSetting()
    {
       const wchar_t* const app_data = _wgetenv(L"APPDATA");
@@ -2206,13 +2193,13 @@ public:
       return matches == 1 ? found : nullptr;
    }
 
-   // Keeps the game's render scale at the override (or the game's own option), live: the game rebuilds its targets at its setting
-   // whenever its window is resized (e.g. alt-tab), so after writing it a WM_SIZE for the current size makes it apply now. Changing
-   // the option in the game's menu (which writes the same setting) drops the override, and applies live too.
-   // In the main menu ("menu") it renders at 100%: DLSS/FSR never run there, and the background would be a stretched render resolution
-   // image. That value is only written for the rebuild, then the kept one is put back, so the game's options menu shows (and would save
-   // to config.xml) the real one. An alt-tab there rebuilds at the kept value, which "menu_rebuilt_low" reports, so 100% is applied again.
-   static void UpdateRenderScale(Persona5StrikersGameDeviceData* game_device_data, bool menu, bool menu_rebuilt_low)
+   // Keeps the game's render scale at the override (or its own option), live: after writing the setting, a WM_SIZE for the current size
+   // makes the game rebuild its targets now (it does on any resize, e.g. alt-tab). Changing the option in the game's menu (the same
+   // setting) drops the override, also live. The override needs DLSS/FSR ("upscaling"); otherwise below 100% the game stretches its
+   // composite, out of SMAA's reach. The main menu ("menu") renders at 100% (no DLSS/FSR there, so the background would be stretched),
+   // written only for the rebuild and then replaced by the kept value, so the options menu shows and saves the real one. An alt-tab there
+   // rebuilds at the kept value ("menu_rebuilt_low"), so 100% is reapplied.
+   static void UpdateRenderScale(Persona5StrikersGameDeviceData* game_device_data, bool upscaling, bool menu, bool menu_rebuilt_low)
    {
       if (!game_device_data->render_scale_searched)
       {
@@ -2225,7 +2212,7 @@ public:
       if (!setting)
          return;
       const int32_t current = *setting;
-      // The game's menu wrote it (never while a temporary value is in)
+      // The game's menu wrote it (never during a temporary value)
       if (game_device_data->render_scale_restore_presents == 0 && current != game_device_data->render_scale_memory)
       {
          game_device_data->render_scale_game = game_device_data->render_scale_memory = current;
@@ -2235,7 +2222,7 @@ public:
             reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
          }
       }
-      const int32_t kept = g_render_scale != 0 ? g_render_scale : game_device_data->render_scale_game;
+      const int32_t kept = upscaling && g_render_scale != 0 ? g_render_scale : game_device_data->render_scale_game;
       const int32_t wanted = menu ? 10 : kept;
       if (menu_rebuilt_low && game_device_data->render_scale_restore_presents == 0 && game_device_data->render_scale_applied == wanted)
          game_device_data->render_scale_applied = kept;
@@ -2253,7 +2240,7 @@ public:
          if (--game_device_data->render_scale_restore_presents == 0)
             *setting = game_device_data->render_scale_memory = kept;
       }
-      // The override changed while the targets already are at "wanted" (the main menu)
+      // The override changed while the targets are already at "wanted" (main menu)
       else if (current != kept)
       {
          *setting = game_device_data->render_scale_memory = kept;
@@ -2264,7 +2251,7 @@ public:
    {
       // Set by the composite; Core copies it into "has_drawn_main_post_processing_previous" before this, but never clears it
       device_data.has_drawn_main_post_processing = false;
-      // The upscaler's history restarts after any frame it didn't draw (menus, loading, the upscaler just picked)
+      // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
       device_data.force_reset_sr = !device_data.has_drawn_sr;
       device_data.has_drawn_sr = false;
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -2277,17 +2264,17 @@ public:
          std::erase_if(game_device_data.layer_composed, stale);
       }
       {
-         // The main menu from 30 presents on (loading screens and fades in between stay at the game's scale), until the scene draws again.
-         // Scene frames are only seen with DLSS/FSR (the motion vectors start them), which is also when 100% matters.
+         // The main menu after 30 presents (loading screens and fades between keep the game's scale), until the scene draws again. Scene
+         // frames are only seen with DLSS/FSR (motion vectors start them), the only time 100% matters.
          const bool render_resolution_composite = game_device_data.render_resolution_composite.exchange(false);
          if (game_device_data.scene_drawn.exchange(false) || !IsSRActive(device_data))
             game_device_data.menu_presents = 0;
          else if (render_resolution_composite && game_device_data.menu_presents < 30)
             game_device_data.menu_presents++;
          const bool menu = game_device_data.menu_presents >= 30;
-         UpdateRenderScale(&game_device_data, menu, menu && render_resolution_composite);
+         UpdateRenderScale(&game_device_data, IsSRActive(device_data), menu, menu && render_resolution_composite);
       }
-      // Textures a mip sharper under DLSS/FSR, which resolves the extra detail over its jittered frames (Core applies it to the anisotropic samplers)
+      // A mip sharper under DLSS/FSR, which resolves the detail over its jittered frames (Core applies it to anisotropic samplers)
       if (!custom_texture_mip_lod_bias_offset)
       {
          const std::unique_lock lock(s_mutex_samplers);
@@ -2319,7 +2306,7 @@ public:
    {
       auto& settings = cb_luma_global_settings.GameSettings;
 
-      // Persisted GameSettings checkbox (0/1) with its tooltip and reset button
+      // Persisted GameSettings checkbox (0/1) with tooltip and reset button
       const auto settings_toggle = [&](const char* label, const char* key, float* value, float default_value, const char* tooltip)
       {
          bool enabled = *value > 0.5f;
@@ -2350,13 +2337,13 @@ public:
 
       ImGui::SeparatorText("Anti-Aliasing");
       {
-         // The game's render scale, overridden live (see "UpdateRenderScale"): presets named after the upscaler modes (the game's
-         // steps are 10%), or any step with the custom slider. Shows the game's own option until overridden.
+         // The game's render scale, overridden live (see "UpdateRenderScale"): presets named after upscaler modes (game steps are 10%), or
+         // any step with the custom slider. Shows the game's option until overridden.
          const auto& game_device_data = GetGameDeviceData(device_data);
-         ImGui::BeginDisabled(!game_device_data.render_scale_setting);
+         ImGui::BeginDisabled(!game_device_data.render_scale_setting || !IsSRActive(device_data));
          if (g_render_scale_custom)
          {
-            // The game's own steps: its setting (5-10), shown as a percentage ("%d0")
+            // The game's steps: its setting (5-10) as a percentage ("%d0")
             int scale = g_render_scale != 0 ? g_render_scale : game_device_data.render_scale_game;
             if (ImGui::SliderInt("Render Scale", &scale, 5, 10, g_render_scale != 0 ? "%d0%%" : "%d0%% (game)", ImGuiSliderFlags_AlwaysClamp))
             {
@@ -2383,7 +2370,7 @@ public:
             }
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("The resolution the game renders at, which DLSS/FSR upscale to the output resolution.\nApplies immediately and overrides the game's own option; changing that option in the game drops the override.");
+            ImGui::SetTooltip("The resolution the game renders at, which DLSS/FSR upscale to the output resolution. Needs DLSS or FSR.\nApplies immediately and overrides the game's own option; changing that option in the game drops the override.");
          DrawResetButton(g_render_scale, 0, "RenderScale");
          if (ImGui::Checkbox("Custom Render Scale", &g_render_scale_custom))
             reshade::set_config_value(nullptr, NAME, "RenderScaleCustom", g_render_scale_custom);
@@ -2391,7 +2378,7 @@ public:
             ImGui::SetTooltip("Picks the render scale in 10%% steps instead of the presets.");
          ImGui::EndDisabled();
       }
-      ImGui::BeginDisabled(!settings_toggle("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off).") && !IsSRActive(device_data));
+      ImGui::BeginDisabled(!settings_toggle("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off, at a 100% render scale).") && !IsSRActive(device_data));
       settings_slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, default_luma_global_game_settings.RCASSharpness, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
       ImGui::EndDisabled();
 
@@ -2454,7 +2441,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Persona 5 Strikers\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR and DLAA or FSR 3 native anti-aliasing, and replaces the game's FXAA with SMAA and its SSAO with XeGTAO.\n"
+         "It adds HDR, DLSS or FSR 3 upscaling and native anti-aliasing (DLAA), and replaces the game's FXAA with SMAA and its SSAO with XeGTAO.\n"
          "Enable Ambient Occlusion in the game's graphic settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -2496,7 +2483,7 @@ public:
                   "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
-                  "\nAMD FidelityFX (RCAS + FSR Native AA)"
+                  "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)");
    }
 };
@@ -2510,11 +2497,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // The composite, UI and FXAA all write the swapchain
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
-      // FXAA reads a BGRA8 copy of the swapchain (after UI), which has to hold HDR too.
-      // The HDR scene (deferred lighting, the refraction grab copy) and the bloom and flare mips (swapchain aspect ratio) are R11G11B10_FLOAT, upgraded for
-      // precision as in Nioh: the bloom chain requantizes through 11 passes, and R11G11B10's 5 bit blue mantissa tints the halos.
-      // Arrays are never upgraded, so the R11G11B10 G-buffer array stays.
-      // This also upgrades every other swapchain aspect ratio BGRA8 target (e.g. the G-buffer albedo); upgrading only the FXAA copy would save VRAM.
+      // FXAA reads a BGRA8 swapchain copy (after UI), which must hold HDR too. R11G11B10_FLOAT is upgraded for precision as in Nioh: the
+      // HDR scene (deferred lighting, refraction grab copy) and the bloom and flare mips (swapchain aspect ratio); the bloom chain
+      // requantizes through 11 passes, and the 5 bit blue mantissa tints the halos. Arrays (the R11G11B10 G-buffer) are never upgraded.
+      // Every other swapchain aspect ratio BGRA8 target (e.g. G-buffer albedo) is upgraded too; upgrading only the FXAA copy would save VRAM.
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       texture_upgrade_formats = {reshade::api::format::b8g8r8a8_typeless, reshade::api::format::r11g11b10_float};
       texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;

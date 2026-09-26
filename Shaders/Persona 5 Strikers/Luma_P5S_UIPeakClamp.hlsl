@@ -1,4 +1,4 @@
-// The display's peak in swapchain units (relative to UI paper white), drawn with a MIN blend under additive UI that went beyond it
+// The display's peak in swapchain units (relative to UI paper white), MIN blended under additive UI that exceeded it
 #include "Includes/Common.hlsl"
 
 float4 main() : SV_Target

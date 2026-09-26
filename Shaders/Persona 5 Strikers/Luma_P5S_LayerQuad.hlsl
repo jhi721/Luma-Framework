@@ -1,6 +1,6 @@
-// The game's quad vertex shader (0x2B6CA9A0) for the 3D layers drawn at the output resolution (see "DrawLayerAtOutputResolution"):
-// most of its quads' texture coordinates address the render resolution corner of output sized textures, which the layer now fills whole.
-// Some address the whole texture (the pause screen's stretch is a plain copy): those are kept.
+// The game's quad vertex shader (0x2B6CA9A0) for 3D layers drawn at the output resolution (see "Includes/LayerCorner.hlsl"): most
+// quads address the render resolution corner of output sized textures, now filled whole; some address the whole texture (the pause
+// screen's stretch, a plain copy) and are kept.
 #include "Includes/LayerCorner.hlsl"
 
 cbuffer Globals : register(b0)

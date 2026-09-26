@@ -1,7 +1,7 @@
 // Katana engine bloom combine (Unity/Kino style): 5 taps of the bloom mip (1920x1080 in the 3840x2160 captures, center
-// counted twice) / 6, times the scene exposure and g_vBloomInfo.w (intensity), blended additively (one + one) into the full resolution scene.
-// The engine compiles a 2x2 family: this 5 tap filter or a 3x3 tent / 16 (P5S_BLOOM_TENT), each with or without every
-// tap clamped to g_vMaxUV (P5S_BLOOM_MAX_UV); the other three corners include this file.
+// counted twice) / 6, times scene exposure and g_vBloomInfo.w (intensity), added (one + one blend) to the full resolution scene.
+// A 2x2 permutation family: 5 tap or 3x3 tent / 16 (P5S_BLOOM_TENT), each with or without g_vMaxUV tap clamping
+// (P5S_BLOOM_MAX_UV); the other three include this file.
 // Luma: scaled by "Bloom Intensity".
 // clang-format off
 #include "Includes/Common.hlsl"

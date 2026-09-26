@@ -11,12 +11,12 @@
 #define TONEMAP_TYPE 1
 #endif
 
-// Whether the composite and ApplyFxaa passes take the Luma HDR path (HDR display mode only). TONEMAP_TYPE 0 keeps the vanilla SDR output
-// on HDR displays too: no extension, DICE or dither (the scene sliders still apply).
+// Whether the composite and ApplyFxaa take the Luma HDR path (HDR display mode only). TONEMAP_TYPE 0 keeps the vanilla SDR output on
+// HDR displays too: no extension, DICE or dither (scene sliders still apply).
 #define P5S_HDR_SCENE (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
 
-// Luma anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR and SDR on HDR.
-// The color is linear, with 1 = UI paper white (UI_DRAW_TYPE 2). Not in the vanilla reference (TONEMAP_TYPE 0), which has no dither.
+// Luma anti-banding dither of one output quantizer step: an 8-bit code in SDR, 10-bit BT.2020 PQ in HDR and SDR on HDR.
+// The color is linear, 1 = UI paper white (UI_DRAW_TYPE 2). Off in the vanilla reference (TONEMAP_TYPE 0).
 void P5S_DitherOutput(inout float3 color, float2 uv)
 {
    if (TONEMAP_TYPE < 1 || LumaSettings.GameSettings.Dithering <= 0.5)

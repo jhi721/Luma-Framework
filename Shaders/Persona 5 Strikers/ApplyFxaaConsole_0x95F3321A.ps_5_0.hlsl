@@ -1,5 +1,5 @@
-// Katana engine PostEffect3 "ApplyFxaaConsolePS" (0x95F3321A): FXAA 3.11 console: 4 half texel taps and the center reduced to weighted RGB (0.222015, 0.706655, 0.071330), then a 2 or 4 tap blend, over the composite's output.
-// Luma: the shared tail (radial blur, output power curve in SDR only, fade) is in "Includes/ApplyFxaa.hlsl".
+// Katana engine PostEffect3 "ApplyFxaaConsolePS" (0x95F3321A): FXAA 3.11 console: 4 half texel taps and the center reduced to weighted RGB (0.222015, 0.706655, 0.071330), then a 2 or 4 tap blend.
+// Luma: the shared tail is in "Includes/ApplyFxaa.hlsl".
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "Includes/ApplyFxaa.hlsl"

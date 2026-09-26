@@ -1,5 +1,5 @@
-// Katana engine PostEffect3 "ApplyFxaaPS" (0x0B6569A5): a 5 tap (center and diagonals) edge test, then a 2 or 4 tap blend along the edge direction, over the composite's output.
-// Luma: the shared tail (radial blur, output power curve in SDR only, fade) is in "Includes/ApplyFxaa.hlsl".
+// Katana engine PostEffect3 "ApplyFxaaPS" (0x0B6569A5): 5 tap (center and diagonals) edge test, then a 2 or 4 tap blend along the edge.
+// Luma: the shared tail is in "Includes/ApplyFxaa.hlsl".
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "Includes/ApplyFxaa.hlsl"

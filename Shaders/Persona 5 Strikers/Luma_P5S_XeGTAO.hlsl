@@ -2,18 +2,19 @@
 // Forked from Luma_SR3_XeGTAO.hlsl (Saints Row: The Third).
 // Source: https://github.com/GameTechDev/XeGTAO
 //
-// P5S specifics (disassembly of the native SSAO and a capture of its inputs):
-// - Only the SSAO calculate (PS 0x63435B03) is replaced: these 4 dispatches run at its target size (R8_UNORM, half res) and
-//   are CopyResource'd into its target. Its two depth aware blurs (0xDEBA65FD, 0x4D8EC71C, upsampling to full res) and the
-//   G-buffer merge (min into gbuf0.a) stay vanilla, so the output is VISIBILITY (1 = open), as the native one.
-// - Depth = the calculate's t0 (half res raw D32, reversed Z, sky = 0), normals = its t1 (full res R16G16B16A16_UNORM,
-//   octahedral view space normals in .xy), read at the full res pixel of each target pixel (NormalInputScaleRT).
-// - Depth unpack and uv->view from the calculate's own live $Globals (rebound PS -> CS b0), in centimetres:
+// P5S specifics (from the native SSAO's disassembly and a capture of its inputs):
+// - Only the SSAO calculate (PS 0x63435B03) is replaced: these 4 dispatches run at its target size (R8_UNORM, half res) and are
+//   CopyResource'd into it. Its two depth aware blurs (0xDEBA65FD, 0x4D8EC71C, upsampling to full res) and the G-buffer merge
+//   (min into gbuf0.a) stay vanilla, so the output is VISIBILITY (1 = open), as the native one.
+// - Depth = the calculate's t0 (half res raw D32, reversed Z, sky = 0); normals = its t1 (full res R16G16B16A16_UNORM, octahedral
+//   view space normals in .xy), read at each target pixel's full res pixel (NormalInputScaleRT).
+// - Depth unpack and uv->view use the calculate's live $Globals (rebound PS -> CS b0), in centimetres:
 //   viewZ = 1 / (d * vDepthParam.x + vDepthParam.y), view.xy = (uv * vViewParam.xy + vViewParam.zw) * viewZ, view.z = -viewZ
-//   (right handed, y up). XeGTAO's view space is the same with +z forward, so only the normal's z flips.
-// - No TAA: the noise's temporal index is FROZEN at 0 (a frame index would make the pattern boil) and denoise runs twice.
+//   (right handed, y up). XeGTAO's view space only differs by +z forward, so only the normal's z flips.
+// - No TAA (DLSS/FSR are optional): the noise's temporal index is FROZEN at 0 (a frame index would make the pattern boil) and
+//   denoise runs twice.
 
-// --- Game constant buffer: the SSAO calculate's $Globals (main.cpp binds it at CS b0) ---
+// --- The SSAO calculate's $Globals (main.cpp binds it at CS b0) ---
 
 cbuffer GameGlobals : register(b0)
 {
@@ -25,8 +26,8 @@ cbuffer GameGlobals : register(b0)
    float4 vOccParam;        // strength, max occlusion, noise tiling
 }
 
-// --- Luma runtime knobs (set from main.cpp; power and radius are live DEV/TEST sliders, no recompile) ---
-// b9, not b11: core's DrawBloom owns b11 for its own constants. Mirrored by gtao_knobs_cb_slot.
+// --- Luma knobs from main.cpp (power and radius are live DEV/TEST sliders) ---
+// b9, not b11: Core's DrawBloom owns b11. Mirrored by gtao_knobs_cb_slot.
 cbuffer LumaGTAO : register(b9)
 {
    float FinalValuePowerRT;    // primary darkness dial
@@ -53,7 +54,7 @@ cbuffer LumaGTAO : register(b9)
 //
 
 #ifndef NORMAL_Z_SIGN
-#define NORMAL_Z_SIGN -1.0 // the game's view space is right handed (-z forward), XeGTAO's is +z forward
+#define NORMAL_Z_SIGN -1.0 // the game's view space is -z forward, XeGTAO's +z
 #endif
 
 // The native world radius (40 cm), unless RadiusOverrideRT > 0
@@ -264,7 +265,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
 {
    float2 normalizedScreenPos = (pixCoord + 0.5) * VIEWPORT_PIXEL_SIZE;
 
-   // Center + cross depths from the prefiltered (already linearized) mip0, our own R32F.
+   // Center and cross depths from our prefiltered (linear) R32F mip0.
    float4 valuesUL = sourceViewspaceDepth.GatherRed(depthSampler, float2(pixCoord * VIEWPORT_PIXEL_SIZE));
    float4 valuesBR = sourceViewspaceDepth.GatherRed(depthSampler, float2(pixCoord * VIEWPORT_PIXEL_SIZE), int2(1, 1));
 
@@ -281,8 +282,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
    const float edges = XeGTAO_PackEdges(edgesLRTB);
 
 #if DEVELOPMENT
-   // Debug views (visible on screen through the native SSAO blurs into the G-buffer AO; the final denoise passes
-   // raw values through when DebugViewRT > 0).
+   // Debug views reach the screen through the native blurs into the G-buffer AO; the final denoise passes them through raw.
    if (DebugViewRT > 0.5 && DebugViewRT < 1.5) // 1 = depth gradient (proves live depth + linearization/scale)
    {
       outWorkingAOTermAndEdges[pixCoord] = float2(saturate(frac(log2(max(viewspaceZ, 1e-6)))), 1.0);
@@ -302,8 +302,8 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
    const float3 viewVec = normalize(-pixCenterPos);
 
 #if DEVELOPMENT
-   // 2 = normals view-facing term, before the correction below: surfaces facing the camera are bright,
-   // black everywhere means NORMAL_Z_SIGN is inverted.
+   // 2 = normals' view-facing term before the correction below: camera-facing surfaces are bright; all black means NORMAL_Z_SIGN
+   // is inverted.
    if (DebugViewRT >= 1.5 && DebugViewRT < 2.5)
    {
       outWorkingAOTermAndEdges[pixCoord] = float2(saturate(dot(viewspaceNormal, viewVec)), 1.0);
@@ -514,7 +514,7 @@ void XeGTAO_Denoise(uint2 pixCoordBase, Texture2D sourceAOTermAndEdges, SamplerS
 )
 {
 #if DEVELOPMENT
-   // Debug views: pass the raw working value through unblurred so the on-screen viz is exact.
+   // Debug views: the raw working value, unblurred, so the on-screen viz is exact.
    if (DebugViewRT > 0.5)
    {
       for (int dside = 0; dside < 2; dside++)
@@ -677,7 +677,7 @@ uint HilbertIndex(uint posX, uint posY)
    return index;
 }
 
-// No TAA: temporalIndex is ALWAYS 0 (frozen pattern, static noise instead of boiling).
+// temporalIndex is ALWAYS 0 (see the header).
 float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    float2 noise;

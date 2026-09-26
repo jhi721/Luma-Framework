@@ -1,5 +1,5 @@
-// Katana engine PostEffect3 "ApplyFxaaQualityPS" (0xED7941FD): FXAA 3.11 quality (g_vFxaaQualityParams.w picks the preset's search steps), over the composite's output.
-// Luma: the shared tail (radial blur, output power curve in SDR only, fade) is in "Includes/ApplyFxaa.hlsl".
+// Katana engine PostEffect3 "ApplyFxaaQualityPS" (0xED7941FD): FXAA 3.11 quality (g_vFxaaQualityParams.w picks the preset's search steps).
+// Luma: the shared tail is in "Includes/ApplyFxaa.hlsl".
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "Includes/ApplyFxaa.hlsl"
@@ -365,7 +365,7 @@ void main(
          r0.z = r0.z * r0.z;
          r0.y = r0.y * -r2.y + 0.5;
          r0.z = g_vFxaaQualityParams.z * r0.z;
-         r0.x = r0.x ? r0.y : 0; // The bytecode "and"s a comparison mask with a float; 3Dmigoto's integer "&" would truncate the float
+         r0.x = r0.x ? r0.y : 0; // The bytecode "and"s a comparison mask with a float, which 3Dmigoto's integer "&" would truncate
          r0.x = max(r0.x, r0.z);
          r0.xy = r0.xx * r2.xx + v1.xy;
          r2.x = r3.w ? v1.x : r0.x;

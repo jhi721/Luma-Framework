@@ -1,4 +1,4 @@
-// Katana engine PostEffect3 "cbComposite" (b2), shared by the composite, the bloom combine and the ApplyFxaa passes
+// Katana engine PostEffect3 "cbComposite" (b2), shared by the composite, bloom combine and ApplyFxaa passes
 
 cbuffer cbComposite : register(b2)
 {

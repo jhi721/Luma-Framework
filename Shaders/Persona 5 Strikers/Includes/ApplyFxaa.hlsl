@@ -1,7 +1,7 @@
-// Katana engine PostEffect3 "ApplyFxaa*PS": optional FXAA over the composite's output, drawn into the swapchain. Never seen drawn;
-// presumably used when the engine's own FXAA or its radial blur is on. The four FXAA types (ApplyFxaaPS, ApplyFxaaRepairPS,
-// ApplyFxaaConsolePS, ApplyFxaaQualityPS) differ only in the antialiasing; this is their shared tail: the radial blur (it only exists
-// here, not in the composite), the output power curve (g_vGammaCorrection) and the fade.
+// Katana engine PostEffect3 "ApplyFxaa*PS": optional FXAA of the composite's output into the swapchain. Never seen drawn; presumably
+// used when the engine's FXAA or radial blur is on. The four variants (ApplyFxaaPS, ApplyFxaaRepairPS, ApplyFxaaConsolePS,
+// ApplyFxaaQualityPS) differ only in the antialiasing; this is their shared tail: the radial blur (not in the composite), the output
+// power curve (g_vGammaCorrection) and the fade.
 
 #include "cbComposite.hlsl"
 
@@ -34,7 +34,7 @@ float3 ApplyRadialBlurGammaFade(float3 color, float2 uv)
       }
       color = sum / weightSum;
    }
-   if (!P5S_HDR_SCENE && g_vGammaCorrection.y != 1.0) // Luma: the output power curve only applies to SDR, Luma has its own
+   if (!P5S_HDR_SCENE && g_vGammaCorrection.y != 1.0) // Luma: SDR only, Luma has its own
       color = exp2(log2(abs(color)) * g_vGammaCorrection.y);
    return color * g_vRadialBlurCenter.w;
 }

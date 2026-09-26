@@ -1,11 +1,11 @@
-// Camera motion for the motion vector pixels no patched draw wrote (still at the clear value): the scene depth reprojected from the
-// current to the previous frame's view projection (row vectors, as the game's "mW2P"). Sky (reversed Z depth 0) gets the rotation only.
+// Camera motion for motion vector pixels no patched draw wrote (still cleared): scene depth reprojected from the current to the
+// previous frame's view projection (row vectors, as the game's "mW2P"). Sky (reversed Z depth 0) gets rotation only.
 #include "../Includes/Math.hlsl"
 
 cbuffer MotionVectorFill : register(b0)
 {
    row_major float4x4 reprojection; // Current clip space to the previous frame's
-   float2 jitter_ndc;               // This frame's projection jitter, which the depth has and the motion vectors don't
+   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
 };
 
 Texture2D<float> depth : register(t0);

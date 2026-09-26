@@ -1,5 +1,5 @@
-// The game's UI sprite vertex shader (0x8B19022A), for the sprite that composes a 3D layer drawn at the output resolution onto the
-// swapchain (the pause screen's): its texture coordinates address the layer's render resolution corner, which the layer now fills whole.
+// The game's UI sprite vertex shader (0x8B19022A) that composes a 3D layer drawn at the output resolution (the pause screen's) onto
+// the swapchain: its texture coordinates address the layer's render resolution corner, now filled whole.
 #include "Includes/LayerCorner.hlsl"
 
 cbuffer Globals : register(b0)
