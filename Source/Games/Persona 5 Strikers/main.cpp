@@ -2203,15 +2203,15 @@ public:
          }
       }
 
-      // Everything drawn onto the swapchain after the composite is UI (HUD, menus, dialogue boxes, fades), except FXAA. Checked after the
-      // composite, so a stale flag can't stop the scene drawing.
-      if (device_data.has_drawn_main_post_processing && (stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel && !original_shader_hashes.Contains(fxaa_hash, reshade::api::shader_stage::pixel) && !original_shader_hashes.Contains(shader_hashes_apply_fxaa))
+      // Everything drawn onto the swapchain after the composite is UI (HUD, menus, dialogue boxes, fades), except FXAA; so is all of it in
+      // frames without one (pause screen, world transitions), whose blends need the same clamps. Hide UI keeps those frames.
+      if ((stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel && !original_shader_hashes.Contains(fxaa_hash, reshade::api::shader_stage::pixel) && !original_shader_hashes.Contains(shader_hashes_apply_fxaa))
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
          if (const com_ptr<ID3D11Resource> rtv_resource = GetViewResource(rtv.get()); rtv_resource && IsBackBuffer(&device_data, rtv_resource.get()))
          {
-            if (g_hide_ui)
+            if (g_hide_ui && device_data.has_drawn_main_post_processing)
                return DrawOrDispatchOverrideType::Skip;
 
             // The sprite putting a 3D layer's composite on the swapchain scales up its render resolution corner: draw all of it instead
