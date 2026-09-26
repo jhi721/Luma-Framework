@@ -2353,9 +2353,9 @@ public:
          }
          else
          {
-            constexpr std::pair<const char*, int> presets[] = {{"Game Setting", 0}, {"DLAA (100%)", 10}, {"Quality (70%)", 7}, {"Balanced (60%)", 6}, {"Performance (50%)", 5}};
+            constexpr std::pair<const char*, int> presets[] = {{"Game Setting", 0}, {"Native", 10}, {"Quality", 7}, {"Balanced", 6}, {"Performance", 5}};
             const auto current = std::ranges::find(presets, g_render_scale, &std::pair<const char*, int>::second);
-            const std::string preview = g_render_scale == 0 ? std::format("Game Setting ({}%)", game_device_data.render_scale_game * 10) : (current != std::end(presets) ? std::string(current->first) : std::format("{}%", g_render_scale * 10));
+            const std::string preview = current != std::end(presets) ? std::string(current->first) : std::format("{}%", g_render_scale * 10);
             if (ImGui::BeginCombo("Render Scale", preview.c_str()))
             {
                for (const auto& [label, value] : presets)
