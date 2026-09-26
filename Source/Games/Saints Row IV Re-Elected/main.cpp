@@ -2325,6 +2325,9 @@ public:
       }
       if (std::ranges::contains(tonemap_pixel_shaders, pixel_shader_hash, &std::pair<uint32_t, const char*>::first))
       {
+         // A 3D scene was composited this frame: Core then shows whether DLSS/FSR ran (the tick next to "Super Resolution"). No
+         // UI separation, UI shader replacements or UI background tonemap here, so nothing else reads it.
+         device_data.has_drawn_main_post_processing = true;
 #if DEVELOPMENT
          g_final_perm = pixel_shader_hash;
          g_finals_this_frame++;
@@ -2737,6 +2740,7 @@ public:
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
       device_data.force_reset_sr = !device_data.has_drawn_sr;
       device_data.has_drawn_sr = false;
+      device_data.has_drawn_main_post_processing = false;
       game_device_data.msaa_scene = std::exchange(game_device_data.msaa_scene_resolved, false);
       game_device_data.mv_active = IsSRActive(device_data) || g_mv_enable;
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before the G-buffer
