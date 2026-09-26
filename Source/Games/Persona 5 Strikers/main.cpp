@@ -1124,6 +1124,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw White PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(1.0, 1.0, 1.0, 1.0)"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw Black PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(0.0, 0.0, 0.0, 0.0)"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S UI Peak Clamp PS"), ShaderDefinition{"Luma_P5S_UIPeakClamp", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S UI Coverage Clamp PS"), ShaderDefinition{"Luma_P5S_UICoverageClamp", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Layer Quad VS"), ShaderDefinition{"Luma_P5S_LayerQuad", reshade::api::pipeline_subobject_type::vertex_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Layer Sprite VS"), ShaderDefinition{"Luma_P5S_LayerSprite", reshade::api::pipeline_subobject_type::vertex_shader});
       // XeGTAO passes (Luma_P5S_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
@@ -2240,10 +2241,10 @@ public:
 
             // UI blends reading the swapchain saw it clamped to 0-1 by the vanilla UNORM target; in fp16, earlier additive UI (e.g. the menu
             // cursor's RGB cards, alpha 1 + 1 + 1) exceeds 1: the cursor's reverse subtracted text vanished and destination alpha masks (HUD,
-            // main menu) read alphas up to 2. So clamp first with the same draw (own geometry and stencil), a white pixel shader and a MIN blend:
-            // all channels before a color subtract, else only the never displayed alpha, keeping the HDR scene's color range. Subtracts are floored
-            // after (dialogue bubbles reached -1.5) with a black pixel shader and a MAX blend; additive UI is clamped after to the display's peak
-            // (vanilla clipped at 1), likewise.
+            // main menu) read alphas up to 2. So clamp first with the same draw (own geometry and stencil) and a MIN blend: all channels before a
+            // color subtract, only where the sprite subtracts something (a HUD subtract's quad would clip the HDR scene under it; this reads the
+            // UI pixel shaders' b0 "nStageNum", t0/s0 and TEXCOORD1 and assumes a source alpha factor), else only the never displayed alpha (white). Subtracts are floored after (dialogue bubbles reached -1.5) with a black pixel shader and a MAX
+            // blend; additive UI is clamped after to the display's peak (vanilla clipped at 1), likewise.
             bool drawn = false;
             if (original_draw_dispatch_func && *original_draw_dispatch_func)
             {
@@ -2266,17 +2267,19 @@ public:
                if (subtracts_colors || clamp_alpha || adds_colors)
                {
                   com_ptr<ID3D11PixelShader> white_pixel_shader;
+                  com_ptr<ID3D11PixelShader> coverage_pixel_shader;
                   com_ptr<ID3D11PixelShader> black_pixel_shader;
                   com_ptr<ID3D11PixelShader> peak_pixel_shader;
                   {
                      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
                      white_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw White PS"_h);
+                     coverage_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Coverage Clamp PS"_h);
                      black_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw Black PS"_h);
                      peak_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Peak Clamp PS"_h);
                   }
                   // Index 0 all channels, 1 alpha only
                   const int channels = subtracts_colors ? 0 : 1;
-                  if (white_pixel_shader && black_pixel_shader && peak_pixel_shader && game_device_data.ui_min_blend_states[0] && game_device_data.ui_min_blend_states[1] && game_device_data.ui_max_blend_states[channels])
+                  if (white_pixel_shader && coverage_pixel_shader && black_pixel_shader && peak_pixel_shader && game_device_data.ui_min_blend_states[0] && game_device_data.ui_min_blend_states[1] && game_device_data.ui_max_blend_states[channels])
                   {
                      com_ptr<ID3D11PixelShader> pixel_shader;
                      native_device_context->PSGetShader(&pixel_shader, nullptr, nullptr);
@@ -2287,7 +2290,7 @@ public:
                         (*original_draw_dispatch_func)();
                      };
                      if (subtracts_colors || clamp_alpha)
-                        draw(white_pixel_shader.get(), game_device_data.ui_min_blend_states[channels].get());
+                        draw(subtracts_colors ? coverage_pixel_shader.get() : white_pixel_shader.get(), game_device_data.ui_min_blend_states[channels].get());
                      draw(pixel_shader.get(), blend_state.get());
                      if (subtracts_colors || subtracts_alpha)
                         draw(black_pixel_shader.get(), game_device_data.ui_max_blend_states[channels].get());
