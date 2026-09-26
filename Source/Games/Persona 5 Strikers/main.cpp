@@ -2085,6 +2085,10 @@ public:
                (*original_draw_dispatch_func)();
             }
             state.Restore(native_device_context);
+            // Also into the game's own target, which the pause screen freezes as its background (else a stale frame)
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData);
+            (*original_draw_dispatch_func)();
             return DrawOrDispatchOverrideType::Replaced;
          }
          // SMAA not with DLSS/FSR (not even on composites they skip, like the pause screen's), RCAS after either
