@@ -407,8 +407,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    uint32_t gtao_width = 0;
    uint32_t gtao_height = 0;
    DXGI_FORMAT gtao_format = DXGI_FORMAT_UNKNOWN;
-   com_ptr<ID3D11Buffer> gtao_knobs_cb; // immutable, recreated when a knob changes
-   float gtao_knobs[8] = {};
+   com_ptr<ID3D11Buffer> gtao_knobs_cb; // dynamic, rewritten every run (the noise index changes per frame with DLSS/FSR)
 
    // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
    // blend state writes it unblended, see "OnCreateBlendState")
@@ -2110,19 +2109,12 @@ public:
 #else
       const float debug_view = 0.f;
 #endif
-      const float knobs[8] = {g_gtao_final_value_power, float(input_scale), g_gtao_radius_override, debug_view, 1.f / float(width), 1.f / float(height), 0.f, 0.f};
-      if (!game_device_data.gtao_knobs_cb || std::memcmp(game_device_data.gtao_knobs, knobs, sizeof(knobs)) != 0)
-      {
-         game_device_data.gtao_knobs_cb.reset();
-         D3D11_BUFFER_DESC cb_desc = {};
-         cb_desc.ByteWidth = sizeof(knobs);
-         cb_desc.Usage = D3D11_USAGE_IMMUTABLE;
-         cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-         const D3D11_SUBRESOURCE_DATA cb_data = {knobs};
-         if (FAILED(native_device->CreateBuffer(&cb_desc, &cb_data, &game_device_data.gtao_knobs_cb)))
-            return false;
-         std::memcpy(game_device_data.gtao_knobs, knobs, sizeof(knobs));
-      }
+      // DLSS/FSR accumulate the lit scene the AO multiplies into: cycle the noise and denoise once (Intel's XeGTAO.h with TAA);
+      // without them a moving pattern would boil, so it stays frozen and denoises twice
+      const bool temporal = IsSRActive(device_data);
+      const float knobs[8] = {g_gtao_final_value_power, float(input_scale), g_gtao_radius_override, debug_view, 1.f / float(width), 1.f / float(height), temporal ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 0.f};
+      if (!WriteConstants(native_device, native_device_context, std::addressof(game_device_data.gtao_knobs_cb), knobs, sizeof(knobs)))
+         return false;
 
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       compute_state.Cache(native_device_context, device_data.uav_max_count);
@@ -2150,8 +2142,9 @@ public:
       ID3D11UnorderedAccessView* const final_uav = game_device_data.gtao_final_uav.get();
       pass("SR4 XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, {depth_srv.get(), nullptr}, (width + 15) / 16, (height + 15) / 16);
       pass("SR4 XeGTAO Main Pass CS"_h, 1, &working_uavs[0], {game_device_data.gtao_depth_mips_srv.get(), normals_srv.get()}, (width + 7) / 8, (height + 7) / 8);
-      pass("SR4 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
-      pass("SR4 XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+      if (!temporal)
+         pass("SR4 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+      pass("SR4 XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[temporal ? 0 : 1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
       compute_state.Restore(native_device_context);
 
       // The target is still bound as the draw's render target, and a copy into an OM-bound resource is a hazard the runtime

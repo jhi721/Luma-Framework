@@ -13,7 +13,9 @@
 // - NDC->view and depth unpack from the game's live vc0 (the calculate's own b0, rebound PS -> CS), so the animated
 //   FOV is this frame's: ssao_inv_proj rows c1-c4, view = (ndc.x*c1 + ndc.y*c2 + d*c3 + c4) / w, i.e.
 //   viewZ = 1 / (c3.w*d + c4.w), view.xy = ndc.xy * (c1.x, c2.y) * viewZ (y up, +z forward).
-// - No TAA: NoiseIndex is FROZEN at 0 (a frame index would make the pattern boil) and denoise runs twice.
+// - Noise: frozen at 0 without an upscaler (a frame index would make the pattern boil), denoise runs twice. With DLSS/FSR
+//   (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once, as Intel's XeGTAO.h
+//   advises with TAA (NoiseIndexRT, set by main.cpp).
 
 // --- Game constant buffer: the SSAO calculate's vc0 (main.cpp binds it at CS b0) ---
 
@@ -31,7 +33,8 @@ cbuffer LumaGTAO : register(b9)
    float RadiusOverrideRT;     // > 0 overrides EFFECT_RADIUS (metres)
    float DebugViewRT;          // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    float2 ViewportPixelSizeRT; // 1 / AO target resolution, set by main.cpp
-   float2 PaddingRT;
+   float NoiseIndexRT;         // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
+   float PaddingRT;
 }
 
 #if XE_GTAO_QUALITY == 0 // Low
@@ -680,7 +683,7 @@ uint HilbertIndex(uint posX, uint posY)
    return index;
 }
 
-// No TAA: temporalIndex is ALWAYS 0 (frozen pattern, static noise instead of boiling).
+// temporalIndex: NoiseIndexRT (0 without an upscaler: frozen pattern, static noise instead of boiling).
 float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    float2 noise;
@@ -704,7 +707,7 @@ float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
    const float2 e = normals.Load(int3(dtid * uint(DepthInputScaleRT), 0)) * 2.0 - 1.0;
    const float f = min(dot(e, e), 1.0);
    const float3 viewspaceNormal = float3(e * (2.0 * sqrt(1.0 - f)), (2.0 * f - 1.0) * NORMAL_Z_SIGN);
-   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, 0), viewspaceNormal, tex0, smp, ao_term_and_edges);
+   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, uint(NoiseIndexRT)), viewspaceNormal, tex0, smp, ao_term_and_edges);
 }
 
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void denoise_pass_cs(uint2 dtid : SV_DispatchThreadID) {
