@@ -379,7 +379,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    // to weight samples in the displayed exposure. Copied only while Luma MSAA is on; null until then (the resolve shader
    // falls back to a box resolve on the zeroed binding).
    com_ptr<ID3D11Buffer> composite_tint_cb;
-   // The game resolved an MSAA scene this frame / last frame (display.ini MSAA_Level, applied at the game's start)
+   // The game resolved an MSAA scene this frame / last frame (its Anti-Aliasing display setting)
    bool msaa_scene_resolved = false;
    bool msaa_scene = false;
 
@@ -2571,7 +2571,7 @@ public:
          ImGui::SetTooltip("Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off or low in the game's display settings; not used with DLSS/FSR).");
       ImGui::EndDisabled();
       if (device_data.sr_type != SR::Type::None && GetGameDeviceData(device_data).msaa_scene)
-         ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "DLSS/FSR inactive: turn Anti-Aliasing off in the game's display settings and restart the game.");
+         ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "DLSS/FSR inactive: turn Anti-Aliasing off in the game's display settings.");
 
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
       slider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
