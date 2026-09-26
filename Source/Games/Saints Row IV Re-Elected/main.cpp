@@ -166,6 +166,38 @@ namespace
    bool g_mv_enable = false;
    bool g_mv_debug_view = false;
    bool g_mv_force_jitter = false; // The projection jitter without an upscaler
+   // "Performance Test" (see "OnPresent"): the mode, and the anti-aliasing it sets while it runs (the user's is restored on "Off" or
+   // "Current Settings", and never saved)
+   int g_perf_test = 0;
+   struct PerfTestMode
+   {
+      const char* name;
+      bool set_aa = false; // Else the current settings
+      SR::Type sr_type = SR::Type::None;
+      unsigned int dlss_preset = 0; // NVSDK_NGX_DLSS_Hint_Render_Preset (5 = E, 11 = K, ...)
+      bool smaa = false;
+      int motion_vector_draws = 2; // 2 patched (motion vectors and jitter), 1 jitter only, 0 untouched
+   };
+   constexpr PerfTestMode perf_test_modes[] = {
+      {"Off"},
+      {"Current Settings"},
+      {"DLSS K", true, SR::Type::DLSS, 11},
+      {"DLSS K Jitter Only", true, SR::Type::DLSS, 11, false, 1},
+      {"DLSS K Without Motion Vector Draws", true, SR::Type::DLSS, 11, false, 0},
+      {"DLSS L", true, SR::Type::DLSS, 12},
+      {"DLSS M", true, SR::Type::DLSS, 13},
+      {"DLSS E (CNN)", true, SR::Type::DLSS, 5},
+      {"FSR 3", true, SR::Type::FSR},
+      {"SMAA", true, SR::Type::None, 0, true},
+      {"No AA", true, SR::Type::None, 0, false},
+   };
+   // "Sweep": these modes in turn, a few log windows each, over several rounds (interleaved, so the scene's drift averages out), then
+   // a median per mode
+   bool g_perf_sweep = false;
+   constexpr int perf_sweep_modes[] = {2, 3, 4, 10};
+   static_assert(std::string_view(perf_test_modes[perf_sweep_modes[0]].name) == "DLSS K" && std::string_view(perf_test_modes[perf_sweep_modes[3]].name) == "No AA");
+   constexpr int perf_sweep_rounds = 5;
+   constexpr int perf_sweep_windows = 3; // Per mode and round
 #else
    constexpr bool g_mv_enable = false;
    constexpr bool g_mv_force_jitter = false;
@@ -473,6 +505,39 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    std::atomic<uint32_t> mv_rejects[std::size(mv_reject_names)] = {};
    std::atomic<uint64_t> mv_reject_examples[std::size(mv_reject_names)] = {};
    uint64_t mv_rejected_scene_target = 0;
+
+   // "Performance Test": GPU timestamps per frame (present to present, the scene from the G-buffer to its first post pass, the
+   // upscaler), all on the immediate context, in a ring read back a few frames later without waiting; and the CPU time in the
+   // motion vector hooks
+   struct PerfQueries
+   {
+      com_ptr<ID3D11Query> disjoint, frame_start, scene_start, scene_end, sr_end, frame_end;
+      bool scene_started = false; // scene_start issued
+      bool scene = false;         // ... and scene_end
+      bool sr = false;            // ... and sr_end
+      bool pending = false;
+   };
+   struct PerfStats
+   {
+      double frame_ms = 0.0, frame_max_ms = 0.0, scene_ms = 0.0, scene_max_ms = 0.0, sr_ms = 0.0, sr_max_ms = 0.0, cpu_frame_ms = 0.0;
+      uint32_t samples = 0, scene_samples = 0, sr_samples = 0, disjoint = 0, frames = 0;
+   };
+   std::array<PerfQueries, 8> perf_queries;
+   size_t perf_query_index = 0;
+   PerfQueries* perf_frame_queries = nullptr; // This frame's, from present to present
+   PerfStats perf_stats;                      // This log window's
+   int perf_settle_frames = 0;                // Frames skipped after a change (targets rebuilt, history reset)
+   uint32_t perf_settings = 0;                // The measured settings, to restart the settle on a change
+   std::chrono::steady_clock::time_point perf_last_present;
+   std::atomic<int64_t> perf_hook_ns = 0; // This log window's
+   // The user's anti-aliasing, while a mode that sets its own runs
+   SR::Type perf_user_sr_type = SR::Type::None;
+   unsigned int perf_user_dlss_preset = 0;
+   bool perf_user_smaa = false;
+   // "Sweep": the step over all rounds, the log windows done in it, and per mode each window's frame, scene, SR and hook times
+   int perf_sweep_step = 0;
+   int perf_sweep_windows_done = 0;
+   std::vector<std::array<double, 4>> perf_sweep_results[std::size(perf_test_modes)];
 #endif
 
    void ReleaseGTAOScratch()
@@ -546,6 +611,21 @@ class SaintsRowIV final : public Game
       return *static_cast<SaintsRowIVGameDeviceData*>(device_data.game);
    }
 
+#if DEVELOPMENT
+   // "Performance Test": adds the scope's CPU time to the motion vector hooks' total, while the test runs
+   struct PerfHookTimer
+   {
+      std::atomic<int64_t>& total_ns;
+      const bool enabled = g_perf_test != 0;
+      const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      ~PerfHookTimer()
+      {
+         if (enabled)
+            total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+      }
+   };
+#endif
+
    // Writes a dynamic constant buffer, (re)created at the data's size; false if it can't
    static bool WriteConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, com_ptr<ID3D11Buffer>* buffer, const void* data, UINT size)
    {
@@ -565,6 +645,31 @@ class SaintsRowIV final : public Game
       native_device_context->Unmap(buffer->get(), 0);
       return true;
    }
+
+#if DEVELOPMENT
+   // "Performance Test": switches to a mode, setting its anti-aliasing as Core's "Super Resolution" and "DLSS Preset" selection do
+   // (without saving), keeping the user's while any mode that sets its own runs and restoring it after
+   static void ApplyPerfTestMode(DeviceData& device_data, int mode_index)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      const PerfTestMode& mode = perf_test_modes[mode_index];
+      const PerfTestMode& previous_mode = perf_test_modes[g_perf_test];
+      if (!previous_mode.set_aa && mode.set_aa)
+      {
+         game_device_data.perf_user_sr_type = device_data.sr_type;
+         game_device_data.perf_user_dlss_preset = dlss_render_preset;
+         game_device_data.perf_user_smaa = g_smaa_enable;
+      }
+      if (mode.set_aa || previous_mode.set_aa)
+      {
+         device_data.sr_type = mode.set_aa ? mode.sr_type : game_device_data.perf_user_sr_type;
+         device_data.sr_suppressed = false;
+         dlss_render_preset = mode.set_aa && mode.sr_type == SR::Type::DLSS ? mode.dlss_preset : game_device_data.perf_user_dlss_preset;
+         g_smaa_enable = mode.set_aa ? mode.smaa : game_device_data.perf_user_smaa;
+      }
+      g_perf_test = mode_index;
+   }
+#endif
 
    // An upscaler is picked, hasn't failed (it then gives way to SMAA until picked again) and the scene isn't the game's MSAA one (no
    // motion vectors there: the upscaler steps aside while it lasts)
@@ -588,6 +693,9 @@ class SaintsRowIV final : public Game
       if (device_data && device_data->game && GetGameDeviceData(*device_data).mv_active && access == reshade::api::map_access::write_discard && offset == 0 && data && *data)
       {
          auto& game_device_data = GetGameDeviceData(*device_data);
+#if DEVELOPMENT
+         const PerfHookTimer timer{game_device_data.perf_hook_ns};
+#endif
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
          if (game_device_data.mv_constants_copies.contains(resource.handle))
             game_device_data.mv_mapped_constants[resource.handle] = *data;
@@ -604,6 +712,9 @@ class SaintsRowIV final : public Game
       if (device_data && device_data->game && GetGameDeviceData(*device_data).mv_active)
       {
          auto& game_device_data = GetGameDeviceData(*device_data);
+#if DEVELOPMENT
+         const PerfHookTimer timer{game_device_data.perf_hook_ns};
+#endif
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
          if (const auto mapped = game_device_data.mv_mapped_constants.find(resource.handle); mapped != game_device_data.mv_mapped_constants.end())
          {
@@ -732,6 +843,10 @@ class SaintsRowIV final : public Game
             if (gbuffer_depth_size.x == device_data.output_resolution.x && gbuffer_depth_size.y == device_data.output_resolution.y)
             {
                game_device_data.mv_scene_open = true;
+#if DEVELOPMENT
+               if (auto* const perf_queries = game_device_data.perf_frame_queries; perf_queries && !std::exchange(perf_queries->scene_started, true))
+                  native_device_context->End(perf_queries->scene_start.get());
+#endif
                game_device_data.mv_scene_copied = false;
                game_device_data.mv_scene_copy_source = 0;
                game_device_data.mv_scene_copy_dest = 0;
@@ -923,6 +1038,12 @@ class SaintsRowIV final : public Game
             }
 #endif
          }
+#if DEVELOPMENT
+         // "Performance Test" without motion vector draws: the frame (camera, target clear, camera fill, upscaler) still happens, the
+         // draws run jittered only, or untouched
+         if (perf_test_modes[g_perf_test].motion_vector_draws < 2)
+            return false;
+#endif
 
          // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by translation. No instance count: frustum culling
          // changes it for the instanced statics as the camera turns.
@@ -1189,6 +1310,10 @@ class SaintsRowIV final : public Game
          return false;
 #if !DEVELOPMENT // Development counts the scene sized draws outside the scene below
       if (!game_device_data.mv_scene_open)
+         return false;
+#else
+      // "Performance Test" without motion vector draws: the whole frame unjittered, so its depth tests stay consistent
+      if (perf_test_modes[g_perf_test].motion_vector_draws < 1)
          return false;
 #endif
       com_ptr<ID3D11DepthStencilView> dsv;
@@ -1940,15 +2065,31 @@ public:
             {
 #if DEVELOPMENT
                game_device_data.mv_frame_end_shader = pixel_shader_hash;
+               auto* const perf_queries = game_device_data.perf_frame_queries;
+               if (perf_queries && perf_queries->scene_started && !perf_queries->scene)
+               {
+                  native_device_context->End(perf_queries->scene_end.get());
+                  perf_queries->scene = true;
+               }
 #endif
                if (IsSRActive(device_data))
                   DrawSuperResolution(native_device, native_device_context, device_data);
+#if DEVELOPMENT
+               if (perf_queries && perf_queries->scene && !perf_queries->sr && device_data.has_drawn_sr)
+               {
+                  native_device_context->End(perf_queries->sr_end.get());
+                  perf_queries->sr = true;
+               }
+#endif
             }
             game_device_data.mv_frame_ended = true;
             game_device_data.mv_scene_open = false;
          }
          else
          {
+#if DEVELOPMENT
+            const PerfHookTimer timer{game_device_data.perf_hook_ns}; // The draw's own submission included
+#endif
             const bool motion_vectors = DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func);
             const bool jittered = motion_vectors || DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func);
 #if DEVELOPMENT
@@ -2425,6 +2566,135 @@ public:
       if (!g_gtao_enable && game_device_data.gtao_width != 0)
          game_device_data.ReleaseGTAOScratch();
 #if DEVELOPMENT
+      // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, the first 60
+      // after a change of mode or AA settings skipped), opens the next frame's
+      if (auto* const queries = std::exchange(game_device_data.perf_frame_queries, nullptr))
+      {
+         native_device_context->End(queries->frame_end.get());
+         native_device_context->End(queries->disjoint.get());
+         queries->pending = true;
+      }
+      if (g_perf_test != 0)
+      {
+         const auto now = std::chrono::steady_clock::now();
+         const uint32_t settings = uint32_t(g_perf_test) | (uint32_t(int(device_data.sr_type) + 1) << 5) | (dlss_render_preset << 8) | (uint32_t(g_smaa_enable) << 16) | (uint32_t(g_gtao_enable) << 17) | (uint32_t(game_device_data.msaa_scene) << 18);
+         // Also after a pause (the game stops presenting while unfocused): the upscaler history and the clocks restart
+         if (std::exchange(game_device_data.perf_settings, settings) != settings || now - game_device_data.perf_last_present > std::chrono::milliseconds(250))
+            game_device_data.perf_settle_frames = 60;
+         const bool measuring = game_device_data.perf_settle_frames <= 0;
+         auto& stats = game_device_data.perf_stats;
+         for (auto& queries : game_device_data.perf_queries)
+         {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+            if (!queries.pending || native_device_context->GetData(queries.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+               continue;
+            queries.pending = false;
+            if (!measuring)
+               continue;
+            if (disjoint.Disjoint || disjoint.Frequency == 0)
+            {
+               stats.disjoint++;
+               continue;
+            }
+            const auto read = [&](const com_ptr<ID3D11Query>& query, UINT64* ticks)
+            { return native_device_context->GetData(query.get(), ticks, sizeof(*ticks), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK; };
+            const auto add = [&](UINT64 start, UINT64 end, double* total, double* max_ms, uint32_t* samples)
+            {
+               const double ms = 1000.0 * double(end - start) / double(disjoint.Frequency);
+               *total += ms;
+               *max_ms = (std::max)(*max_ms, ms);
+               ++*samples;
+            };
+            UINT64 frame_start, frame_end, scene_start, scene_end, sr_end;
+            if (!read(queries.frame_start, &frame_start) || !read(queries.frame_end, &frame_end))
+               continue;
+            add(frame_start, frame_end, &stats.frame_ms, &stats.frame_max_ms, &stats.samples);
+            if (queries.scene && read(queries.scene_start, &scene_start) && read(queries.scene_end, &scene_end))
+            {
+               add(scene_start, scene_end, &stats.scene_ms, &stats.scene_max_ms, &stats.scene_samples);
+               if (queries.sr && read(queries.sr_end, &sr_end))
+                  add(scene_end, sr_end, &stats.sr_ms, &stats.sr_max_ms, &stats.sr_samples);
+            }
+         }
+         if (!measuring)
+         {
+            game_device_data.perf_settle_frames--;
+            stats = {};
+            game_device_data.perf_hook_ns = 0;
+         }
+         else
+         {
+            stats.cpu_frame_ms += std::chrono::duration<double, std::milli>(now - game_device_data.perf_last_present).count();
+            if (++stats.frames >= 120)
+            {
+               const auto average = [](double total, uint32_t samples)
+               { return samples != 0 ? total / samples : 0.0; };
+               std::string aa = g_smaa_enable ? "SMAA" : "None";
+               if (IsSRActive(device_data))
+                  aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
+               const std::array<double, 4> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.sr_ms, stats.sr_samples), double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames};
+               reshade::log::message(reshade::log::level::info, std::format("[SR4 Perf] mode=\"{}\" aa={} msaa={} gtao={} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test].name, aa, game_device_data.msaa_scene, g_gtao_enable, g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), window[0], stats.frame_max_ms, window[1], stats.scene_max_ms, stats.scene_samples, window[2], stats.sr_max_ms, stats.sr_samples, stats.cpu_frame_ms / stats.frames, window[3], stats.samples, stats.frames, stats.disjoint).c_str());
+               stats = {};
+
+               if (g_perf_sweep)
+               {
+                  game_device_data.perf_sweep_results[g_perf_test].push_back(window);
+                  if (++game_device_data.perf_sweep_windows_done >= perf_sweep_windows)
+                  {
+                     game_device_data.perf_sweep_windows_done = 0;
+                     const int step = ++game_device_data.perf_sweep_step;
+                     if (step < perf_sweep_rounds * int(std::size(perf_sweep_modes)))
+                     {
+                        ApplyPerfTestMode(device_data, perf_sweep_modes[step % std::size(perf_sweep_modes)]);
+                     }
+                     else
+                     {
+                        // Per mode: the median window (and the frame's range), and the frame against the last mode's (No AA)
+                        const auto median = [&](int mode, size_t column)
+                        {
+                           std::vector<double> values;
+                           for (const auto& result : game_device_data.perf_sweep_results[mode])
+                              values.push_back(result[column]);
+                           std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+                           return values.empty() ? 0.0 : values[values.size() / 2];
+                        };
+                        const double baseline = median(perf_sweep_modes[std::size(perf_sweep_modes) - 1], 0);
+                        for (const int mode : perf_sweep_modes)
+                        {
+                           const auto& results = game_device_data.perf_sweep_results[mode];
+                           const auto [min_frame, max_frame] = std::minmax_element(results.begin(), results.end(), [](const auto& a, const auto& b)
+                              { return a[0] < b[0]; });
+                           reshade::log::message(reshade::log::level::info, std::format("[SR4 Perf] sweep mode=\"{}\" windows={} gpu frame median={:.3f} ms (min/max {:.3f}/{:.3f}, {:+.3f} vs \"{}\") scene median={:.3f} ms sr median={:.3f} ms cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, results.size(), median(mode, 0), results.empty() ? 0.0 : (*min_frame)[0], results.empty() ? 0.0 : (*max_frame)[0], median(mode, 0) - baseline, perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name, median(mode, 1), median(mode, 2), median(mode, 3)).c_str());
+                        }
+                        g_perf_sweep = false;
+                        ApplyPerfTestMode(device_data, 0);
+                     }
+                  }
+               }
+            }
+         }
+         game_device_data.perf_last_present = now;
+
+         auto& queries = game_device_data.perf_queries[game_device_data.perf_query_index];
+         if (!queries.pending)
+         {
+            if (!queries.disjoint)
+            {
+               const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
+               native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
+               for (auto* const query : {&queries.frame_start, &queries.scene_start, &queries.scene_end, &queries.sr_end, &queries.frame_end})
+                  native_device->CreateQuery(&timestamp_desc, &*query);
+            }
+            if (queries.disjoint && queries.frame_start && queries.scene_start && queries.scene_end && queries.sr_end && queries.frame_end)
+            {
+               native_device_context->Begin(queries.disjoint.get());
+               native_device_context->End(queries.frame_start.get());
+               queries.scene_started = queries.scene = queries.sr = false;
+               game_device_data.perf_frame_queries = &queries;
+               game_device_data.perf_query_index = (game_device_data.perf_query_index + 1) % game_device_data.perf_queries.size();
+            }
+         }
+      }
       // The probe covers the draws between this present and the next, summarized at that next present
       const ProbeRequest probe_request = g_probe_request.exchange(ProbeRequest::None);
       if (game_device_data.probe_mode.exchange(probe_request) != ProbeRequest::None)
@@ -2658,6 +2928,37 @@ public:
          g_probe_request = ProbeRequest::LogAndDump;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("The same, and every draw's full vc2 / vc3 contents (as written this frame) to Luma_SR4_Probe_<frame>.csv\nnext to the executable (one row per draw and buffer).");
+
+      ImGui::SeparatorText("Performance");
+      const std::string sweep_label = std::format("Sweep ({}/{})", game_device_data.perf_sweep_step + 1, perf_sweep_rounds * std::size(perf_sweep_modes));
+      if (ImGui::BeginCombo("Performance Test", g_perf_sweep ? sweep_label.c_str() : perf_test_modes[g_perf_test].name))
+      {
+         for (int i = 0; i < int(std::size(perf_test_modes)); i++)
+         {
+            const PerfTestMode& mode = perf_test_modes[i];
+            ImGui::BeginDisabled(mode.set_aa && mode.sr_type != SR::Type::None && !device_data.sr_implementations_instances.contains(mode.sr_type));
+            if (ImGui::Selectable(mode.name, !g_perf_sweep && g_perf_test == i) && (g_perf_sweep || g_perf_test != i))
+            {
+               g_perf_sweep = false;
+               ApplyPerfTestMode(device_data, i);
+            }
+            ImGui::EndDisabled();
+         }
+         ImGui::BeginDisabled(!device_data.sr_implementations_instances.contains(SR::Type::DLSS));
+         if (ImGui::Selectable("Sweep", g_perf_sweep) && !g_perf_sweep)
+         {
+            for (auto& results : game_device_data.perf_sweep_results)
+               results.clear();
+            game_device_data.perf_sweep_step = 0;
+            game_device_data.perf_sweep_windows_done = 0;
+            g_perf_sweep = true;
+            ApplyPerfTestMode(device_data, perf_sweep_modes[0]);
+         }
+         ImGui::EndDisabled();
+         ImGui::EndCombo();
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Logs \"[SR4 Perf]\" to ReShade.log every 120 frames (the first 60 after a change of mode or AA settings, or a pause, skipped): the GPU\ntime of the whole frame (present to present), of the scene (G-buffer to its first post pass: motion vector, jitter and camera\nfill included) and of DLSS/FSR (timestamps), the CPU frame time and the CPU time in the motion vector hooks.\nThe modes set the anti-aliasing and DLSS preset themselves (the user's come back on \"Off\" or \"Current Settings\", nothing is\nsaved). \"Jitter Only\" draws the material pass jittered but without motion vectors, \"Without Motion Vector Draws\" leaves every\ndraw untouched (unjittered): the differences to \"DLSS K\" are their costs. Keep the camera still and the game focused, 10 s per mode.\n\"Sweep\" runs DLSS K, Jitter Only, Without Motion Vector Draws and No AA in turn, %d windows each, %d rounds (about 1.5 min), then logs\n\"[SR4 Perf] sweep\" lines: each mode's median window and its frame time against No AA; picking another mode stops it.", perf_sweep_windows, perf_sweep_rounds);
    }
 #endif
 
