@@ -4,7 +4,7 @@
 // Game specifics (Saints Row: The Third DevKit SSAO snapshots and DEV vc0 readout; Saints Row IV ships the same calculate,
 // blur and apply shaders byte-for-byte):
 // - Only rl_ssao_singleframe_calculate (PS 0x624BF56D, SSAO_Level 2/3) is replaced: the first of its 4 draws (one RGBA
-//   channel each) runs these 4 dispatches at the half-res target size, CopyResource'd into the game's target
+//   channel each) runs the passes below at the half-res target size, CopyResource'd into the game's target
 //   (r8g8b8a8_unorm, r16g16b16a16_float once Luma upgrades it), and the other 3 are skipped. Its blur (level 3) and
 //   apply (max(1 - avg(rgba), 0.05), multiplied into lighting) stay vanilla, so the output is AO AMOUNT (0 = open) in
 //   all four channels.
@@ -24,7 +24,7 @@ cbuffer GameVC0 : register(b0)
    float4 vc0[19]; // c0.x ssao_fade_parameter, c1-c4 ssao_inv_proj rows, c5.xy ssao_projection_scales, ...
 }
 
-// --- Luma runtime knobs (set from main.cpp; live-tunable via DEV sliders, no recompile) ---
+// --- Luma runtime knobs (set from main.cpp; live-tunable via DEVELOPMENT/TEST sliders, no recompile) ---
 // b9, not b11: core's DrawBloom owns b11 for its own constants. Mirrored by gtao_knobs_cb_slot.
 cbuffer LumaGTAO : register(b9)
 {
@@ -32,7 +32,7 @@ cbuffer LumaGTAO : register(b9)
    float DepthInputScaleRT;    // full-res depth/normals pixels per AO target pixel (2 = half res)
    float RadiusOverrideRT;     // > 0 overrides EFFECT_RADIUS (metres)
    float DebugViewRT;          // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
-   float2 ViewportPixelSizeRT; // 1 / AO target resolution, set by main.cpp
+   float2 ViewportPixelSizeRT; // 1 / AO target resolution
    float NoiseIndexRT;         // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
    float PaddingRT;
 }
@@ -290,7 +290,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
    const float edges = XeGTAO_PackEdges(edgesLRTB);
 
 #if DEVELOPMENT
-   // Debug views (visible on screen through the game's own AO blur/apply chain; the final denoise passes
+   // Debug views (visible on screen through the game's own AO blur/apply chain; both denoise passes pass
    // raw values through when DebugViewRT > 0).
    if (DebugViewRT > 0.5 && DebugViewRT < 1.5) // 1 = depth gradient (proves live depth + linearization/scale)
    {
@@ -513,7 +513,7 @@ void XeGTAO_AddSample(float ssaoValue, float edgeValue, inout float sum, inout f
 
 void XeGTAO_Denoise(uint2 pixCoordBase, Texture2D sourceAOTermAndEdges, SamplerState texSampler,
 #if XE_GTAO_FINAL_APPLY
-                    RWTexture2D<float4> outputTexture // copy source for the game's rgba16f AO target: AO amount in all four channels
+                    RWTexture2D<float4> outputTexture // copy source in the game's AO target format (rgba8 unorm or rgba16f): AO amount in all four channels
 #else
                     RWTexture2D<unorm float2> outputTexture
 #endif
@@ -683,7 +683,7 @@ uint HilbertIndex(uint posX, uint posY)
    return index;
 }
 
-// temporalIndex: NoiseIndexRT (0 without an upscaler: frozen pattern, static noise instead of boiling).
+// temporalIndex: NoiseIndexRT, see the header.
 float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    float2 noise;

@@ -7,8 +7,8 @@
 
 // Motion vectors for a game that renders none, by patching whole DXBC containers (signatures change, which Core's patch module can't do).
 // Vertex shaders run twice: the second run reads the previous frame's per-draw constants (vc2: view projection, world matrix, tree
-// wind; vc3: bone palette) and resources from other slots, and only its SV_Position is kept, as an extra output. The first run's SV_Position is also copied to
-// an extra output, as outputs can't be read back.
+// wind; vc3: bone palette) and resources from other slots, and only its SV_Position is kept, as an extra output. The first run's
+// SV_Position is also copied to an extra output, as outputs can't be read back.
 // Pixel shaders write the UV space delta from the current to the previous position to an extra target.
 namespace MotionVectorPatches
 {
@@ -31,9 +31,10 @@ namespace MotionVectorPatches
    constexpr uint32_t resource_slots = 16;
    constexpr uint32_t previous_resources_slot = 64;
    // Past every register the game uses (vertex outputs end at o10, pixel inputs at v10), within SM4's 16 vertex outputs
+   // (D3D10_VS_OUTPUT_REGISTER_COUNT)
    constexpr uint32_t current_position_register = 14;
    constexpr uint32_t previous_position_register = 15;
-   // The G-buffer writes up to 3 targets (o3 in 2 shaders), the material pass 1
+   // Past the game's targets (the G-buffer writes 2-3, the material pass 1, only 2 shaders reach o3), within SM4's 8
    constexpr uint32_t target_slot = 4;
    constexpr char semantic_name[] = "LUMAMV";
 
@@ -352,8 +353,8 @@ namespace MotionVectorPatches
                                                                                                        { return instruction.opcode == D3D10_SB_OPCODE_RET; }) != 1)
          return (*error = "returns", std::vector<uint8_t>());
 
-      // Added declarations: $Globals (same size and indexing) and each resource again at the previous frame's slots, the two
-      // outputs, one temp
+      // Added declarations: vc2 / vc3 (same size and indexing) and each resource again at the previous frame's slots, the jitter
+      // buffer, the two outputs, one temp
       const auto is_resource_declaration = [](D3D10_SB_OPCODE_TYPE opcode)
       { return opcode == D3D10_SB_OPCODE_DCL_RESOURCE || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_RAW || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED; };
       std::vector<size_t> object_indices;

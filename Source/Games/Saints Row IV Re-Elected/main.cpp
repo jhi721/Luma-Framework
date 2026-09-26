@@ -1,12 +1,12 @@
 #define GAME_SAINTS_ROW_IV 1
 
 #define DISABLE_AUTO_DEBUGGER 1
-// Alpha to coverage wraps the game's own alpha-tested draws, so it needs "original_draw_dispatch_func".
+// Alpha to coverage, the motion vector draws and SMAA wrap the game's own draws, so they need "original_draw_dispatch_func".
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // Alpha to coverage also patches the alpha those draws output, into a clone that OnDrawOrDispatch swaps in per draw.
 #define LUMA_PATCH_BYTECODE_SYNC 1
 #define LUMA_PATCH_SYNC_MODE_CLONE 1
-// SMAA runs after the rl_hdr final composite, through the post-draw callback above.
+// SMAA runs right after the rl_hdr final composite.
 #define ENABLE_SMAA 1
 #define ENABLE_BLOOM 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -160,8 +160,8 @@ namespace
       0x4608446A, // rl_motion_blur
    };
 
-   // Motion vectors for DLSS / FSR (the game renders none, see MotionVectorPatches.h): the main material pass redraws every object with
-   // patched shaders into an extra target, the second run reading the object's previous frame vc2 / vc3.
+   // Motion vectors for DLSS / FSR (the game renders none, see MotionVectorPatches.h): the main material pass draws every object with
+   // patched shaders that also write an extra target, the vertex shader's second run reading the object's previous frame vc2 / vc3.
 #if DEVELOPMENT
    bool g_mv_enable = false;
    bool g_mv_debug_view = false;
@@ -206,9 +206,9 @@ namespace
    constexpr uint32_t blur_pixel_shader = 0x378BA268; // rl_gaussian_blur_01, the bloom levels' separable blur
 
    // XeGTAO over rl_ssao_singleframe_calculate (SSAO_Level 2/3). Its 4 draws (one AO channel each, into a half-res target:
-   // r8g8b8a8_unorm, r16g16b16a16_float once Luma's format upgrade reaches it) become one run of the 4 compute passes at the
-   // target's size, copied into the target (created without UAV bind); the native blur and apply stay. Level 1
-   // (multiframe) stays native.
+   // r8g8b8a8_unorm, r16g16b16a16_float once Luma's format upgrade reaches it) become one XeGTAO run at the target's size (see
+   // "RunXeGTAO"), copied into the target (created without UAV bind); the native blur and apply stay. Level 1 (multiframe)
+   // stays native.
    constexpr uint32_t ssao_singleframe_calculate_pixel_shader = 0x624BF56D;
    constexpr UINT gtao_knobs_cb_slot = 9;   // "register(b9)" in Luma_SR4_XeGTAO.hlsl; b11 is core DrawBloom's
    constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_SR4_XeGTAO.hlsl
@@ -432,7 +432,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    // pass's t0 (forward draws go there), so it's that copy's source.
    com_ptr<ID3D11Resource> mv_scene_color;
    bool mv_scene_color_wanted = false; // Since the last G-buffer draw, until the first downsample
-   // The last CopyResource since the G-buffer (not referenced, only compared)
+   // The last resource copy since the G-buffer (not referenced, only compared)
    uint64_t mv_scene_copy_source = 0;
    uint64_t mv_scene_copy_dest = 0;
    bool mv_scene_copied = false; // This frame's material target copy happened
@@ -985,7 +985,7 @@ class SaintsRowIV final : public Game
 
    // Draws an opaque main material pass draw (the fp16 scene alone, output sized, with depth) with the patched shaders, adding the
    // motion vector target ("target_slot", past the game's) and the previous frame's vc2 / vc3 ("previous_slots"). False if it can't
-   // (the draw then runs untouched).
+   // (the draw then goes to "DrawWithJitter").
    static bool DrawWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, const com_ptr<ID3D11RenderTargetView> (&rtvs)[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT], ID3D11DepthStencilView* dsv)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1019,7 +1019,6 @@ class SaintsRowIV final : public Game
                game_device_data.mv_scene_copied = false;
                game_device_data.mv_scene_copy_source = 0;
                game_device_data.mv_scene_copy_dest = 0;
-               // Views and states can be recreated between scenes
                game_device_data.jitter_dsv = nullptr;
                game_device_data.jitter_depth_stencil_state = nullptr;
                game_device_data.jitter_depth_test = true;
@@ -1072,7 +1071,7 @@ class SaintsRowIV final : public Game
          rtvs[0]->GetDesc(&rtv_desc);
          if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
             return reject(1);
-         // The target must match the scene's sample count; MSAA (display.ini MSAA_Level) is off with DLAA
+         // The motion vector target is single sampled; an MSAA scene (display.ini MSAA_Level) turns the upscaler off (see "IsSRActive")
          if (rtv_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D)
             return reject(5);
          uint4 size, depth_size;
@@ -1528,8 +1527,8 @@ class SaintsRowIV final : public Game
       if (!vertex_shader)
          return skip(1);
 
-      // The patched vertex shader stays bound after the draw, with the game's pixel shader (a motion vector draw's is put back). The
-      // jitter stays bound: no game shader reads a constant buffer at slot 9 or above.
+      // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel shader
+      // (a motion vector draw's is put back).
       BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
       RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
       ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
@@ -2024,9 +2023,9 @@ public:
       return DrawOrDispatchOverrideType::Replaced;
    }
 
-   // XeGTAO in place of the first singleframe calculate draw: prefilter, main pass and two denoisers on the draw's own
-   // inputs (t14 depth, t13 normals, vc0 at b0 for this frame's projection), then a copy into its render target. Returns
-   // false, and the native draw runs, when an input, a shader or the scratch is missing.
+   // XeGTAO in place of the first singleframe calculate draw: prefilter, main pass and denoise (two passes, one under DLSS/FSR) on
+   // the draw's own inputs (t14 depth, t13 normals, vc0 at b0 for this frame's projection), then a copy into its render target.
+   // Returns false, and the native draw runs, when an input, a shader or the scratch is missing.
    bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
       // Held through the dispatches so a shader reload cannot release them mid-use.

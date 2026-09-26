@@ -39,7 +39,7 @@ cbuffer vc0 : register(b0)
    float3 Distortion_scale : packoffset(c4);
    float4 Blur_tint : packoffset(c5);
    float4 Near_clip_params : packoffset(c6); // x near, y far
-   float4 Focal_params : packoffset(c7);     // near blur end, focus start... (x < y <= z < w, view depth)
+   float4 Focal_params : packoffset(c7);     // x near blur end, y focus start, z focus end, w far blur start (x < y <= z < w, view depth)
    float2 Override_blur_percent : packoffset(c8);
    float Depth_map_scale : packoffset(c9.x);
    float Bloom_amount : packoffset(c11.x);
@@ -86,7 +86,7 @@ float3 SR4_Shoulder(float3 u)
 
 // The vanilla LUT read, transcribed from the disassembly: slice = floor(b * 31) picks one 32x32 tile in an 8x4 grid,
 // red and green address it with a half-texel centre, and the next slice (capped at 31) is lerped by b's fraction.
-// `index` must already be in [0, 1]: past it the tile maths walks into the neighbouring slice and row.
+// "index" must already be in [0, 1]: past it the tile maths walks into the neighbouring slice and row.
 float3 SR4_SampleLUT(float3 index)
 {
    const float slice = floor(index.b * 31.0);
@@ -207,7 +207,7 @@ float4 SR4_SceneInput(float4 texcoord1, bool diffracted, out float2 uv)
 }
 
 // Radial vignette and the two film grain layers the finals apply after the shoulder (or the tint, in no_tonemapping).
-// The monochrome grain ends in a saturate in vanilla; the HDR no_tonemapping path passes `clampGrain` false.
+// The monochrome grain ends in a saturate in vanilla; the HDR no_tonemapping path passes "clampGrain" false.
 // The user's Vignette / Film Grain Intensity scale the vignette strength (not its power) and both grain amounts.
 float3 SR4_VignetteAndGrain(float3 color, float2 texcoord0, float4 texcoord1, bool clampGrain)
 {
@@ -243,7 +243,7 @@ float4 SR4_TonemapFinal(float2 texcoord0, float4 texcoord1, bool diffracted, boo
    return SR4_Output(vanilla, SR4_RecoveryGain(u), texcoord1.xy, scene.a);
 }
 
-// rl_hdr_05 0xC235DDDD [no_tonemapping] (PostProcess 0): vanilla lost everything above 1 to the grain's saturate.
+// no_tonemapping, see the header.
 float4 SR4_TonemapNoPost(float2 texcoord0, float4 texcoord1)
 {
    float2 uv;
