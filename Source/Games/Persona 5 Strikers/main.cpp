@@ -326,10 +326,11 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // The game's "RenderScale" in memory (see "FindRenderScaleSetting"), null if not found. Present thread only.
    int32_t* render_scale_setting = nullptr;
    bool render_scale_searched = false;
-   int32_t render_scale_game = 0;         // The game's own option, restored without an override
-   int32_t render_scale_applied = 0;      // The value the game last rebuilt its targets at (as known)
-   int32_t render_scale_memory = 0;       // The value Luma last left in the setting
-   int render_scale_restore_presents = 0; // Until a temporary value (the main menu's 100%) is replaced by the kept one
+   int32_t render_scale_game = 0;            // The game's own option, restored without an override
+   int32_t render_scale_applied = 0;         // The value the game last rebuilt its targets at (as known)
+   int32_t render_scale_memory = 0;          // The value Luma last left in the setting
+   int render_scale_restore_presents = 0;    // Until a temporary value (the main menu's 100%) is replaced by the kept one
+   bool render_scale_menu_reapplied = false; // The main menu's 100% was reapplied since it opened (see "UpdateRenderScale")
    // The main menu: presents without a scene frame whose composite draws into a render resolution target (its background); the
    // pause screen has neither. Reset by any scene frame.
    std::atomic<bool> scene_drawn = false;
@@ -2323,7 +2324,7 @@ public:
    // setting) drops the override, also live. Without DLSS/FSR the game stretches its composite (SMAA runs before). With them the main
    // menu ("menu") renders at 100% (no DLSS/FSR there, so the background would be stretched), written only for the rebuild and then
    // replaced by the kept value, so the options menu shows and saves the real one. An alt-tab there rebuilds at the kept value
-   // ("menu_rebuilt_low"), so 100% is reapplied.
+   // ("menu_rebuilt_low"), so 100% is reapplied, once per menu stay.
    static void UpdateRenderScale(Persona5StrikersGameDeviceData* game_device_data, bool menu, bool menu_rebuilt_low)
    {
       if (!game_device_data->render_scale_searched)
@@ -2354,8 +2355,15 @@ public:
 #endif
       const int32_t kept = render_scale != 0 ? render_scale : game_device_data->render_scale_game;
       const int32_t wanted = menu ? 10 : kept;
-      if (menu_rebuilt_low && game_device_data->render_scale_restore_presents == 0 && game_device_data->render_scale_applied == wanted)
+      // Once per menu stay: P5StrikersFix rebuilds at the kept value right after it's restored, which would loop the rebuilds (and
+      // ReShade's effect reloads) every few presents; the menu then stays at the kept value, as in the game
+      if (!menu)
+         game_device_data->render_scale_menu_reapplied = false;
+      if (menu_rebuilt_low && !game_device_data->render_scale_menu_reapplied && game_device_data->render_scale_restore_presents == 0 && game_device_data->render_scale_applied == wanted)
+      {
          game_device_data->render_scale_applied = kept;
+         game_device_data->render_scale_menu_reapplied = true;
+      }
       if (wanted != game_device_data->render_scale_applied)
       {
          *setting = game_device_data->render_scale_memory = game_device_data->render_scale_applied = wanted;
