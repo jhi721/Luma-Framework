@@ -58,7 +58,6 @@ namespace
 
    // Overrides the game's "RenderScale" (5 = 50% ... 10 = 100%); 0 keeps the game's option
    int g_render_scale = 0;
-   bool g_render_scale_custom = false; // A 10% step slider instead of the presets
 
    bool g_gtao_enable = true;
    constexpr UINT gtao_knobs_cb_slot = 9; // "register(b9)" in Luma_P5S_XeGTAO.hlsl; b11 is core DrawBloom's
@@ -69,6 +68,10 @@ namespace
    int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    bool g_smaa_predication = true;
    int g_smaa_debug_view = 0; // 0 off, 1 edges, 2 predication
+   // "Performance Test" (see "OnPresent"): the mode, its render scale override (0 none) and name; 2 skips the motion vector draws
+   int g_perf_test = 0;
+   constexpr int perf_test_render_scales[] = {0, 10, 10, 7, 5};
+   constexpr const char* perf_test_modes[] = {"Off", "DLAA", "DLAA Without Motion Vector Draws", "Quality (70%)", "Performance (50%)"};
 #else
    constexpr int g_gtao_debug_view = 0;
    constexpr bool g_smaa_predication = true;
@@ -263,10 +266,30 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    uint32_t mv_frame_present = 0;
    std::atomic<uint32_t> mv_presents = 0;
 
+#if DEVELOPMENT
+   // "Performance Test": GPU timestamps from the scene frame's start (in the game's command list) to the split and around DLSS/FSR, in a
+   // ring read back a few frames later without waiting (the game caps at 60 fps, so frame times say nothing), and the CPU time in the
+   // motion vector hooks
+   struct PerfQueries
+   {
+      com_ptr<ID3D11Query> disjoint, scene_start, sr_start, sr_end;
+      // Issued, until read back. A set whose split never ran is reused when the ring comes back to it (8 scene frames later).
+      bool pending = false;
+   };
+   struct PerfStats
+   {
+      double scene_ms = 0.0, scene_max_ms = 0.0, sr_ms = 0.0, sr_max_ms = 0.0;
+      uint32_t samples = 0, disjoint = 0, frames = 0;
+   };
+#endif
+
    // DLSS/FSR run on the immediate context but the scene records on a deferred one, so its command list is split before post; the
    // first part runs before the upscaler when the game executes the rest (see "OnExecuteSecondaryCommandList").
    struct SRSplit
    {
+#if DEVELOPMENT
+      PerfQueries* perf_queries = nullptr;
+#endif
       com_ptr<ID3D11CommandList> partial;
       com_ptr<ID3D11CommandList> remainder;  // Held so its address (the pending split's key) can't be reused
       com_ptr<ID3D11Texture2D> source_color; // Also the output at native resolution (DLAA), read by the post process
@@ -281,6 +304,15 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    SRSplit sr_split;                                           // The last split, likewise
    std::unordered_map<uint64_t, SRSplit> sr_pending_splits;    // By the game's command list (the remainder), until executed
    std::vector<com_ptr<ID3D11Buffer>> sr_no_overwrite_buffers; // Dynamic buffers the game appends to ("D3D11_MAP_WRITE_NO_OVERWRITE")
+#if DEVELOPMENT
+   std::mutex perf_mutex;
+   std::array<PerfQueries, 8> perf_queries;
+   size_t perf_query_index = 0;
+   PerfQueries* perf_frame_queries = nullptr; // Scene context only: this frame's, until its split takes it
+   PerfStats perf_stats;                      // This log window's
+   int perf_settle_frames = 0;                // Frames skipped after a mode change (targets rebuilt, history reset)
+   std::atomic<int64_t> perf_hook_ns = 0;     // This log window's
+#endif
    // Upscaling: the game renders scene and post (composite included) at render scale, then stretches onto the swapchain. Instead the
    // upscaler writes the output resolution, scene blending post passes also blend into it, and the composite draws from it into an
    // output sized canvas that the stretch copies 1:1.
@@ -348,6 +380,21 @@ class Persona5Strikers final : public Game
       return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
    }
 
+#if DEVELOPMENT
+   // "Performance Test": adds the scope's CPU time to the motion vector hooks' total, while the test runs
+   struct PerfHookTimer
+   {
+      std::atomic<int64_t>& total_ns;
+      const bool enabled = g_perf_test != 0;
+      const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      ~PerfHookTimer()
+      {
+         if (enabled)
+            total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+      }
+   };
+#endif
+
    static DeviceData* GetDeviceData(reshade::api::device* device)
    {
       auto* const device_data = device->get_private_data<DeviceData>();
@@ -361,6 +408,9 @@ class Persona5Strikers final : public Game
       if (!device_data || !IsSRActive(*device_data))
          return;
       auto& game_device_data = GetGameDeviceData(*device_data);
+#if DEVELOPMENT
+      const PerfHookTimer timer{game_device_data.perf_hook_ns};
+#endif
       if (access == reshade::api::map_access::write_discard && data && *data)
       {
          const std::lock_guard lock(game_device_data.mv_globals_mutex);
@@ -393,6 +443,9 @@ class Persona5Strikers final : public Game
       auto* const game_device_data = device_data && IsSRActive(*device_data) ? &GetGameDeviceData(*device_data) : nullptr;
       if (!game_device_data)
          return;
+#if DEVELOPMENT
+      const PerfHookTimer timer{game_device_data->perf_hook_ns};
+#endif
       const std::lock_guard lock(game_device_data->mv_globals_mutex);
       const auto mapped = game_device_data->mv_mapped_globals.find(resource.handle);
       if (mapped == game_device_data->mv_mapped_globals.end())
@@ -464,6 +517,32 @@ class Persona5Strikers final : public Game
    static void StartMotionVectorFrame(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, const uint4& depth_size)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+#if DEVELOPMENT
+      // "Performance Test": the scene's GPU time starts here, a timestamp recorded into the game's command list
+      {
+         const std::lock_guard lock(game_device_data.perf_mutex);
+         game_device_data.perf_frame_queries = nullptr; // The last frame's if it never split
+         auto& queries = game_device_data.perf_queries[game_device_data.perf_query_index];
+         // Skipped while the ring's next set is still unread
+         if (g_perf_test != 0 && !queries.pending)
+         {
+            const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
+            if (!queries.disjoint)
+            {
+               native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
+               native_device->CreateQuery(&timestamp_desc, &queries.scene_start);
+               native_device->CreateQuery(&timestamp_desc, &queries.sr_start);
+               native_device->CreateQuery(&timestamp_desc, &queries.sr_end);
+            }
+            if (queries.disjoint && queries.scene_start && queries.sr_start && queries.sr_end)
+            {
+               game_device_data.perf_frame_queries = &queries;
+               game_device_data.perf_query_index = (game_device_data.perf_query_index + 1) % game_device_data.perf_queries.size();
+               native_device_context->End(queries.scene_start.get());
+            }
+         }
+      }
+#endif
       {
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          game_device_data.mv_fill_pending = game_device_data.mv_uav && HasShaders(device_data.native_compute_shaders, "P5S Motion Vector Fill CS"_h);
@@ -651,6 +730,11 @@ class Persona5Strikers final : public Game
          GetResourceInfo(depth.get(), depth_size, depth_format);
          StartMotionVectorFrame(native_device, native_device_context, device_data, depth_size);
       }
+#if DEVELOPMENT
+      // "Performance Test" without motion vector draws: the frame and its split still happen, the draws run untouched
+      if (g_perf_test == 2)
+         return false;
+#endif
 
       com_ptr<ID3D11VertexShader> original_vertex_shader;
       native_device_context->VSGetShader(&original_vertex_shader, nullptr, nullptr);
@@ -747,6 +831,10 @@ class Persona5Strikers final : public Game
          if (game_device_data.mv_frame_ended)
             StartMotionVectorFrame(native_device, native_device_context, device_data, depth_size);
       }
+#if DEVELOPMENT
+      if (g_perf_test == 2)
+         return false;
+#endif
 
       com_ptr<ID3D11VertexShader> original_vertex_shader;
       com_ptr<ID3D11PixelShader> original_pixel_shader;
@@ -1047,7 +1135,8 @@ public:
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
    }
 
-   // Draws the composite, then SMAA on its canvas (swapchain or upscaled canvas) before the UI: copy, gamma encode, predication, SMAA
+   // Draws the composite, then SMAA on its canvas (swapchain, upscaled canvas, or without DLSS/FSR below render scale 1 its own target,
+   // which the game stretches onto the swapchain) before the UI: copy, gamma encode, predication, SMAA
    // into the gamma copy, finalize (RCAS, decode, dither) into the canvas; without RCAS, SMAA writes the canvas. With "smaa" false
    // (DLSS/FSR antialiased) only RCAS: copy, gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
    // composite is left alone and the vanilla FXAA runs (not after DLSS/FSR).
@@ -1058,11 +1147,13 @@ public:
       native_device_context->OMGetRenderTargets(1, &canvas_rtv, nullptr);
       const com_ptr<ID3D11Resource> canvas_resource = GetViewResource(canvas_rtv.get());
       com_ptr<ID3D11Texture2D> canvas_texture;
-      // Not the main menu's second, off-screen composite
-      if (!canvas_resource || FAILED(canvas_resource->QueryInterface(&canvas_texture)) || (!IsBackBuffer(&device_data, canvas_resource.get()) && canvas_rtv != game_device_data.sr_upscaled_canvas_rtv))
+      if (!canvas_resource || FAILED(canvas_resource->QueryInterface(&canvas_texture)))
          return DrawOrDispatchOverrideType::None;
       D3D11_TEXTURE2D_DESC canvas_desc;
       canvas_texture->GetDesc(&canvas_desc);
+      // Not the main menu's second, off-screen composite (RGBA8, see the format check)
+      if (!IsBackBuffer(&device_data, canvas_resource.get()) && canvas_rtv != game_device_data.sr_upscaled_canvas_rtv && (IsSRActive(device_data) || canvas_desc.Width >= uint32_t(device_data.output_resolution.x + 0.5f)))
+         return DrawOrDispatchOverrideType::None;
       // The upgraded (linear fp16) swapchain, the SMAA copies' format
       if (canvas_desc.SampleDesc.Count != 1 || canvas_desc.ArraySize != 1 || (canvas_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && canvas_desc.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS))
          return DrawOrDispatchOverrideType::None;
@@ -1086,6 +1177,11 @@ public:
          game_device_data.smaa_gamma_uav.reset();
          game_device_data.smaa_predication_srv.reset();
          game_device_data.smaa_predication_uav.reset();
+         // Core's "DrawSMAA" sizes its intermediates from its first target and rebuilds them only on swapchain init (as in MEA/MELE)
+         auto& managed_resources = device_data.managed_resources;
+         managed_resources.depth_stencil_views["smaa_dsv"_h].reset();
+         managed_resources.render_target_views["smaa_edge_detection"_h].reset();
+         managed_resources.render_target_views["smaa_blending_weight_calculation"_h].reset();
          D3D11_TEXTURE2D_DESC desc = canvas_desc;
          desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
          desc.MipLevels = 1;
@@ -1130,11 +1226,11 @@ public:
             depth_srv.reset();
       }
 
-      // The replaced composite reads the Luma cbuffers, which Core binds only after this callback; they stay bound for SMAA and finalize
-      // (settings for the canvas size). The data's CustomData3 is the predication scale, never 0 here, which also defers the composite's
-      // dither to the chain's end so RCAS doesn't sharpen it.
+      // The replaced composite reads the Luma cbuffers, which Core binds only after this callback; they stay bound for SMAA and finalize.
+      // The data carries the canvas size (CustomData1/2: the swapchain's, or the render resolution) and the predication scale
+      // (CustomData3), never 0 here, which also defers the composite's dither to the chain's end so RCAS doesn't sharpen it.
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, depth_srv ? 2.f : 1.f);
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, canvas_desc.Width, canvas_desc.Height, depth_srv ? 2.f : 1.f);
       *updated_cbuffers = true;
       original_draw_dispatch_func();
       native_device_context->CopyResource(game_device_data.smaa_linear_texture.get(), canvas_resource.get());
@@ -1369,8 +1465,18 @@ public:
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       draw_state.Cache(native_device_context.get(), device_data->uav_max_count);
       compute_state.Cache(native_device_context.get(), device_data->uav_max_count);
+#if DEVELOPMENT
+      // The scene's start timestamp already ran with the game's earlier command lists; the disjoint query only covers the rest
+      auto* const perf_queries = split.perf_queries;
+      if (perf_queries)
+         native_device_context->Begin(perf_queries->disjoint.get());
+#endif
       // Always, even if the upscaler went away meanwhile: it starts the game's frame
       native_device_context->ExecuteCommandList(split.partial.get(), FALSE);
+#if DEVELOPMENT
+      if (perf_queries)
+         native_device_context->End(perf_queries->sr_start.get());
+#endif
 
       D3D11_TEXTURE2D_DESC desc;
       split.source_color->GetDesc(&desc);
@@ -1452,6 +1558,15 @@ public:
             device_data->sr_suppressed = true;
          }
       }
+#if DEVELOPMENT
+      if (perf_queries)
+      {
+         native_device_context->End(perf_queries->sr_end.get());
+         native_device_context->End(perf_queries->disjoint.get());
+         const std::lock_guard lock(game_device_data.perf_mutex);
+         perf_queries->pending = true;
+      }
+#endif
       draw_state.Restore(native_device_context.get());
       compute_state.Restore(native_device_context.get());
    }
@@ -1664,6 +1779,10 @@ public:
 
       if (IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_draw_dispatch_func && *original_draw_dispatch_func)
       {
+#if DEVELOPMENT
+         // Includes recording the draw itself (patched or not)
+         const PerfHookTimer timer{game_device_data.perf_hook_ns};
+#endif
          if (original_shader_hashes.Contains(post_process_start_shader_hashes))
          {
             if (native_device_context == game_device_data.mv_scene_context && !game_device_data.mv_frame_ended)
@@ -1851,6 +1970,12 @@ public:
             game_device_data.sr_render_height = scene_desc.Height;
             device_data.render_resolution = {float(scene_desc.Width), float(scene_desc.Height)}; // Shown by Core
             game_device_data.sr_output_height = split.output_color ? output_size.y : scene_desc.Height;
+#if DEVELOPMENT
+            {
+               const std::lock_guard perf_lock(game_device_data.perf_mutex);
+               split.perf_queries = std::exchange(game_device_data.perf_frame_queries, nullptr);
+            }
+#endif
             game_device_data.sr_split = std::move(split);
             game_device_data.sr_split_context = reinterpret_cast<uint64_t>(native_device_context);
             game_device_data.scene_antialiased = true;
@@ -2195,11 +2320,11 @@ public:
 
    // Keeps the game's render scale at the override (or its own option), live: after writing the setting, a WM_SIZE for the current size
    // makes the game rebuild its targets now (it does on any resize, e.g. alt-tab). Changing the option in the game's menu (the same
-   // setting) drops the override, also live. The override needs DLSS/FSR ("upscaling"); otherwise below 100% the game stretches its
-   // composite, out of SMAA's reach. The main menu ("menu") renders at 100% (no DLSS/FSR there, so the background would be stretched),
-   // written only for the rebuild and then replaced by the kept value, so the options menu shows and saves the real one. An alt-tab there
-   // rebuilds at the kept value ("menu_rebuilt_low"), so 100% is reapplied.
-   static void UpdateRenderScale(Persona5StrikersGameDeviceData* game_device_data, bool upscaling, bool menu, bool menu_rebuilt_low)
+   // setting) drops the override, also live. Without DLSS/FSR the game stretches its composite (SMAA runs before). With them the main
+   // menu ("menu") renders at 100% (no DLSS/FSR there, so the background would be stretched), written only for the rebuild and then
+   // replaced by the kept value, so the options menu shows and saves the real one. An alt-tab there rebuilds at the kept value
+   // ("menu_rebuilt_low"), so 100% is reapplied.
+   static void UpdateRenderScale(Persona5StrikersGameDeviceData* game_device_data, bool menu, bool menu_rebuilt_low)
    {
       if (!game_device_data->render_scale_searched)
       {
@@ -2222,7 +2347,12 @@ public:
             reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
          }
       }
-      const int32_t kept = upscaling && g_render_scale != 0 ? g_render_scale : game_device_data->render_scale_game;
+#if DEVELOPMENT
+      const int32_t render_scale = g_perf_test != 0 ? perf_test_render_scales[g_perf_test] : g_render_scale;
+#else
+      const int32_t render_scale = g_render_scale;
+#endif
+      const int32_t kept = render_scale != 0 ? render_scale : game_device_data->render_scale_game;
       const int32_t wanted = menu ? 10 : kept;
       if (menu_rebuilt_low && game_device_data->render_scale_restore_presents == 0 && game_device_data->render_scale_applied == wanted)
          game_device_data->render_scale_applied = kept;
@@ -2272,7 +2402,7 @@ public:
          else if (render_resolution_composite && game_device_data.menu_presents < 30)
             game_device_data.menu_presents++;
          const bool menu = game_device_data.menu_presents >= 30;
-         UpdateRenderScale(&game_device_data, IsSRActive(device_data), menu, menu && render_resolution_composite);
+         UpdateRenderScale(&game_device_data, menu, menu && render_resolution_composite);
       }
       // A mip sharper under DLSS/FSR, which resolves the detail over its jittered frames (Core applies it to anisotropic samplers)
       if (!custom_texture_mip_lod_bias_offset)
@@ -2280,6 +2410,51 @@ public:
          const std::unique_lock lock(s_mutex_samplers);
          device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load()) : 0.f;
       }
+#if DEVELOPMENT
+      // "Performance Test": the finished timestamp sets, averaged into a log line every 120 frames (the first 60 after a mode change skipped)
+      if (g_perf_test != 0)
+      {
+         com_ptr<ID3D11DeviceContext> immediate_context;
+         native_device->GetImmediateContext(&immediate_context);
+         const std::lock_guard lock(game_device_data.perf_mutex);
+         const bool measuring = game_device_data.perf_settle_frames <= 0;
+         auto& stats = game_device_data.perf_stats;
+         for (auto& queries : game_device_data.perf_queries)
+         {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+            UINT64 scene_start, sr_start, sr_end;
+            if (!queries.pending || immediate_context->GetData(queries.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+               continue;
+            queries.pending = false;
+            if (!measuring || immediate_context->GetData(queries.scene_start.get(), &scene_start, sizeof(scene_start), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || immediate_context->GetData(queries.sr_start.get(), &sr_start, sizeof(sr_start), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || immediate_context->GetData(queries.sr_end.get(), &sr_end, sizeof(sr_end), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+               continue;
+            if (disjoint.Disjoint || disjoint.Frequency == 0)
+            {
+               stats.disjoint++;
+               continue;
+            }
+            const double scene_ms = 1000.0 * double(sr_start - scene_start) / double(disjoint.Frequency);
+            const double sr_ms = 1000.0 * double(sr_end - sr_start) / double(disjoint.Frequency);
+            stats.scene_ms += scene_ms;
+            stats.scene_max_ms = (std::max)(stats.scene_max_ms, scene_ms);
+            stats.sr_ms += sr_ms;
+            stats.sr_max_ms = (std::max)(stats.sr_max_ms, sr_ms);
+            stats.samples++;
+         }
+         if (!measuring)
+         {
+            game_device_data.perf_settle_frames--;
+            stats = {};
+            game_device_data.perf_hook_ns = 0;
+         }
+         else if (++stats.frames >= 120)
+         {
+            const uint32_t samples = (std::max)(stats.samples, 1u);
+            reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load(), stats.scene_ms / samples, stats.scene_max_ms, stats.sr_ms / samples, stats.sr_max_ms, double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, stats.samples, stats.frames, stats.disjoint).c_str());
+            stats = {};
+         }
+      }
+#endif
    }
 
    void LoadConfigs() override
@@ -2299,7 +2474,6 @@ public:
       reshade::get_config_value(nullptr, NAME, "RenderScale", g_render_scale);
       if (g_render_scale != 0)
          g_render_scale = std::clamp(g_render_scale, 5, 10);
-      reshade::get_config_value(nullptr, NAME, "RenderScaleCustom", g_render_scale_custom);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -2337,48 +2511,45 @@ public:
 
       ImGui::SeparatorText("Anti-Aliasing");
       {
-         // The game's render scale, overridden live (see "UpdateRenderScale"): presets named after upscaler modes (game steps are 10%), or
-         // any step with the custom slider. Shows the game's option until overridden.
+         // The game's render scale (its option steps by 10%), overridden live (see "UpdateRenderScale"), at the upscaler modes' steps. A saved
+         // value between them shows as a percentage.
          const auto& game_device_data = GetGameDeviceData(device_data);
-         ImGui::BeginDisabled(!game_device_data.render_scale_setting || !IsSRActive(device_data));
-         if (g_render_scale_custom)
+         ImGui::BeginDisabled(!game_device_data.render_scale_setting);
+         constexpr std::pair<const char*, int> presets[] = {{"Game Setting", 0}, {"Native", 10}, {"Quality", 7}, {"Balanced", 6}, {"Performance", 5}};
+         const auto current = std::ranges::find(presets, g_render_scale, &std::pair<const char*, int>::second);
+         if (ImGui::BeginCombo("Render Scale", current != std::end(presets) ? current->first : std::format("{}%", g_render_scale * 10).c_str()))
          {
-            // The game's steps: its setting (5-10) as a percentage ("%d0")
-            int scale = g_render_scale != 0 ? g_render_scale : game_device_data.render_scale_game;
-            if (ImGui::SliderInt("Render Scale", &scale, 5, 10, g_render_scale != 0 ? "%d0%%" : "%d0%% (game)", ImGuiSliderFlags_AlwaysClamp))
+            for (const auto& [label, value] : presets)
             {
-               g_render_scale = scale;
-               reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
-            }
-         }
-         else
-         {
-            constexpr std::pair<const char*, int> presets[] = {{"Game Setting", 0}, {"Native", 10}, {"Quality", 7}, {"Balanced", 6}, {"Performance", 5}};
-            const auto current = std::ranges::find(presets, g_render_scale, &std::pair<const char*, int>::second);
-            const std::string preview = current != std::end(presets) ? std::string(current->first) : std::format("{}%", g_render_scale * 10);
-            if (ImGui::BeginCombo("Render Scale", preview.c_str()))
-            {
-               for (const auto& [label, value] : presets)
+               if (ImGui::Selectable(label, value == g_render_scale))
                {
-                  if (ImGui::Selectable(label, value == g_render_scale))
-                  {
-                     g_render_scale = value;
-                     reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
-                  }
+                  g_render_scale = value;
+                  reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
                }
-               ImGui::EndCombo();
             }
+            ImGui::EndCombo();
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("The resolution the game renders at, which DLSS/FSR upscale to the output resolution. Needs DLSS or FSR.\nApplies immediately and overrides the game's own option; changing that option in the game drops the override.");
+            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR or stretched by the game.\nOverrides the game's own option until you change it in the game.");
          DrawResetButton(g_render_scale, 0, "RenderScale");
-         if (ImGui::Checkbox("Custom Render Scale", &g_render_scale_custom))
-            reshade::set_config_value(nullptr, NAME, "RenderScaleCustom", g_render_scale_custom);
-         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Picks the render scale in 10%% steps instead of the presets.");
          ImGui::EndDisabled();
       }
-      ImGui::BeginDisabled(!settings_toggle("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off, at a 100% render scale).") && !IsSRActive(device_data));
+      constexpr const char* smaa_tooltip = "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR).";
+      bool smaa = false;
+      // DLSS/FSR replace SMAA: shown off, the saved choice kept for when they're turned off
+      if (IsSRActive(device_data))
+      {
+         ImGui::BeginDisabled();
+         ImGui::Checkbox("SMAA Enable", &smaa);
+         ImGui::EndDisabled();
+         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", smaa_tooltip);
+      }
+      else
+      {
+         smaa = settings_toggle("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, smaa_tooltip);
+      }
+      ImGui::BeginDisabled(!smaa && !IsSRActive(device_data));
       settings_slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, default_luma_global_game_settings.RCASSharpness, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
       ImGui::EndDisabled();
 
@@ -2396,6 +2567,7 @@ public:
          reshade::set_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion enabled in the game's graphic settings).");
+      DrawResetButton(g_gtao_enable, true, "GTAOEnable");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
@@ -2433,6 +2605,19 @@ public:
       ImGui::Combo("SMAA Predication Debug View", &g_smaa_debug_view, "Off\0Edges\0Predication\0");
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the frame with SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red).\nToggle SMAA Predication to compare: texture detail should lose edges, silhouettes keep them.");
+
+      ImGui::SeparatorText("Performance");
+      ImGui::BeginDisabled(!IsSRActive(device_data));
+      const int previous_perf_test = g_perf_test;
+      if (ImGui::Combo("Performance Test", &g_perf_test, perf_test_modes, int(std::size(perf_test_modes))) && g_perf_test != previous_perf_test)
+      {
+         auto& game_device_data = GetGameDeviceData(device_data);
+         const std::lock_guard lock(game_device_data.perf_mutex);
+         game_device_data.perf_settle_frames = 60;
+      }
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Sets the render scale for the mode and logs \"[P5S Perf]\" to ReShade.log every 120 frames: the GPU time of the scene (from its first depth draw to the split,\nthe motion vector draws included, and any GPU idle between the game's command lists) and of DLSS/FSR (timestamps, so the 60 fps cap doesn't matter), and the CPU time in the motion vector hooks.\nThe difference between DLAA and \"DLAA Without Motion Vector Draws\" is their cost (that mode's image is unjittered, with camera-only motion vectors).\nNeeds DLSS or FSR. Keep the camera still, set the GPU to maximum performance in the driver (a capped GPU downclocks). Not saved.");
    }
 #endif
 

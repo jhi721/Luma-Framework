@@ -1,6 +1,7 @@
 // SMAA implementation for Persona 5 Strikers. Reference: https://github.com/iryoku/smaa
-// ULTRA preset + color edge detection on the swapchain canvas after the composite and before the UI, replacing the game's FXAA
-// (which runs after the UI).
+// ULTRA preset + color edge detection on the composite's canvas (swapchain, upscaled canvas, or its render resolution target, which
+// the game then stretches) before the UI, replacing the game's FXAA (which runs after the UI). main.cpp passes the
+// canvas size in LumaData.CustomData1/2.
 // The canvas is linear (1 = UI paper white, HDR above), so edge detection reads a gamma copy (Luma_P5S_SMAAEncode); neighborhood
 // blending reads the linear copy and re-encodes to gamma for Luma_P5S_SMAAFinalize (RCAS), or writes the canvas.
 // Predication reads the depth edge-ness of Luma_P5S_SMAAPredication; without it main.cpp passes null and scale 1 (plain ULTRA).
@@ -8,7 +9,8 @@
 
 #include "Includes/Common.hlsl"
 
-#define SMAA_RT_METRICS float4(LumaSettings.SwapchainInvSize, LumaSettings.SwapchainSize)
+#define SMAA_CANVAS_SIZE float2(LumaData.CustomData1, LumaData.CustomData2)
+#define SMAA_RT_METRICS  float4(1.0 / SMAA_CANVAS_SIZE, SMAA_CANVAS_SIZE)
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION 1
 // TW2's validated tuning: flagged silhouettes get plain ULTRA (2 x (1 - 0.5) x 0.05), the rest twice that.
@@ -82,6 +84,6 @@ float4 smaa_neighborhood_blending_ps(float4 position : SV_Position, float2 texco
    float4 color = SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1);
    [branch] if (LumaSettings.GameSettings.RCASSharpness > 0.0)
        color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
-   else P5S_DitherOutput(color.rgb, position.xy * LumaSettings.SwapchainInvSize);
+   else P5S_DitherOutput(color.rgb, position.xy / SMAA_CANVAS_SIZE);
    return color;
 }
