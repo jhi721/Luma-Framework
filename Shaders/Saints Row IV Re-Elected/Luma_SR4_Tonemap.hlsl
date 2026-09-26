@@ -208,14 +208,15 @@ float4 SR4_SceneInput(float4 texcoord1, bool diffracted, out float2 uv)
 
 // Radial vignette and the two film grain layers the finals apply after the shoulder (or the tint, in no_tonemapping).
 // The monochrome grain ends in a saturate in vanilla; the HDR no_tonemapping path passes `clampGrain` false.
+// The user's Vignette / Film Grain Intensity scale the vignette strength (not its power) and both grain amounts.
 float3 SR4_VignetteAndGrain(float3 color, float2 texcoord0, float4 texcoord1, bool clampGrain)
 {
    const float2 centered = (texcoord1.xy - 0.5) * 2.0;
-   color *= 1.0 - saturate(pow(length(centered), Grain_params2.w) * Grain_params2.z);
+   color *= 1.0 - saturate(pow(length(centered), Grain_params2.w) * Grain_params2.z * LumaSettings.GameSettings.VignetteIntensity);
    const float grain = dot(Grain_textureTexture.Sample(Grain_textureSampler, texcoord1.zw).rgb, 1.0) - 1.0;
-   color += max(color, 0.02) * grain * Grain_params2.x;
+   color += max(color, 0.02) * grain * Grain_params2.x * LumaSettings.GameSettings.FilmGrainIntensity;
    color = clampGrain ? saturate(color) : max(color, 0.0);
-   return color * (1.0 + Grain_params2.y * (Grain_textureTexture.Sample(Grain_textureSampler, texcoord0).rgb - 1.0));
+   return color * (1.0 + Grain_params2.y * LumaSettings.GameSettings.FilmGrainIntensity * (Grain_textureTexture.Sample(Grain_textureSampler, texcoord0).rgb - 1.0));
 }
 
 // final / final_no_lut / final_diffracted / final_no_lut_diffracted. Returns the gamma-encoded colour; alpha is the
