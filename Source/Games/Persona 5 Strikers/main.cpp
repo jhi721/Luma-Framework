@@ -276,10 +276,16 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       // Issued, until read back. A set whose split never ran is reused when the ring comes back to it (8 scene frames later).
       bool pending = false;
    };
+   // The upscaled frame's second composite, into the game's own target (after the split, so timed on its own)
+   struct PerfDrawQueries
+   {
+      com_ptr<ID3D11Query> disjoint, start, end;
+      bool pending = false;
+   };
    struct PerfStats
    {
-      double scene_ms = 0.0, scene_max_ms = 0.0, sr_ms = 0.0, sr_max_ms = 0.0;
-      uint32_t samples = 0, disjoint = 0, frames = 0;
+      double scene_ms = 0.0, scene_max_ms = 0.0, sr_ms = 0.0, sr_max_ms = 0.0, composite_ms = 0.0, composite_max_ms = 0.0;
+      uint32_t samples = 0, composite_samples = 0, disjoint = 0, frames = 0;
    };
 #endif
 
@@ -308,6 +314,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::mutex perf_mutex;
    std::array<PerfQueries, 8> perf_queries;
    size_t perf_query_index = 0;
+   std::array<PerfDrawQueries, 8> perf_composite_queries;
+   size_t perf_composite_query_index = 0;
    PerfQueries* perf_frame_queries = nullptr; // Scene context only: this frame's, until its split takes it
    PerfStats perf_stats;                      // This log window's
    int perf_settle_frames = 0;                // Frames skipped after a mode change (targets rebuilt, history reset)
@@ -2088,7 +2096,43 @@ public:
             // Also into the game's own target, which the pause screen freezes as its background (else a stale frame)
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData);
+#if DEVELOPMENT
+            Persona5StrikersGameDeviceData::PerfDrawQueries* perf_queries = nullptr;
+            if (g_perf_test != 0)
+            {
+               const std::lock_guard lock(game_device_data.perf_mutex);
+               auto& queries = game_device_data.perf_composite_queries[game_device_data.perf_composite_query_index];
+               if (!queries.pending)
+               {
+                  const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
+                  if (!queries.disjoint)
+                  {
+                     native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
+                     native_device->CreateQuery(&timestamp_desc, &queries.start);
+                     native_device->CreateQuery(&timestamp_desc, &queries.end);
+                  }
+                  if (queries.disjoint && queries.start && queries.end)
+                  {
+                     perf_queries = &queries;
+                     queries.pending = true;
+                     game_device_data.perf_composite_query_index = (game_device_data.perf_composite_query_index + 1) % game_device_data.perf_composite_queries.size();
+                  }
+               }
+            }
+            if (perf_queries)
+            {
+               native_device_context->Begin(perf_queries->disjoint.get());
+               native_device_context->End(perf_queries->start.get());
+            }
+#endif
             (*original_draw_dispatch_func)();
+#if DEVELOPMENT
+            if (perf_queries)
+            {
+               native_device_context->End(perf_queries->end.get());
+               native_device_context->End(perf_queries->disjoint.get());
+            }
+#endif
             return DrawOrDispatchOverrideType::Replaced;
          }
          // SMAA not with DLSS/FSR (not even on composites they skip, like the pause screen's), RCAS after either
@@ -2453,6 +2497,20 @@ public:
             stats.sr_max_ms = (std::max)(stats.sr_max_ms, sr_ms);
             stats.samples++;
          }
+         for (auto& queries : game_device_data.perf_composite_queries)
+         {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+            UINT64 start, end;
+            if (!queries.pending || immediate_context->GetData(queries.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+               continue;
+            queries.pending = false;
+            if (!measuring || disjoint.Disjoint || disjoint.Frequency == 0 || immediate_context->GetData(queries.start.get(), &start, sizeof(start), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || immediate_context->GetData(queries.end.get(), &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+               continue;
+            const double composite_ms = 1000.0 * double(end - start) / double(disjoint.Frequency);
+            stats.composite_ms += composite_ms;
+            stats.composite_max_ms = (std::max)(stats.composite_max_ms, composite_ms);
+            stats.composite_samples++;
+         }
          if (!measuring)
          {
             game_device_data.perf_settle_frames--;
@@ -2462,7 +2520,7 @@ public:
          else if (++stats.frames >= 120)
          {
             const uint32_t samples = (std::max)(stats.samples, 1u);
-            reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load(), stats.scene_ms / samples, stats.scene_max_ms, stats.sr_ms / samples, stats.sr_max_ms, double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, stats.samples, stats.frames, stats.disjoint).c_str());
+            reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms gpu game composite avg/max={:.3f}/{:.3f} ms ({} samples) cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load(), stats.scene_ms / samples, stats.scene_max_ms, stats.sr_ms / samples, stats.sr_max_ms, stats.composite_ms / (std::max)(stats.composite_samples, 1u), stats.composite_max_ms, stats.composite_samples, double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, stats.samples, stats.frames, stats.disjoint).c_str());
             stats = {};
          }
       }
