@@ -35,6 +35,8 @@ cbuffer LumaGTAO : register(b9)
    float2 ViewportPixelSizeRT; // 1 / AO target resolution
    float NoiseIndexRT;         // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
    float PaddingRT;
+   float2 SubRectScaleRT; // Upscaling prototype: the scene's share of the target (1 = the whole target), see main.cpp "g_render_scale"
+   float2 PaddingRT2;
 }
 
 #if XE_GTAO_QUALITY == 0 // Low
@@ -101,8 +103,9 @@ cbuffer LumaGTAO : register(b9)
 #define VIEWPORT_PIXEL_SIZE ViewportPixelSizeRT
 
 // Transcribed from the native calculate: ndc = (uv.x*2-1, 1-2*uv.y), view.xy = ndc * (c1.x, c2.y) * viewZ.
-// Expressed as the XeGTAO mul/add pair over raw uv: viewPos.xy = (uv * MUL + ADD) * viewZ.
-#define NDC_TO_VIEW_MUL              (float2(2.0, -2.0) * float2(vc0[1].x, vc0[2].y))
+// Expressed as the XeGTAO mul/add pair over raw uv: viewPos.xy = (uv * MUL + ADD) * viewZ. Under a render sub-rect the scene covers
+// uv 0..SubRectScaleRT: its ndc is then (uv / SubRectScaleRT) * 2 - 1, while every read keeps the texture's uv.
+#define NDC_TO_VIEW_MUL              (float2(2.0, -2.0) * float2(vc0[1].x, vc0[2].y) / SubRectScaleRT)
 #define NDC_TO_VIEW_ADD              (float2(-1.0, 1.0) * float2(vc0[1].x, vc0[2].y))
 #define NDC_TO_VIEW_MUL_X_PIXEL_SIZE (NDC_TO_VIEW_MUL * VIEWPORT_PIXEL_SIZE)
 
