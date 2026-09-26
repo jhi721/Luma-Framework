@@ -72,20 +72,9 @@ namespace
    int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    bool g_smaa_predication = true;
    int g_smaa_debug_view = 0; // 0 off, 1 edges, 2 predication
-   // Motion vector research (the game renders none): how the G-buffer draws get their VS $Globals (cb0: view projection, world matrix
-   // or bone palette). Consumed at the next present.
-   std::atomic<bool> g_mv_probe = false;
-
-   // Motion vectors (see "DrawWithMotionVectors") without an upscaler, to check them
-   bool g_mv_enable = false;
-   bool g_mv_debug_view = false;
-   bool g_mv_force_jitter = false;                    // The upscaler's jitter without an upscaler, to check it: the image shakes, the motion vectors don't
-   constexpr uint32_t mv_probe_max_draw_lines = 8000; // Field gameplay has ~3000 draws
 #else
    constexpr int g_gtao_debug_view = 0;
    constexpr bool g_smaa_predication = true;
-   constexpr bool g_mv_enable = false;
-   constexpr bool g_mv_force_jitter = false;
 #endif
 
    // A Luma shader, null until compiled. The caller holds s_mutex_shader_objects.
@@ -209,21 +198,6 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       gtao_height = 0;
    }
 
-#if DEVELOPMENT
-   // "Log MV Probe": every constant buffer mapped or updated in the probed frame, and the G-buffer draws that bind it as VS cb0
-   struct MVProbeBuffer
-   {
-      uint32_t maps[5] = {}; // By reshade::api::map_access (1 read_only ... 4 write_discard)
-      uint32_t device_updates = 0;
-      uint32_t command_updates = 0;
-      uint64_t update_bytes = 0;
-      uint32_t gbuffer_draws = 0;
-      uint32_t other_draws = 0;
-      std::unordered_set<uint32_t> first_constants; // Distinct VSSetConstantBuffers1 offsets, a ring buffer if many
-      D3D11_BUFFER_DESC desc = {};
-   };
-#endif
-
    // Motion vectors: the patched shaders by original hash (null when the patch failed), patched on first use, and the target
    std::shared_mutex mv_mutex;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> mv_vertex_shaders;
@@ -293,17 +267,6 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    uint32_t mv_frame_present = 0;
    std::atomic<uint32_t> mv_presents = 0;
 
-   std::atomic<uint32_t> mv_patched_draws = 0;
-   std::atomic<uint32_t> mv_skipped_draws = 0;
-   std::atomic<uint32_t> mv_uncopied_draws = 0;     // No CPU copy of its $Globals yet
-   std::atomic<uint32_t> mv_other_camera_draws = 0; // A view projection other than the frame's camera, left as is
-   std::atomic<uint32_t> mv_matched_draws = 0;      // Found last frame's own $Globals
-   std::atomic<uint32_t> mv_ambiguous_draws = 0;    // Matched among several candidates
-   std::atomic<uint32_t> mv_forward_draws = 0;      // Of the patched draws, the forward redraws (outlines, sky)
-   std::atomic<uint32_t> mv_jitter_only_draws = 0;  // Scene draws with the jitter but no motion vectors (depth prepass, depth tested geometry)
-   std::atomic<uint32_t> mv_resource_copies = 0;    // Of the resources the patched vertex shaders read, for their previous frame
-   std::atomic<uint32_t> mv_fills = 0;
-
    // DLSS/FSR run on the immediate context, but the scene records on a deferred one: its command list is split right before the post
    // process, and the first part is executed before the upscaler when the game executes the rest (see "OnExecuteSecondaryCommandList").
    struct SRSplit
@@ -356,8 +319,6 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::unordered_map<UINT, com_ptr<ID3D11Buffer>> layer_globals_buffers; // The patched $Globals uploads, one dynamic buffer per size
    com_ptr<ID3D11Buffer> layer_uv_scale_buffer;
    float layer_uv_scale[2] = {};
-   std::atomic<uint32_t> layer_draws = 0;
-   std::atomic<uint32_t> layer_uncopied_draws = 0; // No CPU copy of their $Globals yet: light clusters at the render resolution's scale
    // The layer's stretch targets, then the composite outputs made from them (only compared): the pause screen's composite reads its
    // stretch target whole, and a UI sprite scales up the render resolution corner of its output, and the exposure reads that corner.
    struct LayerOutput
@@ -369,28 +330,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::unordered_map<ID3D11Resource*, LayerOutput> layer_composed;
    com_ptr<ID3D11RenderTargetView> layer_histogram_rtv; // The stretch target scaled down to the render resolution, for the exposure
    com_ptr<ID3D11ShaderResourceView> layer_histogram_srv;
-   std::atomic<uint32_t> layer_sprite_draws = 0;
-   std::atomic<uint32_t> layer_composites = 0;
-   std::atomic<uint32_t> layer_alpha_copies = 0;
-   std::atomic<uint32_t> layer_histogram_downsamples = 0;
    std::atomic<uint32_t> sr_render_height = 1;
    std::atomic<uint32_t> sr_output_height = 1;
-   std::atomic<uint32_t> sr_splits = 0;
-   std::atomic<uint32_t> sr_draws = 0;
-   std::atomic<uint32_t> sr_no_overwrite_maps = 0;
-
-#if DEVELOPMENT
-   std::atomic<bool> mv_probe_logging = false; // The probed frame
-   std::mutex mv_probe_mutex;
-   std::unordered_map<uint64_t, MVProbeBuffer> mv_probe_buffers;
-   std::unordered_map<ID3D11DeviceContext*, uint32_t> mv_probe_context_gbuffer_draws;
-   uint32_t mv_probe_draws = 0;
-   uint32_t mv_probe_gbuffer_draws = 0;
-   // Every buffer event received, constant buffer or not: 0 means this ReShade build doesn't send them (maps need RESHADE_ADDON >= 2)
-   uint32_t mv_probe_map_events = 0;
-   uint32_t mv_probe_update_events = 0;
-
-#endif
 };
 
 class Persona5Strikers final : public Game
@@ -411,33 +352,6 @@ class Persona5Strikers final : public Game
       return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
    }
 
-   // The scene draws with motion vectors (and jitter) for the upscaler
-   static bool AreMotionVectorsEnabled(const DeviceData& device_data)
-   {
-      return g_mv_enable || IsSRActive(device_data);
-   }
-
-#if DEVELOPMENT
-   // The probed frame's entry for a constant buffer, null for other resources. The caller holds the mutex from "GetMVProbeMutex".
-   static Persona5StrikersGameDeviceData::MVProbeBuffer* GetMVProbeBuffer(reshade::api::device* device, reshade::api::resource resource, bool map)
-   {
-      auto& game_device_data = GetGameDeviceData(*GetDeviceData(device));
-      (map ? game_device_data.mv_probe_map_events : game_device_data.mv_probe_update_events)++;
-      if ((device->get_resource_desc(resource).usage & reshade::api::resource_usage::constant_buffer) == 0)
-         return nullptr;
-      return &game_device_data.mv_probe_buffers[resource.handle];
-   }
-
-   // Null outside the probed frame, so the buffer events cost nothing then
-   static std::mutex* GetMVProbeMutex(reshade::api::device* device)
-   {
-      DeviceData* const device_data = GetDeviceData(device);
-      auto* const game_device_data = device_data ? &GetGameDeviceData(*device_data) : nullptr;
-      return game_device_data && game_device_data->mv_probe_logging ? &game_device_data->mv_probe_mutex : nullptr;
-   }
-
-#endif
-
    static DeviceData* GetDeviceData(reshade::api::device* device)
    {
       auto* const device_data = device->get_private_data<DeviceData>();
@@ -448,7 +362,7 @@ class Persona5Strikers final : public Game
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
       DeviceData* const device_data = GetDeviceData(device);
-      if (!device_data || !AreMotionVectorsEnabled(*device_data))
+      if (!device_data || !IsSRActive(*device_data))
          return;
       auto& game_device_data = GetGameDeviceData(*device_data);
       if (access == reshade::api::map_access::write_discard && data && *data)
@@ -460,7 +374,6 @@ class Persona5Strikers final : public Game
       // A deferred context's first map of a dynamic buffer in a command list must discard, so the split discards these (see "sr_no_overwrite_buffers")
       else if (access == reshade::api::map_access::write_only)
       {
-         game_device_data.sr_no_overwrite_maps++;
          auto* const buffer = reinterpret_cast<ID3D11Buffer*>(resource.handle);
          // "D3D11_MAP_WRITE" (staging) is reported as write only too, it can't be discarded
          D3D11_BUFFER_DESC desc;
@@ -475,22 +388,13 @@ class Persona5Strikers final : public Game
             game_device_data.sr_no_overwrite_buffers.emplace_back(buffer);
          }
       }
-
-#if DEVELOPMENT
-      std::mutex* const mutex = GetMVProbeMutex(device);
-      if (!mutex)
-         return;
-      const std::lock_guard lock(*mutex);
-      if (auto* const buffer = GetMVProbeBuffer(device, resource, true))
-         buffer->maps[std::clamp(int(access), 0, 4)]++;
-#endif
    }
 
    // Motion vectors: the CPU copy of a $Globals buffer, before its Unmap (the game has written it). Reads the mapped memory back.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = GetDeviceData(device);
-      auto* const game_device_data = device_data && AreMotionVectorsEnabled(*device_data) ? &GetGameDeviceData(*device_data) : nullptr;
+      auto* const game_device_data = device_data && IsSRActive(*device_data) ? &GetGameDeviceData(*device_data) : nullptr;
       if (!game_device_data)
          return;
       const std::lock_guard lock(game_device_data->mv_globals_mutex);
@@ -504,173 +408,6 @@ class Persona5Strikers final : public Game
       std::memcpy(copy.data(), mapped->second, desc.ByteWidth);
       game_device_data->mv_mapped_globals.erase(mapped);
    }
-
-#if DEVELOPMENT
-
-   static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
-   {
-      std::mutex* const mutex = GetMVProbeMutex(device);
-      if (!mutex)
-         return false;
-      const std::lock_guard lock(*mutex);
-      if (auto* const buffer = GetMVProbeBuffer(device, dest, false))
-      {
-         buffer->device_updates++;
-         buffer->update_bytes += size;
-      }
-      return false;
-   }
-
-   static bool OnUpdateBufferRegionCommand(reshade::api::command_list* cmd_list, const void* data, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
-   {
-      reshade::api::device* const device = cmd_list->get_device();
-      std::mutex* const mutex = GetMVProbeMutex(device);
-      if (!mutex)
-         return false;
-      const std::lock_guard lock(*mutex);
-      if (auto* const buffer = GetMVProbeBuffer(device, dest, false))
-      {
-         buffer->command_updates++;
-         buffer->update_bytes += size;
-      }
-      return false;
-   }
-
-   // Logs every graphics draw of the probed frame: its pass (targets, depth and blend state, viewport), VS cb0 binding, the other VS
-   // inputs (vertex buffers, SRVs, cbuffer slots: instancing or skinning data outside cb0) and arguments. G-buffer draws (5 render
-   // targets, 6 for water) are also counted per cb0 buffer; outlines, a depth prepass or forward opaques show up as the other passes.
-   static void LogMVProbeDraw(ID3D11DeviceContext* native_device_context, Persona5StrikersGameDeviceData* game_device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
-   {
-      com_ptr<ID3D11DeviceContext1> native_device_context1;
-      if (FAILED(native_device_context->QueryInterface(&native_device_context1)))
-         return;
-      com_ptr<ID3D11Buffer> cb;
-      UINT first = 0, count = 0;
-      native_device_context1->VSGetConstantBuffers1(0, 1, &cb, &first, &count);
-      com_ptr<ID3D11RenderTargetView> rtvs[8];
-      com_ptr<ID3D11DepthStencilView> dsv;
-      native_device_context->OMGetRenderTargets(8, &rtvs[0], &dsv);
-      const UINT rt_count = UINT(std::ranges::count_if(rtvs, [](const auto& rtv)
-         { return rtv.get() != nullptr; }));
-      const bool gbuffer = rt_count >= 5;
-
-      uint32_t line_index = 0;
-      {
-         const std::lock_guard lock(game_device_data->mv_probe_mutex);
-         line_index = game_device_data->mv_probe_draws++;
-         if (gbuffer)
-         {
-            game_device_data->mv_probe_gbuffer_draws++;
-            game_device_data->mv_probe_context_gbuffer_draws[native_device_context]++;
-         }
-         if (cb)
-         {
-            auto& buffer = game_device_data->mv_probe_buffers[reinterpret_cast<uint64_t>(cb.get())];
-            if (buffer.desc.ByteWidth == 0)
-               cb->GetDesc(&buffer.desc);
-            (gbuffer ? buffer.gbuffer_draws : buffer.other_draws)++;
-            if (gbuffer)
-               buffer.first_constants.insert(first);
-         }
-      }
-      if (line_index >= mv_probe_max_draw_lines)
-         return;
-
-      DXGI_FORMAT rt0_format = DXGI_FORMAT_UNKNOWN;
-      if (rtvs[0])
-      {
-         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
-         rtvs[0]->GetDesc(&rtv_desc);
-         rt0_format = rtv_desc.Format;
-      }
-      com_ptr<ID3D11DepthStencilState> depth_stencil_state;
-      UINT stencil_ref = 0;
-      native_device_context->OMGetDepthStencilState(&depth_stencil_state, &stencil_ref);
-      D3D11_DEPTH_STENCIL_DESC depth_desc = {};
-      if (depth_stencil_state)
-         depth_stencil_state->GetDesc(&depth_desc);
-      com_ptr<ID3D11BlendState> blend_state;
-      FLOAT blend_factor[4];
-      UINT sample_mask = 0;
-      native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
-      D3D11_BLEND_DESC blend_desc = {};
-      if (blend_state)
-         blend_state->GetDesc(&blend_desc);
-      D3D11_VIEWPORT viewport = {};
-      UINT viewports = 1;
-      native_device_context->RSGetViewports(&viewports, &viewport);
-
-      com_ptr<ID3D11Buffer> vbs[4];
-      UINT vb_strides[4] = {}, vb_offsets[4] = {};
-      native_device_context->IAGetVertexBuffers(0, 4, &vbs[0], vb_strides, vb_offsets);
-      com_ptr<ID3D11Buffer> ib;
-      DXGI_FORMAT ib_format = DXGI_FORMAT_UNKNOWN;
-      UINT ib_offset = 0;
-      native_device_context->IAGetIndexBuffer(&ib, &ib_format, &ib_offset);
-      // Bound slot masks: VS SRVs t0-t15 and cbuffers b0-b13
-      com_ptr<ID3D11ShaderResourceView> vs_srvs[16];
-      native_device_context->VSGetShaderResources(0, 16, &vs_srvs[0]);
-      com_ptr<ID3D11Buffer> vs_cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
-      native_device_context->VSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, &vs_cbs[0]);
-      uint32_t vs_srv_mask = 0, vs_cb_mask = 0;
-      for (uint32_t i = 0; i < 16; i++)
-         vs_srv_mask |= vs_srvs[i] ? (1u << i) : 0u;
-      for (uint32_t i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-         vs_cb_mask |= vs_cbs[i] ? (1u << i) : 0u;
-
-      const DrawDispatchData& draw = last_draw_dispatch_data;
-      reshade::log::message(reshade::log::level::info, std::format("[P5S MV] frame={} draw={} ctx={} deferred={} vs=0x{:08X} ps=0x{:08X} rts={} rt0_format={} dsv={} depth={} depth_write={} depth_func={} stencil={} blend0={} viewport={}x{} cb0={} first={} count={} vs_cbs=0x{:X} vs_srvs=0x{:X} vbs={}/{}/{}/{} strides={}/{}/{}/{} ib={} ib_format={} indexed={} indices={} first_index={} vertex_offset={} vertices={} first_vertex={} instances={}",
-                                                          cb_luma_global_settings.FrameIndex, line_index, static_cast<void*>(native_device_context), native_device_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED,
-                                                          original_shader_hashes.vertex_shaders[0], original_shader_hashes.pixel_shaders[0], rt_count, int(rt0_format), static_cast<void*>(dsv.get()),
-                                                          bool(depth_desc.DepthEnable), depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL, int(depth_desc.DepthFunc), bool(depth_desc.StencilEnable), bool(blend_desc.RenderTarget[0].BlendEnable), viewport.Width, viewport.Height,
-                                                          static_cast<void*>(cb.get()), first, count, vs_cb_mask, vs_srv_mask,
-                                                          static_cast<void*>(vbs[0].get()), static_cast<void*>(vbs[1].get()), static_cast<void*>(vbs[2].get()), static_cast<void*>(vbs[3].get()), vb_strides[0], vb_strides[1], vb_strides[2], vb_strides[3],
-                                                          static_cast<void*>(ib.get()), int(ib_format), draw.indexed, draw.index_count, draw.first_index, draw.vertex_offset, draw.vertex_count, draw.first_vertex, draw.instance_count)
-                                                          .c_str());
-
-      // Which textures the draw writes and reads: resource, size and format of RT0 and PS t0-t3
-      const auto describe = [](ID3D11View* view)
-      {
-         const com_ptr<ID3D11Resource> resource = GetViewResource(view);
-         com_ptr<ID3D11Texture2D> texture;
-         D3D11_TEXTURE2D_DESC desc = {};
-         if (resource && SUCCEEDED(resource->QueryInterface(&texture)))
-            texture->GetDesc(&desc);
-         return std::format("{}({}x{} f{})", static_cast<void*>(resource.get()), desc.Width, desc.Height, int(desc.Format));
-      };
-      com_ptr<ID3D11ShaderResourceView> ps_srvs[4];
-      native_device_context->PSGetShaderResources(0, 4, &ps_srvs[0]);
-      reshade::log::message(reshade::log::level::info, std::format("[P5S MV] frame={} draw={} resources: rt0={} ps_t0={} ps_t1={} ps_t2={} ps_t3={}", cb_luma_global_settings.FrameIndex, line_index, describe(rtvs[0].get()), describe(ps_srvs[0].get()), describe(ps_srvs[1].get()), describe(ps_srvs[2].get()), describe(ps_srvs[3].get())).c_str());
-   }
-
-   // Per buffer: how the game fills the constant buffers its G-buffer draws read as VS cb0, then clears the probe
-   static void LogMVProbeSummary(Persona5StrikersGameDeviceData* game_device_data)
-   {
-      const std::lock_guard lock(game_device_data->mv_probe_mutex);
-      const auto log = [](const std::string& line)
-      { reshade::log::message(reshade::log::level::info, line.c_str()); };
-      uint32_t gbuffer_buffers = 0;
-      for (const auto& [handle, buffer] : game_device_data->mv_probe_buffers)
-      {
-         if (buffer.gbuffer_draws == 0)
-            continue;
-         gbuffer_buffers++;
-         log(std::format("[P5S MV] cb0 buffer={} bytes={} usage={} cpu_access=0x{:X} misc=0x{:X} gbuffer_draws={} other_draws={} distinct_first={} maps(ro/wo/rw/discard)={}/{}/{}/{} device_updates={} command_updates={} update_bytes={}",
-            reinterpret_cast<void*>(handle), buffer.desc.ByteWidth, int(buffer.desc.Usage), buffer.desc.CPUAccessFlags, buffer.desc.MiscFlags, buffer.gbuffer_draws, buffer.other_draws, buffer.first_constants.size(),
-            buffer.maps[1], buffer.maps[2], buffer.maps[3], buffer.maps[4], buffer.device_updates, buffer.command_updates, buffer.update_bytes));
-      }
-      log(std::format("[P5S MV] summary: draws={} gbuffer_draws={} gbuffer_cb0_buffers={} constant_buffers_touched={} map_events={} update_events={}", game_device_data->mv_probe_draws, game_device_data->mv_probe_gbuffer_draws, gbuffer_buffers, game_device_data->mv_probe_buffers.size(), game_device_data->mv_probe_map_events, game_device_data->mv_probe_update_events));
-      for (const auto& [context, draws] : game_device_data->mv_probe_context_gbuffer_draws)
-         log(std::format("[P5S MV] gbuffer context={} draws={}", static_cast<void*>(context), draws));
-      game_device_data->mv_probe_buffers.clear();
-      game_device_data->mv_probe_context_gbuffer_draws.clear();
-      game_device_data->mv_probe_draws = 0;
-      game_device_data->mv_probe_gbuffer_draws = 0;
-      game_device_data->mv_probe_map_events = 0;
-      game_device_data->mv_probe_update_events = 0;
-   }
-
-#endif
 
    // The motion vector version of the bound shader, patched from Core's copy of its bytecode on first use (null if it can't be)
    template <typename T>
@@ -758,7 +495,7 @@ class Persona5Strikers final : public Game
          { return entry.second.frame + 1 < game_device_data.mv_frame_present; });
 
       // Halton (2, 3) over the upscaler's phases
-      const bool jitter = g_mv_force_jitter || IsSRActive(device_data);
+      const bool jitter = IsSRActive(device_data);
       // More phases the lower the render scale (the upscaler's own count, from its last settings)
       const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
@@ -894,7 +631,6 @@ class Persona5Strikers final : public Game
             native_device_context->Dispatch((mv_desc.Width + 7) / 8, (mv_desc.Height + 7) / 8, 1);
             compute_state.Restore(native_device_context);
             graphics_state.Restore(native_device_context);
-            game_device_data.mv_fills++;
          }
       }
    }
@@ -935,7 +671,6 @@ class Persona5Strikers final : public Game
       native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
       ID3D11Buffer* const restored_jitter = original_jitter.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &restored_jitter);
-      game_device_data.mv_jitter_only_draws++;
       return true;
    }
 
@@ -960,10 +695,7 @@ class Persona5Strikers final : public Game
       const com_ptr<ID3D11PixelShader> pixel_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_pixel_shaders, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader);
       // Without independent blending the MV target takes RT0's blend, which must be off; with it, a copy of the state writes it unblended
       if ((!blend_desc.IndependentBlendEnable && blend_desc.RenderTarget[0].BlendEnable) || !vertex_shader || !pixel_shader || !dsv)
-      {
-         game_device_data.mv_skipped_draws++;
          return false;
-      }
       // Forward draws that aren't objects (full screen passes) have no camera
       const Persona5StrikersGameDeviceData::GlobalsLayout layout = GetGlobalsLayout(&game_device_data, original_shader_hashes.vertex_shaders[0]);
       if (!gbuffer && layout.view_projection == UINT_MAX)
@@ -983,10 +715,7 @@ class Persona5Strikers final : public Game
          }
          motion_vector_blend_state = cached_state;
          if (!motion_vector_blend_state)
-         {
-            game_device_data.mv_skipped_draws++;
             return false;
-         }
       }
 
       // The G-buffer owns the target (sized like the scene depth) and starts the frames; forward draws only add to it
@@ -1078,7 +807,6 @@ class Persona5Strikers final : public Game
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
          const Persona5StrikersGameDeviceData::MotionVectorObject* match = nullptr;
-         size_t candidates = 0;
          if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
          {
             float nearest = FLT_MAX;
@@ -1091,33 +819,18 @@ class Persona5Strikers final : public Game
                   nearest = distance;
                   match = &object;
                }
-               candidates++;
             }
-         }
-         if (match)
-         {
-            game_device_data.mv_matched_draws++;
-            if (candidates > 1)
-               game_device_data.mv_ambiguous_draws++;
          }
          // Kept as drawn for the next frame (moved when the match's own is uploaded)
          game_device_data.mv_objects[key].push_back({translation, match ? std::move(previous_globals_data) : previous_globals_data});
-         if (!match)
-         {
-            if (std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) != 0)
-               game_device_data.mv_other_camera_draws++;
-            else if (game_device_data.mv_previous_view_projection_valid)
-               std::memcpy(view_projection, game_device_data.mv_previous_view_projection.data(), sizeof(game_device_data.mv_previous_view_projection));
-         }
+         // Not found: last frame's camera, if this is the frame's (another view projection is left as is)
+         if (!match && game_device_data.mv_previous_view_projection_valid && std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) == 0)
+            std::memcpy(view_projection, game_device_data.mv_previous_view_projection.data(), sizeof(game_device_data.mv_previous_view_projection));
 
          const std::vector<uint8_t>& upload_data = match ? match->globals : previous_globals_data;
          com_ptr<ID3D11Buffer>& upload = game_device_data.mv_previous_globals_buffers[UINT(upload_data.size())];
          if (WriteConstants(native_device, native_device_context, std::addressof(upload), upload_data.data(), UINT(upload_data.size())))
             previous_globals = upload.get();
-      }
-      else
-      {
-         game_device_data.mv_uncopied_draws++;
       }
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_globals_slot, 1, &previous_globals);
       // The vertex shader's resources for its second run: the previous frame's copies, or the current ones (immutable, or nothing from
@@ -1201,10 +914,7 @@ class Persona5Strikers final : public Game
                }
             }
             if (entry.copies[0])
-            {
                native_device_context->CopyResource(entry.copies[0].get(), resource.get());
-               game_device_data.mv_resource_copies++;
-            }
          }
          if (!entry.has_previous || !entry.copies[1])
             continue;
@@ -1237,9 +947,6 @@ class Persona5Strikers final : public Game
       ID3D11ShaderResourceView* const null_srvs[MotionVectorPatches::resource_slots] = {};
       native_device_context->VSSetShaderResources(MotionVectorPatches::previous_resources_slot, MotionVectorPatches::resource_slots, null_srvs);
       native_device_context->OMSetRenderTargets(8, rtvs, dsv);
-      game_device_data.mv_patched_draws++;
-      if (!gbuffer)
-         game_device_data.mv_forward_draws++;
       return true;
    }
 
@@ -1339,10 +1046,6 @@ public:
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
-#if DEVELOPMENT
-      reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::register_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommand);
-#endif
    }
 
    static void UnregisterEvents()
@@ -1350,10 +1053,6 @@ public:
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
-#if DEVELOPMENT
-      reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommand);
-#endif
    }
 
    // Draws the composite, then SMAA on the canvas it wrote (the swapchain), before the UI: copy, gamma encode, predication,
@@ -1754,7 +1453,6 @@ public:
                   DrawCustomPixelShader(native_device_context.get(), device_data->default_depth_stencil_state.get(), device_data->default_blend_state.get(), device_data->sampler_state_linear.get(), scale_vertex_shader.get(), scale_pixel_shader.get(), output_srv.get(), scene_rtv.get(), desc.Width, desc.Height);
             }
             device_data->has_drawn_sr = true;
-            game_device_data.sr_draws++;
          }
          else
          {
@@ -1914,10 +1612,6 @@ public:
             if (WriteConstants(native_device, native_device_context, std::addressof(upload), globals_data.data(), UINT(globals_data.size())))
                patched_globals = upload;
          }
-         else
-         {
-            game_device_data.layer_uncopied_draws++;
-         }
       }
 
       if (!stretch)
@@ -1956,7 +1650,6 @@ public:
          ID3D11Buffer* const buffer = original_globals.get();
          native_device_context->PSSetConstantBuffers(0, 1, &buffer);
       }
-      game_device_data.layer_draws++;
       return true;
    }
 
@@ -1978,12 +1671,7 @@ public:
          }
       }
 
-#if DEVELOPMENT
-      if (game_device_data.mv_probe_logging && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
-         LogMVProbeDraw(native_device_context, &game_device_data, original_shader_hashes);
-#endif
-
-      if (AreMotionVectorsEnabled(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_draw_dispatch_func && *original_draw_dispatch_func)
+      if (IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_draw_dispatch_func && *original_draw_dispatch_func)
       {
          if (original_shader_hashes.Contains(post_process_start_shader_hashes))
          {
@@ -2094,7 +1782,6 @@ public:
             (*original_draw_dispatch_func)();
             srv = layer_srv.get();
             native_device_context->CSSetShaderResources(0, 1, &srv);
-            game_device_data.layer_histogram_downsamples++;
             return DrawOrDispatchOverrideType::Replaced;
          }
       }
@@ -2176,7 +1863,6 @@ public:
             game_device_data.sr_split = std::move(split);
             game_device_data.sr_split_context = reinterpret_cast<uint64_t>(native_device_context);
             game_device_data.scene_antialiased = true;
-            game_device_data.sr_splits++;
          }
       }
 
@@ -2256,7 +1942,6 @@ public:
                   (*original_draw_dispatch_func)();
                   native_device_context->RSSetViewports(1, &viewport);
                   native_device_context->RSSetScissorRects(scissors, &scissor);
-                  game_device_data.layer_composites++;
                   return DrawOrDispatchOverrideType::Replaced;
                }
             }
@@ -2332,7 +2017,6 @@ public:
             DrawWithLayerVertexShader(native_device_context, quad_vertex_shader.get(), uv_scale_buffer.get(), *original_draw_dispatch_func);
             native_device_context->RSSetViewports(1, &viewport);
             native_device_context->RSSetScissorRects(scissors, &scissor);
-            game_device_data.layer_alpha_copies++;
             return DrawOrDispatchOverrideType::Replaced;
          }
       }
@@ -2389,7 +2073,6 @@ public:
                if (uv_scale_buffer)
                {
                   DrawWithLayerVertexShader(native_device_context, sprite_vertex_shader.get(), uv_scale_buffer.get(), *original_draw_dispatch_func);
-                  game_device_data.layer_sprite_draws++;
                   return DrawOrDispatchOverrideType::Replaced;
                }
             }
@@ -2610,45 +2293,6 @@ public:
          const std::unique_lock lock(s_mutex_samplers);
          device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load()) : 0.f;
       }
-#if DEVELOPMENT
-      // "Log MV Probe" logs the frame between this present and the next, and summarizes it at that next present
-      if (game_device_data.mv_probe_logging.exchange(g_mv_probe.exchange(false)))
-         LogMVProbeSummary(&game_device_data);
-      // "MV Debug View": Core's debug draw of the target, absolute values in pixels
-      {
-         const std::shared_lock lock(game_device_data.mv_mutex);
-         if (g_mv_debug_view && game_device_data.mv_texture)
-         {
-            D3D11_TEXTURE2D_DESC desc;
-            game_device_data.mv_texture->GetDesc(&desc);
-            debug_draw_auto_clear_texture = false;
-            debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace;
-            device_data.debug_draw_texture = game_device_data.mv_texture.get();
-            device_data.debug_draw_texture_format = desc.Format;
-            device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
-         }
-         else if (device_data.debug_draw_texture && device_data.debug_draw_texture.get() == game_device_data.mv_texture.get())
-         {
-            device_data.debug_draw_texture = nullptr;
-         }
-      }
-      if (AreMotionVectorsEnabled(device_data) && cb_luma_global_settings.FrameIndex % 60 == 0)
-      {
-         // The game's samplers Core upgrades (anisotropic ones), which the mip bias applies to
-         size_t samplers = 0, anisotropic_samplers = 0;
-         {
-            const std::shared_lock lock(s_mutex_samplers);
-            for (const auto& [handle, custom_samplers] : device_data.custom_sampler_by_original_sampler)
-            {
-               D3D11_SAMPLER_DESC desc;
-               reinterpret_cast<ID3D11SamplerState*>(handle)->GetDesc(&desc);
-               samplers++;
-               anisotropic_samplers += desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC;
-            }
-         }
-         reshade::log::message(reshade::log::level::info, std::format("[P5S MV] frame={} per 60 frames: patched_draws={} forward_draws={} jitter_only_draws={} skipped_draws={} uncopied_draws={} matched_draws={} ambiguous_draws={} other_camera_draws={} sr_splits={} sr_draws={} no_overwrite_maps={} samplers={} anisotropic_samplers={} mip_bias={} resource_copies={} fills={} layer_draws={} layer_uncopied_draws={} layer_composites={} layer_alpha_copies={} layer_sprite_draws={} layer_histogram_downsamples={}", cb_luma_global_settings.FrameIndex, game_device_data.mv_patched_draws.exchange(0), game_device_data.mv_forward_draws.exchange(0), game_device_data.mv_jitter_only_draws.exchange(0), game_device_data.mv_skipped_draws.exchange(0), game_device_data.mv_uncopied_draws.exchange(0), game_device_data.mv_matched_draws.exchange(0), game_device_data.mv_ambiguous_draws.exchange(0), game_device_data.mv_other_camera_draws.exchange(0), game_device_data.sr_splits.exchange(0), game_device_data.sr_draws.exchange(0), game_device_data.sr_no_overwrite_maps.exchange(0), samplers, anisotropic_samplers, float(device_data.texture_mip_lod_bias_offset), game_device_data.mv_resource_copies.exchange(0), game_device_data.mv_fills.exchange(0), game_device_data.layer_draws.exchange(0), game_device_data.layer_uncopied_draws.exchange(0), game_device_data.layer_composites.exchange(0), game_device_data.layer_alpha_copies.exchange(0), game_device_data.layer_sprite_draws.exchange(0), game_device_data.layer_histogram_downsamples.exchange(0)).c_str());
-      }
-#endif
    }
 
    void LoadConfigs() override
@@ -2802,21 +2446,6 @@ public:
       ImGui::Combo("SMAA Predication Debug View", &g_smaa_debug_view, "Off\0Edges\0Predication\0");
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the frame with SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red).\nToggle SMAA Predication to compare: texture detail should lose edges, silhouettes keep them.");
-
-      ImGui::SeparatorText("Motion Vectors");
-      ImGui::Checkbox("MV Enable", &g_mv_enable);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Runs the G-buffer with the motion vector shaders without DLSS/FSR (camera and object motion; particles have none).\nReShade.log gets the patched/refused shaders and per 60 frames the draw counters (matched = own previous frame found). Not saved.");
-      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Jitters the motion vector draws like for DLSS (Halton, 8 phases, +-0.5 px) without it: the image shakes,\nthe motion vectors must not (debug view black with a static camera). Needs MV Enable.");
-      ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");
-      if (ImGui::Button("Log MV Probe"))
-         g_mv_probe = true;
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Logs the next frame's draws to ReShade.log (pass state, VS cb0 binding and other VS inputs, draw arguments, up to %u),\nthen per G-buffer cb0 buffer how the game fills it (maps by type, updates, distinct binding offsets). Use it in gameplay.", mv_probe_max_draw_lines);
    }
 #endif
 
