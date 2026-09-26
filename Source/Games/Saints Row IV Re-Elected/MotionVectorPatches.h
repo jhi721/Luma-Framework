@@ -27,7 +27,7 @@ namespace MotionVectorPatches
    }
    // Upscaler projection jitter in NDC (c0.xy), added to SV_Position after its unjittered copy, so motion vectors never contain it
    constexpr uint32_t jitter_slot = 9;
-   // The second run reads t0-t15 (wind and interaction buffers, ocean maps...) from these slots, which hold the previous frame's copies
+   // The second run reads t0-t15 from these slots, bound to the current resources (no motion vector VS reads a per frame one)
    constexpr uint32_t resource_slots = 16;
    constexpr uint32_t previous_resources_slot = 64;
    // Past every register the game uses (vertex outputs end at o10, pixel inputs at v10), within SM4's 16 vertex outputs
