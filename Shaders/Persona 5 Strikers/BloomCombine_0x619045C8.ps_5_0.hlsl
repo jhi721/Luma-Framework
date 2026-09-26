@@ -24,7 +24,7 @@ float3 SampleBloom(float2 uv)
 #if P5S_BLOOM_MAX_UV
    uv = min(uv, g_vMaxUV.xy);
 #endif
-   return min(g_tBloomMap.SampleLevel(sampleLinear_s, uv, 0).rgb, 65024.0);
+   return min(g_tBloomMap.SampleLevel(sampleLinear_s, uv, 0).rgb, FLT11_MAX);
 }
 
 void main(float4 v0 : SV_Position0, float2 v1 : TEXCOORD0, out float4 o0 : SV_Target0)

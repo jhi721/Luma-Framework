@@ -2,7 +2,7 @@
 // Forked from Luma_SR3_XeGTAO.hlsl (Saints Row: The Third).
 // Source: https://github.com/GameTechDev/XeGTAO
 //
-// P5S specifics (disassembly of the native SSAO and the DEV "Log XeGTAO Inputs" readout):
+// P5S specifics (disassembly of the native SSAO and a capture of its inputs):
 // - Only the SSAO calculate (PS 0x63435B03) is replaced: these 4 dispatches run at its target size (R8_UNORM, half res) and
 //   are CopyResource'd into its target. Its two depth aware blurs (0xDEBA65FD, 0x4D8EC71C, upsampling to full res) and the
 //   G-buffer merge (min into gbuf0.a) stay vanilla, so the output is VISIBILITY (1 = open), as the native one.

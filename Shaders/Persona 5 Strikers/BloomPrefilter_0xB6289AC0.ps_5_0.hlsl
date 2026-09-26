@@ -26,7 +26,7 @@ static const float SourceCap = 5.0;
 
 float3 Tap(float2 uv, float exposure)
 {
-   float3 color = clamp(g_tSceneMap.SampleLevel(sampleLinear_s, uv, 0).rgb, 0.0, 65024.0) * exposure; // Luma: >= 0 too
+   float3 color = clamp(g_tSceneMap.SampleLevel(sampleLinear_s, uv, 0).rgb, 0.0, FLT11_MAX) * exposure; // Luma: >= 0 too
    const float maxChannel = max3(color);
    if (g_vBloomInfo1.w > 0.0 && maxChannel > SourceCap)
       color *= SourceCap / maxChannel;

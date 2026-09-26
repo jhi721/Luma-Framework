@@ -40,19 +40,6 @@ float LUTGrayCurve(float x)
    return average(g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(x), 0).rgb);
 }
 
-// Luma: "Color Grading Intensity" fades the LUT's color grading out towards its gray tone curve alone (0), applied by luminance
-float3 SampleGradedLUT(float3 color)
-{
-   float3 graded = g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(color), 0).rgb;
-   [branch] if (LumaSettings.GameSettings.ColorGradingIntensity != 1.0)
-   {
-      const float luminance = GetLuminance(color);
-      const float3 neutral = luminance > 0.0 ? color * (LUTGrayCurve(luminance) / luminance) : 0.0;
-      graded = lerp(neutral, graded, LumaSettings.GameSettings.ColorGradingIntensity);
-   }
-   return graded;
-}
-
 // The gray tone curve's tangent where it crosses "targetValue": the first gray diagonal texel center at or above it, and the secant from the
 // previous texel. If the curve never gets there, the pivot stays out of reach (no extension, the other outputs are unused). The LUT output
 // is linear (the composite writes through an sRGB view). All the texels are loaded unconditionally so the loads don't serialize.
@@ -111,7 +98,7 @@ void main(
    const float sceneUVScale = LumaData.CustomData4 > 0.0 ? LumaData.CustomData4 : 1.0;
    r2.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r1.xz * sceneUVScale, 0).xyz;
    // Luma: the scene is upgraded from R11G11B10_FLOAT, which could not hold negatives (65024, the vanilla cap, is its max)
-   r2.xyz = clamp(r2.xyz, 0.0, 65024.0);
+   r2.xyz = clamp(r2.xyz, 0.0, FLT11_MAX);
    r0.w = cmp(0 < g_vEtcEffect.x);
    if (r0.w != 0)
    {
@@ -144,7 +131,7 @@ void main(
             break;
          r9.xy = r9.xy + r3.xy;
          r10.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, r9.xy * sceneUVScale, 0).xyz;
-         r10.xyz = clamp(r10.xyz, 0.0, 65024.0);
+         r10.xyz = clamp(r10.xyz, 0.0, FLT11_MAX);
          r4.w = (int)r3.w;
          r4.w = r4.w / r2.w;
          r5.w = cmp(r4.w < 0.5);
@@ -168,10 +155,10 @@ void main(
    if (r0.x != 0)
    {
       r3.xyz = g_tSceneMap.SampleLevel(sampleLinear_s, g_vSun2dInfo.xy * sceneUVScale, 0).xyz;
-      r3.xyz = clamp(r3.xyz, 0.0, 65024.0);
+      r3.xyz = clamp(r3.xyz, 0.0, FLT11_MAX);
       r0.xzw = r3.xyz * r0.zzz;
       r3.xyz = g_tLensFlareMap.SampleLevel(sampleLinear_s, r1.xz, 0).xyz;
-      r3.xyz = clamp(r3.xyz, 0.0, 65024.0); // Luma: the flare target is upgraded from R11G11B10_FLOAT too
+      r3.xyz = clamp(r3.xyz, 0.0, FLT11_MAX); // Luma: the flare target is upgraded from R11G11B10_FLOAT too
       r1.w = dot(r0.xzw, float3(0.222014993, 0.706655025, 0.0713300034));
       r1.w = cmp(g_vEtcEffect.w < r1.w);
       r1.w = r1.w ? g_vEtcEffect.z : 0;
@@ -200,7 +187,14 @@ void main(
       r2.xyz = r2.xyz * r0.xxx;
    }
    const float3 untonemappedColor = r2.xyz;
-   r0.xyz = SampleGradedLUT(r2.xyz);
+   r0.xyz = g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(r2.xyz), 0).rgb;
+   // Luma: "Color Grading Intensity" fades the LUT's color grading out towards its gray tone curve alone (0), applied by luminance
+   [branch] if (LumaSettings.GameSettings.ColorGradingIntensity != 1.0)
+   {
+      const float luminance = GetLuminance(r2.xyz);
+      const float3 neutral = luminance > 0.0 ? r2.xyz * (LUTGrayCurve(luminance) / luminance) : 0.0;
+      r0.xyz = lerp(neutral, r0.xyz, LumaSettings.GameSettings.ColorGradingIntensity);
+   }
 
    if (r1.y != 0)
    {
