@@ -346,6 +346,9 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    // to weight samples in the displayed exposure. Copied only while Luma MSAA is on; null until then (the resolve shader
    // falls back to a box resolve on the zeroed binding).
    com_ptr<ID3D11Buffer> composite_tint_cb;
+   // The game resolved an MSAA scene this frame / last frame (display.ini MSAA_Level, applied at the game's start)
+   bool msaa_scene_resolved = false;
+   bool msaa_scene = false;
 
    // GPU copies of the native bloom's constants, taken at their own draws earlier in the same frame: the brightpass vc0
    // (bound at b0 for the prefilter) and vc4 (b4), the combine vc4 (b5) and the source downsample vc4 (b6). Copied only
@@ -563,10 +566,11 @@ class SaintsRowIV final : public Game
       return true;
    }
 
-   // An upscaler is picked and hasn't failed (it then gives way to SMAA until picked again)
-   static bool IsSRActive(const DeviceData& device_data)
+   // An upscaler is picked, hasn't failed (it then gives way to SMAA until picked again) and the scene isn't the game's MSAA one (no
+   // motion vectors there: the upscaler steps aside while it lasts)
+   static bool IsSRActive(DeviceData& device_data)
    {
-      return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+      return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed && !GetGameDeviceData(device_data).msaa_scene;
    }
 
    // A vc2 / vc3 buffer's CPU copy (empty until its first Unmap); registers it for a copy at every Unmap
@@ -2132,6 +2136,8 @@ public:
    // Luma_SR4_MSAAResolve instead. Anything else, or a target we cannot bind, keeps the hardware resolve.
    static bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
    {
+      if (DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>(); device_data && device_data->game && format == reshade::api::format::r16g16b16a16_float)
+         GetGameDeviceData(*device_data).msaa_scene_resolved = true;
       if (!g_luma_msaa_enable || format != reshade::api::format::r16g16b16a16_float || source_subresource != 0 || dest_subresource != 0 || source_box != nullptr || dest_x != 0 || dest_y != 0 || dest_z != 0)
          return false;
 
@@ -2313,16 +2319,22 @@ public:
 
       ImGui::SeparatorText("Anti-Aliasing");
 
-      config_checkbox("Luma MSAA Enable", "MSAAResolveEnable", &g_luma_msaa_enable, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings).");
-      // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
+      // The upscaler (Super Resolution, in the Settings tab) replaces MSAA and SMAA: shown off, the saved choices are kept
       const bool sr_active = IsSRActive(device_data);
       ImGui::BeginDisabled(sr_active);
+      bool msaa_shown = g_luma_msaa_enable && !sr_active;
+      if (ImGui::Checkbox("Luma MSAA Enable", sr_active ? &msaa_shown : &g_luma_msaa_enable))
+         reshade::set_config_value(nullptr, NAME, "MSAAResolveEnable", g_luma_msaa_enable);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR).");
       bool smaa_shown = g_smaa_enable && !sr_active;
       if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off or low in the game's display settings; not used with DLSS/FSR).");
       ImGui::EndDisabled();
+      if (device_data.sr_type != SR::Type::None && GetGameDeviceData(device_data).msaa_scene)
+         ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "DLSS/FSR inactive: turn Anti-Aliasing off in the game's display settings and restart the game.");
 
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
       slider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
@@ -2396,6 +2408,7 @@ public:
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
       device_data.force_reset_sr = !device_data.has_drawn_sr;
       device_data.has_drawn_sr = false;
+      game_device_data.msaa_scene = std::exchange(game_device_data.msaa_scene_resolved, false);
       game_device_data.mv_active = IsSRActive(device_data) || g_mv_enable;
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before the G-buffer
       game_device_data.mv_scene_open = false;
