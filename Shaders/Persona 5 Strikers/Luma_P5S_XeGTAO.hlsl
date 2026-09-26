@@ -11,8 +11,9 @@
 // - Depth unpack and uv->view use the calculate's live $Globals (rebound PS -> CS b0), in centimetres:
 //   viewZ = 1 / (d * vDepthParam.x + vDepthParam.y), view.xy = (uv * vViewParam.xy + vViewParam.zw) * viewZ, view.z = -viewZ
 //   (right handed, y up). XeGTAO's view space only differs by +z forward, so only the normal's z flips.
-// - No TAA (DLSS/FSR are optional): the noise's temporal index is FROZEN at 0 (a frame index would make the pattern boil) and
-//   denoise runs twice.
+// - Noise: frozen at 0 without an upscaler (a frame index would make the pattern boil), denoise runs twice. With DLSS/FSR
+//   (they accumulate the lit scene the AO feeds) it cycles frame % 64 and denoise runs once, as Intel's XeGTAO.h advises
+//   with TAA (NoiseIndexRT, set by main.cpp).
 
 // --- The SSAO calculate's $Globals (main.cpp binds it at CS b0) ---
 
@@ -35,7 +36,8 @@ cbuffer LumaGTAO : register(b9)
    float RadiusOverrideRT;     // > 0 overrides the native radius (centimetres)
    float DebugViewRT;          // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    float2 ViewportPixelSizeRT; // 1 / AO target resolution
-   float2 PaddingRT;
+   float NoiseIndexRT;         // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
+   float PaddingRT;
 }
 
 #if XE_GTAO_QUALITY == 0 // Low
@@ -677,7 +679,7 @@ uint HilbertIndex(uint posX, uint posY)
    return index;
 }
 
-// temporalIndex is ALWAYS 0 (see the header).
+// temporalIndex: NoiseIndexRT (0 without an upscaler: frozen pattern, static noise instead of boiling).
 float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    float2 noise;
@@ -704,7 +706,7 @@ float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
       n.xy = (1.0 - abs(n.yx)) * (n.xy >= 0.0 ? 1.0 : -1.0);
    n = normalize(n);
    const float3 viewspaceNormal = float3(n.xy, n.z * NORMAL_Z_SIGN);
-   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, 0), viewspaceNormal, tex0, smp, ao_term_and_edges);
+   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, uint(NoiseIndexRT)), viewspaceNormal, tex0, smp, ao_term_and_edges);
 }
 
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void denoise_pass_cs(uint2 dtid : SV_DispatchThreadID) {
