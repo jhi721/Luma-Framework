@@ -2073,29 +2073,11 @@ public:
          // Upscaled: from the upscaler's output into the output resolution canvas (RCAS included), which the stretch copies 1:1
          if (native_device_context == game_device_data.sr_upscaling_context)
          {
-            DrawStateStack<DrawStateStackType::FullGraphics> state;
-            state.Cache(native_device_context, device_data.uav_max_count);
-            D3D11_TEXTURE2D_DESC desc;
-            game_device_data.sr_upscaled_output->GetDesc(&desc); // The canvas' size
-            const D3D11_VIEWPORT viewport = {0.f, 0.f, float(desc.Width), float(desc.Height), 0.f, 1.f};
-            const D3D11_RECT scissor = {0, 0, LONG(desc.Width), LONG(desc.Height)};
-            ID3D11ShaderResourceView* const scene_srv = game_device_data.sr_upscaled_output_srv.get();
-            ID3D11RenderTargetView* const canvas_rtv = game_device_data.sr_upscaled_canvas_rtv.get();
-            native_device_context->PSSetShaderResources(0, 1, &scene_srv);
-            native_device_context->OMSetRenderTargets(1, &canvas_rtv, nullptr);
-            native_device_context->RSSetViewports(1, &viewport);
-            native_device_context->RSSetScissorRects(1, &scissor);
-            if (cb_luma_global_settings.GameSettings.RCASSharpness <= 0.f || DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, false) == DrawOrDispatchOverrideType::None)
-            {
-               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData);
-               updated_cbuffers = true;
-               (*original_draw_dispatch_func)();
-            }
-            state.Restore(native_device_context);
-            // Also into the game's own target, which the pause screen freezes as its background (else a stale frame)
+            // First into the game's own target, which the pause screen freezes as its background (else a stale frame); the cbuffers stay
+            // bound for the canvas draw
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData);
+            updated_cbuffers = true;
 #if DEVELOPMENT
             Persona5StrikersGameDeviceData::PerfDrawQueries* perf_queries = nullptr;
             if (g_perf_test != 0)
@@ -2133,6 +2115,21 @@ public:
                native_device_context->End(perf_queries->disjoint.get());
             }
 #endif
+            DrawStateStack<DrawStateStackType::FullGraphics> state;
+            state.Cache(native_device_context, device_data.uav_max_count);
+            D3D11_TEXTURE2D_DESC desc;
+            game_device_data.sr_upscaled_output->GetDesc(&desc); // The canvas' size
+            const D3D11_VIEWPORT viewport = {0.f, 0.f, float(desc.Width), float(desc.Height), 0.f, 1.f};
+            const D3D11_RECT scissor = {0, 0, LONG(desc.Width), LONG(desc.Height)};
+            ID3D11ShaderResourceView* const scene_srv = game_device_data.sr_upscaled_output_srv.get();
+            ID3D11RenderTargetView* const canvas_rtv = game_device_data.sr_upscaled_canvas_rtv.get();
+            native_device_context->PSSetShaderResources(0, 1, &scene_srv);
+            native_device_context->OMSetRenderTargets(1, &canvas_rtv, nullptr);
+            native_device_context->RSSetViewports(1, &viewport);
+            native_device_context->RSSetScissorRects(1, &scissor);
+            if (cb_luma_global_settings.GameSettings.RCASSharpness <= 0.f || DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, false) == DrawOrDispatchOverrideType::None)
+               (*original_draw_dispatch_func)();
+            state.Restore(native_device_context);
             return DrawOrDispatchOverrideType::Replaced;
          }
          // SMAA not with DLSS/FSR (not even on composites they skip, like the pause screen's), RCAS after either
