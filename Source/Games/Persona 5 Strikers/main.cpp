@@ -2087,8 +2087,8 @@ public:
             state.Restore(native_device_context);
             return DrawOrDispatchOverrideType::Replaced;
          }
-         // SMAA not after DLSS/FSR (split this frame), RCAS after either
-         if (cb_luma_global_settings.GameSettings.SMAAEnable > 0.5f && !game_device_data.scene_antialiased)
+         // SMAA not with DLSS/FSR (not even on composites they skip, like the pause screen's), RCAS after either
+         if (cb_luma_global_settings.GameSettings.SMAAEnable > 0.5f && !IsSRActive(device_data) && !game_device_data.scene_antialiased)
             return DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, true);
          if (game_device_data.scene_antialiased && cb_luma_global_settings.GameSettings.RCASSharpness > 0.f)
             return DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, false);
