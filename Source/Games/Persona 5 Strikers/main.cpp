@@ -67,11 +67,9 @@ namespace
    constexpr UINT gtao_knobs_cb_slot = 9; // "register(b9)" in Luma_P5S_XeGTAO.hlsl; b11 is core DrawBloom's
    float g_gtao_final_value_power = 1.f;  // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;    // > 0 overrides the native radius (centimetres)
-#if DEVELOPMENT
-   int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
-#endif
 
 #if DEVELOPMENT
+   int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    bool g_smaa_predication = true;
    int g_smaa_debug_view = 0; // 0 off, 1 edges, 2 predication
    // Motion vector research (the game renders none): how the G-buffer draws get their VS $Globals (cb0: view projection, world matrix
@@ -84,20 +82,71 @@ namespace
    bool g_mv_force_jitter = false;                    // The upscaler's jitter without an upscaler, to check it: the image shakes, the motion vectors don't
    constexpr uint32_t mv_probe_max_draw_lines = 8000; // Field gameplay has ~3000 draws
 #else
+   constexpr int g_gtao_debug_view = 0;
+   constexpr bool g_smaa_predication = true;
    constexpr bool g_mv_enable = false;
    constexpr bool g_mv_force_jitter = false;
 #endif
 
-   // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
+   // A Luma shader, null until compiled. The caller holds s_mutex_shader_objects.
+   template <typename T>
+   typename T::mapped_type FindShader(const T& shaders, uint32_t name)
+   {
+      const auto it = shaders.find(name);
+      return it != shaders.end() ? it->second : typename T::mapped_type{};
+   }
+
+   // True when all the named Luma shaders are compiled. The caller holds s_mutex_shader_objects.
    template <typename T, typename... Names>
    bool HasShaders(const T& shaders, Names... names)
    {
-      const auto has = [&](uint32_t name)
+      return (bool(FindShader(shaders, names)) && ...);
+   }
+
+   // The resource a view is of, null without a view
+   com_ptr<ID3D11Resource> GetViewResource(ID3D11View* view)
+   {
+      com_ptr<ID3D11Resource> resource;
+      if (view)
+         view->GetResource(&resource);
+      return resource;
+   }
+
+   // Writes a dynamic constant buffer, created on first use; false if it can't
+   bool WriteConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, com_ptr<ID3D11Buffer>* buffer, const void* data, UINT size)
+   {
+      if (!*buffer)
       {
-         const auto it = shaders.find(name);
-         return it != shaders.end() && it->second;
-      };
-      return (has(names) && ...);
+         const D3D11_BUFFER_DESC desc = {size, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
+         native_device->CreateBuffer(&desc, nullptr, &(*buffer));
+      }
+      D3D11_MAPPED_SUBRESOURCE mapped;
+      if (!*buffer || FAILED(native_device_context->Map(buffer->get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+         return false;
+      std::memcpy(mapped.pData, data, size);
+      native_device_context->Unmap(buffer->get(), 0);
+      return true;
+   }
+
+   // Draws with a Luma clone of a layer's vertex shader (see "Includes/LayerCorner.hlsl") and its uv scale, or as is without one. Set
+   // directly, so Core's tracking of the bound state never sees them: the game's are put back after.
+   void DrawWithLayerVertexShader(ID3D11DeviceContext* native_device_context, ID3D11VertexShader* vertex_shader, ID3D11Buffer* uv_scale_buffer, const std::function<void()>& draw)
+   {
+      if (!vertex_shader)
+      {
+         draw();
+         return;
+      }
+      com_ptr<ID3D11VertexShader> original_vertex_shader;
+      com_ptr<ID3D11Buffer> original_uv_scale_buffer;
+      native_device_context->VSGetShader(&original_vertex_shader, nullptr, nullptr);
+      native_device_context->VSGetConstantBuffers(layer_uv_scale_cb_slot, 1, &original_uv_scale_buffer);
+      native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &uv_scale_buffer);
+      native_device_context->VSSetShader(vertex_shader, nullptr, 0);
+      draw();
+      ID3D11Buffer* const buffer = original_uv_scale_buffer.get();
+      native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
+      native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
    }
 
 } // namespace
@@ -134,8 +183,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // XeGTAO scratch, recreated when the SSAO target size changes. The SSAO records on worker threads (deferred contexts), so
    // everything below is guarded by the mutex.
    std::mutex gtao_mutex;
-   com_ptr<ID3D11Texture2D> gtao_depth_mips_texture; // R32F view space depth pyramid, 5 mips
-   com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5];
+   com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5]; // R32F view space depth pyramid, 5 mips
    com_ptr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
    com_ptr<ID3D11UnorderedAccessView> gtao_working_uavs[2]; // R8G8_UNORM AO + edges ping-pong
    com_ptr<ID3D11ShaderResourceView> gtao_working_srvs[2];
@@ -148,7 +196,6 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
 
    void ReleaseGTAOScratch()
    {
-      gtao_depth_mips_texture.reset();
       for (auto& uav : gtao_depth_mip_uavs)
          uav.reset();
       gtao_depth_mips_srv.reset();
@@ -213,9 +260,9 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    struct PreviousResource
    {
       com_ptr<ID3D11Resource> resource;
-      com_ptr<ID3D11Resource> copies[2]; // This frame's, the previous frame's
-      com_ptr<ID3D11ShaderResourceView> previous_view;
-      D3D11_SHADER_RESOURCE_VIEW_DESC previous_view_desc = {};
+      com_ptr<ID3D11Resource> copies[2];          // This frame's, the previous frame's
+      com_ptr<ID3D11ShaderResourceView> views[2]; // Of the copies, created when read
+      D3D11_SHADER_RESOURCE_VIEW_DESC view_descs[2] = {};
       uint32_t frame = 0;
       bool has_previous = false;
    };
@@ -239,8 +286,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    bool mv_fill_pending = false;
    com_ptr<ID3D11ShaderResourceView> mv_scene_depth_srv;
    com_ptr<ID3D11Resource> mv_frame_depth;
-   std::array<uint8_t, 64> mv_view_projection = {};
-   std::array<uint8_t, 64> mv_previous_view_projection = {};
+   std::array<float, 16> mv_view_projection = {};
+   std::array<float, 16> mv_previous_view_projection = {};
    bool mv_view_projection_valid = false;
    bool mv_previous_view_projection_valid = false;
    uint32_t mv_frame_present = 0;
@@ -282,7 +329,6 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_output_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_output_srv;
-   com_ptr<ID3D11Texture2D> sr_upscaled_canvas;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_canvas_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_canvas_srv;
    com_ptr<ID3D11Resource> composite_target; // This frame's composite target when it isn't the swapchain (render scales below 1)
@@ -375,18 +421,18 @@ class Persona5Strikers final : public Game
    // The probed frame's entry for a constant buffer, null for other resources. The caller holds the mutex from "GetMVProbeMutex".
    static Persona5StrikersGameDeviceData::MVProbeBuffer* GetMVProbeBuffer(reshade::api::device* device, reshade::api::resource resource, bool map)
    {
-      auto* const game_device_data = static_cast<Persona5StrikersGameDeviceData*>(device->get_private_data<DeviceData>()->game);
-      (map ? game_device_data->mv_probe_map_events : game_device_data->mv_probe_update_events)++;
+      auto& game_device_data = GetGameDeviceData(*GetDeviceData(device));
+      (map ? game_device_data.mv_probe_map_events : game_device_data.mv_probe_update_events)++;
       if ((device->get_resource_desc(resource).usage & reshade::api::resource_usage::constant_buffer) == 0)
          return nullptr;
-      return &game_device_data->mv_probe_buffers[resource.handle];
+      return &game_device_data.mv_probe_buffers[resource.handle];
    }
 
    // Null outside the probed frame, so the buffer events cost nothing then
    static std::mutex* GetMVProbeMutex(reshade::api::device* device)
    {
-      auto* const device_data = device->get_private_data<DeviceData>();
-      auto* const game_device_data = device_data ? static_cast<Persona5StrikersGameDeviceData*>(device_data->game) : nullptr;
+      DeviceData* const device_data = GetDeviceData(device);
+      auto* const game_device_data = device_data ? &GetGameDeviceData(*device_data) : nullptr;
       return game_device_data && game_device_data->mv_probe_logging ? &game_device_data->mv_probe_mutex : nullptr;
    }
 
@@ -585,9 +631,7 @@ class Persona5Strikers final : public Game
       // Which textures the draw writes and reads: resource, size and format of RT0 and PS t0-t3
       const auto describe = [](ID3D11View* view)
       {
-         com_ptr<ID3D11Resource> resource;
-         if (view)
-            view->GetResource(&resource);
+         const com_ptr<ID3D11Resource> resource = GetViewResource(view);
          com_ptr<ID3D11Texture2D> texture;
          D3D11_TEXTURE2D_DESC desc = {};
          if (resource && SUCCEEDED(resource->QueryInterface(&texture)))
@@ -707,6 +751,7 @@ class Persona5Strikers final : public Game
       game_device_data.mv_frame_present = game_device_data.mv_presents;
       game_device_data.mv_previous_objects = std::move(game_device_data.mv_objects);
       game_device_data.mv_objects.clear();
+      game_device_data.mv_objects.reserve(game_device_data.mv_previous_objects.size());
       if (!game_device_data.mv_previous_view_projection_valid)
          game_device_data.mv_previous_objects.clear();
       std::erase_if(game_device_data.mv_previous_resources, [&](const auto& entry)
@@ -718,18 +763,139 @@ class Persona5Strikers final : public Game
       const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
       game_device_data.mv_jitter = jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{};
-      if (!game_device_data.mv_jitter_buffer)
+      // Pixels to NDC (y up)
+      const float ndc_jitter[4] = {game_device_data.mv_jitter[0] * 2.f / float(depth_size.x), game_device_data.mv_jitter[1] * -2.f / float(depth_size.y), 0.f, 0.f};
+      WriteConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter));
+   }
+
+   // The $Globals byte offsets of a patched vertex shader, by original hash (none until it's patched)
+   static Persona5StrikersGameDeviceData::GlobalsLayout GetGlobalsLayout(Persona5StrikersGameDeviceData* game_device_data, uint32_t hash)
+   {
+      const std::shared_lock lock(game_device_data->mv_mutex);
+      const auto it = game_device_data->mv_globals_layouts.find(hash);
+      return it != game_device_data->mv_globals_layouts.end() ? it->second : Persona5StrikersGameDeviceData::GlobalsLayout{};
+   }
+
+   // The CPU copy of a $Globals buffer (empty until its first Unmap is seen), which from now on gets copied at every Unmap
+   static std::vector<uint8_t> GetGlobalsCopy(Persona5StrikersGameDeviceData* game_device_data, ID3D11Buffer* buffer)
+   {
+      const std::lock_guard lock(game_device_data->mv_globals_mutex);
+      const uint64_t handle = reinterpret_cast<uint64_t>(buffer);
+      game_device_data->mv_globals_buffers.insert(handle);
+      const auto copy = game_device_data->mv_globals_copies.find(handle);
+      return copy != game_device_data->mv_globals_copies.end() ? copy->second : std::vector<uint8_t>{};
+   }
+
+   // A scene frame ends at its first post process pass: the frame's depth (the upscaler's), and the camera motion fill of the pixels no
+   // patched draw wrote
+   static void EndMotionVectorFrame(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      game_device_data.mv_frame_ended = true;
+
+      // The G-buffer's depth, if it can be read (a shader resource), otherwise the copy the game makes before post
+      com_ptr<ID3D11ShaderResourceView> depth_srv;
+      D3D11_TEXTURE2D_DESC depth_desc = {};
+      if (com_ptr<ID3D11Texture2D> depth_texture; game_device_data.mv_scene_depth && SUCCEEDED(game_device_data.mv_scene_depth->QueryInterface(&depth_texture)))
+         depth_texture->GetDesc(&depth_desc);
+      if ((depth_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0)
       {
-         const D3D11_BUFFER_DESC desc = {16, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-         native_device->CreateBuffer(&desc, nullptr, &game_device_data.mv_jitter_buffer);
+         if (GetViewResource(game_device_data.mv_scene_depth_srv.get()) != game_device_data.mv_scene_depth)
+         {
+            game_device_data.mv_scene_depth_srv.reset();
+            // The depth channel of the depth formats
+            const DXGI_FORMAT format = depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : (depth_desc.Format == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_R32_FLOAT : (depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : depth_desc.Format));
+            D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {format, D3D11_SRV_DIMENSION_TEXTURE2D};
+            view_desc.Texture2D.MipLevels = 1;
+            native_device->CreateShaderResourceView(game_device_data.mv_scene_depth.get(), &view_desc, &game_device_data.mv_scene_depth_srv);
+         }
+         depth_srv = game_device_data.mv_scene_depth_srv;
       }
-      D3D11_MAPPED_SUBRESOURCE mapped;
-      if (game_device_data.mv_jitter_buffer && SUCCEEDED(native_device_context->Map(game_device_data.mv_jitter_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+      else
       {
-         // Pixels to NDC (y up)
-         const float ndc_jitter[4] = {game_device_data.mv_jitter[0] * 2.f / float(depth_size.x), game_device_data.mv_jitter[1] * -2.f / float(depth_size.y), 0.f, 0.f};
-         std::memcpy(mapped.pData, ndc_jitter, sizeof(ndc_jitter));
-         native_device_context->Unmap(game_device_data.mv_jitter_buffer.get(), 0);
+         const std::lock_guard lock(game_device_data.smaa_depth_mutex);
+         depth_srv = game_device_data.smaa_depth_srv;
+      }
+      game_device_data.mv_frame_depth = GetViewResource(depth_srv.get());
+
+      // Camera motion where no patched draw wrote
+      if (game_device_data.mv_fill_pending)
+      {
+         game_device_data.mv_fill_pending = false;
+         // Current clip space to the previous frame's, for row vectors: inverse(current) * previous. In double, the world
+         // translation (centimetres) cancels out between the two.
+         double reprojection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+         if (game_device_data.mv_view_projection_valid && game_device_data.mv_previous_view_projection_valid)
+         {
+            // Gauss-Jordan with partial pivoting on [current | identity]
+            double a[4][8] = {};
+            for (int row = 0; row < 4; row++)
+            {
+               for (int column = 0; column < 4; column++)
+                  a[row][column] = game_device_data.mv_view_projection[row * 4 + column];
+               a[row][4 + row] = 1.0;
+            }
+            bool invertible = true;
+            for (int column = 0; column < 4 && invertible; column++)
+            {
+               int pivot = column;
+               for (int row = column + 1; row < 4; row++)
+               {
+                  if (std::abs(a[row][column]) > std::abs(a[pivot][column]))
+                     pivot = row;
+               }
+               invertible = std::abs(a[pivot][column]) > 1e-30;
+               std::swap(a[column], a[pivot]);
+               const double scale = invertible ? 1.0 / a[column][column] : 0.0;
+               for (double& value : a[column])
+                  value *= scale;
+               for (int row = 0; row < 4; row++)
+               {
+                  const double factor = row == column ? 0.0 : a[row][column];
+                  for (int i = 0; i < 8; i++)
+                     a[row][i] -= factor * a[column][i];
+               }
+            }
+            for (int row = 0; row < 4 && invertible; row++)
+            {
+               for (int column = 0; column < 4; column++)
+               {
+                  reprojection[row * 4 + column] = 0.0;
+                  for (int k = 0; k < 4; k++)
+                     reprojection[row * 4 + column] += a[row][4 + k] * double(game_device_data.mv_previous_view_projection[k * 4 + column]);
+               }
+            }
+         }
+         D3D11_TEXTURE2D_DESC mv_desc;
+         game_device_data.mv_texture->GetDesc(&mv_desc);
+         float constants[20] = {};
+         for (int i = 0; i < 16; i++)
+            constants[i] = float(reprojection[i]);
+         constants[16] = game_device_data.mv_jitter[0] * 2.f / float(mv_desc.Width);
+         constants[17] = game_device_data.mv_jitter[1] * -2.f / float(mv_desc.Height);
+         const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+         const com_ptr<ID3D11ComputeShader> fill_shader = FindShader(device_data.native_compute_shaders, "P5S Motion Vector Fill CS"_h);
+         // ponytail: a shader reload between the clear and here (DEV) leaves the FLT_MAX marker for a frame
+         if (depth_srv && fill_shader && WriteConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
+         {
+            DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+            DrawStateStack<DrawStateStackType::Compute> compute_state;
+            graphics_state.Cache(native_device_context, device_data.uav_max_count);
+            compute_state.Cache(native_device_context, device_data.uav_max_count);
+            // The depth may be bound as the depth target, and the motion vectors as a render target
+            native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
+            ID3D11Buffer* const buffer = game_device_data.mv_fill_buffer.get();
+            ID3D11ShaderResourceView* const srv = depth_srv.get();
+            ID3D11UnorderedAccessView* const uav = game_device_data.mv_uav.get();
+            native_device_context->CSSetConstantBuffers(0, 1, &buffer);
+            native_device_context->CSSetShaderResources(0, 1, &srv);
+            native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            native_device_context->CSSetShader(fill_shader.get(), nullptr, 0);
+            native_device_context->Dispatch((mv_desc.Width + 7) / 8, (mv_desc.Height + 7) / 8, 1);
+            compute_state.Restore(native_device_context);
+            graphics_state.Restore(native_device_context);
+            game_device_data.mv_fills++;
+         }
       }
    }
 
@@ -739,8 +905,7 @@ class Persona5Strikers final : public Game
    static bool DrawWithJitter(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, ID3D11DepthStencilView* dsv, bool depth_prepass, const std::function<void()>& draw)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
-      com_ptr<ID3D11Resource> depth;
-      dsv->GetResource(&depth);
+      const com_ptr<ID3D11Resource> depth = GetViewResource(dsv);
       // Into the last G-buffer's depth; only a depth prepass starts a frame, other draws join the started one
       if (!depth || depth != game_device_data.mv_scene_depth || !game_device_data.mv_rtv || (game_device_data.mv_frame_ended ? !depth_prepass : native_device_context != game_device_data.mv_scene_context))
          return false;
@@ -748,11 +913,8 @@ class Persona5Strikers final : public Game
       if (!vertex_shader)
          return false;
       // Objects only: full screen passes have no camera
-      {
-         const std::shared_lock lock(game_device_data.mv_mutex);
-         if (const auto it = game_device_data.mv_globals_layouts.find(original_shader_hashes.vertex_shaders[0]); it == game_device_data.mv_globals_layouts.end() || it->second.view_projection == UINT_MAX)
-            return false;
-      }
+      if (GetGlobalsLayout(&game_device_data, original_shader_hashes.vertex_shaders[0]).view_projection == UINT_MAX)
+         return false;
       if (game_device_data.mv_frame_ended)
       {
          uint4 depth_size;
@@ -783,9 +945,7 @@ class Persona5Strikers final : public Game
    static bool DrawWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, ID3D11RenderTargetView* const (&rtvs)[8], ID3D11DepthStencilView* dsv, bool gbuffer, const std::function<void()>& draw)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
-      com_ptr<ID3D11Resource> depth;
-      if (dsv)
-         dsv->GetResource(&depth);
+      const com_ptr<ID3D11Resource> depth = GetViewResource(dsv);
       // Forward draws: after this frame's G-buffer (and before its post process), into its depth
       if (!gbuffer && (game_device_data.mv_frame_ended || native_device_context != game_device_data.mv_scene_context || !depth || depth != game_device_data.mv_scene_depth || !game_device_data.mv_rtv))
          return false;
@@ -805,12 +965,9 @@ class Persona5Strikers final : public Game
          return false;
       }
       // Forward draws that aren't objects (full screen passes) have no camera
-      if (!gbuffer)
-      {
-         const std::shared_lock lock(game_device_data.mv_mutex);
-         if (const auto it = game_device_data.mv_globals_layouts.find(original_shader_hashes.vertex_shaders[0]); it == game_device_data.mv_globals_layouts.end() || it->second.view_projection == UINT_MAX)
-            return false;
-      }
+      const Persona5StrikersGameDeviceData::GlobalsLayout layout = GetGlobalsLayout(&game_device_data, original_shader_hashes.vertex_shaders[0]);
+      if (!gbuffer && layout.view_projection == UINT_MAX)
+         return false;
       com_ptr<ID3D11BlendState> motion_vector_blend_state;
       if (blend_desc.IndependentBlendEnable)
       {
@@ -835,11 +992,13 @@ class Persona5Strikers final : public Game
       // The G-buffer owns the target (sized like the scene depth) and starts the frames; forward draws only add to it
       if (gbuffer)
       {
-         uint4 depth_size;
-         DXGI_FORMAT depth_format;
-         GetResourceInfo(depth.get(), depth_size, depth_format);
-         game_device_data.mv_scene_depth = depth;
+         uint4 depth_size = {};
+         // The target already matches the same depth, and only a frame start needs the size
+         if (depth != game_device_data.mv_scene_depth || !game_device_data.mv_rtv || game_device_data.mv_frame_ended)
          {
+            DXGI_FORMAT depth_format;
+            GetResourceInfo(depth.get(), depth_size, depth_format);
+            game_device_data.mv_scene_depth = depth;
             const std::unique_lock lock(game_device_data.mv_mutex);
             D3D11_TEXTURE2D_DESC desc = {};
             if (game_device_data.mv_texture)
@@ -886,20 +1045,7 @@ class Persona5Strikers final : public Game
       native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
       // The previous frame's $Globals: last frame's copy of the same object's if found, otherwise this draw's with last frame's camera
       // (no object motion). Until a buffer has a CPU copy, its draws get the current data (zero motion).
-      std::vector<uint8_t> previous_globals_data;
-      {
-         const std::lock_guard lock(game_device_data.mv_globals_mutex);
-         const uint64_t handle = reinterpret_cast<uint64_t>(globals.get());
-         game_device_data.mv_globals_buffers.insert(handle);
-         if (const auto copy = game_device_data.mv_globals_copies.find(handle); copy != game_device_data.mv_globals_copies.end())
-            previous_globals_data = copy->second;
-      }
-      Persona5StrikersGameDeviceData::GlobalsLayout layout;
-      {
-         const std::shared_lock lock(game_device_data.mv_mutex);
-         if (const auto it = game_device_data.mv_globals_layouts.find(original_shader_hashes.vertex_shaders[0]); it != game_device_data.mv_globals_layouts.end())
-            layout = it->second;
-      }
+      std::vector<uint8_t> previous_globals_data = GetGlobalsCopy(&game_device_data, globals.get());
       ID3D11Buffer* previous_globals = globals.get();
       if (!previous_globals_data.empty() && layout.view_projection != UINT_MAX && layout.view_projection + 64 <= previous_globals_data.size())
       {
@@ -907,7 +1053,7 @@ class Persona5Strikers final : public Game
          // The frame's first draw has the camera
          if (!game_device_data.mv_view_projection_valid)
          {
-            std::memcpy(game_device_data.mv_view_projection.data(), view_projection, 64);
+            std::memcpy(game_device_data.mv_view_projection.data(), view_projection, sizeof(game_device_data.mv_view_projection));
             game_device_data.mv_view_projection_valid = true;
          }
 
@@ -929,7 +1075,6 @@ class Persona5Strikers final : public Game
             const float* const world = reinterpret_cast<const float*>(previous_globals_data.data() + layout.world);
             translation = {world[3], world[7], world[11]};
          }
-         game_device_data.mv_objects[key].push_back({translation, previous_globals_data});
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
          const Persona5StrikersGameDeviceData::MotionVectorObject* match = nullptr;
@@ -951,33 +1096,24 @@ class Persona5Strikers final : public Game
          }
          if (match)
          {
-            previous_globals_data = match->globals;
             game_device_data.mv_matched_draws++;
             if (candidates > 1)
                game_device_data.mv_ambiguous_draws++;
          }
-         else if (std::memcmp(view_projection, game_device_data.mv_view_projection.data(), 64) != 0)
+         // Kept as drawn for the next frame (moved when the match's own is uploaded)
+         game_device_data.mv_objects[key].push_back({translation, match ? std::move(previous_globals_data) : previous_globals_data});
+         if (!match)
          {
-            game_device_data.mv_other_camera_draws++;
-         }
-         else if (game_device_data.mv_previous_view_projection_valid)
-         {
-            std::memcpy(view_projection, game_device_data.mv_previous_view_projection.data(), 64);
+            if (std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) != 0)
+               game_device_data.mv_other_camera_draws++;
+            else if (game_device_data.mv_previous_view_projection_valid)
+               std::memcpy(view_projection, game_device_data.mv_previous_view_projection.data(), sizeof(game_device_data.mv_previous_view_projection));
          }
 
-         com_ptr<ID3D11Buffer>& upload = game_device_data.mv_previous_globals_buffers[UINT(previous_globals_data.size())];
-         if (!upload)
-         {
-            const D3D11_BUFFER_DESC desc = {UINT(previous_globals_data.size()), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-            native_device->CreateBuffer(&desc, nullptr, &upload);
-         }
-         D3D11_MAPPED_SUBRESOURCE mapped;
-         if (upload && SUCCEEDED(native_device_context->Map(upload.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-         {
-            std::memcpy(mapped.pData, previous_globals_data.data(), previous_globals_data.size());
-            native_device_context->Unmap(upload.get(), 0);
+         const std::vector<uint8_t>& upload_data = match ? match->globals : previous_globals_data;
+         com_ptr<ID3D11Buffer>& upload = game_device_data.mv_previous_globals_buffers[UINT(upload_data.size())];
+         if (WriteConstants(native_device, native_device_context, std::addressof(upload), upload_data.data(), UINT(upload_data.size())))
             previous_globals = upload.get();
-         }
       }
       else
       {
@@ -992,9 +1128,7 @@ class Persona5Strikers final : public Game
       for (UINT slot = 0; slot < MotionVectorPatches::resource_slots; slot++)
       {
          previous_srvs[slot] = srvs[slot].get();
-         com_ptr<ID3D11Resource> resource;
-         if (srvs[slot])
-            srvs[slot]->GetResource(&resource);
+         const com_ptr<ID3D11Resource> resource = GetViewResource(srvs[slot].get());
          D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
          if (resource)
             resource->GetType(&dimension);
@@ -1032,7 +1166,8 @@ class Persona5Strikers final : public Game
             entry.resource = resource;
             entry.has_previous = entry.copies[0] && entry.frame + 1 == game_device_data.mv_frame_present;
             std::swap(entry.copies[0], entry.copies[1]);
-            entry.previous_view.reset();
+            std::swap(entry.views[0], entry.views[1]);
+            std::swap(entry.view_descs[0], entry.view_descs[1]);
             entry.frame = game_device_data.mv_frame_present;
             // Plain GPU resources (a dynamic one can't be a copy destination)
             if (!entry.copies[0])
@@ -1075,14 +1210,14 @@ class Persona5Strikers final : public Game
             continue;
          D3D11_SHADER_RESOURCE_VIEW_DESC view_desc;
          srvs[slot]->GetDesc(&view_desc);
-         if (!entry.previous_view || std::memcmp(&view_desc, &entry.previous_view_desc, sizeof(view_desc)) != 0)
+         if (!entry.views[1] || std::memcmp(&view_desc, &entry.view_descs[1], sizeof(view_desc)) != 0)
          {
-            entry.previous_view.reset();
-            entry.previous_view_desc = view_desc;
-            native_device->CreateShaderResourceView(entry.copies[1].get(), &view_desc, &entry.previous_view);
+            entry.views[1].reset();
+            entry.view_descs[1] = view_desc;
+            native_device->CreateShaderResourceView(entry.copies[1].get(), &view_desc, &entry.views[1]);
          }
-         if (entry.previous_view)
-            previous_srvs[slot] = entry.previous_view.get();
+         if (entry.views[1])
+            previous_srvs[slot] = entry.views[1].get();
       }
       native_device_context->VSSetShaderResources(MotionVectorPatches::previous_resources_slot, MotionVectorPatches::resource_slots, previous_srvs);
       native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
@@ -1193,8 +1328,6 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw White PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(1.0, 1.0, 1.0, 1.0)"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw Black PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(0.0, 0.0, 0.0, 0.0)"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S UI Peak Clamp PS"), ShaderDefinition{"Luma_P5S_UIPeakClamp", reshade::api::pipeline_subobject_type::pixel_shader});
-      native_shaders_definitions.emplace(CompileTimeStringHash("P5S Downsample VS"), ShaderDefinition{"Luma_P5S_Downsample", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "vs_main"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("P5S Downsample PS"), ShaderDefinition{"Luma_P5S_Downsample", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "ps_main"});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Layer Quad VS"), ShaderDefinition{"Luma_P5S_LayerQuad", reshade::api::pipeline_subobject_type::vertex_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Layer Sprite VS"), ShaderDefinition{"Luma_P5S_LayerSprite", reshade::api::pipeline_subobject_type::vertex_shader});
       // XeGTAO passes (Luma_P5S_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
@@ -1231,9 +1364,7 @@ public:
    {
       com_ptr<ID3D11RenderTargetView> canvas_rtv;
       native_device_context->OMGetRenderTargets(1, &canvas_rtv, nullptr);
-      com_ptr<ID3D11Resource> canvas_resource;
-      if (canvas_rtv)
-         canvas_rtv->GetResource(&canvas_resource);
+      const com_ptr<ID3D11Resource> canvas_resource = GetViewResource(canvas_rtv.get());
       com_ptr<ID3D11Texture2D> canvas_texture;
       // Not the main menu's second composite, into an off-screen target
       if (!canvas_resource || FAILED(canvas_resource->QueryInterface(&canvas_texture)) || !IsBackBuffer(&device_data, canvas_resource.get()))
@@ -1294,11 +1425,7 @@ public:
 
       // Predication depth, if captured and canvas sized. Anything else falls back to plain ULTRA.
       com_ptr<ID3D11ShaderResourceView> depth_srv;
-      bool predication_available = smaa && game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "P5S SMAA Predication CS"_h);
-#if DEVELOPMENT
-      predication_available = predication_available && g_smaa_predication;
-#endif
-      if (predication_available)
+      if (smaa && g_smaa_predication && game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "P5S SMAA Predication CS"_h))
       {
          const std::lock_guard lock(game_device_data.smaa_depth_mutex);
          depth_srv = game_device_data.smaa_depth_srv;
@@ -1347,18 +1474,22 @@ public:
       if (smaa)
          DrawSMAA(native_device, native_device_context, device_data, sharpen ? game_device_data.smaa_gamma_rtv.get() : canvas_rtv.get(), game_device_data.smaa_linear_srv.get(), game_device_data.smaa_gamma_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
 
-      DrawStateStack<DrawStateStackType::FullGraphics> finalize_state;
-      finalize_state.Cache(native_device_context, device_data.uav_max_count);
-      if (sharpen)
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("P5S SMAA Finalize PS"_h).get(), game_device_data.smaa_gamma_srv.get(), canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
+      // Development builds may also draw a debug view
+      if (sharpen || DEVELOPMENT)
+      {
+         DrawStateStack<DrawStateStackType::FullGraphics> finalize_state;
+         finalize_state.Cache(native_device_context, device_data.uav_max_count);
+         if (sharpen)
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("P5S SMAA Finalize PS"_h).get(), game_device_data.smaa_gamma_srv.get(), canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
 #if DEVELOPMENT
-      // Calibration aid: SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red) replace the frame
-      ID3D11ShaderResourceView* const edges_srv = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h].get();
-      ID3D11ShaderResourceView* const debug_srv = g_smaa_debug_view == 1 && smaa ? edges_srv : (g_smaa_debug_view == 2 && depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
-      if (debug_srv && HasShaders(device_data.native_pixel_shaders, "Copy PS"_h))
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("Copy PS"_h).get(), debug_srv, canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
+         // Calibration aid: SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red) replace the frame
+         ID3D11ShaderResourceView* const edges_srv = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h].get();
+         ID3D11ShaderResourceView* const debug_srv = g_smaa_debug_view == 1 && smaa ? edges_srv : (g_smaa_debug_view == 2 && depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+         if (debug_srv && HasShaders(device_data.native_pixel_shaders, "Copy PS"_h))
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("Copy PS"_h).get(), debug_srv, canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
 #endif
-      finalize_state.Restore(native_device_context);
+         finalize_state.Restore(native_device_context);
+      }
 
       game_device_data.scene_antialiased = true;
       return DrawOrDispatchOverrideType::Replaced;
@@ -1390,8 +1521,7 @@ public:
       native_device_context->OMGetRenderTargets(1, &target_rtv, &target_dsv);
       if (!depth_srv || !normals_srv || !globals_cb || !target_rtv)
          return false;
-      com_ptr<ID3D11Resource> target;
-      target_rtv->GetResource(&target);
+      const com_ptr<ID3D11Resource> target = GetViewResource(target_rtv.get());
       uint4 target_size, depth_size, normals_size;
       DXGI_FORMAT target_format, unused_format;
       GetResourceInfo(target.get(), target_size, target_format);
@@ -1420,14 +1550,15 @@ public:
          desc.Format = DXGI_FORMAT_R32_FLOAT;
          desc.SampleDesc.Count = 1;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-         bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.gtao_depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(game_device_data.gtao_depth_mips_texture.get(), nullptr, &game_device_data.gtao_depth_mips_srv));
+         com_ptr<ID3D11Texture2D> depth_mips_texture;
+         bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(depth_mips_texture.get(), nullptr, &game_device_data.gtao_depth_mips_srv));
          D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
          uav_desc.Format = desc.Format;
          uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
          for (UINT mip = 0; ok && mip < 5; mip++)
          {
             uav_desc.Texture2D.MipSlice = mip;
-            ok = SUCCEEDED(native_device->CreateUnorderedAccessView(game_device_data.gtao_depth_mips_texture.get(), &uav_desc, &game_device_data.gtao_depth_mip_uavs[mip]));
+            ok = SUCCEEDED(native_device->CreateUnorderedAccessView(depth_mips_texture.get(), &uav_desc, &game_device_data.gtao_depth_mip_uavs[mip]));
          }
          desc.MipLevels = 1;
          desc.Format = DXGI_FORMAT_R8G8_UNORM;
@@ -1446,12 +1577,7 @@ public:
       if (!game_device_data.gtao_final_uav)
          return false;
 
-#if DEVELOPMENT
-      const float debug_view = float(g_gtao_debug_view);
-#else
-      const float debug_view = 0.f;
-#endif
-      const float knobs[8] = {g_gtao_final_value_power, float(normal_input_scale), g_gtao_radius_override, debug_view, 1.f / float(width), 1.f / float(height), 0.f, 0.f};
+      const float knobs[8] = {g_gtao_final_value_power, float(normal_input_scale), g_gtao_radius_override, float(g_gtao_debug_view), 1.f / float(width), 1.f / float(height), 0.f, 0.f};
       if (!game_device_data.gtao_knobs_cb || std::memcmp(game_device_data.gtao_knobs, knobs, sizeof(knobs)) != 0)
       {
          game_device_data.gtao_knobs_cb.reset();
@@ -1536,6 +1662,8 @@ public:
       com_ptr<ID3D11DeviceContext> native_device_context;
       if (FAILED(native->QueryInterface(&native_device_context)))
          return;
+      com_ptr<ID3D11Device> native_device;
+      native_device_context->GetDevice(&native_device);
       Persona5StrikersGameDeviceData::SRSplit split;
       {
          const std::lock_guard lock(game_device_data.sr_mutex);
@@ -1567,8 +1695,6 @@ public:
             {
                device_data->sr_output_color.reset();
                output_desc = {desc.Width, desc.Height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
-               com_ptr<ID3D11Device> native_device;
-               native_device_context->GetDevice(&native_device);
                native_device->CreateTexture2D(&output_desc, nullptr, &device_data->sr_output_color);
             }
          }
@@ -1618,14 +1744,14 @@ public:
             {
                // Also scaled back down into the scene: the post passes that read it at the render resolution (DOF, bloom, exposure) would
                // otherwise see the raw jittered frame, and the DOF merge would blend a shaking blur into the output (blurry and shaking)
-               com_ptr<ID3D11Device> native_device;
-               native_device_context->GetDevice(&native_device);
                com_ptr<ID3D11ShaderResourceView> output_srv;
                com_ptr<ID3D11RenderTargetView> scene_rtv;
                const D3D11_RENDER_TARGET_VIEW_DESC scene_rtv_desc = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_RTV_DIMENSION_TEXTURE2D};
                const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-               if (HasShaders(device_data->native_vertex_shaders, "P5S Downsample VS"_h) && HasShaders(device_data->native_pixel_shaders, "P5S Downsample PS"_h) && SUCCEEDED(native_device->CreateShaderResourceView(output_color, nullptr, &output_srv)) && SUCCEEDED(native_device->CreateRenderTargetView(split.source_color.get(), &scene_rtv_desc, &scene_rtv)))
-                  DrawCustomPixelShader(native_device_context.get(), device_data->default_depth_stencil_state.get(), device_data->default_blend_state.get(), device_data->sampler_state_linear.get(), device_data->native_vertex_shaders.at("P5S Downsample VS"_h).get(), device_data->native_pixel_shaders.at("P5S Downsample PS"_h).get(), output_srv.get(), scene_rtv.get(), desc.Width, desc.Height);
+               const com_ptr<ID3D11VertexShader> scale_vertex_shader = FindShader(device_data->native_vertex_shaders, "Scale VS"_h);
+               const com_ptr<ID3D11PixelShader> scale_pixel_shader = FindShader(device_data->native_pixel_shaders, "Scale PS"_h);
+               if (scale_vertex_shader && scale_pixel_shader && SUCCEEDED(native_device->CreateShaderResourceView(output_color, nullptr, &output_srv)) && SUCCEEDED(native_device->CreateRenderTargetView(split.source_color.get(), &scene_rtv_desc, &scene_rtv)))
+                  DrawCustomPixelShader(native_device_context.get(), device_data->default_depth_stencil_state.get(), device_data->default_blend_state.get(), device_data->sampler_state_linear.get(), scale_vertex_shader.get(), scale_pixel_shader.get(), output_srv.get(), scene_rtv.get(), desc.Width, desc.Height);
             }
             device_data->has_drawn_sr = true;
             game_device_data.sr_draws++;
@@ -1705,20 +1831,19 @@ public:
       UINT viewports = 1;
       native_device_context->RSGetViewports(&viewports, &viewport);
       const uint2 output_size = {uint32_t(device_data.output_resolution.x + 0.5f), uint32_t(device_data.output_resolution.y + 0.5f)};
-      // Most draws (the scene's included) stop here
-      if (!stretch && (viewports == 0 || viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f || viewport.Width >= float(output_size.x)))
+      // Most draws (the scene's included) stop here. The target must be output sized, so this is the render scale: the same in both axes
+      // (not a panel).
+      float scale[2] = {viewport.Width / float(output_size.x), viewport.Height / float(output_size.y)};
+      if (!stretch && (viewports == 0 || viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f || viewport.Width >= float(output_size.x) || scale[0] <= 0.f || std::abs(scale[0] - scale[1]) > 0.01f))
          return false;
       D3D11_TEXTURE2D_DESC target_desc = {};
       com_ptr<ID3D11Resource> target;
-      float scale[2];
       if (stretch)
       {
          // From a target the layer drew whole
          com_ptr<ID3D11ShaderResourceView> srv;
          native_device_context->PSGetShaderResources(0, 1, &srv);
-         com_ptr<ID3D11Resource> source;
-         if (srv)
-            srv->GetResource(&source);
+         const com_ptr<ID3D11Resource> source = GetViewResource(srv.get());
          const std::lock_guard lock(game_device_data.layer_mutex);
          const auto it = game_device_data.layer_frames.find(native_device_context);
          if (!source || it == game_device_data.layer_frames.end() || std::ranges::find(it->second.targets, source.get()) == it->second.targets.end())
@@ -1727,10 +1852,7 @@ public:
          game_device_data.layer_frames.erase(it);
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-         com_ptr<ID3D11Resource> stretch_target;
-         if (rtv)
-            rtv->GetResource(&stretch_target);
-         if (stretch_target)
+         if (const com_ptr<ID3D11Resource> stretch_target = GetViewResource(rtv.get()))
             game_device_data.layer_outputs[stretch_target.get()] = {scale[0], cb_luma_global_settings.FrameIndex};
       }
       else
@@ -1738,37 +1860,31 @@ public:
          com_ptr<ID3D11RenderTargetView> rtv;
          com_ptr<ID3D11DepthStencilView> dsv;
          native_device_context->OMGetRenderTargets(1, &rtv, &dsv);
-         if (rtv)
-            rtv->GetResource(&target);
+         target = GetViewResource(rtv.get());
          if (com_ptr<ID3D11Texture2D> texture; target && SUCCEEDED(target->QueryInterface(&texture)))
             texture->GetDesc(&target_desc);
-         // An output sized off-screen target, with the viewport at its top left corner smaller in both axes by the same ratio (not a panel)
+         // An output sized off-screen target, with the viewport at its top left corner
          if (target_desc.Width != output_size.x || target_desc.Height != output_size.y || IsBackBuffer(&device_data, target.get()))
-            return false;
-         scale[0] = viewport.Width / float(target_desc.Width);
-         scale[1] = viewport.Height / float(target_desc.Height);
-         if (scale[0] <= 0.f || std::abs(scale[0] - scale[1]) > 0.01f)
             return false;
          if (dsv)
          {
-            com_ptr<ID3D11Resource> depth;
-            dsv->GetResource(&depth);
             uint4 depth_size;
             DXGI_FORMAT depth_format;
-            GetResourceInfo(depth.get(), depth_size, depth_format);
+            GetResourceInfo(GetViewResource(dsv.get()).get(), depth_size, depth_format);
             if (depth_size.x != target_desc.Width || depth_size.y != target_desc.Height)
                return false;
          }
       }
 
-      // All or nothing: without it, the layer's quads would read a corner of what it drew
+      // All or nothing: without them, the layer's quads, its sprite onto the swapchain and its exposure would read a corner of what it drew
       com_ptr<ID3D11VertexShader> quad_vertex_shader;
       {
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-         if (!HasShaders(device_data.native_vertex_shaders, "P5S Layer Quad VS"_h))
+         quad_vertex_shader = FindShader(device_data.native_vertex_shaders, "P5S Layer Quad VS"_h);
+         if (!quad_vertex_shader || !HasShaders(device_data.native_vertex_shaders, "P5S Layer Sprite VS"_h, "Scale VS"_h) || !HasShaders(device_data.native_pixel_shaders, "Scale PS"_h))
             return false;
-         if (original_shader_hashes.Contains(quad_vertex_shader_hash, reshade::api::shader_stage::vertex))
-            quad_vertex_shader = device_data.native_vertex_shaders.at("P5S Layer Quad VS"_h);
+         if (!original_shader_hashes.Contains(quad_vertex_shader_hash, reshade::api::shader_stage::vertex))
+            quad_vertex_shader.reset();
       }
       com_ptr<ID3D11Buffer> uv_scale_buffer;
       if (quad_vertex_shader)
@@ -1786,41 +1902,17 @@ public:
       if (cluster_scale_offset != UINT_MAX)
       {
          native_device_context->PSGetConstantBuffers(0, 1, &original_globals);
-         std::vector<uint8_t> globals_data;
-         if (original_globals)
-         {
-            const std::lock_guard lock(game_device_data.mv_globals_mutex);
-            const uint64_t handle = reinterpret_cast<uint64_t>(original_globals.get());
-            game_device_data.mv_globals_buffers.insert(handle);
-            if (const auto copy = game_device_data.mv_globals_copies.find(handle); copy != game_device_data.mv_globals_copies.end())
-               globals_data = copy->second;
-         }
+         std::vector<uint8_t> globals_data = original_globals ? GetGlobalsCopy(&game_device_data, original_globals.get()) : std::vector<uint8_t>{};
          if (cluster_scale_offset + sizeof(float) <= globals_data.size())
          {
             float cluster_scale;
             std::memcpy(&cluster_scale, globals_data.data() + cluster_scale_offset, sizeof(float));
             cluster_scale *= scale[0];
             std::memcpy(globals_data.data() + cluster_scale_offset, &cluster_scale, sizeof(float));
-            {
-               const std::lock_guard lock(game_device_data.layer_mutex);
-               com_ptr<ID3D11Buffer>& upload = game_device_data.layer_globals_buffers[UINT(globals_data.size())];
-               if (!upload)
-               {
-                  const D3D11_BUFFER_DESC desc = {UINT(globals_data.size()), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-                  native_device->CreateBuffer(&desc, nullptr, &upload);
-               }
+            const std::lock_guard lock(game_device_data.layer_mutex);
+            com_ptr<ID3D11Buffer>& upload = game_device_data.layer_globals_buffers[UINT(globals_data.size())];
+            if (WriteConstants(native_device, native_device_context, std::addressof(upload), globals_data.data(), UINT(globals_data.size())))
                patched_globals = upload;
-            }
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            if (patched_globals && SUCCEEDED(native_device_context->Map(patched_globals.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-            {
-               std::memcpy(mapped.pData, globals_data.data(), globals_data.size());
-               native_device_context->Unmap(patched_globals.get(), 0);
-            }
-            else
-            {
-               patched_globals.reset();
-            }
          }
          else
          {
@@ -1841,8 +1933,6 @@ public:
       D3D11_RECT scissor = {};
       UINT scissors = 1;
       native_device_context->RSGetScissorRects(&scissors, &scissor);
-      com_ptr<ID3D11VertexShader> original_vertex_shader;
-      com_ptr<ID3D11Buffer> original_uv_scale_buffer;
       if (!stretch)
       {
          const D3D11_VIEWPORT full_viewport = {0.f, 0.f, float(target_desc.Width), float(target_desc.Height), viewport.MinDepth, viewport.MaxDepth};
@@ -1850,30 +1940,16 @@ public:
          native_device_context->RSSetViewports(1, &full_viewport);
          native_device_context->RSSetScissorRects(1, &full_scissor);
       }
-      if (quad_vertex_shader)
-      {
-         native_device_context->VSGetShader(&original_vertex_shader, nullptr, nullptr);
-         native_device_context->VSGetConstantBuffers(layer_uv_scale_cb_slot, 1, &original_uv_scale_buffer);
-         ID3D11Buffer* const buffer = uv_scale_buffer.get();
-         native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
-         native_device_context->VSSetShader(quad_vertex_shader.get(), nullptr, 0);
-      }
       if (patched_globals)
       {
          ID3D11Buffer* const buffer = patched_globals.get();
          native_device_context->PSSetConstantBuffers(0, 1, &buffer);
       }
-      draw();
+      DrawWithLayerVertexShader(native_device_context, quad_vertex_shader.get(), uv_scale_buffer.get(), draw);
       if (!stretch)
       {
          native_device_context->RSSetViewports(1, &viewport);
          native_device_context->RSSetScissorRects(scissors, &scissor);
-      }
-      if (quad_vertex_shader)
-      {
-         ID3D11Buffer* const buffer = original_uv_scale_buffer.get();
-         native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
-         native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
       }
       if (patched_globals)
       {
@@ -1912,129 +1988,7 @@ public:
          if (original_shader_hashes.Contains(post_process_start_shader_hashes))
          {
             if (native_device_context == game_device_data.mv_scene_context && !game_device_data.mv_frame_ended)
-            {
-               game_device_data.mv_frame_ended = true;
-
-               // The G-buffer's depth, if it can be read (a shader resource), otherwise the copy the game makes before post
-               com_ptr<ID3D11ShaderResourceView> depth_srv;
-               D3D11_TEXTURE2D_DESC depth_desc = {};
-               if (com_ptr<ID3D11Texture2D> depth_texture; game_device_data.mv_scene_depth && SUCCEEDED(game_device_data.mv_scene_depth->QueryInterface(&depth_texture)))
-                  depth_texture->GetDesc(&depth_desc);
-               if ((depth_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0)
-               {
-                  com_ptr<ID3D11Resource> view_resource;
-                  if (game_device_data.mv_scene_depth_srv)
-                     game_device_data.mv_scene_depth_srv->GetResource(&view_resource);
-                  if (view_resource != game_device_data.mv_scene_depth)
-                  {
-                     game_device_data.mv_scene_depth_srv.reset();
-                     // The depth channel of the depth formats
-                     const DXGI_FORMAT format = depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : (depth_desc.Format == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_R32_FLOAT : (depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : depth_desc.Format));
-                     D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {format, D3D11_SRV_DIMENSION_TEXTURE2D};
-                     view_desc.Texture2D.MipLevels = 1;
-                     native_device->CreateShaderResourceView(game_device_data.mv_scene_depth.get(), &view_desc, &game_device_data.mv_scene_depth_srv);
-                  }
-                  depth_srv = game_device_data.mv_scene_depth_srv;
-               }
-               else
-               {
-                  const std::lock_guard lock(game_device_data.smaa_depth_mutex);
-                  depth_srv = game_device_data.smaa_depth_srv;
-               }
-               game_device_data.mv_frame_depth.reset();
-               if (depth_srv)
-                  depth_srv->GetResource(&game_device_data.mv_frame_depth);
-
-               // Camera motion where no patched draw wrote
-               if (game_device_data.mv_fill_pending)
-               {
-                  game_device_data.mv_fill_pending = false;
-                  // Current clip space to the previous frame's, for row vectors: inverse(current) * previous. In double, the world
-                  // translation (centimetres) cancels out between the two.
-                  double reprojection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-                  if (game_device_data.mv_view_projection_valid && game_device_data.mv_previous_view_projection_valid)
-                  {
-                     float current_float[16], previous_float[16];
-                     std::memcpy(current_float, game_device_data.mv_view_projection.data(), sizeof(current_float));
-                     std::memcpy(previous_float, game_device_data.mv_previous_view_projection.data(), sizeof(previous_float));
-                     // Gauss-Jordan with partial pivoting on [current | identity]
-                     double a[4][8] = {};
-                     for (int row = 0; row < 4; row++)
-                     {
-                        for (int column = 0; column < 4; column++)
-                           a[row][column] = current_float[row * 4 + column];
-                        a[row][4 + row] = 1.0;
-                     }
-                     bool invertible = true;
-                     for (int column = 0; column < 4 && invertible; column++)
-                     {
-                        int pivot = column;
-                        for (int row = column + 1; row < 4; row++)
-                        {
-                           if (std::abs(a[row][column]) > std::abs(a[pivot][column]))
-                              pivot = row;
-                        }
-                        invertible = std::abs(a[pivot][column]) > 1e-30;
-                        std::swap(a[column], a[pivot]);
-                        const double scale = invertible ? 1.0 / a[column][column] : 0.0;
-                        for (double& value : a[column])
-                           value *= scale;
-                        for (int row = 0; row < 4; row++)
-                        {
-                           const double factor = row == column ? 0.0 : a[row][column];
-                           for (int i = 0; i < 8; i++)
-                              a[row][i] -= factor * a[column][i];
-                        }
-                     }
-                     for (int row = 0; row < 4 && invertible; row++)
-                     {
-                        for (int column = 0; column < 4; column++)
-                        {
-                           reprojection[row * 4 + column] = 0.0;
-                           for (int k = 0; k < 4; k++)
-                              reprojection[row * 4 + column] += a[row][4 + k] * double(previous_float[k * 4 + column]);
-                        }
-                     }
-                  }
-                  D3D11_TEXTURE2D_DESC mv_desc;
-                  game_device_data.mv_texture->GetDesc(&mv_desc);
-                  float constants[20] = {};
-                  for (int i = 0; i < 16; i++)
-                     constants[i] = float(reprojection[i]);
-                  constants[16] = game_device_data.mv_jitter[0] * 2.f / float(mv_desc.Width);
-                  constants[17] = game_device_data.mv_jitter[1] * -2.f / float(mv_desc.Height);
-                  if (!game_device_data.mv_fill_buffer)
-                  {
-                     const D3D11_BUFFER_DESC desc = {sizeof(constants), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-                     native_device->CreateBuffer(&desc, nullptr, &game_device_data.mv_fill_buffer);
-                  }
-                  D3D11_MAPPED_SUBRESOURCE mapped;
-                  const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-                  // ponytail: a shader reload between the clear and here (DEV) leaves the FLT_MAX marker for a frame
-                  if (depth_srv && game_device_data.mv_fill_buffer && HasShaders(device_data.native_compute_shaders, "P5S Motion Vector Fill CS"_h) && SUCCEEDED(native_device_context->Map(game_device_data.mv_fill_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-                  {
-                     std::memcpy(mapped.pData, constants, sizeof(constants));
-                     native_device_context->Unmap(game_device_data.mv_fill_buffer.get(), 0);
-                     DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-                     DrawStateStack<DrawStateStackType::Compute> compute_state;
-                     graphics_state.Cache(native_device_context, device_data.uav_max_count);
-                     compute_state.Cache(native_device_context, device_data.uav_max_count);
-                     // The depth may be bound as the depth target, and the motion vectors as a render target
-                     native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-                     ID3D11Buffer* const buffer = game_device_data.mv_fill_buffer.get();
-                     ID3D11ShaderResourceView* const srv = depth_srv.get();
-                     ID3D11UnorderedAccessView* const uav = game_device_data.mv_uav.get();
-                     native_device_context->CSSetConstantBuffers(0, 1, &buffer);
-                     native_device_context->CSSetShaderResources(0, 1, &srv);
-                     native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-                     native_device_context->CSSetShader(device_data.native_compute_shaders.at("P5S Motion Vector Fill CS"_h).get(), nullptr, 0);
-                     native_device_context->Dispatch((mv_desc.Width + 7) / 8, (mv_desc.Height + 7) / 8, 1);
-                     compute_state.Restore(native_device_context);
-                     graphics_state.Restore(native_device_context);
-                     game_device_data.mv_fills++;
-                  }
-               }
-            }
+               EndMotionVectorFrame(native_device, native_device_context, device_data);
          }
          else
          {
@@ -2046,7 +2000,9 @@ public:
                { return rtv.get() != nullptr; });
             D3D11_DEPTH_STENCIL_DESC depth_desc = {};
             com_ptr<ID3D11Buffer> vertex_buffer;
-            if (!gbuffer && dsv)
+            // Forward draws join a started frame on the scene context; out of a frame only a depth prepass (no targets) can start one
+            const bool scene_draw = game_device_data.mv_frame_ended ? !rtvs[0] : native_device_context == game_device_data.mv_scene_context;
+            if (!gbuffer && dsv && scene_draw)
             {
                com_ptr<ID3D11DepthStencilState> depth_stencil_state;
                UINT stencil_ref;
@@ -2082,9 +2038,7 @@ public:
       {
          com_ptr<ID3D11ShaderResourceView> layer_srv;
          native_device_context->CSGetShaderResources(0, 1, &layer_srv);
-         com_ptr<ID3D11Resource> layer;
-         if (layer_srv)
-            layer_srv->GetResource(&layer);
+         const com_ptr<ID3D11Resource> layer = GetViewResource(layer_srv.get());
          com_ptr<ID3D11RenderTargetView> histogram_rtv;
          com_ptr<ID3D11ShaderResourceView> histogram_srv;
          UINT width = 0;
@@ -2092,7 +2046,7 @@ public:
          if (layer)
          {
             const std::lock_guard lock(game_device_data.layer_mutex);
-            if (const float scale = GetRecentLayerScale(game_device_data.layer_outputs, layer.get()); scale > 0.f && scale < 1.f)
+            if (const float scale = GetRecentLayerScale(game_device_data.layer_outputs, layer.get()); scale > 0.f)
             {
                uint4 layer_size;
                DXGI_FORMAT layer_format;
@@ -2124,13 +2078,10 @@ public:
          if (histogram_srv)
          {
             const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-            if (HasShaders(device_data.native_vertex_shaders, "P5S Downsample VS"_h) && HasShaders(device_data.native_pixel_shaders, "P5S Downsample PS"_h))
-            {
-               downsample_vertex_shader = device_data.native_vertex_shaders.at("P5S Downsample VS"_h);
-               downsample_pixel_shader = device_data.native_pixel_shaders.at("P5S Downsample PS"_h);
-            }
+            downsample_vertex_shader = FindShader(device_data.native_vertex_shaders, "Scale VS"_h);
+            downsample_pixel_shader = FindShader(device_data.native_pixel_shaders, "Scale PS"_h);
          }
-         if (downsample_pixel_shader)
+         if (downsample_vertex_shader && downsample_pixel_shader)
          {
             {
                DrawStateStack<DrawStateStackType::FullGraphics> state;
@@ -2157,9 +2108,7 @@ public:
          game_device_data.sr_split_ready = false;
          com_ptr<ID3D11ShaderResourceView> scene_srv;
          native_device_context->PSGetShaderResources(0, 1, &scene_srv);
-         com_ptr<ID3D11Resource> scene;
-         if (scene_srv)
-            scene_srv->GetResource(&scene);
+         const com_ptr<ID3D11Resource> scene = GetViewResource(scene_srv.get());
          Persona5StrikersGameDeviceData::SRSplit split;
          D3D11_TEXTURE2D_DESC scene_desc = {};
          if (scene && SUCCEEDED(scene->QueryInterface(&split.source_color)))
@@ -2173,8 +2122,7 @@ public:
          // "mW2P" is row major and multiplies row vectors: its column 1 (xyz) is the view's up axis times 1 / tan(fov / 2)
          if (game_device_data.mv_view_projection_valid)
          {
-            float view_projection[16];
-            std::memcpy(view_projection, game_device_data.mv_view_projection.data(), sizeof(view_projection));
+            const auto& view_projection = game_device_data.mv_view_projection;
             split.vertical_fov = 2.f * std::atan(1.f / std::sqrt(view_projection[1] * view_projection[1] + view_projection[5] * view_projection[5] + view_projection[9] * view_projection[9]));
          }
          // Upscaling when the game renders below the output resolution (its render scale option): the output and the canvas at the output resolution
@@ -2189,16 +2137,19 @@ public:
                game_device_data.sr_upscaled_output.reset();
                game_device_data.sr_upscaled_output_rtv.reset();
                game_device_data.sr_upscaled_output_srv.reset();
-               game_device_data.sr_upscaled_canvas.reset();
                game_device_data.sr_upscaled_canvas_rtv.reset();
                game_device_data.sr_upscaled_canvas_srv.reset();
                output_desc = {output_size.x, output_size.y, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS};
                bool created = SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, &game_device_data.sr_upscaled_output)) && SUCCEEDED(native_device->CreateRenderTargetView(game_device_data.sr_upscaled_output.get(), nullptr, &game_device_data.sr_upscaled_output_rtv)) && SUCCEEDED(native_device->CreateShaderResourceView(game_device_data.sr_upscaled_output.get(), nullptr, &game_device_data.sr_upscaled_output_srv));
                output_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-               created = created && SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, &game_device_data.sr_upscaled_canvas)) && SUCCEEDED(native_device->CreateRenderTargetView(game_device_data.sr_upscaled_canvas.get(), nullptr, &game_device_data.sr_upscaled_canvas_rtv)) && SUCCEEDED(native_device->CreateShaderResourceView(game_device_data.sr_upscaled_canvas.get(), nullptr, &game_device_data.sr_upscaled_canvas_srv));
-               // Retried next frame; meanwhile the upscaler runs at the render resolution, which the game stretches
+               com_ptr<ID3D11Texture2D> canvas;
+               created = created && SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, &canvas)) && SUCCEEDED(native_device->CreateRenderTargetView(canvas.get(), nullptr, &game_device_data.sr_upscaled_canvas_rtv)) && SUCCEEDED(native_device->CreateShaderResourceView(canvas.get(), nullptr, &game_device_data.sr_upscaled_canvas_srv));
+               // Retried next frame (the size check above sees no output); meanwhile the upscaler runs at the render resolution, which the game stretches
                if (!created)
+               {
+                  game_device_data.sr_upscaled_output.reset();
                   game_device_data.sr_upscaled_canvas_srv.reset();
+               }
 #if DEVELOPMENT
                reshade::log::message(created ? reshade::log::level::info : reshade::log::level::warning, std::format("[P5S SR] upscaling {}x{} -> {}x{}{}", scene_desc.Width, scene_desc.Height, output_size.x, output_size.y, created ? "" : " failed").c_str());
 #endif
@@ -2262,9 +2213,7 @@ public:
          {
             com_ptr<ID3D11RenderTargetView> rtv;
             native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-            com_ptr<ID3D11Resource> target;
-            if (rtv)
-               rtv->GetResource(&target);
+            const com_ptr<ID3D11Resource> target = GetViewResource(rtv.get());
             game_device_data.composite_target.reset();
             if (target && !IsBackBuffer(&device_data, target.get()))
             {
@@ -2278,15 +2227,12 @@ public:
                // A 3D layer's composite, from its stretch target: see "layer_composed"
                com_ptr<ID3D11ShaderResourceView> scene_srv;
                native_device_context->PSGetShaderResources(0, 1, &scene_srv);
-               com_ptr<ID3D11Resource> scene;
-               if (scene_srv)
-                  scene_srv->GetResource(&scene);
                float layer_scale = 0.f;
-               if (scene)
+               if (const com_ptr<ID3D11Resource> scene = GetViewResource(scene_srv.get()))
                {
                   const std::lock_guard lock(game_device_data.layer_mutex);
                   layer_scale = GetRecentLayerScale(game_device_data.layer_outputs, scene.get());
-                  if (layer_scale > 0.f && layer_scale < 1.f)
+                  if (layer_scale > 0.f)
                      game_device_data.layer_composed[target.get()] = {layer_scale, cb_luma_global_settings.FrameIndex};
                }
                // It draws the render resolution corner (which the sprite then scales up), cut by its scissor (or viewport): the whole target,
@@ -2298,7 +2244,7 @@ public:
                D3D11_RECT scissor = {};
                UINT scissors = 1;
                native_device_context->RSGetScissorRects(&scissors, &scissor);
-               if (layer_scale > 0.f && layer_scale < 1.f && viewports != 0 && viewport.Width > 0.f && (viewport.Width < float(target_size.x) || (scissors != 0 && scissor.right < LONG(target_size.x))) && original_draw_dispatch_func && *original_draw_dispatch_func)
+               if (layer_scale > 0.f && viewports != 0 && viewport.Width > 0.f && (viewport.Width < float(target_size.x) || (scissors != 0 && scissor.right < LONG(target_size.x))))
                {
                   const D3D11_VIEWPORT full_viewport = {0.f, 0.f, float(target_size.x), float(target_size.y), viewport.MinDepth, viewport.MaxDepth};
                   const D3D11_RECT full_scissor = {0, 0, LONG(target_size.x), LONG(target_size.y)};
@@ -2321,7 +2267,7 @@ public:
             DrawStateStack<DrawStateStackType::FullGraphics> state;
             state.Cache(native_device_context, device_data.uav_max_count);
             D3D11_TEXTURE2D_DESC desc;
-            game_device_data.sr_upscaled_canvas->GetDesc(&desc);
+            game_device_data.sr_upscaled_output->GetDesc(&desc); // The canvas' size
             const D3D11_VIEWPORT viewport = {0.f, 0.f, float(desc.Width), float(desc.Height), 0.f, 1.f};
             const D3D11_RECT scissor = {0, 0, LONG(desc.Width), LONG(desc.Height)};
             ID3D11ShaderResourceView* const scene_srv = game_device_data.sr_upscaled_output_srv.get();
@@ -2354,9 +2300,7 @@ public:
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-         com_ptr<ID3D11Resource> target;
-         if (rtv)
-            rtv->GetResource(&target);
+         const com_ptr<ID3D11Resource> target = GetViewResource(rtv.get());
          float scale[2] = {};
          if (target)
          {
@@ -2364,11 +2308,10 @@ public:
             scale[0] = scale[1] = GetRecentLayerScale(game_device_data.layer_composed, target.get());
          }
          com_ptr<ID3D11VertexShader> quad_vertex_shader;
-         if (scale[0] > 0.f && scale[0] < 1.f)
+         if (scale[0] > 0.f)
          {
             const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-            if (HasShaders(device_data.native_vertex_shaders, "P5S Layer Quad VS"_h))
-               quad_vertex_shader = device_data.native_vertex_shaders.at("P5S Layer Quad VS"_h);
+            quad_vertex_shader = FindShader(device_data.native_vertex_shaders, "P5S Layer Quad VS"_h);
          }
          const com_ptr<ID3D11Buffer> uv_scale_buffer = quad_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr;
          D3D11_VIEWPORT viewport = {};
@@ -2382,21 +2325,11 @@ public:
             D3D11_RECT scissor = {};
             UINT scissors = 1;
             native_device_context->RSGetScissorRects(&scissors, &scissor);
-            com_ptr<ID3D11VertexShader> vertex_shader;
-            native_device_context->VSGetShader(&vertex_shader, nullptr, nullptr);
-            com_ptr<ID3D11Buffer> original_uv_scale_buffer;
-            native_device_context->VSGetConstantBuffers(layer_uv_scale_cb_slot, 1, &original_uv_scale_buffer);
             const D3D11_VIEWPORT whole_viewport = {viewport.TopLeftX / scale[0], viewport.TopLeftY / scale[1], viewport.Width / scale[0], viewport.Height / scale[1], viewport.MinDepth, viewport.MaxDepth};
             const D3D11_RECT whole_scissor = {0, 0, LONG(target_size.x), LONG(target_size.y)};
             native_device_context->RSSetViewports(1, &whole_viewport);
             native_device_context->RSSetScissorRects(1, &whole_scissor);
-            ID3D11Buffer* buffer = uv_scale_buffer.get();
-            native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
-            native_device_context->VSSetShader(quad_vertex_shader.get(), nullptr, 0);
-            (*original_draw_dispatch_func)();
-            buffer = original_uv_scale_buffer.get();
-            native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
-            native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
+            DrawWithLayerVertexShader(native_device_context, quad_vertex_shader.get(), uv_scale_buffer.get(), *original_draw_dispatch_func);
             native_device_context->RSSetViewports(1, &viewport);
             native_device_context->RSSetScissorRects(scissors, &scissor);
             game_device_data.layer_alpha_copies++;
@@ -2409,10 +2342,7 @@ public:
       {
          com_ptr<ID3D11ShaderResourceView> game_srv;
          native_device_context->PSGetShaderResources(0, 1, &game_srv);
-         com_ptr<ID3D11Resource> source;
-         if (game_srv)
-            game_srv->GetResource(&source);
-         if (source && source == game_device_data.composite_target)
+         if (const com_ptr<ID3D11Resource> source = GetViewResource(game_srv.get()); source && source == game_device_data.composite_target)
          {
             if (native_device_context != game_device_data.sr_upscaling_context)
                return DrawOrDispatchOverrideType::None;
@@ -2433,10 +2363,7 @@ public:
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-         com_ptr<ID3D11Resource> rtv_resource;
-         if (rtv)
-            rtv->GetResource(&rtv_resource);
-         if (rtv_resource && IsBackBuffer(&device_data, rtv_resource.get()))
+         if (const com_ptr<ID3D11Resource> rtv_resource = GetViewResource(rtv.get()); rtv_resource && IsBackBuffer(&device_data, rtv_resource.get()))
          {
             if (g_hide_ui)
                return DrawOrDispatchOverrideType::Skip;
@@ -2446,11 +2373,8 @@ public:
             {
                com_ptr<ID3D11ShaderResourceView> layer_srv;
                native_device_context->PSGetShaderResources(0, 1, &layer_srv);
-               com_ptr<ID3D11Resource> layer;
-               if (layer_srv)
-                  layer_srv->GetResource(&layer);
                float scale[2] = {};
-               if (layer)
+               if (const com_ptr<ID3D11Resource> layer = GetViewResource(layer_srv.get()))
                {
                   const std::lock_guard lock(game_device_data.layer_mutex);
                   scale[0] = scale[1] = GetRecentLayerScale(game_device_data.layer_composed, layer.get());
@@ -2459,23 +2383,12 @@ public:
                if (scale[0] > 0.f)
                {
                   const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-                  if (HasShaders(device_data.native_vertex_shaders, "P5S Layer Sprite VS"_h))
-                     sprite_vertex_shader = device_data.native_vertex_shaders.at("P5S Layer Sprite VS"_h);
+                  sprite_vertex_shader = FindShader(device_data.native_vertex_shaders, "P5S Layer Sprite VS"_h);
                }
                const com_ptr<ID3D11Buffer> uv_scale_buffer = sprite_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr;
                if (uv_scale_buffer)
                {
-                  com_ptr<ID3D11VertexShader> vertex_shader;
-                  native_device_context->VSGetShader(&vertex_shader, nullptr, nullptr);
-                  com_ptr<ID3D11Buffer> original_uv_scale_buffer;
-                  native_device_context->VSGetConstantBuffers(layer_uv_scale_cb_slot, 1, &original_uv_scale_buffer);
-                  ID3D11Buffer* buffer = uv_scale_buffer.get();
-                  native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
-                  native_device_context->VSSetShader(sprite_vertex_shader.get(), nullptr, 0);
-                  (*original_draw_dispatch_func)();
-                  buffer = original_uv_scale_buffer.get();
-                  native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
-                  native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
+                  DrawWithLayerVertexShader(native_device_context, sprite_vertex_shader.get(), uv_scale_buffer.get(), *original_draw_dispatch_func);
                   game_device_data.layer_sprite_draws++;
                   return DrawOrDispatchOverrideType::Replaced;
                }
@@ -2515,12 +2428,9 @@ public:
                   com_ptr<ID3D11PixelShader> peak_pixel_shader;
                   {
                      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-                     if (HasShaders(device_data.native_pixel_shaders, "P5S Draw White PS"_h, "P5S Draw Black PS"_h, "P5S UI Peak Clamp PS"_h))
-                     {
-                        white_pixel_shader = device_data.native_pixel_shaders.at("P5S Draw White PS"_h);
-                        black_pixel_shader = device_data.native_pixel_shaders.at("P5S Draw Black PS"_h);
-                        peak_pixel_shader = device_data.native_pixel_shaders.at("P5S UI Peak Clamp PS"_h);
-                     }
+                     white_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw White PS"_h);
+                     black_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw Black PS"_h);
+                     peak_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Peak Clamp PS"_h);
                   }
                   // Index 0 all channels, 1 alpha only
                   const int channels = subtracts_colors ? 0 : 1;
@@ -2676,6 +2586,13 @@ public:
       device_data.has_drawn_sr = false;
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.mv_presents++;
+      {
+         const std::lock_guard lock(game_device_data.layer_mutex);
+         const auto stale = [](const auto& entry)
+         { return cb_luma_global_settings.FrameIndex - entry.second.frame_index > 1; };
+         std::erase_if(game_device_data.layer_outputs, stale);
+         std::erase_if(game_device_data.layer_composed, stale);
+      }
       {
          // The main menu from 30 presents on (loading screens and fades in between stay at the game's scale), until the scene draws again.
          // Scene frames are only seen with DLSS/FSR (the motion vectors start them), which is also when 100% matters.

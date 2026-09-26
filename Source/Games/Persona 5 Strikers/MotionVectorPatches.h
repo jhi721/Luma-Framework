@@ -12,6 +12,8 @@
 // Pixel shaders: an extra render target gets the UV space delta from the current to the previous position.
 namespace MotionVectorPatches
 {
+   // The cbuffer the second run reads from the previous frame's copy ($Globals), and that copy's slot
+   constexpr uint32_t globals_slot = 0;
    constexpr uint32_t previous_globals_slot = 10;
    // The projection jitter for temporal upscalers, in NDC (c0.xy), added to the current position after its unjittered copy (so the
    // motion vectors never contain it)
@@ -306,9 +308,8 @@ namespace MotionVectorPatches
       return last;
    }
 
-   // The vertex shader with the second run added, or empty if it can't be patched (the draw then keeps the original shaders).
-   // "globals_slot" is the cbuffer the second run reads from the previous frame's copy.
-   inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, std::string* error, uint32_t globals_slot = 0)
+   // The vertex shader with the second run added, or empty if it can't be patched (the draw then keeps the original shaders)
+   inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, std::string* error)
    {
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
