@@ -614,10 +614,15 @@ namespace MotionVectorPatches
    // the sub-rect by the jitter buffer's share (cb9[0].zw, see "Luma_SR4_SubRectQuad.hlsl"):
    // - one that makes its screen UV from NDC itself, "mad rX.xy, rY.xyxx, l(0.5, -0.5, ..), l(0.5, 0.5, ..)", gets
    //   "mul rX.xy, rX.xyxx, cb9[0].zwzz" after it;
-   // - every read of "texture_slot" (none: no_texture) at a register coordinate reads at "mul rNew.xy, coordinate, cb9[0].zwzz".
-   // Empty if nothing matched or there's no constant buffer declaration to copy.
-   constexpr uint32_t no_texture = UINT32_MAX;
-   inline std::vector<uint8_t> PatchScreenUVPixelShader(const uint8_t* code, size_t size, uint32_t texture_slot, std::string* error)
+   // - every read of the "texture_slots" (a bit per t slot, none: no_texture) at a register coordinate reads at
+   //   "mul rNew.xy, coordinate, cb9[0].zwzz";
+   // - the stipple DSF (material pass, "IR_Stipple_Pattern_Offset"), "mad rB.xyzw, cb4[9].xyxy, l(0.9, ..), rA.xzxz" (viewport UV plus
+   //   0.9 texel), then the texel from rB ("IR_Pixel_Steps.zw", the render size under the sub-rect), after which rB is only compared
+   //   with the samples' UVs over the full texture (distance weights, all zero from the sub-rect: black): after that texel instruction
+   //   rB = (rB - 0.9 * cb4[9].xy) * cb9[0].zw + 0.9 * cb4[9].xy.
+   // Empty if nothing matched ("no screen uv") or there's no constant buffer declaration to copy.
+   constexpr uint32_t no_texture = 0;
+   inline std::vector<uint8_t> PatchScreenUVPixelShader(const uint8_t* code, size_t size, uint32_t texture_slots, std::string* error)
    {
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
@@ -656,11 +661,11 @@ namespace MotionVectorPatches
                 t[5] == immediate && t[6] == std::bit_cast<uint32_t>(0.5f) && t[7] == std::bit_cast<uint32_t>(-0.5f) &&
                 t[10] == immediate && t[11] == std::bit_cast<uint32_t>(0.5f) && t[12] == std::bit_cast<uint32_t>(0.5f);
       };
-      // A texture read (sample*, ld, gather4) of "texture_slot": the position of its coordinate operand (2 tokens, a 1D register without
+      // A texture read (sample*, ld, gather4) of one of the "texture_slots": the position of its coordinate operand (2 tokens, a 1D register without
       // modifiers), else 0
       const auto screen_texture_coordinate = [&](const Instruction& instruction) -> size_t
       {
-         if (texture_slot == no_texture || (instruction.opcode != D3D10_SB_OPCODE_SAMPLE && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_L && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_B && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_D && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_C && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_C_LZ && instruction.opcode != D3D10_SB_OPCODE_LD && instruction.opcode != D3D10_1_SB_OPCODE_GATHER4))
+         if (texture_slots == no_texture || (instruction.opcode != D3D10_SB_OPCODE_SAMPLE && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_L && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_B && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_D && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_C && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_C_LZ && instruction.opcode != D3D10_SB_OPCODE_LD && instruction.opcode != D3D10_1_SB_OPCODE_GATHER4))
             return 0;
          std::vector<size_t> operands;
          if (!WalkOperands(tokens, instruction, [&](size_t token_position, size_t)
@@ -671,14 +676,25 @@ namespace MotionVectorPatches
             return 0;
          const uint32_t coordinate = tokens[operands[1]], resource = tokens[operands[2]];
          const D3D10_SB_OPERAND_TYPE coordinate_type = DECODE_D3D10_SB_OPERAND_TYPE(coordinate);
-         if (DECODE_D3D10_SB_OPERAND_TYPE(resource) != D3D10_SB_OPERAND_TYPE_RESOURCE || tokens[operands[2] + 1] != texture_slot || (coordinate_type != D3D10_SB_OPERAND_TYPE_INPUT && coordinate_type != D3D10_SB_OPERAND_TYPE_TEMP) || DECODE_IS_D3D10_SB_OPERAND_EXTENDED(coordinate) || DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(coordinate) != D3D10_SB_OPERAND_INDEX_1D || operands[2] != operands[1] + 2)
+         if (DECODE_D3D10_SB_OPERAND_TYPE(resource) != D3D10_SB_OPERAND_TYPE_RESOURCE || tokens[operands[2] + 1] >= 32 || (texture_slots & (1u << tokens[operands[2] + 1])) == 0 || (coordinate_type != D3D10_SB_OPERAND_TYPE_INPUT && coordinate_type != D3D10_SB_OPERAND_TYPE_TEMP) || DECODE_IS_D3D10_SB_OPERAND_EXTENDED(coordinate) || DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(coordinate) != D3D10_SB_OPERAND_INDEX_1D || operands[2] != operands[1] + 2)
             return 0;
          return operands[1];
       };
-      const uint32_t cb9_zw = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(2, 3, 2, 2) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      constexpr uint32_t mad = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MAD) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(13);
+      constexpr uint32_t mask_xyzw = D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL;
+      constexpr uint32_t bias = std::bit_cast<uint32_t>(0.9f);
+      const auto is_stipple_uv = [&](const Instruction& instruction)
+      {
+         const uint32_t* t = tokens.data() + instruction.begin;
+         return instruction.length == 13 && t[0] == mad && t[1] == Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xyzw) && DECODE_D3D10_SB_OPERAND_TYPE(t[3]) == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER &&
+                t[4] == 4 && t[5] == 9 && t[6] == immediate && t[7] == bias && t[8] == bias && t[9] == bias && t[10] == bias;
+      };
+      const auto cb9_swizzle = [](uint32_t x, uint32_t y, uint32_t z, uint32_t w)
+      { return ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(x, y, z, w) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32); };
+      const uint32_t cb9_zw = cb9_swizzle(2, 3, 2, 2);
       constexpr uint32_t mul = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8);
       uint32_t scaled;
-      std::vector<uint32_t> patched = CopyDeclarations(tokens, instructions, first_body, texture_slot == no_texture ? 0 : 1, &scaled, [&](size_t i)
+      std::vector<uint32_t> patched = CopyDeclarations(tokens, instructions, first_body, texture_slots == no_texture ? 0 : 1, &scaled, [&](size_t i)
          {
             std::vector<uint32_t> added;
             if (i == constant_buffer)
@@ -705,6 +721,23 @@ namespace MotionVectorPatches
             continue;
          }
          patched.insert(patched.end(), tokens.begin() + instruction.begin, tokens.begin() + instruction.begin + instruction.length);
+         if (is_stipple_uv(instruction) && i + 1 < instructions.size())
+         {
+            // The texel instruction reads rB first ("mad rT.xy, rB.zwzz, cb4[9].zwzz, ..")
+            const Instruction& texel = instructions[i + 1];
+            const uint32_t uv = tokens[instruction.begin + 2];
+            if (texel.opcode != D3D10_SB_OPCODE_MAD || texel.length < 5 || DECODE_D3D10_SB_OPERAND_TYPE(tokens[texel.begin + 3]) != D3D10_SB_OPERAND_TYPE_TEMP || tokens[texel.begin + 4] != uv)
+               continue;
+            patched.insert(patched.end(), tokens.begin() + texel.begin, tokens.begin() + texel.begin + texel.length);
+            const uint32_t* c9 = tokens.data() + instruction.begin + 3;
+            constexpr uint32_t negative_bias = std::bit_cast<uint32_t>(-0.9f);
+            patched.insert(patched.end(), {mad, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xyzw), uv, c9[0], c9[1], c9[2], immediate, negative_bias, negative_bias, negative_bias, negative_bias, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3), uv,
+                                             mul, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xyzw), uv, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3), uv, cb9_swizzle(2, 3, 2, 3), jitter_slot, 0,
+                                             mad, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xyzw), uv, c9[0], c9[1], c9[2], immediate, bias, bias, bias, bias, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3), uv});
+            i++;
+            found = true;
+            continue;
+         }
          if (!is_ndc_to_uv(instruction))
             continue;
          const uint32_t uv = tokens[instruction.begin + 2];
