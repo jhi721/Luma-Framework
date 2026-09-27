@@ -195,14 +195,14 @@ namespace
    bool g_mv_debug_view = false;
    bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
    bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
-   // "Performance Test" (see "OnPresent"): the mode, and the anti-aliasing it sets while it runs (the user's is restored on "Off" or
-   // "Current Settings", and never saved)
+   // "Performance Test" (see "OnPresent"): the mode, and the anti-aliasing, render scale and GTAO resolution it sets while it runs (the
+   // user's are restored on "Off" or "Current Settings", and never saved)
    int g_perf_test = 0;
    bool g_perf_hook_timers = true; // The hooks' CPU time (two clock reads per hooked draw, themselves a cost to measure)
    struct PerfTestMode
    {
       const char* name;
-      bool set_aa = false; // Else the current settings
+      bool set_aa = false; // Else the current settings (the fields below too)
       SR::Type sr_type = SR::Type::None;
       unsigned int dlss_preset = 0; // NVSDK_NGX_DLSS_Hint_Render_Preset (5 = E, 11 = K, ...)
       bool smaa = false;
@@ -214,12 +214,12 @@ namespace
       {"Off"},
       {"Current Settings"},
       {"DLSS K", true, SR::Type::DLSS, 11},
-      {"DLSS K 100%", true, SR::Type::DLSS, 11, false, 2, 1.f},
-      {"DLSS K 67%", true, SR::Type::DLSS, 11, false, 2, 0.67f},
-      {"DLSS K 50%", true, SR::Type::DLSS, 11, false, 2, 0.5f},
+      {"DLSS K 100%", true, SR::Type::DLSS, 11, false, 2, 1.f, 0},
+      {"DLSS K 67%", true, SR::Type::DLSS, 11, false, 2, 0.67f, 0},
+      {"DLSS K 50%", true, SR::Type::DLSS, 11, false, 2, 0.5f, 0},
       {"DLSS K 100% GTAO Half Res", true, SR::Type::DLSS, 11, false, 2, 1.f, 1},
-      {"DLSS K 100% Jitter Only", true, SR::Type::DLSS, 11, false, 1, 1.f},
-      {"DLSS K 100% Without Motion Vector Draws", true, SR::Type::DLSS, 11, false, 0, 1.f},
+      {"DLSS K 100% Jitter Only", true, SR::Type::DLSS, 11, false, 1, 1.f, 0},
+      {"DLSS K 100% Without Motion Vector Draws", true, SR::Type::DLSS, 11, false, 0, 1.f, 0},
       {"DLSS L", true, SR::Type::DLSS, 12},
       {"DLSS M", true, SR::Type::DLSS, 13},
       {"DLSS E (CNN)", true, SR::Type::DLSS, 5},
@@ -232,6 +232,7 @@ namespace
    bool g_perf_sweep = false;
    constexpr int perf_sweep_modes[] = {3, 4, 5, 6, 7, 8, 14};
    static_assert(std::string_view(perf_test_modes[perf_sweep_modes[0]].name) == "DLSS K 100%" && std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
+   static_assert(std::size(perf_test_modes) <= 32); // 5 bits in "perf_settings"
    constexpr int perf_sweep_rounds = 5;
    constexpr int perf_sweep_windows = 3; // Per mode and round
    uint32_t g_pixel_steps_overrides_this_frame = 0;
@@ -627,7 +628,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    uint32_t perf_settings = 0;                // The measured settings, to restart the settle on a change
    std::chrono::steady_clock::time_point perf_last_present;
    std::atomic<int64_t> perf_hook_ns = 0; // This log window's
-   // The user's anti-aliasing, while a mode that sets its own runs
+   // The user's anti-aliasing, render scale and GTAO resolution, while a mode that sets its own runs
    SR::Type perf_user_sr_type = SR::Type::None;
    unsigned int perf_user_dlss_preset = 0;
    bool perf_user_smaa = false;
@@ -724,8 +725,8 @@ class SaintsRowIV final : public Game
    }
 
 #if DEVELOPMENT
-   // "Performance Test": switches to a mode, setting its anti-aliasing as Core's "Super Resolution" and "DLSS Preset" selection do
-   // (without saving), keeping the user's while any mode that sets its own runs and restoring it after
+   // "Performance Test": switches to a mode, setting its anti-aliasing as Core's "Super Resolution" and "DLSS Preset" selection do, and
+   // its render scale and GTAO resolution (without saving), keeping the user's while any mode that sets its own runs and restoring them after
    static void ApplyPerfTestMode(DeviceData& device_data, int mode_index)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -736,6 +737,8 @@ class SaintsRowIV final : public Game
          game_device_data.perf_user_sr_type = device_data.sr_type;
          game_device_data.perf_user_dlss_preset = dlss_render_preset;
          game_device_data.perf_user_smaa = g_smaa_enable;
+         game_device_data.perf_user_render_scale = g_render_scale;
+         game_device_data.perf_user_gtao_full_res = g_gtao_full_res;
       }
       if (mode.set_aa || previous_mode.set_aa)
       {
@@ -743,15 +746,9 @@ class SaintsRowIV final : public Game
          device_data.sr_suppressed = false;
          dlss_render_preset = mode.set_aa && mode.sr_type == SR::Type::DLSS ? mode.dlss_preset : game_device_data.perf_user_dlss_preset;
          g_smaa_enable = mode.set_aa ? mode.smaa : game_device_data.perf_user_smaa;
-      }
-      if (previous_mode.render_scale <= 0.f && mode.render_scale > 0.f)
-         game_device_data.perf_user_render_scale = g_render_scale;
-      if (previous_mode.render_scale > 0.f || mode.render_scale > 0.f)
          g_render_scale = mode.render_scale > 0.f ? mode.render_scale : game_device_data.perf_user_render_scale;
-      if (previous_mode.gtao_full_res < 0 && mode.gtao_full_res >= 0)
-         game_device_data.perf_user_gtao_full_res = g_gtao_full_res;
-      if (previous_mode.gtao_full_res >= 0 || mode.gtao_full_res >= 0)
          g_gtao_full_res = mode.gtao_full_res >= 0 ? mode.gtao_full_res : game_device_data.perf_user_gtao_full_res;
+      }
       g_perf_test = mode_index;
    }
 #endif
@@ -1290,9 +1287,7 @@ class SaintsRowIV final : public Game
          if (rtvs[slot] && (slot != MotionVectorPatches::target_slot || rtvs[slot] != game_device_data.mv_rtv))
             return false;
       }
-      if (!rtvs[0] || !dsv)
-         return false;
-      if (!game_device_data.mv_scene_open)
+      if (!rtvs[0] || !dsv || !game_device_data.mv_scene_open)
          return false;
       // Known targets: checked, and the motion vector target built for them
       if (rtvs[0].get() != game_device_data.mv_accepted_rtv || dsv != game_device_data.mv_accepted_dsv)
@@ -1303,19 +1298,15 @@ class SaintsRowIV final : public Game
             return false;
          D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
          rtvs[0]->GetDesc(&rtv_desc);
-         if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
-            return false;
          // The motion vector target is single sampled; an MSAA scene (display.ini MSAA_Level) turns the upscaler off (see "IsSRActive")
-         if (rtv_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D)
+         if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || rtv_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D)
             return false;
          uint4 size, depth_size;
          DXGI_FORMAT unused_format;
          GetResourceInfo(rtvs[0].get(), size, unused_format);
          GetResourceInfo(dsv, depth_size, unused_format);
          // The main scene only (reflections and cube faces are smaller)
-         if (size.x != device_data.output_resolution.x || size.y != device_data.output_resolution.y)
-            return false;
-         if (depth_size.x != size.x || depth_size.y != size.y)
+         if (size.x != device_data.output_resolution.x || size.y != device_data.output_resolution.y || depth_size.x != size.x || depth_size.y != size.y)
             return false;
          const std::unique_lock lock(game_device_data.mv_mutex);
          D3D11_TEXTURE2D_DESC desc = {};
@@ -1368,9 +1359,7 @@ class SaintsRowIV final : public Game
          game_device_data.mv_last_pixel_shader_sub_rect = sub_rect;
       }
       ID3D11PixelShader* const pixel_shader = game_device_data.mv_last_pixel_shader;
-      if (!vertex_shader || !pixel_shader)
-         return false;
-      if (!game_device_data.mv_jitter_buffer)
+      if (!vertex_shader || !pixel_shader || !game_device_data.mv_jitter_buffer)
          return false;
       if (std::exchange(game_device_data.mv_frame_ended, false))
       {
@@ -1471,8 +1460,6 @@ class SaintsRowIV final : public Game
                }
             }
          }
-         // Draws with another projTM than the frame's camera (sky, windows at infinity) are left as is and not tracked
-         const bool frame_camera = std::memcmp(object->data(), game_device_data.mv_camera.data(), camera_size) == 0;
          if (match)
          {
             // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
@@ -1482,7 +1469,8 @@ class SaintsRowIV final : public Game
             // Kept as drawn for the next frame
             game_device_data.mv_objects[key].push_back({translation, object, bones});
          }
-         else if (frame_camera)
+         // Draws with another projTM than the frame's camera (sky, windows at infinity) are left as is and not tracked
+         else if (std::memcmp(object->data(), game_device_data.mv_camera.data(), camera_size) == 0)
          {
             // Not found: its own constants with last frame's camera (camera motion only)
             if (game_device_data.mv_previous_camera_valid)
@@ -1595,16 +1583,16 @@ class SaintsRowIV final : public Game
       const double far_plane = (a > 1.0 && b / (1.0 - a) > near_plane) ? b / (1.0 - a) : 100000.0;
       const double vert_fov = length3(up) > 0.0 ? 2.0 * std::atan(1.0 / length3(up)) : 0.0;
 
-      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-      DrawStateStack<DrawStateStackType::Compute> compute_state;
-      graphics_state.Cache(native_device_context, device_data.uav_max_count);
-      compute_state.Cache(native_device_context, device_data.uav_max_count);
-
       // The top-left render sub-rect under the render scale, else the whole scene
       const uint32_t render_width = (std::min)(game_device_data.mv_render_size[0], scene_desc.Width);
       const uint32_t render_height = (std::min)(game_device_data.mv_render_size[1], scene_desc.Height);
       if (render_width == 0 || render_height == 0)
          return;
+
+      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+      DrawStateStack<DrawStateStackType::Compute> compute_state;
+      graphics_state.Cache(native_device_context, device_data.uav_max_count);
+      compute_state.Cache(native_device_context, device_data.uav_max_count);
 
       SR::SettingsData settings_data;
       settings_data.output_width = scene_desc.Width;
@@ -2396,13 +2384,18 @@ public:
       const uint32_t input_scale = (depth_size.x + width / 2) / width;
       if (input_scale == 0 || (depth_size.y + height / 2) / height != input_scale || normals_size.x != depth_size.x || normals_size.y != depth_size.y)
          return false;
-      // Full resolution mode: every pass at the depth's size, averaged into the target at the end ("downsample_cs"). At half res the
-      // upscaler's jitter flips a target pixel's one depth texel between grass blades and the ground: the AO boils. On with DLSS/FSR
-      // (+0.55 ms at 4K, DLSS K, "Performance Test" sweep).
+      // DLSS/FSR accumulate the lit scene the AO multiplies into: cycle the noise and denoise once (Intel's XeGTAO.h with TAA);
+      // without them a moving pattern would boil, so it stays frozen and denoises twice. Full resolution mode (also with DLSS/FSR,
+      // +0.55 ms at 4K, DLSS K, "Performance Test" sweep): every pass at the depth's size, averaged into the target at the end
+      // ("downsample_cs"). At half res the upscaler's jitter flips a target pixel's one depth texel between grass blades and the
+      // ground: the AO boils.
+      const bool temporal = IsSRActive(device_data);
 #if DEVELOPMENT
-      const bool full_res = g_gtao_full_res ? g_gtao_full_res == 2 : IsSRActive(device_data);
+      const bool full_res = g_gtao_full_res ? g_gtao_full_res == 2 : temporal;
+      const bool noise_per_frame = g_gtao_noise_per_frame ? g_gtao_noise_per_frame == 2 : temporal;
+      const bool single_denoise = g_gtao_single_denoise ? g_gtao_single_denoise == 2 : temporal;
 #else
-      const bool full_res = IsSRActive(device_data);
+      const bool full_res = temporal, noise_per_frame = temporal, single_denoise = temporal;
 #endif
       const uint32_t work_width = full_res ? depth_size.x : width, work_height = full_res ? depth_size.y : height;
 
@@ -2450,15 +2443,6 @@ public:
       const float debug_view = float(g_gtao_debug_view);
 #else
       const float debug_view = 0.f;
-#endif
-      // DLSS/FSR accumulate the lit scene the AO multiplies into: cycle the noise and denoise once (Intel's XeGTAO.h with TAA);
-      // without them a moving pattern would boil, so it stays frozen and denoises twice
-      const bool temporal = IsSRActive(device_data);
-#if DEVELOPMENT
-      const bool noise_per_frame = g_gtao_noise_per_frame ? g_gtao_noise_per_frame == 2 : temporal;
-      const bool single_denoise = g_gtao_single_denoise ? g_gtao_single_denoise == 2 : temporal;
-#else
-      const bool noise_per_frame = temporal, single_denoise = temporal;
 #endif
       // Render scale: the scene fills the target's top-left share (see "g_render_scale"): the shader's ndc follow it, the main
       // pass and the denoise run over it only (the depth prefilter covers the whole target, so samples past the edge read cleared depth)
@@ -3268,7 +3252,7 @@ public:
                if (IsSRActive(device_data))
                   aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
                const std::array<double, 4> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.sr_ms, stats.sr_samples), double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames};
-               reshade::log::message(reshade::log::level::info, std::format("[SR4 Perf] mode=\"{}\" aa={} hook_timers={} msaa={} gtao={} gtao_full_res={} render_scale={:.2f} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test].name, aa, g_perf_hook_timers, game_device_data.msaa_scene, g_gtao_enable, g_gtao_full_res, IsSRActive(device_data) ? GetSubRectScale(device_data) : 1.f, g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), window[0], stats.frame_max_ms, window[1], stats.scene_max_ms, stats.scene_samples, window[2], stats.sr_max_ms, stats.sr_samples, stats.cpu_frame_ms / stats.frames, window[3], stats.samples, stats.frames, stats.disjoint).c_str());
+               reshade::log::message(reshade::log::level::info, std::format("[SR4 Perf] mode=\"{}\" aa={} hook_timers={} msaa={} gtao={} gtao_full_res={} render_scale={:.2f} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test].name, aa, g_perf_hook_timers, game_device_data.msaa_scene, g_gtao_enable, g_gtao_full_res, GetSubRectScale(device_data), g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), window[0], stats.frame_max_ms, window[1], stats.scene_max_ms, stats.scene_samples, window[2], stats.sr_max_ms, stats.sr_samples, stats.cpu_frame_ms / stats.frames, window[3], stats.samples, stats.frames, stats.disjoint).c_str());
                stats = {};
 
                if (g_perf_sweep)
@@ -3445,7 +3429,7 @@ public:
          ImGui::EndCombo();
       }
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Logs \"[SR4 Perf]\" to ReShade.log every 120 frames (the first 60 after a change of mode or AA settings, or a pause, skipped): the GPU\ntime of the whole frame (present to present), of the scene (G-buffer to its first post pass: motion vector, jitter and camera\nfill included) and of DLSS/FSR (timestamps), the CPU frame time and the CPU time in the motion vector hooks.\nThe modes set the anti-aliasing and DLSS preset themselves (the user's come back on \"Off\" or \"Current Settings\", nothing is\nsaved). \"Jitter Only\" draws the material pass jittered but without motion vectors, \"Without Motion Vector Draws\" leaves every\ndraw untouched (unjittered): the differences to \"DLSS K\" are their costs. Keep the camera still and the game focused, 10 s per mode.\n\"Sweep\" runs the DLSS K render scale, GTAO and motion vector modes, then No AA, in turn, %d windows each, %d rounds, then logs\n\"[SR4 Perf] sweep\" lines: each mode's median window and its frame time against No AA; picking another mode stops it.", perf_sweep_windows, perf_sweep_rounds);
+         ImGui::SetTooltip("Logs \"[SR4 Perf]\" to ReShade.log every 120 frames (the first 60 after a change of mode or AA settings, or a pause, skipped): the GPU\ntime of the whole frame (present to present), of the scene (G-buffer to its first post pass: motion vector, jitter and camera\nfill included) and of DLSS/FSR (timestamps), the CPU frame time and the CPU time in the motion vector hooks.\nThe modes set the anti-aliasing, DLSS preset, render scale and GTAO resolution themselves (the user's come back on \"Off\" or\n\"Current Settings\", nothing is saved). \"Jitter Only\" draws the material pass jittered but without motion vectors, \"Without\nMotion Vector Draws\" leaves every draw untouched (unjittered): the differences to \"DLSS K 100%\" are their costs. Keep the camera still and the game focused, 10 s per mode.\n\"Sweep\" runs the DLSS K render scale, GTAO and motion vector modes, then No AA, in turn, %d windows each, %d rounds, then logs\n\"[SR4 Perf] sweep\" lines: each mode's median window and its frame time against No AA; picking another mode stops it.", perf_sweep_windows, perf_sweep_rounds);
       ImGui::Checkbox("Hook Timers", &g_perf_hook_timers);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Times the motion vector hooks for \"cpu hooks\" (two clock reads per hooked draw, ~9000 a frame in a dense view).\nRun a Sweep with it off to see their own cost in the frame times.");
