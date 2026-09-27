@@ -3237,8 +3237,19 @@ public:
 
       ImGui::SeparatorText("Anti-Aliasing");
 
-      // The upscaler (Super Resolution, in the Settings tab) replaces MSAA and SMAA: shown off, the saved choices are kept
       const bool sr_active = IsSRActive(device_data);
+      ImGui::BeginDisabled(!sr_active);
+      int render_scale = int(std::round(g_render_scale * 100.f));
+      if (ImGui::SliderInt("Render Scale (%)", &render_scale, int(min_render_scale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp))
+         g_render_scale = float(render_scale) / 100.f;
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR.");
+      DrawResetButton(g_render_scale, 1.f, "RenderScale");
+      ImGui::EndDisabled();
+
+      // The upscaler (Super Resolution, in the Settings tab) replaces MSAA and SMAA: shown off, the saved choices are kept
       ImGui::BeginDisabled(sr_active);
       bool msaa_shown = g_luma_msaa_enable && !sr_active;
       if (ImGui::Checkbox("Luma MSAA Enable", sr_active ? &msaa_shown : &g_luma_msaa_enable))
@@ -3253,17 +3264,6 @@ public:
       ImGui::EndDisabled();
       if (device_data.sr_type != SR::Type::None && GetGameDeviceData(device_data).msaa_scene)
          ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "DLSS/FSR inactive: turn Anti-Aliasing off in the game's display settings.");
-
-      ImGui::BeginDisabled(!sr_active);
-      int render_scale = int(std::round(g_render_scale * 100.f));
-      if (ImGui::SliderInt("Render Scale (%)", &render_scale, int(min_render_scale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp))
-         g_render_scale = float(render_scale) / 100.f;
-      if (ImGui::IsItemDeactivatedAfterEdit())
-         reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("The resolution DLSS/FSR upscale from, in percent of the screen's (100%% = native, DLAA). Lower is faster and softer.");
-      DrawResetButton(g_render_scale, 1.f, "RenderScale");
-      ImGui::EndDisabled();
 
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
       slider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
