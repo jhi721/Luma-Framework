@@ -48,8 +48,32 @@ namespace
    };
    // rl_distortion_01, replaced: it reads the distortion map's share like the finals (see "Distortion_0xE9E18958.ps_4_0.hlsl")
    constexpr uint32_t distortion_pixel_shader = 0xE9E18958;
-   // rl_bokeh_sprite_01: the aiming depth of field's bokeh sprites, added onto the output after the finals (see "DrawBokehSpritesLimited")
+   // rl_bokeh_sprite_01: the aiming depth of field's bokeh sprites, added onto the output after the finals (see "DrawBlendLimited")
    constexpr uint32_t bokeh_sprite_pixel_shader = 0x4DDED58A;
+
+   // How a draw onto the output combines with it, for "DrawBlendLimited": the vint UI's render modes additive / additive_alpha
+   // (dest + src), subtractive (dest - src); multiply and plain alpha blending stay within the target's range.
+   enum class OutputBlend
+   {
+      Other,
+      Additive,
+      Subtractive,
+   };
+   constexpr OutputBlend GetOutputBlend(const D3D11_RENDER_TARGET_BLEND_DESC& rt)
+   {
+      if (!rt.BlendEnable || (rt.RenderTargetWriteMask & (D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE)) == 0 || rt.DestBlend != D3D11_BLEND_ONE)
+         return OutputBlend::Other;
+      if (rt.BlendOp == D3D11_BLEND_OP_ADD)
+         return OutputBlend::Additive;
+      return rt.BlendOp == D3D11_BLEND_OP_REV_SUBTRACT ? OutputBlend::Subtractive : OutputBlend::Other;
+   }
+   static_assert(GetOutputBlend({TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL}) == OutputBlend::Additive);
+   static_assert(GetOutputBlend({TRUE, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL}) == OutputBlend::Additive);
+   static_assert(GetOutputBlend({TRUE, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_REV_SUBTRACT, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL}) == OutputBlend::Subtractive);
+   static_assert(GetOutputBlend({TRUE, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL}) == OutputBlend::Other);
+   static_assert(GetOutputBlend({TRUE, D3D11_BLEND_DEST_COLOR, D3D11_BLEND_ZERO, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL}) == OutputBlend::Other);
+   static_assert(GetOutputBlend({FALSE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL}) == OutputBlend::Other);
+   static_assert(GetOutputBlend({TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALPHA}) == OutputBlend::Other);
 
    // Luma bloom pyramid (MELE's widths). No energy constant: the native combine sums three levels and the finals divide
    // bloom by 3, so vanilla shows their mean, and the pyramid's mips are energy-preserving means too.
@@ -425,10 +449,10 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11UnorderedAccessView> smaa_predication_uav;
    com_ptr<ID3D11ShaderResourceView> smaa_predication_srv;
 
-   // The output before the bokeh sprites, and the blend op MIN state that caps them (see "DrawBokehSpritesLimited")
-   com_ptr<ID3D11Texture2D> bokeh_base_texture;
-   com_ptr<ID3D11ShaderResourceView> bokeh_base_srv;
-   com_ptr<ID3D11BlendState> bokeh_limit_blend_state;
+   // The output before an additive or subtractive draw, and the blend op MIN / MAX states that limit it (see "DrawBlendLimited")
+   com_ptr<ID3D11Texture2D> blend_limit_base_texture;
+   com_ptr<ID3D11ShaderResourceView> blend_limit_base_srv;
+   com_ptr<ID3D11BlendState> blend_limit_states[2];
 
    // GPU copy of the final composite's vc4 (Tint_saturation c0, Tint_color c1). The game's eye-adaptation exposure lives in
    // Tint_color, applied only in the composite, so the MSAA scene is unexposed; the weighted resolve reads last frame's copy
@@ -2265,69 +2289,68 @@ public:
       return false;
    }
 
-   // Draws the final composite, then SMAA on the canvas it wrote (the swapchain), before DoF and the UI read it.
-   // Anything missing (shaders still compiling, an unexpected target) leaves the composite alone and skips SMAA.
-   // rl_bokeh_sprite_01 adds its sprites onto the gamma-encoded HDR output (blend ONE + ONE). Vanilla's UNORM target clipped the
-   // sum at 1; here it went past the peak over highlights. The game's draw, then "SR4 Bokeh Limit PS" with blend op MIN from a
-   // copy taken before it. False (the game's draw runs alone) when something is missing.
-   bool DrawBokehSpritesLimited(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, const std::function<void()>& original_draw_dispatch_func)
+   // An additive or subtractive draw onto the gamma-encoded HDR output (the vint UI's additive / subtractive render modes, the
+   // bokeh sprites). Vanilla's UNORM swapchain clipped its result to [0,1]; here it went past the peak over highlights, or negative.
+   // The game's draw, then "SR4 Additive Limit PS" / "SR4 Subtractive Limit PS" with blend op MIN / MAX from a copy of the target
+   // taken before it (see "Luma_SR4_BlendLimit.hlsl"). False (the game's draw runs alone) when something is missing.
+   bool DrawBlendLimited(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, const std::function<void()>& original_draw_dispatch_func, ID3D11RenderTargetView* target_rtv, ID3D11Resource* target_resource, OutputBlend blend)
    {
-      com_ptr<ID3D11RenderTargetView> target_rtv;
-      native_device_context->OMGetRenderTargets(1, &target_rtv, nullptr);
-      com_ptr<ID3D11Resource> target_resource;
-      if (target_rtv)
-         target_rtv->GetResource(&target_resource);
       com_ptr<ID3D11Texture2D> target_texture;
-      if (!target_resource || FAILED(target_resource->QueryInterface(&target_texture)))
+      if (FAILED(target_resource->QueryInterface(&target_texture)))
          return false;
       D3D11_TEXTURE2D_DESC desc;
       target_texture->GetDesc(&desc);
       if (desc.SampleDesc.Count != 1 || desc.ArraySize != 1)
          return false;
       auto& game_device_data = GetGameDeviceData(device_data);
+      const bool subtractive = blend == OutputBlend::Subtractive;
+      const uint32_t limit_pixel_shader = subtractive ? "SR4 Subtractive Limit PS"_h : "SR4 Additive Limit PS"_h;
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SR4 Bokeh Limit PS"_h))
+      if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, limit_pixel_shader))
          return false;
 
       D3D11_TEXTURE2D_DESC base_desc = {};
-      if (game_device_data.bokeh_base_texture)
-         game_device_data.bokeh_base_texture->GetDesc(&base_desc);
+      if (game_device_data.blend_limit_base_texture)
+         game_device_data.blend_limit_base_texture->GetDesc(&base_desc);
       if (base_desc.Width != desc.Width || base_desc.Height != desc.Height || base_desc.Format != desc.Format || base_desc.MipLevels != desc.MipLevels)
       {
-         game_device_data.bokeh_base_srv.reset();
-         game_device_data.bokeh_base_texture.reset();
+         game_device_data.blend_limit_base_srv.reset();
+         game_device_data.blend_limit_base_texture.reset();
          desc.Usage = D3D11_USAGE_DEFAULT;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
          desc.CPUAccessFlags = 0;
          desc.MiscFlags = 0;
-         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.bokeh_base_texture)) || FAILED(native_device->CreateShaderResourceView(game_device_data.bokeh_base_texture.get(), nullptr, &game_device_data.bokeh_base_srv)))
+         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.blend_limit_base_texture)) || FAILED(native_device->CreateShaderResourceView(game_device_data.blend_limit_base_texture.get(), nullptr, &game_device_data.blend_limit_base_srv)))
          {
-            game_device_data.bokeh_base_srv.reset();
-            game_device_data.bokeh_base_texture.reset();
+            game_device_data.blend_limit_base_srv.reset();
+            game_device_data.blend_limit_base_texture.reset();
             return false;
          }
       }
-      if (!game_device_data.bokeh_limit_blend_state)
+      com_ptr<ID3D11BlendState>& blend_state = game_device_data.blend_limit_states[subtractive ? 1 : 0];
+      if (!blend_state)
       {
          D3D11_BLEND_DESC blend_desc = {};
          auto& rt = blend_desc.RenderTarget[0];
          rt.BlendEnable = TRUE;
          rt.SrcBlend = rt.DestBlend = rt.SrcBlendAlpha = rt.DestBlendAlpha = D3D11_BLEND_ONE;
-         rt.BlendOp = rt.BlendOpAlpha = D3D11_BLEND_OP_MIN;
+         rt.BlendOp = rt.BlendOpAlpha = subtractive ? D3D11_BLEND_OP_MAX : D3D11_BLEND_OP_MIN;
          rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
-         if (FAILED(native_device->CreateBlendState(&blend_desc, &game_device_data.bokeh_limit_blend_state)))
+         if (FAILED(native_device->CreateBlendState(&blend_desc, &blend_state)))
             return false;
       }
 
-      native_device_context->CopyResource(game_device_data.bokeh_base_texture.get(), target_resource.get());
+      native_device_context->CopyResource(game_device_data.blend_limit_base_texture.get(), target_resource);
       original_draw_dispatch_func();
       DrawStateStack<DrawStateStackType::FullGraphics> limit_state;
       limit_state.Cache(native_device_context, device_data.uav_max_count);
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), game_device_data.bokeh_limit_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("SR4 Bokeh Limit PS"_h).get(), game_device_data.bokeh_base_srv.get(), target_rtv.get(), desc.Width, desc.Height);
+      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at(limit_pixel_shader).get(), game_device_data.blend_limit_base_srv.get(), target_rtv, desc.Width, desc.Height);
       limit_state.Restore(native_device_context);
       return true;
    }
 
+   // Draws the final composite, then SMAA on the canvas it wrote (the swapchain), before DoF and the UI read it.
+   // Anything missing (shaders still compiling, an unexpected target) leaves the composite alone and skips SMAA.
    DrawOrDispatchOverrideType DrawTonemapWithSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const std::function<void()>& original_draw_dispatch_func, bool smaa)
    {
       com_ptr<ID3D11RenderTargetView> canvas_rtv;
@@ -2899,22 +2922,34 @@ public:
             return DrawTonemapWithSMAA(native_device, native_device_context, cmd_list_data, device_data, *original_draw_dispatch_func, !device_data.has_drawn_sr);
          return DrawOrDispatchOverrideType::None;
       }
-      if (pixel_shader_hash == bokeh_sprite_pixel_shader && original_draw_dispatch_func && *original_draw_dispatch_func)
-         return DrawBokehSpritesLimited(native_device, native_device_context, device_data, *original_draw_dispatch_func) ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
-      // Hide the UI: drop its draws, but only those onto the swapchain, so any off-screen use of the same shaders survives.
-      if (g_hide_ui && ui_pixel_shaders.contains(pixel_shader_hash))
+      // The UI and the bokeh sprites onto the swapchain (any off-screen use of the same shaders is left alone): the UI dropped with
+      // "Hide Gameplay UI", and an additive or subtractive draw limited to the vanilla UNORM range (see "DrawBlendLimited").
+      const bool ui = ui_pixel_shaders.contains(pixel_shader_hash);
+      if (ui || pixel_shader_hash == bokeh_sprite_pixel_shader)
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
          com_ptr<ID3D11Resource> rtv_resource;
          if (rtv)
             rtv->GetResource(&rtv_resource);
+         bool back_buffer = false;
          if (rtv_resource)
          {
             const std::shared_lock lock(device_data.mutex);
-            if (device_data.back_buffers.contains(reinterpret_cast<uint64_t>(rtv_resource.get())))
-               return DrawOrDispatchOverrideType::Replaced;
+            back_buffer = device_data.back_buffers.contains(reinterpret_cast<uint64_t>(rtv_resource.get()));
          }
+         if (!back_buffer)
+            return DrawOrDispatchOverrideType::None;
+         if (ui && g_hide_ui)
+            return DrawOrDispatchOverrideType::Replaced;
+         com_ptr<ID3D11BlendState> blend_state;
+         native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
+         D3D11_BLEND_DESC blend_desc = {};
+         if (blend_state)
+            blend_state->GetDesc(&blend_desc);
+         const OutputBlend blend = blend_state ? GetOutputBlend(blend_desc.RenderTarget[0]) : OutputBlend::Other;
+         if (blend != OutputBlend::Other && original_draw_dispatch_func && *original_draw_dispatch_func && DrawBlendLimited(native_device, native_device_context, device_data, *original_draw_dispatch_func, rtv.get(), rtv_resource.get(), blend))
+            return DrawOrDispatchOverrideType::Replaced;
          return DrawOrDispatchOverrideType::None;
       }
 
@@ -3099,7 +3134,8 @@ public:
 #endif
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 SMAA Linearize CS"), ShaderDefinition{"Luma_SR4_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 SMAA Predication CS"), ShaderDefinition{"Luma_SR4_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
-      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Bokeh Limit PS"), ShaderDefinition{"Luma_SR4_BokehLimit", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bokeh_limit_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Additive Limit PS"), ShaderDefinition{"Luma_SR4_BlendLimit", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "additive_limit_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Subtractive Limit PS"), ShaderDefinition{"Luma_SR4_BlendLimit", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "subtractive_limit_ps"});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sharpen PS"), ShaderDefinition{"Luma_SR4_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
       // XeGTAO passes (Luma_SR4_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY.
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 XeGTAO Prefilter Depths CS"), ShaderDefinition{"Luma_SR4_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
