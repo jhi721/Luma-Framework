@@ -644,6 +644,10 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
+   // Render scale research: the sizes of the last frame that drew the upscaled uber (DEV panel)
+   uint2 sp_debug_sr_render_size = {};   // The upscaler's input
+   float2 sp_debug_uber_viewport = {};   // The uber's own viewport
+   uint2 sp_debug_uber_render_size = {}; // ... scaled up as for this sub-rect
 
    // "Performance Test": GPU timestamps per frame (present to present, the scene from the depth prepass to its first post pass, the
    // upscaler), all on the immediate context, in a ring read back a few frames later without waiting; and the CPU time in the
@@ -1701,6 +1705,9 @@ class BorderlandsGoty final : public Game
       draw_data.motion_vectors = game_device_data.mv_texture.get();
       draw_data.depth_buffer = depth.get();
       draw_data.render_width = render_size.x;
+#if DEVELOPMENT
+      game_device_data.sp_debug_sr_render_size = render_size;
+#endif
       draw_data.render_height = render_size.y;
       // As applied (pixels, +y down)
       draw_data.jitter_x = game_device_data.mv_jitter[0];
@@ -2058,6 +2065,10 @@ public:
                const D3D11_VIEWPORT game_viewport = viewport;
                const uint2 render_size = GetScreenPercentageRenderSize(device_data.output_resolution);
                viewport.Width *= device_data.output_resolution.x / float(render_size.x);
+#if DEVELOPMENT
+               gd.sp_debug_uber_viewport = {game_viewport.Width, game_viewport.Height};
+               gd.sp_debug_uber_render_size = render_size;
+#endif
                viewport.Height *= device_data.output_resolution.y / float(render_size.y);
                native_device_context->RSSetViewports(1, &viewport);
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
@@ -2871,6 +2882,7 @@ public:
       data.GameData.ScreenPercentageScale = upscaled ? float2{1.f, 1.f} : share;
       data.GameData.SceneUVScale = upscaled ? float2{1.f / share.x, 1.f / share.y} : float2{1.f, 1.f};
       data.GameData.BlurUVScale = GetGameDeviceData(device_data).sp_post_output_res ? float2{1.f / share.x, 1.f / share.y} : float2{1.f, 1.f};
+      data.GameData.SceneRenderSize = {float(render_size.x), float(render_size.y)};
    }
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
@@ -3316,6 +3328,11 @@ public:
 
       ImGui::SeparatorText("Render scale research");
       ImGui::Text("ScreenPercentage %.2f", g_screen_percentage);
+      {
+         const auto& gd = GetGameDeviceData(device_data);
+         const float engine = g_engine_screen_percentage ? *g_engine_screen_percentage : 0.f;
+         ImGui::Text("Scene %ux%u (last latched), engine %.0f%% -> %ux%u, upscaler input %ux%u, uber viewport %.0fx%.0f scaled for %ux%u", g_previous_scene_render_size.x, g_previous_scene_render_size.y, engine, uint32_t(engine / 100.f * device_data.output_resolution.x), uint32_t(engine / 100.f * device_data.output_resolution.y), gd.sp_debug_sr_render_size.x, gd.sp_debug_sr_render_size.y, gd.sp_debug_uber_viewport.x, gd.sp_debug_uber_viewport.y, gd.sp_debug_uber_render_size.x, gd.sp_debug_uber_render_size.y);
+      }
       ImGui::Checkbox("SP Fix HUD Canvas", &g_sp_fix_hud_canvas);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Moves the Canvas draws with a HUD transform (the crosshair) after the stretch back by the centred view origin UE3 gives them. Not saved.");
