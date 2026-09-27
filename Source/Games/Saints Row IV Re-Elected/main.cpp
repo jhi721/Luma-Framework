@@ -3168,7 +3168,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Saints Row IV: Re-Elected\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, DLSS or FSR 3 upscaling and native anti-aliasing (DLAA), HDR bloom and SMAA anti-aliasing, and replaces the game's SSAO with XeGTAO.\n"
+         "It adds HDR, DLSS or FSR 3 upscaling, HDR bloom and SMAA anti-aliasing, and replaces the game's SSAO with XeGTAO.\n"
          "Set Ambient Occlusion to Medium or High in the game's display settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
