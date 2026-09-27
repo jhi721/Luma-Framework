@@ -165,7 +165,8 @@ namespace
 #if DEVELOPMENT
    bool g_mv_enable = false;
    bool g_mv_debug_view = false;
-   bool g_mv_force_jitter = false; // The projection jitter without an upscaler
+   bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
+   bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
    // "Performance Test" (see "OnPresent"): the mode, and the anti-aliasing it sets while it runs (the user's is restored on "Off" or
    // "Current Settings", and never saved)
    int g_perf_test = 0;
@@ -209,6 +210,7 @@ namespace
 #else
    constexpr bool g_mv_enable = false;
    constexpr bool g_mv_force_jitter = false;
+   constexpr bool g_mv_disable_jitter = false;
 #endif
    // DLSS/FSR render scale (docs/SaintsRow4-DLSS-Upscaling-Research.md, method A; the game has none): while motion vectors run
    // (DLSS/FSR, or MV Enable in development), the scene window's output sized viewports and scissors shrink to a top-left sub-rect of
@@ -249,12 +251,17 @@ namespace
    // "RunXeGTAO"), copied into the target (created without UAV bind); the native blur and apply stay. Level 1 (multiframe)
    // stays native.
    constexpr uint32_t ssao_singleframe_calculate_pixel_shader = 0x624BF56D;
-   constexpr UINT gtao_knobs_cb_slot = 9;   // "register(b9)" in Luma_SR4_XeGTAO.hlsl; b11 is core DrawBloom's
-   constexpr UINT gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Luma_SR4_XeGTAO.hlsl
-   float g_gtao_final_value_power = 2.2f;   // DEV/TEST calibration knobs, not persisted
-   float g_gtao_radius_override = 0.f;      // > 0 overrides the shader's EFFECT_RADIUS (metres)
+   constexpr UINT gtao_knobs_cb_slot = 9;     // "register(b9)" in Luma_SR4_XeGTAO.hlsl; b11 is core DrawBloom's
+   constexpr UINT gtao_depth_mip_count = 5;   // XE_GTAO_DEPTH_MIP_LEVELS in Luma_SR4_XeGTAO.hlsl
+   float g_gtao_final_value_power = 2.2f;     // DEV/TEST calibration knobs, not persisted
+   float g_gtao_radius_override = 0.f;        // > 0 overrides the shader's EFFECT_RADIUS (metres)
+   float g_gtao_thin_occluder_override = 0.f; // > 0 overrides the shader's THIN_OCCLUDER_COMPENSATION
 #if DEVELOPMENT
    int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
+   // A/B of the DLSS/FSR mode (see "RunXeGTAO"): 0 = auto (with the upscaler), 1 = off, 2 = on
+   int g_gtao_noise_per_frame = 0;
+   int g_gtao_single_denoise = 0;
+   int g_gtao_full_res = 0;
 #endif
 
    // The material-pass pixel shaders that alpha test (discard on "Alpha_Threshold", one render target: the MSAA scene) and end
@@ -1294,7 +1301,7 @@ class SaintsRowIV final : public Game
                const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
                const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
                const unsigned int phase = cb_luma_global_settings.FrameIndex % phases;
-               game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+               game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
                // The render size: the upscaling prototype's sub-rect (see "ScaleSceneViewport"), else the scene's
                const float scale = GetSubRectScale(device_data);
                const float render_width = std::round(float(gbuffer_depth_size.x) * scale), render_height = std::round(float(gbuffer_depth_size.y) * scale);
@@ -2400,7 +2407,7 @@ public:
       // Held through the dispatches so a shader reload cannot release them mid-use.
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       const auto& shaders = device_data.native_compute_shaders;
-      if (!HasShaders(shaders, "SR4 XeGTAO Prefilter Depths CS"_h, "SR4 XeGTAO Main Pass CS"_h, "SR4 XeGTAO Denoise Pass 1 CS"_h, "SR4 XeGTAO Denoise Pass 2 CS"_h))
+      if (!HasShaders(shaders, "SR4 XeGTAO Prefilter Depths CS"_h, "SR4 XeGTAO Main Pass CS"_h, "SR4 XeGTAO Denoise Pass 1 CS"_h, "SR4 XeGTAO Denoise Pass 2 CS"_h, "SR4 XeGTAO Downsample CS"_h))
          return false;
 
       com_ptr<ID3D11ShaderResourceView> normals_srv;
@@ -2433,13 +2440,21 @@ public:
       const uint32_t input_scale = (depth_size.x + width / 2) / width;
       if (input_scale == 0 || (depth_size.y + height / 2) / height != input_scale || normals_size.x != depth_size.x || normals_size.y != depth_size.y)
          return false;
+      // Full resolution mode: every pass at the depth's size, averaged into the target at the end ("downsample_cs"). At half res the
+      // upscaler's jitter flips a target pixel's one depth texel between grass blades and the ground: the AO boils.
+#if DEVELOPMENT
+      const bool full_res = g_gtao_full_res ? g_gtao_full_res == 2 : IsSRActive(device_data);
+#else
+      constexpr bool full_res = false;
+#endif
+      const uint32_t work_width = full_res ? depth_size.x : width, work_height = full_res ? depth_size.y : height;
 
-      if (game_device_data.gtao_width != width || game_device_data.gtao_height != height || game_device_data.gtao_format != target_rtv_desc.Format)
+      if (game_device_data.gtao_width != work_width || game_device_data.gtao_height != work_height || game_device_data.gtao_format != target_rtv_desc.Format)
       {
          game_device_data.ReleaseGTAOScratch();
          D3D11_TEXTURE2D_DESC desc = {};
-         desc.Width = width;
-         desc.Height = height;
+         desc.Width = work_width;
+         desc.Height = work_height;
          desc.MipLevels = gtao_depth_mip_count;
          desc.ArraySize = 1;
          desc.Format = DXGI_FORMAT_R32_FLOAT;
@@ -2461,12 +2476,14 @@ public:
             com_ptr<ID3D11Texture2D> working_texture;
             ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &working_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(working_texture.get(), nullptr, &game_device_data.gtao_working_uavs[i])) && SUCCEEDED(native_device->CreateShaderResourceView(working_texture.get(), nullptr, &game_device_data.gtao_working_srvs[i]));
          }
+         desc.Width = width;
+         desc.Height = height;
          desc.Format = target_rtv_desc.Format;
          ok = ok && SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.gtao_final_texture)) && SUCCEEDED(native_device->CreateUnorderedAccessView(game_device_data.gtao_final_texture.get(), nullptr, &game_device_data.gtao_final_uav));
          if (!ok)
             game_device_data.ReleaseGTAOScratch();
-         game_device_data.gtao_width = width;
-         game_device_data.gtao_height = height;
+         game_device_data.gtao_width = work_width;
+         game_device_data.gtao_height = work_height;
          game_device_data.gtao_format = target_rtv_desc.Format;
       }
       if (!game_device_data.gtao_final_uav)
@@ -2480,12 +2497,18 @@ public:
       // DLSS/FSR accumulate the lit scene the AO multiplies into: cycle the noise and denoise once (Intel's XeGTAO.h with TAA);
       // without them a moving pattern would boil, so it stays frozen and denoises twice
       const bool temporal = IsSRActive(device_data);
+#if DEVELOPMENT
+      const bool noise_per_frame = g_gtao_noise_per_frame ? g_gtao_noise_per_frame == 2 : temporal;
+      const bool single_denoise = g_gtao_single_denoise ? g_gtao_single_denoise == 2 : temporal;
+#else
+      const bool noise_per_frame = temporal, single_denoise = temporal;
+#endif
       // Upscaling prototype: the scene fills the target's top-left share (see "g_render_scale"): the shader's ndc follow it, the main
       // pass and the denoise run over it only (the depth prefilter covers the whole target, so samples past the edge read cleared depth)
       const bool sub_rect = GetSubRectScale(device_data) < 1.f;
       const float sub_rect_scale[2] = {sub_rect ? float(game_device_data.mv_render_size[0]) / device_data.output_resolution.x : 1.f, sub_rect ? float(game_device_data.mv_render_size[1]) / device_data.output_resolution.y : 1.f};
-      const UINT ao_width = (std::min)(width, UINT(std::ceil(float(width) * sub_rect_scale[0]))), ao_height = (std::min)(height, UINT(std::ceil(float(height) * sub_rect_scale[1])));
-      const float knobs[12] = {g_gtao_final_value_power, float(input_scale), g_gtao_radius_override, debug_view, 1.f / float(width), 1.f / float(height), temporal ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 0.f, sub_rect_scale[0], sub_rect_scale[1], 0.f, 0.f};
+      const UINT ao_width = (std::min)(work_width, UINT(std::ceil(float(work_width) * sub_rect_scale[0]))), ao_height = (std::min)(work_height, UINT(std::ceil(float(work_height) * sub_rect_scale[1])));
+      const float knobs[12] = {g_gtao_final_value_power, full_res ? 1.f : float(input_scale), g_gtao_radius_override, debug_view, 1.f / float(work_width), 1.f / float(work_height), noise_per_frame ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, float(input_scale), sub_rect_scale[0], sub_rect_scale[1], g_gtao_thin_occluder_override, 0.f};
       if (!WriteConstants(native_device, native_device_context, std::addressof(game_device_data.gtao_knobs_cb), knobs, sizeof(knobs)))
          return false;
 
@@ -2513,11 +2536,23 @@ public:
       ID3D11UnorderedAccessView* const mip_uavs[gtao_depth_mip_count] = {game_device_data.gtao_depth_mip_uavs[0].get(), game_device_data.gtao_depth_mip_uavs[1].get(), game_device_data.gtao_depth_mip_uavs[2].get(), game_device_data.gtao_depth_mip_uavs[3].get(), game_device_data.gtao_depth_mip_uavs[4].get()};
       ID3D11UnorderedAccessView* const working_uavs[2] = {game_device_data.gtao_working_uavs[0].get(), game_device_data.gtao_working_uavs[1].get()};
       ID3D11UnorderedAccessView* const final_uav = game_device_data.gtao_final_uav.get();
-      pass("SR4 XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, {depth_srv.get(), nullptr}, (width + 15) / 16, (height + 15) / 16);
+      pass("SR4 XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, {depth_srv.get(), nullptr}, (work_width + 15) / 16, (work_height + 15) / 16);
       pass("SR4 XeGTAO Main Pass CS"_h, 1, &working_uavs[0], {game_device_data.gtao_depth_mips_srv.get(), normals_srv.get()}, (ao_width + 7) / 8, (ao_height + 7) / 8);
-      if (!temporal)
+      if (full_res)
+      {
+         // Both denoise passes stay at full res (working 0 -> 1 -> 0), then the average into the target's share
          pass("SR4 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (ao_width + 15) / 16, (ao_height + 7) / 8);
-      pass("SR4 XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[temporal ? 0 : 1].get(), nullptr}, (ao_width + 15) / 16, (ao_height + 7) / 8);
+         if (!single_denoise)
+            pass("SR4 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[0], {game_device_data.gtao_working_srvs[1].get(), nullptr}, (ao_width + 15) / 16, (ao_height + 7) / 8);
+         const UINT target_ao_width = (std::min)(width, (ao_width + input_scale - 1) / input_scale), target_ao_height = (std::min)(height, (ao_height + input_scale - 1) / input_scale);
+         pass("SR4 XeGTAO Downsample CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[single_denoise ? 1 : 0].get(), nullptr}, (target_ao_width + 7) / 8, (target_ao_height + 7) / 8);
+      }
+      else
+      {
+         if (!single_denoise)
+            pass("SR4 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (ao_width + 15) / 16, (ao_height + 7) / 8);
+         pass("SR4 XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[single_denoise ? 0 : 1].get(), nullptr}, (ao_width + 15) / 16, (ao_height + 7) / 8);
+      }
       compute_state.Restore(native_device_context);
 
       // The target is still bound as the draw's render target, and a copy into an OM-bound resource is a hazard the runtime
@@ -2988,6 +3023,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 XeGTAO Main Pass CS"), ShaderDefinition{"Luma_SR4_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 XeGTAO Denoise Pass 1 CS"), ShaderDefinition{"Luma_SR4_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 XeGTAO Denoise Pass 2 CS"), ShaderDefinition{"Luma_SR4_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 XeGTAO Downsample CS"), ShaderDefinition{"Luma_SR4_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "downsample_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
       reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
       reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
@@ -3146,10 +3182,16 @@ public:
       ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("0 = the shader's EFFECT_RADIUS (0.5 m); > 0 overrides it, in metres.");
+      ImGui::SliderFloat("GTAO Thin Occluder Compensation", &g_gtao_thin_occluder_override, 0.f, 1.f, "%.2f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("0 = the shader's THIN_OCCLUDER_COMPENSATION (0); > 0 overrides it (Intel: 0-0.7). Higher = samples behind the center\nstop occluding sooner: thin occluders (grass, poles) darken what is behind them less.");
 #if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Draws diagnostics through the game's SSAO apply (multiplied into the lighting). Depth gradient flat or blocky = wrong input;\nNormals: camera-facing surfaces bright, black everywhere = NORMAL_Z_SIGN inverted; AO x8 = spot broad over-occlusion.");
+      ImGui::Combo("GTAO Noise Per Frame", &g_gtao_noise_per_frame, "Auto (DLSS/FSR)\0Off (frozen)\0On (frame % 64)\0");
+      ImGui::Combo("GTAO Single Denoise", &g_gtao_single_denoise, "Auto (DLSS/FSR)\0Off (2 passes)\0On (1 pass)\0");
+      ImGui::Combo("GTAO Full Resolution", &g_gtao_full_res, "Auto (DLSS/FSR)\0Off (half res)\0On\0");
 #endif
       ImGui::EndDisabled();
 #endif
@@ -3559,6 +3601,9 @@ public:
       ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without an upscaler, with MV Enable. The image shakes by a subpixel; nothing\nmay flicker or lose pixels, and the debug view stays black with a static camera. Not saved.");
+      ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("No projection jitter under DLSS/FSR (the upscaler gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");

@@ -16,6 +16,9 @@
 // - Noise: frozen at 0 without an upscaler (a frame index would make the pattern boil), denoise runs twice. With DLSS/FSR
 //   (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once, as Intel's XeGTAO.h
 //   advises with TAA (NoiseIndexRT, set by main.cpp).
+// - Full resolution mode (main.cpp "RunXeGTAO"): every pass runs at the depth's size (DepthInputScaleRT 1) and downsample_cs
+//   averages each target pixel's block into the target. At half res one depth texel per target pixel flips between a grass blade and
+//   the ground under the upscaler's jitter, and the AO boils.
 
 // --- Game constant buffer: the SSAO calculate's vc0 (main.cpp binds it at CS b0) ---
 
@@ -28,15 +31,16 @@ cbuffer GameVC0 : register(b0)
 // b9, not b11: core's DrawBloom owns b11 for its own constants. Mirrored by gtao_knobs_cb_slot.
 cbuffer LumaGTAO : register(b9)
 {
-   float FinalValuePowerRT;    // primary darkness dial
-   float DepthInputScaleRT;    // full-res depth/normals pixels per AO target pixel (2 = half res)
-   float RadiusOverrideRT;     // > 0 overrides EFFECT_RADIUS (metres)
-   float DebugViewRT;          // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
-   float2 ViewportPixelSizeRT; // 1 / AO target resolution
-   float NoiseIndexRT;         // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
-   float PaddingRT;
-   float2 SubRectScaleRT; // Upscaling prototype: the scene's share of the target (1 = the whole target), see main.cpp "g_render_scale"
-   float2 PaddingRT2;
+   float FinalValuePowerRT;          // primary darkness dial
+   float DepthInputScaleRT;          // full-res depth/normals pixels per AO target pixel (2 = half res)
+   float RadiusOverrideRT;           // > 0 overrides EFFECT_RADIUS (metres)
+   float DebugViewRT;                // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
+   float2 ViewportPixelSizeRT;       // 1 / AO target resolution
+   float NoiseIndexRT;               // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
+   float DownsampleScaleRT;          // full resolution mode: working pixels per target pixel, averaged by downsample_cs (see the header)
+   float2 SubRectScaleRT;            // Upscaling prototype: the scene's share of the target (1 = the whole target), see main.cpp "g_render_scale"
+   float ThinOccluderCompensationRT; // > 0 overrides THIN_OCCLUDER_COMPENSATION
+   float PaddingRT2;
 }
 
 #if XE_GTAO_QUALITY == 0 // Low
@@ -328,7 +332,7 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
 
    const float effectRadius = XeGTAO_EffectRadius();
    const float sampleDistributionPower = SAMPLE_DISTRIBUTION_POWER;
-   const float thinOccluderCompensation = THIN_OCCLUDER_COMPENSATION;
+   const float thinOccluderCompensation = ThinOccluderCompensationRT > 0.0 ? ThinOccluderCompensationRT : THIN_OCCLUDER_COMPENSATION;
    const float falloffRange = EFFECT_FALLOFF_RANGE * effectRadius;
    const float falloffFrom = effectRadius * (1.0 - EFFECT_FALLOFF_RANGE);
 
@@ -460,7 +464,6 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
             shc0 = lerp(lowHorizonCos0, shc0, weight0); // this would be more correct but too expensive: cos(lerp( acos(lowHorizonCos0), acos(shc0), weight0 ));
             shc1 = lerp(lowHorizonCos1, shc1, weight1); // this would be more correct but too expensive: cos(lerp( acos(lowHorizonCos1), acos(shc1), weight1 ));
 
-            // thickness heuristic disabled (THIN_OCCLUDER_COMPENSATION == 0)
             horizonCos0 = max(horizonCos0, shc0);
             horizonCos1 = max(horizonCos1, shc1);
          }
@@ -719,3 +722,31 @@ float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
    const uint2 pix_coord_base = dtid * uint2(2, 1); // we're computing 2 horizontal pixels at a time (performance optimization)
    XeGTAO_Denoise(pix_coord_base, tex0, smp, final_output);
 }
+
+#if XE_GTAO_FINAL_APPLY
+    // Full resolution mode: tex0 = the denoised full-res AO term; the mean AO amount of each target pixel's block, as the final denoise
+    // writes it (debug views: the raw value, as it passes them).
+    [numthreads(8, 8, 1)] void downsample_cs(uint2 dtid : SV_DispatchThreadID)
+{
+   const uint scale = uint(DownsampleScaleRT);
+   uint2 size;
+   tex0.GetDimensions(size.x, size.y);
+   float sum = 0.0;
+   for (uint y = 0; y < scale; y++)
+   {
+      for (uint x = 0; x < scale; x++)
+      {
+         const float v = tex0.Load(int3(min(dtid * scale + uint2(x, y), size - 1), 0)).x;
+#if DEVELOPMENT
+         if (DebugViewRT > 0.5)
+         {
+            sum += 1.0 - ((DebugViewRT >= 2.5 && DebugViewRT < 3.5) ? saturate(1.0 - (1.0 - v * XE_GTAO_OCCLUSION_TERM_SCALE) * 8.0) : v);
+            continue;
+         }
+#endif
+         sum += 1.0 - saturate(v * XE_GTAO_OCCLUSION_TERM_SCALE);
+      }
+   }
+   final_output[dtid] = sum / float(scale * scale);
+}
+#endif
