@@ -73,12 +73,61 @@ static constexpr bool g_mv_disable_jitter = false;
 // DLSS/FSR render scale: Luma sets the engine's ScreenPercentage to it while the upscaler is selected, else to 100 (see "OnPresent")
 static float g_render_scale = 1.f;
 static constexpr float min_render_scale = 0.5f;
-// The engine's ScreenPercentage as Luma last set it, as a fraction
+// The ScreenPercentage this frame renders at, as a fraction: the value Luma set at present, then the scene's own (see "OpenScene")
 static float g_screen_percentage = 1.f;
 
-// The top-left sub-rect the engine renders the scene into: UE3's appTrunc(output x ScreenPercentage) (ScaleScreenCoords)
+#if DEVELOPMENT
+// "Performance Test" (see "OnPresent"): the mode, and the anti-aliasing and render scale it sets while it runs (the user's are restored
+// on "Off" or "Current Settings", and never saved)
+static int g_perf_test = 0;
+static bool g_perf_hook_timers = true; // The hooks' CPU time (two clock reads per hooked draw, themselves a cost to measure)
+struct PerfTestMode
+{
+   const char* name;
+   bool set_aa = false; // Else the current settings (the fields below too)
+   SR::Type sr_type = SR::Type::None;
+   unsigned int dlss_preset = 0; // NVSDK_NGX_DLSS_Hint_Render_Preset (5 = E, 11 = K, ...)
+   bool smaa = false;
+   int motion_vector_draws = 2; // 2 patched (motion vectors and jitter), 1 jitter only, 0 untouched
+   float render_scale = 0.f;    // > 0: "Render Scale (%)" while it runs, else the current one
+};
+static constexpr PerfTestMode perf_test_modes[] = {
+   {"Off"},
+   {"Current Settings"},
+   {"DLSS K", true, SR::Type::DLSS, 11},
+   {"DLSS K 100%", true, SR::Type::DLSS, 11, false, 2, 1.f},
+   {"DLSS K 67%", true, SR::Type::DLSS, 11, false, 2, 0.67f},
+   {"DLSS K 50%", true, SR::Type::DLSS, 11, false, 2, 0.5f},
+   {"DLSS K 100% Jitter Only", true, SR::Type::DLSS, 11, false, 1, 1.f},
+   {"DLSS K 100% Without Motion Vector Draws", true, SR::Type::DLSS, 11, false, 0, 1.f},
+   {"DLSS L", true, SR::Type::DLSS, 12},
+   {"DLSS M", true, SR::Type::DLSS, 13},
+   {"DLSS E (CNN)", true, SR::Type::DLSS, 5},
+   {"FSR 3", true, SR::Type::FSR},
+   {"SMAA", true, SR::Type::None, 0, true},
+   {"No AA", true, SR::Type::None, 0, false},
+};
+// "Sweep": these modes in turn, a few log windows each, over several rounds (interleaved, so the scene's drift averages out), then a
+// median per mode
+static bool g_perf_sweep = false;
+static constexpr int perf_sweep_modes[] = {3, 4, 5, 6, 7, 13};
+static_assert(std::string_view(perf_test_modes[perf_sweep_modes[0]].name) == "DLSS K 100%" && std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
+static_assert(std::size(perf_test_modes) <= 32); // 5 bits in "perf_settings"
+static constexpr int perf_sweep_rounds = 3;
+static constexpr int perf_sweep_windows = 2; // Per mode and round
+#endif
+
+// The sub-rect this frame's scene rendered into (its depth prepass viewport, see "OpenScene"; zero until then), and the last frame's
+static uint2 g_scene_render_size = {};
+static uint2 g_previous_scene_render_size = {};
+
+// The top-left sub-rect the engine renders the scene into: this frame's, else UE3's appTrunc(output x ScreenPercentage)
+// (ScaleScreenCoords) of the value Luma set. The game thread can run a frame ahead of the renderer, so after a change the frame's own
+// size is the reliable one.
 static uint2 GetScreenPercentageRenderSize(const float2& output_resolution)
 {
+   if (g_scene_render_size.x != 0)
+      return g_scene_render_size;
    return {uint32_t(g_screen_percentage * output_resolution.x), uint32_t(g_screen_percentage * output_resolution.y)};
 }
 
@@ -595,6 +644,47 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
+
+   // "Performance Test": GPU timestamps per frame (present to present, the scene from the depth prepass to its first post pass, the
+   // upscaler), all on the immediate context, in a ring read back a few frames later without waiting; and the CPU time in the
+   // motion vector hooks. Inside them: the camera fill (the scene's end), the upscaler's own draw (the rest of "sr" is the copies back
+   // or the downscale), and the replaced DOF/Bloom gather's two passes.
+   struct PerfQueries
+   {
+      com_ptr<ID3D11Query> disjoint, frame_start, scene_start, fill_start, scene_end, sr_draw_end, sr_end, dof_start, dof_history_end, dof_end, frame_end;
+      bool scene_started = false; // scene_start issued
+      bool fill = false;          // fill_start issued
+      bool scene = false;         // ... and scene_end
+      bool sr_draw = false;       // sr_draw_end issued
+      bool sr = false;            // ... and sr_end
+      bool dof = false;           // dof_start, dof_history_end and dof_end issued
+      bool pending = false;
+   };
+   struct PerfStats
+   {
+      double frame_ms = 0.0, frame_max_ms = 0.0, scene_ms = 0.0, scene_max_ms = 0.0, sr_ms = 0.0, sr_max_ms = 0.0, cpu_frame_ms = 0.0;
+      double fill_ms = 0.0, sr_draw_ms = 0.0, sr_copy_ms = 0.0, dof_history_ms = 0.0, dof_gather_ms = 0.0, unused_max_ms = 0.0;
+      uint32_t samples = 0, scene_samples = 0, sr_samples = 0, disjoint = 0, frames = 0;
+      uint32_t fill_samples = 0, sr_draw_samples = 0, sr_copy_samples = 0, dof_samples = 0, dof_gather_samples = 0;
+   };
+   std::array<PerfQueries, 8> perf_queries;
+   size_t perf_query_index = 0;
+   PerfQueries* perf_frame_queries = nullptr; // This frame's, from present to present
+   PerfStats perf_stats;                      // This log window's
+   int perf_settle_frames = 0;                // Frames skipped after a change (targets rebuilt, history reset)
+   uint32_t perf_settings = 0;                // The measured settings, to restart the settle on a change
+   std::chrono::steady_clock::time_point perf_last_present;
+   std::atomic<int64_t> perf_hook_ns = 0; // This log window's
+   // The user's anti-aliasing and render scale, while a mode that sets its own runs
+   SR::Type perf_user_sr_type = SR::Type::None;
+   unsigned int perf_user_dlss_preset = 0;
+   bool perf_user_smaa = false;
+   float perf_user_render_scale = 1.f;
+   // "Sweep": the step over all rounds, the log windows done in it, and per mode each window's frame, scene, SR, hook, fill, upscaler
+   // draw, SR copy, DOF history and gather times
+   int perf_sweep_step = 0;
+   int perf_sweep_windows_done = 0;
+   std::vector<std::array<double, 9>> perf_sweep_results[std::size(perf_test_modes)];
 #endif
 
    void ReleaseGTAOScratch()
@@ -619,6 +709,46 @@ class BorderlandsGoty final : public Game
    {
       return *static_cast<BorderlandsGotyGameDeviceData*>(device_data.game);
    }
+
+#if DEVELOPMENT
+   // "Performance Test": adds the scope's CPU time to the motion vector hooks' total, while the test runs
+   struct PerfHookTimer
+   {
+      std::atomic<int64_t>& total_ns;
+      const bool enabled = g_perf_test != 0 && g_perf_hook_timers;
+      const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      ~PerfHookTimer()
+      {
+         if (enabled)
+            total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+      }
+   };
+
+   // "Performance Test": switches to a mode, setting its anti-aliasing as Core's "Super Resolution" and "DLSS Preset" selection do, and
+   // its render scale (without saving), keeping the user's while any mode that sets its own runs and restoring them after
+   static void ApplyPerfTestMode(DeviceData& device_data, int mode_index)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      const PerfTestMode& mode = perf_test_modes[mode_index];
+      const PerfTestMode& previous_mode = perf_test_modes[g_perf_test];
+      if (!previous_mode.set_aa && mode.set_aa)
+      {
+         game_device_data.perf_user_sr_type = device_data.sr_type;
+         game_device_data.perf_user_dlss_preset = dlss_render_preset;
+         game_device_data.perf_user_smaa = g_smaa_enable;
+         game_device_data.perf_user_render_scale = g_render_scale;
+      }
+      if (mode.set_aa || previous_mode.set_aa)
+      {
+         device_data.sr_type = mode.set_aa ? mode.sr_type : game_device_data.perf_user_sr_type;
+         device_data.sr_suppressed = false;
+         dlss_render_preset = mode.set_aa && mode.sr_type == SR::Type::DLSS ? mode.dlss_preset : game_device_data.perf_user_dlss_preset;
+         g_smaa_enable = mode.set_aa ? mode.smaa : game_device_data.perf_user_smaa;
+         g_render_scale = mode.render_scale > 0.f ? mode.render_scale : game_device_data.perf_user_render_scale;
+      }
+      g_perf_test = mode_index;
+   }
+#endif
 
    // Named injected shaders live in unordered_maps the render thread otherwise only reads: look them up with
    // "find" (operator[] would default-insert on a miss and mutate a map DrawSMAA reads concurrently).
@@ -890,6 +1020,9 @@ class BorderlandsGoty final : public Game
       auto& game_device_data = GetGameDeviceData(*device_data);
       if (g_screen_percentage >= 1.f && !game_device_data.mv_active)
          return false;
+#if DEVELOPMENT
+      const PerfHookTimer timer{game_device_data.perf_hook_ns};
+#endif
       const std::lock_guard lock(game_device_data.mv_constants_mutex);
       if (const auto canvas = game_device_data.sp_canvas_transforms.find(resource.handle); canvas != game_device_data.sp_canvas_transforms.end() && offset == 0 && size >= sizeof(float) * 16)
          std::memcpy(canvas->second.emplace().data(), data, sizeof(float) * 16);
@@ -1086,6 +1219,10 @@ class BorderlandsGoty final : public Game
       if (depth_size.x != device_data.output_resolution.x || depth_size.y != device_data.output_resolution.y || !GetPatchedVertexShader(native_device, cmd_list_data, device_data, vertex_shader_hash))
          return;
       game_device_data.mv_scene_open = true;
+#if DEVELOPMENT
+      if (auto* const perf_queries = game_device_data.perf_frame_queries; perf_queries && !std::exchange(perf_queries->scene_started, true))
+         native_device_context->End(perf_queries->scene_start.get());
+#endif
       game_device_data.mv_depth.reset();
       dsv->GetResource(&game_device_data.mv_depth);
       game_device_data.mv_depth_copy = 0;
@@ -1103,7 +1240,19 @@ class BorderlandsGoty final : public Game
       const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
       const unsigned int phase = cb_luma_global_settings.FrameIndex % phases;
       game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
-      // The viewport is the render sub-rect below ScreenPercentage 100
+      // The viewport is the render sub-rect below ScreenPercentage 100: this frame's size for every consumer, and the upscaler restarts
+      // when it changed
+      D3D11_VIEWPORT viewport;
+      UINT viewport_count = 1;
+      native_device_context->RSGetViewports(&viewport_count, &viewport);
+      if (viewport_count == 1 && viewport.TopLeftX == 0.f && viewport.TopLeftY == 0.f && viewport.Width >= 1.f && viewport.Height >= 1.f && viewport.Width <= device_data.output_resolution.x && viewport.Height <= device_data.output_resolution.y)
+      {
+         g_scene_render_size = {uint32_t(viewport.Width), uint32_t(viewport.Height)};
+         g_screen_percentage = viewport.Width / device_data.output_resolution.x;
+         if (g_previous_scene_render_size.x != 0 && (g_previous_scene_render_size.x != g_scene_render_size.x || g_previous_scene_render_size.y != g_scene_render_size.y))
+            device_data.force_reset_sr = true;
+         g_previous_scene_render_size = g_scene_render_size;
+      }
       const uint2 render_size = GetScreenPercentageRenderSize(device_data.output_resolution);
       game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / float(render_size.x), game_device_data.mv_jitter[1] * -2.f / float(render_size.y)};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
@@ -1276,6 +1425,16 @@ class BorderlandsGoty final : public Game
       { return copy ? copy->size() : size_t(0); };
       // The previous frame's b0 / b1 / b3: the same object's from last frame, else this draw's with last frame's world camera (no object
       // motion). None (no CPU copy yet, or an unmatched weapon draw): the current ones (zero motion).
+#if DEVELOPMENT
+      // "Performance Test" without motion vector draws: the frame (camera, target clear, camera fill, upscaler) still happens, the draws
+      // run jittered only, or untouched
+      if (perf_test_modes[g_perf_test].motion_vector_draws < 2)
+      {
+         if (object && camera && !game_device_data.mv_camera)
+            game_device_data.mv_camera = camera;
+         return false;
+      }
+#endif
       const std::vector<uint8_t>* uploads[std::size(MotionVectorPatches::previous_slots)] = {};
       if (object && camera && (!skinned || bones))
       {
@@ -1379,6 +1538,11 @@ class BorderlandsGoty final : public Game
       auto& game_device_data = GetGameDeviceData(device_data);
       if (!game_device_data.mv_scene_open || game_device_data.mv_jitter == std::array<float, 2>{} || !game_device_data.mv_jitter_buffer)
          return false;
+#if DEVELOPMENT
+      // "Performance Test" without motion vector draws: the whole frame unjittered, so its depth tests stay consistent
+      if (perf_test_modes[g_perf_test].motion_vector_draws < 1)
+         return false;
+#endif
       // Meshes only (full screen passes have no vertex buffer or no depth test), into the scene depth (not shadows)
       if (!dsv)
          return false;
@@ -1557,6 +1721,10 @@ class BorderlandsGoty final : public Game
          return false;
       }
 #if DEVELOPMENT
+      if (auto* const perf_queries = game_device_data.perf_frame_queries; perf_queries && perf_queries->scene && !std::exchange(perf_queries->sr_draw, true))
+         native_device_context->End(perf_queries->sr_draw_end.get());
+#endif
+#if DEVELOPMENT
       if (com_ptr<ID3D11UnorderedAccessView> output_uav; tonemapped && SUCCEEDED(native_device->CreateUnorderedAccessView(device_data.sr_output_color.get(), nullptr, &output_uav)))
       {
          ID3D11UnorderedAccessView* uav = output_uav.get();
@@ -1631,6 +1799,10 @@ class BorderlandsGoty final : public Game
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
       compute_state.Cache(native_device_context, device_data.uav_max_count);
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL Motion Vector Fill CS"));
+#if DEVELOPMENT
+      if (auto* const perf_queries = game_device_data.perf_frame_queries; perf_queries && perf_queries->scene_started && !std::exchange(perf_queries->fill, true))
+         native_device_context->End(perf_queries->fill_start.get());
+#endif
       if (std::exchange(game_device_data.mv_fill_pending, false) && fill_shader)
       {
          // Current clip space to the previous frame's: previous * inverse(current) for column vectors (b1 holds the row vector
@@ -1671,11 +1843,24 @@ class BorderlandsGoty final : public Game
             native_device_context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
          }
       }
+#if DEVELOPMENT
+      auto* const perf_queries = game_device_data.perf_frame_queries;
+      if (perf_queries && perf_queries->scene_started && !perf_queries->scene)
+      {
+         native_device_context->End(perf_queries->scene_end.get());
+         perf_queries->scene = true;
+      }
+#endif
       if (IsSRActive(device_data))
       {
          const bool drawn = DrawUpscaler(native_device, native_device_context, device_data);
 #if DEVELOPMENT
          game_device_data.mv_stats.sr_draws += drawn;
+         if (perf_queries && perf_queries->scene && !perf_queries->sr && drawn)
+         {
+            native_device_context->End(perf_queries->sr_end.get());
+            perf_queries->sr = true;
+         }
 #else
          (void)drawn;
 #endif
@@ -2012,6 +2197,9 @@ public:
          }
          else if (!gd.mv_scene_done && !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
          {
+#if DEVELOPMENT
+            const PerfHookTimer timer{gd.perf_hook_ns}; // The draw's own submission included
+#endif
             com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
             com_ptr<ID3D11DepthStencilView> dsv;
             native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
@@ -2083,6 +2271,11 @@ public:
                ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get();
                native_device_context->CSSetConstantBuffers(5, 1, &cb);
                native_device_context->CSSetSamplers(0, 1, &linear_sampler);
+#if DEVELOPMENT
+               auto* const perf_queries = gd.perf_frame_queries && !gd.perf_frame_queries->dof ? gd.perf_frame_queries : nullptr;
+               if (perf_queries)
+                  native_device_context->End(perf_queries->dof_start.get());
+#endif
 
                // Outputs are bound before inputs in both passes: D3D11 nulls an SRV of a resource still bound for output (the new history
                // is the first pass's output and the gather's input)
@@ -2096,6 +2289,10 @@ public:
                   native_device_context->CSSetShader(history_shader, nullptr, 0);
                   native_device_context->Dispatch((render_size.x + 7) / 8, (render_size.y + 7) / 8, 1);
                }
+#if DEVELOPMENT
+               if (perf_queries)
+                  native_device_context->End(perf_queries->dof_history_end.get());
+#endif
 
                // The gather: the scene, the game's depth and the new history in, its target out
                {
@@ -2107,6 +2304,13 @@ public:
                   // One thread per 2x2 scene texels, as the game's at 100%
                   native_device_context->Dispatch((uint32_t(device_data.output_resolution.x) + 15) / 16, (uint32_t(device_data.output_resolution.y) + 15) / 16, 1);
                }
+#if DEVELOPMENT
+               if (perf_queries)
+               {
+                  native_device_context->End(perf_queries->dof_end.get());
+                  perf_queries->dof = true;
+               }
+#endif
 
                compute_state.Restore(native_device_context);
                graphics_state.Restore(native_device_context);
@@ -2681,9 +2885,9 @@ public:
       gd.mv_active = IsSRActive(device_data) || g_mv_enable;
       gd.sp_post_output_res = false;
       // Render scale: the engine renders every view into a top-left sub-rect of its full size targets, so ScreenPercentage applies live.
-      // It is rewritten whenever it differs (the game may restore its own).
-      // ponytail: the game thread can run a frame ahead of the renderer, so the first frame after a change may mismatch Luma's sub-rect
-      // (the upscaler restarts); latch the engine's actual view size if that frame shows
+      // It is rewritten whenever it differs (the game may restore its own). The next frame's scene gives its actual size (see
+      // "GetScreenPercentageRenderSize").
+      g_scene_render_size = {};
       if (g_engine_screen_percentage)
       {
          const float screen_percentage = gd.sr_active ? std::round(g_render_scale * 100.f) : 100.f;
@@ -2711,6 +2915,151 @@ public:
          device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(float(GetScreenPercentageRenderSize(device_data.output_resolution).y), device_data.output_resolution.y) : 0.f;
       }
 #if DEVELOPMENT
+      // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, the first 60
+      // after a change of mode or AA settings skipped), opens the next frame's
+      com_ptr<ID3D11DeviceContext> native_device_context;
+      native_device->GetImmediateContext(&native_device_context);
+      if (auto* const queries = std::exchange(gd.perf_frame_queries, nullptr))
+      {
+         native_device_context->End(queries->frame_end.get());
+         native_device_context->End(queries->disjoint.get());
+         queries->pending = true;
+      }
+      if (g_perf_test != 0)
+      {
+         const auto now = std::chrono::steady_clock::now();
+         const uint32_t settings = uint32_t(g_perf_test) | (uint32_t(int(device_data.sr_type) + 1) << 5) | (dlss_render_preset << 8) | (uint32_t(g_smaa_enable) << 16) | (uint32_t(g_gtao_enable) << 17) | (uint32_t(g_perf_hook_timers) << 18) | (uint32_t(std::lround(g_render_scale * 100.f)) << 19);
+         // Also after a pause (the game stops presenting while unfocused): the upscaler history and the clocks restart
+         if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250))
+            gd.perf_settle_frames = 60;
+         const bool measuring = gd.perf_settle_frames <= 0;
+         auto& stats = gd.perf_stats;
+         for (auto& queries : gd.perf_queries)
+         {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+            if (!queries.pending || native_device_context->GetData(queries.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+               continue;
+            queries.pending = false;
+            if (!measuring)
+               continue;
+            if (disjoint.Disjoint || disjoint.Frequency == 0)
+            {
+               stats.disjoint++;
+               continue;
+            }
+            const auto read = [&](const com_ptr<ID3D11Query>& query, UINT64* ticks)
+            { return native_device_context->GetData(query.get(), ticks, sizeof(*ticks), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK; };
+            const auto add = [&](UINT64 start, UINT64 end, double* total, double* max_ms, uint32_t* samples)
+            {
+               const double ms = 1000.0 * double(end - start) / double(disjoint.Frequency);
+               *total += ms;
+               *max_ms = (std::max)(*max_ms, ms);
+               ++*samples;
+            };
+            UINT64 frame_start, frame_end, scene_start, fill_start, scene_end, sr_draw_end, sr_end, dof_start, dof_history_end, dof_end;
+            if (!read(queries.frame_start, &frame_start) || !read(queries.frame_end, &frame_end))
+               continue;
+            add(frame_start, frame_end, &stats.frame_ms, &stats.frame_max_ms, &stats.samples);
+            if (queries.scene && read(queries.scene_start, &scene_start) && read(queries.scene_end, &scene_end))
+            {
+               add(scene_start, scene_end, &stats.scene_ms, &stats.scene_max_ms, &stats.scene_samples);
+               if (queries.fill && read(queries.fill_start, &fill_start))
+                  add(fill_start, scene_end, &stats.fill_ms, &stats.unused_max_ms, &stats.fill_samples);
+               if (queries.sr && read(queries.sr_end, &sr_end))
+               {
+                  add(scene_end, sr_end, &stats.sr_ms, &stats.sr_max_ms, &stats.sr_samples);
+                  if (queries.sr_draw && read(queries.sr_draw_end, &sr_draw_end))
+                  {
+                     add(scene_end, sr_draw_end, &stats.sr_draw_ms, &stats.unused_max_ms, &stats.sr_draw_samples);
+                     add(sr_draw_end, sr_end, &stats.sr_copy_ms, &stats.unused_max_ms, &stats.sr_copy_samples);
+                  }
+               }
+            }
+            if (queries.dof && read(queries.dof_start, &dof_start) && read(queries.dof_history_end, &dof_history_end) && read(queries.dof_end, &dof_end))
+            {
+               add(dof_start, dof_history_end, &stats.dof_history_ms, &stats.unused_max_ms, &stats.dof_samples);
+               add(dof_history_end, dof_end, &stats.dof_gather_ms, &stats.unused_max_ms, &stats.dof_gather_samples);
+            }
+         }
+         if (!measuring)
+         {
+            gd.perf_settle_frames--;
+            stats = {};
+            gd.perf_hook_ns = 0;
+         }
+         else
+         {
+            stats.cpu_frame_ms += std::chrono::duration<double, std::milli>(now - gd.perf_last_present).count();
+            if (++stats.frames >= 120)
+            {
+               const auto average = [](double total, uint32_t samples)
+               { return samples != 0 ? total / samples : 0.0; };
+               std::string aa = g_smaa_enable ? "SMAA" : "None";
+               if (IsSRActive(device_data))
+                  aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
+               const std::array<double, 9> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.sr_ms, stats.sr_samples), double(gd.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, average(stats.fill_ms, stats.fill_samples), average(stats.sr_draw_ms, stats.sr_draw_samples), average(stats.sr_copy_ms, stats.sr_copy_samples), average(stats.dof_history_ms, stats.dof_samples), average(stats.dof_gather_ms, stats.dof_gather_samples)};
+               reshade::log::message(reshade::log::level::info, std::format("[BL Perf] mode=\"{}\" aa={} hook_timers={} gtao={} render_scale={:.2f} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame fill={:.3f} sr_draw={:.3f} sr_copy={:.3f} dof_history={:.3f} dof_gather={:.3f} ms ({}) samples={}/{} disjoint={}", perf_test_modes[g_perf_test].name, aa, g_perf_hook_timers, g_gtao_enable, g_screen_percentage, g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), window[0], stats.frame_max_ms, window[1], stats.scene_max_ms, stats.scene_samples, window[2], stats.sr_max_ms, stats.sr_samples, stats.cpu_frame_ms / stats.frames, window[3], window[4], window[5], window[6], window[7], window[8], stats.dof_samples, stats.samples, stats.frames, stats.disjoint).c_str());
+               stats = {};
+
+               if (g_perf_sweep)
+               {
+                  gd.perf_sweep_results[g_perf_test].push_back(window);
+                  if (++gd.perf_sweep_windows_done >= perf_sweep_windows)
+                  {
+                     gd.perf_sweep_windows_done = 0;
+                     const int step = ++gd.perf_sweep_step;
+                     if (step < perf_sweep_rounds * int(std::size(perf_sweep_modes)))
+                     {
+                        ApplyPerfTestMode(device_data, perf_sweep_modes[step % std::size(perf_sweep_modes)]);
+                     }
+                     else
+                     {
+                        // Per mode: the median window (and the frame's range), and the frame against the last mode's (No AA)
+                        const auto median = [&](int mode, size_t column)
+                        {
+                           std::vector<double> values;
+                           for (const auto& result : gd.perf_sweep_results[mode])
+                              values.push_back(result[column]);
+                           std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+                           return values.empty() ? 0.0 : values[values.size() / 2];
+                        };
+                        const double baseline = median(perf_sweep_modes[std::size(perf_sweep_modes) - 1], 0);
+                        for (const int mode : perf_sweep_modes)
+                        {
+                           const auto& results = gd.perf_sweep_results[mode];
+                           const auto [min_frame, max_frame] = std::minmax_element(results.begin(), results.end(), [](const auto& a, const auto& b)
+                              { return a[0] < b[0]; });
+                           reshade::log::message(reshade::log::level::info, std::format("[BL Perf] sweep mode=\"{}\" hook_timers={} windows={} gpu frame median={:.3f} ms (min/max {:.3f}/{:.3f}, {:+.3f} vs \"{}\") scene median={:.3f} ms sr median={:.3f} ms cpu hooks median={:.3f} ms/frame fill={:.3f} sr_draw={:.3f} sr_copy={:.3f} dof_history={:.3f} dof_gather={:.3f} ms (medians)", perf_test_modes[mode].name, g_perf_hook_timers, results.size(), median(mode, 0), results.empty() ? 0.0 : (*min_frame)[0], results.empty() ? 0.0 : (*max_frame)[0], median(mode, 0) - baseline, perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name, median(mode, 1), median(mode, 2), median(mode, 3), median(mode, 4), median(mode, 5), median(mode, 6), median(mode, 7), median(mode, 8)).c_str());
+                        }
+                        g_perf_sweep = false;
+                        ApplyPerfTestMode(device_data, 0);
+                     }
+                  }
+               }
+            }
+         }
+         gd.perf_last_present = now;
+
+         auto& queries = gd.perf_queries[gd.perf_query_index];
+         if (!queries.pending)
+         {
+            if (!queries.disjoint)
+            {
+               const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
+               native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
+               for (auto* const query : {&queries.frame_start, &queries.scene_start, &queries.fill_start, &queries.scene_end, &queries.sr_draw_end, &queries.sr_end, &queries.dof_start, &queries.dof_history_end, &queries.dof_end, &queries.frame_end})
+                  native_device->CreateQuery(&timestamp_desc, &*query);
+            }
+            if (queries.disjoint && queries.frame_start && queries.scene_start && queries.fill_start && queries.scene_end && queries.sr_draw_end && queries.sr_end && queries.dof_start && queries.dof_history_end && queries.dof_end && queries.frame_end)
+            {
+               native_device_context->Begin(queries.disjoint.get());
+               native_device_context->End(queries.frame_start.get());
+               queries.scene_started = queries.fill = queries.scene = queries.sr_draw = queries.sr = queries.dof = false;
+               gd.perf_frame_queries = &queries;
+               gd.perf_query_index = (gd.perf_query_index + 1) % gd.perf_queries.size();
+            }
+         }
+      }
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run
       if (const auto& stats = gd.mv_last_stats; gd.mv_active && cb_luma_global_settings.FrameIndex % 300 == 0)
@@ -2792,11 +3141,16 @@ public:
       ImGui::SeparatorText("Anti-Aliasing");
       const bool sr_active = IsSRActive(device_data);
       ImGui::BeginDisabled(!sr_active || !g_engine_screen_percentage);
-      int render_scale = int(std::round(g_render_scale * 100.f));
-      if (ImGui::SliderInt("Render Scale (%)", &render_scale, int(min_render_scale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp))
-         g_render_scale = float(render_scale) / 100.f;
+      // Applied on release: changed every frame while dragged, the game thread's view lags the sub-rect Luma upscales (uncovered borders)
+      static int dragged_render_scale = -1;
+      int render_scale = dragged_render_scale >= 0 ? dragged_render_scale : int(std::round(g_render_scale * 100.f));
+      ImGui::SliderInt("Render Scale (%)", &render_scale, int(min_render_scale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+      dragged_render_scale = ImGui::IsItemActive() ? render_scale : -1;
       if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         g_render_scale = float(render_scale) / 100.f;
          reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR.");
       DrawResetButton(g_render_scale, 1.f, "RenderScale");
@@ -2976,6 +3330,39 @@ public:
          ImGui::SetTooltip("Skips ScreenPercentage at one ScaleScreenCoords call site (see ScaleScreenCoordsPatch). Not saved.");
       if (changed)
          ScaleScreenCoordsPatch::Apply(g_sp_unscaled_render_target_views, g_sp_unscaled_other_calls);
+
+      ImGui::SeparatorText("Performance");
+      auto& game_device_data = GetGameDeviceData(device_data);
+      const std::string sweep_label = std::format("Sweep ({}/{})", game_device_data.perf_sweep_step + 1, perf_sweep_rounds * std::size(perf_sweep_modes));
+      if (ImGui::BeginCombo("Performance Test", g_perf_sweep ? sweep_label.c_str() : perf_test_modes[g_perf_test].name))
+      {
+         for (int i = 0; i < int(std::size(perf_test_modes)); i++)
+         {
+            const PerfTestMode& mode = perf_test_modes[i];
+            ImGui::BeginDisabled(mode.set_aa && mode.sr_type != SR::Type::None && !device_data.sr_implementations_instances.contains(mode.sr_type));
+            if (ImGui::Selectable(mode.name, !g_perf_sweep && g_perf_test == i) && (g_perf_sweep || g_perf_test != i))
+            {
+               g_perf_sweep = false;
+               ApplyPerfTestMode(device_data, i);
+            }
+            ImGui::EndDisabled();
+         }
+         ImGui::BeginDisabled(!device_data.sr_implementations_instances.contains(SR::Type::DLSS));
+         if (ImGui::Selectable("Sweep", g_perf_sweep) && !g_perf_sweep)
+         {
+            for (auto& results : game_device_data.perf_sweep_results)
+               results.clear();
+            game_device_data.perf_sweep_step = 0;
+            game_device_data.perf_sweep_windows_done = 0;
+            g_perf_sweep = true;
+            ApplyPerfTestMode(device_data, perf_sweep_modes[0]);
+         }
+         ImGui::EndDisabled();
+         ImGui::EndCombo();
+      }
+      ImGui::Checkbox("Hook Timers", &g_perf_hook_timers);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Times the motion vector hooks for \"cpu hooks\" (two clock reads per hooked draw and constant upload).\nRun a Sweep with it off to see their own cost in the frame times.");
    }
 #endif
 

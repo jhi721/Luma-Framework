@@ -31,11 +31,20 @@ SamplerState linear_sampler : register(s0);
 
 #include "Includes/DOFBlurAmount.hlsli"
 
-[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+// The group's 8x8 pixels and a 1 pixel border (edge clamped), each amount computed once instead of by up to 9 threads
+groupshared float group_amounts[10 * 10];
+
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
+   const int2 tile_origin = int2(group_id.xy) * 8 - 1;
+   for (uint i = group_index; i < 10 * 10; i += 8 * 8)
+      group_amounts[i] = BlurAmount(depth.Load(int3(clamp(tile_origin + int2(i % 10, i / 10), 0, int2(render_size) - 1), 0)));
+   GroupMemoryBarrierWithGroupSync();
+
    if (any(float2(id.xy) >= render_size))
       return;
    const int2 pixel = int2(id.xy);
-   const float current = BlurAmount(depth.Load(int3(pixel, 0)));
+   const int2 tile_pixel = pixel - tile_origin;
+   const float current = group_amounts[tile_pixel.y * 10 + tile_pixel.x];
    float result = current;
    const float2 uv = (float2(pixel) + 0.5) / render_size + motion_vectors.Load(int3(pixel, 0));
    if (history_weight < 1.0 && all(uv >= 0.0) && all(uv <= 1.0))
@@ -45,9 +54,7 @@ SamplerState linear_sampler : register(s0);
       {
          [unroll] for (int x = -1; x <= 1; x++)
          {
-            if (x == 0 && y == 0) // "current"
-               continue;
-            const float neighbor = BlurAmount(depth.Load(int3(clamp(pixel + int2(x, y), 0, int2(render_size) - 1), 0)));
+            const float neighbor = group_amounts[(tile_pixel.y + y) * 10 + tile_pixel.x + x];
             lowest = min(lowest, neighbor);
             highest = max(highest, neighbor);
          }
