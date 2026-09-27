@@ -1,6 +1,6 @@
-// rl_distortion_01: offsets the scene by the distortion map and blends in the blurred scene by its z. Its decode centres the
-// offset on the 8-bit 128/255 (the 1 + 1/255 bias, vanilla's -1.003922), so the map is read as its 8-bit target stored it
-// ("SR4_SampleDistortionMap": Luma's FP16 upgrade stores the writers' 0.5 neutral as exactly 0.5 and shifted the whole screen).
+// rl_distortion_01: offsets the scene by the distortion map and blends in the blurred scene by its z. Its decode (vanilla's
+// -1.003922, the 1 + 1/255 bias) centres the offset on the 8-bit 128/255, so the map is read as its 8-bit target stored it (see
+// "SR4_SampleDistortionMap"): Luma's FP16 upgrade would store the writers' 0.5 neutral as exactly 0.5 and shift the whole screen.
 #include "Includes/Common.hlsl"
 
 cbuffer vc0 : register(b0)

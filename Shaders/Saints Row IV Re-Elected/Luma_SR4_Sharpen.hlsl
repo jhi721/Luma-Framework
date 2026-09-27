@@ -1,6 +1,5 @@
 // RCAS sharpening of the gamma canvas after SMAA, or alone after DLSS/FSR (same shape as the TW2 and BL2/TPS passes).
-// Reads the canvas snapshot and writes straight into the canvas RTV. The sharpness slider (LumaData.CustomData3) is
-// the tuning knob.
+// Reads the canvas snapshot and writes straight into the canvas RTV. LumaData.CustomData3 is the RCAS Sharpness slider.
 
 #include "../Includes/RCAS.hlsl"
 #include "Includes/Common.hlsl"

@@ -1,8 +1,7 @@
-// rl_bokeh_cs_00: spawns a bokeh sprite (drawn additively by rl_bokeh_sprite_01/02) where a pixel's luma (the 0.21 / 0.72 / 0.07
-// sum of the gamma-encoded composite) stands out from its ring. It reads the copy of the final composite, which was 8-bit UNORM in
-// vanilla. The HDR output goes above 1, and the sprite color grows with the luma excess over the threshold times the color itself,
-// so peaks went past 10k nits.
-// Each read is clamped to the vanilla range; the rest is the original.
+// rl_bokeh_cs_00: spawns a bokeh sprite (drawn additively by rl_bokeh_sprite_01/02) where a pixel's luma (0.21 / 0.72 / 0.07 over
+// the gamma-encoded composite) stands out from its ring. It reads a copy of the final composite, 8-bit UNORM in vanilla; the HDR one
+// goes above 1, and the sprite color grows with the luma excess over the threshold times the color itself, so peaks went past 10k
+// nits. Each read is clamped to the vanilla range; the rest is the original.
 
 cbuffer CSConstants : register(b0)
 {
@@ -24,7 +23,7 @@ Texture2D<float4> Depth_tex : register(t1);
 Texture2D<float4> Color_tex : register(t2);
 AppendStructuredBuffer<Sprite> Out_buff : register(u0);
 
-// The bilinear sample of the clamped texels (UNORM clamped before the filter, not after it); clamp addressing.
+// Bilinear over the clamped texels, as the UNORM copy clamped before filtering, not after; clamp addressing.
 float3 SampleColor(float2 uv, float2 offset)
 {
    int2 size;

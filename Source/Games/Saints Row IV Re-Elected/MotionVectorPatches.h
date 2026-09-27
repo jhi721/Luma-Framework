@@ -25,9 +25,10 @@ namespace MotionVectorPatches
       }
       return slot;
    }
-   // Upscaler projection jitter in NDC (c0.xy), added to SV_Position after its unjittered copy, so motion vectors never contain it
+   // The jitter buffer. c0.xy: the upscaler's projection jitter in NDC, added to SV_Position after its unjittered copy, so motion
+   // vectors never contain it; c0.zw: the render sub-rect's share of the target (see "PatchScreenUVPixelShader").
    constexpr uint32_t jitter_slot = 9;
-   // The second run reads t0-t15 from these slots, bound to the current resources (no motion vector VS reads a per frame one)
+   // The second run reads t0-t15 at t64-t79, bound to the current resources (no motion vector VS reads one that changes per frame)
    constexpr uint32_t resource_slots = 16;
    constexpr uint32_t previous_resources_slot = 64;
    // Past every register the game uses (vertex outputs end at o10, pixel inputs at v10), within SM4's 16 vertex outputs
@@ -179,7 +180,7 @@ namespace MotionVectorPatches
       return true;
    }
 
-   // Position of an operand's first index when immediate (or immediate plus relative), or none
+   // WalkOperand's "first_index_position" when the first index has no immediate part (or the operand no index)
    constexpr size_t no_index = SIZE_MAX;
 
    // Calls "visit(operand_token_position, first_index_position)" on the operand at "i" and on its relative index operands (which
@@ -371,8 +372,8 @@ namespace MotionVectorPatches
                                                                                                        { return instruction.opcode == D3D10_SB_OPCODE_RET; }) != 1)
          return (*error = "returns", std::vector<uint8_t>());
 
-      // Added declarations: vc2 / vc3 (same size and indexing) and each resource again at the previous frame's slots, the jitter
-      // buffer, the two outputs, one temp
+      // Added declarations: vc2 / vc3 again at their previous frame slots (same size and indexing), each resource again at the second
+      // run's slots, the jitter buffer, the two outputs, one temp
       const auto is_resource_declaration = [](D3D10_SB_OPCODE_TYPE opcode)
       { return opcode == D3D10_SB_OPCODE_DCL_RESOURCE || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_RAW || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED; };
       std::vector<size_t> object_indices;
@@ -627,11 +628,11 @@ namespace MotionVectorPatches
    //   "mul rX.xy, rX.xyxx, cb9[0].zwzz" after it;
    // - every read of the "texture_slots" (a bit per t slot, none: no_texture) at a register coordinate reads at
    //   "mul rNew.xy, coordinate, cb9[0].zwzz";
-   // - the stipple DSF (material pass, "IR_Stipple_Pattern_Offset"), "mad rB.xyzw, cb4[9].xyxy, l(0.9, ..), rA.xzxz" (viewport UV plus
-   //   0.9 texel), then the texel from rB ("IR_Pixel_Steps.zw", the render size under the sub-rect), after which rB is only compared
-   //   with the samples' UVs over the full texture (distance weights, all zero from the sub-rect: black): after that texel instruction
-   //   rB = (rB - 0.9 * cb4[9].xy) * cb9[0].zw + 0.9 * cb4[9].xy.
-   // Empty if nothing matched ("no screen uv") or there's no constant buffer declaration to copy.
+   // - the stipple DSF (material pass, "IR_Stipple_Pattern_Offset"): "mad rB.xyzw, cb4[9].xyxy, l(0.9, ..), rA.xzxz" makes the
+   //   viewport UV plus 0.9 texel, the next instruction the texel from rB ("IR_Pixel_Steps.zw", the render size under the sub-rect).
+   //   rB is then only compared with the samples' UVs over the full texture as distance weights, all zero from sub-rect UVs (black),
+   //   so after that texel instruction rB = (rB - 0.9 * cb4[9].xy) * cb9[0].zw + 0.9 * cb4[9].xy.
+   // Empty if nothing matched ("no screen uv") or unpatchable (e.g. no constant buffer declaration to copy for the jitter buffer's).
    constexpr uint32_t no_texture = 0;
    inline std::vector<uint8_t> PatchScreenUVPixelShader(const uint8_t* code, size_t size, uint32_t texture_slots, std::string* error)
    {
@@ -669,8 +670,8 @@ namespace MotionVectorPatches
                 t[5] == immediate && t[6] == std::bit_cast<uint32_t>(0.5f) && t[7] == std::bit_cast<uint32_t>(-0.5f) &&
                 t[10] == immediate && t[11] == std::bit_cast<uint32_t>(0.5f) && t[12] == std::bit_cast<uint32_t>(0.5f);
       };
-      // A texture read (sample*, ld, gather4) of one of the "texture_slots": the position of its coordinate operand (2 tokens, a 1D register without
-      // modifiers), else 0
+      // A texture read (sample*, ld, gather4) of one of the "texture_slots": the position of its coordinate operand (2 tokens, a 1D
+      // register without modifiers), else 0
       const auto screen_texture_coordinate = [&](const Instruction& instruction) -> size_t
       {
          if (texture_slots == no_texture || (instruction.opcode != D3D10_SB_OPCODE_SAMPLE && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_L && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_B && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_D && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_C && instruction.opcode != D3D10_SB_OPCODE_SAMPLE_C_LZ && instruction.opcode != D3D10_SB_OPCODE_LD && instruction.opcode != D3D10_1_SB_OPCODE_GATHER4))

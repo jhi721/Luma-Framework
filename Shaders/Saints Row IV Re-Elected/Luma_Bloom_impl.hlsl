@@ -1,9 +1,8 @@
-// Saints Row IV - the shared fp16 pyramidal bloom, built from the rl_hdr final's own scene input (t0) and bound
-// over the game's Final_bloom (t6). The prefilter replays the native rl_hdr_prep_08 brightpass
-// and rl_hdr_prep_07 combine on their own constants, copied at their draws earlier in the frame (main.cpp), with the tint of
-// the rl_downsample_02 that feeds the brightpass (quarter-res 16-tap box; the pyramid's own first blur stands in for
-// it), so the knee, its per-area values and the chain's tints are the game's. The scene is unexposed here, as for the
-// native pass. DrawBloom binds only b11; main.cpp binds the copies at b0/b4/b5/b6 around it.
+// Saints Row IV - the shared fp16 pyramidal bloom, built from the rl_hdr final's own scene input (t0) and bound over the game's
+// Final_bloom (t6). The prefilter replays the native rl_hdr_prep_08 brightpass and rl_hdr_prep_07 combine on their own constants,
+// copied at their draws earlier in the frame, with the tint of the rl_downsample_02 that feeds the brightpass (a quarter-res 16-tap
+// box; the pyramid's own first blur stands in for it), so the knee, its per-area values and the chain's tints are the game's. The
+// scene is unexposed here, as for the native pass. DrawBloom binds only b11; main.cpp binds the copies at b0/b4/b5/b6 around it.
 
 #include "../Includes/Math.hlsl"
 

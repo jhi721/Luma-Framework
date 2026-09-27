@@ -46,7 +46,8 @@ namespace
       {0x9F1F6557, "rl_hdr_06 [final_no_lut_diffracted]"},
       {tonemap_no_post_pixel_shader, "rl_hdr_05 [no_tonemapping] (PostProcess 0)"},
    };
-   // rl_distortion_01, replaced: it reads the distortion map's share like the finals (see "Distortion_0xE9E18958.ps_4_0.hlsl")
+   // rl_distortion_01, replaced: it reads the distortion map through "SR4_SampleDistortionMap" like the finals (see
+   // "Distortion_0xE9E18958.ps_4_0.hlsl")
    constexpr uint32_t distortion_pixel_shader = 0xE9E18958;
    // rl_bokeh_sprite_01: the aiming depth of field's bokeh sprites, added onto the output after the finals (see "DrawBlendLimited")
    constexpr uint32_t bokeh_sprite_pixel_shader = 0x4DDED58A;
@@ -254,7 +255,7 @@ namespace
    constexpr std::pair<uint32_t, uint32_t> sub_rect_quad_vertex_shaders[] = {
       {0x0FFC4B94, CompileTimeStringHash("SR4 Sub Rect Light Unit Z VS")}, // Deferred lights
       {0x086E02B3, CompileTimeStringHash("SR4 Sub Rect Light VS")},
-      {0x58DBDDA3, CompileTimeStringHash("SR4 Sub Rect Quad VS")}, // Full screen: rl_restore_depth, the AO term (also post)
+      {0x58DBDDA3, CompileTimeStringHash("SR4 Sub Rect Quad VS")}, // Full screen: rl_restore_depth, the particle depth downsample, the AO term (also post)
       {0x9669662B, CompileTimeStringHash("SR4 Sub Rect SSAO VS")}, // SSAO blur and apply
    };
    // The scene's pixel shaders that make their screen UV from NDC themselves (the sun shadow term family, reading Depth_map), patched to
@@ -274,8 +275,8 @@ namespace
    // SSAO also reads its previous result, t0)
    constexpr std::pair<uint32_t, uint32_t> sub_rect_quad_ndc_pixel_shaders[] = {{0x624BF56D, gbuffer_texture_slots}, {0x1D8BB773, gbuffer_texture_slots | 1u}, {0xDA63305D, gbuffer_texture_slots}, {0x30983822, gbuffer_texture_slots}};
    // The post passes Luma doesn't replace that read the distortion map (drawn into the sub-rect with the scene) at the screen UV, with
-   // its slot: rl_distortion_02, and the rl_hdr finals outside "tonemap_pixel_shaders" (those scale it in "Luma_SR4_Tonemap.hlsl",
-   // rl_distortion_01 in "Distortion_0xE9E18958.ps_4_0.hlsl")
+   // its slot: rl_distortion_02, and the rl_hdr finals outside "tonemap_pixel_shaders" (those and rl_distortion_01 scale it in
+   // "SR4_SampleDistortionMap")
    constexpr std::pair<uint32_t, uint32_t> sub_rect_distortion_pixel_shaders[] = {{0x8957630A, 1}, {0x7DCC8A34, 4}, {0x7FC325C0, 4}, {0x8D1F6BBB, 4}, {0xD501C191, 4}, {0xE9664111, 4}, {0xFEE7D6DC, 4}};
 
    // XeGTAO over rl_ssao_singleframe_calculate (SSAO_Level 2/3). Its 4 draws (one AO channel each, into a half-res target:
@@ -1138,9 +1139,9 @@ class SaintsRowIV final : public Game
    }
 
    // Render scale: a scene draw that reads screen textures at UVs over the full target, into the sub-rect: the screen space quads
-   // (see "sub_rect_quad_vertex_shaders") with their sub-rect VS, the screen UV pixel shaders ("sub_rect_uv_pixel_shaders", and the quads
-   // rebuilding NDC from their UV, "sub_rect_quad_ndc_pixel_shaders", with the game's VS) patched, both
-   // left bound like the motion vector shaders, with the jitter buffer for the UV scale. False if it's neither (or the shader is missing).
+   // ("sub_rect_quad_vertex_shaders") with their sub-rect VS, or the patched screen UV pixel shaders ("sub_rect_uv_pixel_shaders", and
+   // the quads rebuilding NDC from their UV, "sub_rect_quad_ndc_pixel_shaders", with the game's VS), both left bound like the motion
+   // vector shaders, with the jitter buffer for the UV scale. False if it's neither (or the shader is missing).
    // ponytail: the patched PS draws skip the jitter (their VS isn't patched); jitter them too if the sun shadow term shimmers under DLSS
    static bool DrawSubRect(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw)
    {
@@ -1475,8 +1476,8 @@ class SaintsRowIV final : public Game
       return true;
    }
 
-   // DLSS / FSR at native resolution on the jittered scene (the post scene, see "ResolveScene"), the G-buffer depth and the motion
-   // vectors; the result goes back into the scene. False if it didn't draw (missing input, or the upscaler failed).
+   // DLSS / FSR on the jittered scene (the post scene, see "ResolveScene"; its render scale sub-rect, else all of it), the G-buffer
+   // depth and the motion vectors; the full size result goes back into the scene. False if it didn't draw (missing input, or the upscaler failed).
    static bool DrawUpscaler(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11Texture2D* scene, const D3D11_TEXTURE2D_DESC& scene_desc, ID3D11Resource* depth, uint32_t render_width, uint32_t render_height)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -2172,8 +2173,8 @@ public:
       if (input_scale == 0 || (depth_size.y + height / 2) / height != input_scale || normals_size.x != depth_size.x || normals_size.y != depth_size.y)
          return false;
       // DLSS/FSR accumulate the lit scene the AO multiplies into: cycle the noise and denoise once (Intel's XeGTAO.h with TAA);
-      // without them a moving pattern would boil, so it stays frozen and denoises twice. Full resolution mode (also with DLSS/FSR,
-      // +0.55 ms at 4K, DLSS K, "Performance Test" sweep): every pass at the depth's size, averaged into the target at the end
+      // without them a moving pattern would boil, so it stays frozen and denoises twice. Full resolution mode (with DLSS/FSR only,
+      // +0.55 ms at 4K with DLSS K in the "Performance Test" sweep): every pass at the depth's size, averaged into the target at the end
       // ("downsample_cs"). At half res the upscaler's jitter flips a target pixel's one depth texel between grass blades and the
       // ground: the AO boils.
       const bool temporal = IsSRActive(device_data);

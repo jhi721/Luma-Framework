@@ -14,7 +14,7 @@ struct LumaGameSettings
 {
    float Dithering;             // 0/1. Animated triangular dither on the rl_hdr finals' output (HDR path).
    float VideoAutoHDREnable;    // 0/1. Light AutoHDR on Bink videos (Video_0x11B77605); no-op in SDR.
-   float VideoAutoHDRBoost;     // 0..1 highlight-expansion strength. 0 = peak at paper white (off).
+   float VideoAutoHDRBoost;     // 0..1 highlight-expansion strength. 0 = peak at sRGB white (off), 1 = VideoAutoHDRPeakNits.
    float BloomIntensity;        // 1 = vanilla. Scales the finals' bloom term, native or Luma.
    float Exposure;              // 1 = vanilla. Scales the finals' tinted scene and bloom.
    float Saturation;            // 1 = vanilla. HDR path only.

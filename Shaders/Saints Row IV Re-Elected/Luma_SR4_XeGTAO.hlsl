@@ -16,9 +16,9 @@
 // - Noise: frozen at 0 without an upscaler (a frame index would make the pattern boil), denoise runs twice. With DLSS/FSR
 //   (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once, as Intel's XeGTAO.h
 //   advises with TAA (NoiseIndexRT, set by main.cpp).
-// - Full resolution mode (main.cpp "RunXeGTAO"): every pass runs at the depth's size (DepthInputScaleRT 1) and downsample_cs
-//   averages each target pixel's block into the target. At half res one depth texel per target pixel flips between a grass blade and
-//   the ground under the upscaler's jitter, and the AO boils.
+// - Full resolution mode (the default with DLSS/FSR, main.cpp "RunXeGTAO"): every pass runs at the depth's size (DepthInputScaleRT 1)
+//   and downsample_cs averages each target pixel's block into the target. At half res the upscaler's jitter flips a target pixel's one
+//   depth texel between a grass blade and the ground, and the AO boils.
 
 // --- Game constant buffer: the SSAO calculate's vc0 (main.cpp binds it at CS b0) ---
 
@@ -63,7 +63,7 @@ cbuffer LumaGTAO : register(b9)
 #endif
 
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.5 // Intel default, metres (near plane 0.15). The native AO reaches only 5-10 cm near the camera and grows with distance through a 1.5%-of-screen floor, so there is no radius to anchor to; with FinalValuePowerRT 2.2 this matched the native coverage and mean darkening in a lit interior. RadiusOverrideRT > 0 wins.
+#define EFFECT_RADIUS 0.5 // Intel default, metres (near plane 0.15). The native AO has no radius to anchor to (5-10 cm near the camera, growing with distance through a 1.5%-of-screen floor); with FinalValuePowerRT 2.2 this matched the native coverage and mean darkening in a lit interior. RadiusOverrideRT > 0 wins.
 #endif
 
 #ifndef RADIUS_MULTIPLIER
@@ -275,8 +275,8 @@ void XeGTAO_MainPass(uint2 pixCoord, float2 localNoise, float3 viewspaceNormal, 
 {
    float2 normalizedScreenPos = (pixCoord + 0.5) * VIEWPORT_PIXEL_SIZE;
 
-   // Center + cross depths from the prefiltered (already linearized) mip0. This texture is our own R32F,
-   // Gather is safe here (the D24 view quirk is only on the game's depth view).
+   // Center and cross depths from the prefiltered view depth mip 0, our own R32F: Gather is safe here (the D24 view quirk is only
+   // on the game's depth view).
    float4 valuesUL = sourceViewspaceDepth.GatherRed(depthSampler, float2(pixCoord * VIEWPORT_PIXEL_SIZE));
    float4 valuesBR = sourceViewspaceDepth.GatherRed(depthSampler, float2(pixCoord * VIEWPORT_PIXEL_SIZE), int2(1, 1));
 

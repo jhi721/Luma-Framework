@@ -7,11 +7,12 @@
 #include "../../Includes/Common.hlsl"
 // clang-format on
 
-// The distortion map (r8g8b8a8 in vanilla, FP16 once Luma upgrades it with the swapchain-sized targets) at the screen uv, as the
-// 8-bit target stored it: each texel clamped and re-quantized before a bilinear filter. The writers' 0.5 neutral then reads 128/255
-// again, as the readers' decode bias expects: rl_distortion_01 centres it exactly, the finals keep vanilla's 1 + 0.5/255 bias. At scale 1 the pixels sit on texel centres, so this is the texel itself. Under
-// the upscaling sub-rect (main.cpp "g_render_scale") the scene drew the map into the target's top-left share, LumaData.CustomData3/4
-// (0 = the whole target): read at that share, clamped to it, and interpolated without re-quantization steps.
+// The distortion map (r8g8b8a8 in vanilla, FP16 once Luma upgrades it with the swapchain-sized targets) at the screen uv, read as
+// the 8-bit target stored it: each texel clamped and re-quantized before a bilinear filter, so the writers' 0.5 neutral reads 128/255
+// again, as the readers' decode bias expects (rl_distortion_01 centres it exactly, the finals keep vanilla's 1 + 0.5/255 bias). At
+// scale 1 the pixels sit on texel centres, so this is the texel itself. Under the render scale (main.cpp "g_render_scale") the scene
+// drew the map into the target's top-left share, LumaData.CustomData3/4 (0 = the whole target): it is read at that share, clamped
+// to it, and interpolated without re-quantization steps.
 float4 SR4_LoadDistortionTexel(Texture2D<float4> map, int2 texel, int2 limit)
 {
    return round(saturate(map.Load(int3(clamp(texel, 0, limit - 1), 0))) * 255.0) / 255.0;

@@ -163,9 +163,8 @@ float SR4_RecoveryGain(float3 u)
 }
 
 // The scene input every final starts from, in the pass's "TEXCOORD1" space (texcoord1.xy = screen UV): the distortion
-// map's offsets, in the diffracted techniques a per-channel sine-wobbled split, then the DoF lerp towards the blur.
-// The map is read as its 8-bit target stored it ("SR4_SampleDistortionMap"): Luma's FP16 upgrade would otherwise store the 0.5
-// neutral as exactly 0.5 instead of 128/255 and shift the whole scene by the decode's 1 + 0.5/255 bias.
+// map's offsets, in the diffracted techniques a per-channel sine-wobbled split, then the DoF lerp towards the blur. The map is
+// read as its 8-bit target stored it (see "SR4_SampleDistortionMap").
 float4 SR4_SceneInput(float4 texcoord1, bool diffracted, out float2 uv)
 {
    const float4 distortion = SR4_SampleDistortionMap(distortion_samplerTexture, texcoord1.xy);
@@ -236,7 +235,7 @@ float4 SR4_TonemapFinal(float2 texcoord0, float4 texcoord1, bool diffracted, boo
    }
    else
    {
-      // The vanilla pow(1/2.2) is decoded exactly by gamma 2.2, so the linear reference is the graded shoulder itself.
+      // The gamma 2.2 decode exactly inverts the vanilla pow(1/2.2), so the linear reference is the graded shoulder itself.
       vanilla = curved;
    }
    return SR4_Output(vanilla, SR4_RecoveryGain(u), texcoord1.xy, scene.a);
