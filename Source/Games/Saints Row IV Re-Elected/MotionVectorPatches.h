@@ -610,7 +610,7 @@ namespace MotionVectorPatches
       return WriteChunks(chunks);
    }
 
-   // Upscaling prototype (sub-rect rendering): a pixel shader whose screen texture reads address the full target gets them scaled to
+   // Render scale (sub-rect rendering): a pixel shader whose screen texture reads address the full target gets them scaled to
    // the sub-rect by the jitter buffer's share (cb9[0].zw, see "Luma_SR4_SubRectQuad.hlsl"):
    // - one that makes its screen UV from NDC itself, "mad rX.xy, rY.xyxx, l(0.5, -0.5, ..), l(0.5, 0.5, ..)", gets
    //   "mul rX.xy, rX.xyxx, cb9[0].zwzz" after it;

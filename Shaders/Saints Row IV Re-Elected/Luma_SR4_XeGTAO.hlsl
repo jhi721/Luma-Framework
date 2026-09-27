@@ -38,7 +38,7 @@ cbuffer LumaGTAO : register(b9)
    float2 ViewportPixelSizeRT;       // 1 / AO target resolution
    float NoiseIndexRT;               // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
    float DownsampleScaleRT;          // full resolution mode: working pixels per target pixel, averaged by downsample_cs (see the header)
-   float2 SubRectScaleRT;            // Upscaling prototype: the scene's share of the target (1 = the whole target), see main.cpp "g_render_scale"
+   float2 SubRectScaleRT;            // Render scale: the scene's share of the target (1 = the whole target), see main.cpp "g_render_scale"
    float ThinOccluderCompensationRT; // > 0 overrides THIN_OCCLUDER_COMPENSATION
    float PaddingRT2;
 }

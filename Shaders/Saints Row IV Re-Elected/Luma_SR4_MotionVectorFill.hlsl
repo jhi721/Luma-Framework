@@ -6,7 +6,7 @@ cbuffer MotionVectorFill : register(b0)
 {
    row_major float4x4 reprojection; // Current clip space to the previous frame's
    float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
-   float2 render_size;              // The scene's pixels (the upscaling prototype's sub-rect, else the whole target)
+   float2 render_size;              // The scene's pixels (the render scale's sub-rect, else the whole target)
 };
 
 Texture2D<float> depth : register(t0);

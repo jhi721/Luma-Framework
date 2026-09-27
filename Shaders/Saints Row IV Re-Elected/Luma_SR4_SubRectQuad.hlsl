@@ -1,4 +1,4 @@
-// Upscaling prototype: the scene's screen space quads drawn into the render sub-rect (see "g_render_scale" in main.cpp), in place of
+// Render scale: the scene's screen space quads drawn into the render sub-rect (see "g_render_scale" in main.cpp), in place of
 // the game's VS: deferred lights (0x0FFC4B94, 0x086E02B3), the full screen quad (0x58DBDDA3: rl_restore_depth, the particle depth
 // downsample) and the SSAO blur and apply (0x9669662B), in output and half output sized targets. Their
 // UVs (0..1 over the full target) are scaled to the sub-rect; positions stay NDC from the vertex buffer. Same signatures as the

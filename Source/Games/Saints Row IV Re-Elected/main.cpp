@@ -499,7 +499,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    std::shared_mutex mv_mutex;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> mv_vertex_shaders;
    std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_pixel_shaders;
-   std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> sub_rect_pixel_shaders;    // Upscaling prototype, see "sub_rect_uv_pixel_shaders"
+   std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> sub_rect_pixel_shaders;    // Render scale, see "sub_rect_uv_pixel_shaders"
    std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> sub_rect_mv_pixel_shaders; // The same on top of the motion vector patch
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
@@ -528,7 +528,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    std::array<float, 2> mv_jitter = {};
    std::array<float, 2> mv_jitter_ndc = {}; // The same offset in NDC (y up), as the jitter buffer holds it
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
-   std::array<uint32_t, 2> mv_render_size = {}; // The scene's pixels: the upscaling prototype's sub-rect, else the whole target
+   std::array<uint32_t, 2> mv_render_size = {}; // The scene's pixels: the render scale's sub-rect, else the whole target
    // Per-draw lookups kept for the next draw. Views and states (reset when the scene opens, they can be recreated between scenes):
    // the jitter path's last depth view and whether it's output sized, and its last depth stencil state's depth test; the motion
    // vector path's last accepted scene targets (the motion vector target is built for them) and the last blend state's opacity
@@ -592,7 +592,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
 
-   // Upscaling prototype (see "g_render_scale"): whether the scaled viewport and scissor are still bound (until the game binds its own, see
+   // Render scale (see "g_render_scale"): whether the scaled viewport and scissor are still bound (until the game binds its own, see
    // "OnBindViewports"; a value compare can't tell them apart, the half res SSAO viewport equals the sub-rect at 0.5), the game's they
    // replaced (put back when the scene ends), and the scene draws' PS vc4 buffers, whose "IR_Pixel_Steps" (c9) is rewritten at Unmap
    // (under mv_constants_mutex)
@@ -826,7 +826,7 @@ class SaintsRowIV final : public Game
       return GetGameDeviceData(device_data).sr_active;
    }
 
-   // The upscaling prototype's render scale, 1 when it's off (see "g_render_scale")
+   // The render scale, 1 when it's off (see "g_render_scale")
    static float GetSubRectScale(DeviceData& device_data)
    {
       return (g_render_scale < 1.f && GetGameDeviceData(device_data).mv_active) ? g_render_scale : 1.f;
@@ -942,8 +942,7 @@ class SaintsRowIV final : public Game
             D3D11_BUFFER_DESC desc;
             reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
             auto* const mapped_data = static_cast<uint8_t*>(mapped->second);
-#if DEVELOPMENT
-            // Upscaling prototype: the material pass maps its screen texel to UV as ((ndc + 1) / 2 * c9.zw + 0.5) * c9.xy (y flipped), so
+            // Render scale: the material pass maps its screen texel to UV as ((ndc + 1) / 2 * c9.zw + 0.5) * c9.xy (y flipped), so
             // zw = the render size puts it in the sub-rect, xy stays 1 / the full texture size. Only the output sized steps (reflections
             // have their own). The G-buffer's stipple (LOD fades, translucents) samples its pattern at the viewport UV times
             // "IR_Stipple_Repeat_Info" (c12.xy, pattern repeats over the target): scaled alike, so its pixels keep the parity the material
@@ -957,7 +956,9 @@ class SaintsRowIV final : public Game
                   pixel_steps[2] = std::round(pixel_steps[2] * scale);
                   pixel_steps[3] = std::round(pixel_steps[3] * scale);
                   std::memcpy(mapped_data + 9 * 16, pixel_steps, sizeof(pixel_steps));
+#if DEVELOPMENT
                   g_pixel_steps_overrides_this_frame++;
+#endif
                   if (desc.ByteWidth >= 13 * 16)
                   {
                      float stipple_repeat[2];
@@ -968,14 +969,8 @@ class SaintsRowIV final : public Game
                   }
                }
             }
-#endif
-            if (game_device_data.mv_constants_copies.contains(resource.handle))
-            {
-               game_device_data.mv_constants_copies[resource.handle] = std::make_shared<const std::vector<uint8_t>>(mapped_data, mapped_data + desc.ByteWidth);
-#if DEVELOPMENT
-               game_device_data.mv_constant_copies++;
-#endif
-            }
+            if (const auto copy = game_device_data.mv_constants_copies.find(resource.handle); copy != game_device_data.mv_constants_copies.end())
+               copy->second = std::make_shared<const std::vector<uint8_t>>(mapped_data, mapped_data + desc.ByteWidth);
             game_device_data.mv_mapped_constants.erase(mapped);
          }
       }
@@ -1164,7 +1159,7 @@ class SaintsRowIV final : public Game
       bound->game.reset();
    }
 
-   // Upscaling prototype (see "g_render_scale"): a scene draw's output or half output sized viewport (the half res SSAO and particle
+   // Render scale (see "g_render_scale"): a scene draw's output or half output sized viewport (the half res SSAO and particle
    // targets) shrinks to the top-left render sub-rect's share of it, its scissor with it, both left bound after the draw like the patched
    // shaders; other viewports (shadows, reflections) stay. Its PS vc4 gets "IR_Pixel_Steps" rewritten from its next Map on (see
    // "OnUnmapBufferRegion"). True if the draw has the scaled viewport.
@@ -1230,7 +1225,7 @@ class SaintsRowIV final : public Game
       return true;
    }
 
-   // Upscaling prototype: the game's viewport and scissor back where the scaled ones are still bound (the scene ended)
+   // Render scale: the game's viewport and scissor back where the scaled ones are still bound (the scene ended)
    static void RestoreSceneViewport(ID3D11DeviceContext* native_device_context, SaintsRowIVGameDeviceData* game_device_data)
    {
       if (std::exchange(game_device_data->sub_rect_bound, false))
@@ -1239,7 +1234,7 @@ class SaintsRowIV final : public Game
          native_device_context->RSSetScissorRects(1, &game_device_data->sub_rect_game_scissor);
    }
 
-   // Upscaling prototype: the game binding its own viewports or scissors replaces the scaled ones (ours are set on the native context, so
+   // Render scale: the game binding its own viewports or scissors replaces the scaled ones (ours are set on the native context, so
    // they send no event)
    static void OnBindViewports(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::viewport* viewports)
    {
@@ -1252,7 +1247,7 @@ class SaintsRowIV final : public Game
          GetGameDeviceData(*device_data).sub_rect_scissor_bound = false;
    }
 
-   // Upscaling prototype: a scene draw that reads screen textures at UVs over the full target, into the sub-rect: the screen space quads
+   // Render scale: a scene draw that reads screen textures at UVs over the full target, into the sub-rect: the screen space quads
    // (see "sub_rect_quad_vertex_shaders") with their sub-rect VS, the screen UV pixel shaders ("sub_rect_uv_pixel_shaders", and the quads
    // rebuilding NDC from their UV, "sub_rect_quad_ndc_pixel_shaders", with the game's VS) patched, both
    // left bound like the motion vector shaders, with the jitter buffer for the UV scale. False if it's neither (or the shader is missing).
@@ -1344,7 +1339,7 @@ class SaintsRowIV final : public Game
                const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
                const unsigned int phase = cb_luma_global_settings.FrameIndex % phases;
                game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
-               // The render size: the upscaling prototype's sub-rect (see "ScaleSceneViewport"), else the scene's
+               // The render size: the render scale's sub-rect (see "ScaleSceneViewport"), else the scene's
                const float scale = GetSubRectScale(device_data);
                const float render_width = std::round(float(gbuffer_depth_size.x) * scale), render_height = std::round(float(gbuffer_depth_size.y) * scale);
                game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / render_width, game_device_data.mv_jitter[1] * -2.f / render_height};
@@ -1443,7 +1438,7 @@ class SaintsRowIV final : public Game
          return reject(4);
 
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
-      // Under the upscaling prototype's sub-rect, with the stipple DSF moved to the full texture (see "MotionVectorPatches::PatchScreenUVPixelShader")
+      // Under the render scale's sub-rect, with the stipple DSF moved to the full texture (see "MotionVectorPatches::PatchScreenUVPixelShader")
       const bool sub_rect = GetSubRectScale(device_data) < 1.f;
       if (const uint32_t pixel_shader_hash = original_shader_hashes.pixel_shaders[0]; pixel_shader_hash != game_device_data.mv_last_pixel_shader_hash || sub_rect != game_device_data.mv_last_pixel_shader_sub_rect)
       {
@@ -1488,9 +1483,13 @@ class SaintsRowIV final : public Game
          game_device_data.mv_previous_camera_valid = game_device_data.mv_camera_valid && cb_luma_global_settings.FrameIndex - game_device_data.mv_frame_index <= 1;
          game_device_data.mv_camera_valid = false;
          game_device_data.mv_frame_index = cb_luma_global_settings.FrameIndex;
-         game_device_data.mv_previous_objects = std::move(game_device_data.mv_objects);
-         game_device_data.mv_objects.clear();
-         game_device_data.mv_objects.reserve(game_device_data.mv_previous_objects.size());
+         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
+         // two frames go
+         game_device_data.mv_previous_objects.swap(game_device_data.mv_objects);
+         std::erase_if(game_device_data.mv_objects, [](const auto& entry)
+            { return entry.second.empty(); });
+         for (auto& entry : game_device_data.mv_objects)
+            entry.second.clear();
          if (!game_device_data.mv_previous_camera_valid)
             game_device_data.mv_previous_objects.clear();
 #if DEVELOPMENT
@@ -1696,6 +1695,10 @@ class SaintsRowIV final : public Game
          return skip();
       com_ptr<ID3D11Resource> depth;
       game_device_data.mv_frame_depth->GetResource(&depth);
+      // None when "Super Resolution" changed after present (see "IsSRActive"): no output texture is made for it
+      SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
+      if (!sr_instance_data)
+         return;
 
       D3D11_TEXTURE2D_DESC output_desc = {};
       if (device_data.sr_output_color)
@@ -1707,9 +1710,8 @@ class SaintsRowIV final : public Game
          native_device->CreateTexture2D(&output_desc, nullptr, &device_data.sr_output_color);
          game_device_data.sr_output_recreated = true;
       }
-      SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
-      if (!device_data.sr_output_color || !sr_instance_data)
-         return skip();
+      if (!device_data.sr_output_color)
+         return;
 
       // FSR needs the camera (DLSS ignores it). projTM (vc2 c0-c3) is a column vector view projection with absolute world
       // translation: row 1 = the up axis / tan(fov / 2), row 3 = the view depth axis, row 2 = A * row 3 + B (w), with
@@ -1732,7 +1734,7 @@ class SaintsRowIV final : public Game
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
       compute_state.Cache(native_device_context, device_data.uav_max_count);
 
-      // The top-left render sub-rect under the upscaling prototype, else the whole scene
+      // The top-left render sub-rect under the render scale, else the whole scene
       const uint32_t render_width = (std::min)(game_device_data.mv_render_size[0], scene_desc.Width);
       const uint32_t render_height = (std::min)(game_device_data.mv_render_size[1], scene_desc.Height);
       if (render_width == 0 || render_height == 0)
@@ -1811,7 +1813,7 @@ class SaintsRowIV final : public Game
          }
          device_data.has_drawn_sr = true;
          device_data.render_resolution = {float(render_width), float(render_height)};
-         // Upscaling prototype: post (the final composite's DoF weight, t5) reads the frame depth over the full target, the scene drew it
+         // Render scale: post (the final composite's DoF weight, t5) reads the frame depth over the full target, the scene drew it
          // into the sub-rect: resampled (nearest) from a copy of it. The state stack below gives the game its state back.
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          if ((render_width != scene_desc.Width || render_height != scene_desc.Height) && game_device_data.mv_jitter_buffer && HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SR4 Sub Rect Depth Upscale PS"_h))
@@ -2035,7 +2037,7 @@ class SaintsRowIV final : public Game
          return skip(1);
 
       // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel shader
-      // (a motion vector draw's is put back), or under the upscaling prototype's sub-rect a patched one reading screen textures (soft
+      // (a motion vector draw's is put back), or under the render scale's sub-rect a patched one reading screen textures (soft
       // particles, the stipple DSF)
       BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
       ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
@@ -2706,7 +2708,7 @@ public:
 #else
       const bool noise_per_frame = temporal, single_denoise = temporal;
 #endif
-      // Upscaling prototype: the scene fills the target's top-left share (see "g_render_scale"): the shader's ndc follow it, the main
+      // Render scale: the scene fills the target's top-left share (see "g_render_scale"): the shader's ndc follow it, the main
       // pass and the denoise run over it only (the depth prefilter covers the whole target, so samples past the edge read cleared depth)
       const bool sub_rect = GetSubRectScale(device_data) < 1.f;
       const float sub_rect_scale[2] = {sub_rect ? float(game_device_data.mv_render_size[0]) / device_data.output_resolution.x : 1.f, sub_rect ? float(game_device_data.mv_render_size[1]) / device_data.output_resolution.y : 1.f};
@@ -2736,7 +2738,9 @@ public:
          native_device_context->Dispatch(groups_x, groups_y, 1);
          native_device_context->CSSetUnorderedAccessViews(0, uav_count, null_uavs, nullptr);
       };
-      ID3D11UnorderedAccessView* const mip_uavs[gtao_depth_mip_count] = {game_device_data.gtao_depth_mip_uavs[0].get(), game_device_data.gtao_depth_mip_uavs[1].get(), game_device_data.gtao_depth_mip_uavs[2].get(), game_device_data.gtao_depth_mip_uavs[3].get(), game_device_data.gtao_depth_mip_uavs[4].get()};
+      ID3D11UnorderedAccessView* mip_uavs[gtao_depth_mip_count];
+      for (UINT mip = 0; mip < gtao_depth_mip_count; mip++)
+         mip_uavs[mip] = game_device_data.gtao_depth_mip_uavs[mip].get();
       ID3D11UnorderedAccessView* const working_uavs[2] = {game_device_data.gtao_working_uavs[0].get(), game_device_data.gtao_working_uavs[1].get()};
       ID3D11UnorderedAccessView* const final_uav = game_device_data.gtao_final_uav.get();
       pass("SR4 XeGTAO Prefilter Depths CS"_h, gtao_depth_mip_count, mip_uavs, {depth_srv.get(), nullptr}, (work_width + 15) / 16, (work_height + 15) / 16);
@@ -2774,7 +2778,7 @@ public:
 #if DEVELOPMENT
       if (game_device_data.probe_mode != ProbeRequest::None && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
          LogProbeDraw(native_device_context, &game_device_data, original_shader_hashes);
-      // Upscaling prototype: mesh draws into the output sized depth after the scene was ended this frame (the upscaler ran before them),
+      // Render scale: mesh draws into the output sized depth after the scene was ended this frame (the upscaler ran before them),
       // logged at present once per ending shader (see "g_late_scene_draws")
       if (g_scene_ended_this_frame && GetSubRectScale(device_data) < 1.f && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
       {
@@ -2906,7 +2910,7 @@ public:
       // Every draw without a patched shader: the game's own, if the last patched draw's are still bound
       RestoreGameShader(native_device_context, &game_device_data.mv_bound_vertex_shader);
       RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
-      // Upscaling prototype: a post pass reading the distortion map, which the scene drew into the sub-rect, at its share of the UV
+      // Render scale: a post pass reading the distortion map, which the scene drew into the sub-rect, at its share of the UV
       // (patched, left bound like the motion vector shaders, the jitter buffer's zw)
       if (GetSubRectScale(device_data) < 1.f && game_device_data.mv_jitter_buffer && std::ranges::contains(sub_rect_distortion_pixel_shaders, pixel_shader_hash, &std::pair<uint32_t, uint32_t>::first))
       {
@@ -2969,7 +2973,7 @@ public:
          game_device_data.gtao_ran_this_frame = RunXeGTAO(native_device, native_device_context, device_data);
          return game_device_data.gtao_ran_this_frame ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
       }
-      // The distortion map's share of the target for the replacements that read it (upscaling prototype, 0 = the whole target), set at
+      // The distortion map's share of the target for the replacements that read it (render scale, 0 = the whole target), set at
       // each of their draws so they never read the SMAA/RCAS values left in LumaData
       const auto set_distortion_map_share = [&]
       {
@@ -3141,9 +3145,13 @@ public:
    // Luma_SR4_MSAAResolve instead. Anything else, or a target we cannot bind, keeps the hardware resolve.
    static bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
    {
-      if (DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>(); device_data && device_data->game && format == reshade::api::format::r16g16b16a16_float)
-         GetGameDeviceData(*device_data).msaa_scene_resolved = true;
-      if (!g_luma_msaa_enable || format != reshade::api::format::r16g16b16a16_float || source_subresource != 0 || dest_subresource != 0 || source_box != nullptr || dest_x != 0 || dest_y != 0 || dest_z != 0)
+      DeviceData* const device_data_pointer = cmd_list->get_device()->get_private_data<DeviceData>();
+      if (!device_data_pointer || !device_data_pointer->game || format != reshade::api::format::r16g16b16a16_float)
+         return false;
+      DeviceData& device_data = *device_data_pointer;
+      auto& game_device_data = GetGameDeviceData(device_data);
+      game_device_data.msaa_scene_resolved = true;
+      if (!g_luma_msaa_enable || source_subresource != 0 || dest_subresource != 0 || source_box != nullptr || dest_x != 0 || dest_y != 0 || dest_z != 0)
          return false;
 
       com_ptr<ID3D11Texture2D> source_texture;
@@ -3157,8 +3165,6 @@ public:
       if (source_desc.SampleDesc.Count <= 1 || source_desc.ArraySize != 1 || (source_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 || (dest_desc.BindFlags & D3D11_BIND_RENDER_TARGET) == 0)
          return false;
 
-      DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
-      auto& game_device_data = GetGameDeviceData(device_data);
       // Held through the draw so a shader reload cannot release them mid-use.
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SR4 MSAA Resolve PS"_h))
@@ -3234,13 +3240,11 @@ public:
 
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 MSAA Resolve PS"), ShaderDefinition{"Luma_SR4_MSAAResolve", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Motion Vector Fill CS"), ShaderDefinition{"Luma_SR4_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader});
-#if DEVELOPMENT
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Quad VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "quad_vs"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Light VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "light_vs", { {"LIGHT_VIEW_RAY_UNIT_Z", "0"} }});
-      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Light Unit Z VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "light_vs", { {"LIGHT_VIEW_RAY_UNIT_Z", "1"} }});
+      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Light VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "light_vs", {{"LIGHT_VIEW_RAY_UNIT_Z", "0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Light Unit Z VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "light_vs", {{"LIGHT_VIEW_RAY_UNIT_Z", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect SSAO VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "ssao_vs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Depth Upscale PS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_upscale_ps"});
-#endif
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 SMAA Linearize CS"), ShaderDefinition{"Luma_SR4_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 SMAA Predication CS"), ShaderDefinition{"Luma_SR4_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Additive Limit PS"), ShaderDefinition{"Luma_SR4_BlendLimit", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "additive_limit_ps"});
@@ -3257,10 +3261,8 @@ public:
       reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
-#if DEVELOPMENT
       reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
       reshade::register_event<reshade::addon_event::bind_scissor_rects>(OnBindScissorRects);
-#endif
 #if DEVELOPMENT
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnProbeUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region_command>(OnProbeUpdateBufferRegionCommand);
@@ -3274,10 +3276,8 @@ public:
       reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
-#if DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::bind_viewports>(OnBindViewports);
       reshade::unregister_event<reshade::addon_event::bind_scissor_rects>(OnBindScissorRects);
-#endif
 #if DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnProbeUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(OnProbeUpdateBufferRegionCommand);
@@ -3465,7 +3465,7 @@ public:
       if (!custom_texture_mip_lod_bias_offset)
       {
          const std::unique_lock lock(s_mutex_samplers);
-         // -1 at native resolution, lower below it (the upscaling prototype's render scale)
+         // -1 at native resolution, lower below it (the render scale)
          device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(std::round(device_data.output_resolution.y * GetSubRectScale(device_data)), device_data.output_resolution.y) : 0.f;
       }
       // Turning XeGTAO off gives its scratch back; it is rebuilt on demand.
