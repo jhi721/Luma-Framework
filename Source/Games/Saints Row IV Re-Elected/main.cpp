@@ -46,6 +46,8 @@ namespace
       {0x9F1F6557, "rl_hdr_06 [final_no_lut_diffracted]"},
       {tonemap_no_post_pixel_shader, "rl_hdr_05 [no_tonemapping] (PostProcess 0)"},
    };
+   // rl_distortion_01, replaced: it reads the distortion map's share like the finals (see "Distortion_0xE9E18958.ps_4_0.hlsl")
+   constexpr uint32_t distortion_pixel_shader = 0xE9E18958;
    // rl_bokeh_sprite_01: the aiming depth of field's bokeh sprites, added onto the output after the finals (see "DrawBokehSpritesLimited")
    constexpr uint32_t bokeh_sprite_pixel_shader = 0x4DDED58A;
 
@@ -244,8 +246,9 @@ namespace
    // SSAO also reads its previous result, t0)
    constexpr std::pair<uint32_t, uint32_t> sub_rect_quad_ndc_pixel_shaders[] = {{0x624BF56D, gbuffer_texture_slots}, {0x1D8BB773, gbuffer_texture_slots | 1u}, {0xDA63305D, gbuffer_texture_slots}, {0x30983822, gbuffer_texture_slots}};
    // The post passes Luma doesn't replace that read the distortion map (drawn into the sub-rect with the scene) at the screen UV, with
-   // its slot: rl_distortion, and the rl_hdr finals outside "tonemap_pixel_shaders" (those scale it in "Luma_SR4_Tonemap.hlsl")
-   constexpr std::pair<uint32_t, uint32_t> sub_rect_distortion_pixel_shaders[] = {{0x8957630A, 1}, {0xE9E18958, 1}, {0x7DCC8A34, 4}, {0x7FC325C0, 4}, {0x8D1F6BBB, 4}, {0xD501C191, 4}, {0xE9664111, 4}, {0xFEE7D6DC, 4}};
+   // its slot: rl_distortion_02, and the rl_hdr finals outside "tonemap_pixel_shaders" (those scale it in "Luma_SR4_Tonemap.hlsl",
+   // rl_distortion_01 in "Distortion_0xE9E18958.ps_4_0.hlsl")
+   constexpr std::pair<uint32_t, uint32_t> sub_rect_distortion_pixel_shaders[] = {{0x8957630A, 1}, {0x7DCC8A34, 4}, {0x7FC325C0, 4}, {0x8D1F6BBB, 4}, {0xD501C191, 4}, {0xE9664111, 4}, {0xFEE7D6DC, 4}};
    constexpr uint32_t blur_pixel_shader = 0x378BA268; // rl_gaussian_blur_01, the bloom levels' separable blur
 
    // XeGTAO over rl_ssao_singleframe_calculate (SSAO_Level 2/3). Its 4 draws (one AO channel each, into a half-res target:
@@ -2834,17 +2837,26 @@ public:
          game_device_data.gtao_ran_this_frame = RunXeGTAO(native_device, native_device_context, device_data);
          return game_device_data.gtao_ran_this_frame ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
       }
+      // The distortion map's share of the target for the replacements that read it (upscaling prototype, 0 = the whole target), set at
+      // each of their draws so they never read the SMAA/RCAS values left in LumaData
+      const auto set_distortion_map_share = [&]
+      {
+         const bool sub_rect = GetSubRectScale(device_data) < 1.f;
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, sub_rect ? float(game_device_data.mv_render_size[0]) / device_data.output_resolution.x : 0.f, sub_rect ? float(game_device_data.mv_render_size[1]) / device_data.output_resolution.y : 0.f);
+         updated_cbuffers = true;
+      };
+      if (pixel_shader_hash == distortion_pixel_shader)
+      {
+         set_distortion_map_share();
+         return DrawOrDispatchOverrideType::None;
+      }
       if (std::ranges::contains(tonemap_pixel_shaders, pixel_shader_hash, &std::pair<uint32_t, const char*>::first))
       {
          // A 3D scene was composited this frame: Core then shows whether DLSS/FSR ran (the tick next to "Super Resolution"). No
          // UI separation, UI shader replacements or UI background tonemap here, so nothing else reads it.
          device_data.has_drawn_main_post_processing = true;
-         // The distortion map's share of the target for "Luma_SR4_Tonemap.hlsl" (upscaling prototype, 0 = the whole target), set every
-         // frame so it never reads the SMAA/RCAS values left in LumaData
-         const bool sub_rect = GetSubRectScale(device_data) < 1.f;
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, sub_rect ? float(game_device_data.mv_render_size[0]) / device_data.output_resolution.x : 0.f, sub_rect ? float(game_device_data.mv_render_size[1]) / device_data.output_resolution.y : 0.f);
-         updated_cbuffers = true;
+         set_distortion_map_share();
 #if DEVELOPMENT
          g_final_perm = pixel_shader_hash;
          g_finals_this_frame++;

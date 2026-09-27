@@ -164,15 +164,11 @@ float SR4_RecoveryGain(float3 u)
 
 // The scene input every final starts from, in the pass's "TEXCOORD1" space (texcoord1.xy = screen UV): the distortion
 // map's offsets, in the diffracted techniques a per-channel sine-wobbled split, then the DoF lerp towards the blur.
-// Luma upgrades the r8g8b8a8 distortion map to FP16 with the swapchain-sized targets, which would store its 0.5
-// neutral as exactly 0.5 instead of 128/255 and shift the whole scene by the decode's 1 + 0.5/255 bias: re-quantizing to
-// the 8-bit code the game wrote restores the vanilla offsets (a no-op on the UNORM map). Under the upscaling prototype's render
-// sub-rect (main.cpp "g_render_scale") the map was drawn with the scene into the target's top-left share, LumaData.CustomData3/4
-// (0 = the whole target).
+// The map is read as its 8-bit target stored it ("SR4_SampleDistortionMap"): Luma's FP16 upgrade would otherwise store the 0.5
+// neutral as exactly 0.5 instead of 128/255 and shift the whole scene by the decode's 1 + 0.5/255 bias.
 float4 SR4_SceneInput(float4 texcoord1, bool diffracted, out float2 uv)
 {
-   const float2 distortion_uv = texcoord1.xy * (LumaData.CustomData3 > 0.0 ? float2(LumaData.CustomData3, LumaData.CustomData4) : 1.0);
-   const float4 distortion = round(saturate(distortion_samplerTexture.Sample(distortion_samplerSampler, distortion_uv)) * 255.0) / 255.0;
+   const float4 distortion = SR4_SampleDistortionMap(distortion_samplerTexture, texcoord1.xy);
    float4 scene;
    if (diffracted)
    {
