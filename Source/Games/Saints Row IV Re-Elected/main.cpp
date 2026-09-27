@@ -208,13 +208,19 @@ namespace
       unsigned int dlss_preset = 0; // NVSDK_NGX_DLSS_Hint_Render_Preset (5 = E, 11 = K, ...)
       bool smaa = false;
       int motion_vector_draws = 2; // 2 patched (motion vectors and jitter), 1 jitter only, 0 untouched
+      float render_scale = 0.f;    // > 0: "Render Scale (%)" while it runs, else the current one
+      int gtao_full_res = -1;      // >= 0: "GTAO Full Resolution" while it runs, else the current one
    };
    constexpr PerfTestMode perf_test_modes[] = {
       {"Off"},
       {"Current Settings"},
       {"DLSS K", true, SR::Type::DLSS, 11},
-      {"DLSS K Jitter Only", true, SR::Type::DLSS, 11, false, 1},
-      {"DLSS K Without Motion Vector Draws", true, SR::Type::DLSS, 11, false, 0},
+      {"DLSS K 100%", true, SR::Type::DLSS, 11, false, 2, 1.f},
+      {"DLSS K 67%", true, SR::Type::DLSS, 11, false, 2, 0.67f},
+      {"DLSS K 50%", true, SR::Type::DLSS, 11, false, 2, 0.5f},
+      {"DLSS K 100% GTAO Half Res", true, SR::Type::DLSS, 11, false, 2, 1.f, 1},
+      {"DLSS K 100% Jitter Only", true, SR::Type::DLSS, 11, false, 1, 1.f},
+      {"DLSS K 100% Without Motion Vector Draws", true, SR::Type::DLSS, 11, false, 0, 1.f},
       {"DLSS L", true, SR::Type::DLSS, 12},
       {"DLSS M", true, SR::Type::DLSS, 13},
       {"DLSS E (CNN)", true, SR::Type::DLSS, 5},
@@ -225,8 +231,8 @@ namespace
    // "Sweep": these modes in turn, a few log windows each, over several rounds (interleaved, so the scene's drift averages out), then
    // a median per mode
    bool g_perf_sweep = false;
-   constexpr int perf_sweep_modes[] = {2, 3, 4, 10};
-   static_assert(std::string_view(perf_test_modes[perf_sweep_modes[0]].name) == "DLSS K" && std::string_view(perf_test_modes[perf_sweep_modes[3]].name) == "No AA");
+   constexpr int perf_sweep_modes[] = {3, 4, 5, 6, 7, 8, 14};
+   static_assert(std::string_view(perf_test_modes[perf_sweep_modes[0]].name) == "DLSS K 100%" && std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
    constexpr int perf_sweep_rounds = 5;
    constexpr int perf_sweep_windows = 3; // Per mode and round
    uint32_t g_pixel_steps_overrides_this_frame = 0;
@@ -681,6 +687,8 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    SR::Type perf_user_sr_type = SR::Type::None;
    unsigned int perf_user_dlss_preset = 0;
    bool perf_user_smaa = false;
+   float perf_user_render_scale = 1.f;
+   int perf_user_gtao_full_res = 0;
    // "Sweep": the step over all rounds, the log windows done in it, and per mode each window's frame, scene, SR and hook times
    int perf_sweep_step = 0;
    int perf_sweep_windows_done = 0;
@@ -814,6 +822,14 @@ class SaintsRowIV final : public Game
          dlss_render_preset = mode.set_aa && mode.sr_type == SR::Type::DLSS ? mode.dlss_preset : game_device_data.perf_user_dlss_preset;
          g_smaa_enable = mode.set_aa ? mode.smaa : game_device_data.perf_user_smaa;
       }
+      if (previous_mode.render_scale <= 0.f && mode.render_scale > 0.f)
+         game_device_data.perf_user_render_scale = g_render_scale;
+      if (previous_mode.render_scale > 0.f || mode.render_scale > 0.f)
+         g_render_scale = mode.render_scale > 0.f ? mode.render_scale : game_device_data.perf_user_render_scale;
+      if (previous_mode.gtao_full_res < 0 && mode.gtao_full_res >= 0)
+         game_device_data.perf_user_gtao_full_res = g_gtao_full_res;
+      if (previous_mode.gtao_full_res >= 0 || mode.gtao_full_res >= 0)
+         g_gtao_full_res = mode.gtao_full_res >= 0 ? mode.gtao_full_res : game_device_data.perf_user_gtao_full_res;
       g_perf_test = mode_index;
    }
 #endif
@@ -3484,7 +3500,7 @@ public:
       if (g_perf_test != 0)
       {
          const auto now = std::chrono::steady_clock::now();
-         const uint32_t settings = uint32_t(g_perf_test) | (uint32_t(int(device_data.sr_type) + 1) << 5) | (dlss_render_preset << 8) | (uint32_t(g_smaa_enable) << 16) | (uint32_t(g_gtao_enable) << 17) | (uint32_t(game_device_data.msaa_scene) << 18) | (uint32_t(g_perf_hook_timers) << 19);
+         const uint32_t settings = uint32_t(g_perf_test) | (uint32_t(int(device_data.sr_type) + 1) << 5) | (dlss_render_preset << 8) | (uint32_t(g_smaa_enable) << 16) | (uint32_t(g_gtao_enable) << 17) | (uint32_t(game_device_data.msaa_scene) << 18) | (uint32_t(g_perf_hook_timers) << 19) | (uint32_t(g_gtao_full_res) << 20) | (uint32_t(std::lround(g_render_scale * 100.f)) << 22);
          // Also after a pause (the game stops presenting while unfocused): the upscaler history and the clocks restart
          if (std::exchange(game_device_data.perf_settings, settings) != settings || now - game_device_data.perf_last_present > std::chrono::milliseconds(250))
             game_device_data.perf_settle_frames = 60;
@@ -3540,7 +3556,7 @@ public:
                if (IsSRActive(device_data))
                   aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
                const std::array<double, 4> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.sr_ms, stats.sr_samples), double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames};
-               reshade::log::message(reshade::log::level::info, std::format("[SR4 Perf] mode=\"{}\" aa={} hook_timers={} msaa={} gtao={} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test].name, aa, g_perf_hook_timers, game_device_data.msaa_scene, g_gtao_enable, g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), window[0], stats.frame_max_ms, window[1], stats.scene_max_ms, stats.scene_samples, window[2], stats.sr_max_ms, stats.sr_samples, stats.cpu_frame_ms / stats.frames, window[3], stats.samples, stats.frames, stats.disjoint).c_str());
+               reshade::log::message(reshade::log::level::info, std::format("[SR4 Perf] mode=\"{}\" aa={} hook_timers={} msaa={} gtao={} gtao_full_res={} render_scale={:.2f} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test].name, aa, g_perf_hook_timers, game_device_data.msaa_scene, g_gtao_enable, g_gtao_full_res, IsSRActive(device_data) ? GetSubRectScale(device_data) : 1.f, g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), window[0], stats.frame_max_ms, window[1], stats.scene_max_ms, stats.scene_samples, window[2], stats.sr_max_ms, stats.sr_samples, stats.cpu_frame_ms / stats.frames, window[3], stats.samples, stats.frames, stats.disjoint).c_str());
                stats = {};
 
                if (g_perf_sweep)
@@ -3880,7 +3896,7 @@ public:
          ImGui::EndCombo();
       }
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Logs \"[SR4 Perf]\" to ReShade.log every 120 frames (the first 60 after a change of mode or AA settings, or a pause, skipped): the GPU\ntime of the whole frame (present to present), of the scene (G-buffer to its first post pass: motion vector, jitter and camera\nfill included) and of DLSS/FSR (timestamps), the CPU frame time and the CPU time in the motion vector hooks.\nThe modes set the anti-aliasing and DLSS preset themselves (the user's come back on \"Off\" or \"Current Settings\", nothing is\nsaved). \"Jitter Only\" draws the material pass jittered but without motion vectors, \"Without Motion Vector Draws\" leaves every\ndraw untouched (unjittered): the differences to \"DLSS K\" are their costs. Keep the camera still and the game focused, 10 s per mode.\n\"Sweep\" runs DLSS K, Jitter Only, Without Motion Vector Draws and No AA in turn, %d windows each, %d rounds (about 1.5 min), then logs\n\"[SR4 Perf] sweep\" lines: each mode's median window and its frame time against No AA; picking another mode stops it.", perf_sweep_windows, perf_sweep_rounds);
+         ImGui::SetTooltip("Logs \"[SR4 Perf]\" to ReShade.log every 120 frames (the first 60 after a change of mode or AA settings, or a pause, skipped): the GPU\ntime of the whole frame (present to present), of the scene (G-buffer to its first post pass: motion vector, jitter and camera\nfill included) and of DLSS/FSR (timestamps), the CPU frame time and the CPU time in the motion vector hooks.\nThe modes set the anti-aliasing and DLSS preset themselves (the user's come back on \"Off\" or \"Current Settings\", nothing is\nsaved). \"Jitter Only\" draws the material pass jittered but without motion vectors, \"Without Motion Vector Draws\" leaves every\ndraw untouched (unjittered): the differences to \"DLSS K\" are their costs. Keep the camera still and the game focused, 10 s per mode.\n\"Sweep\" runs the DLSS K render scale, GTAO and motion vector modes, then No AA, in turn, %d windows each, %d rounds, then logs\n\"[SR4 Perf] sweep\" lines: each mode's median window and its frame time against No AA; picking another mode stops it.", perf_sweep_windows, perf_sweep_rounds);
       ImGui::Checkbox("Hook Timers", &g_perf_hook_timers);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Times the motion vector hooks for \"cpu hooks\" (two clock reads per hooked draw, ~9000 a frame in a dense view).\nRun a Sweep with it off to see their own cost in the frame times.");
