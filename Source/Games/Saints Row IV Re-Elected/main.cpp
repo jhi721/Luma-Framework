@@ -2299,8 +2299,6 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
-#if DEVELOPMENT
-#endif
       // The alpha test materials count as custom (Core flags their A2C patch clone), but draw with the game's shader outside of MSAA
       if (game_device_data.mv_active && (!is_custom_pass || alpha_test_material_pixel_shaders.contains(pixel_shader_hash)) && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
       {
