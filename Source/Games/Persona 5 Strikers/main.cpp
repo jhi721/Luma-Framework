@@ -2689,7 +2689,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Persona 5 Strikers\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, DLSS or FSR 3 upscaling and native anti-aliasing (DLAA), and replaces the game's FXAA with SMAA and its SSAO with XeGTAO.\n"
+         "It adds HDR, DLSS or FSR 3 upscaling, and replaces the game's FXAA with SMAA and its SSAO with XeGTAO.\n"
          "Enable Ambient Occlusion in the game's graphic settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
