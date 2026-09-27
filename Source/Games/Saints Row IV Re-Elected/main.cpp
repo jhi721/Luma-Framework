@@ -193,9 +193,8 @@ namespace
 #if DEVELOPMENT
    bool g_mv_enable = false;
    bool g_mv_debug_view = false;
-   std::atomic<bool> g_sr_dump_request = false; // DEV: the upscaler's color, motion vectors and output to files, at its next draw
-   bool g_mv_force_jitter = false;              // The projection jitter without an upscaler
-   bool g_mv_disable_jitter = false;            // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
+   bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
+   bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
    // "Performance Test" (see "OnPresent"): the mode, and the anti-aliasing it sets while it runs (the user's is restored on "Off" or
    // "Current Settings", and never saved)
    int g_perf_test = 0;
@@ -280,7 +279,6 @@ namespace
    // its slot: rl_distortion_02, and the rl_hdr finals outside "tonemap_pixel_shaders" (those scale it in "Luma_SR4_Tonemap.hlsl",
    // rl_distortion_01 in "Distortion_0xE9E18958.ps_4_0.hlsl")
    constexpr std::pair<uint32_t, uint32_t> sub_rect_distortion_pixel_shaders[] = {{0x8957630A, 1}, {0x7DCC8A34, 4}, {0x7FC325C0, 4}, {0x8D1F6BBB, 4}, {0xD501C191, 4}, {0xE9664111, 4}, {0xFEE7D6DC, 4}};
-   constexpr uint32_t blur_pixel_shader = 0x378BA268; // rl_gaussian_blur_01, the bloom levels' separable blur
 
    // XeGTAO over rl_ssao_singleframe_calculate (SSAO_Level 2/3). Its 4 draws (one AO channel each, into a half-res target:
    // r8g8b8a8_unorm, r16g16b16a16_float once Luma's format upgrade reaches it) become one XeGTAO run at the target's size (see
@@ -405,25 +403,6 @@ namespace
    uint32_t g_final_perm = 0;
    uint32_t g_finals_this_frame = 0;
    uint32_t g_finals_last_frame = 0;
-   // Native bloom constants readout: true inside the brightpass-to-combine window, where the blur / downsample vc4 are
-   // copied. The staging copies live in bloom_readouts (read a frame late with DO_NOT_WAIT, so it never stalls).
-   bool g_in_bloom_chain = false;
-
-   // Native SSAO constants readout (XeGTAO calibration): vc0 of the frame's first calculate draw, read a frame late through
-   // a staging copy and formatted into g_ssao_readout. Layout: c0.x ssao_fade_parameter, c1-c4 ssao_inv_proj (rows, applied as
-   // ndc.x*c1 + ndc.y*c2 + depth*c3 + c4), c5.xy ssao_projection_scales, then ssao_sample_radius_reference at c18.x
-   // (singleframe) or c14.x with ssao_temporal_falloff at c19.xy (multiframe).
-   constexpr uint32_t ssao_multiframe_calculate_pixel_shader = 0x1D8BB773; // SSAO_Level 1
-
-   uint32_t g_ssao_perm_this_frame = 0; // calculate shader whose vc0 was copied this frame
-   uint32_t g_ssao_staging_perm = 0;    // ... and the one the staging copy holds
-   uint32_t g_ssao_perm = 0;            // ... and the one "g_ssao_vc0" was read from
-   uint32_t g_ssao_calculate_draws_this_frame = 0;
-   uint32_t g_ssao_calculate_draws_last_frame = 0;
-   float g_ssao_vc0[20][4] = {};
-   float g_ssao_vc0_logged[20][4] = {};
-   char g_ssao_readout[2048] = {}; // the formatted g_ssao_vc0, shown in the DEV panel and logged
-   uint32_t g_ssao_frames_since_log = 0;
 
    // Motion vector research (the game renders none): the frame probe logs the next frame's draws (pass state, the per-draw VS
    // constants vc2 / vc3 and a few vc2 values, vertex buffers, draw arguments), then how every buffer those draws read was filled.
@@ -476,7 +455,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
 
    // GPU copies of the native bloom's constants, taken at their own draws earlier in the same frame: the brightpass vc0
    // (bound at b0 for the prefilter) and vc4 (b4), the combine vc4 (b5) and the source downsample vc4 (b6). Copied only
-   // while Luma bloom is on (always in DEVELOPMENT, for the readout); null until those passes first draw.
+   // while Luma bloom is on; null until those passes first draw.
    com_ptr<ID3D11Buffer> bloom_brightpass_vc0_cb;
    com_ptr<ID3D11Buffer> bloom_brightpass_vc4_cb;
    com_ptr<ID3D11Buffer> bloom_combine_vc4_cb;
@@ -622,42 +601,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    uint32_t mv_frame_index = 0; // The Luma frame index of the last motion vector frame
 
 #if DEVELOPMENT
-   std::atomic<uint32_t> mv_draws = 0;
-   std::atomic<uint32_t> mv_skipped_draws = 0;      // Material draws that couldn't get motion vectors (patch refused)
-   std::atomic<uint32_t> mv_matched_draws = 0;      // Found last frame's own constants
-   std::atomic<uint32_t> mv_other_camera_draws = 0; // Not matched, with a projTM other than the frame's camera: left as is
-   std::atomic<uint32_t> mv_off_camera_draws = 0;   // Any, with a projTM other than the frame's camera
-   std::atomic<uint32_t> mv_jitter_only_draws = 0;  // See "DrawWithJitter"
-   std::atomic<uint32_t> mv_sr_draws = 0;           // Upscaler runs
-   std::atomic<uint32_t> mv_sr_failures = 0;        // Upscaler failures (it's then suppressed until picked again)
-   std::atomic<uint32_t> mv_sr_skips = 0;           // Upscaler frames skipped (no usable scene, depth or camera)
-   uint32_t mv_frame_end_shader = 0;                // The post pass that ended the last motion vector frame
-   // Depth tested scene sized draws in the scene left unjittered: no vertex buffer, VS refused
-   static constexpr const char* mv_jitter_skip_names[] = {"no_vertex_buffer", "vs_refused"};
-   std::atomic<uint32_t> mv_jitter_skips[std::size(mv_jitter_skip_names)] = {};
-   std::atomic<uint64_t> mv_jitter_skip_examples[std::size(mv_jitter_skip_names)] = {};
-   uint64_t mv_camera_draw = 0;                 // VS << 32 | PS of the draw that set the frame's camera
-   std::atomic<uint32_t> mv_uncopied_draws = 0; // No CPU copy of vc2 yet: zero motion
-   // Draws that reached the motion vector path, and why the others were left untouched, per 60 frames, with the last VS/PS seen
-   // for each reason
-   std::atomic<uint32_t> mv_candidate_draws = 0;
-   std::atomic<uint32_t> mv_frames = 0;          // Motion vector frames started
-   std::atomic<uint32_t> mv_constant_copies = 0; // vc2 / vc3 CPU copies taken at Unmap
-   std::atomic<uint32_t> mv_moved_draws = 0;     // Matched draws whose previous vc2 differs from the current one
-   // A sample matched draw per 60 frames: largest |previous - current| over projTM and over objTM
-   float mv_sample_camera_delta = -1.f;
-   float mv_sample_object_delta = -1.f;
-   // Largest |previous - current| over the frame camera's projTM in the last 60 frames
-   float mv_camera_delta = 0.f;
-   // The whole target, read back a frame late: largest |motion vector| (UV) and the share of non zero pixels
-   com_ptr<ID3D11Texture2D> mv_readback;
-   bool mv_readback_pending = false;
-   // The upscaler's color, motion vectors and output, read back on its reset frames and every 60th (see "DrawSuperResolution")
-   com_ptr<ID3D11Texture2D> sr_check_textures[3];
-   static constexpr const char* mv_reject_names[] = {"targets", "format", "size", "depth_size", "blend", "msaa", "outside_scene", "not_scene_color"};
-   std::atomic<uint32_t> mv_rejects[std::size(mv_reject_names)] = {};
-   std::atomic<uint64_t> mv_reject_examples[std::size(mv_reject_names)] = {};
-   uint64_t mv_rejected_scene_target = 0;
+   uint32_t mv_frame_end_shader = 0; // The post pass that ended the last motion vector frame
 
    // "Performance Test": GPU timestamps per frame (present to present, the scene from the G-buffer to its first post pass, the
    // upscaler), all on the immediate context, in a ring read back a few frames later without waiting; and the CPU time in the
@@ -714,28 +658,6 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    }
 
 #if DEVELOPMENT
-   com_ptr<ID3D11Buffer> bloom_blur_vc4_cb;
-   com_ptr<ID3D11Buffer> bloom_downsample_vc4_cb;
-   struct BloomConstantReadout
-   {
-      const char* name;
-      com_ptr<ID3D11Buffer> SaintsRowIVGameDeviceData::* source;
-      UINT register_index;
-      com_ptr<ID3D11Buffer> staging;
-      float value[4];
-   };
-   BloomConstantReadout bloom_readouts[6] = {
-      {"Source downsample Tint_color (vc4 c1)", &SaintsRowIVGameDeviceData::bloom_source_downsample_vc4_cb, 1},
-      {"Brightpass Bloom_curve_values (vc0 c22)", &SaintsRowIVGameDeviceData::bloom_brightpass_vc0_cb, 22},
-      {"Brightpass Tint_color (vc4 c1)", &SaintsRowIVGameDeviceData::bloom_brightpass_vc4_cb, 1},
-      {"Blur Tint_color (vc4 c1)", &SaintsRowIVGameDeviceData::bloom_blur_vc4_cb, 1},
-      {"Downsample Tint_color (vc4 c1)", &SaintsRowIVGameDeviceData::bloom_downsample_vc4_cb, 1},
-      {"Combine Tint_color (vc4 c1)", &SaintsRowIVGameDeviceData::bloom_combine_vc4_cb, 1},
-   };
-
-   com_ptr<ID3D11Buffer> ssao_vc0_cb;
-   com_ptr<ID3D11Buffer> ssao_vc0_staging;
-
    // Frame probe: every buffer mapped or updated in the probed frame, and the draws that read it as vc2, vc3 or an instance stream
    struct ProbeBuffer
    {
@@ -1313,18 +1235,6 @@ class SaintsRowIV final : public Game
    static bool DrawWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, const com_ptr<ID3D11RenderTargetView> (&rtvs)[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT], ID3D11DepthStencilView* dsv)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
-#if DEVELOPMENT
-      game_device_data.mv_candidate_draws++;
-      const auto reject = [&](size_t reason)
-      {
-         game_device_data.mv_rejects[reason]++;
-         game_device_data.mv_reject_examples[reason] = (uint64_t(original_shader_hashes.vertex_shaders[0]) << 32) | uint32_t(original_shader_hashes.pixel_shaders[0]);
-         return false;
-      };
-#else
-      const auto reject = [](size_t)
-      { return false; };
-#endif
       // The G-buffer (2-3 targets, output sized depth) opens the scene; post passes with 2 targets must not reopen it
       if (rtvs[0] && rtvs[1])
       {
@@ -1372,46 +1282,41 @@ class SaintsRowIV final : public Game
             }
          }
          game_device_data.mv_scene_color_wanted |= game_device_data.mv_scene_open;
-         return reject(0);
+         return false;
       }
       // The scene target alone, plus the motion vector target the last motion vector draw left bound
       for (UINT slot = 1; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; slot++)
       {
          if (rtvs[slot] && (slot != MotionVectorPatches::target_slot || rtvs[slot] != game_device_data.mv_rtv))
-            return reject(0);
+            return false;
       }
       if (!rtvs[0] || !dsv)
-         return reject(0);
+         return false;
       if (!game_device_data.mv_scene_open)
-         return reject(6);
+         return false;
       // Known targets: checked, and the motion vector target built for them
       if (rtvs[0].get() != game_device_data.mv_accepted_rtv || dsv != game_device_data.mv_accepted_dsv)
       {
          com_ptr<ID3D11Resource> color;
          rtvs[0]->GetResource(&color);
          if (!color || color != game_device_data.mv_scene_color)
-         {
-#if DEVELOPMENT
-            game_device_data.mv_rejected_scene_target = uint64_t(color.get());
-#endif
-            return reject(7);
-         }
+            return false;
          D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
          rtvs[0]->GetDesc(&rtv_desc);
          if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
-            return reject(1);
+            return false;
          // The motion vector target is single sampled; an MSAA scene (display.ini MSAA_Level) turns the upscaler off (see "IsSRActive")
          if (rtv_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D)
-            return reject(5);
+            return false;
          uint4 size, depth_size;
          DXGI_FORMAT unused_format;
          GetResourceInfo(rtvs[0].get(), size, unused_format);
          GetResourceInfo(dsv, depth_size, unused_format);
          // The main scene only (reflections and cube faces are smaller)
          if (size.x != device_data.output_resolution.x || size.y != device_data.output_resolution.y)
-            return reject(2);
+            return false;
          if (depth_size.x != size.x || depth_size.y != size.y)
-            return reject(3);
+            return false;
          const std::unique_lock lock(game_device_data.mv_mutex);
          D3D11_TEXTURE2D_DESC desc = {};
          if (game_device_data.mv_texture)
@@ -1451,7 +1356,7 @@ class SaintsRowIV final : public Game
          game_device_data.mv_blend_state = blend_state.get();
       }
       if (!game_device_data.mv_blend_opaque)
-         return reject(4);
+         return false;
 
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
       // Under the render scale's sub-rect, with the stipple DSF moved to the full texture (see "MotionVectorPatches::PatchScreenUVPixelShader")
@@ -1464,12 +1369,7 @@ class SaintsRowIV final : public Game
       }
       ID3D11PixelShader* const pixel_shader = game_device_data.mv_last_pixel_shader;
       if (!vertex_shader || !pixel_shader)
-      {
-#if DEVELOPMENT
-         game_device_data.mv_skipped_draws++;
-#endif
          return false;
-      }
       if (!game_device_data.mv_jitter_buffer)
          return false;
       if (std::exchange(game_device_data.mv_frame_ended, false))
@@ -1508,9 +1408,6 @@ class SaintsRowIV final : public Game
             entry.second.clear();
          if (!game_device_data.mv_previous_camera_valid)
             game_device_data.mv_previous_objects.clear();
-#if DEVELOPMENT
-         game_device_data.mv_frames++;
-#endif
       }
 
       // The game's vc2 / vc3. The slots added past them stay bound after the draw: no game shader reads a constant buffer at slot 9 or above.
@@ -1534,14 +1431,6 @@ class SaintsRowIV final : public Game
          {
             std::memcpy(game_device_data.mv_camera.data(), object->data(), camera_size);
             game_device_data.mv_camera_valid = true;
-#if DEVELOPMENT
-            game_device_data.mv_camera_draw = (uint64_t(original_shader_hashes.vertex_shaders[0]) << 32) | uint32_t(original_shader_hashes.pixel_shaders[0]);
-            if (game_device_data.mv_previous_camera_valid)
-            {
-               for (int i = 0; i < 16; i++)
-                  game_device_data.mv_camera_delta = (std::max)(game_device_data.mv_camera_delta, std::abs(game_device_data.mv_camera[i] - game_device_data.mv_previous_camera[i]));
-            }
-#endif
          }
 #if DEVELOPMENT
          // "Performance Test" without motion vector draws: the frame (camera, target clear, camera fill, upscaler) still happens, the
@@ -1584,26 +1473,8 @@ class SaintsRowIV final : public Game
          }
          // Draws with another projTM than the frame's camera (sky, windows at infinity) are left as is and not tracked
          const bool frame_camera = std::memcmp(object->data(), game_device_data.mv_camera.data(), camera_size) == 0;
-#if DEVELOPMENT
-         game_device_data.mv_off_camera_draws += !frame_camera;
-#endif
          if (match)
          {
-#if DEVELOPMENT
-            game_device_data.mv_matched_draws++;
-            game_device_data.mv_moved_draws += *match->object != *object;
-            if (game_device_data.mv_sample_camera_delta < 0.f)
-            {
-               const float* const previous_values = reinterpret_cast<const float*>(match->object->data());
-               float camera_delta = 0.f, object_delta = 0.f;
-               for (int i = 0; i < 16; i++)
-                  camera_delta = (std::max)(camera_delta, std::abs(previous_values[i] - values[i]));
-               for (int i = 16 * 4; i < 19 * 4; i++)
-                  object_delta = (std::max)(object_delta, std::abs(previous_values[i] - values[i]));
-               game_device_data.mv_sample_camera_delta = camera_delta;
-               game_device_data.mv_sample_object_delta = object_delta;
-            }
-#endif
             // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
             uploads[0] = match->object.get();
             if (skinned)
@@ -1623,19 +1494,7 @@ class SaintsRowIV final : public Game
             }
             game_device_data.mv_objects[key].push_back({translation, object, bones});
          }
-#if DEVELOPMENT
-         else
-         {
-            game_device_data.mv_other_camera_draws++;
-         }
-#endif
       }
-#if DEVELOPMENT
-      else
-      {
-         game_device_data.mv_uncopied_draws++;
-      }
-#endif
       BindPreviousConstants(native_device, native_device_context, &game_device_data, uploads, game_cbs);
       ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
@@ -1670,9 +1529,6 @@ class SaintsRowIV final : public Game
          ID3D11ShaderResourceView* const null_resources[MotionVectorPatches::resource_slots] = {};
          native_device_context->VSSetShaderResources(MotionVectorPatches::previous_resources_slot, MotionVectorPatches::resource_slots, null_resources);
       }
-#if DEVELOPMENT
-      game_device_data.mv_draws++;
-#endif
       return true;
    }
 
@@ -1696,19 +1552,13 @@ class SaintsRowIV final : public Game
             scene_srv->GetResource(&scene_resource);
       }
       com_ptr<ID3D11Texture2D> scene;
-#if DEVELOPMENT
-      const auto skip = [&]()
-      { game_device_data.mv_sr_skips++; };
-#else
-      const auto skip = []() {};
-#endif
       if (!scene_resource || FAILED(scene_resource->QueryInterface(&scene)) || !game_device_data.mv_texture || !game_device_data.mv_frame_depth || !game_device_data.mv_camera_valid)
-         return skip();
+         return;
       D3D11_TEXTURE2D_DESC scene_desc, mv_desc;
       scene->GetDesc(&scene_desc);
       game_device_data.mv_texture->GetDesc(&mv_desc);
       if ((scene_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && scene_desc.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS) || scene_desc.SampleDesc.Count != 1 || scene_desc.Width != mv_desc.Width || scene_desc.Height != mv_desc.Height)
-         return skip();
+         return;
       com_ptr<ID3D11Resource> depth;
       game_device_data.mv_frame_depth->GetResource(&depth);
       // None when "Super Resolution" changed after present (see "IsSRActive"): no output texture is made for it
@@ -1754,7 +1604,7 @@ class SaintsRowIV final : public Game
       const uint32_t render_width = (std::min)(game_device_data.mv_render_size[0], scene_desc.Width);
       const uint32_t render_height = (std::min)(game_device_data.mv_render_size[1], scene_desc.Height);
       if (render_width == 0 || render_height == 0)
-         return skip();
+         return;
 
       SR::SettingsData settings_data;
       settings_data.output_width = scene_desc.Width;
@@ -1783,31 +1633,6 @@ class SaintsRowIV final : public Game
       draw_data.jitter_x = game_device_data.mv_jitter[0];
       draw_data.jitter_y = game_device_data.mv_jitter[1];
       draw_data.reset = device_data.force_reset_sr;
-#if DEVELOPMENT
-      // A non-finite input or output texel stays in the upscaler's history (a spreading black blob only a new feature clears):
-      // counted on its reset frames and every 60th, stalling that frame
-      const bool check_sr = draw_data.reset || cb_luma_global_settings.FrameIndex % 60 == 0 || g_sr_dump_request;
-      const auto stage = [&](com_ptr<ID3D11Texture2D>& staging, ID3D11Texture2D* source)
-      {
-         D3D11_TEXTURE2D_DESC desc, staging_desc = {};
-         source->GetDesc(&desc);
-         if (staging)
-            staging->GetDesc(&staging_desc);
-         if (staging_desc.Width != desc.Width || staging_desc.Height != desc.Height || staging_desc.Format != desc.Format)
-         {
-            staging.reset();
-            desc = {desc.Width, desc.Height, 1, 1, desc.Format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
-            native_device->CreateTexture2D(&desc, nullptr, &staging);
-         }
-         if (staging)
-            native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source, 0, nullptr);
-      };
-      if (check_sr)
-      {
-         stage(game_device_data.sr_check_textures[0], scene.get());
-         stage(game_device_data.sr_check_textures[1], game_device_data.mv_texture.get());
-      }
-#endif
       if (vert_fov > 0.0)
          draw_data.vert_fov = float(vert_fov);
       if (near_plane > 0.0)
@@ -1906,88 +1731,12 @@ class SaintsRowIV final : public Game
                }
             }
          }
-#if DEVELOPMENT
-         game_device_data.mv_sr_draws++;
-#endif
       }
       else
       {
          // Back to SMAA until the upscaler is picked again
          device_data.sr_suppressed = true;
-#if DEVELOPMENT
-         game_device_data.mv_sr_failures++;
-#endif
       }
-#if DEVELOPMENT
-      if (check_sr)
-      {
-         stage(game_device_data.sr_check_textures[2], device_data.sr_output_color.get());
-         // Texels with a non-finite rgb / xy, texels all zero, largest finite |value|, over the top-left width x height
-         struct Counts
-         {
-            size_t non_finite = 0, zero = 0;
-            float max_abs = 0.f;
-         };
-         // "Dump SR Textures": the whole staging texture, raw (8 bytes a texel, rows packed), named with its size and DXGI format
-         const bool dump = g_sr_dump_request.exchange(false);
-         const auto count = [&](ID3D11Texture2D* staging, UINT width, UINT height, const char* name)
-         {
-            Counts counts;
-            D3D11_TEXTURE2D_DESC desc;
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            if (!staging || FAILED(native_device_context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)))
-               return counts;
-            staging->GetDesc(&desc);
-            // RGBA16F or RG32F: 8 bytes a texel either way
-            const bool half = desc.Format != DXGI_FORMAT_R32G32_FLOAT;
-            width = (std::min)(width, desc.Width);
-            height = (std::min)(height, desc.Height);
-            if (dump)
-            {
-               std::ofstream file(System::GetModulePath().parent_path() / std::format("Luma_SR4_{}_{}x{}_f{}.bin", name, desc.Width, desc.Height, int(desc.Format)), std::ios::binary);
-               for (UINT y = 0; y < desc.Height; y++)
-                  file.write(static_cast<const char*>(mapped.pData) + y * mapped.RowPitch, std::streamsize(desc.Width) * 8);
-            }
-            for (UINT y = 0; y < height; y++)
-            {
-               const uint8_t* const row = static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
-               for (UINT x = 0; x < width; x++)
-               {
-                  bool non_finite = false, zero = true;
-                  for (UINT c = 0; c < (half ? 3u : 2u); c++)
-                  {
-                     if (half)
-                     {
-                        uint16_t bits;
-                        std::memcpy(&bits, row + x * 8 + c * 2, sizeof(bits));
-                        non_finite |= (bits & 0x7C00) == 0x7C00;
-                        zero &= (bits & 0x7FFF) == 0;
-                     }
-                     else
-                     {
-                        float value;
-                        std::memcpy(&value, row + x * 8 + c * 4, sizeof(value));
-                        non_finite |= !std::isfinite(value);
-                        zero &= value == 0.f;
-                        if (std::isfinite(value))
-                           counts.max_abs = (std::max)(counts.max_abs, std::abs(value));
-                     }
-                  }
-                  counts.non_finite += non_finite;
-                  counts.zero += zero;
-               }
-            }
-            native_device_context->Unmap(staging, 0);
-            return counts;
-         };
-         const Counts color = count(game_device_data.sr_check_textures[0].get(), render_width, render_height, "color");
-         const Counts mv = count(game_device_data.sr_check_textures[1].get(), render_width, render_height, "mv");
-         const Counts output = count(game_device_data.sr_check_textures[2].get(), scene_desc.Width, scene_desc.Height, "output");
-         reshade::log::message(color.non_finite || mv.non_finite || output.non_finite ? reshade::log::level::warning : reshade::log::level::info, std::format("[SR4 SR] check{} {}x{} of {}x{}: color non-finite {} zero {}, mv non-finite {} zero {} max |uv| {:.3g}, output non-finite {} zero {}", draw_data.reset ? " (reset)" : "", render_width, render_height, scene_desc.Width, scene_desc.Height, color.non_finite, color.zero, mv.non_finite, mv.zero, mv.max_abs, output.non_finite, output.zero).c_str());
-      }
-      if (cb_luma_global_settings.FrameIndex % 600 == 0)
-         reshade::log::message(reshade::log::level::info, std::format("[SR4 SR] vert_fov {:.4g} deg, near {:.4g}, far {:.6g} (A {:.9g}), jitter {:.3f},{:.3f}, reset {}", vert_fov * 180.0 / 3.14159265358979, near_plane, far_plane, a, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset).c_str());
-#endif
       compute_state.Restore(native_device_context);
       graphics_state.Restore(native_device_context);
    }
@@ -2035,22 +1784,11 @@ class SaintsRowIV final : public Game
       com_ptr<ID3D11Buffer> vertex_buffer;
       UINT vertex_stride, vertex_offset;
       native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vertex_offset);
-#if DEVELOPMENT
-      const auto skip = [&](size_t reason)
-      {
-         game_device_data.mv_jitter_skips[reason]++;
-         game_device_data.mv_jitter_skip_examples[reason] = (uint64_t(original_shader_hashes.vertex_shaders[0]) << 32) | uint32_t(original_shader_hashes.pixel_shaders[0]);
-         return false;
-      };
-#else
-      const auto skip = [](size_t)
-      { return false; };
-#endif
       if (!vertex_buffer)
-         return skip(0);
+         return false;
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
       if (!vertex_shader)
-         return skip(1);
+         return false;
 
       // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel shader
       // (a motion vector draw's is put back), or under the render scale's sub-rect a patched one reading screen textures (soft
@@ -2071,9 +1809,6 @@ class SaintsRowIV final : public Game
          RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
       }
       draw();
-#if DEVELOPMENT
-      game_device_data.mv_jitter_only_draws++;
-#endif
       return true;
    }
 
@@ -2938,25 +2673,18 @@ public:
             native_device_context->PSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &sub_rect);
          }
       }
-      // The native bloom constants only feed Luma bloom (and the DEV readout).
-      const bool copy_bloom_constants = g_luma_bloom_enable || DEVELOPMENT;
-      if (copy_bloom_constants)
+      // The native bloom constants only feed Luma bloom.
+      if (g_luma_bloom_enable)
       {
          if (pixel_shader_hash == bloom_brightpass_pixel_shader)
          {
             CopyBoundPSConstantBuffer(native_device, native_device_context, 0, game_device_data.bloom_brightpass_vc0_cb);
             CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.bloom_brightpass_vc4_cb);
-#if DEVELOPMENT
-            g_in_bloom_chain = true;
-#endif
             return DrawOrDispatchOverrideType::None;
          }
          if (pixel_shader_hash == bloom_combine_pixel_shader)
          {
             CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.bloom_combine_vc4_cb);
-#if DEVELOPMENT
-            g_in_bloom_chain = false;
-#endif
             return DrawOrDispatchOverrideType::None;
          }
          if (!game_device_data.bloom_source_downsampled && pixel_shader_hash == downsample_pixel_shader)
@@ -2966,22 +2694,6 @@ public:
             return DrawOrDispatchOverrideType::None;
          }
       }
-#if DEVELOPMENT
-      if (pixel_shader_hash == ssao_singleframe_calculate_pixel_shader || pixel_shader_hash == ssao_multiframe_calculate_pixel_shader)
-      {
-         if (g_ssao_calculate_draws_this_frame++ == 0)
-         {
-            g_ssao_perm_this_frame = pixel_shader_hash;
-            CopyBoundPSConstantBuffer(native_device, native_device_context, 0, game_device_data.ssao_vc0_cb);
-         }
-      }
-      // The blur and downsample inside the bloom chain, for the constants readout only (the last of each wins).
-      if (g_in_bloom_chain && (pixel_shader_hash == blur_pixel_shader || pixel_shader_hash == downsample_pixel_shader))
-      {
-         CopyBoundPSConstantBuffer(native_device, native_device_context, 4, pixel_shader_hash == blur_pixel_shader ? game_device_data.bloom_blur_vc4_cb : game_device_data.bloom_downsample_vc4_cb);
-         return DrawOrDispatchOverrideType::None;
-      }
-#endif
       if (g_gtao_enable && pixel_shader_hash == ssao_singleframe_calculate_pixel_shader)
       {
          // Decided on the frame's first draw, so the four AO channels never mix XeGTAO and native.
@@ -3649,77 +3361,6 @@ public:
             device_data.debug_draw_texture = nullptr;
          }
       }
-      // The whole motion vector target: copied at a 60th frame, read at the next present
-      float mv_max = -1.f;
-      double mv_nonzero = 0.0;
-      if (game_device_data.mv_readback_pending)
-      {
-         game_device_data.mv_readback_pending = false;
-         D3D11_TEXTURE2D_DESC desc;
-         game_device_data.mv_readback->GetDesc(&desc);
-         D3D11_MAPPED_SUBRESOURCE mapped;
-         if (SUCCEEDED(native_device_context->Map(game_device_data.mv_readback.get(), 0, D3D11_MAP_READ, 0, &mapped)))
-         {
-            mv_max = 0.f;
-            size_t nonzero = 0;
-            for (UINT y = 0; y < desc.Height; y++)
-            {
-               const float* const row = reinterpret_cast<const float*>(static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch);
-               for (UINT x = 0; x < desc.Width; x++)
-               {
-                  const float largest = (std::max)(std::abs(row[x * 2]), std::abs(row[x * 2 + 1]));
-                  mv_max = (std::max)(mv_max, largest);
-                  // Not "> 0": the patched shader's two runs differ by rounding (~1e-7) with identical constants
-                  nonzero += largest > 0.1f / float(desc.Width);
-               }
-            }
-            mv_nonzero = double(nonzero) / (double(desc.Width) * desc.Height);
-            native_device_context->Unmap(game_device_data.mv_readback.get(), 0);
-         }
-      }
-      if (game_device_data.mv_active && cb_luma_global_settings.FrameIndex % 60 == 59)
-      {
-         const std::shared_lock lock(game_device_data.mv_mutex);
-         if (game_device_data.mv_texture)
-         {
-            D3D11_TEXTURE2D_DESC desc;
-            game_device_data.mv_texture->GetDesc(&desc);
-            D3D11_TEXTURE2D_DESC readback_desc = {};
-            if (game_device_data.mv_readback)
-               game_device_data.mv_readback->GetDesc(&readback_desc);
-            if (readback_desc.Width != desc.Width || readback_desc.Height != desc.Height)
-            {
-               game_device_data.mv_readback.reset();
-               readback_desc = {desc.Width, desc.Height, 1, 1, DXGI_FORMAT_R32G32_FLOAT, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
-               native_device->CreateTexture2D(&readback_desc, nullptr, &game_device_data.mv_readback);
-            }
-            if (game_device_data.mv_readback)
-            {
-               native_device_context->CopyResource(game_device_data.mv_readback.get(), game_device_data.mv_texture.get());
-               game_device_data.mv_readback_pending = true;
-            }
-         }
-      }
-      if (game_device_data.mv_active && cb_luma_global_settings.FrameIndex % 60 == 0)
-      {
-         reshade::log::message(reshade::log::level::info, std::format("[SR4 MV] sample: frame camera delta {:.6g}, matched draw projTM delta {:.6g} objTM delta {:.6g}, target max |mv| {:.6g} (UV), moving (> 0.1 px) {:.1f}%, scene color 0x{:X} (copy 0x{:X} -> 0x{:X}), last rejected target 0x{:X}", game_device_data.mv_camera_delta, game_device_data.mv_sample_camera_delta, game_device_data.mv_sample_object_delta, mv_max, mv_nonzero * 100.0, uint64_t(game_device_data.mv_scene_color.get()), game_device_data.mv_scene_copy_source, game_device_data.mv_scene_copy_dest, game_device_data.mv_rejected_scene_target).c_str());
-         game_device_data.mv_camera_delta = 0.f;
-         game_device_data.mv_sample_camera_delta = -1.f;
-         game_device_data.mv_sample_object_delta = -1.f;
-         std::string rejects;
-         for (size_t i = 0; i < std::size(game_device_data.mv_rejects); i++)
-         {
-            const uint64_t example = game_device_data.mv_reject_examples[i];
-            rejects += std::format(" {}={} (vs 0x{:08X} ps 0x{:08X})", SaintsRowIVGameDeviceData::mv_reject_names[i], game_device_data.mv_rejects[i].exchange(0), uint32_t(example >> 32), uint32_t(example));
-         }
-         rejects += " unjittered:";
-         for (size_t i = 0; i < std::size(game_device_data.mv_jitter_skips); i++)
-         {
-            const uint64_t example = game_device_data.mv_jitter_skip_examples[i];
-            rejects += std::format(" {}={} (vs 0x{:08X} ps 0x{:08X})", SaintsRowIVGameDeviceData::mv_jitter_skip_names[i], game_device_data.mv_jitter_skips[i].exchange(0), uint32_t(example >> 32), uint32_t(example));
-         }
-         reshade::log::message(reshade::log::level::info, std::format("[SR4 MV] frame={} per 60 frames: mv_frames={} constant_copies={} moved={} candidates={} mv_draws={} matched={} other_camera={} off_camera={} jitter_only={} sr_draws={} sr_failures={} sr_skips={} ended_by=0x{:08X} (camera from vs 0x{:08X} ps 0x{:08X}) uncopied={} skipped_draws={} rejected:{}", cb_luma_global_settings.FrameIndex, game_device_data.mv_frames.exchange(0), game_device_data.mv_constant_copies.exchange(0), game_device_data.mv_moved_draws.exchange(0), game_device_data.mv_candidate_draws.exchange(0), game_device_data.mv_draws.exchange(0), game_device_data.mv_matched_draws.exchange(0), game_device_data.mv_other_camera_draws.exchange(0), game_device_data.mv_off_camera_draws.exchange(0), game_device_data.mv_jitter_only_draws.exchange(0), game_device_data.mv_sr_draws.exchange(0), game_device_data.mv_sr_failures.exchange(0), game_device_data.mv_sr_skips.exchange(0), game_device_data.mv_frame_end_shader, uint32_t(game_device_data.mv_camera_draw >> 32), uint32_t(game_device_data.mv_camera_draw), game_device_data.mv_uncopied_draws.exchange(0), game_device_data.mv_skipped_draws.exchange(0), rejects).c_str());
-      }
 
       g_msaa_resolves_last_frame = std::exchange(g_msaa_resolves_this_frame, 0);
       g_finals_last_frame = std::exchange(g_finals_this_frame, 0);
@@ -3730,88 +3371,6 @@ public:
          static std::set<std::pair<uint32_t, uint64_t>> logged;
          if (logged.insert({game_device_data.mv_frame_end_shader, g_first_late_scene_draw}).second)
             reshade::log::message(reshade::log::level::warning, std::format("[SR4 SubRect] scene ended by ps 0x{:08X} before {} draws into the output sized depth (first vs 0x{:08X} ps 0x{:08X})", game_device_data.mv_frame_end_shader, g_late_scene_draws, uint32_t(g_first_late_scene_draw >> 32), uint32_t(g_first_late_scene_draw)).c_str());
-      }
-
-      for (auto& readout : game_device_data.bloom_readouts)
-      {
-         D3D11_MAPPED_SUBRESOURCE mapped;
-         if (readout.staging && SUCCEEDED(native_device_context->Map(readout.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)))
-         {
-            std::memcpy(readout.value, static_cast<const float*>(mapped.pData) + readout.register_index * 4, sizeof(readout.value));
-            native_device_context->Unmap(readout.staging.get(), 0);
-         }
-         const com_ptr<ID3D11Buffer>& source = game_device_data.*readout.source;
-         if (!source)
-            continue;
-         D3D11_BUFFER_DESC desc;
-         source->GetDesc(&desc);
-         if (desc.ByteWidth < (readout.register_index + 1) * 16)
-            continue;
-         if (!readout.staging)
-         {
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.BindFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            native_device->CreateBuffer(&desc, nullptr, &readout.staging);
-         }
-         if (readout.staging)
-            native_device_context->CopyResource(readout.staging.get(), source.get());
-      }
-
-      g_ssao_calculate_draws_last_frame = std::exchange(g_ssao_calculate_draws_this_frame, 0);
-      g_ssao_frames_since_log++;
-      D3D11_MAPPED_SUBRESOURCE mapped;
-      if (g_ssao_staging_perm != 0 && SUCCEEDED(native_device_context->Map(game_device_data.ssao_vc0_staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)))
-      {
-         D3D11_BUFFER_DESC desc;
-         game_device_data.ssao_vc0_staging->GetDesc(&desc);
-         std::memset(g_ssao_vc0, 0, sizeof(g_ssao_vc0));
-         std::memcpy(g_ssao_vc0, mapped.pData, (std::min)(size_t(desc.ByteWidth), sizeof(g_ssao_vc0)));
-         native_device_context->Unmap(game_device_data.ssao_vc0_staging.get(), 0);
-         g_ssao_perm = std::exchange(g_ssao_staging_perm, 0);
-
-         const auto& c = g_ssao_vc0;
-         const bool multiframe = g_ssao_perm == ssao_multiframe_calculate_pixel_shader;
-         int length = std::snprintf(g_ssao_readout, sizeof(g_ssao_readout),
-            "SR4 SSAO vc0 (%s 0x%08X): fade %g, radius_reference %g, projection_scales %g %g, temporal_falloff %g %g, hFOV %.3f vFOV %.3f deg, view z at depth 0 / 1: %g / %g\n"
-            "  inv_proj c1 %g %g %g %g | c2 %g %g %g %g | c3 %g %g %g %g | c4 %g %g %g %g",
-            multiframe ? "multiframe" : "singleframe", g_ssao_perm, c[0][0], multiframe ? c[14][0] : c[18][0], c[5][0], c[5][1], multiframe ? c[19][0] : 0.f, multiframe ? c[19][1] : 0.f,
-            2.f * std::atan(c[1][0]) * 57.29578f, 2.f * std::atan(c[2][1]) * 57.29578f, c[4][2] / c[4][3], (c[3][2] + c[4][2]) / (c[3][3] + c[4][3]),
-            c[1][0], c[1][1], c[1][2], c[1][3], c[2][0], c[2][1], c[2][2], c[2][3], c[3][0], c[3][1], c[3][2], c[3][3], c[4][0], c[4][1], c[4][2], c[4][3]);
-         // Sample offsets, .xy used (UV = offset * radius): interleave c6-c9 (this is the first draw's set), blue noise c10+.
-         for (int i = 6; i < (multiframe ? 14 : 18); i++)
-            length += std::snprintf(g_ssao_readout + length, sizeof(g_ssao_readout) - length, "%s%s c%d %g %g (|%g|)", i == 6 || i == 10 ? "\n  " : "", i == 6 ? "interleave" : (i == 10 ? "blue_noise" : ""), i, c[i][0], c[i][1], std::sqrt(c[i][0] * c[i][0] + c[i][1] * c[i][1]));
-
-         // Logged on change only, at most every 30 frames: the FOV animates and the multiframe offsets alternate per frame,
-         // so this samples the values rather than logging every change.
-         if (g_ssao_frames_since_log >= 30 && std::memcmp(g_ssao_vc0, g_ssao_vc0_logged, sizeof(g_ssao_vc0)) != 0)
-         {
-            std::memcpy(g_ssao_vc0_logged, g_ssao_vc0, sizeof(g_ssao_vc0));
-            g_ssao_frames_since_log = 0;
-            reshade::log::message(reshade::log::level::info, g_ssao_readout);
-         }
-      }
-      const uint32_t ssao_perm_copied = std::exchange(g_ssao_perm_this_frame, 0);
-      if (ssao_perm_copied != 0 && game_device_data.ssao_vc0_cb)
-      {
-         D3D11_BUFFER_DESC desc;
-         game_device_data.ssao_vc0_cb->GetDesc(&desc);
-         D3D11_BUFFER_DESC staging_desc = {};
-         if (game_device_data.ssao_vc0_staging)
-            game_device_data.ssao_vc0_staging->GetDesc(&staging_desc);
-         if (staging_desc.ByteWidth != desc.ByteWidth)
-         {
-            game_device_data.ssao_vc0_staging.reset();
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.BindFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            native_device->CreateBuffer(&desc, nullptr, &game_device_data.ssao_vc0_staging);
-         }
-         if (game_device_data.ssao_vc0_staging)
-         {
-            native_device_context->CopyResource(game_device_data.ssao_vc0_staging.get(), game_device_data.ssao_vc0_cb.get());
-            g_ssao_staging_perm = ssao_perm_copied;
-         }
       }
 #endif
    }
@@ -3832,18 +3391,10 @@ public:
             ImGui::SetTooltip("The rl_hdr final the game drew last; its HDR path is in the matching Tonemap*_0x<hash> shader. Two draws in a frame mean two finals (e.g. a menu over the scene).");
       }
 
-      ImGui::SeparatorText("Bloom DEV readout");
-      for (const auto& readout : game_device_data.bloom_readouts)
-         ImGui::Text("%s: %.4f %.4f %.4f %.4f", readout.name, readout.value[0], readout.value[1], readout.value[2], readout.value[3]);
-
-      ImGui::SeparatorText("SSAO DEV readout");
-      ImGui::Text("calculate draws last frame: %u", g_ssao_calculate_draws_last_frame);
-      ImGui::TextUnformatted(g_ssao_perm == 0 ? "no SSAO calculate seen yet" : g_ssao_readout);
-
       ImGui::SeparatorText("Motion vector research");
       ImGui::Checkbox("MV Enable", &g_mv_enable);
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Redraws the opaque main material pass with the motion vector shaders without DLSS/FSR: camera and object motion\n(each draw finds its own previous frame vc2/vc3). The image must not change; the debug view is black with a static camera\nand lights up only what moves. ReShade.log: patched/refused shaders, and per 60 frames mv_draws / matched / other_camera /\nuncopied and the rejection reasons. Not saved.");
+         ImGui::SetTooltip("Redraws the opaque main material pass with the motion vector shaders without DLSS/FSR: camera and object motion\n(each draw finds its own previous frame vc2/vc3). The image must not change; the debug view is black with a static camera\nand lights up only what moves. ReShade.log: patched/refused shaders. Not saved.");
       ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without an upscaler, with MV Enable. The image shakes by a subpixel; nothing\nmay flicker or lose pixels, and the debug view stays black with a static camera. Not saved.");
@@ -3851,8 +3402,6 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("No projection jitter under DLSS/FSR (the upscaler gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
-      if (ImGui::Button("Dump SR Textures"))
-         g_sr_dump_request = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");
       // With MV Enable and no upscaler, "Render Scale (%)" leaves the scene in the corner
