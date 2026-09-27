@@ -2,7 +2,8 @@
 // counted twice) / 6, times scene exposure and g_vBloomInfo.w (intensity), added (one + one blend) to the full resolution scene.
 // A 2x2 permutation family: 5 tap or 3x3 tent / 16 (P5S_BLOOM_TENT), each with or without g_vMaxUV tap clamping
 // (P5S_BLOOM_MAX_UV); the other three include this file.
-// Luma: scaled by "Bloom Intensity".
+// Luma: scaled by "Bloom Intensity". The tap offset is the bloom mip's texel from its size instead of g_vBloomInfo.xy, as under DLSS/FSR
+// upscaling the bloom chain is output resolution (identical without upscaling).
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "Includes/cbComposite.hlsl"
@@ -29,7 +30,9 @@ float3 SampleBloom(float2 uv)
 
 void main(float4 v0 : SV_Position0, float2 v1 : TEXCOORD0, out float4 o0 : SV_Target0)
 {
-   const float2 offset = g_vBloomInfo.xy * g_vBloomInfo.z;
+   float2 bloomSize;
+   g_tBloomMap.GetDimensions(bloomSize.x, bloomSize.y);
+   const float2 offset = g_vBloomInfo.z / bloomSize;
 #if P5S_BLOOM_TENT
    float3 bloom = SampleBloom(v1) * 4.0;
    bloom += (SampleBloom(v1 + float2(offset.x, 0.0)) + SampleBloom(v1 - float2(offset.x, 0.0)) + SampleBloom(v1 + float2(0.0, offset.y)) + SampleBloom(v1 - float2(0.0, offset.y))) * 2.0;
