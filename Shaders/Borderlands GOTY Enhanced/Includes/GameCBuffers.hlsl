@@ -27,7 +27,9 @@ struct LumaGameSettings
 // Game specific cbuffer (instance/pass) data.
 struct LumaGameData
 {
-   float Dummy; // hlsl doesn't support empty structs
+   float2 ScreenPercentageScale; // The stretch's share of its source (ScreenPercentage < 100 draws a top-left sub-rect); 1 at 100% or upscaled
+   float2 SceneUVScale;          // Scales the uber's scene UVs: 1 / share when DLSS / FSR upscaled the sub-rect to the output, else 1
+   float2 BlurUVScale;           // Scales the uber's blurred image UVs: 1 / share when the DOF/Bloom gather ran at output resolution, else 1
 };
 } // namespace CB
 
