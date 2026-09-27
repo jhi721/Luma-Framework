@@ -1779,12 +1779,12 @@ public:
          return nullptr;
       const uint32_t* tail = reinterpret_cast<const uint32_t*>(code) + size / sizeof(uint32_t) - tail_tokens;
 
-      const uint32_t operand_4_component_1d = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_1D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      using MotionVectorPatches::Destination, MotionVectorPatches::RegisterOperand;
       const uint32_t swizzle_mode = ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE);
       const bool tail_matches =
          tail[0] == (ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8)) &&
-         tail[1] == (operand_4_component_1d | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) | D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_OUTPUT)) && tail[2] == 0 &&
-         (tail[3] & ~D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MASK) == (operand_4_component_1d | swizzle_mode | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP)) &&
+         tail[1] == Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL) && tail[2] == 0 &&
+         (tail[3] & ~D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MASK) == (RegisterOperand(D3D10_SB_OPERAND_TYPE_TEMP) | swizzle_mode) &&
          (tail[5] & ~D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MASK) == (ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) | swizzle_mode | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER)) && tail[6] == 4 && tail[7] == 1 &&
          tail[8] == (ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1));
       ASSERT_ONCE(tail_matches);
@@ -1795,11 +1795,11 @@ public:
       std::vector<uint32_t> patch;
       const auto dest = [&](D3D10_SB_OPERAND_TYPE operand_type, uint32_t index, uint32_t component)
       {
-         patch.insert(patch.end(), {operand_4_component_1d | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) | (D3D10_SB_OPERAND_4_COMPONENT_MASK_X << component) | ENCODE_D3D10_SB_OPERAND_TYPE(operand_type), index});
+         patch.insert(patch.end(), {Destination(operand_type, D3D10_SB_OPERAND_4_COMPONENT_MASK_X << component), index});
       };
       const auto src = [&](uint32_t component, D3D10_SB_OPERAND_MODIFIER modifier = D3D10_SB_OPERAND_MODIFIER_NONE)
       {
-         const uint32_t token = operand_4_component_1d | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(component) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP);
+         const uint32_t token = RegisterOperand(D3D10_SB_OPERAND_TYPE_TEMP) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(component);
          if (modifier == D3D10_SB_OPERAND_MODIFIER_NONE)
             patch.insert(patch.end(), {token, r});
          else

@@ -316,6 +316,27 @@ namespace MotionVectorPatches
       return last;
    }
 
+   // The program's tokens, split into instructions, and the index of the first one past the declarations; false on a broken length
+   inline bool ReadProgram(const Chunk& program, std::vector<uint32_t>* tokens, std::vector<Instruction>* instructions, size_t* first_body)
+   {
+      tokens->resize(program.data.size() / 4);
+      std::memcpy(tokens->data(), program.data.data(), program.data.size());
+      if (!SplitInstructions(*tokens, instructions))
+         return false;
+      *first_body = size_t(std::ranges::find_if(*instructions, [](const Instruction& instruction)
+                              { return !IsDeclaration(instruction.opcode); }) -
+                           instructions->begin());
+      return true;
+   }
+
+   // The patched tokens as the program, with their length token set
+   inline void WriteProgram(std::vector<uint32_t>* tokens, Chunk* program)
+   {
+      (*tokens)[1] = uint32_t(tokens->size());
+      program->data.resize(tokens->size() * 4);
+      std::memcpy(program->data.data(), tokens->data(), program->data.size());
+   }
+
    // The vertex shader with the second run, or empty if unpatchable (the draw then keeps the original shaders)
    inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, std::string* error)
    {
@@ -341,14 +362,11 @@ namespace MotionVectorPatches
          return (*error = "outputs", std::vector<uint8_t>());
       const uint32_t position_register = position->reg;
 
-      std::vector<uint32_t> tokens(program->data.size() / 4);
-      std::memcpy(tokens.data(), program->data.data(), program->data.size());
+      std::vector<uint32_t> tokens;
       std::vector<Instruction> instructions;
-      if (!SplitInstructions(tokens, &instructions))
+      size_t first_body;
+      if (!ReadProgram(*program, &tokens, &instructions, &first_body))
          return (*error = "lengths", std::vector<uint8_t>());
-      const size_t first_body = size_t(std::ranges::find_if(instructions, [](const Instruction& instruction)
-                                          { return !IsDeclaration(instruction.opcode); }) -
-                                       instructions.begin());
       if (first_body >= instructions.size() || instructions.back().opcode != D3D10_SB_OPCODE_RET || std::count_if(instructions.begin() + first_body, instructions.end(), [](const Instruction& instruction)
                                                                                                        { return instruction.opcode == D3D10_SB_OPCODE_RET; }) != 1)
          return (*error = "returns", std::vector<uint8_t>());
@@ -499,9 +517,7 @@ namespace MotionVectorPatches
       }
 
       declarations.insert(declarations.end(), body.begin(), body.end());
-      declarations[1] = uint32_t(declarations.size());
-      program->data.resize(declarations.size() * 4);
-      std::memcpy(program->data.data(), declarations.data(), program->data.size());
+      WriteProgram(&declarations, program);
 
       SignatureElement element = {semantic_name, 0, 0, 3 /* float */, current_position_register, 0xF, 0};
       outputs.push_back(element);
@@ -543,14 +559,11 @@ namespace MotionVectorPatches
              { return element.reg >= current_position_register; }))
          return (*error = "signatures", std::vector<uint8_t>());
 
-      std::vector<uint32_t> tokens(program->data.size() / 4);
-      std::memcpy(tokens.data(), program->data.data(), program->data.size());
+      std::vector<uint32_t> tokens;
       std::vector<Instruction> instructions;
-      if (!SplitInstructions(tokens, &instructions))
+      size_t first_body;
+      if (!ReadProgram(*program, &tokens, &instructions, &first_body))
          return (*error = "lengths", std::vector<uint8_t>());
-      const size_t first_body = size_t(std::ranges::find_if(instructions, [](const Instruction& instruction)
-                                          { return !IsDeclaration(instruction.opcode); }) -
-                                       instructions.begin());
       if (first_body >= instructions.size() || instructions.back().opcode != D3D10_SB_OPCODE_RET || std::ranges::any_of(instructions.begin() + first_body, instructions.end() - 1, [](const Instruction& instruction)
                                                                                                        { return instruction.opcode == D3D10_SB_OPCODE_RET || instruction.opcode == D3D10_SB_OPCODE_RETC; }))
          return (*error = "returns", std::vector<uint8_t>());
@@ -592,9 +605,7 @@ namespace MotionVectorPatches
       declarations.insert(declarations.end(), tokens.begin() + instructions[first_body].begin, tokens.begin() + last);
       declarations.insert(declarations.end(), motion_vector.begin(), motion_vector.end());
       declarations.insert(declarations.end(), tokens.begin() + last, tokens.end());
-      declarations[1] = uint32_t(declarations.size());
-      program->data.resize(declarations.size() * 4);
-      std::memcpy(program->data.data(), declarations.data(), program->data.size());
+      WriteProgram(&declarations, program);
 
       // Signature masks are plain component bits (x = 1), unlike the operand token masks above
       inputs.push_back({semantic_name, 0, 0, 3, current_position_register, 0xF, 0xB});
@@ -635,14 +646,11 @@ namespace MotionVectorPatches
       }
       if (!program || program->data.size() % 4 != 0)
          return (*error = "chunks", std::vector<uint8_t>());
-      std::vector<uint32_t> tokens(program->data.size() / 4);
-      std::memcpy(tokens.data(), program->data.data(), program->data.size());
+      std::vector<uint32_t> tokens;
       std::vector<Instruction> instructions;
-      if (!SplitInstructions(tokens, &instructions))
+      size_t first_body;
+      if (!ReadProgram(*program, &tokens, &instructions, &first_body))
          return (*error = "lengths", std::vector<uint8_t>());
-      const size_t first_body = size_t(std::ranges::find_if(instructions, [](const Instruction& instruction)
-                                          { return !IsDeclaration(instruction.opcode); }) -
-                                       instructions.begin());
       const size_t constant_buffer = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER});
       if (constant_buffer == first_body || instructions[constant_buffer].length != 4)
          return (*error = "no constant buffer", std::vector<uint8_t>());
@@ -746,9 +754,7 @@ namespace MotionVectorPatches
       }
       if (!found)
          return (*error = "no screen uv", std::vector<uint8_t>());
-      patched[1] = uint32_t(patched.size());
-      program->data.resize(patched.size() * 4);
-      std::memcpy(program->data.data(), patched.data(), program->data.size());
+      WriteProgram(&patched, program);
       return WriteChunks(chunks);
    }
 } // namespace MotionVectorPatches
