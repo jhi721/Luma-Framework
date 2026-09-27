@@ -238,9 +238,6 @@ namespace
    uint32_t g_pixel_steps_overrides_this_frame = 0;
    uint32_t g_pixel_steps_overrides_last_frame = 0;
    uint32_t g_sub_rect_draws_this_frame = 0;
-   bool g_scene_ended_this_frame = false;
-   uint32_t g_late_scene_draws = 0;
-   uint64_t g_first_late_scene_draw = 0;
    uint32_t g_sub_rect_draws_last_frame = 0;
 #else
    constexpr bool g_mv_enable = false;
@@ -404,21 +401,6 @@ namespace
    uint32_t g_final_perm = 0;
    uint32_t g_finals_this_frame = 0;
    uint32_t g_finals_last_frame = 0;
-
-   // Motion vector research (the game renders none): the frame probe logs the next frame's draws (pass state, the per-draw VS
-   // constants vc2 / vc3 and a few vc2 values, vertex buffers, draw arguments), then how every buffer those draws read was filled.
-   // Consumed at the next present.
-   enum class ProbeRequest : int
-   {
-      None,
-      Log,
-      LogAndDump, // also writes every draw's vc2 / vc3 contents to a CSV next to the executable
-   };
-   std::atomic<ProbeRequest> g_probe_request = ProbeRequest::None;
-   constexpr uint32_t probe_max_draw_lines = 12000;
-   // The VS slots of the per-draw constants: vc2 (projTM c0-3, eyePos c4, objTM c16-18), vc3 (Bone_weights)
-   constexpr UINT object_constants_slot = MotionVectorPatches::object_slot;
-   constexpr UINT bone_constants_slot = MotionVectorPatches::previous_slots[1].first;
 #endif
 } // namespace
 
@@ -602,8 +584,6 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    uint32_t mv_frame_index = 0; // The Luma frame index of the last motion vector frame
 
 #if DEVELOPMENT
-   uint32_t mv_frame_end_shader = 0; // The post pass that ended the last motion vector frame
-
    // "Performance Test": GPU timestamps per frame (present to present, the scene from the G-buffer to its first post pass, the
    // upscaler), all on the immediate context, in a ring read back a few frames later without waiting; and the CPU time in the
    // motion vector hooks
@@ -657,29 +637,6 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
       gtao_height = 0;
       gtao_format = DXGI_FORMAT_UNKNOWN;
    }
-
-#if DEVELOPMENT
-   // Frame probe: every buffer mapped or updated in the probed frame, and the draws that read it as vc2, vc3 or an instance stream
-   struct ProbeBuffer
-   {
-      uint32_t maps[5] = {}; // By reshade::api::map_access (1 read_only, 2 write_only = NO_OVERWRITE or WRITE, 3 read_write, 4 write_discard)
-      uint32_t updates = 0;  // UpdateSubresource
-      uint32_t object_draws = 0;
-      uint32_t bone_draws = 0;
-      uint32_t instance_draws = 0; // Bound at a vertex buffer slot >= 1
-      D3D11_BUFFER_DESC desc = {};
-      uint8_t* mapped = nullptr;
-      std::vector<uint8_t> shadow; // Constant buffers: CPU copy of the last write (Unmap or update)
-   };
-   std::atomic<ProbeRequest> probe_mode = ProbeRequest::None; // The probed frame
-   std::mutex probe_mutex;
-   std::unordered_map<uint64_t, ProbeBuffer> probe_buffers;
-   uint32_t probe_draws = 0;
-   uint32_t probe_map_events = 0; // Every buffer event: 0 means this ReShade build doesn't send them
-   uint32_t probe_update_events = 0;
-   std::unordered_map<std::string_view, uint32_t> probe_pass_draws;
-   std::ofstream probe_dump;
-#endif
 };
 
 class SaintsRowIV final : public Game
@@ -856,9 +813,6 @@ class SaintsRowIV final : public Game
          if (game_device_data.mv_constants_copies.contains(resource.handle) || game_device_data.sub_rect_vc4_buffers.contains(resource.handle))
             game_device_data.mv_mapped_constants[resource.handle] = *data;
       }
-#if DEVELOPMENT
-      OnProbeMapBufferRegion(device, resource, offset, size, access, data);
-#endif
    }
 
    // Motion vectors: the CPU copy of a vc2 / vc3 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
@@ -909,9 +863,6 @@ class SaintsRowIV final : public Game
             game_device_data.mv_mapped_constants.erase(mapped);
          }
       }
-#if DEVELOPMENT
-      OnProbeUnmapBufferRegion(device, resource);
-#endif
    }
 
    // Motion vectors: the copy of the material target into the post scene (see "mv_scene_color")
@@ -1800,235 +1751,6 @@ class SaintsRowIV final : public Game
       return true;
    }
 
-#if DEVELOPMENT
-   // The probed frame's game data, null otherwise (the buffer events then cost nothing)
-   static SaintsRowIVGameDeviceData* GetProbingGameDeviceData(reshade::api::device* device)
-   {
-      DeviceData* const device_data = device->get_private_data<DeviceData>();
-      auto* const game_device_data = device_data && device_data->game ? &GetGameDeviceData(*device_data) : nullptr;
-      return game_device_data && game_device_data->probe_mode != ProbeRequest::None ? game_device_data : nullptr;
-   }
-
-   // The probed frame's entry for a buffer. The caller holds probe_mutex.
-   static SaintsRowIVGameDeviceData::ProbeBuffer& GetProbeBuffer(SaintsRowIVGameDeviceData* game_device_data, ID3D11Buffer* buffer)
-   {
-      auto& entry = game_device_data->probe_buffers[reinterpret_cast<uint64_t>(buffer)];
-      if (entry.desc.ByteWidth == 0)
-         buffer->GetDesc(&entry.desc);
-      return entry;
-   }
-
-   static void OnProbeMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
-   {
-      auto* const game_device_data = GetProbingGameDeviceData(device);
-      if (!game_device_data)
-         return;
-      const std::lock_guard lock(game_device_data->probe_mutex);
-      game_device_data->probe_map_events++;
-      auto& entry = GetProbeBuffer(game_device_data, reinterpret_cast<ID3D11Buffer*>(resource.handle));
-      entry.maps[std::clamp(int(access), 0, 4)]++;
-      entry.mapped = access != reshade::api::map_access::read_only && data && *data && offset == 0 ? static_cast<uint8_t*>(*data) : nullptr;
-   }
-
-   // Reads the mapped memory back (write combined, slow): DEVELOPMENT only, for the probed frame
-   static void OnProbeUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
-   {
-      auto* const game_device_data = GetProbingGameDeviceData(device);
-      if (!game_device_data)
-         return;
-      const std::lock_guard lock(game_device_data->probe_mutex);
-      const auto it = game_device_data->probe_buffers.find(resource.handle);
-      if (it == game_device_data->probe_buffers.end() || !it->second.mapped)
-         return;
-      auto& entry = it->second;
-      if (entry.desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
-         entry.shadow.assign(entry.mapped, entry.mapped + entry.desc.ByteWidth);
-      entry.mapped = nullptr;
-   }
-
-   static void RecordProbeUpdate(reshade::api::device* device, const void* data, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
-   {
-      auto* const game_device_data = GetProbingGameDeviceData(device);
-      if (!game_device_data)
-         return;
-      const std::lock_guard lock(game_device_data->probe_mutex);
-      game_device_data->probe_update_events++;
-      auto& entry = GetProbeBuffer(game_device_data, reinterpret_cast<ID3D11Buffer*>(dest.handle));
-      entry.updates++;
-      if ((entry.desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && data && dest_offset + size <= entry.desc.ByteWidth)
-      {
-         entry.shadow.resize(entry.desc.ByteWidth);
-         std::memcpy(entry.shadow.data() + dest_offset, data, size_t(size));
-      }
-   }
-   static bool OnProbeUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
-   {
-      RecordProbeUpdate(device, data, dest, dest_offset, size);
-      return false;
-   }
-   static bool OnProbeUpdateBufferRegionCommand(reshade::api::command_list* cmd_list, const void* data, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
-   {
-      RecordProbeUpdate(cmd_list->get_device(), data, dest, dest_offset, size);
-      return false;
-   }
-
-   // One ReShade.log line per draw of the probed frame, plus the vc2 values that tell the transform model (world absolute or
-   // camera relative, per-draw or shared camera), and with a dump, the CSV rows of vc2 / vc3.
-   static void LogProbeDraw(ID3D11DeviceContext* native_device_context, SaintsRowIVGameDeviceData* game_device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
-   {
-      com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-      com_ptr<ID3D11DepthStencilView> dsv;
-      native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
-      // The game's targets (not the motion vector target left bound by the last motion vector draw)
-      const UINT rt_count = UINT(std::ranges::count_if(rtvs, [&](const auto& rtv)
-         { return rtv && rtv != game_device_data->mv_rtv; }));
-      com_ptr<ID3D11DepthStencilState> depth_stencil_state;
-      UINT stencil_ref = 0;
-      native_device_context->OMGetDepthStencilState(&depth_stencil_state, &stencil_ref);
-      D3D11_DEPTH_STENCIL_DESC depth_desc = {};
-      if (depth_stencil_state)
-         depth_stencil_state->GetDesc(&depth_desc);
-      const bool depth_write = depth_desc.DepthEnable && depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
-      D3D11_RENDER_TARGET_VIEW_DESC rt0_desc = {};
-      uint4 rt0_size = {};
-      if (rtvs[0])
-      {
-         rtvs[0]->GetDesc(&rt0_desc);
-         DXGI_FORMAT unused_format;
-         GetResourceInfo(rtvs[0].get(), rt0_size, unused_format);
-      }
-      // G-buffer: 2-3 targets (normals, DSF, lighting); material pass: the fp16 scene alone
-      const std::string_view pass = rt_count >= 2 ? "gbuffer" : (rt_count == 1 && dsv && rt0_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "scene" : (rt_count == 0 && depth_write ? "depth" : "other"));
-
-      com_ptr<ID3D11Buffer> vs_cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
-      native_device_context->VSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, &vs_cbs[0]);
-      uint32_t vs_cb_mask = 0;
-      for (uint32_t i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-         vs_cb_mask |= vs_cbs[i] ? (1u << i) : 0u;
-      com_ptr<ID3D11Buffer> vbs[4];
-      UINT vb_strides[4] = {}, vb_offsets[4] = {};
-      native_device_context->IAGetVertexBuffers(0, 4, &vbs[0], vb_strides, vb_offsets);
-      com_ptr<ID3D11Buffer> ib;
-      DXGI_FORMAT ib_format = DXGI_FORMAT_UNKNOWN;
-      UINT ib_offset = 0;
-      native_device_context->IAGetIndexBuffer(&ib, &ib_format, &ib_offset);
-      D3D11_VIEWPORT viewport = {};
-      UINT viewports = 1;
-      native_device_context->RSGetViewports(&viewports, &viewport);
-      // The motion vector target's blend slot: independent blending, or RT0 unblended
-      com_ptr<ID3D11BlendState> blend_state;
-      FLOAT blend_factor[4];
-      UINT sample_mask = 0;
-      native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
-      D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
-      if (blend_state)
-         blend_state->GetDesc(&blend_desc);
-
-      uint32_t line_index;
-      std::vector<uint8_t> object_constants, bone_constants;
-      {
-         const std::lock_guard lock(game_device_data->probe_mutex);
-         line_index = game_device_data->probe_draws++;
-         game_device_data->probe_pass_draws[pass]++;
-         if (vs_cbs[object_constants_slot])
-         {
-            auto& entry = GetProbeBuffer(game_device_data, vs_cbs[object_constants_slot].get());
-            entry.object_draws++;
-            object_constants = entry.shadow;
-         }
-         if (vs_cbs[bone_constants_slot])
-         {
-            auto& entry = GetProbeBuffer(game_device_data, vs_cbs[bone_constants_slot].get());
-            entry.bone_draws++;
-            bone_constants = entry.shadow;
-         }
-         for (int i = 1; i < 4; i++)
-         {
-            if (vbs[i])
-               GetProbeBuffer(game_device_data, vbs[i].get()).instance_draws++;
-         }
-      }
-      if (line_index >= probe_max_draw_lines)
-         return;
-
-      const DrawDispatchData& draw = last_draw_dispatch_data;
-      reshade::log::message(reshade::log::level::info, std::format("[SR4 Probe] frame={} draw={} ctx={} deferred={} pass={} vs=0x{:08X} ps=0x{:08X} rts={} rt0_format={} rt0={}x{} dsv={} depth={} depth_write={} depth_func={} stencil={} blend0={} independent_blend={} a2c={} viewport={}x{} vs_cbs=0x{:X} vc2={} vc3={} vbs={}/{}/{}/{} strides={}/{}/{}/{} ib={} indexed={} indices={} vertices={} instances={} first_instance={}",
-                                                          cb_luma_global_settings.FrameIndex, line_index, static_cast<void*>(native_device_context), native_device_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED, pass,
-                                                          original_shader_hashes.vertex_shaders[0], original_shader_hashes.pixel_shaders[0], rt_count, int(rt0_desc.Format), rt0_size.x, rt0_size.y, static_cast<void*>(dsv.get()),
-                                                          bool(depth_desc.DepthEnable), depth_write, int(depth_desc.DepthFunc), bool(depth_desc.StencilEnable), bool(blend_desc.RenderTarget[0].BlendEnable), bool(blend_desc.IndependentBlendEnable), bool(blend_desc.AlphaToCoverageEnable), viewport.Width, viewport.Height, vs_cb_mask,
-                                                          static_cast<void*>(vs_cbs[object_constants_slot].get()), static_cast<void*>(vs_cbs[bone_constants_slot].get()),
-                                                          static_cast<void*>(vbs[0].get()), static_cast<void*>(vbs[1].get()), static_cast<void*>(vbs[2].get()), static_cast<void*>(vbs[3].get()), vb_strides[0], vb_strides[1], vb_strides[2], vb_strides[3],
-                                                          static_cast<void*>(ib.get()), draw.indexed, draw.index_count, draw.vertex_count, draw.instance_count, draw.first_instance)
-                                                          .c_str());
-
-      // vc2: projTM rows c0-c3, eyePos c4, objTM rows c16-c18 (translation in .w)
-      if (object_constants.size() >= 19 * 16)
-      {
-         const auto* c = reinterpret_cast<const float (*)[4]>(object_constants.data());
-         reshade::log::message(reshade::log::level::info, std::format("[SR4 Probe] frame={} draw={} vc2: proj c0=({:.5g} {:.5g} {:.5g} {:.5g}) c1=({:.5g} {:.5g} {:.5g} {:.5g}) c2=({:.5g} {:.5g} {:.5g} {:.5g}) c3=({:.5g} {:.5g} {:.5g} {:.5g}) eye=({:.6g} {:.6g} {:.6g}) obj_t=({:.6g} {:.6g} {:.6g})",
-                                                             cb_luma_global_settings.FrameIndex, line_index, c[0][0], c[0][1], c[0][2], c[0][3], c[1][0], c[1][1], c[1][2], c[1][3], c[2][0], c[2][1], c[2][2], c[2][3], c[3][0], c[3][1], c[3][2], c[3][3],
-                                                             c[4][0], c[4][1], c[4][2], c[16][3], c[17][3], c[18][3])
-                                                             .c_str());
-      }
-      else if (vs_cbs[object_constants_slot])
-      {
-         reshade::log::message(reshade::log::level::info, std::format("[SR4 Probe] frame={} draw={} vc2: no CPU copy (not written in the probed frame)", cb_luma_global_settings.FrameIndex, line_index).c_str());
-      }
-
-      if (game_device_data->probe_dump.is_open())
-      {
-         const auto dump = [&](UINT slot, const std::vector<uint8_t>& constants)
-         {
-            if (constants.empty())
-               return;
-            game_device_data->probe_dump << line_index << ",0x" << std::format("{:08X}", original_shader_hashes.vertex_shaders[0]) << ",0x" << std::format("{:08X}", original_shader_hashes.pixel_shaders[0]) << ',' << pass << ",vc" << slot;
-            const float* values = reinterpret_cast<const float*>(constants.data());
-            for (size_t i = 0; i < constants.size() / sizeof(float); i++)
-               game_device_data->probe_dump << ',' << std::format("{:.7g}", values[i]);
-            game_device_data->probe_dump << '\n';
-         };
-         dump(object_constants_slot, object_constants);
-         dump(bone_constants_slot, bone_constants);
-      }
-   }
-
-   // Per buffer read as vc2, vc3 or an instance stream in the probed frame: how the game fills it. Then clears the probe.
-   static void LogProbeSummary(SaintsRowIVGameDeviceData* game_device_data)
-   {
-      const std::lock_guard lock(game_device_data->probe_mutex);
-      const auto log = [](const std::string& line)
-      { reshade::log::message(reshade::log::level::info, line.c_str()); };
-      uint32_t object_buffers = 0, bone_buffers = 0, instance_buffers = 0, rewritten_instance_buffers = 0;
-      for (const auto& [handle, buffer] : game_device_data->probe_buffers)
-      {
-         if (buffer.object_draws == 0 && buffer.bone_draws == 0 && buffer.instance_draws == 0)
-            continue;
-         object_buffers += buffer.object_draws != 0;
-         bone_buffers += buffer.bone_draws != 0;
-         instance_buffers += buffer.instance_draws != 0;
-         const uint32_t writes = buffer.maps[2] + buffer.maps[3] + buffer.maps[4] + buffer.updates;
-         rewritten_instance_buffers += buffer.instance_draws != 0 && writes != 0;
-         // Static instance streams are many and identical in shape: only the rewritten ones get a line
-         if (buffer.object_draws == 0 && buffer.bone_draws == 0 && writes == 0)
-            continue;
-         log(std::format("[SR4 Probe] buffer={} bytes={} usage={} cpu_access=0x{:X} bind=0x{:X} vc2_draws={} vc3_draws={} instance_draws={} maps(ro/wo/rw/discard)={}/{}/{}/{} updates={} cpu_copy={}",
-            reinterpret_cast<void*>(handle), buffer.desc.ByteWidth, int(buffer.desc.Usage), buffer.desc.CPUAccessFlags, buffer.desc.BindFlags, buffer.object_draws, buffer.bone_draws, buffer.instance_draws,
-            buffer.maps[1], buffer.maps[2], buffer.maps[3], buffer.maps[4], buffer.updates, !buffer.shadow.empty()));
-      }
-      std::string passes;
-      for (const auto& [pass, draws] : game_device_data->probe_pass_draws)
-         passes += std::format(" {}={}", pass, draws);
-      log(std::format("[SR4 Probe] summary: draws={}{} vc2_buffers={} vc3_buffers={} instance_buffers={} rewritten_instance_buffers={} buffers_touched={} map_events={} update_events={}",
-         game_device_data->probe_draws, passes, object_buffers, bone_buffers, instance_buffers, rewritten_instance_buffers, game_device_data->probe_buffers.size(), game_device_data->probe_map_events, game_device_data->probe_update_events));
-      game_device_data->probe_buffers.clear();
-      game_device_data->probe_pass_draws.clear();
-      game_device_data->probe_draws = 0;
-      game_device_data->probe_map_events = 0;
-      game_device_data->probe_update_events = 0;
-      game_device_data->probe_dump.close();
-   }
-#endif
-
 public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
@@ -2512,21 +2234,6 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
 #if DEVELOPMENT
-      if (game_device_data.probe_mode != ProbeRequest::None && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
-         LogProbeDraw(native_device_context, &game_device_data, original_shader_hashes);
-      // Render scale: mesh draws into the output sized depth after the scene was ended this frame (the upscaler ran before them),
-      // logged at present once per ending shader (see "g_late_scene_draws")
-      if (g_scene_ended_this_frame && GetSubRectScale(device_data) < 1.f && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
-      {
-         com_ptr<ID3D11DepthStencilView> dsv;
-         native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
-         uint4 depth_size = {};
-         DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
-         if (dsv)
-            GetResourceInfo(dsv.get(), depth_size, depth_format);
-         if (depth_size.x == device_data.output_resolution.x && depth_size.y == device_data.output_resolution.y && g_late_scene_draws++ == 0)
-            g_first_late_scene_draw = (uint64_t(uint32_t(original_shader_hashes.vertex_shaders[0])) << 32) | pixel_shader_hash;
-      }
 #endif
       // The alpha test materials count as custom (Core flags their A2C patch clone), but draw with the game's shader outside of MSAA
       if (game_device_data.mv_active && (!is_custom_pass || alpha_test_material_pixel_shaders.contains(pixel_shader_hash)) && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
@@ -2594,9 +2301,6 @@ public:
             if (!game_device_data.mv_frame_ended)
             {
 #if DEVELOPMENT
-               game_device_data.mv_frame_end_shader = pixel_shader_hash;
-               g_scene_ended_this_frame = true;
-               g_late_scene_draws = 0;
                auto* const perf_queries = game_device_data.perf_frame_queries;
                if (perf_queries && perf_queries->scene_started && !perf_queries->scene)
                {
@@ -2634,11 +2338,6 @@ public:
             if (!scene_was_open && game_device_data.mv_scene_open)
                ScaleSceneViewport(native_device_context, device_data, &original_shader_hashes);
             const bool jittered = motion_vectors || DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv.get());
-#if DEVELOPMENT
-            // The path the probed draw (the line logged just before) actually took
-            if (game_device_data.probe_mode != ProbeRequest::None && game_device_data.probe_draws <= probe_max_draw_lines)
-               reshade::log::message(reshade::log::level::info, std::format("[SR4 Probe] draw={} path={} scene_open={} jitter={},{}", game_device_data.probe_draws - 1, motion_vectors ? "mv" : (jittered ? "jitter" : "none"), game_device_data.mv_scene_open, game_device_data.mv_jitter[0], game_device_data.mv_jitter[1]).c_str());
-#endif
             if (jittered)
                return DrawOrDispatchOverrideType::Replaced;
          }
@@ -2976,10 +2675,6 @@ public:
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
       reshade::register_event<reshade::addon_event::bind_scissor_rects>(OnBindScissorRects);
-#if DEVELOPMENT
-      reshade::register_event<reshade::addon_event::update_buffer_region>(OnProbeUpdateBufferRegion);
-      reshade::register_event<reshade::addon_event::update_buffer_region_command>(OnProbeUpdateBufferRegionCommand);
-#endif
    }
 
    static void UnregisterEvents()
@@ -2991,10 +2686,6 @@ public:
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::bind_viewports>(OnBindViewports);
       reshade::unregister_event<reshade::addon_event::bind_scissor_rects>(OnBindScissorRects);
-#if DEVELOPMENT
-      reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnProbeUpdateBufferRegion);
-      reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(OnProbeUpdateBufferRegionCommand);
-#endif
    }
 
    void LoadConfigs() override
@@ -3314,19 +3005,6 @@ public:
             }
          }
       }
-      // The probe covers the draws between this present and the next, summarized at that next present
-      const ProbeRequest probe_request = g_probe_request.exchange(ProbeRequest::None);
-      if (game_device_data.probe_mode.exchange(probe_request) != ProbeRequest::None)
-         LogProbeSummary(&game_device_data);
-      if (probe_request == ProbeRequest::LogAndDump)
-      {
-         const std::filesystem::path dump_path = System::GetModulePath().parent_path() / std::format("Luma_SR4_Probe_{}.csv", cb_luma_global_settings.FrameIndex);
-         const std::lock_guard lock(game_device_data.probe_mutex);
-         game_device_data.probe_dump.open(dump_path);
-         game_device_data.probe_dump << "draw,vs,ps,pass,slot,c0.x...\n";
-         reshade::log::message(game_device_data.probe_dump.is_open() ? reshade::log::level::info : reshade::log::level::warning, std::format("[SR4 Probe] constants dump {}", dump_path.string()).c_str());
-      }
-
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels
       {
          const std::shared_lock lock(game_device_data.mv_mutex);
@@ -3350,12 +3028,6 @@ public:
       g_finals_last_frame = std::exchange(g_finals_this_frame, 0);
       g_pixel_steps_overrides_last_frame = std::exchange(g_pixel_steps_overrides_this_frame, 0);
       g_sub_rect_draws_last_frame = std::exchange(g_sub_rect_draws_this_frame, 0);
-      if (std::exchange(g_scene_ended_this_frame, false) && g_late_scene_draws != 0)
-      {
-         static std::set<std::pair<uint32_t, uint64_t>> logged;
-         if (logged.insert({game_device_data.mv_frame_end_shader, g_first_late_scene_draw}).second)
-            reshade::log::message(reshade::log::level::warning, std::format("[SR4 SubRect] scene ended by ps 0x{:08X} before {} draws into the output sized depth (first vs 0x{:08X} ps 0x{:08X})", game_device_data.mv_frame_end_shader, g_late_scene_draws, uint32_t(g_first_late_scene_draw >> 32), uint32_t(g_first_late_scene_draw)).c_str());
-      }
 #endif
    }
 
@@ -3390,15 +3062,6 @@ public:
          ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");
       // With MV Enable and no upscaler, "Render Scale (%)" leaves the scene in the corner
       ImGui::Text("IR_Pixel_Steps overrides last frame: %u, sub-rect draws: %u", g_pixel_steps_overrides_last_frame, g_sub_rect_draws_last_frame);
-      if (ImGui::Button("Log Frame Probe"))
-         g_probe_request = ProbeRequest::Log;
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Logs the next frame's draws to ReShade.log (pass, targets, depth and blend state, VS vc2/vc3 bindings with projTM,\neyePos and objTM translation, vertex buffers, draw arguments; up to %u lines), then per vc2/vc3/instance buffer\nhow the game fills it (maps by type, updates). Use it in gameplay.", probe_max_draw_lines);
-      ImGui::SameLine();
-      if (ImGui::Button("Log Frame Probe + Dump Constants"))
-         g_probe_request = ProbeRequest::LogAndDump;
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("The same, and every draw's full vc2 / vc3 contents (as written this frame) to Luma_SR4_Probe_<frame>.csv\nnext to the executable (one row per draw and buffer).");
 
       ImGui::SeparatorText("Performance");
       const std::string sweep_label = std::format("Sweep ({}/{})", game_device_data.perf_sweep_step + 1, perf_sweep_rounds * std::size(perf_sweep_modes));
