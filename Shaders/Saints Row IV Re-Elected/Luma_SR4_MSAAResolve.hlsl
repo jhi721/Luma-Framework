@@ -31,8 +31,8 @@ float4 main(float4 pos : SV_Position) : SV_Target0
    for (uint i = 0; i < sampleCount; i++)
    {
       const float4 color = sceneMS.Load(int2(pos.xy), i);
-      // An all-ones exponent is NaN or Inf: one of either would poison the whole pixel, so the sample is dropped.
-      if (any((asuint(color) & 0x7F800000) == 0x7F800000))
+      // A NaN or Inf would poison the whole pixel, so the sample is dropped.
+      if (IsAnyNaN_Strict(color) || any(IsInfinite_Strict(color.rgb)) || IsInfinite_Strict(color.a))
          continue;
       const float weight = rcp(1.0 + max3(max(color.rgb, 0.0) * Tint_color.rgb));
       weightedColor += color.rgb * weight;

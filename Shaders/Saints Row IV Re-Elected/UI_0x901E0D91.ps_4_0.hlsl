@@ -1,6 +1,6 @@
 // rl_prim_2d_tex_s_01: the textured vint UI (HUD, menus). Vanilla drew it onto the 8-bit UNORM swapchain, which clamped its output
 // to [0,1] before blending; Luma's is FP16, where a tint above 1 (hud_btnmash.lua passes 255) or an additive element went on
-// unclamped. The output is saturated as the UNORM target did; the rest is the original.
+// unclamped. The output is clamped to [0,1] as the UNORM target did; the rest is the original.
 
 cbuffer vc1 : register(b1)
 {

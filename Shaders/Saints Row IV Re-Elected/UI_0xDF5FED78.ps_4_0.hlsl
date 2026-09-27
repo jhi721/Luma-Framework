@@ -1,5 +1,5 @@
 // rl_prim_2d_s_01: the untextured vint UI (solid rects, fades). Vanilla drew it onto the 8-bit UNORM swapchain, which clamped its
-// output to [0,1] before blending; the output is saturated as that target did (see "UI_0x901E0D91.ps_4_0.hlsl").
+// output to [0,1] before blending; the output is clamped to [0,1] as that target did (see "UI_0x901E0D91.ps_4_0.hlsl").
 
 cbuffer vc4 : register(b4)
 {

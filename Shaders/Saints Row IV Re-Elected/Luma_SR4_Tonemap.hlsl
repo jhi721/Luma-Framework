@@ -143,7 +143,7 @@ float4 SR4_Output(float3 vanillaLinear, float recoveryGain, float2 uv, float alp
 #endif
 }
 
-// HDR brightness recovery: how much brighter the clamped vanilla output gets, one scalar for all channels.
+// HDR recovery gain: how much brighter the clamped vanilla output gets, one scalar for all channels.
 // Onset in u, the curve's own input. F'(p) = 1.5(1 - p^2), and the tangent's intercept F(p) - p F'(p) = p^3 is positive
 // while F'' = -3u < 0, so every pivot in (0, 1) extends above the curve and the gain is >= 1. With no inflection the
 // pivot only sets brightness, lower is brighter up to the u -> 0 limit (SDR white 1.5x). Scene mid-gray 0.18, u 0.121,

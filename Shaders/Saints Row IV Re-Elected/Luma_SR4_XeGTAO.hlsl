@@ -63,7 +63,7 @@ cbuffer LumaGTAO : register(b9)
 #endif
 
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.5 // Intel default, metres (near plane 0.15). The native AO reaches only 5-10 cm near the camera and grows with distance through a 1.5%-of-screen floor, so there is no radius to anchor to; with FINAL_VALUE_POWER 2.2 this matched the native coverage and mean darkening in a lit interior. RadiusOverrideRT > 0 wins.
+#define EFFECT_RADIUS 0.5 // Intel default, metres (near plane 0.15). The native AO reaches only 5-10 cm near the camera and grows with distance through a 1.5%-of-screen floor, so there is no radius to anchor to; with FinalValuePowerRT 2.2 this matched the native coverage and mean darkening in a lit interior. RadiusOverrideRT > 0 wins.
 #endif
 
 #ifndef RADIUS_MULTIPLIER
@@ -80,10 +80,6 @@ cbuffer LumaGTAO : register(b9)
 
 #ifndef THIN_OCCLUDER_COMPENSATION
 #define THIN_OCCLUDER_COMPENSATION 0.0 // Default 0.0; > 0 causes more mistakes than it fixes on big geometry
-#endif
-
-#ifndef FINAL_VALUE_POWER
-#define FINAL_VALUE_POWER 2.2 // Default 2.2; shadow default for FinalValuePowerRT (the CB value is what actually applies)
 #endif
 
 #ifndef DEPTH_MIP_SAMPLING_OFFSET

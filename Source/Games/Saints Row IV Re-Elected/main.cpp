@@ -97,9 +97,9 @@ namespace
       return (has(names) && ...);
    }
 
-   // Snapshots the pixel shader cbuffer bound at `slot` into `copy`, on the GPU. The game re-uploads the same vc0 / vc4
+   // Snapshots the pixel shader cbuffer bound at `slot` into `*copy`, on the GPU. The game re-uploads the same vc0 / vc4
    // buffers for every pass, so a later pass sees an earlier pass's constants only through a copy.
-   void CopyBoundPSConstantBuffer(ID3D11Device* device, ID3D11DeviceContext* device_context, UINT slot, com_ptr<ID3D11Buffer>& copy)
+   void CopyBoundPSConstantBuffer(ID3D11Device* device, ID3D11DeviceContext* device_context, UINT slot, com_ptr<ID3D11Buffer>* copy)
    {
       com_ptr<ID3D11Buffer> cb;
       device_context->PSGetConstantBuffers(slot, 1, &cb);
@@ -108,21 +108,21 @@ namespace
       D3D11_BUFFER_DESC cb_desc;
       cb->GetDesc(&cb_desc);
       D3D11_BUFFER_DESC copy_desc = {};
-      if (copy)
-         copy->GetDesc(&copy_desc);
+      if (*copy)
+         (*copy)->GetDesc(&copy_desc);
       if (copy_desc.ByteWidth != cb_desc.ByteWidth)
       {
-         copy.reset();
+         copy->reset();
          copy_desc = cb_desc;
          copy_desc.Usage = D3D11_USAGE_DEFAULT;
          copy_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
          copy_desc.CPUAccessFlags = 0;
          copy_desc.MiscFlags = 0;
          copy_desc.StructureByteStride = 0;
-         device->CreateBuffer(&copy_desc, nullptr, &copy);
+         device->CreateBuffer(&copy_desc, nullptr, &*copy);
       }
-      if (copy)
-         device_context->CopyResource(copy.get(), cb.get());
+      if (*copy)
+         device_context->CopyResource(copy->get(), cb.get());
    }
 
    // The frame's first rl_downsample_02 is the quarter-res brightpass source (16-tap box * its vc4 Tint_color, b6).
@@ -2059,7 +2059,7 @@ public:
          }
       }
 
-      // Predication depth: the final composite's own depth input (t5, the R24 main-pass depth the DoF weight reads).
+      // Predication depth: the final composite's own depth input (t5, the frame depth the DoF weight reads, R24).
       // Anything else (another format or size, or nothing bound) falls back to plain ULTRA.
       com_ptr<ID3D11ShaderResourceView> depth_srv;
       bool predication_available = smaa && game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, "SR4 SMAA Predication CS"_h);
@@ -2426,19 +2426,19 @@ public:
       {
          if (pixel_shader_hash == bloom_brightpass_pixel_shader)
          {
-            CopyBoundPSConstantBuffer(native_device, native_device_context, 0, game_device_data.bloom_brightpass_vc0_cb);
-            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.bloom_brightpass_vc4_cb);
+            CopyBoundPSConstantBuffer(native_device, native_device_context, 0, std::addressof(game_device_data.bloom_brightpass_vc0_cb));
+            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, std::addressof(game_device_data.bloom_brightpass_vc4_cb));
             return DrawOrDispatchOverrideType::None;
          }
          if (pixel_shader_hash == bloom_combine_pixel_shader)
          {
-            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.bloom_combine_vc4_cb);
+            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, std::addressof(game_device_data.bloom_combine_vc4_cb));
             return DrawOrDispatchOverrideType::None;
          }
          if (!game_device_data.bloom_source_downsampled && pixel_shader_hash == downsample_pixel_shader)
          {
             game_device_data.bloom_source_downsampled = true;
-            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.bloom_source_downsample_vc4_cb);
+            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, std::addressof(game_device_data.bloom_source_downsample_vc4_cb));
             return DrawOrDispatchOverrideType::None;
          }
       }
@@ -2475,7 +2475,7 @@ public:
          g_finals_this_frame++;
 #endif
          if (g_luma_msaa_enable) // only the weighted resolve reads it
-            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, game_device_data.composite_tint_cb);
+            CopyBoundPSConstantBuffer(native_device, native_device_context, 4, std::addressof(game_device_data.composite_tint_cb));
 
          // Luma bloom from the final's own scene input (t0), bound over the game's Final_bloom (t6). The native chain
          // still runs and is simply not read. The prefilter replays the native brightpass and combine on their own
@@ -3169,7 +3169,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Saints Row IV: Re-Elected\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, HDR bloom and SMAA anti-aliasing, and replaces the game's SSAO with XeGTAO.\n"
+         "It adds HDR, DLSS or FSR 3 upscaling and native anti-aliasing (DLAA), HDR bloom and SMAA anti-aliasing, and replaces the game's SSAO with XeGTAO.\n"
          "Set Ambient Occlusion to Medium or High in the game's display settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -3211,7 +3211,8 @@ public:
                   "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
-                  "\nAMD FidelityFX (RCAS)");
+                  "\nAMD FidelityFX (RCAS + FSR 3)"
+                  "\nNVIDIA NGX (DLSS)");
    }
 };
 

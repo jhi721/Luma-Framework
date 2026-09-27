@@ -1,6 +1,7 @@
-// rl_bokeh_cs_00: spawns a bokeh sprite (drawn additively by rl_bokeh_sprite_01/02) where a pixel is brighter than its
-// ring. It reads the copy of the final composite, which was 8-bit UNORM in vanilla. The HDR output goes above 1, and the
-// sprite color grows with the brightness excess over the threshold times the brightness itself, so peaks went past 10k nits.
+// rl_bokeh_cs_00: spawns a bokeh sprite (drawn additively by rl_bokeh_sprite_01/02) where a pixel's luma (the 0.21 / 0.72 / 0.07
+// sum of the gamma-encoded composite) stands out from its ring. It reads the copy of the final composite, which was 8-bit UNORM in
+// vanilla. The HDR output goes above 1, and the sprite color grows with the luma excess over the threshold times the color itself,
+// so peaks went past 10k nits.
 // Each read is clamped to the vanilla range; the rest is the original.
 
 cbuffer CSConstants : register(b0)
