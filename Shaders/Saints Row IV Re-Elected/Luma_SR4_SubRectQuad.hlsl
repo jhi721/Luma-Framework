@@ -54,3 +54,21 @@ float depth_upscale_ps(float4 position : SV_Position) : SV_Depth
 {
    return scene_depth.Load(int3(position.xy * uv_scale, 0));
 }
+
+// The scene color in the sub-rect stretched over the full target (bilinear, clamped to the sub-rect): a frame without the upscaler
+// under the render scale (main.cpp "ResolveScene"), so post never reads the scene in the corner
+Texture2D<float4> scene_color : register(t0);
+
+float4 color_upscale_ps(float4 position : SV_Position) : SV_Target
+{
+   uint2 size;
+   scene_color.GetDimensions(size.x, size.y);
+   const int2 last = int2(round(uv_scale * size)) - 1;
+   const float2 texel = position.xy * uv_scale - 0.5;
+   const int2 base = int2(floor(texel));
+   const float2 weight = texel - base;
+   const int2 a = clamp(base, 0, last), b = clamp(base + 1, 0, last);
+   const float4 top = lerp(scene_color.Load(int3(a.x, a.y, 0)), scene_color.Load(int3(b.x, a.y, 0)), weight.x);
+   const float4 bottom = lerp(scene_color.Load(int3(a.x, b.y, 0)), scene_color.Load(int3(b.x, b.y, 0)), weight.x);
+   return lerp(top, bottom, weight.y);
+}

@@ -431,7 +431,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    // The game resolved an MSAA scene this frame / last frame (its Anti-Aliasing display setting)
    bool msaa_scene_resolved = false;
    bool msaa_scene = false;
-   // "DrawSuperResolution" made a new upscaler output texture (see there)
+   // "DrawUpscaler" made a new upscaler output texture (see there)
    bool sr_output_recreated = false;
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the draws
    bool sr_active = false;
@@ -576,6 +576,10 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> sub_rect_depth_copy_srv;
    com_ptr<ID3D11DepthStencilView> sub_rect_depth_dsv;
    com_ptr<ID3D11DepthStencilState> sub_rect_depth_write_state;
+   // A frame without the upscaler under the sub-rect (see "ResolveScene"): a copy of the scene to read and a view to write it
+   com_ptr<ID3D11Texture2D> sub_rect_color_copy;
+   com_ptr<ID3D11ShaderResourceView> sub_rect_color_copy_srv;
+   com_ptr<ID3D11RenderTargetView> sub_rect_scene_rtv;
    // The frame's camera (vc2 projTM of its first draw) and the previous frame's
    std::array<float, 16> mv_camera = {};
    std::array<float, 16> mv_previous_camera = {};
@@ -1471,39 +1475,21 @@ class SaintsRowIV final : public Game
       return true;
    }
 
-   // DLSS / FSR at native resolution on the jittered scene, before its first post pass (immediate context): that pass's t0 (the
-   // material target's copy, with the forward draws), the G-buffer depth and the motion vectors. The result goes back into t0.
-   static void DrawSuperResolution(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   // DLSS / FSR at native resolution on the jittered scene (the post scene, see "ResolveScene"), the G-buffer depth and the motion
+   // vectors; the result goes back into the scene. False if it didn't draw (missing input, or the upscaler failed).
+   static bool DrawUpscaler(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11Texture2D* scene, const D3D11_TEXTURE2D_DESC& scene_desc, ID3D11Resource* depth, uint32_t render_width, uint32_t render_height)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
-      // The post scene: this frame's copy of the material target, else the pass's t0 (the downsample reads the scene there, the god
-      // rays mask, first when the sun is in view, reads the depth)
-      com_ptr<ID3D11Resource> scene_resource;
-      if (game_device_data.mv_scene_copy_dest && game_device_data.mv_scene_copy_source == uint64_t(game_device_data.mv_scene_color.get()))
-      {
-         scene_resource = reinterpret_cast<ID3D11Resource*>(game_device_data.mv_scene_copy_dest);
-      }
-      else
-      {
-         com_ptr<ID3D11ShaderResourceView> scene_srv;
-         native_device_context->PSGetShaderResources(0, 1, &scene_srv);
-         if (scene_srv)
-            scene_srv->GetResource(&scene_resource);
-      }
-      com_ptr<ID3D11Texture2D> scene;
-      if (!scene_resource || FAILED(scene_resource->QueryInterface(&scene)) || !game_device_data.mv_texture || !game_device_data.mv_frame_depth || !game_device_data.mv_camera_valid)
-         return;
-      D3D11_TEXTURE2D_DESC scene_desc, mv_desc;
-      scene->GetDesc(&scene_desc);
+      if (!game_device_data.mv_texture || !game_device_data.mv_camera_valid)
+         return false;
+      D3D11_TEXTURE2D_DESC mv_desc;
       game_device_data.mv_texture->GetDesc(&mv_desc);
-      if ((scene_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && scene_desc.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS) || scene_desc.SampleDesc.Count != 1 || scene_desc.Width != mv_desc.Width || scene_desc.Height != mv_desc.Height)
-         return;
-      com_ptr<ID3D11Resource> depth;
-      game_device_data.mv_frame_depth->GetResource(&depth);
+      if (scene_desc.Width != mv_desc.Width || scene_desc.Height != mv_desc.Height)
+         return false;
       // None when "Super Resolution" changed after present (see "IsSRActive"): no output texture is made for it
       SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
       if (!sr_instance_data)
-         return;
+         return false;
 
       D3D11_TEXTURE2D_DESC output_desc = {};
       if (device_data.sr_output_color)
@@ -1516,7 +1502,7 @@ class SaintsRowIV final : public Game
          game_device_data.sr_output_recreated = true;
       }
       if (!device_data.sr_output_color)
-         return;
+         return false;
 
       // FSR needs the camera (DLSS ignores it). projTM (vc2 c0-c3) is a column vector view projection with absolute world
       // translation: row 1 = the up axis / tan(fov / 2), row 3 = the view depth axis, row 2 = A * row 3 + B (w), with
@@ -1533,17 +1519,6 @@ class SaintsRowIV final : public Game
       // sets FFX_FSR3_ENABLE_DEPTH_INFINITE only with inverted depth, a separate infinite far flag in SR::SettingsData would drop it
       const double far_plane = (a > 1.0 && b / (1.0 - a) > near_plane) ? b / (1.0 - a) : 100000.0;
       const double vert_fov = length3(up) > 0.0 ? 2.0 * std::atan(1.0 / length3(up)) : 0.0;
-
-      // The top-left render sub-rect under the render scale, else the whole scene
-      const uint32_t render_width = (std::min)(game_device_data.mv_render_size[0], scene_desc.Width);
-      const uint32_t render_height = (std::min)(game_device_data.mv_render_size[1], scene_desc.Height);
-      if (render_width == 0 || render_height == 0)
-         return;
-
-      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-      DrawStateStack<DrawStateStackType::Compute> compute_state;
-      graphics_state.Cache(native_device_context, device_data.uav_max_count);
-      compute_state.Cache(native_device_context, device_data.uav_max_count);
 
       SR::SettingsData settings_data;
       settings_data.output_width = scene_desc.Width;
@@ -1562,10 +1537,10 @@ class SaintsRowIV final : public Game
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
       SR::SuperResolutionImpl::DrawData draw_data;
-      draw_data.source_color = scene.get();
+      draw_data.source_color = scene;
       draw_data.output_color = device_data.sr_output_color.get();
       draw_data.motion_vectors = game_device_data.mv_texture.get();
-      draw_data.depth_buffer = depth.get();
+      draw_data.depth_buffer = depth;
       draw_data.render_width = render_width;
       draw_data.render_height = render_height;
       // As applied (pixels, +y down)
@@ -1579,24 +1554,121 @@ class SaintsRowIV final : public Game
          draw_data.near_plane = float(near_plane);
          draw_data.far_plane = float(far_plane);
       }
-      if (sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data))
+      if (!sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data))
       {
-         native_device_context->CopySubresourceRegion(scene.get(), 0, 0, 0, 0, device_data.sr_output_color.get(), 0, nullptr);
-         // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame shows
-         // the texture's stale memory until its feature is created again after a draw (a preset change fixed it, a new feature before the
-         // first draw didn't). Settings changed once here force that at the next frame's "UpdateSettings".
-         if (std::exchange(game_device_data.sr_output_recreated, false) && device_data.sr_type == SR::Type::DLSS)
+         // Back to SMAA until the upscaler is picked again
+         device_data.sr_suppressed = true;
+         return false;
+      }
+      native_device_context->CopySubresourceRegion(scene, 0, 0, 0, 0, device_data.sr_output_color.get(), 0, nullptr);
+      // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame shows
+      // the texture's stale memory until its feature is created again after a draw (a preset change fixed it, a new feature before the
+      // first draw didn't). Settings changed once here force that at the next frame's "UpdateSettings".
+      if (std::exchange(game_device_data.sr_output_recreated, false) && device_data.sr_type == SR::Type::DLSS)
+      {
+         SR::SettingsData throwaway_settings_data = settings_data;
+         throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
+         sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
+      }
+      device_data.has_drawn_sr = true;
+      device_data.render_resolution = {float(render_width), float(render_height)};
+      return true;
+   }
+
+   // The scene post reads, before its first pass (immediate context): that pass's t0 (the material target's copy, with the forward
+   // draws) upscaled by DLSS / FSR ("DrawUpscaler"); under the render scale's sub-rect without it (the upscaler skipped this frame, or
+   // "MV Enable" without one), stretched over the target instead. Then the depths post reads, resampled over the target.
+   static void ResolveScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      // The post scene: this frame's copy of the material target, else the pass's t0 (the downsample reads the scene there, the god
+      // rays mask, first when the sun is in view, reads the depth)
+      com_ptr<ID3D11Resource> scene_resource;
+      if (game_device_data.mv_scene_copy_dest && game_device_data.mv_scene_copy_source == uint64_t(game_device_data.mv_scene_color.get()))
+      {
+         scene_resource = reinterpret_cast<ID3D11Resource*>(game_device_data.mv_scene_copy_dest);
+      }
+      else
+      {
+         com_ptr<ID3D11ShaderResourceView> scene_srv;
+         native_device_context->PSGetShaderResources(0, 1, &scene_srv);
+         if (scene_srv)
+            scene_srv->GetResource(&scene_resource);
+      }
+      com_ptr<ID3D11Texture2D> scene;
+      if (!scene_resource || FAILED(scene_resource->QueryInterface(&scene)))
+         return;
+      D3D11_TEXTURE2D_DESC scene_desc;
+      scene->GetDesc(&scene_desc);
+      // The top-left render sub-rect under the render scale, else the whole scene
+      const uint32_t render_width = (std::min)(game_device_data.mv_render_size[0], scene_desc.Width);
+      const uint32_t render_height = (std::min)(game_device_data.mv_render_size[1], scene_desc.Height);
+      if ((scene_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && scene_desc.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS) || scene_desc.SampleDesc.Count != 1 || render_width == 0 || render_height == 0)
+         return;
+      com_ptr<ID3D11Resource> depth;
+      if (game_device_data.mv_frame_depth)
+         game_device_data.mv_frame_depth->GetResource(&depth);
+
+      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+      DrawStateStack<DrawStateStackType::Compute> compute_state;
+      graphics_state.Cache(native_device_context, device_data.uav_max_count);
+      compute_state.Cache(native_device_context, device_data.uav_max_count);
+
+      const bool upscaled = IsSRActive(device_data) && depth && DrawUpscaler(native_device, native_device_context, device_data, scene.get(), scene_desc, depth.get(), render_width, render_height);
+      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      if ((render_width != scene_desc.Width || render_height != scene_desc.Height) && game_device_data.mv_jitter_buffer && HasShaders(device_data.native_vertex_shaders, "Copy VS"_h))
+      {
+         ID3D11Buffer* const sub_rect = game_device_data.mv_jitter_buffer.get();
+         const D3D11_VIEWPORT viewport = {0.f, 0.f, float(scene_desc.Width), float(scene_desc.Height), 0.f, 1.f};
+         // No upscaled scene: the sub-rect stretched (bilinear) over the target from a copy of it, so post never shows it in the corner
+         if (!upscaled && HasShaders(device_data.native_pixel_shaders, "SR4 Sub Rect Color Upscale PS"_h))
          {
-            SR::SettingsData throwaway_settings_data = settings_data;
-            throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
-            sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
+            D3D11_TEXTURE2D_DESC copy_desc = {};
+            if (game_device_data.sub_rect_color_copy)
+               game_device_data.sub_rect_color_copy->GetDesc(&copy_desc);
+            if (copy_desc.Width != scene_desc.Width || copy_desc.Height != scene_desc.Height || copy_desc.Format != scene_desc.Format)
+            {
+               game_device_data.sub_rect_color_copy.reset();
+               game_device_data.sub_rect_color_copy_srv.reset();
+               copy_desc = {scene_desc.Width, scene_desc.Height, 1, 1, scene_desc.Format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+               const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R16G16B16A16_FLOAT);
+               if (FAILED(native_device->CreateTexture2D(&copy_desc, nullptr, &game_device_data.sub_rect_color_copy)) || FAILED(native_device->CreateShaderResourceView(game_device_data.sub_rect_color_copy.get(), &srv_desc, &game_device_data.sub_rect_color_copy_srv)))
+                  game_device_data.sub_rect_color_copy.reset();
+            }
+            com_ptr<ID3D11Resource> rtv_resource;
+            if (game_device_data.sub_rect_scene_rtv)
+               game_device_data.sub_rect_scene_rtv->GetResource(&rtv_resource);
+            if (rtv_resource != scene_resource)
+            {
+               game_device_data.sub_rect_scene_rtv.reset();
+               const CD3D11_RENDER_TARGET_VIEW_DESC rtv_desc(D3D11_RTV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R16G16B16A16_FLOAT);
+               native_device->CreateRenderTargetView(scene.get(), &rtv_desc, &game_device_data.sub_rect_scene_rtv);
+            }
+            if (game_device_data.sub_rect_color_copy && game_device_data.sub_rect_scene_rtv)
+            {
+               // The scene is still bound for reading
+               ID3D11ShaderResourceView* const null_srv = nullptr;
+               native_device_context->PSSetShaderResources(0, 1, &null_srv);
+               native_device_context->CopyResource(game_device_data.sub_rect_color_copy.get(), scene.get());
+               ID3D11ShaderResourceView* const color_copy = game_device_data.sub_rect_color_copy_srv.get();
+               ID3D11RenderTargetView* const scene_rtv = game_device_data.sub_rect_scene_rtv.get();
+               native_device_context->OMSetRenderTargets(1, &scene_rtv, nullptr);
+               native_device_context->OMSetDepthStencilState(nullptr, 0);
+               native_device_context->OMSetBlendState(nullptr, nullptr, UINT_MAX);
+               native_device_context->RSSetState(nullptr);
+               native_device_context->RSSetViewports(1, &viewport);
+               native_device_context->IASetInputLayout(nullptr);
+               native_device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+               native_device_context->VSSetShader(device_data.native_vertex_shaders.at("Copy VS"_h).get(), nullptr, 0);
+               native_device_context->PSSetShader(device_data.native_pixel_shaders.at("SR4 Sub Rect Color Upscale PS"_h).get(), nullptr, 0);
+               native_device_context->PSSetShaderResources(0, 1, &color_copy);
+               native_device_context->PSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &sub_rect);
+               native_device_context->Draw(4, 0);
+            }
          }
-         device_data.has_drawn_sr = true;
-         device_data.render_resolution = {float(render_width), float(render_height)};
-         // Render scale: post (the final composite's DoF weight, t5) reads the frame depth over the full target, the scene drew it
-         // into the sub-rect: resampled (nearest) from a copy of it. The state stack below gives the game its state back.
-         const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-         if ((render_width != scene_desc.Width || render_height != scene_desc.Height) && game_device_data.mv_jitter_buffer && HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SR4 Sub Rect Depth Upscale PS"_h))
+         // Post (the final composite's DoF weight, t5) reads the frame depth over the full target, the scene drew it into the sub-rect:
+         // resampled (nearest) from a copy of it. The state stack below gives the game its state back.
+         if (depth && HasShaders(device_data.native_pixel_shaders, "SR4 Sub Rect Depth Upscale PS"_h))
          {
             com_ptr<ID3D11Texture2D> depth_texture;
             D3D11_TEXTURE2D_DESC depth_desc = {}, copy_desc = {};
@@ -1636,8 +1708,6 @@ class SaintsRowIV final : public Game
                native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
                native_device_context->CopyResource(game_device_data.sub_rect_depth_copy.get(), depth.get());
                ID3D11ShaderResourceView* const depth_copy = game_device_data.sub_rect_depth_copy_srv.get();
-               ID3D11Buffer* const sub_rect = game_device_data.mv_jitter_buffer.get();
-               const D3D11_VIEWPORT viewport = {0.f, 0.f, float(scene_desc.Width), float(scene_desc.Height), 0.f, 1.f};
                native_device_context->OMSetRenderTargets(0, nullptr, game_device_data.sub_rect_depth_dsv.get());
                native_device_context->OMSetDepthStencilState(game_device_data.sub_rect_depth_write_state.get(), 0);
                native_device_context->OMSetBlendState(nullptr, nullptr, UINT_MAX);
@@ -1670,11 +1740,6 @@ class SaintsRowIV final : public Game
                }
             }
          }
-      }
-      else
-      {
-         // Back to SMAA until the upscaler is picked again
-         device_data.sr_suppressed = true;
       }
       compute_state.Restore(native_device_context);
       graphics_state.Restore(native_device_context);
@@ -2308,8 +2373,8 @@ public:
                   perf_queries->scene = true;
                }
 #endif
-               if (IsSRActive(device_data))
-                  DrawSuperResolution(native_device, native_device_context, device_data);
+               if (IsSRActive(device_data) || GetSubRectScale(device_data) < 1.f)
+                  ResolveScene(native_device, native_device_context, device_data);
 #if DEVELOPMENT
                if (perf_queries && perf_queries->scene && !perf_queries->sr && device_data.has_drawn_sr)
                {
@@ -2657,6 +2722,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Light Unit Z VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "light_vs", {{"LIGHT_VIEW_RAY_UNIT_Z", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect SSAO VS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "ssao_vs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Depth Upscale PS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_upscale_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Sub Rect Color Upscale PS"), ShaderDefinition{"Luma_SR4_SubRectQuad", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "color_upscale_ps"});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 SMAA Linearize CS"), ShaderDefinition{"Luma_SR4_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 SMAA Predication CS"), ShaderDefinition{"Luma_SR4_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 Additive Limit PS"), ShaderDefinition{"Luma_SR4_BlendLimit", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "additive_limit_ps"});
@@ -3060,7 +3126,6 @@ public:
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");
-      // With MV Enable and no upscaler, "Render Scale (%)" leaves the scene in the corner
       ImGui::Text("IR_Pixel_Steps overrides last frame: %u, sub-rect draws: %u", g_pixel_steps_overrides_last_frame, g_sub_rect_draws_last_frame);
 
       ImGui::SeparatorText("Performance");
