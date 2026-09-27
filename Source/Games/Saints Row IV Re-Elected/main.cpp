@@ -2646,11 +2646,12 @@ public:
       if (input_scale == 0 || (depth_size.y + height / 2) / height != input_scale || normals_size.x != depth_size.x || normals_size.y != depth_size.y)
          return false;
       // Full resolution mode: every pass at the depth's size, averaged into the target at the end ("downsample_cs"). At half res the
-      // upscaler's jitter flips a target pixel's one depth texel between grass blades and the ground: the AO boils.
+      // upscaler's jitter flips a target pixel's one depth texel between grass blades and the ground: the AO boils. On with DLSS/FSR
+      // (+0.55 ms at 4K, DLSS K, "Performance Test" sweep).
 #if DEVELOPMENT
       const bool full_res = g_gtao_full_res ? g_gtao_full_res == 2 : IsSRActive(device_data);
 #else
-      constexpr bool full_res = false;
+      const bool full_res = IsSRActive(device_data);
 #endif
       const uint32_t work_width = full_res ? depth_size.x : width, work_height = full_res ? depth_size.y : height;
 
