@@ -193,8 +193,9 @@ namespace
 #if DEVELOPMENT
    bool g_mv_enable = false;
    bool g_mv_debug_view = false;
-   bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
-   bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
+   std::atomic<bool> g_sr_dump_request = false; // DEV: the upscaler's color, motion vectors and output to files, at its next draw
+   bool g_mv_force_jitter = false;              // The projection jitter without an upscaler
+   bool g_mv_disable_jitter = false;            // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
    // "Performance Test" (see "OnPresent"): the mode, and the anti-aliasing it sets while it runs (the user's is restored on "Off" or
    // "Current Settings", and never saved)
    int g_perf_test = 0;
@@ -462,6 +463,10 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    // The game resolved an MSAA scene this frame / last frame (its Anti-Aliasing display setting)
    bool msaa_scene_resolved = false;
    bool msaa_scene = false;
+   // "DrawSuperResolution" made a new upscaler output texture (see there)
+   bool sr_output_recreated = false;
+   // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the draws
+   bool sr_active = false;
 
    // GPU copies of the native bloom's constants, taken at their own draws earlier in the same frame: the brightpass vc0
    // (bound at b0 for the prefilter) and vc4 (b4), the combine vc4 (b5) and the source downsample vc4 (b6). Copied only
@@ -641,6 +646,8 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    // The whole target, read back a frame late: largest |motion vector| (UV) and the share of non zero pixels
    com_ptr<ID3D11Texture2D> mv_readback;
    bool mv_readback_pending = false;
+   // The upscaler's color, motion vectors and output, read back on its reset frames and every 60th (see "DrawSuperResolution")
+   com_ptr<ID3D11Texture2D> sr_check_textures[3];
    static constexpr const char* mv_reject_names[] = {"targets", "format", "size", "depth_size", "blend", "msaa", "outside_scene", "not_scene_color"};
    std::atomic<uint32_t> mv_rejects[std::size(mv_reject_names)] = {};
    std::atomic<uint64_t> mv_reject_examples[std::size(mv_reject_names)] = {};
@@ -812,10 +819,11 @@ class SaintsRowIV final : public Game
 #endif
 
    // An upscaler is picked, hasn't failed (it then gives way to SMAA until picked again) and the scene isn't the game's MSAA one (no
-   // motion vectors there: the upscaler steps aside while it lasts)
+   // motion vectors there: the upscaler steps aside while it lasts). Fixed for the whole frame (see "OnPresent"): a selection made
+   // after the render scale and the motion vector state were set would otherwise run the upscaler, XeGTAO and post on mixed state
    static bool IsSRActive(DeviceData& device_data)
    {
-      return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed && !GetGameDeviceData(device_data).msaa_scene;
+      return GetGameDeviceData(device_data).sr_active;
    }
 
    // The upscaling prototype's render scale, 1 when it's off (see "g_render_scale")
@@ -1697,6 +1705,7 @@ class SaintsRowIV final : public Game
          device_data.sr_output_color.reset();
          output_desc = {scene_desc.Width, scene_desc.Height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
          native_device->CreateTexture2D(&output_desc, nullptr, &device_data.sr_output_color);
+         game_device_data.sr_output_recreated = true;
       }
       SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
       if (!device_data.sr_output_color || !sr_instance_data)
@@ -1756,6 +1765,31 @@ class SaintsRowIV final : public Game
       draw_data.jitter_x = game_device_data.mv_jitter[0];
       draw_data.jitter_y = game_device_data.mv_jitter[1];
       draw_data.reset = device_data.force_reset_sr;
+#if DEVELOPMENT
+      // A non-finite input or output texel stays in the upscaler's history (a spreading black blob only a new feature clears):
+      // counted on its reset frames and every 60th, stalling that frame
+      const bool check_sr = draw_data.reset || cb_luma_global_settings.FrameIndex % 60 == 0 || g_sr_dump_request;
+      const auto stage = [&](com_ptr<ID3D11Texture2D>& staging, ID3D11Texture2D* source)
+      {
+         D3D11_TEXTURE2D_DESC desc, staging_desc = {};
+         source->GetDesc(&desc);
+         if (staging)
+            staging->GetDesc(&staging_desc);
+         if (staging_desc.Width != desc.Width || staging_desc.Height != desc.Height || staging_desc.Format != desc.Format)
+         {
+            staging.reset();
+            desc = {desc.Width, desc.Height, 1, 1, desc.Format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
+            native_device->CreateTexture2D(&desc, nullptr, &staging);
+         }
+         if (staging)
+            native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source, 0, nullptr);
+      };
+      if (check_sr)
+      {
+         stage(game_device_data.sr_check_textures[0], scene.get());
+         stage(game_device_data.sr_check_textures[1], game_device_data.mv_texture.get());
+      }
+#endif
       if (vert_fov > 0.0)
          draw_data.vert_fov = float(vert_fov);
       if (near_plane > 0.0)
@@ -1766,6 +1800,15 @@ class SaintsRowIV final : public Game
       if (sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data))
       {
          native_device_context->CopySubresourceRegion(scene.get(), 0, 0, 0, 0, device_data.sr_output_color.get(), 0, nullptr);
+         // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame shows
+         // the texture's stale memory until its feature is created again after a draw (a preset change fixed it, a new feature before the
+         // first draw didn't). Settings changed once here force that at the next frame's "UpdateSettings".
+         if (std::exchange(game_device_data.sr_output_recreated, false) && device_data.sr_type == SR::Type::DLSS)
+         {
+            SR::SettingsData throwaway_settings_data = settings_data;
+            throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
+            sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
+         }
          device_data.has_drawn_sr = true;
          device_data.render_resolution = {float(render_width), float(render_height)};
          // Upscaling prototype: post (the final composite's DoF weight, t5) reads the frame depth over the full target, the scene drew it
@@ -1858,6 +1901,72 @@ class SaintsRowIV final : public Game
 #endif
       }
 #if DEVELOPMENT
+      if (check_sr)
+      {
+         stage(game_device_data.sr_check_textures[2], device_data.sr_output_color.get());
+         // Texels with a non-finite rgb / xy, texels all zero, largest finite |value|, over the top-left width x height
+         struct Counts
+         {
+            size_t non_finite = 0, zero = 0;
+            float max_abs = 0.f;
+         };
+         // "Dump SR Textures": the whole staging texture, raw (8 bytes a texel, rows packed), named with its size and DXGI format
+         const bool dump = g_sr_dump_request.exchange(false);
+         const auto count = [&](ID3D11Texture2D* staging, UINT width, UINT height, const char* name)
+         {
+            Counts counts;
+            D3D11_TEXTURE2D_DESC desc;
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (!staging || FAILED(native_device_context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)))
+               return counts;
+            staging->GetDesc(&desc);
+            // RGBA16F or RG32F: 8 bytes a texel either way
+            const bool half = desc.Format != DXGI_FORMAT_R32G32_FLOAT;
+            width = (std::min)(width, desc.Width);
+            height = (std::min)(height, desc.Height);
+            if (dump)
+            {
+               std::ofstream file(System::GetModulePath().parent_path() / std::format("Luma_SR4_{}_{}x{}_f{}.bin", name, desc.Width, desc.Height, int(desc.Format)), std::ios::binary);
+               for (UINT y = 0; y < desc.Height; y++)
+                  file.write(static_cast<const char*>(mapped.pData) + y * mapped.RowPitch, std::streamsize(desc.Width) * 8);
+            }
+            for (UINT y = 0; y < height; y++)
+            {
+               const uint8_t* const row = static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+               for (UINT x = 0; x < width; x++)
+               {
+                  bool non_finite = false, zero = true;
+                  for (UINT c = 0; c < (half ? 3u : 2u); c++)
+                  {
+                     if (half)
+                     {
+                        uint16_t bits;
+                        std::memcpy(&bits, row + x * 8 + c * 2, sizeof(bits));
+                        non_finite |= (bits & 0x7C00) == 0x7C00;
+                        zero &= (bits & 0x7FFF) == 0;
+                     }
+                     else
+                     {
+                        float value;
+                        std::memcpy(&value, row + x * 8 + c * 4, sizeof(value));
+                        non_finite |= !std::isfinite(value);
+                        zero &= value == 0.f;
+                        if (std::isfinite(value))
+                           counts.max_abs = (std::max)(counts.max_abs, std::abs(value));
+                     }
+                  }
+                  counts.non_finite += non_finite;
+                  counts.zero += zero;
+               }
+            }
+            native_device_context->Unmap(staging, 0);
+            return counts;
+         };
+         const Counts color = count(game_device_data.sr_check_textures[0].get(), render_width, render_height, "color");
+         const Counts mv = count(game_device_data.sr_check_textures[1].get(), render_width, render_height, "mv");
+         const Counts output = count(game_device_data.sr_check_textures[2].get(), scene_desc.Width, scene_desc.Height, "output");
+         reshade::log::message(color.non_finite || mv.non_finite || output.non_finite ? reshade::log::level::warning : reshade::log::level::info, std::format("[SR4 SR] check{} {}x{} of {}x{}: color non-finite {} zero {}, mv non-finite {} zero {} max |uv| {:.3g}, output non-finite {} zero {}", draw_data.reset ? " (reset)" : "", render_width, render_height, scene_desc.Width, scene_desc.Height, color.non_finite, color.zero, mv.non_finite, mv.zero, mv.max_abs, output.non_finite, output.zero).c_str());
+      }
       if (cb_luma_global_settings.FrameIndex % 600 == 0)
          reshade::log::message(reshade::log::level::info, std::format("[SR4 SR] vert_fov {:.4g} deg, near {:.4g}, far {:.6g} (A {:.9g}), jitter {:.3f},{:.3f}, reset {}", vert_fov * 180.0 / 3.14159265358979, near_plane, far_plane, a, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset).c_str());
 #endif
@@ -3345,6 +3454,7 @@ public:
       device_data.has_drawn_sr = false;
       device_data.has_drawn_main_post_processing = false;
       game_device_data.msaa_scene = std::exchange(game_device_data.msaa_scene_resolved, false);
+      game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed && !game_device_data.msaa_scene;
       game_device_data.mv_active = IsSRActive(device_data) || g_mv_enable;
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before the G-buffer
       game_device_data.mv_scene_open = false;
@@ -3724,6 +3834,8 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("No projection jitter under DLSS/FSR (the upscaler gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
+      if (ImGui::Button("Dump SR Textures"))
+         g_sr_dump_request = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");
       // With MV Enable and no upscaler, "Render Scale (%)" leaves the scene in the corner
