@@ -87,7 +87,8 @@ $vcxproj = $vcxproj.FullName
 $useLumaFastNoise = Test-PropEnabled $vcxproj "UseLumaFastNoise"
 $useLumaDXP = Test-PropEnabled $vcxproj "UseLumaDXP"
 $useLumaNGX = Test-PropEnabled $vcxproj "UseLumaNGX"
-Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX"
+$useLumaSRBridge = Test-PropEnabled $vcxproj "UseLumaSRBridge"
+Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge"
 
 # Locate the addon. When packaging runs from the LumaPackage build target the
 # exact build output is passed in (-AddonPath = $(TargetPath)); standalone runs
@@ -145,7 +146,16 @@ try {
     $reshadeSrc = if ($Platform -eq "Win32") { Join-Path $repoRoot "Source\External\reshade\bin\Win32\Release\ReShade32.dll" }
                   else { Join-Path $repoRoot "Source\External\reshade\bin\x64\Release\ReShade64.dll" }
     if (Test-Path $reshadeSrc) { Copy-Item $reshadeSrc -Destination (Join-Path $tempDir "dxgi.dll") -Force }
-    if ($useLumaNGX) {
+    # The SR bridge's x64 helper (a Luma.sln project, built next to the Win32 addons), which also loads DLSS's dll
+    if ($useLumaSRBridge) {
+        $helperSrc = Join-Path $repoRoot "Binaries\Win32-$Config\sr_bridge_helper.exe"
+        if (-not (Test-Path $helperSrc)) {
+            Write-Error "SR bridge helper not found: $helperSrc (build the ""SR Bridge Helper"" project)"
+            exit 1
+        }
+        Copy-Item $helperSrc -Destination $tempDir -Force
+    }
+    if ($useLumaNGX -or $useLumaSRBridge) {
         $ngxSrc = Join-Path $repoRoot "Source\External\NGX\bin\dev\nvngx_dlss.dll"
         if ($Config -notlike "Development*") { $ngxSrc = Join-Path $repoRoot "Source\External\NGX\bin\rel\nvngx_dlss.dll" }
         if (Test-Path $ngxSrc) { Copy-Item $ngxSrc -Destination $tempDir -Force }
