@@ -1051,9 +1051,10 @@ class BorderlandsGoty final : public Game
          D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
          if (blend_state)
             blend_state->GetDesc(&blend_desc);
-         // Additive lights, decals and translucents keep the motion vectors of what's behind them
+         // Additive lights, decals and translucents keep the motion vectors of what's behind them, and so do draws that write no color
+         // (occlusion query bounding boxes: every blend state writes the motion vector target, see "OnCreateBlendState")
          const D3D11_RENDER_TARGET_BLEND_DESC& rt0_blend = blend_desc.RenderTarget[0];
-         game_device_data.mv_blend_opaque = !rt0_blend.BlendEnable || (rt0_blend.SrcBlend == D3D11_BLEND_ONE && rt0_blend.DestBlend == D3D11_BLEND_ZERO && rt0_blend.BlendOp == D3D11_BLEND_OP_ADD);
+         game_device_data.mv_blend_opaque = rt0_blend.RenderTargetWriteMask != 0 && (!rt0_blend.BlendEnable || (rt0_blend.SrcBlend == D3D11_BLEND_ONE && rt0_blend.DestBlend == D3D11_BLEND_ZERO && rt0_blend.BlendOp == D3D11_BLEND_OP_ADD));
          game_device_data.mv_blend_state = blend_state.get();
       }
       if (!game_device_data.mv_blend_opaque)
