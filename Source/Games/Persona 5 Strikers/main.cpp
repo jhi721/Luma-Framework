@@ -598,7 +598,12 @@ class Persona5Strikers final : public Game
       game_device_data.mv_jitter = jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{};
       // Pixels to NDC (y up)
       const float ndc_jitter[4] = {game_device_data.mv_jitter[0] * 2.f / float(depth_size.x), game_device_data.mv_jitter[1] * -2.f / float(depth_size.y), 0.f, 0.f};
-      PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter));
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
+      {
+         // No stale jitter on the scene draws either (its slot then reads 0), nor for the upscaler
+         game_device_data.mv_jitter = {};
+         game_device_data.mv_jitter_buffer.reset();
+      }
    }
 
    // A patched vertex shader's $Globals byte offsets, by original hash (none until patched)
