@@ -93,11 +93,15 @@
 #ifndef ENABLE_FIDELITY_SK
 #define ENABLE_FIDELITY_SK 0
 #endif // ENABLE_FIDELITY_SK
+// 32-bit only: DLSS and FSR through an x64 helper process (see "SRBridge.h")
+#ifndef ENABLE_SR_BRIDGE
+#define ENABLE_SR_BRIDGE 0
+#endif // ENABLE_SR_BRIDGE
 // Automatically define "ENABLE_SR" if any SR tech is enabled
 #ifdef ENABLE_SR
 #undef ENABLE_SR
 #endif // ENABLE_SR
-#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK)
+#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || (ENABLE_SR_BRIDGE && !defined(_WIN64))
 #define ENABLE_SR 1
 #else
 #define ENABLE_SR 0
@@ -172,6 +176,7 @@
 
 #include "dlss/DLSS.h" // see "ENABLE_NGX"
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
+#include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
 
 #include "includes/containers.h"
 #include "includes/globals.h"
@@ -16156,6 +16161,10 @@ void Init(bool async)
 #endif
 #if ENABLE_FIDELITY_SK
    sr_implementations[SR::Type::FSR] = std::make_unique<FidelityFX::FSR>();
+#endif
+#if ENABLE_SR_BRIDGE
+   sr_implementations[SR::Type::DLSS] = std::make_unique<SRBridge::Bridge>(SR::Type::DLSS);
+   sr_implementations[SR::Type::FSR] = std::make_unique<SRBridge::Bridge>(SR::Type::FSR);
 #endif
 
    // Load settings
