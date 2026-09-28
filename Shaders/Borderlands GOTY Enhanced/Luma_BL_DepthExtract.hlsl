@@ -1,22 +1,18 @@
-// Borderlands GOTY Enhanced — SMAA predication signal, ported from Medal of Honor: Airborne (which took it from
-// The Witcher 2). Replaces feeding the raw depth buffer straight into SMAA's predication.
+// SMAA predication signal in place of the raw depth buffer, ported from Medal of Honor: Airborne (which took it from The Witcher 2).
 //
-// This measures deviation from the local tangent plane, NOT depth. Depth itself cannot work: SMAA's predication is
-// a plain first difference between adjacent pixels, and on linear depth a plane's own per-pixel change grows as
-// z^2, so a distant floor seen edge-on moves more between neighbours than a nearby silhouette does - no monotonic
-// remap of z and no threshold fixes that ratio.
+// It measures deviation from the local tangent plane, not depth. Depth cannot work: SMAA's predication is a plain first difference
+// between adjacent pixels, and on linear depth a plane's own per-pixel change grows as z^2, so a distant floor seen edge-on moves
+// more between neighbours than a nearby silhouette does; no monotonic remap of z and no threshold fixes that ratio.
 //
-// The math is a slope-adjusted second difference with a depth-proportional tolerance, the same as
-// XeGTAO_CalculateEdges in Luma_BL_XeGTAO.hlsl (SVGF, Schied et al. 2017; Emil Persson 2009). Output is one-sided,
-// against the LEFT and TOP neighbours only, because SMAA compares centre-vs-left on one axis and centre-vs-top on
-// the other; a symmetric mask would read 1 on both sides of a silhouette and difference to 0 exactly where
-// predication must fire. Normalizing by centreZ makes it a unitless edge-ness in [0,1], so
-// SMAA_PREDICATION_THRESHOLD is simply 0.5 whatever the scale, FOV or resolution - tune P.x, not it.
+// The math is a slope-adjusted second difference with a depth-proportional tolerance, as XeGTAO_CalculateEdges in
+// Luma_BL_XeGTAO.hlsl (SVGF, Schied et al. 2017; Emil Persson 2009). The output is one-sided, against the left and top neighbours
+// only, because SMAA compares centre-vs-left on one axis and centre-vs-top on the other; a symmetric mask would read 1 on both sides
+// of a silhouette and difference to 0 exactly where predication must fire. Normalized by centreZ it is a unitless edge-ness in
+// [0,1], so SMAA_PREDICATION_THRESHOLD is 0.5 whatever the scale, FOV or resolution: tune P.x, not it.
 //
-// DIFFERENCE FROM MoH: this game hands us hardware d24, not a linear depth, so each tap is linearized first
-// through the game's own MinZ_MaxZRatio - the identical expression XeGTAO uses. DepthScaleRT is deliberately
-// NOT applied: the tolerance is a fraction of view depth, so a uniform divisor cancels out of the ratio and the
-// calibrated value carries across games unchanged.
+// Unlike MoH, the input is hardware D24, not linear depth: each tap is linearized through the game's own MinZ_MaxZRatio, the
+// expression XeGTAO uses. DepthScaleRT is not applied: the tolerance is a fraction of view depth, so a uniform divisor cancels out
+// of the ratio and the calibrated value carries across games.
 
 Texture2D<float4> depth : register(t0); // hardware d24 scene depth (r24_unorm_x8_uint view), non-reverse-Z
 RWTexture2D<float> uav : register(u0);  // R16_FLOAT predication signal (0 = on the local plane, 1 = edge)
@@ -63,6 +59,6 @@ float ViewDepthAt(int3 p)
    // noise at 200 m). Both terms are required - the slope adjustment alone degrades toward the vanishing point,
    // and a depth-proportional threshold alone cannot reject a grazing plane at all.
    const float tolerance = max(centerZ, 1e-3) * max(P.x, 1e-4);
-   // Left and top only (see the header): this is the axis pairing SMAA's predication actually compares.
+   // Left and top only (see the header).
    uav[id.xy] = saturate(max(edgesLRTB.x, edgesLRTB.z) / tolerance);
 }

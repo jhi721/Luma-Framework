@@ -1,33 +1,29 @@
-// XeGTAO adapted for Borderlands GOTY Enhanced (UE3.5) — replaces the game's NVIDIA HBAO+ (GFSDK_SSAO).
-// Source: https://github.com/GameTechDev/XeGTAO
-//
-// BL GOTY specifics:
-// - The native AO pipeline is FULL-RES (3840x2160 @ 4K): deinterleave 0xFFE232A6 -> normals 0xB2B47225 ->
-//   coarse horizon AO 0xF534EB09 -> bilateral blur 0x4E1BEE34 -> apply-multiply PS 0x44764BF6. We run at
-//   full res and write the final visibility term into the game's own FINAL AO target (the blur CS u0, a
-//   r16g16_float; apply blit reads .x). The apply blit (blend dst*src_color) is untouched by us.
-// - We read the game's OWN constant buffers, left bound by its AO passes (main.cpp does not rebind them):
-//   cb0 = HBAO+ $Globals (ProjInfo = NDC->view, live FOV), cb2 = CSOffsetConstants (MinZ_MaxZRatioCS = depth
-//   linearization).
-// - Depth input = the game's full-res r24_g8 scene depth (deinterleave 0xFFE232A6 t0), viewed r24_unorm_x8 and
-//   read with explicit Loads (see XeGTAO_PrefilterDepths16x16).
-// - Normals input = the game's ViewNormalTex (coarse-AO pass 0xF534EB09 t0), r11g11b10_float: xyz packed
-//   v*0.5+0.5 (full 3-channel view-space normal, no z reconstruct). View-space already.
-// - Noise: frozen at 0 without an upscaler (the game has no TAA: a frame index would make the pattern boil), denoise runs
-//   twice. With DLSS/FSR (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once,
-//   as Intel's XeGTAO.h advises with TAA (NoiseIndexRT, set by main.cpp). Quality default is Very High.
-// - viewZ is in UE3 units (near plane ~10 units) — a huge range; DepthScale (default 50 -> ~meters)
-//   rescales it into the range XeGTAO's Intel-tuned constants expect (R32F pyramid, so no fp16 precision
-//   loss at huge Z). EFFECT_RADIUS below is anchored at that scale.
+// XeGTAO (https://github.com/GameTechDev/XeGTAO) for Borderlands GOTY Enhanced (UE3.5), replacing the game's NVIDIA HBAO+
+// (GFSDK_SSAO).
+// - The native AO runs at full resolution: deinterleave 0xFFE232A6 -> normals 0xB2B47225 -> coarse horizon AO 0xF534EB09 ->
+//   bilateral blur 0x4E1BEE34 -> apply-multiply PS 0x44764BF6. XeGTAO runs at full resolution too and writes the final visibility
+//   into the blur CS's u0, the game's final AO target (r16g16_float, the apply blit reads .x); the apply blit (dst * src_color) is
+//   untouched.
+// - It reads the game's own constant buffers, left bound by its AO passes (main.cpp does not rebind them): b0 = HBAO+ $Globals
+//   (ProjInfo = NDC to view, live FOV), b2 = CSOffsetConstants (MinZ_MaxZRatioCS, the depth linearization).
+// - Depth: the game's full-res r24_g8 scene depth (deinterleave 0xFFE232A6 t0), viewed r24_unorm_x8 and read with explicit Loads
+//   (see XeGTAO_PrefilterDepths16x16).
+// - Normals: the game's ViewNormalTex (coarse AO 0xF534EB09 t0), r11g11b10_float, the full view-space xyz packed v * 0.5 + 0.5 (no
+//   z reconstruction).
+// - Noise: frozen at 0 without an upscaler (the game has no TAA: a frame index would make the pattern boil), and denoise runs twice.
+//   With DLSS/FSR (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once, as Intel's
+//   XeGTAO.h advises with TAA (NoiseIndexRT, set by main.cpp). The quality default is Very High.
+// - View z is in UE3 units (near plane ~10), a huge range: DepthScaleRT (default 50, to ~metres) brings it into the range Intel's
+//   constants expect (the R32F pyramid loses no precision at large z). EFFECT_RADIUS is anchored at that scale.
 
 // --- Game constant buffers (bound by the game at the hooked dispatches) ---
 
 cbuffer _Globals : register(b0) // NVIDIA GFSDK_SSAO $Globals
 {
    float RadiusToScreen;        // Offset:   0
-   float NegInvR2;              // Offset:   4  (GFSDK name; this build stores +1/R^2 (measured positive) -> R=sqrt(1/NegInvR2), view units = vanilla AO radius)
+   float NegInvR2;              // Offset:   4  (GFSDK name, but stored as +1/R^2, measured: R = sqrt(1/NegInvR2), the vanilla AO radius)
    float NDotVBias;             // Offset:   8
-   float2 InvFullResolution;    // Offset:  16  (1 / the AO input resolution; native HBAO+ runs full-res here — we size scratch + dispatches from that same depth, so the UV math matches by construction)
+   float2 InvFullResolution;    // Offset:  16  (1 / the AO input size: HBAO+ runs full-res; scratch and dispatches use that depth's size)
    float2 InvQuarterResolution; // Offset:  24
    int2 FullResOffset;          // Offset:  32
    int2 QuarterResOffset;       // Offset:  40
@@ -49,18 +45,18 @@ cbuffer CSOffsetConstants : register(b2)
    float4 DynamicScaleCS;            // Offset: 112
 }
 
-// --- Luma runtime knobs (set from main.cpp; live-tunable via DEV sliders, no recompile) ---
+// --- Luma runtime knobs (main.cpp; DEVELOPMENT/TEST sliders tune them live) ---
 cbuffer LumaGTAO : register(b11)
 {
    float FinalValuePowerRT; // primary darkness dial, calibrated to the vanilla AO histogram
-   float DepthScaleRT;      // viewZ divisor (UE3 units -> ~meters); THE dial against broad over-occlusion
+   float DepthScaleRT;      // view z divisor (UE3 units to ~metres), the dial against broad over-occlusion
    float RadiusOverrideRT;  // > 0 overrides EFFECT_RADIUS (view units after DepthScale)
    float DebugViewRT;       // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    float NoiseIndexRT;      // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
 }
 
 // clang-format off
-#include "Includes/Common.hlsl" // game-local: order load-bearing (pulls GameCBuffers before shared includes) — do not let SortIncludes move it
+#include "Includes/Common.hlsl" // Game-local, before any shared include (see Includes/Common.hlsl)
 // clang-format on
 
 #if XE_GTAO_QUALITY == 0 // Low
@@ -79,7 +75,9 @@ cbuffer LumaGTAO : register(b11)
 //
 
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.64 // anchored to the game's own HBAO+ radius: probed NegInvR2=0.000463 -> R=sqrt(1/NegInvR2)=46.5 UE3-units; chosen so the effective search (EFFECT_RADIUS * RADIUS_MULTIPLIER * DepthScale) = 0.64*1.457*50 = 46.6uu matches native R. RadiusOverrideRT > 0 wins.
+// The game's HBAO+ radius: NegInvR2 probed 0.000463 -> R = 46.5 UE3 units, and EFFECT_RADIUS * RADIUS_MULTIPLIER * DepthScale =
+// 0.64 * 1.457 * 50 = 46.6. RadiusOverrideRT > 0 wins.
+#define EFFECT_RADIUS 0.64
 #endif
 
 #ifndef RADIUS_MULTIPLIER
@@ -87,7 +85,9 @@ cbuffer LumaGTAO : register(b11)
 #endif
 
 #ifndef EFFECT_FALLOFF_RANGE
-#define EFFECT_FALLOFF_RANGE 0.005 // punchy hard-edge falloff: full sample weight up to the radius edge = crisp contact AO matching BL's punchy native HBAO+ (vs the soft 0.615/0.95 gradual fade). Pairs with power ~1.0
+// Hard-edged: full sample weight up to the radius edge, crisp contact AO like the native HBAO+ (0.615 / 0.95 fade softly). Pairs
+// with FinalValuePowerRT ~1.
+#define EFFECT_FALLOFF_RANGE 0.005
 #endif
 
 #ifndef SAMPLE_DISTRIBUTION_POWER
@@ -114,9 +114,8 @@ cbuffer LumaGTAO : register(b11)
 #define DENOISE_BLUR_BETA 1.2 // Default 1.2
 #endif
 
-// BL packs the full xyz view-space normal (v*0.5+0.5) — decoded directly, no reconstruction. NORMAL_Z_SIGN
-// flips only the decoded z if the view-space handedness needs it (verify via DebugViewRT=2: smooth
-// per-surface shading = correct; flip to -1.0 if the shading looks inverted).
+// Flips the decoded normal z if the view-space handedness needs it: with DebugViewRT 2, smooth per-surface shading is correct, and
+// inverted shading wants -1.
 #ifndef NORMAL_Z_SIGN
 #define NORMAL_Z_SIGN (1.0)
 #endif
@@ -136,10 +135,9 @@ cbuffer LumaGTAO : register(b11)
 #define XE_GTAO_PI                   3.1415926535897932384626433832795
 #define XE_GTAO_PI_HALF              1.5707963267948966192313216916398
 
-// Hardware d24 (non-reverse-Z) -> view Z via the game's own MinZ_MaxZRatioCS, then rescaled by
-// DepthScaleRT so the tuned XeGTAO constants (radius/falloff, ~meter scale) apply. UE3 near plane ~10
-// units and far -> infinity; without the rescale the huge Z range causes broad over-occlusion
-// (mips/falloff assumptions break).
+// Hardware D24 (not reversed) to view z through the game's own MinZ_MaxZRatioCS, divided by DepthScaleRT so Intel's radius and
+// falloff (~metre scale) apply: with UE3's near plane at ~10 units and far at infinity, the raw range over-occludes broadly (the mip
+// and falloff assumptions break).
 float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
 {
    float viewZ = 1.0 / max(1e-7, screenDepth * MinZ_MaxZRatioCS.z - MinZ_MaxZRatioCS.w);

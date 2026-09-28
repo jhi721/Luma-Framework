@@ -1,16 +1,12 @@
 // DLSS / FSR: the DOF/Bloom gather (0xF0D8D818), from the upscaled scene.
 // Its DOF blur amount comes from the max depth of each 4x4 block, and the depth is jittered: a thin object near a block edge moves in
 // and out of it every frame, and the block flips between sharp and blurred after the upscaler (a flickering halo around wires against
-// the sky; any max over the block flips like that). With DOF_HISTORY the amount is the mean over the block of per pixel amounts
-// accumulated over frames like the upscaler accumulates color: each pixel's amount (the gather's formula, same constants) is blended
-// into its history, reprojected with the motion vectors and clamped to the current 3x3 range. 0 = the game's.
+// the sky; any max over the block flips like that). Here the amount is the mean over the block of per pixel amounts accumulated over
+// frames like the upscaler accumulates color: each pixel's amount (the gather's formula, same constants) is blended into its history,
+// reprojected with the motion vectors and clamped to the current 3x3 range.
 
-#ifndef DOF_HISTORY
-#define DOF_HISTORY 1
-#endif
-
-// The gather, as the game's: 4x4 scene texels per output texel (2x2 per thread, 2x2 threads through group memory), the max depth of
-// its 16 for the DOF blur amount (alpha), plus the bloom term; written one texel in from the border.
+// The gather, as the game's: 4x4 scene texels per output texel (2x2 per thread, 2x2 threads through group memory), the mean of its
+// 16 pixels' history amounts for the DOF blur amount (alpha), plus the bloom term; written one texel in from the border.
 cbuffer GatherGlobals : register(b0)
 {
    float4 gather_constants[4]; // [0] focus distance, 1 / range, exponent; [1] near / far max blur; [2].xy texel offset (ints); [3] bloom threshold, scale, range
@@ -26,9 +22,6 @@ RWTexture2D<float4> gathered : register(u0);
 
 groupshared float4 group_texels[64];
 
-#include "Includes/DOFBlurAmount.hlsli"
-
-#if DOF_HISTORY
 cbuffer DOFHistory : register(b5)
 {
    float history_weight; // Weight of the current frame, 1 = no history
@@ -38,6 +31,15 @@ Texture2D<float2> motion_vectors : register(t2); // UV, previous minus current
 Texture2D<float> previous_history : register(t3);
 RWTexture2D<float> history : register(u1);
 SamplerState linear_sampler : register(s0);
+
+// The gather's blur amount for a device depth
+float BlurAmount(float device_depth)
+{
+   const float view_depth = 1.0 / max(device_depth * offset_constants[6].z - offset_constants[6].w, 0.0);
+   const float focus_offset = view_depth - gather_constants[0].x;
+   const float max_blur = focus_offset < 0.0 ? gather_constants[1].x : gather_constants[1].y;
+   return min(exp2(log2(max(saturate(abs(focus_offset) * gather_constants[0].y), 0.0001)) * gather_constants[0].z), max_blur);
+}
 
 // The group's 16x16 pixels and a 1 pixel border (edge clamped), each amount computed once
 groupshared float group_amounts[18 * 18];
@@ -67,12 +69,10 @@ float History(int2 pixel, int2 tile_origin, int2 size)
    history[pixel] = result;
    return f16tof32(f32tof16(result));
 }
-#endif
 
 [numthreads(8, 8, 1)] void gather_cs(uint3 id : SV_DispatchThreadID, uint3 group_thread_id : SV_GroupThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
    const int2 pixel = int2(id.xy) * 2 + asint(gather_constants[2].xy);
    const float3 color = scene.Load(int3(pixel, 0)).rgb + scene.Load(int3(pixel + int2(1, 0), 0)).rgb + scene.Load(int3(pixel + int2(0, 1), 0)).rgb + scene.Load(int3(pixel + int2(1, 1), 0)).rgb;
-#if DOF_HISTORY
    uint2 history_size;
    history.GetDimensions(history_size.x, history_size.y);
    const int2 size = int2(history_size);
@@ -88,9 +88,6 @@ float History(int2 pixel, int2 tile_origin, int2 size)
       if (all(texel >= 0) && all(texel < size))
          depth_term += History(texel, tile_origin, size);
    }
-#else
-   const float depth_term = max(max(depth.Load(int3(pixel, 0)).x, depth.Load(int3(pixel + int2(1, 0), 0)).x), max(depth.Load(int3(pixel + int2(0, 1), 0)).x, depth.Load(int3(pixel + int2(1, 1), 0)).x));
-#endif
    group_texels[group_index] = float4(color, depth_term);
    GroupMemoryBarrierWithGroupSync();
    if (any(group_thread_id.xy & 1))
@@ -100,11 +97,7 @@ float History(int2 pixel, int2 tile_origin, int2 size)
    const float4 down = group_texels[group_index + 8];
    const float4 diagonal = group_texels[group_index + 9];
    const float3 average = (right.rgb + down.rgb + diagonal.rgb + color) * 0.0625;
-#if DOF_HISTORY
    const float blur = (depth_term + right.w + down.w + diagonal.w) * 0.0625;
-#else
-   const float blur = BlurAmount(max(max(depth_term, right.w), max(down.w, diagonal.w)));
-#endif
 
    const float3 clamped = min(average, 65536.0);
    float bloom = saturate((dot(clamped, float3(0.3, 0.59, 0.11)) * gather_constants[3].y - gather_constants[3].x) / gather_constants[3].z);
