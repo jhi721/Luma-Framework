@@ -59,14 +59,14 @@ namespace
          settings = settings_;
          NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", L".", device_);
          if (NVSDK_NGX_FAILED(result))
-            return printf("[helper] NGX init 0x%08X\n", unsigned(result)), false;
+            return printf("[Luma Upscaler] NGX init 0x%08X\n", unsigned(result)), false;
          device = device_;
          NVSDK_NGX_D3D11_GetCapabilityParameters(&capabilities);
          int available = 0;
          if (capabilities)
             capabilities->Get(NVSDK_NGX_EParameter_SuperSampling_Available, &available);
          if (!available)
-            return printf("[helper] DLSS not available\n"), false;
+            return printf("[Luma Upscaler] DLSS not available\n"), false;
 
          // The mode whose optimal render resolution matches, else the closest one in range
          int quality = NVSDK_NGX_PerfQuality_Value_Balanced;
@@ -102,7 +102,7 @@ namespace
 
          NVSDK_NGX_D3D11_AllocateParameters(&parameters);
          if (!parameters)
-            return printf("[helper] NGX parameters\n"), false;
+            return printf("[Luma Upscaler] NGX parameters\n"), false;
          for (const char* preset : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality,
                  NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
                  NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance})
@@ -125,7 +125,7 @@ namespace
             result = NGX_D3D11_CREATE_DLSS_EXT(context, &feature, parameters, &create);
          }
          if (NVSDK_NGX_FAILED(result))
-            return printf("[helper] DLSS create 0x%08X\n", unsigned(result)), false;
+            return printf("[Luma Upscaler] DLSS create 0x%08X\n", unsigned(result)), false;
          return true;
       }
 
@@ -177,7 +177,7 @@ namespace
          FfxFsr3ContextDescription create = {};
          FfxErrorCode result = ffxGetInterfaceDX11(&create.backendInterfaceUpscaling, ffxGetDeviceDX11(device), scratch.data(), scratch.size(), 1);
          if (result != FFX_OK)
-            return printf("[helper] FSR interface %d\n", int(result)), false;
+            return printf("[Luma Upscaler] FSR interface %d\n", int(result)), false;
          create.displaySize = create.maxUpscaleSize = {settings.output_width, settings.output_height};
          create.maxRenderSize = settings.dynamic_resolution ? create.displaySize : FfxDimensions2D{settings.render_width, settings.render_height};
          create.flags = FFX_FSR3_ENABLE_UPSCALING_ONLY | (settings.hdr ? FFX_FSR3_ENABLE_HIGH_DYNAMIC_RANGE : 0) |
@@ -187,7 +187,7 @@ namespace
          create.backBufferFormat = FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT; // Frame generation's only
          result = ffxFsr3ContextCreate(&context, &create);
          if (result != FFX_OK)
-            return printf("[helper] FSR create %d\n", int(result)), false;
+            return printf("[Luma Upscaler] FSR create %d\n", int(result)), false;
          created = true;
          return true;
       }
@@ -263,7 +263,7 @@ int main()
    uint64_t handles[kCount] = {}, fence_handles[2] = {};
    std::cin >> mode >> version;
    if (mode != "bridge" || version != kVersion)
-      return printf("[helper] FAIL protocol \"%s\" %d, expected \"bridge\" %d\n", mode.c_str(), version, kVersion), 1;
+      return printf("[Luma Upscaler] FAIL protocol \"%s\" %d, expected \"bridge\" %d\n", mode.c_str(), version, kVersion), 1;
    std::cin >> settings.upscaler >> luid.LowPart >> luid.HighPart >> settings.render_width >> settings.render_height >> settings.output_width >> settings.output_height >>
       settings.hdr >> settings.inverted_depth >> settings.mvs_jittered >> settings.auto_exposure >> settings.dynamic_resolution >> settings.mvs_x_scale >>
       settings.mvs_y_scale >> settings.render_preset;
@@ -271,11 +271,11 @@ int main()
       std::cin >> handle;
    std::cin >> fence_handles[0] >> fence_handles[1];
    if (!std::cin)
-      return printf("[helper] FAIL bad start line\n"), 1;
+      return printf("[Luma Upscaler] FAIL bad start line\n"), 1;
 
    const ComPtr<IDXGIAdapter1> adapter = FindAdapter(luid);
    if (!adapter)
-      return printf("[helper] FAIL no adapter with the game's LUID\n"), 1;
+      return printf("[Luma Upscaler] FAIL no adapter with the game's LUID\n"), 1;
    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
    ComPtr<ID3D11Device> device;
    ComPtr<ID3D11DeviceContext> context;
@@ -284,20 +284,20 @@ int main()
    ComPtr<ID3D11DeviceContext4> context4;
    if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, levels, UINT(std::size(levels)), D3D11_SDK_VERSION, &device, nullptr, &context)) ||
        FAILED(device.As(&device1)) || FAILED(device.As(&device5)) || FAILED(context.As(&context4)))
-      return printf("[helper] FAIL device\n"), 1;
+      return printf("[Luma Upscaler] FAIL device\n"), 1;
 
    ComPtr<ID3D11Texture2D> textures[kCount];
    ID3D11Texture2D* raw[kCount] = {};
    for (int i = 0; i < kCount; i++)
    {
       if (handles[i] && FAILED(device1->OpenSharedResource1(HANDLE(uintptr_t(handles[i])), IID_PPV_ARGS(&textures[i]))))
-         return printf("[helper] FAIL open texture %d\n", i), 1;
+         return printf("[Luma Upscaler] FAIL open texture %d\n", i), 1;
       raw[i] = textures[i].Get();
    }
    ComPtr<ID3D11Fence> fence_in, fence_out;
    if (!raw[kColor] || !raw[kMotion] || !raw[kDepth] || !raw[kOutput] || FAILED(device5->OpenSharedFence(HANDLE(uintptr_t(fence_handles[0])), IID_PPV_ARGS(&fence_in))) ||
        FAILED(device5->OpenSharedFence(HANDLE(uintptr_t(fence_handles[1])), IID_PPV_ARGS(&fence_out))))
-      return printf("[helper] FAIL inputs or fences\n"), 1;
+      return printf("[Luma Upscaler] FAIL inputs or fences\n"), 1;
 
    std::unique_ptr<Dlss> dlss;
    std::unique_ptr<Fsr> fsr; // Its context is far larger than the stack
@@ -315,7 +315,7 @@ int main()
    }
    context4->Signal(fence_out.Get(), kReady);
    context->Flush();
-   printf("[helper] ready: %s %ux%u -> %ux%u\n", dlss ? "DLSS" : "FSR 3", settings.render_width, settings.render_height, settings.output_width, settings.output_height);
+   printf("[Luma Upscaler] ready: %s %ux%u -> %ux%u\n", dlss ? "DLSS" : "FSR 3", settings.render_width, settings.render_height, settings.output_width, settings.output_height);
    fflush(stdout);
 
    Frame frame;
@@ -330,10 +330,10 @@ int main()
       frames++;
       if (!drawn && failures++ < 5)
       {
-         printf("[helper] frame %llu: the upscaler failed\n", (unsigned long long)frame.n);
+         printf("[Luma Upscaler] frame %llu: the upscaler failed\n", (unsigned long long)frame.n);
          fflush(stdout);
       }
    }
-   printf("[helper] the game closed the pipe after %u frames (%u failed)\n", frames, failures);
+   printf("[Luma Upscaler] the game closed the pipe after %u frames (%u failed)\n", frames, failures);
    return 0;
 }

@@ -43,7 +43,7 @@
     <UseLumaNGX>true</UseLumaNGX>
     <UseLumaFSR>true</UseLumaFSR>
     <UseLumaNVAPI>false</UseLumaNVAPI>
-    <TargetName>sr_bridge_helper</TargetName>
+    <TargetName>Luma-Upscaler</TargetName>
     <OutDir>$(SolutionDir)\Binaries\Win32-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)\Binaries\Intermediate\SRBridgeHelper-$(Platform)-$(Configuration)\</IntDir>
     <LinkIncremental>false</LinkIncremental>
@@ -59,12 +59,22 @@
       <RuntimeLibrary Condition="'$(Configuration)'!='Development-Debug'">MultiThreadedDLL</RuntimeLibrary>
       <Optimization Condition="'$(Configuration)'=='Development-Debug'">Disabled</Optimization>
       <Optimization Condition="'$(Configuration)'!='Development-Debug'">MaxSpeed</Optimization>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- The standard mitigations, and only the PDB's name in the exe (not the build machine's path) -->
+      <RandomizedBaseAddress>true</RandomizedBaseAddress>
+      <DataExecutionPrevention>true</DataExecutionPrevention>
+      <CETCompat>true</CETCompat>
+      <AdditionalOptions>/HIGHENTROPYVA /PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
     </Link>
+    <Manifest>
+      <AdditionalManifestFiles>Luma-Upscaler.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
+    </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
@@ -74,6 +84,9 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="SR Bridge Helper.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Luma-Upscaler.ico" />
   </ItemGroup>
   <Import Project="..\..\Games\Luma.DXP.props" Condition="Exists('..\..\Games\Luma.DXP.props')" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
