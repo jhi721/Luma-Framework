@@ -910,7 +910,7 @@ class SaintsRowIV final : public Game
             const auto* code = static_cast<const uint8_t*>(desc->code);
             if constexpr (vertex)
             {
-               patched = MotionVectorPatches::PatchVertexShader(code, desc->code_size, &error);
+               patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error);
             }
             else
             {
@@ -932,7 +932,7 @@ class SaintsRowIV final : public Game
                }
                else
                {
-                  patched = MotionVectorPatches::PatchPixelShader(code, desc->code_size, &error);
+                  patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error);
                   if (shaders == &game_device_data.sub_rect_mv_pixel_shaders && !patched.empty())
                      patched = MotionVectorPatches::PatchScreenUVPixelShader(patched.data(), patched.size(), texture_slots, &error);
                }
