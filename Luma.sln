@@ -1058,6 +1058,18 @@ Global
 		{F793561E-7196-4EC9-B617-55B6BA8256CB}.Test-Release|Win32.ActiveCfg = Test-Release|Win32
 		{F793561E-7196-4EC9-B617-55B6BA8256CB}.Test-Release|Win32.Build.0 = Test-Release|Win32
 		{F793561E-7196-4EC9-B617-55B6BA8256CB}.Test-Release|x64.ActiveCfg = Test-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Development-Debug|Win32.ActiveCfg = Development-Debug|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Development-Debug|Win32.Build.0 = Development-Debug|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Development-Debug|x64.ActiveCfg = Development-Debug|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Development-Release|Win32.ActiveCfg = Development-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Development-Release|Win32.Build.0 = Development-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Development-Release|x64.ActiveCfg = Development-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Publishing-Release|Win32.Build.0 = Publishing-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Publishing-Release|x64.ActiveCfg = Publishing-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Test-Release|Win32.ActiveCfg = Test-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Test-Release|Win32.Build.0 = Test-Release|Win32
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Test-Release|x64.ActiveCfg = Test-Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -1134,6 +1146,7 @@ Global
 		{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{69619760-85C1-45A7-BD6B-7E524CA1FFC1} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{F793561E-7196-4EC9-B617-55B6BA8256CB} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{D5FC2D39-9270-4281-B68E-92EAF35B3E25} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {8B799422-BA66-3174-B21F-B9FA07C4B2E3}
