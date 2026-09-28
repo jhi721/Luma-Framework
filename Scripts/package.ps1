@@ -148,9 +148,9 @@ try {
     if (Test-Path $reshadeSrc) { Copy-Item $reshadeSrc -Destination (Join-Path $tempDir "dxgi.dll") -Force }
     # The SR bridge's x64 helper (a Luma.sln project, built next to the Win32 addons), which also loads DLSS's dll
     if ($useLumaSRBridge) {
-        $helperSrc = Join-Path $repoRoot "Binaries\Win32-$Config\sr_bridge_helper.exe"
+        $helperSrc = Join-Path $repoRoot "Binaries\Win32-$Config\Luma-Upscaler.exe"
         if (-not (Test-Path $helperSrc)) {
-            Write-Error "SR bridge helper not found: $helperSrc (build the ""SR Bridge Helper"" project)"
+            Write-Error "Luma-Upscaler.exe not found: $helperSrc (build the ""SR Bridge Helper"" project)"
             exit 1
         }
         Copy-Item $helperSrc -Destination $tempDir -Force
