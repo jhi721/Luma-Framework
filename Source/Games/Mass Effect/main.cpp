@@ -1078,8 +1078,7 @@ class MassEffect final : public Game
                it->second->subobjects_cache[0].data);
             const auto* code = static_cast<const uint8_t*>(desc->code);
             if constexpr (vertex)
-               patched = MotionVectorPatches::PatchVertexShader(code, desc->code_size,
-                  &error);
+               patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error);
             else if (reactive != 0)
                patched = MotionVectorPatches::PatchPixelShaderReactive(code,
                   desc->code_size, reactive == 2, &error);
