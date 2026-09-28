@@ -9,7 +9,7 @@
 // - The 4096x1 R16_UNORM filmic LUT is the whole tonemap, with no exponential pre-curve before it.
 // - Channels remain straight RGB, and motion blur weights each tap by velocity.
 // - The smoothstep vignette contains a blue-tinted white point; the slider affects only radial darkening.
-// - Motion blur does not change the $Globals layout; grain appends c40/c41 and moves ScreenUVScaleBias from c40 to c42.
+// - Motion blur does not change the _Globals layout; grain appends c40/c41 and moves ScreenUVScaleBias from c40 to c42.
 
 // clang-format off
 #include "Includes/Common.hlsl"      // Defines game settings; keep first.
@@ -142,9 +142,8 @@ SamplerState NoiseTextureSampler_s : register(S_NOISE);
 #endif
 SamplerState smpFilmicLUTSampler_s : register(S_FILMIC);
 
-// Native ME3LE SDR grade transcribed from the live CSO. main() runs it once on the untouched native value in every
-// Display Mode and, in HDR, once more on the grade proxy; HDR keeps the native result's RGB ratios and takes only
-// luminance from the reconstruction. Preserve register-level operations; the filmic 1D LUT stays inline in main().
+// Native ME3LE SDR grade transcribed from the live CSO, with the same call contract as MELE_ME12LE_GradeChain in
+// Tonemap_ME12LE_LUT_Body.hlsl. Preserve register-level operations; the filmic 1D LUT stays inline in main().
 float3 MELE_ME3LE_GradeChain(float3 c)
 {
    float4 r0, r1;
@@ -272,8 +271,8 @@ void main(
    r0.x = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.xx).x;
    r0.y = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.yy).x;
    r0.z = smpFilmicLUT.Sample(smpFilmicLUTSampler_s, r0.zz).x;
-   // The native per-channel filmic value reaches the grade untouched - that is this body's SDR output. Family
-   // 04 does not touch it; it continues the tone LUT itself and grades that second value.
+   // The native per-channel filmic value reaches the grade untouched as this body's SDR output. Family 04 leaves it
+   // alone, continues the tone LUT itself and grades that second value.
    float3 workHDR = 0.0;
    bool workValid = false;
    if (LumaSettings.DisplayMode == 1)

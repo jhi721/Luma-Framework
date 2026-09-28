@@ -299,10 +299,10 @@ void main(
 
 #if TM_HAS_FILMIC
    // Filmic path from 0x222186F8: bloom, exponential curve, then per-channel 4096x1 LUT. DELIBERATE DEVIATION: the
-   // screen-blend weight reads the luma of the LINEAR scene, where the native CSO reads it after the curve (always 1
-   // at the measured threshold). Bright pixels therefore lose their bloom; that keeps highlight detail and colour in
-   // HDR, and the families were calibrated with it. Restoring the native weight was A/B'd in game and rejected; do not
-   // change the weight or its input without an in-game A/B (see Shaders/Mass Effect Legendary Edition/AGENTS.md).
+   // screen-blend weight reads the BT.601-weighted sum of the LINEAR scene, where the native CSO reads it after the
+   // curve (weight always 1 at the measured threshold). Bright pixels therefore lose their bloom, which keeps highlight
+   // detail and colour in HDR; the families were calibrated with it and the native weight was rejected in an in-game
+   // A/B. Do not change the weight or its input without one (see Shaders/Mass Effect Legendary Edition/AGENTS.md).
    r0.xyz = MELE_BloomScreenBlend(r0.xy, r1.xyz, r0.w);
 
    // Kept separate on purpose: the game evaluates L(F(C) + B), so C and B must not be summed before the
@@ -326,10 +326,10 @@ void main(
 #else
    // Non-filmic path from 0x2754F750: bloom, exponential curve, highlight desaturation, adjustments, then LUT.
    // DELIBERATE DEVIATION: the screen-blend weight reads the LINEAR RGB scene through r1.yzx, i.e. in GBR order (native
-   // reads the curved BRG scene, where .yzx restores RGB), so bright pixels lose their bloom, with a hue-dependent
+   // reads the curved BRG scene, where .yzx restores RGB), so bright pixels lose their bloom at a hue-dependent
    // threshold. Keeps highlight detail and colour in HDR; the families were calibrated with it, and the native weight
-   // and an RGB-order linear weight were both A/B'd in game and rejected. Do not change the weight, its input or its
-   // channel order without an in-game A/B (see Shaders/Mass Effect Legendary Edition/AGENTS.md).
+   // and an RGB-order linear weight were both rejected in in-game A/Bs. Do not change the weight, its input or its
+   // channel order without one (see Shaders/Mass Effect Legendary Edition/AGENTS.md).
    r0.xyz = BlurredImageSeperateBloom.Sample(BlurredImageSeperateBloomSampler_s, r0.xy).xyz * LumaSettings.GameSettings.BloomIntensity;
    r0.xyz = BloomTintAndScreenBlendThreshold.zxy * r0.zxy;
    r0.w = dot(r1.yzx, float3(0.298999995, 0.587000012, 0.114));
@@ -360,8 +360,8 @@ void main(
       float3 workRGB;
       bool sourceValid = MELE_TryExpExtendedInput(sceneLinear, bloomLinear, workRGB);
 #if TM_HAS_FILMIC
-      // workRGB, the continued scene plus bloom, is the filmic LUT's input z. The native filmic samples in r1 were
-      // written BRG, so they are rotated to RGB here.
+      // workRGB, the continued scene plus bloom, is the filmic LUT's input z. The native samples in r1 are BRG,
+      // rotated to RGB here.
       const float3 z = workRGB;
       if (sourceValid)
       {
@@ -369,7 +369,7 @@ void main(
       }
 #endif
       // The bridge drives the real grade and 16-slice LUT, whose chain is transcribed BRG-in / RGB-out in both
-      // branches, so the proxy is rotated into it. r is read from the frame's own cbuffer, never assumed to be 1.
+      // branches, so the proxy is rotated into it.
       float q;
       float3 proxyRGB;
       if (sourceValid && MELE_TryBuildGradeProxy(workRGB, GammaColorScaleAndInverse.w * DefaultGamma, q, proxyRGB))

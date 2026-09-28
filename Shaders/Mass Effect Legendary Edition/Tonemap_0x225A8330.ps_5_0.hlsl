@@ -110,15 +110,14 @@ void main(
 
    float3 untonemapped = r0.xyz * r0.www + r1.xyz;
    r0.xyz = untonemapped;
-   // No tonemap curve here, so the raw scene reaches the grade and the saturate its grade opens with is this
-   // permutation's vanilla blowout. Family 05 answers that by preparing the grade input, so nothing here
-   // measures the clip.
+   // No tonemap curve here, so the raw scene reaches the grade and the saturate it opens with is this permutation's
+   // vanilla blowout.
    float3 workHDR = 0.0;
    bool workValid = false;
    if (LumaSettings.DisplayMode == 1)
    {
-      // Family 05. The grade chain is called unchanged, caps and all: this path earns its range by preparing
-      // the INPUT, not by stripping the grade. The blue white point and the black floor stay inside it.
+      // Family 05 calls the grade chain unchanged, caps and all, and earns its range by preparing the INPUT, not by
+      // measuring the clip or stripping the grade. The blue white point and the black floor stay inside it.
       float q;
       float3 proxy;
       if (MELE_TryBuildGradeProxy(untonemapped, GammaColorScaleAndInverse.w * DefaultGamma, q, proxy))

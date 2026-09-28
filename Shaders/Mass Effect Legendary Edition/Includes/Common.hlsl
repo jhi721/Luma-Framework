@@ -54,20 +54,18 @@ float MELE_NativeToneCurve(float x)
 static const float3 kMELE_ME1LEVignetteFloor = float3(0.0103630004, 5.75000013e-06, 0.0130924946);
 static const float3 kMELE_ME2LEVignetteFloor = float3(0.0103630004, 5.75000013e-06, 0.163092494);
 
-// Finite guards for the stage-1 HDR reconstruction. Two predicates, not one: every value it guards is either a light
-// quantity that has no meaning below zero, or an artist dial whose sign is free - a shadow lift, a luminance weight,
-// an overlay offset, and the signed differences those produce. Applying the non-negative form to one of those would
-// reject valid game data as corrupt, so the choice is made per value.
+// Finite guards for the stage-1 HDR reconstruction, chosen per value: a light quantity has no meaning below zero,
+// while an artist dial (a shadow lift, a luminance weight, an overlay offset, and the signed differences they produce)
+// has a free sign, and the non-negative form would reject it as corrupt.
 //
 // Ordered comparisons against constants, not the IsNaN_Strict/IsInfinite_Strict bit tests: NaN fails both (DXBC ge/le
-// are ordered), +INF fails the upper bound, -INF and negatives the lower, so the sets are identical, at 2 instructions
-// per channel where the bit tests cost about 7 - the same trade Luma_BL2TPS_Tonemap.hlsl measured. Keep any negation
+// are ordered), +INF fails the upper bound, -INF and negatives the lower, so the rejected sets are identical, at 2
+// instructions per channel instead of about 7 (the same trade Luma_BL2TPS_Tonemap.hlsl measured). Keep any negation
 // OUTSIDE the conjunction: (x < lo || x > hi) is false for NaN and would accept it.
 //
 // COMPUTED VALUES ONLY. Without IEEE strictness (/Gis) fxc treats a raw constant-buffer read as finite and deletes
-// these comparisons on it: MELE_IsFinite(SceneMidTones.xyz) was measured to vanish from the analytic listings.
-// A product, sum or quotient can overflow, so its comparison survives. Guard a raw cbuffer value with the
-// IsNaN_Strict/IsInfinite_Strict bit tests instead.
+// these comparisons on it (MELE_IsFinite(SceneMidTones.xyz) was measured to vanish from the analytic listings), while
+// a product, sum or quotient can overflow and keeps its comparison. Guard raw cbuffer values with the bit tests.
 bool MELE_IsFinite(float x)
 {
    return abs(x) <= FLT_MAX;

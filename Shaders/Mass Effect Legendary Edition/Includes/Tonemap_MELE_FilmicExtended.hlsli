@@ -5,7 +5,7 @@
 
 // Sampled continuation of the game's own 1D filmic LUT, for the two filmic families. Include AFTER the
 // permutation declares smpFilmicLUT and its sampler; MELE_IsFiniteNonNegative and MELE_NativeToneCurve come from
-// Includes/Common.hlsl. The include above carries a guard, so a body that already pulled it in pays nothing.
+// Includes/Common.hlsl.
 //
 // Nothing here invents a curve. Every anchor is a real read of the bound LUT, so a different shipped
 // table gives a different continuation; the constants are probe positions, not curve coefficients.
@@ -45,11 +45,10 @@ struct MELE_FilmicFit
 // A secant, not an analytic derivative: the table is discrete, so this cannot be claimed to match the
 // local slope of the neighbouring texels.
 //
-// The validity test is LOCAL by construction. A table that is globally non-monotone but rising across
-// the window still yields a usable fit and is accepted; only a window that is flat, falling or
-// non-finite is rejected. That matters for R16_UNORM, where quantization can flatten a short run: the
-// answer there is to report the rejection, never to substitute a slope of 1 or one borrowed from
-// another game's curve. Local validity is not a statement about the whole table.
+// The validity test is LOCAL, not a statement about the whole table: a globally non-monotone table
+// that rises across the window is accepted; only a flat, falling or non-finite window is rejected.
+// R16_UNORM quantization can flatten a short run; the answer there is to report the rejection, never
+// to substitute a slope of 1 or one borrowed from another game's curve.
 //
 // min_slope belongs to the caller's domain and the two families' thresholds are NOT interchangeable:
 // see MELE_FILMIC_MIN_SLOPE_Z and MELE_FILMIC_MIN_SLOPE_X.

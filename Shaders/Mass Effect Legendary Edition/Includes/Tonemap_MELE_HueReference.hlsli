@@ -9,18 +9,17 @@
 // (renodx/src/shaders/color/clamp.hlsl) rebuilt on Luma's own ACES matrices. MELE_IsFinite comes from
 // Includes/Common.hlsl.
 //
-// WHAT MOVES AND WHAT DOES NOT. Only the direction of the OKLab (a, b) vector is allowed to travel
-// toward the reference. The target keeps its perceptual lightness L and the magnitude of its own
-// chroma, so the reference sets no brightness, no saturation and no range - it is a hue donor and
-// nothing else. Describing this as restoring the vanilla SDR colour would be wrong.
+// WHAT MOVES AND WHAT DOES NOT. Only the direction of the OKLab (a, b) vector travels toward the
+// reference. The target keeps its OKLab lightness L and OKLab chroma (the (a, b) magnitude), so the
+// reference sets no lightness, no chroma and no range: it is a hue donor, not a restoration of the
+// vanilla SDR colour.
 //
-// The rescale back to the target's chroma is what makes that true, and it also bounds the operation:
-// the blended vector is always renormalized to a length the target already had, so this cannot
-// amplify anything. The degenerate case is a blended vector at or near zero - a neutral donor at
-// strength 1, or a donor ab that cancels the target's: exactly zero comes out achromatic (safeDivision
-// returns 1), and round-off is scaled up to the target's chroma in an arbitrary direction. That is left
-// as it is deliberately; a donor-chroma threshold would be a new artistic rule, and the shipped strength
-// is below 1 precisely so a neutral donor still leaves a direction to keep (MELE_HARDCLIP_HUE_STRENGTH).
+// Renormalizing to the target's own chroma is what makes that true, and it also bounds the operation,
+// so this cannot amplify anything. The degenerate case is a blended vector at or near zero (a neutral
+// donor at strength 1, or a donor ab that cancels the target's): exactly zero comes out achromatic
+// (safeDivision returns 1), and round-off is scaled up to the target's chroma in an arbitrary
+// direction. That is left deliberately; see MELE_HARDCLIP_HUE_STRENGTH for why the shipped strength is
+// below 1 and no donor-chroma threshold exists.
 //
 // GAMUT. RenoDX clamps to positive AP1 and converts back, which is wider than BT.709: a negative
 // BT.709 component coming out of this is ordinary wide-gamut colour and is NOT a reason to abandon

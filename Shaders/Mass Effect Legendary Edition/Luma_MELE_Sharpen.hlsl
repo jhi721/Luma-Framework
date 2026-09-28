@@ -1,6 +1,6 @@
-// RCAS sharpens the gamma SMAA output before it is copied to the fp16 post buffer and decoded by stage 2. It uses
+// RCAS on the gamma post buffer after SMAA or DLSS/FSR, before it is copied back and decoded by stage 2. It uses
 // paperWhite=1 and an SDR-tuned lobe limiter bounded by RCAS_LIMIT, so gamma highlights above 1 may sharpen less
-// uniformly. Sharpness defaults to zero.
+// uniformly.
 
 #include "../Includes/RCAS.hlsl"
 
@@ -9,7 +9,7 @@ cbuffer SharpenCB : register(b0)
    float4 SharpenParams; // (width, height, sharpness [0,1], unused).
 }
 
-Texture2D<float4> tex0 : register(t0);    // Gamma SMAA output.
+Texture2D<float4> tex0 : register(t0);    // Gamma SMAA output, or a copy of the upscaled post buffer.
 Texture2D<float2> dummyMV : register(t1); // Unused because dynamicSharpening is false.
 
 float4 sharpen_ps(float4 pos : SV_Position) : SV_Target
