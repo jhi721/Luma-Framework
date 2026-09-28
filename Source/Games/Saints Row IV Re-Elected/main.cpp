@@ -1361,7 +1361,11 @@ class SaintsRowIV final : public Game
          game_device_data.sr_output_recreated = true;
       }
       if (!device_data.sr_output_color)
+      {
+         // Back to SMAA until the upscaler is picked again
+         device_data.sr_suppressed = true;
          return false;
+      }
 
       // FSR needs the camera (DLSS ignores it). projTM (vc2 c0-c3) is a column vector view projection with absolute world
       // translation: row 1 = the up axis / tan(fov / 2), row 3 = the view depth axis, row 2 = A * row 3 + B (w), with
