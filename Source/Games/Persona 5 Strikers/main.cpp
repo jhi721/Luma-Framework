@@ -320,6 +320,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // upscaler writes the output resolution, the post process up to the composite runs at the output resolution on it (see
    // "RedirectPostDraw"), and the composite draws from it into an output sized canvas that the stretch copies 1:1.
    ID3D11DeviceContext* sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
+   // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the scene's command lists
+   std::atomic<bool> sr_active = false;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_output_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_output_srv;
@@ -399,7 +401,7 @@ class Persona5Strikers final : public Game
 
    static bool IsSRActive(const DeviceData& device_data)
    {
-      return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+      return device_data.game && static_cast<const Persona5StrikersGameDeviceData*>(device_data.game)->sr_active;
    }
 
 #if DEVELOPMENT
@@ -1504,7 +1506,8 @@ public:
 
       D3D11_TEXTURE2D_DESC desc;
       split.source_color->GetDesc(&desc);
-      if (IsSRActive(*device_data) && game_device_data.mv_texture)
+      // The instance too: the selection is taken at present, Core may have changed it since
+      if (IsSRActive(*device_data) && game_device_data.mv_texture && device_data->GetSRInstanceData())
       {
          // Written as a UAV. Upscaling: into the split's output, read by the post process; DLAA: copied back into the scene.
          D3D11_TEXTURE2D_DESC output_desc = {};
@@ -2673,6 +2676,7 @@ public:
       device_data.force_reset_sr = !device_data.has_drawn_sr;
       device_data.has_drawn_sr = false;
       auto& game_device_data = GetGameDeviceData(device_data);
+      game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       game_device_data.mv_presents++;
       {
          const std::lock_guard lock(game_device_data.layer_mutex);
