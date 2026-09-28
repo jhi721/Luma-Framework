@@ -515,7 +515,7 @@ class Persona5Strikers final : public Game
          {
             const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
             const auto* code = static_cast<const uint8_t*>(desc->code);
-            patched = vertex ? MotionVectorPatches::PatchVertexShader(code, desc->code_size, &error) : MotionVectorPatches::PatchPixelShader(code, desc->code_size, &error);
+            patched = vertex ? MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error) : MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error);
             com_ptr<ID3D11ShaderReflection> reflection;
             if (vertex && Shader::d3d_reflect && SUCCEEDED(Shader::d3d_reflect(code, desc->code_size, IID_PPV_ARGS(&reflection))))
             {
