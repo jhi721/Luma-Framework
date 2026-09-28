@@ -16,6 +16,7 @@
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
+#include "..\..\Core\includes\patched_draws.h"
 
 namespace
 {
@@ -110,22 +111,6 @@ namespace
       if (view)
          view->GetResource(&resource);
       return resource;
-   }
-
-   // Writes a dynamic constant buffer, created on first use; false if it can't
-   bool WriteConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, com_ptr<ID3D11Buffer>* buffer, const void* data, UINT size)
-   {
-      if (!*buffer)
-      {
-         const D3D11_BUFFER_DESC desc = {size, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-         native_device->CreateBuffer(&desc, nullptr, &(*buffer));
-      }
-      D3D11_MAPPED_SUBRESOURCE mapped;
-      if (!*buffer || FAILED(native_device_context->Map(buffer->get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-         return false;
-      std::memcpy(mapped.pData, data, size);
-      native_device_context->Unmap(buffer->get(), 0);
-      return true;
    }
 
    // Draws with a Luma clone of a layer's vertex shader (see "Includes/LayerCorner.hlsl") and uv scale, or as is without one, bypassing
@@ -613,7 +598,7 @@ class Persona5Strikers final : public Game
       game_device_data.mv_jitter = jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{};
       // Pixels to NDC (y up)
       const float ndc_jitter[4] = {game_device_data.mv_jitter[0] * 2.f / float(depth_size.x), game_device_data.mv_jitter[1] * -2.f / float(depth_size.y), 0.f, 0.f};
-      WriteConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter));
+      PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter));
    }
 
    // A patched vertex shader's $Globals byte offsets, by original hash (none until patched)
@@ -722,7 +707,7 @@ class Persona5Strikers final : public Game
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          const com_ptr<ID3D11ComputeShader> fill_shader = FindShader(device_data.native_compute_shaders, "P5S Motion Vector Fill CS"_h);
          // ponytail: a shader reload between the clear and here (DEV) leaves the FLT_MAX marker for a frame
-         if (depth_srv && fill_shader && WriteConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
+         if (depth_srv && fill_shader && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
          {
             DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
             DrawStateStack<DrawStateStackType::Compute> compute_state;
@@ -947,7 +932,7 @@ class Persona5Strikers final : public Game
 
          const std::vector<uint8_t>& upload_data = match ? match->globals : previous_globals_data;
          com_ptr<ID3D11Buffer>& upload = game_device_data.mv_previous_globals_buffers[UINT(upload_data.size())];
-         if (WriteConstants(native_device, native_device_context, std::addressof(upload), upload_data.data(), UINT(upload_data.size())))
+         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(upload), upload_data.data(), UINT(upload_data.size())))
             previous_globals = upload.get();
       }
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_globals_slot, 1, &previous_globals);
@@ -1408,7 +1393,7 @@ public:
       // them a moving pattern would boil, so it stays frozen and denoises twice
       const bool temporal = IsSRActive(device_data);
       const float knobs[8] = {g_gtao_final_value_power, float(normal_input_scale), g_gtao_radius_override, float(g_gtao_debug_view), 1.f / float(width), 1.f / float(height), temporal ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 0.f};
-      if (!WriteConstants(native_device, native_device_context, std::addressof(game_device_data.gtao_knobs_cb), knobs, sizeof(knobs)))
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.gtao_knobs_cb), knobs, sizeof(knobs)))
          return false;
 
       DrawStateStack<DrawStateStackType::Compute> compute_state;
@@ -1735,7 +1720,7 @@ public:
             std::memcpy(globals_data.data() + cluster_scale_offset, &cluster_scale, sizeof(float));
             const std::lock_guard lock(game_device_data.layer_mutex);
             com_ptr<ID3D11Buffer>& upload = game_device_data.layer_globals_buffers[UINT(globals_data.size())];
-            if (WriteConstants(native_device, native_device_context, std::addressof(upload), globals_data.data(), UINT(globals_data.size())))
+            if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(upload), globals_data.data(), UINT(globals_data.size())))
                patched_globals = upload;
          }
       }
