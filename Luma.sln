@@ -41,6 +41,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "_Generic Mod", "Source\Game
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Graphics Analyzer", "Source\Graphics Analyzer\Graphics Analyzer.vcxproj", "{08143144-3ABB-D7B3-815C-7C798924E8E6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SR Bridge Helper", "Source\Tools\SR Bridge Helper\SR Bridge Helper.vcxproj", "{1A1AC095-1247-455C-8FF4-D8D6051AA52A}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Thumper", "Source\Games\Thumper\Thumper.vcxproj", "{3C99EF50-7B5C-475C-9E13-F451F0D7A3A1}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Burnout Paradise Remastered", "Source\Games\Burnout Paradise Remastered\Burnout Paradise Remastered.vcxproj", "{5671B4DE-DD84-4FCC-890F-D5B7F5437E42}"
@@ -1070,6 +1072,18 @@ Global
 		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Test-Release|Win32.ActiveCfg = Test-Release|Win32
 		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Test-Release|Win32.Build.0 = Test-Release|Win32
 		{D5FC2D39-9270-4281-B68E-92EAF35B3E25}.Test-Release|x64.ActiveCfg = Test-Release|Win32
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Development-Debug|Win32.Build.0 = Development-Debug|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Development-Release|Win32.ActiveCfg = Development-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Development-Release|Win32.Build.0 = Development-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Development-Release|x64.ActiveCfg = Development-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Publishing-Release|Win32.Build.0 = Publishing-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Publishing-Release|x64.ActiveCfg = Publishing-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Test-Release|Win32.ActiveCfg = Test-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Test-Release|Win32.Build.0 = Test-Release|x64
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A}.Test-Release|x64.ActiveCfg = Test-Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
