@@ -1,0 +1,69 @@
+// ps_glow_pass0, the same math in every game (Y5R only moves the UV to v0): bloom build, a 5x6-tap RMS of the
+// downsampled glow source (t1) x cb5[2], plus (cb11[0].y & 8: unset in Y3R, set in Y5R) a thresholded term from the scene
+// (t0). Vanilla read and wrote 8-bit UNORM targets. The DoF-sized targets are now fp16, so every input and the output are
+// saturated to keep the vanilla bloom bounded. GLOW_PASS0_MATERIAL_CURVE (Y5R): the scene taps are taken per texel
+// through the vanilla material curve instead (see SampleSaturatedBilinear). Otherwise verbatim.
+#include "Common.hlsl"
+
+#ifndef GLOW_PASS0_MATERIAL_CURVE
+#define GLOW_PASS0_MATERIAL_CURVE 0
+#endif
+
+cbuffer cb5 : register(b5)
+{
+   float4 cb5[3];
+}
+cbuffer cb11 : register(b11)
+{
+   uint4 cb11[1];
+}
+
+SamplerState s0_s : register(s0);
+SamplerState s1_s : register(s1);
+Texture2D<float4> t0 : register(t0);
+Texture2D<float4> t1 : register(t1);
+
+static const float3 kGlowLumaWeights = float3(0.298912, 0.586611, 0.114478);
+
+// The scene term (cb11[0].y & 8): over the 5x6 taps, the RMS of the color above cb5[0].yzw and the mean of the luma above
+// cb5[0].x, both scaled by cb5[1]. Also Luma Bloom's (Luma_YRC_GlowGain.hlsl).
+float4 GlowSceneThreshold(float2 uv, float2 stepX, float2 stepY, bool materialCurve)
+{
+   float3 thresholdSum = 0.0;
+   float thresholdLuma = 0.0;
+   for (int y = -2; y < 4; y++)
+   {
+      for (int x = -2; x < 3; x++)
+      {
+         const float2 tapUV = uv + stepX * x + stepY * y;
+         float3 c = materialCurve ? SampleSaturatedBilinear(t0, s0_s, tapUV, true).rgb : saturate(t0.Sample(s0_s, tapUV).rgb);
+         float4 t = saturate(float4(saturate(dot(kGlowLumaWeights, c) - cb5[0].x), saturate(c - cb5[0].yzw)) * cb5[1]);
+         thresholdSum += t.yzw * t.yzw;
+         thresholdLuma += t.x;
+      }
+   }
+   return float4(sqrt(thresholdSum * (1.0 / 30.0)), thresholdLuma * (1.0 / 30.0));
+}
+
+float4 GlowPass0(float2 uv)
+{
+   const float2 stepX = ddx_coarse(uv) * 0.2;
+   const float2 stepY = ddy_coarse(uv) * (1.0 / 6.0);
+
+   float3 sum = 0.0;
+   for (int y = -2; y < 4; y++)
+   {
+      for (int x = -2; x < 3; x++)
+      {
+         float3 c = saturate(t1.Sample(s1_s, uv + stepX * x + stepY * y).rgb);
+         sum += c * c;
+      }
+   }
+   float3 rms = sqrt(sum * (1.0 / 30.0));
+   float4 glow = float4(rms, dot(kGlowLumaWeights, rms)) * cb5[2];
+
+   if ((cb11[0].y & 8u) != 0u)
+      glow += GlowSceneThreshold(uv, stepX, stepY, GLOW_PASS0_MATERIAL_CURVE != 0);
+
+   return saturate(glow);
+}
