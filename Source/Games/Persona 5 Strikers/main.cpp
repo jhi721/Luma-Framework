@@ -322,6 +322,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    ID3D11DeviceContext* sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the scene's command lists
    std::atomic<bool> sr_active = false;
+   // A new upscaler output texture this frame (see the DLSS workaround after "Draw")
+   std::atomic<bool> sr_output_recreated = false;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_output_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_output_srv;
@@ -1520,6 +1522,7 @@ public:
                device_data->sr_output_color.reset();
                output_desc = {desc.Width, desc.Height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
                native_device->CreateTexture2D(&output_desc, nullptr, &device_data->sr_output_color);
+               game_device_data.sr_output_recreated = true;
             }
          }
          ID3D11Texture2D* const output_color = split.output_color ? split.output_color.get() : device_data->sr_output_color.get();
@@ -1563,6 +1566,15 @@ public:
             // DLAA writes back into the scene; upscaling leaves the output to the post process (see "RedirectPostDraw")
             if (!split.output_color)
                native_device_context->CopySubresourceRegion(split.source_color.get(), 0, 0, 0, 0, output_color, 0, nullptr);
+            // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame
+            // shows the texture's stale memory until its feature is created again after a draw. Settings changed once here force that at
+            // the next frame's "UpdateSettings".
+            if (game_device_data.sr_output_recreated.exchange(false) && device_data->sr_type == SR::Type::DLSS)
+            {
+               SR::SettingsData throwaway_settings_data = settings_data;
+               throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
+               sr_implementations[device_data->sr_type]->UpdateSettings(sr_instance_data, native_device_context.get(), throwaway_settings_data);
+            }
             device_data->has_drawn_sr = true;
          }
          else
@@ -2192,6 +2204,7 @@ public:
                   game_device_data.sr_upscaled_output.reset();
                   game_device_data.sr_upscaled_canvas_srv.reset();
                }
+               game_device_data.sr_output_recreated = created;
 #if DEVELOPMENT
                reshade::log::message(created ? reshade::log::level::info : reshade::log::level::warning, std::format("[P5S SR] upscaling {}x{} -> {}x{}{}", scene_desc.Width, scene_desc.Height, output_size.x, output_size.y, created ? "" : " failed").c_str());
 #endif
