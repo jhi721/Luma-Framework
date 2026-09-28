@@ -1,0 +1,54 @@
+// Katana engine bloom prefilter (Unity/Kino style): exposure, each tap capped at 5 (scaled by its max channel in max channel mode, else
+// clamped per channel), optional 5 tap median (anti-flicker), quadratic soft knee threshold. The next downsample is a Karis average.
+// Luma: scene samples are clamped >= 0, as the scene is upgraded from R11G11B10_FLOAT. The median's texel is the scene's from its size
+// instead of "g_vMainTexSize", as under DLSS/FSR upscaling the scene is output resolution (identical without upscaling).
+// clang-format off
+#include "Includes/Common.hlsl"
+#include "Includes/cbBloom.hlsl"
+// clang-format on
+
+SamplerState sampleLinear_s : register(s7);
+Texture2D<float4> g_tSceneMap : register(t0);
+Texture2D<float4> g_tExposureScaleInfo : register(t1);
+
+static const float SourceCap = 5.0;
+
+float3 Tap(float2 uv, float exposure)
+{
+   float3 color = clamp(g_tSceneMap.SampleLevel(sampleLinear_s, uv, 0).rgb, 0.0, FLT11_MAX) * exposure; // Luma: >= 0 too
+   const float maxChannel = max3(color);
+   if (g_vBloomInfo1.w > 0.0 && maxChannel > SourceCap)
+      color *= SourceCap / maxChannel;
+   return min(color, SourceCap);
+}
+
+float3 Median(float3 a, float3 b, float3 c)
+{
+   return a + b + c - min3(a, b, c) - max3(a, b, c);
+}
+
+void main(float4 v0 : SV_Position0, float2 v1 : TEXCOORD0, out float4 o0 : SV_Target0)
+{
+   const float exposure = g_vBloomInfo1.x < 0.0 ? g_tExposureScaleInfo.Load(int3(0, 0, 0)).x : (g_vBloomInfo1.x > 0.0 ? g_vBloomInfo1.x : 1.0);
+
+   float3 color;
+   if (g_vBloomInfo1.z > 0.0) // Anti-flicker: 5 tap median
+   {
+      float2 sceneSize;
+      g_tSceneMap.GetDimensions(sceneSize.x, sceneSize.y);
+      const float2 texel = 1.0 / sceneSize;
+      const float2 uv = v1 + texel * g_vBloomInfo1.y;
+      color = Median(Tap(uv - float2(texel.x, 0.0), exposure), Tap(uv, exposure), Tap(uv + float2(texel.x, 0.0), exposure));
+      color = Median(Tap(uv - float2(0.0, texel.y), exposure), color, Tap(uv + float2(0.0, texel.y), exposure));
+   }
+   else
+   {
+      color = Tap(v1, exposure);
+   }
+
+   const float thresholdInput = g_vBloomInfo1.w > 0.0 ? max3(color) : dot(color, P5S_PostWeights);
+   float rq = clamp(thresholdInput - g_vBloomInfo0.x, 0.0, g_vBloomInfo0.y);
+   rq = g_vBloomInfo0.z * rq * rq;
+   o0.rgb = color * (max(rq, thresholdInput - g_vBloomInfo0.w) / max(thresholdInput, 1e-5));
+   o0.a = 1.0;
+}
