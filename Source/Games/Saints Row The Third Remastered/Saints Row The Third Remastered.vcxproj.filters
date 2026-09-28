@@ -3,5 +3,9 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="..\..\Core\unity_build.cpp" />
+    <ClCompile Include="..\..\External\reshade\deps\minhook\src\buffer.c" />
+    <ClCompile Include="..\..\External\reshade\deps\minhook\src\hook.c" />
+    <ClCompile Include="..\..\External\reshade\deps\minhook\src\trampoline.c" />
+    <ClCompile Include="..\..\External\reshade\deps\minhook\src\hde\hde64.c" />
   </ItemGroup>
 </Project>
