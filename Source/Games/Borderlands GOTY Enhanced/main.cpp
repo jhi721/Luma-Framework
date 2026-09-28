@@ -27,6 +27,7 @@
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
+#include "..\..\Core\includes\patched_draws.h"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 
 // FXAA is a compute work-queue implementation (FXAA 3.11 CS):
@@ -463,15 +464,8 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    uint32_t mv_last_vertex_shader_translation = UINT_MAX;
    uint32_t mv_last_pixel_shader_hash = 0;
    ID3D11PixelShader* mv_last_pixel_shader = nullptr;
-   // A patched shader left bound after its draw, with the game's shader it replaced (see "BindPatchedShader")
-   template <typename T>
-   struct BoundShader
-   {
-      T* patched = nullptr;
-      com_ptr<T> game;
-   };
-   BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
-   BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
+   PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
+   PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
 
    // CPU copies of the b0 / b1 / b3 buffers the motion vector draws bind, by buffer (an entry registers it, null until its first
    // update): the engine uploads every one with UpdateSubresource (whole buffer, only when a constant changed), so a draw's constants
@@ -479,15 +473,8 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
    std::mutex mv_constants_mutex;
    std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
-   // The previous frame's b0 / b1 / b3 uploads, by "MotionVectorPatches::previous_slots" index: one dynamic buffer written in order
-   // without renaming and bound at an offset (D3D11.1 constant buffer offsetting), restarted with a discard when full; without device
-   // support, a dynamic buffer per slot, renamed at every upload
-   static constexpr UINT mv_ring_size = 4 << 20;
-   com_ptr<ID3D11Buffer> mv_ring;
-   ID3D11DeviceContext1* mv_ring_context = nullptr;
-   UINT mv_ring_offset = 0;
-   bool mv_ring_checked = false;
-   com_ptr<ID3D11Buffer> mv_previous_buffers[std::size(MotionVectorPatches::previous_slots)];
+   // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
+   PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with the LocalToWorld translation and b0 / b1 / b3. A draw takes
    // the previous frame's constants of its key's nearest draw (same object, a frame earlier), its camera included: the first person
    // weapon draws with a camera of its own.
@@ -759,26 +746,6 @@ class BorderlandsGoty final : public Game
    }
 #endif
 
-   // Writes a dynamic constant buffer, (re)created at the data's size; false if it can't
-   static bool WriteConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, com_ptr<ID3D11Buffer>* buffer, const void* data, UINT size)
-   {
-      D3D11_BUFFER_DESC desc = {};
-      if (*buffer)
-         (*buffer)->GetDesc(&desc);
-      if (desc.ByteWidth != size)
-      {
-         buffer->reset();
-         desc = {size, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-         native_device->CreateBuffer(&desc, nullptr, &(*buffer));
-      }
-      D3D11_MAPPED_SUBRESOURCE mapped;
-      if (!*buffer || FAILED(native_device_context->Map(buffer->get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-         return false;
-      std::memcpy(mapped.pData, data, size);
-      native_device_context->Unmap(buffer->get(), 0);
-      return true;
-   }
-
    // XeGTAO noise per frame and one denoise pass (Intel's XeGTAO.h with TAA) while DLSS / FSR accumulate the lit scene the AO multiplies
    // into; without them a moving pattern would boil, so it stays frozen and denoises twice
    static bool IsGTAOTemporal(DeviceData& device_data)
@@ -791,73 +758,6 @@ class BorderlandsGoty final : public Game
    static bool IsSRActive(DeviceData& device_data)
    {
       return GetGameDeviceData(device_data).sr_active;
-   }
-
-   // Binds a motion vector draw's previous b0 / b1 / b3 at "MotionVectorPatches::previous_slots": each upload (null: the draw's
-   // current buffer, zero motion) in the ring when the device supports constant buffer offsets, else in its own renamed buffer
-   static void BindPreviousConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, BorderlandsGotyGameDeviceData* game_device_data, const std::vector<uint8_t>* const (&uploads)[std::size(MotionVectorPatches::previous_slots)], ID3D11Buffer* const (&current)[std::size(MotionVectorPatches::previous_slots)])
-   {
-      constexpr size_t count = std::size(MotionVectorPatches::previous_slots);
-      if (!std::exchange(game_device_data->mv_ring_checked, true))
-      {
-         D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
-         com_ptr<ID3D11DeviceContext1> context1;
-         const D3D11_BUFFER_DESC desc = {BorderlandsGotyGameDeviceData::mv_ring_size, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-         if (SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options))) && options.ConstantBufferOffsetting && options.MapNoOverwriteOnDynamicConstantBuffer && SUCCEEDED(native_device_context->QueryInterface(&context1)) && SUCCEEDED(native_device->CreateBuffer(&desc, nullptr, &game_device_data->mv_ring)))
-         {
-            // Not referenced: the immediate context lives as long as the device (holding it would keep the device alive)
-            game_device_data->mv_ring_context = context1.get();
-            game_device_data->mv_ring_offset = BorderlandsGotyGameDeviceData::mv_ring_size; // The first write discards
-         }
-         reshade::log::message(reshade::log::level::info, std::format("[BL MV] previous constants {}", game_device_data->mv_ring ? "in a ring (constant buffer offsets)" : "in renamed buffers (no constant buffer offsets)").c_str());
-      }
-
-      ID3D11Buffer* buffers[count];
-      UINT sizes[count] = {};
-      UINT total = 0;
-      for (size_t i = 0; i < count; i++)
-      {
-         buffers[i] = current[i];
-         // "FirstConstant" and "NumConstants" are multiples of 16 constants (256 bytes)
-         if (uploads[i])
-            total += sizes[i] = (UINT(uploads[i]->size()) + 255u) & ~255u;
-      }
-      if (game_device_data->mv_ring && total != 0 && total <= BorderlandsGotyGameDeviceData::mv_ring_size)
-      {
-         const bool restart = game_device_data->mv_ring_offset + total > BorderlandsGotyGameDeviceData::mv_ring_size;
-         D3D11_MAPPED_SUBRESOURCE mapped;
-         if (SUCCEEDED(native_device_context->Map(game_device_data->mv_ring.get(), 0, restart ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped)))
-         {
-            UINT offset = restart ? 0u : game_device_data->mv_ring_offset;
-            UINT first_constants[count], constant_counts[count];
-            for (size_t i = 0; i < count; i++)
-            {
-               if (!uploads[i])
-                  continue;
-               std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, uploads[i]->data(), uploads[i]->size());
-               first_constants[i] = offset / 16;
-               constant_counts[i] = sizes[i] / 16;
-               offset += sizes[i];
-            }
-            native_device_context->Unmap(game_device_data->mv_ring.get(), 0);
-            game_device_data->mv_ring_offset = offset;
-            ID3D11Buffer* const ring = game_device_data->mv_ring.get();
-            for (size_t i = 0; i < count; i++)
-            {
-               if (uploads[i])
-                  game_device_data->mv_ring_context->VSSetConstantBuffers1(MotionVectorPatches::previous_slots[i].second, 1, &ring, &first_constants[i], &constant_counts[i]);
-               else
-                  native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_slots[i].second, 1, &buffers[i]);
-            }
-            return;
-         }
-      }
-      for (size_t i = 0; i < count; i++)
-      {
-         if (uploads[i] && WriteConstants(native_device, native_device_context, std::addressof(game_device_data->mv_previous_buffers[i]), uploads[i]->data(), UINT(uploads[i]->size())))
-            buffers[i] = game_device_data->mv_previous_buffers[i].get();
-         native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_slots[i].second, 1, &buffers[i]);
-      }
    }
 
    // A b0 / b1 / b3 buffer's CPU copy (null until its first update); registers it for a copy at every update. Under "mv_constants_mutex".
@@ -1023,50 +923,6 @@ class BorderlandsGoty final : public Game
       return game_device_data.mv_last_vertex_shader;
    }
 
-   template <typename T>
-   static com_ptr<T> GetBoundShader(ID3D11DeviceContext* native_device_context)
-   {
-      com_ptr<T> shader;
-      if constexpr (std::is_same_v<T, ID3D11VertexShader>)
-         native_device_context->VSGetShader(&shader, nullptr, nullptr);
-      else
-         native_device_context->PSGetShader(&shader, nullptr, nullptr);
-      return shader;
-   }
-   template <typename T>
-   static void SetBoundShader(ID3D11DeviceContext* native_device_context, T* shader)
-   {
-      if constexpr (std::is_same_v<T, ID3D11VertexShader>)
-         native_device_context->VSSetShader(shader, nullptr, 0);
-      else
-         native_device_context->PSSetShader(shader, nullptr, 0);
-   }
-
-   // Binds a patched shader and leaves it bound after the draw (set directly, bypassing Core's state tracking). If the game hasn't
-   // bound another since, the next draw has the same original shader: it binds it again (a no-op) or puts the game's back first.
-   template <typename T>
-   static void BindPatchedShader(ID3D11DeviceContext* native_device_context, T* patched, BorderlandsGotyGameDeviceData::BoundShader<T>* bound)
-   {
-      com_ptr<T> current = GetBoundShader<T>(native_device_context);
-      if (current.get() == patched)
-         return;
-      bound->game = std::move(current);
-      bound->patched = patched;
-      SetBoundShader(native_device_context, patched);
-   }
-
-   // Puts the game's shader back where a patched one is still bound, before a draw that must not use it
-   template <typename T>
-   static void RestoreGameShader(ID3D11DeviceContext* native_device_context, BorderlandsGotyGameDeviceData::BoundShader<T>* bound)
-   {
-      if (!bound->patched)
-         return;
-      if (GetBoundShader<T>(native_device_context).get() == bound->patched)
-         SetBoundShader(native_device_context, bound->game.get());
-      bound->patched = nullptr;
-      bound->game.reset();
-   }
-
    // Opens the scene at the frame's first mesh draw into output sized depth (the world depth prepass): takes the scene depth and
    // picks the jitter the whole scene draws with. Once per present (the HUD and later passes never reopen it).
    static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash, ID3D11DepthStencilView* dsv)
@@ -1100,7 +956,7 @@ class BorderlandsGoty final : public Game
       game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
       game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / device_data.output_resolution.x, game_device_data.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
-      if (!WriteConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
       {
          // No stale jitter on the scene draws either: no motion vectors this frame
          game_device_data.mv_jitter = {};
@@ -1356,7 +1212,7 @@ class BorderlandsGoty final : public Game
          game_device_data.mv_stats.uncopied++;
       }
 #endif
-      BindPreviousConstants(native_device, native_device_context, &game_device_data, uploads, current);
+      game_device_data.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, uploads, current, "BL");
       ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
       // Left bound after the draw (set directly, bypassing Core's state tracking): the game's next draws either bind their own
@@ -1368,8 +1224,8 @@ class BorderlandsGoty final : public Game
          targets[MotionVectorPatches::target_slot] = game_device_data.mv_rtv.get();
          native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
       }
-      BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
-      BindPatchedShader(native_device_context, pixel_shader, &game_device_data.mv_bound_pixel_shader);
+      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
+      PatchedDraws::BindPatchedShader(native_device_context, pixel_shader, &game_device_data.mv_bound_pixel_shader);
 
       draw();
 #if DEVELOPMENT
@@ -1426,10 +1282,10 @@ class BorderlandsGoty final : public Game
 
       // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel shader
       // (a motion vector draw's is put back)
-      BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
+      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
       ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
-      RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
+      PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
       draw();
 #if DEVELOPMENT
       game_device_data.mv_stats.jitter_draws++;
@@ -1639,7 +1495,7 @@ class BorderlandsGoty final : public Game
             constants[i] = float(reprojection.GetData()[i]);
          constants[16] = game_device_data.mv_jitter_ndc[0];
          constants[17] = game_device_data.mv_jitter_ndc[1];
-         if (WriteConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
+         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
          {
             // The depth may be bound as the depth target, and the motion vectors as a render target
             native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1931,8 +1787,8 @@ public:
       }
 
       // Every draw without a patched shader: the game's own, if the last patched draw's are still bound
-      RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
-      RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
+      PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
+      PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
 
       // DLSS / FSR: the DOF/Bloom gather takes its DOF amount from a per pixel history, updated in the same pass (the jittered depth
       // flipped whole blocks, see Luma_BL_DOFGather.hlsl)
@@ -1966,7 +1822,7 @@ public:
          // The upscaled scene (bound above) and the game's depth (the last copy, before the first person weapon)
          com_ptr<ID3D11ShaderResourceView> game_srvs[2];
          native_device_context->CSGetShaderResources(0, UINT(std::size(game_srvs)), &game_srvs[0]);
-         if (gather_shader && gd.dof_history_srvs[previous] && gd.dof_history_uavs[next] && gd.mv_srv && game_srvs[1] && WriteConstants(native_device, native_device_context, std::addressof(gd.dof_history_cb), constants, sizeof(constants)))
+         if (gather_shader && gd.dof_history_srvs[previous] && gd.dof_history_uavs[next] && gd.mv_srv && game_srvs[1] && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.dof_history_cb), constants, sizeof(constants)))
          {
             com_ptr<ID3D11UnorderedAccessView> target_uav;
             native_device_context->CSGetUnorderedAccessViews(0, 1, &target_uav);
@@ -2118,7 +1974,7 @@ public:
 #endif
             // The last is the noise index
             const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f};
-            if (!WriteConstants(native_device, native_device_context, std::addressof(gd.cb_gtao), knobs, sizeof(knobs)))
+            if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_gtao), knobs, sizeof(knobs)))
                return DrawOrDispatchOverrideType::None;
 
             gd.srv_gtao_depth = srv_d;
@@ -2297,7 +2153,7 @@ public:
                native_device->CreateShaderResourceView(gd.tex_pred.get(), nullptr, gd.srv_pred.put());
             }
             const float pp[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
-            pred_ok = gd.uav_pred && gd.srv_pred && WriteConstants(native_device, native_device_context, std::addressof(gd.cb_pred), pp, sizeof(pp));
+            pred_ok = gd.uav_pred && gd.srv_pred && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_pred), pp, sizeof(pp));
          }
          const float pred_scale = pred_ok ? 2.f : 1.f;
 
@@ -2308,7 +2164,7 @@ public:
             return DrawOrDispatchOverrideType::None;
 
          const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, 0.f, 0.f, 0.f};
-         if (smaa && !WriteConstants(native_device, native_device_context, std::addressof(gd.cb_smaa_metrics), metrics, sizeof(metrics)))
+         if (smaa && !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_smaa_metrics), metrics, sizeof(metrics)))
             return DrawOrDispatchOverrideType::None;
 
          // (Re)create the SMAA output temp (fp16, SRV+RTV).
@@ -2428,7 +2284,7 @@ public:
             if (!gd.tex_rcas_out && CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, std::addressof(gd.tex_rcas_out)))
                native_device->CreateRenderTargetView(gd.tex_rcas_out.get(), nullptr, gd.tex_rcas_out_rtv.put());
             const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-            do_sharpen = gd.tex_rcas_out_rtv && WriteConstants(native_device, native_device_context, std::addressof(gd.cb_sharpen), sp, sizeof(sp));
+            do_sharpen = gd.tex_rcas_out_rtv && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_sharpen), sp, sizeof(sp));
          }
 
          if (do_sharpen)
