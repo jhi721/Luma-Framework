@@ -70,6 +70,7 @@ EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Shenmue I & II", "Source\Games\Shenmue I & II\Shenmue I & II.vcxproj", "{039E634A-718A-4C4A-AE7C-706BABC5212B}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Saints Row IV Re-Elected", "Source\Games\Saints Row IV Re-Elected\Saints Row IV Re-Elected.vcxproj", "{33BB6556-9FBE-4F1A-880A-FE90DB1C2603}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Saints Row The Third and Gat out of Hell", "Source\Games\Saints Row The Third and Gat out of Hell\Saints Row The Third and Gat out of Hell.vcxproj", "{D5FC2D39-9270-4281-B68E-92EAF35B3E25}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Persona 5 Strikers", "Source\Games\Persona 5 Strikers\Persona 5 Strikers.vcxproj", "{6B881B14-5753-4C01-B3FD-EC5B471722E5}"
 EndProject
