@@ -290,7 +290,7 @@ namespace SRBridge
       {
          // A dead process's fences read UINT64_MAX, so no GPU wait is left hanging
          if (WaitForSingleObject(custom_data.process, 0) == WAIT_OBJECT_0 || custom_data.fences[1]->GetCompletedValue() == UINT64_MAX)
-            return custom_data.Fail("the helper exited (see sr_bridge.log next to the game's exe)");
+            return custom_data.Fail("the helper exited (see Luma-Upscaler.log next to the game's exe)");
          if (!std::equal(std::begin(resources), std::end(resources), std::begin(custom_data.sources)))
             custom_data.Stop(); // Recreated: the helper restarts on them
       }

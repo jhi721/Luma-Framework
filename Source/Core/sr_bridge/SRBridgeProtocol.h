@@ -2,9 +2,9 @@
 
 #include <cstdint>
 
-// The protocol between a 32-bit game's SR bridge ("SRBridge.h") and the x64 "sr_bridge_helper.exe" next to the game's exe
+// The protocol between a 32-bit game's SR bridge ("SRBridge.h") and the x64 "Luma-Upscaler.exe" next to the game's exe
 // (Source/Tools/SR Bridge Helper), which runs DLSS or FSR 3 (both x64 only) on NT-handle shared textures between two shared fences.
-// Text lines over the helper's stdin, its stdout and stderr go to "sr_bridge.log" next to the exe.
+// Text lines over the helper's stdin, its stdout and stderr go to "Luma-Upscaler.log" next to the exe.
 //
 // Start line: "bridge <version> <upscaler> <luid low> <luid high> <render width> <render height> <output width> <output height>
 //   <hdr> <inverted depth> <jittered motion vectors> <auto exposure> <dynamic resolution> <motion vector scale x> <motion vector scale y>
@@ -16,8 +16,8 @@ namespace SRBridgeProtocol
 {
    constexpr int kVersion = 2;
 
-   constexpr const wchar_t* kHelperName = L"sr_bridge_helper.exe";
-   constexpr const wchar_t* kLogName = L"sr_bridge.log";
+   constexpr const wchar_t* kHelperName = L"Luma-Upscaler.exe";
+   constexpr const wchar_t* kLogName = L"Luma-Upscaler.log";
 
    enum Upscaler
    {

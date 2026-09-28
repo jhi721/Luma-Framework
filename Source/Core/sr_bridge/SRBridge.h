@@ -2,7 +2,7 @@
 
 #include "../includes/super_resolution.h"
 
-// DLSS and FSR 3 for 32-bit games: both are x64 only, so they run in "sr_bridge_helper.exe" next to the game's exe
+// DLSS and FSR 3 for 32-bit games: both are x64 only, so they run in "Luma-Upscaler.exe" next to the game's exe
 // (Source/Tools/SR Bridge Helper) on shared copies of the inputs. Games opt in with "UseLumaSRBridge" (their package then
 // ships the helper and DLSS's dll), and use it like the in-process implementations.
 #if defined(_WIN64) || !defined(ENABLE_SR_BRIDGE)
