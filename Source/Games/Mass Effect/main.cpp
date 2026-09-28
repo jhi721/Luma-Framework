@@ -7,7 +7,6 @@
 
 #define GAME_MASS_EFFECT 1
 
-#define ENABLE_NGX 0 // NGX and FSR 3 are x64-only and the game is 32-bit: both run in the x64 helper (see "DrawBridge").
 #define GEOMETRY_SHADER_SUPPORT 0
 // The game ships no AA at all (no option, no post AA pass, sampleCount 1), so SMAA adds rather than replaces.
 #define ENABLE_SMAA 1
@@ -21,7 +20,6 @@
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
-#include "SRBridgeProtocol.h"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 #include <unordered_set>
 
@@ -90,7 +88,7 @@ struct PerfTestMode
 {
    const char* name;
    bool set_aa = false; // Else the current settings (the fields below too)
-   SR::UserType sr_user_type = SR::UserType::None;
+   SR::Type sr_type = SR::Type::None;
    bool smaa = false;
    bool reactive_mask = false;
    int motion_vector_draws = 2; // 2 patched (motion vectors and jitter), 1 jitter only, 0 untouched (unjittered)
@@ -98,13 +96,13 @@ struct PerfTestMode
 constexpr PerfTestMode perf_test_modes[] = {
    {"Off"},
    {"Current Settings"},
-   {"DLSS + Reactive Mask", true, SR::UserType::DLSS, false, true},
-   {"FSR 3 + Reactive Mask", true, SR::UserType::FSR_3, false, true},
-   {"FSR 3", true, SR::UserType::FSR_3},
-   {"FSR 3 Jitter Only", true, SR::UserType::FSR_3, false, false, 1},
-   {"FSR 3 Without Motion Vector Draws", true, SR::UserType::FSR_3, false, false, 0},
-   {"SMAA", true, SR::UserType::None, true},
-   {"No AA", true, SR::UserType::None, false},
+   {"DLSS + Reactive Mask", true, SR::Type::DLSS, false, true},
+   {"FSR 3 + Reactive Mask", true, SR::Type::FSR, false, true},
+   {"FSR 3", true, SR::Type::FSR},
+   {"FSR 3 Jitter Only", true, SR::Type::FSR, false, false, 1},
+   {"FSR 3 Without Motion Vector Draws", true, SR::Type::FSR, false, false, 0},
+   {"SMAA", true, SR::Type::None, true},
+   {"No AA", true, SR::Type::None, false},
 };
 // "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a
 // median per mode against the last one ("No AA")
@@ -146,9 +144,6 @@ static constexpr uint32_t kLumaBloomSlot = 6;
 static constexpr float g_bloom_sigmas[] = {1.5f, 2.f, 2.f, 2.f, 1.f, 0.5f};
 
 static bool g_hide_ui = false; // session-only, never persisted
-// Core's "Super Resolution" setting, which this 32-bit game doesn't get (DLSS and FSR 3 are 64-bit only): both run in the x64
-// helper (see "DrawBridge")
-static SR::UserType g_sr_user_type = SR::UserType::Auto;
 // ReShade's runtime for "Take Screenshot" (the settings callback isn't given it)
 static reshade::api::effect_runtime* g_effect_runtime = nullptr;
 #if ENABLE_SMAA
@@ -228,14 +223,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> srv_scene;
 
    // ---- DLAA / FSR Native AA (BL GOTY's motion vector path, one per-draw buffer: dgVoodoo's vc4) ----
-   // Core's own SR state is compiled out in this 32-bit game (no in-process DLSS or FSR): the upscaler's lives here.
-   // "IsSRActive", taken at present: the "Super Resolution" selection changes after it, mid frame for the draws
+   // DLSS and FSR run in the x64 helper of Core's SR bridge (the game is 32-bit, see "SRBridge.h").
+   // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the draws
    bool sr_active = false;
-   std::atomic<bool> sr_drawn = false; // The upscaler drew this frame
-   std::atomic<bool> sr_reset = false; // Its history restarts (it didn't draw the last frame)
    // The upscaler's output goes back into the scene without its alpha (the linear depth the post passes read), drawn from this
    // view of it
-   com_ptr<ID3D11Texture2D> sr_output_color;
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
    // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
@@ -268,7 +260,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::chrono::steady_clock::time_point perf_last_present;
    std::atomic<int64_t> perf_hook_ns = 0; // This log window's
    // The user's anti-aliasing while a mode that sets its own runs
-   SR::UserType perf_user_sr_user_type = SR::UserType::None;
+   SR::Type perf_user_sr_type = SR::Type::None;
    bool perf_user_smaa = false;
    bool perf_user_reactive_mask = true;
    // "Sweep": the step over all rounds, the log windows done in it, and per mode each window's GPU frame, scene, end, hook and CPU
@@ -308,25 +300,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11RenderTargetView> mv_reactive_target_rtv;
    com_ptr<ID3D11ShaderResourceView> mv_reactive_target_srv;
    com_ptr<ID3D11Resource> mv_depth; // The scene depth (the depth view's resource)
-   // DLSS or FSR 3 through the x64 helper (see "DrawBridge")
-   struct SRBridge
-   {
-      com_ptr<ID3D11Texture2D> color;         // The scene's copy
-      com_ptr<ID3D11Fence> fences[2];         // "in": a frame's inputs done, "out": its output done (first its ready value)
-      com_ptr<ID3D11DeviceContext4> context4; // The immediate context's, for the fences
-      // What the helper opened, by "SRBridgeProtocol::Resource" (it restarts when one is recreated)
-      com_ptr<ID3D11Resource> inputs[SRBridgeProtocol::kCount];
-      HANDLE process = nullptr;
-      HANDLE pipe = nullptr;                       // The helper's stdin: a line per frame
-      SR::UserType user_type = SR::UserType::None; // What it was started for
-      SR::Type type = SR::Type::None;              // What it runs, once ready
-      uint64_t frame = 0;                          // The last frame's fence value (past the ready value)
-      bool failed = false;                         // Missing or dead: SMAA until the setting is changed
-      bool Ready() const
-      {
-         return fences[1] && fences[1]->GetCompletedValue() >= 1;
-      }
-   } sr_bridge;
    // The fp16 scene the motion vector draws write, and the game's view of it (the upscaler's copy back)
    com_ptr<ID3D11Resource> mv_scene_color;
    com_ptr<ID3D11RenderTargetView> mv_scene_rtv;
@@ -1268,10 +1241,10 @@ class MassEffect final : public Game
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
       gd.mv_reactive_blend = 0;
-      // Halton (2, 3) over 8 phases (FSR's count at native resolution), once the helper runs the upscaler (until then SMAA
-      // draws, on an unjittered scene); pixels to NDC (y up)
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % SR::GetDefaultJitterPhases();
-      gd.mv_jitter = ((IsSRActive(device_data) && gd.sr_bridge.Ready()) || g_mv_force_jitter) && !g_mv_disable_jitter && GetPerfMotionVectorDraws() != 0
+      // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
+      const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
+      const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
+      gd.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter && GetPerfMotionVectorDraws() != 0
                         ? std::array<float, 2>{SR::HaltonSequence(phase, 2),
                              SR::HaltonSequence(phase, 3)}
                         : std::array<float, 2>{};
@@ -1297,7 +1270,7 @@ class MassEffect final : public Game
 #define MV_REJECT(reason) false
 #endif
 
-   // A texture the bridge can hand to its helper (NT handle shared), else a plain one
+   // A texture Core's SR bridge hands to its helper as is (NT handle shared), else a plain one (it copies those)
    static HRESULT CreateSharableTexture(ID3D11Device* native_device, D3D11_TEXTURE2D_DESC desc, ID3D11Texture2D** texture)
    {
       desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
@@ -1760,247 +1733,10 @@ class MassEffect final : public Game
       return {a, double(view_projection[14]) - a * view_projection[15]};
    }
 
-   // Ends the helper (its stdin's EOF ends it) and resets the bridge. "failed":
-   // SMAA until the setting is changed.
-   static void StopBridge(MassEffectGameDeviceData& gd, const char* reason,
-      bool failed)
-   {
-      auto& bridge = gd.sr_bridge;
-      if (bridge.pipe)
-         CloseHandle(bridge.pipe);
-      if (bridge.process)
-      {
-         if (WaitForSingleObject(bridge.process, 2000) != WAIT_OBJECT_0)
-         {
-            TerminateProcess(bridge.process, 0);
-            WaitForSingleObject(bridge.process, 1000);
-         }
-         CloseHandle(bridge.process);
-      }
-      bridge = {};
-      bridge.failed = failed;
-      reshade::log::message(failed ? reshade::log::level::warning
-                                   : reshade::log::level::info,
-         (std::string("[ME1 SR Bridge] ") + reason).c_str());
-   }
-
-   // DLSS (DLAA) or FSR 3 (native AA) through the x64 helper
-   // (docs/DLSS-x86-Out-Of-Process-Research.md: this process is 32-bit, NGX and
-   // the DX11 FSR 3 libraries are x64 only). "sr_bridge_helper.exe" next to the
-   // exe (_tools/dlss_x86_bridge/helper.cpp, "bridge" mode) opens the scene's
-   // copy, the motion vectors, depth, masks and the output texture (created
-   // shareable) through NT handles, creates the upscaler ("Auto": DLSS, else FSR
-   // 3) and runs it between two shared fences: "out" first at its ready value,
-   // then a frame's inputs done at "in" n, its output at "out" n, which the
-   // immediate context waits for on the GPU. Same frame, not pipelined: the post
-   // passes read the depth in the scene's alpha, a frame late color would not
-   // match it. False until the helper is ready, and for good once it's missing or
-   // dies (a dead process's fences read UINT64_MAX, so no wait is left hanging).
-   static bool DrawBridge(ID3D11Device* native_device,
-      ID3D11DeviceContext* native_device_context,
-      DeviceData& device_data, ID3D11Texture2D* scene,
-      const SR::SuperResolutionImpl::DrawData& draw_data)
-   {
-      auto& gd = GetGameDeviceData(device_data);
-      auto& bridge = gd.sr_bridge;
-      const auto stop = [&](const char* reason, bool failed)
-      {
-         StopBridge(gd, reason, failed);
-         return false;
-      };
-      if (bridge.failed)
-         return false;
-      if (bridge.process &&
-          (WaitForSingleObject(bridge.process, 0) == WAIT_OBJECT_0 ||
-             bridge.fences[1]->GetCompletedValue() == UINT64_MAX))
-         return stop("the helper exited (see sr_bridge.log next to the exe): SMAA "
-                     "from now on",
-            true);
-      using namespace SRBridgeProtocol;
-      ID3D11Resource* shared[kCount] = {};
-      shared[kMotion] = draw_data.motion_vectors;
-      shared[kDepth] = draw_data.depth_buffer;
-      shared[kReactive] = gd.mv_reactive.get();
-      shared[kOutput] = draw_data.output_color;
-      shared[kTransparency] = gd.mv_transparency.get();
-      if (bridge.process)
-      {
-         if (bridge.user_type != g_sr_user_type)
-            stop("the setting changed: restarting the helper", false);
-         for (size_t i = 0; bridge.process && i < kCount; i++)
-         {
-            if (i != kColor && shared[i] != bridge.inputs[i].get())
-               stop("inputs recreated: restarting the helper", false);
-         }
-      }
-      if (!bridge.process)
-      {
-         com_ptr<ID3D11Device5> device5;
-         native_device->QueryInterface(&device5);
-         native_device_context->QueryInterface(&bridge.context4);
-         if (!device5 || !bridge.context4)
-            return stop("no D3D11 fences on this device", true);
-         D3D11_TEXTURE2D_DESC scene_desc;
-         scene->GetDesc(&scene_desc);
-         const CD3D11_TEXTURE2D_DESC color_desc(
-            DXGI_FORMAT_R16G16B16A16_FLOAT, scene_desc.Width, scene_desc.Height, 1,
-            1, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, 1, 0,
-            D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
-         if (FAILED(native_device->CreateTexture2D(&color_desc, nullptr,
-                &bridge.color)))
-            return stop("the scene's copy can't be shared", true);
-         shared[kColor] = bridge.color.get();
-         HANDLE handles[kCount + 2] = {}; // The textures', then the fences'
-         const auto close_handles = [&]
-         {
-            for (HANDLE handle : handles)
-               if (handle)
-                  CloseHandle(handle);
-         };
-         for (size_t i = 0; i < kCount; i++)
-         {
-            com_ptr<IDXGIResource1> dxgi_resource;
-            if (shared[i] &&
-                (FAILED(shared[i]->QueryInterface(&dxgi_resource)) ||
-                   FAILED(dxgi_resource->CreateSharedHandle(
-                      nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                      nullptr, &handles[i]))))
-            {
-               close_handles();
-               return stop("an input isn't shareable", true);
-            }
-         }
-         for (size_t i = 0; i < std::size(bridge.fences); i++)
-         {
-            if (FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
-                   IID_PPV_ARGS(&bridge.fences[i]))) ||
-                FAILED(bridge.fences[i]->CreateSharedHandle(
-                   nullptr, GENERIC_ALL, nullptr,
-                   &handles[kCount + i])))
-            {
-               close_handles();
-               return stop("no shared fences", true);
-            }
-         }
-         com_ptr<IDXGIDevice> dxgi_device;
-         com_ptr<IDXGIAdapter> adapter;
-         DXGI_ADAPTER_DESC adapter_desc = {};
-         if (SUCCEEDED(native_device->QueryInterface(&dxgi_device)) &&
-             SUCCEEDED(dxgi_device->GetAdapter(&adapter)))
-            adapter->GetDesc(&adapter_desc);
-
-         // The helper next to the exe: its stdin a pipe, its output "sr_bridge.log"
-         // there
-         const std::filesystem::path directory = System::GetModulePath().parent_path();
-         const std::filesystem::path helper_path = directory / "sr_bridge_helper.exe";
-         SECURITY_ATTRIBUTES inherit = {sizeof(inherit), nullptr, TRUE};
-         HANDLE pipe_read = nullptr;
-         const HANDLE log_file =
-            CreateFileW((directory / "sr_bridge.log").c_str(),
-               GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit,
-               CREATE_ALWAYS, 0, nullptr);
-         const DWORD log_error =
-            log_file == INVALID_HANDLE_VALUE ? GetLastError() : 0;
-         PROCESS_INFORMATION process = {};
-         if (log_file != INVALID_HANDLE_VALUE &&
-             CreatePipe(&pipe_read, &bridge.pipe, &inherit, 0))
-         {
-            SetHandleInformation(bridge.pipe, HANDLE_FLAG_INHERIT, 0);
-            STARTUPINFOW startup = {sizeof(startup)};
-            startup.dwFlags = STARTF_USESTDHANDLES;
-            startup.hStdInput = pipe_read;
-            startup.hStdOutput = startup.hStdError = log_file;
-            std::wstring command = L"\"" + helper_path.wstring() + L"\"";
-            if (CreateProcessW(helper_path.c_str(), command.data(), nullptr, nullptr,
-                   TRUE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup,
-                   &process))
-            {
-               CloseHandle(process.hThread);
-               bridge.process = process.hProcess;
-            }
-            else
-            {
-               CloseHandle(bridge.pipe);
-               bridge.pipe = nullptr;
-            }
-         }
-         for (HANDLE handle : {pipe_read, log_file})
-            if (handle && handle != INVALID_HANDLE_VALUE)
-               CloseHandle(handle);
-         if (!bridge.process)
-         {
-            close_handles();
-            return stop(std::format("the helper couldn't start (log file error {}, "
-                                    "process error {}): {}",
-                           log_error, GetLastError(), helper_path.string())
-                           .c_str(),
-               true);
-         }
-         std::string message = std::format(
-            "bridge {} {} {} {} 0", adapter_desc.AdapterLuid.LowPart,
-            adapter_desc.AdapterLuid.HighPart, scene_desc.Width, scene_desc.Height);
-         for (HANDLE handle : handles)
-         {
-            HANDLE remote = nullptr;
-            if (handle)
-               DuplicateHandle(GetCurrentProcess(), handle, bridge.process, &remote, 0,
-                  FALSE, DUPLICATE_SAME_ACCESS);
-            message += std::format(" {}", uint64_t(uintptr_t(remote)));
-         }
-         message += std::format(" 0 0 0 {}\n", int(g_sr_user_type));
-         close_handles();
-         DWORD written = 0;
-         if (!WriteFile(bridge.pipe, message.data(), DWORD(message.size()), &written,
-                nullptr))
-            return stop("the helper's pipe broke", true);
-         for (size_t i = 0; i < kCount; i++)
-            bridge.inputs[i] = shared[i];
-         bridge.user_type = g_sr_user_type;
-         reshade::log::message(
-            reshade::log::level::info,
-            ("[ME1 SR Bridge] helper started: " + helper_path.string()).c_str());
-         return false;
-      }
-      if (bridge.type == SR::Type::None)
-      {
-         const uint64_t ready = bridge.fences[1]->GetCompletedValue();
-         if (ready < kReadyDlss)
-            return false; // Still creating the upscaler: SMAA meanwhile
-         bridge.type = ready == kReadyFsr ? SR::Type::FSR : SR::Type::DLSS;
-         bridge.frame = ready;
-         reshade::log::message(reshade::log::level::info,
-            bridge.type == SR::Type::DLSS
-               ? "[ME1 SR Bridge] running DLSS"
-               : "[ME1 SR Bridge] running FSR 3");
-      }
-
-      native_device_context->CopyResource(bridge.color.get(), scene);
-      const uint64_t frame = ++bridge.frame;
-      bridge.context4->Signal(bridge.fences[0].get(), frame);
-      native_device_context->Flush();
-      // FSR's transparency & composition mask: 1 its own, 2 the reactive one in its
-      // place
-      const int transparency =
-         !draw_data.transparency_alpha
-            ? 0
-            : (draw_data.transparency_alpha == draw_data.bias_mask ? 2 : 1);
-      const std::string line = std::format(
-         "{} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x,
-         draw_data.jitter_y, draw_data.reset ? 1 : 0, draw_data.bias_mask ? 1 : 0,
-         transparency, draw_data.near_plane, draw_data.far_plane,
-         draw_data.vert_fov);
-      DWORD written = 0;
-      if (!WriteFile(bridge.pipe, line.data(), DWORD(line.size()), &written,
-             nullptr))
-         return stop("the helper's pipe broke: SMAA from now on", true);
-      bridge.context4->Wait(bridge.fences[1].get(), frame);
-      return true;
-   }
-
    // DLAA or FSR 3 Native AA on the jittered scene, its depth (from its alpha, see the fill)
    // and the motion vectors; the result goes back into the scene's color, its
    // alpha (the post passes' linear depth) kept. False if it didn't draw (missing
-   // input, or the helper not ready or failed). "reactive_mask": the fill wrote this scene's mask.
+   // input, or the upscaler failed). "reactive_mask": the fill wrote this scene's mask.
    static bool DrawUpscaler(ID3D11Device* native_device,
       ID3D11DeviceContext* native_device_context,
       DeviceData& device_data, bool reactive_mask)
@@ -2019,23 +1755,30 @@ class MassEffect final : public Game
          return false;
       D3D11_TEXTURE2D_DESC scene_desc;
       scene->GetDesc(&scene_desc);
+      SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
+      if (!sr_instance_data)
+         return false;
 
       D3D11_TEXTURE2D_DESC output_desc = {};
-      if (gd.sr_output_color)
-         gd.sr_output_color->GetDesc(&output_desc);
+      if (device_data.sr_output_color)
+         device_data.sr_output_color->GetDesc(&output_desc);
       if (output_desc.Width != scene_desc.Width ||
           output_desc.Height != scene_desc.Height)
       {
-         gd.sr_output_color.reset();
+         device_data.sr_output_color.reset();
          gd.sr_output_srv.reset();
          output_desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R16G16B16A16_FLOAT, scene_desc.Width, scene_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          if (SUCCEEDED(CreateSharableTexture(native_device, output_desc,
-                &gd.sr_output_color)))
-            native_device->CreateShaderResourceView(gd.sr_output_color.get(),
+                &device_data.sr_output_color)))
+            native_device->CreateShaderResourceView(device_data.sr_output_color.get(),
                nullptr, &gd.sr_output_srv);
       }
-      if (!gd.sr_output_color || !gd.sr_output_srv)
+      if (!device_data.sr_output_color || !gd.sr_output_srv)
+      {
+         // Back to SMAA until the upscaler is picked again
+         device_data.sr_suppressed = true;
          return false;
+      }
       if (!gd.sr_rgb_blend_state)
       {
          D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
@@ -2060,10 +1803,22 @@ class MassEffect final : public Game
       const auto [depth_a, depth_b] = GetDepthFromView(view_projection);
       const double near_plane = depth_a != 0.0 ? -depth_b / depth_a : 0.0;
 
-      // The helper scales the motion vectors (UV deltas, previous minus current) to pixels, and runs FSR on HDR input without its
-      // auto exposure (it clips highlights, FSR-Best-Practices FIN-3; the scene is already exposed)
+      SR::SettingsData settings_data;
+      settings_data.output_width = scene_desc.Width;
+      settings_data.output_height = scene_desc.Height;
+      settings_data.render_width = scene_desc.Width;
+      settings_data.render_height = scene_desc.Height;
+      settings_data.hdr = true;
+      // The motion vectors are UV deltas, previous minus current
+      settings_data.mvs_x_scale = float(scene_desc.Width);
+      settings_data.mvs_y_scale = float(scene_desc.Height);
+      settings_data.auto_exposure = false; // FSR's clips highlights (FSR-Best-Practices FIN-3); the scene is already exposed
+      settings_data.render_preset = dlss_render_preset;
+      sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+
       SR::SuperResolutionImpl::DrawData draw_data;
-      draw_data.output_color = gd.sr_output_color.get();
+      draw_data.source_color = scene.get();
+      draw_data.output_color = device_data.sr_output_color.get();
       draw_data.motion_vectors = gd.mv_texture.get();
       draw_data.depth_buffer = gd.mv_device_depth.get();
       draw_data.bias_mask = reactive_mask && g_sr_reactive_pass ? gd.mv_reactive.get() : nullptr;
@@ -2075,7 +1830,7 @@ class MassEffect final : public Game
       // As applied (pixels, +y down)
       draw_data.jitter_x = gd.mv_jitter[0];
       draw_data.jitter_y = gd.mv_jitter[1];
-      draw_data.reset = gd.sr_reset;
+      draw_data.reset = device_data.force_reset_sr;
       // FSR requires a FOV (it errors on 0): a camera without an up axis keeps the last one
       if (vert_fov > 0.0)
          gd.sr_vert_fov = float(vert_fov);
@@ -2083,7 +1838,7 @@ class MassEffect final : public Game
       if (near_plane > 0.0)
       {
          // A finite far (depth 1) when the projection has one, else a large one
-         // (the helper's FSR context isn't FFX_FSR3_ENABLE_DEPTH_INFINITE)
+         // (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE only with inverted depth)
          const double far_plane =
             depth_a > 1.0 + 1e-6 ? depth_b / (1.0 - depth_a) : near_plane * 1e6;
          draw_data.near_plane = float(near_plane);
@@ -2093,9 +1848,11 @@ class MassEffect final : public Game
       gd.mv_stats.near_plane = draw_data.near_plane;
       gd.mv_stats.far_plane = draw_data.far_plane;
 #endif
-      if (!DrawBridge(native_device, native_device_context, device_data, scene.get(), draw_data))
+      if (!sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data))
       {
-         return false; // The helper is starting, or failed (SMAA until the upscaler is picked again)
+         // Back to SMAA until the upscaler is picked again
+         device_data.sr_suppressed = true;
+         return false;
       }
       DrawCustomPixelShader(native_device_context,
          device_data.default_depth_stencil_state.get(),
@@ -2104,7 +1861,8 @@ class MassEffect final : public Game
          scene_desc.Width, scene_desc.Height);
       if (gd.mv_scene_copy)
          native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
-      gd.sr_drawn = true;
+      device_data.has_drawn_sr = true;
+      device_data.has_drawn_main_post_processing = true; // Core's upscaler status icon
       return true;
    }
 
@@ -2309,6 +2067,8 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
+      sr_game_tooltip = "DLAA or FSR 3 native anti-aliasing (the game has none of its own). They run in sr_bridge_helper.exe next to the game's exe:\nthe game is 32-bit, they are 64-bit only.\n";
+
 #if ENABLE_SMAA
       // Core auto-registers the 6 SMAA passes. Added here: the linear decode the neighborhood blend reads, and the
       // predication CS turning scene alpha into R16F edge-ness in [0,1].
@@ -2388,6 +2148,7 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new MassEffectGameDeviceData;
+      device_data.taa_detected = true; // No TAA to replace, but Core's upscaler status checks for it
    }
 
    // Core's default deletes through GameDeviceData*, which has no virtual destructor: delete the concrete type.
@@ -2890,11 +2651,11 @@ public:
 #if ENABLE_SMAA
          // Run the pass ourselves, then SMAA, so AA lands before the HUD. Otherwise the game draws it without AA.
          // On a frame the upscaler already antialiased only RCAS runs.
-         const bool antialias = gd.sr_drawn ? g_rcas_sharpness > 0.f : g_smaa_enable;
+         const bool antialias = device_data.has_drawn_sr ? g_rcas_sharpness > 0.f : g_smaa_enable;
          if (antialias && original_draw_dispatch_func != nullptr && canvas_rtv && gd.canvas_res)
          {
             (*original_draw_dispatch_func)();
-            RunPostFinalGradeSMAA(native_device, native_device_context, device_data, gd, gd.canvas_res.get(), canvas_rtv.get(), !gd.sr_drawn);
+            RunPostFinalGradeSMAA(native_device, native_device_context, device_data, gd, gd.canvas_res.get(), canvas_rtv.get(), !device_data.has_drawn_sr);
             return DrawOrDispatchOverrideType::Replaced; // we ran the original draw ourselves
          }
 #endif
@@ -2915,16 +2676,16 @@ public:
       const PerfTestMode& previous_mode = perf_test_modes[g_perf_test];
       if (!previous_mode.set_aa && mode.set_aa)
       {
-         gd.perf_user_sr_user_type = g_sr_user_type;
+         gd.perf_user_sr_type = device_data.sr_type;
          gd.perf_user_smaa = g_smaa_enable;
          gd.perf_user_reactive_mask = g_sr_reactive_enable;
       }
       if (mode.set_aa || previous_mode.set_aa)
       {
-         g_sr_user_type = mode.set_aa ? mode.sr_user_type : gd.perf_user_sr_user_type;
+         device_data.sr_type = mode.set_aa ? mode.sr_type : gd.perf_user_sr_type;
+         device_data.sr_suppressed = false;
          g_smaa_enable = mode.set_aa ? mode.smaa : gd.perf_user_smaa;
          g_sr_reactive_enable = mode.set_aa ? mode.reactive_mask : gd.perf_user_reactive_mask;
-         gd.sr_bridge.failed = false;
       }
       g_perf_test = mode_index;
    }
@@ -2940,13 +2701,11 @@ public:
             "[Luma] ME1: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
 
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
-      // vector state are fixed here for the next frame (see "IsSRActive"). Without one the helper goes.
-      gd.sr_reset = !gd.sr_drawn;
-      gd.sr_drawn = false;
-      gd.sr_active = g_sr_user_type != SR::UserType::None && !gd.sr_bridge.failed;
+      // vector state are fixed here for the next frame (see "IsSRActive")
+      device_data.force_reset_sr = !device_data.has_drawn_sr;
+      device_data.has_drawn_sr = false;
+      gd.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       gd.mv_active = IsSRActive(device_data) || g_mv_enable;
-      if (!IsSRActive(device_data) && gd.sr_bridge.process)
-         StopBridge(gd, "no upscaler", false);
 #if DEVELOPMENT
       gd.mv_dumping = std::exchange(g_mv_dump_scene, false);
       gd.mv_dump_index = 0;
@@ -2963,14 +2722,11 @@ public:
       if (g_perf_test != 0)
       {
          const auto now = std::chrono::steady_clock::now();
-         // The upscaler in the settings: the helper's start (the upscaler's creation, SMAA meanwhile) restarts the settle
-         const std::string aa = IsSRActive(device_data) ? (gd.sr_bridge.type == SR::Type::DLSS ? "DLSS" : (gd.sr_bridge.type == SR::Type::FSR ? "FSR" : "starting")) : (g_mv_enable ? "MV only" : "none");
+         const std::string aa = IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : "none");
          const std::string settings = std::format("mode=\"{}\" aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, aa, IsSRActive(device_data) && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
          if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250))
             gd.perf_settle_frames = perf_settle_frames;
-         // Nothing measured while the helper starts (the game renders with SMAA meanwhile)
-         const bool starting = IsSRActive(device_data) && gd.sr_bridge.type == SR::Type::None;
-         const bool measuring = gd.perf_settle_frames <= 0 && !starting;
+         const bool measuring = gd.perf_settle_frames <= 0;
          auto& stats = gd.perf_stats;
          for (auto& queries : gd.perf_queries)
          {
@@ -3096,7 +2852,7 @@ public:
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run
       if (const auto& stats = gd.mv_last_stats; gd.mv_active && cb_luma_global_settings.FrameIndex % 300 == 0)
-         reshade::log::message(reshade::log::level::info, std::format("[ME1 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter ({} reactive), {} maps, {} updates, {} other maps, {} offset bindings, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}/{}/{}/{}/{}/{}/{}/{}", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.reactive_draws, stats.maps, stats.updates, stats.other_maps, stats.offset_bindings, stats.sr_draws, int(gd.sr_bridge.type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]).c_str());
+         reshade::log::message(reshade::log::level::info, std::format("[ME1 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter ({} reactive), {} maps, {} updates, {} other maps, {} offset bindings, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}/{}/{}/{}/{}/{}/{}/{}", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.reactive_draws, stats.maps, stats.updates, stats.other_maps, stats.offset_bindings, stats.sr_draws, int(device_data.sr_type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]).c_str());
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels
       {
          const std::shared_lock lock(gd.mv_mutex);
@@ -3197,8 +2953,6 @@ public:
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
-      if (int sr_user_type = int(g_sr_user_type); reshade::get_config_value(nullptr, NAME, "SRUserType", sr_user_type)) // Core's key
-         g_sr_user_type = SR::UserType(std::clamp(sr_user_type, int(SR::UserType::None), int(SR::UserType::FSR_3)));
 #if ENABLE_SMAA
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
@@ -3209,26 +2963,8 @@ public:
 
    void DrawImGuiSettings(DeviceData& device_data) override
    {
-      ImGui::SeparatorText("Anti-Aliasing");
-      {
-         auto& bridge = GetGameDeviceData(device_data).sr_bridge;
-         const char* const sr_user_types[] = {"None", "Auto", "DLSS", "FSR 3"};
-         int sr_user_type = int(g_sr_user_type);
-         if (ImGui::Combo("Super Resolution", &sr_user_type, sr_user_types, int(std::size(sr_user_types))))
-         {
-            g_sr_user_type = SR::UserType(sr_user_type);
-            reshade::set_config_value(nullptr, NAME, "SRUserType", sr_user_type);
-            bridge.failed = false;
-         }
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("DLAA or FSR 3 native anti-aliasing, run by sr_bridge_helper.exe next to the game's exe (the game is 32-bit,\nboth are 64-bit only). Auto: DLSS where supported, else FSR 3. SMAA stands in while the helper starts,\nand from then on if it's missing or stops.");
-         if (g_sr_user_type != SR::UserType::None)
-         {
-            ImGui::SameLine();
-            ImGui::TextUnformatted(bridge.failed ? "(unavailable: SMAA, see ReShade.log)" : (bridge.type == SR::Type::DLSS ? "(DLSS)" : (bridge.type == SR::Type::FSR ? "(FSR 3)" : "(starting)")));
-         }
-      }
 #if ENABLE_SMAA
+      ImGui::SeparatorText("Anti-Aliasing");
       if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       if (ImGui::IsItemHovered())
