@@ -20,6 +20,7 @@
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
+#include "..\..\Core\includes\patched_draws.h"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 #include <unordered_set>
 
@@ -328,15 +329,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ID3D11VertexShader* mv_last_vertex_shader = nullptr;
    uint32_t mv_last_pixel_shader_hash = 0;
    ID3D11PixelShader* mv_last_pixel_shader = nullptr;
-   // A patched shader left bound after its draw, with the game's shader it replaced (see "BindPatchedShader")
-   template <typename T>
-   struct BoundShader
-   {
-      T* patched = nullptr;
-      com_ptr<T> game;
-   };
-   BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
-   BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
+   PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
+   PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
 
    // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, null until its first upload), from
    // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest copy
@@ -344,14 +338,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::mutex mv_constants_mutex;
    std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
    std::unordered_map<uint64_t, void*> mv_mapped_constants; // Registered buffers mapped now, until their Unmap
-   // The previous frame's vc4 uploads: one dynamic buffer written in order without renaming and bound at an offset (D3D11.1 constant
-   // buffer offsetting), restarted with a discard when full; without device support, a dynamic buffer renamed at every upload
-   static constexpr UINT mv_ring_size = 4 << 20;
-   com_ptr<ID3D11Buffer> mv_ring;
-   ID3D11DeviceContext1* mv_ring_context = nullptr;
-   UINT mv_ring_offset = 0;
-   bool mv_ring_checked = false;
-   com_ptr<ID3D11Buffer> mv_previous_buffer;
+   // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
+   PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with a world translation and vc4. A draw takes the previous
    // frame's vc4 of its key's nearest draw (same object, a frame earlier), its camera included.
    struct MotionVectorObject
@@ -848,32 +836,6 @@ class MassEffect final : public Game
    // A camera ("mv_camera") comes from constants holding the translation row, so it always holds the whole camera
    static_assert(kTranslationOffset + 16 >= kViewProjectionOffset + kCameraSize);
 
-   // Writes a dynamic constant buffer, (re)created at the data's size; false if it
-   // can't
-   static bool WriteConstants(ID3D11Device* native_device,
-      ID3D11DeviceContext* native_device_context,
-      com_ptr<ID3D11Buffer>* buffer, const void* data,
-      UINT size)
-   {
-      D3D11_BUFFER_DESC desc = {};
-      if (*buffer)
-         (*buffer)->GetDesc(&desc);
-      if (desc.ByteWidth != size)
-      {
-         buffer->reset();
-         desc = {size, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER,
-            D3D11_CPU_ACCESS_WRITE};
-         native_device->CreateBuffer(&desc, nullptr, &(*buffer));
-      }
-      D3D11_MAPPED_SUBRESOURCE mapped;
-      if (!*buffer || FAILED(native_device_context->Map(
-                         buffer->get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-         return false;
-      std::memcpy(mapped.pData, data, size);
-      native_device_context->Unmap(buffer->get(), 0);
-      return true;
-   }
-
    // An upscaler is picked and hasn't failed (it then gives way to SMAA until
    // picked again). Fixed for the whole frame (see "OnPresent"): a selection made
    // after the motion vector state was set would otherwise run the upscaler on
@@ -881,78 +843,6 @@ class MassEffect final : public Game
    static bool IsSRActive(DeviceData& device_data)
    {
       return GetGameDeviceData(device_data).sr_active;
-   }
-
-   // Binds a motion vector draw's previous vc4 at the previous slot: the upload
-   // (null: the draw's current buffer, zero motion) in the ring when the device
-   // supports constant buffer offsets, else in its own renamed buffer
-   static void BindPreviousConstants(ID3D11Device* native_device,
-      ID3D11DeviceContext* native_device_context,
-      MassEffectGameDeviceData* gd,
-      const void* upload, UINT upload_size,
-      ID3D11Buffer* current)
-   {
-      constexpr UINT slot = MotionVectorPatches::previous_slots[0].second;
-      if (!std::exchange(gd->mv_ring_checked, true))
-      {
-         D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
-         com_ptr<ID3D11DeviceContext1> context1;
-         const D3D11_BUFFER_DESC desc = {
-            MassEffectGameDeviceData::mv_ring_size, D3D11_USAGE_DYNAMIC,
-            D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
-         if (SUCCEEDED(native_device->CheckFeatureSupport(
-                D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options))) &&
-             options.ConstantBufferOffsetting &&
-             options.MapNoOverwriteOnDynamicConstantBuffer &&
-             SUCCEEDED(native_device_context->QueryInterface(&context1)) &&
-             SUCCEEDED(native_device->CreateBuffer(&desc, nullptr, &gd->mv_ring)))
-         {
-            // Not referenced: the immediate context lives as long as the device
-            // (holding it would keep the device alive)
-            gd->mv_ring_context = context1.get();
-            gd->mv_ring_offset =
-               MassEffectGameDeviceData::mv_ring_size; // The first write discards
-         }
-         reshade::log::message(
-            reshade::log::level::info,
-            std::format("[ME1 MV] previous constants {}",
-               gd->mv_ring
-                  ? "in a ring (constant buffer offsets)"
-                  : "in renamed buffers (no constant buffer offsets)")
-               .c_str());
-      }
-
-      ID3D11Buffer* buffer = current;
-      // "FirstConstant" and "NumConstants" are multiples of 16 constants (256
-      // bytes)
-      const UINT size = (upload_size + 255u) & ~255u;
-      if (upload && gd->mv_ring && size <= MassEffectGameDeviceData::mv_ring_size)
-      {
-         const bool restart =
-            gd->mv_ring_offset + size > MassEffectGameDeviceData::mv_ring_size;
-         D3D11_MAPPED_SUBRESOURCE mapped;
-         if (SUCCEEDED(native_device_context->Map(
-                gd->mv_ring.get(), 0,
-                restart ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0,
-                &mapped)))
-         {
-            const UINT offset = restart ? 0u : gd->mv_ring_offset;
-            std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, upload,
-               upload_size);
-            native_device_context->Unmap(gd->mv_ring.get(), 0);
-            gd->mv_ring_offset = offset + size;
-            const UINT first_constant = offset / 16, constant_count = size / 16;
-            ID3D11Buffer* const ring = gd->mv_ring.get();
-            gd->mv_ring_context->VSSetConstantBuffers1(
-               slot, 1, &ring, &first_constant, &constant_count);
-            return;
-         }
-      }
-      if (upload && WriteConstants(native_device, native_device_context,
-                       std::addressof(gd->mv_previous_buffer), upload,
-                       upload_size))
-         buffer = gd->mv_previous_buffer.get();
-      native_device_context->VSSetConstantBuffers(slot, 1, &buffer);
    }
 
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite,
@@ -1155,57 +1045,6 @@ class MassEffect final : public Game
       gd->mv_blend_state = blend_state.get();
    }
 
-   template <typename T>
-   static com_ptr<T> GetBoundShader(ID3D11DeviceContext* native_device_context)
-   {
-      com_ptr<T> shader;
-      if constexpr (std::is_same_v<T, ID3D11VertexShader>)
-         native_device_context->VSGetShader(&shader, nullptr, nullptr);
-      else
-         native_device_context->PSGetShader(&shader, nullptr, nullptr);
-      return shader;
-   }
-   template <typename T>
-   static void SetBoundShader(ID3D11DeviceContext* native_device_context,
-      T* shader)
-   {
-      if constexpr (std::is_same_v<T, ID3D11VertexShader>)
-         native_device_context->VSSetShader(shader, nullptr, 0);
-      else
-         native_device_context->PSSetShader(shader, nullptr, 0);
-   }
-
-   // Binds a patched shader and leaves it bound after the draw (set directly,
-   // bypassing Core's state tracking). If the game hasn't bound another since, the
-   // next draw has the same original shader: it binds it again (a no-op) or puts
-   // the game's back first.
-   template <typename T>
-   static void BindPatchedShader(ID3D11DeviceContext* native_device_context,
-      T* patched,
-      MassEffectGameDeviceData::BoundShader<T>* bound)
-   {
-      com_ptr<T> current = GetBoundShader<T>(native_device_context);
-      if (current.get() == patched)
-         return;
-      bound->game = std::move(current);
-      bound->patched = patched;
-      SetBoundShader(native_device_context, patched);
-   }
-
-   // Puts the game's shader back where a patched one is still bound, before a draw
-   // that must not use it
-   template <typename T>
-   static void RestoreGameShader(ID3D11DeviceContext* native_device_context,
-      MassEffectGameDeviceData::BoundShader<T>* bound)
-   {
-      if (!bound->patched)
-         return;
-      if (GetBoundShader<T>(native_device_context).get() == bound->patched)
-         SetBoundShader(native_device_context, bound->game.get());
-      bound->patched = nullptr;
-      bound->game.reset();
-   }
-
    // Opens the scene at the frame's first mesh draw into output sized depth: takes
    // the scene depth and picks the jitter the whole scene draws with. Once per
    // present (the HUD and later passes never reopen it).
@@ -1251,7 +1090,7 @@ class MassEffect final : public Game
          gd.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1], 0.f,
          0.f};
-      if (!WriteConstants(native_device, native_device_context,
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context,
              std::addressof(gd.mv_jitter_buffer), ndc_jitter,
              sizeof(ndc_jitter)))
       {
@@ -1456,11 +1295,11 @@ class MassEffect final : public Game
       native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot,
          1, &current);
 #if DEVELOPMENT
-      if (gd.mv_ring_context)
+      if (gd.mv_previous_constants.ring_context)
       {
          com_ptr<ID3D11Buffer> bound;
          UINT first_constant = 0, constant_count = 0;
-         gd.mv_ring_context->VSGetConstantBuffers1(MotionVectorPatches::object_slot,
+         gd.mv_previous_constants.ring_context->VSGetConstantBuffers1(MotionVectorPatches::object_slot,
             1, &bound, &first_constant,
             &constant_count);
          gd.mv_stats.offset_bindings += first_constant != 0;
@@ -1475,8 +1314,7 @@ class MassEffect final : public Game
       // The previous frame's vc4: the same object's from last frame, else this
       // draw's with last frame's camera (no object motion). None (no CPU copy yet,
       // another camera): the current one (zero motion).
-      const void* upload = nullptr;
-      UINT upload_size = 0;
+      const std::vector<uint8_t>* upload = nullptr;
       if (constants && constants->size() >= kTranslationOffset + 16)
       {
          // The frame's camera: its first motion vector draw's
@@ -1543,8 +1381,7 @@ class MassEffect final : public Game
          {
             // Last frame's list outlives the draw ("mv_previous_objects" only changes
             // at the next frame start)
-            upload = match->constants->data();
-            upload_size = UINT(match->constants->size());
+            upload = &*match->constants;
 #if DEVELOPMENT
             gd.mv_stats.matched++;
 #endif
@@ -1557,8 +1394,7 @@ class MassEffect final : public Game
             std::memcpy(gd.mv_camera_only_copy.data() + kViewProjectionOffset,
                gd.mv_previous_camera->data() + kViewProjectionOffset,
                kCameraSize);
-            upload = gd.mv_camera_only_copy.data();
-            upload_size = UINT(gd.mv_camera_only_copy.size());
+            upload = &gd.mv_camera_only_copy;
 #if DEVELOPMENT
             gd.mv_stats.camera_only++;
 #endif
@@ -1581,8 +1417,8 @@ class MassEffect final : public Game
       // "Performance Test" modes without motion vector draws: the draw goes to "DrawWithJitter" (jittered or, without jitter, untouched)
       if (GetPerfMotionVectorDraws() < 2)
          return false;
-      BindPreviousConstants(native_device, native_device_context, &gd, upload,
-         upload_size, current.get());
+      ID3D11Buffer* const previous_current[] = {current.get()};
+      gd.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, {&upload, 1}, previous_current, "ME1");
       ID3D11Buffer* const jitter = gd.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot,
          1, &jitter);
@@ -1598,9 +1434,9 @@ class MassEffect final : public Game
          native_device_context->OMSetRenderTargets(
             MotionVectorPatches::target_slot + 1, targets, dsv);
       }
-      BindPatchedShader(native_device_context, vertex_shader,
+      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader,
          &gd.mv_bound_vertex_shader);
-      BindPatchedShader(native_device_context, pixel_shader,
+      PatchedDraws::BindPatchedShader(native_device_context, pixel_shader,
          &gd.mv_bound_pixel_shader);
 
       draw();
@@ -1683,7 +1519,7 @@ class MassEffect final : public Game
       // The patched vertex shader and the jitter stay bound after the draw (see
       // "DrawWithMotionVectors"), with the game's pixel shader (a motion vector
       // draw's is put back) or its reactive version, and the mask target
-      BindPatchedShader(native_device_context, vertex_shader,
+      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader,
          &gd.mv_bound_vertex_shader);
       ID3D11Buffer* const jitter = gd.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot,
@@ -1698,14 +1534,14 @@ class MassEffect final : public Game
             targets[MotionVectorPatches::reactive_slot] = gd.mv_reactive_target_rtv.get();
             native_device_context->OMSetRenderTargets(MotionVectorPatches::reactive_slot + 1, targets, dsv);
          }
-         BindPatchedShader(native_device_context, reactive_shader, &gd.mv_bound_pixel_shader);
+         PatchedDraws::BindPatchedShader(native_device_context, reactive_shader, &gd.mv_bound_pixel_shader);
 #if DEVELOPMENT
          gd.mv_stats.reactive_draws++;
 #endif
       }
       else
       {
-         RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
+         PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
       }
       draw();
 #if DEVELOPMENT
@@ -1953,7 +1789,7 @@ class MassEffect final : public Game
          constants[20] = g_sr_reactive_scale;
          constants[21] = g_sr_reactive_threshold;
          constants[22] = write_reactive ? 1.f : 0.f;
-         if (WriteConstants(native_device, native_device_context,
+         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context,
                 std::addressof(gd.mv_fill_buffer), constants,
                 sizeof(constants)))
          {
@@ -2511,8 +2347,8 @@ public:
       // Every draw without a patched shader: the game's own, if the last patched draw's are still bound
       if (is_immediate)
       {
-         RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
-         RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
+         PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
+         PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
       }
 
 #if ENABLE_BLOOM
