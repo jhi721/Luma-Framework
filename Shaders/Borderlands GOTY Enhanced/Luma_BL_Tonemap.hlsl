@@ -104,12 +104,8 @@ float3 GradeUE3_FromPostMidtones(float3 c, bool clampSDR)
 void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
 {
    // 1. Scene mix (scene color attenuated by inverse-blur weight, plus bloom) — the real pre-tonemap HDR.
-   // Not scaled by DynamicScale as the game does: below ScreenPercentage 100 the quad's UVs already cover the scene's sub-rect, so
-   // the game's scale zooms the scene in and puts it out of step with the blurred image (a magnified ghost). 1 at 100%.
-   // DLSS / FSR below 100% upscaled the sub-rect: the quad's sub-rect UVs scale to the whole upscaled scene, and to the whole blurred
-   // image when the gather ran at output resolution (1 otherwise)
-   float3 sceneColor = SceneColorTexture.Sample(SceneColorTextureSampler_s, v0.zw * LumaData.GameData.SceneUVScale).xyz;
-   float4 blurred = BlurredImage.Sample(BlurredImageSampler_s, v1.xy * LumaData.GameData.BlurUVScale);
+   float3 sceneColor = SceneColorTexture.Sample(SceneColorTextureSampler_s, DynamicScale.xy * v0.zw).xyz;
+   float4 blurred = BlurredImage.Sample(BlurredImageSampler_s, v1.xy);
    float3 untonemapped = sceneColor * saturate(1.0 - blurred.w) + blurred.xyz * LumaSettings.GameSettings.BloomIntensity;
 
    // Scene exposure (multiplier), scene-referred / pre-grade; the SDR reference below derives from the same

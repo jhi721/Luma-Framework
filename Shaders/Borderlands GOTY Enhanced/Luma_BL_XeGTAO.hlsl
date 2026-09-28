@@ -13,9 +13,9 @@
 //   read with explicit Loads (see XeGTAO_PrefilterDepths16x16).
 // - Normals input = the game's ViewNormalTex (coarse-AO pass 0xF534EB09 t0), r11g11b10_float: xyz packed
 //   v*0.5+0.5 (full 3-channel view-space normal, no z reconstruct). View-space already.
-// - BL GOTY has NO TAA and no motion vectors: NoiseIndex is FROZEN at 0 (never feed a frame index — the
-//   pattern must be static or it boils), quality default is Very High and denoise runs twice; all
-//   stability is spatial.
+// - Noise: frozen at 0 without an upscaler (the game has no TAA: a frame index would make the pattern boil), denoise runs
+//   twice. With DLSS/FSR (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once,
+//   as Intel's XeGTAO.h advises with TAA (NoiseIndexRT, set by main.cpp). Quality default is Very High.
 // - viewZ is in UE3 units (near plane ~10 units) — a huge range; DepthScale (default 50 -> ~meters)
 //   rescales it into the range XeGTAO's Intel-tuned constants expect (R32F pyramid, so no fp16 precision
 //   loss at huge Z). EFFECT_RADIUS below is anchored at that scale.
@@ -56,6 +56,7 @@ cbuffer LumaGTAO : register(b11)
    float DepthScaleRT;      // viewZ divisor (UE3 units -> ~meters); THE dial against broad over-occlusion
    float RadiusOverrideRT;  // > 0 overrides EFFECT_RADIUS (view units after DepthScale)
    float DebugViewRT;       // DEVELOPMENT: 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
+   float NoiseIndexRT;      // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
 }
 
 // clang-format off
@@ -709,7 +710,7 @@ uint HilbertIndex(uint posX, uint posY)
    return index;
 }
 
-// BL GOTY has no TAA: temporalIndex is ALWAYS 0 (frozen pattern — static noise instead of boiling).
+// temporalIndex: NoiseIndexRT, see the header.
 float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    float2 noise;
@@ -736,7 +737,7 @@ float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
    n.z *= NORMAL_Z_SIGN;
    float3 viewspaceNormal = normalize(n);
 
-   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, 0), viewspaceNormal, tex0, smp, ao_term_and_edges);
+   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, uint(NoiseIndexRT)), viewspaceNormal, tex0, smp, ao_term_and_edges);
 }
 
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void denoise_pass_cs(uint2 dtid : SV_DispatchThreadID) {
