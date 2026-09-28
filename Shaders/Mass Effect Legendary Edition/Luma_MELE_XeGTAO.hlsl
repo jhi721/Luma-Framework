@@ -1,4 +1,4 @@
-// XeGTAO replacement for the trilogy-wide NVIDIA HBAO+ chain, adapted from the repository's existing XeGTAO ports.
+// XeGTAO replacement for the trilogy-wide NVIDIA HBAO+ chain, ported from the Borderlands GOTY Enhanced mod.
 // Source: https://github.com/GameTechDev/XeGTAO
 //
 // MELE-specific contracts shared by all three games:
@@ -7,13 +7,12 @@
 // - Inherit cb0 HBAO+ $Globals and cb2 CSOffsetConstants; layouts come from live disassembly of
 //   0x80212FD6/0x06D92B08 and retain standard GFSDK offsets.
 // - Depth input = the game's half-res r24_unorm_x8 depth copy (deinterleave 0x497830D8 t0), read with explicit
-//   .Load: GatherRed on an r24_unorm_x8 view returns all-zeros on some drivers and silently kills the AO.
+//   Loads (see XeGTAO_PrefilterDepths16x16).
 // - ViewNormalTex from horizon shader 0x80212FD6 stores view-space xy in R8G8_UNORM; reconstruct z locally.
-// - With no TAA or motion vectors, pass temporalIndex 0 to SpatioTemporalNoise and rely on Very High quality plus two
-//   denoisers.
-// - Divide UE3 view Z by DepthScale=50 to approximate the meter-scale range expected by XeGTAO.
-
-// Native constant buffers inherited at the hooked dispatches; offsets come from live disassembly.
+// - Noise: frozen at 0 without an upscaler (the game has no TAA: a frame index would make the pattern boil), and denoise runs
+//   twice. With DLSS/FSR (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once, as
+//   Intel's XeGTAO.h advises with TAA (NoiseIndexRT, set by main.cpp). The quality default is Very High.
+// - View Z is divided by DepthScaleRT (default 50) to approximate the meter-scale range XeGTAO expects.
 
 cbuffer _Globals : register(b0) // NVIDIA GFSDK_SSAO $Globals.
 {
@@ -49,6 +48,7 @@ cbuffer LumaGTAO : register(b11)
    float DepthScaleRT;      // View-Z divisor from UE3 units to approximate meters.
    float RadiusOverrideRT;  // Positive values override EFFECT_RADIUS after depth scaling.
    float DebugViewRT;       // DEVELOPMENT: 0=off, 1=depth, 2=normals, 3=AO x8, 4=edges.
+   float NoiseIndexRT;      // frame % 64 with DLSS/FSR, 0 otherwise (see the header).
 }
 
 #include "Includes/Common.hlsl"
@@ -68,7 +68,7 @@ cbuffer LumaGTAO : register(b11)
 // Compile-time defaults; runtime b11 overrides the exposed controls.
 
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.6 // Native ME1LE radius: 30 UE3 units / DepthScale 50; runtime override wins.
+#define EFFECT_RADIUS 0.6 // ME1LE's native 30 uu / DepthScale 50; ME2LE/ME3LE's 48 uu arrives as RadiusOverrideRT, which wins.
 #endif
 
 #ifndef RADIUS_MULTIPLIER
@@ -85,10 +85,6 @@ cbuffer LumaGTAO : register(b11)
 
 #ifndef THIN_OCCLUDER_COMPENSATION
 #define THIN_OCCLUDER_COMPENSATION 0.0 // Default 0.0; > 0 causes more mistakes than it fixes on big geometry
-#endif
-
-#ifndef FINAL_VALUE_POWER
-#define FINAL_VALUE_POWER 1.0 // Unused; the main pass reads runtime FinalValuePowerRT.
 #endif
 
 #ifndef DEPTH_MIP_SAMPLING_OFFSET
@@ -175,8 +171,8 @@ void XeGTAO_PrefilterDepths16x16(uint2 dispatchThreadID, uint2 groupThreadID, Te
    // MIP 0
    const uint2 baseCoord = dispatchThreadID;
    const uint2 pixCoord = baseCoord * 2;
-   // GatherRed returns zero on some R24_UNORM_X8 views. Integer Loads preserve depth; D3D11 defines
-   // out-of-bounds Loads as zero before conversion and clamping.
+   // GatherRed on an R24_UNORM_X8 view returns all zeros on some drivers and silently kills the AO. Integer Loads preserve
+   // depth; D3D11 defines out-of-bounds Loads as zero before conversion and clamping.
    float d00 = sourceNDCDepth.Load(int3(pixCoord + uint2(0, 0), 0)).x;
    float d10 = sourceNDCDepth.Load(int3(pixCoord + uint2(1, 0), 0)).x;
    float d01 = sourceNDCDepth.Load(int3(pixCoord + uint2(0, 1), 0)).x;
@@ -601,7 +597,7 @@ void XeGTAO_Denoise(uint2 pixCoordBase, Texture2D sourceAOTermAndEdges, SamplerS
       edgesC_LRTB[side] = saturate(edgesC_LRTB[side] + edginess);
 #endif
 
-      // Diagonal weights shared by both denoise passes.
+      // Diagonal weights, used by every denoise pass.
       weightTL[side] = diagWeight * (edgesC_LRTB[side].x * edgesL_LRTB.z + edgesC_LRTB[side].z * edgesT_LRTB.x);
       weightTR[side] = diagWeight * (edgesC_LRTB[side].z * edgesT_LRTB.y + edgesC_LRTB[side].y * edgesR_LRTB.z);
       weightBL[side] = diagWeight * (edgesC_LRTB[side].w * edgesB_LRTB.x + edgesC_LRTB[side].x * edgesL_LRTB.w);
@@ -693,7 +689,7 @@ uint HilbertIndex(uint posX, uint posY)
    return index;
 }
 
-// MELE has no TAA; callers keep temporalIndex at zero to prevent boiling.
+// temporalIndex: NoiseIndexRT, see the header.
 float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    float2 noise;
@@ -713,14 +709,14 @@ float2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 {
    // tex0 = R32F view-space-depth pyramid; tex1 = native packed R8G8 normals; smp = point-clamp.
 
-   // Decode packed view-space xy and reconstruct unit z. Camera-facing normals use negative z.
+   // Unit z from the packed view-space xy (see NORMAL_Z_SIGN).
    float2 nxy = tex1.Load(int3(dtid, 0)).xy * 2.0 - 1.0;
    float3 viewspaceNormal;
    viewspaceNormal.xy = nxy;
    viewspaceNormal.z = NORMAL_Z_SIGN * sqrt(saturate(1.0 - dot(nxy, nxy)));
    viewspaceNormal = normalize(viewspaceNormal);
 
-   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, 0), viewspaceNormal, tex0, smp, ao_term_and_edges);
+   XeGTAO_MainPass(dtid, SpatioTemporalNoise(dtid, uint(NoiseIndexRT)), viewspaceNormal, tex0, smp, ao_term_and_edges);
 }
 
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void denoise_pass_cs(uint2 dtid : SV_DispatchThreadID) {

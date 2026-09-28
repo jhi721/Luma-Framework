@@ -23,10 +23,9 @@
 // own vanilla curve first and drops the domain adapter because it compresses and restores in the same
 // linear domain.
 
-// Bench values: exercised against the captured LUTs and cbuffers, and carried unchanged through the
-// in-game A/B that chose these families. That A/B judged the families as a whole, so it validates
-// this set as a working combination and not any one number individually - none of them may be presented
-// as individually tuned, and changing one still needs its own frames.
+// Bench values, exercised against the captured LUTs and cbuffers and carried unchanged through the
+// in-game A/B that chose these families. That A/B validates the set as a working combination, not
+// any number as individually tuned; changing one still needs its own frames.
 #define MELE_HDR_BRIDGE_SHOULDER 0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
 #define MELE_HDR_PIVOT           0.18 // p, scene mid-gray, where the tone-curve continuation starts.
 #define MELE_HDR_PROBE_LO        0.16 // Sampled-fit probes for the filmic families, in scene-x.
@@ -47,18 +46,16 @@
 #define MELE_FILMIC_MIN_SLOPE_Z 0.0
 #define MELE_FILMIC_MIN_SLOPE_X 1e-5
 
-// Strength of family 05's hue-only transfer toward the native hard-clipped SDR. A calibration value, not
-// a property of the algorithm. The in-game A/B ran family 05 at 1.0; 0.75 replaced it afterwards on the
-// offline measurement below, without a second in-game A/B.
+// Strength of family 05's hue-only transfer toward the native hard-clipped SDR; a calibration value,
+// not a property of the algorithm. The in-game A/B ran 1.0; 0.75 replaced it on the offline
+// measurement below, without a second in-game A/B.
 //
-// Why not 1.0: at exactly 1.0 the blend IS the donor's ab, so the target keeps none of its own. A hard
-// clip drives the brightest colours to white, and a white donor's OKLab ab is not zero but matrix
-// round-off, about 3.7e-8; the renormalization then scales that round-off back up to the target's full
-// chroma, and the hue of a fully blown highlight becomes arbitrary rather than preserved - measured at
-// +41.3 deg to +89.9 deg on one stimulus. At 0.75 the target keeps 0.25 of its own ab, which is far
-// above that round-off, so the direction survives and the degenerate case cannot be reached from a
-// neutral donor. No donor-chroma threshold is added to paper over it: that would be a new artistic
-// rule, and lowering this number is the honest control.
+// At exactly 1.0 the blend IS the donor's ab. A hard clip drives the brightest colours to white, whose
+// OKLab ab is matrix round-off (about 3.7e-8), not zero; the renormalization scales that back up to the
+// target's full OKLab chroma, so a fully blown highlight's hue becomes arbitrary (measured +41.3 to
+// +89.9 deg on one stimulus). At 0.75 the target keeps 0.25 of its own ab, far above that round-off, so
+// a neutral donor cannot reach the degenerate case. No donor-chroma threshold is added: that would be a
+// new artistic rule, and lowering this number is the honest control.
 #define MELE_HARDCLIP_HUE_STRENGTH 0.75
 
 #endif // LUMA_MELE_TONEMAP_HDR_CONFIG

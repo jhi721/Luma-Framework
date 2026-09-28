@@ -63,11 +63,10 @@ if (LumaSettings.DisplayMode == 1) // HDR
    // gradedHDR arrives as Game-Paper-White-relative linear HDR; DICE owns peak rolloff and gamut from here.
    float3 vignettedHDR = gradedHDR * vigLinear;
 
-   // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider
-   // would escape the Scene Peak it just established, and nothing downstream re-contains it. Multiplicative
-   // around mid-gray (0.18, Game-Paper-White-relative), the repo's form (RenoDX_Contrast). [branch] on a cbuffer
-   // uniform: at the 1.0 default this is a bit-exact no-op. The pow is spelled out with a floored log2 so
-   // Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
+   // User contrast BEFORE the display map so DICE contains whatever it pushes up; after the rolloff it would escape
+   // Scene Peak and nothing downstream re-contains it. Multiplicative around mid-gray (0.18, Game-Paper-White-
+   // relative), the repo's RenoDX_Contrast form. [branch] on a cbuffer uniform keeps the 1.0 default a bit-exact
+   // no-op. The floored log2 makes Contrast 0 on black 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
    [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
    {
       const float midGray = 0.18;
@@ -77,12 +76,12 @@ if (LumaSettings.DisplayMode == 1) // HDR
    // DICE works in absolute-nit ratios, so its cap lands at Scene Peak White (PeakWhiteNits). Type 2 also runs
    // CorrectOutOfRangeColor. Grain, dither, and RCAS can still push the result ~2% past Scene Peak; accepted.
    DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   // Highlight dechroma handed to DICE rather than run as our own pass afterwards, so it runs INSIDE the containment
-   // in the processing primaries. DICE ramps it on the compressed MAX CHANNEL from ShoulderStart * PeakWhite (1/3 of
-   // peak for this type, so mid-tones cannot be touched) to peak, but only enters that block once the channel
-   // AVERAGE passes the same shoulder: a saturated highlight below it is not desaturated, and a non-zero setting
-   // switches on with a step where the average crosses. That gate is shared DICE.hlsl code. 0 = off for the OUTPUT
-   // but not the cost: DICE's guard carries no [branch], so fxc flattens it for every pixel above the shoulder.
+   // Highlight dechroma is DICE's own, so it runs INSIDE the containment in the processing primaries: a lerp toward
+   // relative luminance, ramped on the compressed MAX CHANNEL from ShoulderStart * PeakWhite (1/3 of peak for this
+   // type, so mid-tones cannot be touched) to peak, entered only once the channel AVERAGE passes the same shoulder.
+   // A saturated highlight below it is not desaturated, and a non-zero setting switches on with a step where the
+   // average crosses; that gate is shared DICE.hlsl code. 0 is off for the OUTPUT but not the cost: DICE's guard
+   // carries no [branch], so fxc flattens it for every pixel above the shoulder.
    settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
    postProcessedColor = DICETonemap(vignettedHDR * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
 

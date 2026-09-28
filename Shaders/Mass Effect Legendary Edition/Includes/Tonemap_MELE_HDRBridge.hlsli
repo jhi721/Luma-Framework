@@ -95,12 +95,12 @@ bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 }
 
 // The NATIVE colour contract for families 01-04: RGB ratios from the exact native grade result,
-// luminance from the new working value. Y is the same linear BT.709 luminance on both sides, so on a
-// finite positive reference the reference's channel ratios survive exactly - the per-channel shift
-// and the whitening the native chain produced are kept, not undone. A coloured reference stays
-// coloured, equal channels stay equal, and a channel the grade zeroed is not refilled.
+// relative luminance from the new working value. Y is the same BT.709 relative luminance of linear RGB
+// on both sides, so on a finite positive reference the reference's channel ratios survive exactly - the
+// per-channel shift and the whitening the native chain produced are kept, not undone. A coloured
+// reference stays coloured, equal channels stay equal, and a channel the grade zeroed is not refilled.
 //
-// Of the working value only Y is used; its own hue and chroma are deliberately discarded.
+// Of the working value only Y is used; its own RGB ratios are deliberately discarded.
 //
 // The guarantee ends here, before the shared output tail. The vignette, DICE, the user controls, grain
 // and dither all run after it.
@@ -116,14 +116,12 @@ bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 //     independently would change hue, which is the failure being avoided.
 // A positive target luminance is never clamped to 1, and no path takes colour from the raw scene.
 //
-// Declining returns the reference unscaled, which is the exact native SDR result the caller already
-// holds - there is no second HDR model to fall back to and no fallback for a caller to choose. A
-// bool + out-parameter form would move that decision to the call site, and it was written and
-// measured: fxc costs 3 to 4 extra instructions on every permutation that uses this helper, because
-// it stops folding the fallback into the select it already emits. That is the eighteen of families
-// 01-04, +4 on sixteen of them and +3 on the two analytic ones; 0x225A8330 takes its colour from the
-// hue donor instead, never calls this, and did not move. Measured, not assumed. Do not re-attempt it
-// without re-measuring.
+// Declining returns the reference unscaled, the exact native SDR result the caller already holds;
+// there is no second HDR model and no fallback for a caller to choose. A bool + out-parameter form
+// was written and measured: fxc stops folding the fallback into the select it already emits, costing
+// +4 instructions on sixteen of the eighteen family 01-04 permutations and +3 on the two analytic ones
+// (0x225A8330 takes its colour from the hue donor, never calls this, and did not move). Do not
+// re-attempt it without re-measuring.
 #define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
 float3 MELE_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetLuminance)
@@ -151,8 +149,8 @@ float3 MELE_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetLum
 }
 
 // gradedHDR for families 01-04. The exact native SDR result, decoded once, is the starting value and the only
-// fallback for the whole triple; a valid reconstruction keeps its RGB ratios at the working luminance, so whatever
-// hue the grade gave the working value is dropped. The output tail decodes sdrGamma again on purpose; see
+// fallback for the whole triple; a valid reconstruction keeps its RGB ratios at the working relative luminance, so
+// whatever hue the grade gave the working value is dropped. The output tail decodes sdrGamma again on purpose; see
 // Tonemap_MELE_Output.hlsli.
 float3 MELE_NativeColorGradedHDR(float3 sdrGamma, float3 workHDR, bool workValid)
 {

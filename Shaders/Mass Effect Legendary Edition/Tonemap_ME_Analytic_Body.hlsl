@@ -101,28 +101,27 @@ float3 MELE_Analytic_GradeChain(float3 c)
 // values above the native ceiling. No LUT and no max-channel proxy: the grade is a formula, so it is extended as one.
 // Lifted: the saturate opening the Scene grade becomes max(0, .), since log2 follows it; the gamma curve loses its
 // cap and gains no floor, because these permutations feed mul_sat straight into log; the closing min(1) is dropped.
-// Everything else - the shared head, every Scene* field and its order, GammaOverlayColor, both halves of
-// GammaColorScaleAndInverse, the ME2LE encoded white point - is kept.
+// Everything else is kept: the shared head, every Scene* field and its order, GammaOverlayColor, both halves of
+// GammaColorScaleAndInverse, and the ME2LE encoded white point.
 //
-// Lifting the caps is what makes overflow reachable, so the guards live here and not in the native chain. Each runs
-// BEFORE the operation it protects: the output alone cannot show a NaN that a later max() swallowed. One failing
-// channel declines the WHOLE triple, since switching channels independently would move hue. Artist dials have a
-// free sign, so values derived from them get the finite check, not the non-negative one.
+// Lifting the caps makes overflow reachable, so the guards live here and not in the native chain. Each runs BEFORE
+// the operation it protects, since the output cannot show a NaN that a later max() swallowed. One failing channel
+// declines the WHOLE triple; switching channels independently would move hue. Values derived from artist dials,
+// whose sign is free, get the finite check, not the non-negative one.
 //
-// c is the working grade input from MELE_TryExpExtendedInput. Before the chain, the two cbuffer values no later
-// guard observes are checked: SceneMidTones, because an infinite exponent on a positive base collapses to an exact 0
-// that passes every later guard, and GammaColorScaleAndInverse.w, which must be positive because the tail divides by
-// it - the exponent is checked too, since a tiny invGamma overflows the reciprocal. The other Scene* and Gamma* fields
-// reach a guarded value through arithmetic that turns a non-finite into NaN or inf, and their unused .w never takes
-// part. A zero output scale is a fade and is NOT refused. Bad parameters are never repaired: false only declines the
-// reconstruction, and the caller keeps the exact native SDR reference. The uncapped result is decoded once.
+// c comes from MELE_TryExpExtendedInput. Only the two cbuffer values no later guard observes are checked up front:
+// SceneMidTones, because an infinite exponent on a positive base collapses to an exact 0 that passes every later
+// guard, and GammaColorScaleAndInverse.w, which must be positive because the tail divides by it, with its reciprocal
+// checked too because a tiny invGamma overflows it. The other Scene* and Gamma* fields reach a guarded value through
+// arithmetic that turns a non-finite into NaN or inf; their unused .w never takes part. A zero output scale is a fade
+// and is NOT refused. Bad parameters are never repaired: false only declines the reconstruction, and the caller keeps
+// the exact native SDR reference. The uncapped result is decoded once.
 bool MELE_TryAnalyticGradeChainHDR(float3 c, out float3 workHDR)
 {
    const float invGamma = GammaColorScaleAndInverse.w;
    const float gammaExponent = 1.0 / invGamma;
-   // Raw constant-buffer reads take the bit tests, not MELE_IsFinite: without IEEE strictness fxc assumes a cbuffer
-   // value is finite and deletes an ordered comparison against FLT_MAX on it. The exponent is computed, so its
-   // comparison survives.
+   // Raw cbuffer reads take the bit tests, not MELE_IsFinite, whose comparisons fxc deletes on them (see
+   // Includes/Common.hlsl). The exponent is computed, so its comparison survives.
    if (IsAnyNaN_Strict(SceneMidTones.xyz) || any(IsInfinite_Strict(SceneMidTones.xyz)) || IsNaN_Strict(invGamma) || IsInfinite_Strict(invGamma) || !(invGamma > 0.0 && gammaExponent <= FLT_MAX))
    {
       workHDR = float3(0.0, 0.0, 0.0);
@@ -227,8 +226,8 @@ void main(
       workValid = sourceValid && MELE_TryAnalyticGradeChainHDR(workNative, workHDR);
    }
 
-   // The native grade runs only on the SDR reference; the working value took its uncapped twin above. Hue and
-   // saturation come from this bounded grade, never from the twin or the scene; only the luminance is the twin's.
+   // The native grade runs only on the SDR reference; the working value took its uncapped twin above. RGB ratios
+   // come from this bounded grade, never from the twin or the scene; only the relative luminance is the twin's.
    float3 sdrGamma = MELE_Analytic_GradeChain(r0.xyz);
    float3 gradedHDR = MELE_NativeColorGradedHDR(sdrGamma, workHDR, workValid);
 
