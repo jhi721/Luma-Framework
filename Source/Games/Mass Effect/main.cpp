@@ -2067,7 +2067,7 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
-      sr_game_tooltip = "DLAA or FSR 3 native anti-aliasing (the game has none of its own). They run in sr_bridge_helper.exe next to the game's exe:\nthe game is 32-bit, they are 64-bit only.\n";
+      sr_game_tooltip = "DLAA or FSR 3 native anti-aliasing (the game has none of its own). They run in Luma-Upscaler.exe next to the game's exe:\nthe game is 32-bit, they are 64-bit only.\n";
 
 #if ENABLE_SMAA
       // Core auto-registers the 6 SMAA passes. Added here: the linear decode the neighborhood blend reads, and the
