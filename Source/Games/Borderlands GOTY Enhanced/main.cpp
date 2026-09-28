@@ -961,9 +961,9 @@ class BorderlandsGoty final : public Game
             const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
             const auto* code = static_cast<const uint8_t*>(desc->code);
             if constexpr (vertex)
-               patched = MotionVectorPatches::PatchVertexShader(code, desc->code_size, &error);
+               patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error);
             else
-               patched = MotionVectorPatches::PatchPixelShader(code, desc->code_size, &error);
+               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error);
             com_ptr<ID3D11ShaderReflection> reflection;
             if (vertex && !patched.empty() && Shader::d3d_reflect && SUCCEEDED(Shader::d3d_reflect(code, desc->code_size, IID_PPV_ARGS(&reflection))))
             {
