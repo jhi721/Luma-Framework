@@ -1,6 +1,6 @@
 """Stdio MCP bridge for the Luma DEVELOPMENT addon backend (Source/Core/includes/mcp_server.inl).
 
-The addon serves "\\\\.\\pipe\\luma-mcp-<pid>" while a Development build is presenting frames.
+A Development build serves "\\\\.\\pipe\\luma-mcp-<pid>" from its load, and runs the requests at present.
 This process advertises the tools up front, connects lazily (and reconnects after game restarts),
 and post-processes readbacks: decodes DXGI formats, computes channel statistics and writes a PNG preview.
 
@@ -185,7 +185,8 @@ TOOLS = [
 ]
 TOOL_NAMES = {t["name"] for t in TOOLS}
 
-# DXGI format id -> (dtype, channels, kind). kind: float, unorm, snorm, uint, srgb (encoded bytes), bgra, depth24, stencil_hi, float_x8x24, stencil_x24
+# DXGI format id -> (dtype, channels, kind). kind: float, unorm, snorm, uint, bgra, depth24, stencil_hi, float_x8x24, stencil_x24,
+# r10g10b10a2(_uint), r11g11b10, r9g9b9e5. sRGB formats keep their encoded values, see SRGB_IDS
 FORMATS = {
     2: ("<f4", 4, "float"), 3: ("<u4", 4, "uint"), 6: ("<f4", 3, "float"), 10: ("<f2", 4, "float"), 11: ("<u2", 4, "unorm"),
     12: ("<u2", 4, "uint"), 13: ("<i2", 4, "snorm"), 16: ("<f4", 2, "float"), 17: ("<u4", 2, "uint"),
@@ -624,8 +625,8 @@ class Backend:
         worker.join(wait_s)
         if worker.is_alive():
             # ponytail: the 5 s margin also covers the backend writing the readback files (a huge sr_capture on a slow disk can exceed it:
-            # raise it, or send progress notifications). The abandoned worker keeps the single pipe instance until the game answers or exits, so reconnects fail as busy
-            # meanwhile; CancelSynchronousIo on the worker (ctypes) would free it at once if that ever matters
+            # raise it, or send progress notifications). The abandoned worker holds the single pipe instance until the game answers or
+            # exits, so reconnects fail as busy meanwhile (CancelSynchronousIo on the worker, via ctypes, would free it at once)
             self.pipe, self.pid = None, None
             raise RuntimeError(f"The game did not answer within {wait_s:.0f} s (suspended in a debugger, or its pipe thread is stuck), dropped the connection")
         if "error" in reply:
@@ -636,7 +637,7 @@ class Backend:
         pid = args.pop("pid", None)
         lines = [name] + [f"{k}={int(v) if isinstance(v, bool) else v}" for k, v in args.items() if v is not None]
         payload = "\n".join(lines).encode()
-        # The backend's own job timeout (same default and clamp), plus a margin for it to answer
+        # The backend's job timeout, plus a margin for it to answer
         timeout_ms = args.get("timeout_ms")
         wait_s = min(max(TIMEOUT_MS if timeout_ms is None else int(timeout_ms), TIMEOUT_MS_RANGE[0]), TIMEOUT_MS_RANGE[1]) / 1000 + 5
         for attempt in range(2):
