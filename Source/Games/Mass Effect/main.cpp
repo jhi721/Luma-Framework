@@ -227,8 +227,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // DLSS and FSR run in the x64 helper of Core's SR bridge (the game is 32-bit, see "SRBridge.h").
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the draws
    bool sr_active = false;
-   // The upscaler's output goes back into the scene without its alpha (the linear depth the post passes read), drawn from this
-   // view of it
+   // The upscaler's output goes back into the scene (or its copy, see "mv_scene_copy") without its alpha (the linear depth the post
+   // passes read), drawn from this view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
    // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
@@ -308,9 +308,12 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Resource> mv_scene_color;
    com_ptr<ID3D11RenderTargetView> mv_scene_rtv;
    com_ptr<ID3D11ShaderResourceView> mv_scene_srv; // The fill's view of it, kept while the scene is the same resource
-   // The copy of the scene the first post pass reads (UE3 resolves the scene surface into a texture), the upscaler's output goes
-   // into both (BL GOTY). Null if the pass reads the scene itself.
+   // The copy of the scene the first post pass reads (UE3 resolves the scene surface into a texture), null if it reads none. The
+   // upscaler's output goes into the copy only: the first post pass overwrites the scene before anything reads it again (measured,
+   // "scene_reads_after_end"). Into both if the pass also reads the scene or the copy is not render target bindable.
    com_ptr<ID3D11Resource> mv_scene_copy;
+   com_ptr<ID3D11RenderTargetView> mv_scene_copy_rtv;
+   bool mv_scene_read_by_end = false; // The first post pass reads the scene itself
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    // The projection jitter (pixels, +y down), chosen when the scene opens; its NDC offset is at VS "MotionVectorPatches::jitter_slot"
    // of every mesh draw depth tested against the scene
@@ -1702,10 +1705,33 @@ class MassEffect final : public Game
       if (perf_end_parts)
          native_device_context->End(perf_queries->upscaler_end.get());
 #endif
+      // The copy's alpha is the game's resolve of the same scene (the RGB write mask keeps its linear depth)
+      bool copy_only = false;
+      if (gd.mv_scene_copy && !gd.mv_scene_read_by_end)
+      {
+         com_ptr<ID3D11Resource> copy_rtv_resource;
+         if (gd.mv_scene_copy_rtv)
+            gd.mv_scene_copy_rtv->GetResource(&copy_rtv_resource);
+         if (copy_rtv_resource != gd.mv_scene_copy)
+         {
+            gd.mv_scene_copy_rtv.reset();
+            com_ptr<ID3D11Texture2D> copy;
+            D3D11_TEXTURE2D_DESC copy_desc;
+            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+            if (SUCCEEDED(gd.mv_scene_copy->QueryInterface(&copy)))
+            {
+               copy->GetDesc(&copy_desc);
+               gd.mv_scene_rtv->GetDesc(&rtv_desc);
+               if (copy_desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+                  native_device->CreateRenderTargetView(copy.get(), &rtv_desc, &gd.mv_scene_copy_rtv);
+            }
+         }
+         copy_only = gd.mv_scene_copy_rtv != nullptr;
+      }
       DrawCustomPixelShader(native_device_context,
          device_data.default_depth_stencil_state.get(),
          gd.sr_rgb_blend_state.get(), nullptr, copy_vs, copy_ps,
-         gd.sr_output_srv.get(), gd.mv_scene_rtv.get(),
+         gd.sr_output_srv.get(), copy_only ? gd.mv_scene_copy_rtv.get() : gd.mv_scene_rtv.get(),
          scene_desc.Width, scene_desc.Height);
 #if DEVELOPMENT
       if (perf_end_parts)
@@ -1714,7 +1740,7 @@ class MassEffect final : public Game
          perf_queries->end_parts = true;
       }
 #endif
-      if (gd.mv_scene_copy)
+      if (gd.mv_scene_copy && !copy_only)
          native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
       device_data.has_drawn_sr = true;
       device_data.has_drawn_main_post_processing = true; // Core's upscaler status icon
@@ -2332,6 +2358,7 @@ public:
 #endif
                // The scene or a copy of it (same description, CopyResource compatible) among the pass's textures
                gd.mv_scene_copy.reset();
+               gd.mv_scene_read_by_end = false;
                if (gd.mv_scene_color)
                {
                   com_ptr<ID3D11ShaderResourceView> srvs[8];
@@ -2343,12 +2370,14 @@ public:
                         srvs[slot]->GetResource(&resource);
                      if (!resource || (resource != gd.mv_scene_color && !AreResourcesEqual(resource.get(), gd.mv_scene_color.get())))
                         continue;
-                     if (resource != gd.mv_scene_color)
-                        gd.mv_scene_copy = resource;
 #if DEVELOPMENT
-                     gd.mv_stats.ended_by_scene_slot = slot;
+                     if (!gd.mv_scene_copy && !gd.mv_scene_read_by_end)
+                        gd.mv_stats.ended_by_scene_slot = slot;
 #endif
-                     break;
+                     if (resource == gd.mv_scene_color)
+                        gd.mv_scene_read_by_end = true;
+                     else if (!gd.mv_scene_copy)
+                        gd.mv_scene_copy = resource;
                   }
                }
                EndScene(native_device, native_device_context, device_data);
