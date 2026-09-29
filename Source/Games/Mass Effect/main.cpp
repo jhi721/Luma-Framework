@@ -481,6 +481,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    {
       com_ptr<T> shader;
       UINT read_size = 0;
+      UINT translation_offset = 0; // Vertex shaders: vc4's LocalToWorld translation row (c8, skinned c233)
    };
    std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_pixel_shaders;
@@ -541,6 +542,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    uint32_t mv_last_vertex_shader_hash = 0;
    ID3D11VertexShader* mv_last_vertex_shader = nullptr;
    UINT mv_last_vertex_read_size = 0;
+   UINT mv_last_vertex_translation_offset = 0;
    uint32_t mv_last_pixel_shader_hash = 0;
    ID3D11PixelShader* mv_last_pixel_shader = nullptr;
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
@@ -585,7 +587,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    struct MotionVectorStats
    {
       uint32_t motion_vector_draws = 0, jitter_draws = 0, reactive_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, maps = 0, updates = 0, other_maps = 0, sr_draws = 0;
-      uint32_t offset_bindings = 0; // vc4 bound at a constant buffer offset (a ring: the per-buffer copies would be wrong)
+      uint32_t offset_bindings = 0;     // vc4 bound at a constant buffer offset (a ring: the per-buffer copies would be wrong)
+      uint32_t tiebreak_collisions = 0; // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
       uint32_t ended_by = 0;
       float near_plane = 0.f, far_plane = 0.f;                                                       // The upscaler's, from the camera's projection (0: none found)
       int ended_by_scene_slot = -1;                                                                  // The PS slot the ending pass reads the scene (or its copy) from, -1 if neither
@@ -1081,6 +1084,9 @@ class MassEffect final : public Game
    static constexpr size_t kTranslationOffset =
       (MotionVectorPatches::view_projection_row + 8) *
       16; // c8: LocalToWorld's translation row
+   // Skinned vertex shaders (bones from c5) hold LocalToWorld at c230-c233
+   static constexpr size_t kSkinnedTranslationOffset =
+      (MotionVectorPatches::view_projection_row + 233) * 16;
    // A camera ("mv_camera") comes from constants holding the translation row, so it always holds the whole camera
    static_assert(kTranslationOffset + 16 >= kViewProjectionOffset + kCameraSize);
 
@@ -1279,6 +1285,7 @@ class MassEffect final : public Game
       std::vector<uint8_t> patched;
       std::string error = "no bytecode";
       UINT read_size = 0;
+      UINT translation_offset = kTranslationOffset;
       {
          const std::shared_lock lock(s_mutex_generic);
          if (const auto it =
@@ -1293,6 +1300,8 @@ class MassEffect final : public Game
             {
                patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error);
                read_size = DXBC::ConstantBufferBytes(code, desc->code_size, MotionVectorPatches::object_slot);
+               if (DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, kSkinnedTranslationOffset / 16))
+                  translation_offset = kSkinnedTranslationOffset;
             }
             else if (reactive != 0)
                patched = MotionVectorPatches::PatchPixelShaderReactive(code,
@@ -1326,7 +1335,7 @@ class MassEffect final : public Game
                shader ? "patched" : error)
                .c_str());
       const std::unique_lock lock(gd.mv_mutex);
-      return shaders->try_emplace(hash, MassEffectGameDeviceData::PatchedShader<T>{shader, read_size}).first->second;
+      return shaders->try_emplace(hash, MassEffectGameDeviceData::PatchedShader<T>{shader, read_size, translation_offset}).first->second;
    }
 
    // The bound vertex shader's patched version (null if refused), looked up again
@@ -1342,6 +1351,7 @@ class MassEffect final : public Game
          const auto patched = GetMotionVectorShader(native_device, device_data, &gd.mv_vertex_shaders, hash, cmd_list_data.pipeline_state_original_vertex_shader);
          gd.mv_last_vertex_shader = patched.shader.get();
          gd.mv_last_vertex_read_size = patched.read_size;
+         gd.mv_last_vertex_translation_offset = patched.translation_offset;
          gd.mv_last_vertex_shader_hash = hash;
       }
       return gd.mv_last_vertex_shader;
@@ -1606,6 +1616,10 @@ class MassEffect final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty
          // list matches nothing); keys drawn in neither of the last two frames go
          gd.mv_previous_objects.swap(gd.mv_objects);
+#if DEVELOPMENT
+         gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_previous_objects, [](const auto& a, const auto& b)
+            { return PatchedDraws::SameBytes(a.constants, b.constants); });
+#endif
          std::erase_if(gd.mv_objects,
             [](const auto& entry)
             { return entry.second.empty(); });
@@ -1692,11 +1706,12 @@ class MassEffect final : public Game
                uint64_t(uint32_t(draw_data.vertex_offset)),
                uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         // ponytail: c8 is LocalToWorld's translation for static meshes, a bone row
-         // for skinned ones; either separates objects that share a key, as a
-         // tie-break only
+         // LocalToWorld's translation separates objects that share a key, as a
+         // tie-break only. Skinned meshes' c8 is a bone row, the same for copies of
+         // a model (holstered weapons), which matched each other's history
+         const size_t translation_offset = constants->size() >= gd.mv_last_vertex_translation_offset + 16 ? gd.mv_last_vertex_translation_offset : kTranslationOffset;
          std::array<float, 3> translation;
-         std::memcpy(translation.data(), constants->data() + kTranslationOffset,
+         std::memcpy(translation.data(), constants->data() + translation_offset,
             sizeof(translation));
 
          // ponytail: linear search among the key's candidates (a handful at most); a
@@ -2418,7 +2433,7 @@ public:
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.reactive_draws", &stats.reactive_draws}, {"mv.matched", &stats.matched},
                                {"mv.camera_only", &stats.camera_only}, {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.maps", &stats.maps}, {"mv.updates", &stats.updates},
-                               {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.offset_bindings", &stats.offset_bindings}, {"mv.ended_by_hash", &stats.ended_by},
+                               {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.offset_bindings", &stats.offset_bindings}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by},
                                {"mv.scene_reads_after_end", &stats.scene_reads_after_end}, { "mv.scene_reader_hash",
                                   &stats.scene_reader }},
          &device_data);
