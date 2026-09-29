@@ -26,7 +26,6 @@ namespace
 {
    struct Settings
    {
-      int upscaler = kDlss;
       uint32_t render_width = 0, render_height = 0, output_width = 0, output_height = 0;
       int hdr = 1, inverted_depth = 0, mvs_jittered = 0, auto_exposure = 0, dynamic_resolution = 0;
       float mvs_x_scale = 1.f, mvs_y_scale = 1.f;
@@ -365,15 +364,18 @@ namespace
 
 int main()
 {
+   // Only this reads stdin
+   std::ios::sync_with_stdio(false);
+   std::cin.tie(nullptr);
    std::string mode;
-   int version = 0;
+   int version = 0, upscaler = kDlss;
    Settings settings;
    LUID luid = {};
    uint64_t handles[kCount] = {}, fence_handles[2] = {};
    std::cin >> mode >> version;
    if (mode != "bridge" || version != kVersion)
       return printf("[Luma Upscaler] FAIL protocol \"%s\" %d, expected \"bridge\" %d\n", mode.c_str(), version, kVersion), 1;
-   std::cin >> settings.upscaler >> luid.LowPart >> luid.HighPart >> settings;
+   std::cin >> upscaler >> luid.LowPart >> luid.HighPart >> settings;
    for (uint64_t& handle : handles)
       std::cin >> handle;
    std::cin >> fence_handles[0] >> fence_handles[1];
@@ -386,18 +388,17 @@ int main()
    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
    ComPtr<ID3D11Device> device;
    ComPtr<ID3D11DeviceContext> context;
-   ComPtr<ID3D11Device1> device1;
    ComPtr<ID3D11Device5> device5;
    ComPtr<ID3D11DeviceContext4> context4;
    if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, levels, UINT(std::size(levels)), D3D11_SDK_VERSION, &device, nullptr, &context)) ||
-       FAILED(device.As(&device1)) || FAILED(device.As(&device5)) || FAILED(context.As(&context4)))
+       FAILED(device.As(&device5)) || FAILED(context.As(&context4)))
       return printf("[Luma Upscaler] FAIL device\n"), 1;
 
    ComPtr<ID3D11Texture2D> textures[kCount];
    ID3D11Texture2D* raw[kCount] = {};
    for (int i = 0; i < kCount; i++)
    {
-      if (handles[i] && FAILED(device1->OpenSharedResource1(HANDLE(uintptr_t(handles[i])), IID_PPV_ARGS(&textures[i]))))
+      if (handles[i] && FAILED(device5->OpenSharedResource1(HANDLE(uintptr_t(handles[i])), IID_PPV_ARGS(&textures[i]))))
          return printf("[Luma Upscaler] FAIL open texture %d\n", i), 1;
       raw[i] = textures[i].Get();
    }
@@ -408,7 +409,7 @@ int main()
 
    std::unique_ptr<Dlss> dlss;
    std::unique_ptr<Fsr> fsr; // Its context is far larger than the stack
-   if (settings.upscaler == kDlss)
+   if (upscaler == kDlss)
    {
       dlss = std::make_unique<Dlss>();
       if (!dlss->Init(device.Get()) || !dlss->CreateFeature(context.Get(), settings))
