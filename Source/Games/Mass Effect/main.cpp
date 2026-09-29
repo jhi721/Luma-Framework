@@ -112,7 +112,7 @@ constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7, 8};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
 constexpr int perf_sweep_rounds = 3;
 constexpr int perf_sweep_windows = 1;  // Per mode and round (120 frames)
-constexpr int perf_settle_frames = 30; // Skipped after a settings change (history reset, targets rebuilt), the helper's start apart
+constexpr int perf_settle_frames = 30; // Skipped after a settings change (history reset, targets rebuilt) and the upscaler being ready
 static int GetPerfMotionVectorDraws()
 {
    return perf_test_modes[g_perf_test].motion_vector_draws;
@@ -242,15 +242,18 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    struct PerfQueries
    {
       com_ptr<ID3D11Query> disjoint, frame_start, scene_start, scene_end, end_end, frame_end;
-      bool scene_started = false; // scene_start issued
-      bool scene = false;         // ... and scene_end
-      bool end = false;           // ... and end_end
+      com_ptr<ID3D11Query> fill_end, upscaler_end, copy_end; // Inside the end of the scene: after the fill, the upscaler and its copy back
+      bool scene_started = false;                            // scene_start issued
+      bool scene = false;                                    // ... and scene_end
+      bool end = false;                                      // ... and end_end
+      bool end_parts = false;                                // ... fill_end, upscaler_end and copy_end (the upscaler drew)
       bool pending = false;
    };
    struct PerfStats
    {
       double frame_ms = 0.0, frame_max_ms = 0.0, scene_ms = 0.0, scene_max_ms = 0.0, end_ms = 0.0, end_max_ms = 0.0, cpu_frame_ms = 0.0;
-      uint32_t samples = 0, scene_samples = 0, end_samples = 0, disjoint = 0, frames = 0;
+      double end_parts_ms[4] = {}; // The end of the scene: fill, upscaler, copy back, scene copy (the rest)
+      uint32_t samples = 0, scene_samples = 0, end_samples = 0, end_parts_samples = 0, disjoint = 0, frames = 0;
    };
    std::array<PerfQueries, 8> perf_queries;
    size_t perf_query_index = 0;
@@ -268,7 +271,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // frame times
    int perf_sweep_step = 0;
    int perf_sweep_windows_done = 0;
-   std::vector<std::array<double, 5>> perf_sweep_results[std::size(perf_test_modes)];
+   std::vector<std::array<double, 9>> perf_sweep_results[std::size(perf_test_modes)];
 #endif
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
@@ -364,10 +367,14 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       uint32_t ended_by = 0;
       float near_plane = 0.f, far_plane = 0.f;                                                       // The upscaler's, from the camera's projection (0: none found)
       int ended_by_scene_slot = -1;                                                                  // The PS slot the ending pass reads the scene (or its copy) from, -1 if neither
+      uint32_t scene_reads_after_end = 0;                                                            // Draws, dispatches and copies reading the scene itself after its end, before a pass or copy overwrote it
+      uint32_t scene_reader = 0;                                                                     // The last such draw's PS (or CS) hash
       uint32_t rejected[8] = {};                                                                     // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
+   uint64_t mv_scene_reads_after_end = 0; // The session's total of "MotionVectorStats::scene_reads_after_end"
+   bool mv_scene_overwritten = false;     // A pass or copy wrote the scene after its end (later reads see that, not the upscaled scene)
 #endif
 
 #if ENABLE_SMAA
@@ -1689,11 +1696,24 @@ class MassEffect final : public Game
          device_data.sr_suppressed = true;
          return false;
       }
+#if DEVELOPMENT
+      auto* const perf_queries = gd.perf_frame_queries;
+      const bool perf_end_parts = perf_queries && perf_queries->scene && !perf_queries->end;
+      if (perf_end_parts)
+         native_device_context->End(perf_queries->upscaler_end.get());
+#endif
       DrawCustomPixelShader(native_device_context,
          device_data.default_depth_stencil_state.get(),
          gd.sr_rgb_blend_state.get(), nullptr, copy_vs, copy_ps,
          gd.sr_output_srv.get(), gd.mv_scene_rtv.get(),
          scene_desc.Width, scene_desc.Height);
+#if DEVELOPMENT
+      if (perf_end_parts)
+      {
+         native_device_context->End(perf_queries->copy_end.get());
+         perf_queries->end_parts = true;
+      }
+#endif
       if (gd.mv_scene_copy)
          native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
       device_data.has_drawn_sr = true;
@@ -1719,6 +1739,9 @@ class MassEffect final : public Game
 #endif
       gd.mv_scene_open = false;
       gd.mv_scene_done = true;
+#if DEVELOPMENT
+      gd.mv_scene_overwritten = false;
+#endif
       DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
@@ -1810,6 +1833,10 @@ class MassEffect final : public Game
             native_device_context->CSSetUnorderedAccessViews(0, 4, null_uavs, nullptr);
             native_device_context->CSSetShaderResources(0, 2, null_srvs);
             filled = true;
+#if DEVELOPMENT
+            if (perf_queries && perf_queries->scene && !perf_queries->end)
+               native_device_context->End(perf_queries->fill_end.get());
+#endif
 #if DEVELOPMENT
             if (write_reactive && g_sr_reactive_zero_test)
             {
@@ -2250,6 +2277,34 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
       }
 
+#if DEVELOPMENT
+      // Whether anything reads the upscaled scene itself after its end, while the post passes read a copy of it (the upscaler's
+      // output could then go to the copy only)
+      if (gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
+      {
+         com_ptr<ID3D11ShaderResourceView> srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+         if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
+            native_device_context->CSGetShaderResources(0, UINT(std::size(srvs)), &srvs[0]);
+         else
+            native_device_context->PSGetShaderResources(0, UINT(std::size(srvs)), &srvs[0]);
+         for (const auto& srv : srvs)
+         {
+            com_ptr<ID3D11Resource> resource;
+            if (srv)
+               srv->GetResource(&resource);
+            if (resource && resource == gd.mv_scene_color)
+            {
+               gd.mv_stats.scene_reads_after_end++;
+               gd.mv_stats.scene_reader = uint32_t((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute ? original_shader_hashes.compute_shaders[0] : original_shader_hashes.pixel_shaders[0]);
+               gd.mv_scene_reads_after_end++;
+               break;
+            }
+         }
+         if (GetBoundRenderTargetResource(native_device_context).get() == gd.mv_scene_color.get())
+            gd.mv_scene_overwritten = true;
+      }
+#endif
+
       // DLSS/FSR: the scene's draws with motion vectors or jitter (see "DrawWithMotionVectors"), and the upscaler at its first post pass
       if (gd.mv_active && is_immediate)
       {
@@ -2297,6 +2352,10 @@ public:
                   }
                }
                EndScene(native_device, native_device_context, device_data);
+#if DEVELOPMENT
+               if (GetBoundRenderTargetResource(native_device_context).get() == gd.mv_scene_color.get())
+                  gd.mv_scene_overwritten = true;
+#endif
             }
          }
          else if (!gd.mv_scene_done && !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
@@ -2526,6 +2585,37 @@ public:
    }
 #endif
 
+#if DEVELOPMENT
+   // Copies of the scene itself after its end count as reads of it (see "scene_reads_after_end")
+   static void CountSceneCopyAfterEnd(DeviceData& device_data, uint64_t dst_resource, uint64_t src_resource)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      if (gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
+      {
+         if (src_resource == uint64_t(gd.mv_scene_color.get()))
+         {
+            gd.mv_stats.scene_reads_after_end++;
+            gd.mv_stats.scene_reader = 0;
+            gd.mv_scene_reads_after_end++;
+         }
+         if (dst_resource == uint64_t(gd.mv_scene_color.get()))
+            gd.mv_scene_overwritten = true;
+      }
+   }
+
+   bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) override
+   {
+      CountSceneCopyAfterEnd(device_data, dst_resource, src_resource);
+      return false;
+   }
+
+   bool OverrideCopyTextureRegion(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const D3D11_BOX* dst_box, uint64_t& src_resource, uint32_t src_subresource, const D3D11_BOX* src_box) override
+   {
+      CountSceneCopyAfterEnd(device_data, dst_resource, src_resource);
+      return false;
+   }
+#endif
+
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -2559,7 +2649,9 @@ public:
          const auto now = std::chrono::steady_clock::now();
          const std::string aa = IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : "none");
          const std::string settings = std::format("mode=\"{}\" aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, aa, IsSRActive(device_data) && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
-         if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250))
+         // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile)
+         if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250) ||
+             (IsSRActive(device_data) && !sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData())))
             gd.perf_settle_frames = perf_settle_frames;
          const bool measuring = gd.perf_settle_frames <= 0;
          auto& stats = gd.perf_stats;
@@ -2585,7 +2677,7 @@ public:
                *max_ms = (std::max)(*max_ms, ms);
                ++*samples;
             };
-            UINT64 frame_start, frame_end, scene_start, scene_end, end_end;
+            UINT64 frame_start, frame_end, scene_start, scene_end, end_end, fill_end, upscaler_end, copy_end;
             if (!read(queries.frame_start, &frame_start) || !read(queries.frame_end, &frame_end))
                continue;
             add(frame_start, frame_end, &stats.frame_ms, &stats.frame_max_ms, &stats.samples);
@@ -2593,7 +2685,16 @@ public:
             {
                add(scene_start, scene_end, &stats.scene_ms, &stats.scene_max_ms, &stats.scene_samples);
                if (queries.end && read(queries.end_end, &end_end))
+               {
                   add(scene_end, end_end, &stats.end_ms, &stats.end_max_ms, &stats.end_samples);
+                  if (queries.end_parts && read(queries.fill_end, &fill_end) && read(queries.upscaler_end, &upscaler_end) && read(queries.copy_end, &copy_end))
+                  {
+                     const UINT64 bounds[5] = {scene_end, fill_end, upscaler_end, copy_end, end_end};
+                     for (int part = 0; part < 4; part++)
+                        stats.end_parts_ms[part] += 1000.0 * double(bounds[part + 1] - bounds[part]) / double(disjoint.Frequency);
+                     stats.end_parts_samples++;
+                  }
+               }
             }
          }
          if (!measuring)
@@ -2609,10 +2710,12 @@ public:
             {
                const auto average = [](double total, uint32_t samples)
                { return samples != 0 ? total / samples : 0.0; };
-               reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] {} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) end avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}",
-                                                                   settings, average(stats.frame_ms, stats.samples), stats.frame_max_ms, average(stats.scene_ms, stats.scene_samples), stats.scene_max_ms, stats.scene_samples, average(stats.end_ms, stats.end_samples), stats.end_max_ms, stats.end_samples, stats.cpu_frame_ms / stats.frames, double(gd.perf_hook_ns) / 1e6 / stats.frames, stats.samples, stats.frames, stats.disjoint)
+               const double fill = average(stats.end_parts_ms[0], stats.end_parts_samples), upscaler = average(stats.end_parts_ms[1], stats.end_parts_samples),
+                            copy_back = average(stats.end_parts_ms[2], stats.end_parts_samples), scene_copy = average(stats.end_parts_ms[3], stats.end_parts_samples);
+               reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] {} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) end avg/max={:.3f}/{:.3f} ms ({}) = fill {:.3f} + upscaler {:.3f} + copy back {:.3f} + scene copy {:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}",
+                                                                   settings, average(stats.frame_ms, stats.samples), stats.frame_max_ms, average(stats.scene_ms, stats.scene_samples), stats.scene_max_ms, stats.scene_samples, average(stats.end_ms, stats.end_samples), stats.end_max_ms, stats.end_samples, fill, upscaler, copy_back, scene_copy, stats.end_parts_samples, stats.cpu_frame_ms / stats.frames, double(gd.perf_hook_ns) / 1e6 / stats.frames, stats.samples, stats.frames, stats.disjoint)
                                                                    .c_str());
-               const std::array<double, 5> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.end_ms, stats.end_samples), double(gd.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, stats.cpu_frame_ms / stats.frames};
+               const std::array<double, 9> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.end_ms, stats.end_samples), double(gd.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, stats.cpu_frame_ms / stats.frames, fill, upscaler, copy_back, scene_copy};
                stats = {};
                if (g_perf_sweep)
                {
@@ -2640,7 +2743,7 @@ public:
                         for (const int mode : perf_sweep_modes)
                         {
                            const double cpu_frame = median(mode, 4);
-                           reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, gd.perf_sweep_results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, median(mode, 0), median(mode, 0) - baseline, perf_test_modes[baseline_mode].name, median(mode, 1), median(mode, 2), median(mode, 3)).c_str());
+                           reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, gd.perf_sweep_results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, median(mode, 0), median(mode, 0) - baseline, perf_test_modes[baseline_mode].name, median(mode, 1), median(mode, 2), median(mode, 5), median(mode, 6), median(mode, 7), median(mode, 8), median(mode, 3)).c_str());
                         }
                         g_perf_sweep = false;
                         ApplyPerfTestMode(device_data, 0);
@@ -2658,14 +2761,14 @@ public:
             {
                const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
                native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
-               for (auto* const query : {&queries.frame_start, &queries.scene_start, &queries.scene_end, &queries.end_end, &queries.frame_end})
+               for (auto* const query : {&queries.frame_start, &queries.scene_start, &queries.scene_end, &queries.end_end, &queries.frame_end, &queries.fill_end, &queries.upscaler_end, &queries.copy_end})
                   native_device->CreateQuery(&timestamp_desc, &*query);
             }
-            if (queries.disjoint && queries.frame_start && queries.scene_start && queries.scene_end && queries.end_end && queries.frame_end)
+            if (queries.disjoint && queries.frame_start && queries.scene_start && queries.scene_end && queries.end_end && queries.frame_end && queries.fill_end && queries.upscaler_end && queries.copy_end)
             {
                perf_context->Begin(queries.disjoint.get());
                perf_context->End(queries.frame_start.get());
-               queries.scene_started = queries.scene = queries.end = false;
+               queries.scene_started = queries.scene = queries.end = queries.end_parts = false;
                gd.perf_frame_queries = &queries;
                gd.perf_query_index = (gd.perf_query_index + 1) % gd.perf_queries.size();
             }
@@ -2687,7 +2790,7 @@ public:
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run
       if (const auto& stats = gd.mv_last_stats; gd.mv_active && cb_luma_global_settings.FrameIndex % 300 == 0)
-         reshade::log::message(reshade::log::level::info, std::format("[ME1 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter ({} reactive), {} maps, {} updates, {} other maps, {} offset bindings, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}/{}/{}/{}/{}/{}/{}/{}", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.reactive_draws, stats.maps, stats.updates, stats.other_maps, stats.offset_bindings, stats.sr_draws, int(device_data.sr_type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]).c_str());
+         reshade::log::message(reshade::log::level::info, std::format("[ME1 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter ({} reactive), {} maps, {} updates, {} other maps, {} offset bindings, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}/{}/{}/{}/{}/{}/{}/{}, scene reads after end {} (last by 0x{:08X}, {} total)", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.reactive_draws, stats.maps, stats.updates, stats.other_maps, stats.offset_bindings, stats.sr_draws, int(device_data.sr_type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7], stats.scene_reads_after_end, stats.scene_reader, gd.mv_scene_reads_after_end).c_str());
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels
       {
          const std::shared_lock lock(gd.mv_mutex);
