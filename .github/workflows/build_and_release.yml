@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     # runs-on: windows-2022
@@ -28,17 +32,31 @@ jobs:
       shell: pwsh
       run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
 
+    # Only packaging needs ReShade, and only for this cell's platform
+    - name: ReShade submodule SHA
+      id: reshade_sha
+      if: matrix.config != 'Development-Debug'
+      shell: pwsh
+      run: '"sha=$(git rev-parse HEAD:Source/External/reshade)" >> $env:GITHUB_OUTPUT'
+
+    - name: Cache ReShade
+      id: reshade_cache
+      if: matrix.config != 'Development-Debug'
+      uses: actions/cache@v6
+      with:
+        path: Source/External/reshade/bin/${{ matrix.platform }}/Release/ReShade*.dll
+        key: reshade-v145-${{ matrix.platform }}-${{ steps.reshade_sha.outputs.sha }}
+
     # This requires the git directory to be added to the PATH Windows environment variables, to properly set up versioning information
     - name: Build ReShade.sln Release
-      run: |
-        msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
-        msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="32-bit" /p:PlatformToolset=v145
+      if: matrix.config != 'Development-Debug' && steps.reshade_cache.outputs.cache-hit != 'true'
+      run: msbuild "Source\External\reshade\ReShade.sln" /m /p:Configuration="Release" /p:Platform="${{ matrix.platform == 'x64' && '64-bit' || '32-bit' }}" /p:PlatformToolset=v145
       continue-on-error: true
       
     - name: Build Luma.sln ${{ matrix.config }}-${{ matrix.platform }}
       shell: pwsh
       run: |
-        msbuild Luma.sln /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /p:DefineConstants="REMOTE_BUILD=1"
+        msbuild Luma.sln /m /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /p:DefineConstants="REMOTE_BUILD=1"
         if ($LASTEXITCODE -ne 0) {
           Write-Host "::warning::MSBuild reported errors for ${{ matrix.config }}-${{ matrix.platform }} - the projects that failed to compile will be excluded from packaging/release (see the 'Create ZIP' step for the exact list)."
         }
