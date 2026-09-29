@@ -502,6 +502,7 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
+   int mv_draw_reject = -1; // The current draw's "MV_REJECT" reason (-1 for none), for the MCP trace note
    // Scene copy probe (see "OnDrawOrDispatch"): the lines already logged
    std::unordered_set<std::string> probe_logged;
    std::unordered_map<uint32_t, std::array<uint32_t, 2>> probe_declared; // By shader hash: declared read and write slot masks
@@ -583,6 +584,11 @@ class BorderlandsGoty final : public Game
       }
    };
 
+   // A mode that sets an upscaler this GPU doesn't have can't run
+   static bool IsPerfTestModeAvailable(const DeviceData& device_data, const PerfTestMode& mode)
+   {
+      return !mode.set_aa || mode.sr_type == SR::Type::None || device_data.sr_implementations_instances.contains(mode.sr_type);
+   }
    // "Performance Test": switches to a mode, setting its anti-aliasing as Core's "Super Resolution" and "DLSS Preset" selection do
    // (without saving), keeping the user's while any mode that sets its own runs and restoring it after
    static void ApplyPerfTestMode(DeviceData& device_data, int mode_index)
@@ -966,7 +972,7 @@ class BorderlandsGoty final : public Game
    }
 
 #if DEVELOPMENT
-#define MV_REJECT(reason) (GetGameDeviceData(device_data).mv_stats.rejected[reason]++, false)
+#define MV_REJECT(reason) ([&](auto& gd) { gd.mv_stats.rejected[reason]++; gd.mv_draw_reject = int(reason); return false; }(GetGameDeviceData(device_data)))
 #else
 #define MV_REJECT(reason) false
 #endif
@@ -1557,6 +1563,34 @@ class BorderlandsGoty final : public Game
 public:
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter},
+         {"skip_outlines", &g_skip_outlines}, {"sr_reversible_tonemap", &g_sr_reversible_tonemap}});
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
+         {"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"fix_movie_leak", &g_fix_movie_leak}, {"perf_hook_timers", &g_perf_hook_timers}});
+      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
+         {"gtao_depth_scale", &g_gtao_depth_scale, 1.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_temporal", &g_gtao_temporal, 0, 2},
+         {"perf_test", &g_perf_test, 0, int(std::size(perf_test_modes)) - 1, [](DeviceData& device_data, double value)
+            {
+               // As the "Performance Test" combo
+               const PerfTestMode& mode = perf_test_modes[int(value)];
+               if (!IsPerfTestModeAvailable(device_data, mode))
+                  return std::format("{} needs an upscaler this GPU doesn't have", mode.name);
+               g_perf_sweep = false;
+               ApplyPerfTestMode(device_data, int(value));
+               return std::string();
+            }}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", tex_input),
+         MCP_GAME_TEXTURE("smaa.input_linear", tex_input_linear),
+         MCP_GAME_TEXTURE("smaa.pred_mask", tex_pred),
+         MCP_GAME_TEXTURE("smaa.output", tex_smaa_out),
+         MCP_GAME_TEXTURE("rcas.output", tex_rcas_out),
+         MCP_GAME_TEXTURE("gtao.depth_mips", tex_gtao_depth_mips),
+         MCP_GAME_TEXTURE("sr.tonemap_input", sr_tonemap_input),
+         MCP_GAME_TEXTURE("mv.velocity", mv_texture)});
+#endif
       // Game-specific defines: TONEMAP_TYPE drives Luma_BL_Tonemap.hlsl, XE_GTAO_QUALITY drives Luma_BL_XeGTAO.hlsl.
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla clamped reference\n1 - HDR: Extended UE3 grade + DICE"},
@@ -1638,10 +1672,22 @@ public:
    {
       device_data.game = new BorderlandsGotyGameDeviceData;
       device_data.taa_detected = true; // No TAA to replace, but Core's upscaler UI checks for it
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool: the last complete frame's counts
+      const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
+      Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.matched", &stats.matched}, {"mv.camera_only", &stats.camera_only},
+         {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.updates", &stats.updates}, {"mv.sr_draws", &stats.sr_draws}, {"mv.ended_by_hash", &stats.ended_by}}, &device_data);
+      constexpr const char* reject_names[] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
+      for (size_t i = 0; i < std::size(reject_names); i++)
+         Mcp::RegisterCounter(std::string("mv.rejected.") + reject_names[i], &stats.rejected[i], &device_data);
+#endif
    }
 
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
+#if DEVELOPMENT
+      Mcp::Unregister(&device_data);
+#endif
       // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
       delete static_cast<BorderlandsGotyGameDeviceData*>(device_data.game);
       device_data.game = nullptr;
@@ -1761,8 +1807,14 @@ public:
             native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
             if (!gd.mv_scene_open && dsv)
                OpenScene(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0], dsv.get());
-            if (DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get()) ||
-                DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv.get()))
+            const bool motion_vectors = DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
+            const bool jitter = !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv.get());
+#if DEVELOPMENT
+            Mcp::Annotate(cmd_list_data, motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched"));
+            if (const int reject = std::exchange(gd.mv_draw_reject, -1); reject >= 0)
+               Mcp::Annotate(cmd_list_data, "mv_reject", reject);
+#endif
+            if (motion_vectors || jitter)
                return DrawOrDispatchOverrideType::Replaced;
          }
       }
@@ -2721,7 +2773,7 @@ public:
          for (int i = 0; i < int(std::size(perf_test_modes)); i++)
          {
             const PerfTestMode& mode = perf_test_modes[i];
-            ImGui::BeginDisabled(mode.set_aa && mode.sr_type != SR::Type::None && !device_data.sr_implementations_instances.contains(mode.sr_type));
+            ImGui::BeginDisabled(!IsPerfTestModeAvailable(device_data, mode));
             if (ImGui::Selectable(mode.name, !g_perf_sweep && g_perf_test == i) && (g_perf_sweep || g_perf_test != i))
             {
                g_perf_sweep = false;
