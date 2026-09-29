@@ -955,6 +955,20 @@ public:
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
+         {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"gtao_skip_apply", &g_gtao_skip_apply}, {"hide_ui", &g_hide_ui}});
+      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
+         {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", smaa_gamma_texture),
+         MCP_GAME_TEXTURE("smaa.input_linear", smaa_linear_texture),
+         MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
+         MCP_GAME_TEXTURE("bloom", bloom_all_mips_srv),
+         MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips_srv),
+         MCP_GAME_TEXTURE("gtao.output", gtao_final_srv)});
+#endif
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
