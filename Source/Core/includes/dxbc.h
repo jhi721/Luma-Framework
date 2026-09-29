@@ -313,6 +313,53 @@ namespace DXBC
       return true;
    }
 
+   // Bytes of constant buffer "slot" the shader reads: up to its highest row read if it's only indexed by immediates, else its
+   // declaration's size (in float4s, which covers indexed reads; also what some translators, e.g. dgVoodoo's, declare for every
+   // buffer). 0 if it isn't declared (or the bytecode can't be read).
+   inline uint32_t ConstantBufferBytes(const uint8_t* code, size_t size, uint32_t slot)
+   {
+      std::vector<Chunk> chunks;
+      if (!ReadChunks(code, size, &chunks))
+         return 0;
+      const Chunk* const program = FindChunk(&chunks, FourCC("SHEX"), FourCC("SHDR"));
+      std::vector<uint32_t> tokens;
+      std::vector<Instruction> instructions;
+      size_t first_body;
+      if (!program || !ReadProgram(*program, &tokens, &instructions, &first_body))
+         return 0;
+      // Operand token, slot, size (SM5's 3D form, with the space, isn't used below SM5.1)
+      uint32_t declared = 0;
+      bool immediate_indexed = false;
+      for (size_t i = 0; i < first_body; i++)
+      {
+         const Instruction& instruction = instructions[i];
+         if (instruction.opcode == D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER && instruction.length == 4 && tokens[instruction.begin + 2] == slot)
+         {
+            declared = tokens[instruction.begin + 3] * 16;
+            immediate_indexed = DECODE_D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN(tokens[instruction.begin]) == D3D10_SB_CONSTANT_BUFFER_IMMEDIATE_INDEXED;
+         }
+      }
+      if (declared == 0 || !immediate_indexed)
+         return declared;
+      uint32_t rows = 1;
+      bool relative = false;
+      for (size_t i = first_body; i < instructions.size() && !relative; i++)
+      {
+         const bool walked = WalkOperands(tokens, instructions[i], [&](size_t token_position, size_t index_position)
+            {
+               const uint32_t token = tokens[token_position];
+               if (DECODE_D3D10_SB_OPERAND_TYPE(token) != D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER || index_position == no_index || tokens[index_position] != slot)
+                  return true;
+               if (DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) != D3D10_SB_OPERAND_INDEX_2D || DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) != D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
+                  relative = true;
+               else
+                  rows = (std::max)(rows, tokens[index_position + 1] + 1);
+               return true; });
+         relative |= !walked;
+      }
+      return relative ? declared : (std::min)(declared, rows * 16);
+   }
+
    // The patched tokens as the program, with their length token set
    inline void WriteProgram(std::vector<uint32_t>* tokens, Chunk* program)
    {

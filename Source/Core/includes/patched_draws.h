@@ -104,9 +104,10 @@ namespace PatchedDraws
       std::vector<com_ptr<ID3D11Buffer>> buffers; // Without the ring, one per slot
 
       // Binds each "slots" pair's previous slot: its upload, or where there is none (null), its current buffer (zero motion).
-      // "log_tag" names the game in the log line saying which of the two ways it uses.
+      // "log_tag" names the game in the log line saying which of the two ways it uses. "read_sizes" (optional, 0 = all): the bytes of
+      // each upload the shader reads ("DXBC::ConstantBufferBytes"), the ring gets only those.
       void Bind(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, std::span<const std::pair<uint32_t, uint32_t>> slots,
-         std::span<const std::vector<uint8_t>* const> uploads, std::span<ID3D11Buffer* const> current, const char* log_tag)
+         std::span<const std::vector<uint8_t>* const> uploads, std::span<ID3D11Buffer* const> current, const char* log_tag, std::span<const UINT> read_sizes = {})
       {
          if (!std::exchange(checked, true))
          {
@@ -128,14 +129,18 @@ namespace PatchedDraws
          const size_t count = (std::min)(slots.size(), max_slots);
          assert(slots.size() <= max_slots && uploads.size() >= count && current.size() >= count);
          ID3D11Buffer* buffers_to_bind[max_slots];
-         UINT sizes[max_slots] = {};
+         UINT bytes[max_slots] = {}, sizes[max_slots] = {};
          UINT total = 0;
          for (size_t i = 0; i < count; i++)
          {
             buffers_to_bind[i] = current[i];
+            if (!uploads[i])
+               continue;
+            bytes[i] = UINT(uploads[i]->size());
+            if (i < read_sizes.size() && read_sizes[i] != 0)
+               bytes[i] = (std::min)(bytes[i], read_sizes[i]);
             // "FirstConstant" and "NumConstants" are multiples of 16 constants (256 bytes)
-            if (uploads[i])
-               total += sizes[i] = (UINT(uploads[i]->size()) + 255u) & ~255u;
+            total += sizes[i] = (bytes[i] + 255u) & ~255u;
          }
          if (ring && total != 0 && total <= ring_size)
          {
@@ -149,7 +154,7 @@ namespace PatchedDraws
                {
                   if (!uploads[i])
                      continue;
-                  std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, uploads[i]->data(), uploads[i]->size());
+                  std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, uploads[i]->data(), bytes[i]);
                   first_constants[i] = offset / 16;
                   constant_counts[i] = sizes[i] / 16;
                   offset += sizes[i];
