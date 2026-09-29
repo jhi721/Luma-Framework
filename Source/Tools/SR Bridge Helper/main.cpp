@@ -264,6 +264,89 @@ namespace
       }
    };
 
+   // "LUMA_UPSCALER_PROFILE=<csv path>" (offline, "_tools/sr_bridge_perf"): a row per frame of CPU times (QPC, the same in every
+   // process) and GPU timestamps
+   struct Profile
+   {
+      struct Slot
+      {
+         uint64_t n = 0;
+         int64_t cpu[4] = {};                  // Line read, evaluation called, evaluation returned, flushed
+         ComPtr<ID3D11Query> disjoint, gpu[3]; // Before the wait for "in", after it, after the evaluation
+      };
+      static constexpr int lag = 8; // Frames before a slot is read back (long done by then)
+
+      FILE* csv = nullptr;
+      Slot slots[lag];
+      uint64_t count = 0;
+
+      static int64_t Now()
+      {
+         LARGE_INTEGER time;
+         QueryPerformanceCounter(&time);
+         return time.QuadPart;
+      }
+
+      Profile(ID3D11Device* device, const char* path)
+      {
+         const D3D11_QUERY_DESC disjoint = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0}, timestamp = {D3D11_QUERY_TIMESTAMP, 0};
+         for (Slot& slot : slots)
+         {
+            device->CreateQuery(&disjoint, &slot.disjoint);
+            for (auto& query : slot.gpu)
+               device->CreateQuery(&timestamp, &query);
+         }
+         if (fopen_s(&csv, path, "w") == 0)
+            fprintf(csv, "n,line,evaluate_call,evaluate_return,flushed,gpu_queued,gpu_waited,gpu_evaluated,gpu_frequency,disjoint\n");
+      }
+
+      void Read(ID3D11DeviceContext* context, Slot& slot) const
+      {
+         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+         uint64_t gpu[3] = {};
+         while (context->GetData(slot.disjoint.Get(), &disjoint, sizeof(disjoint), 0) != S_OK)
+            Sleep(0);
+         for (int i = 0; i < 3; i++)
+            while (context->GetData(slot.gpu[i].Get(), &gpu[i], sizeof(gpu[i]), 0) != S_OK)
+               Sleep(0);
+         fprintf(csv, "%llu,%lld,%lld,%lld,%lld,%llu,%llu,%llu,%llu,%d\n", (unsigned long long)slot.n, slot.cpu[0], slot.cpu[1], slot.cpu[2], slot.cpu[3],
+            (unsigned long long)gpu[0], (unsigned long long)gpu[1], (unsigned long long)gpu[2], (unsigned long long)disjoint.Frequency, int(disjoint.Disjoint));
+      }
+
+      void Begin(ID3D11DeviceContext* context, uint64_t n)
+      {
+         Slot& slot = slots[count % lag];
+         if (count >= lag)
+            Read(context, slot);
+         slot.n = n;
+         slot.cpu[0] = Now();
+         context->Begin(slot.disjoint.Get());
+         context->End(slot.gpu[0].Get());
+      }
+
+      // 1: after the wait for "in", 2: after the evaluation
+      void Mark(ID3D11DeviceContext* context, int step)
+      {
+         Slot& slot = slots[count % lag];
+         context->End(slot.gpu[step].Get());
+         if (step == 2)
+            context->End(slot.disjoint.Get());
+         slot.cpu[step] = Now();
+      }
+
+      void End()
+      {
+         slots[count++ % lag].cpu[3] = Now();
+      }
+
+      void Finish(ID3D11DeviceContext* context)
+      {
+         for (uint64_t i = count > lag ? count - lag : 0; i < count; i++)
+            Read(context, slots[i % lag]);
+         fclose(csv);
+      }
+   };
+
    ComPtr<IDXGIAdapter1> FindAdapter(const LUID& luid)
    {
       ComPtr<IDXGIFactory1> factory;
@@ -342,6 +425,15 @@ int main()
    printf("[Luma Upscaler] ready: %s %ux%u -> %ux%u\n", dlss ? "DLSS" : "FSR 3", settings.render_width, settings.render_height, settings.output_width, settings.output_height);
    fflush(stdout);
 
+   std::unique_ptr<Profile> profile;
+   char profile_path[MAX_PATH] = {};
+   if (GetEnvironmentVariableA("LUMA_UPSCALER_PROFILE", profile_path, MAX_PATH))
+   {
+      profile = std::make_unique<Profile>(device.Get(), profile_path);
+      if (!profile->csv)
+         profile.reset();
+   }
+
    Frame frame;
    uint32_t frames = 0, failures = 0;
    std::string message;
@@ -361,10 +453,18 @@ int main()
       if (message != "frame" || !(std::cin >> frame.n >> frame.jitter_x >> frame.jitter_y >> frame.reset >> frame.render_width >> frame.render_height >> frame.pre_exposure >>
                                    frame.sharpness >> frame.near_plane >> frame.far_plane >> frame.vert_fov))
          return printf("[Luma Upscaler] FAIL bad line \"%s\"\n", message.c_str()), 1;
+      if (profile)
+         profile->Begin(context.Get(), frame.n);
       context4->Wait(fence_in.Get(), frame.n);
+      if (profile)
+         profile->Mark(context.Get(), 1);
       const bool drawn = dlss ? dlss->Evaluate(context.Get(), raw, frame) : fsr->Evaluate(context.Get(), raw, frame);
+      if (profile)
+         profile->Mark(context.Get(), 2);
       context4->Signal(fence_out.Get(), frame.n);
       context->Flush();
+      if (profile)
+         profile->End();
       frames++;
       if (!drawn && failures++ < 5)
       {
@@ -373,5 +473,7 @@ int main()
       }
    }
    printf("[Luma Upscaler] the game closed the pipe after %u frames (%u failed)\n", frames, failures);
+   if (profile)
+      profile->Finish(context.Get());
    return 0;
 }

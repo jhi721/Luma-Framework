@@ -18,6 +18,11 @@
 #include <format>
 #include <string>
 
+// Offline profiling of a frame's steps ("_tools/sr_bridge_perf" defines it before including this file)
+#ifndef SR_BRIDGE_PROFILE
+#define SR_BRIDGE_PROFILE(command_list, step)
+#endif
+
 namespace SRBridge
 {
    using Microsoft::WRL::ComPtr;
@@ -341,14 +346,17 @@ namespace SRBridge
                                            custom_data.settings_data.render_height, custom_data.settings_data.output_width, custom_data.settings_data.output_height));
       }
 
+      SR_BRIDGE_PROFILE(command_list, 0);
       for (int i = 0; i < kCount; i++)
       {
          if (i != kOutput && custom_data.copied[i])
             command_list->CopyResource(custom_data.shared[i].Get(), resources[i]);
       }
+      SR_BRIDGE_PROFILE(command_list, 1);
       const uint64_t frame = ++custom_data.frame;
       custom_data.context->Signal(custom_data.fences[0].Get(), frame);
       command_list->Flush();
+      SR_BRIDGE_PROFILE(command_list, 2);
       const std::string line = std::format("frame {} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0,
          draw_data.render_width ? draw_data.render_width : custom_data.settings_data.render_width,
          draw_data.render_height ? draw_data.render_height : custom_data.settings_data.render_height, draw_data.pre_exposure, draw_data.user_sharpness,
@@ -356,9 +364,12 @@ namespace SRBridge
       DWORD written = 0;
       if (!WriteFile(custom_data.pipe, line.data(), DWORD(line.size()), &written, nullptr))
          return custom_data.Fail("the helper's pipe broke");
+      SR_BRIDGE_PROFILE(command_list, 3);
       custom_data.context->Wait(custom_data.fences[1].Get(), frame);
+      SR_BRIDGE_PROFILE(command_list, 4);
       if (custom_data.copied[kOutput])
          command_list->CopyResource(draw_data.output_color, custom_data.shared[kOutput].Get());
+      SR_BRIDGE_PROFILE(command_list, 5);
       return true;
    }
 
