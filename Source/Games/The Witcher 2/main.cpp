@@ -933,6 +933,19 @@ class TheWitcher2Game final : public Game
 public:
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}});
+      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.1f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
+         {"gtao_depth_scale", &g_gtao_depth_scale, 0.01f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", tex_input),
+         MCP_GAME_TEXTURE("smaa.input_linear", tex_input_linear),
+         MCP_GAME_TEXTURE("smaa.pred_mask", tex_pred),
+         MCP_GAME_TEXTURE("smaa.output", tex_smaa_out),
+         MCP_GAME_TEXTURE("gtao.depth_mips", tex_gtao_depth_mips),
+         MCP_GAME_TEXTURE("gtao.output", tex_gtao_final)});
+#endif
       // Game-specific HDR toggle, read by the tonemap, glow/shaft blend and final grade replacements.
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map", 1},
