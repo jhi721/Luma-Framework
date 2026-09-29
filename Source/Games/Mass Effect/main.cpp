@@ -151,6 +151,9 @@ static reshade::api::effect_runtime* g_effect_runtime = nullptr;
 static bool g_smaa_enable = true;
 static bool g_smaa_predication = true;      // on geometry, from the depth in the scene buffer's alpha
 static float g_smaa_pred_tolerance = 0.02f; // a fraction of view depth
+// SMAA's resources go after this many presents without it (the upscaler antialiasing, see "OnPresent"): ~5 s, so menus and
+// loading screens between upscaled frames, which run SMAA, don't recreate them each time
+constexpr uint32_t smaa_idle_release_frames = 600;
 // RCAS on the SMAA output, opt-in (BL2/TW2): at 0 the pass never runs and its full-res intermediate is not allocated.
 static float g_rcas_sharpness = 0.f;
 #if DEVELOPMENT
@@ -231,6 +234,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // passes read), drawn from this view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
+   // None was picked ("CleanExtraSRResources", from the overlay): the upscaler's resources go at the next present
+   std::atomic<bool> release_sr_resources = false;
    // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
    // blend state writes it unblended, see "OnCreateBlendState")
 #if DEVELOPMENT
@@ -386,15 +391,12 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // Canvas size every resource below (and core's DrawSMAA intermediates) was created for. A change releases them all
    // at once; each is then recreated on first use, so no resource tracks a size of its own.
    uint32_t smaa_w = 0, smaa_h = 0;
+   uint32_t smaa_idle_frames = 0; // Presents since SMAA last ran
    ComPtr<ID3D11Buffer> cb_smaa_metrics;
    float smaa_metrics_pred_scale = -1.f;
    // SRV-readable snapshot of the canvas; the chain writes the canvas, so it must sample this copy instead.
    ComPtr<ID3D11Texture2D> tex_input;
    ComPtr<ID3D11ShaderResourceView> srv_input;
-   // Its linear-light decode, for the neighborhood blend.
-   ComPtr<ID3D11Texture2D> tex_input_linear;
-   ComPtr<ID3D11UnorderedAccessView> uav_input_linear;
-   ComPtr<ID3D11ShaderResourceView> srv_input_linear;
 
    // SMAA predication: srv_scene's alpha turned into an edge-ness mask by the depth-extract CS.
    ComPtr<ID3D11Buffer> cb_pred;
@@ -424,14 +426,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       tex_smaa_out.reset();
    }
 
-   // Turning the feature off must give the address space back: ~132 MB at 4K here, and a stock exe is capped at 2 GB.
+   // Turning the feature off (or the upscaler antialiasing) gives the memory back: ~80 MB at 4K here, plus core's intermediates.
    void ReleaseSMAAScratch()
    {
       srv_input.reset();
       tex_input.reset();
-      uav_input_linear.reset();
-      srv_input_linear.reset();
-      tex_input_linear.reset();
       ReleasePredicationScratch();
       ReleaseSharpenScratch();
    }
@@ -1964,10 +1963,7 @@ public:
       sr_game_tooltip = "DLAA or FSR 3 native anti-aliasing (the game has none of its own). They run in Luma-Upscaler.exe next to the game's exe:\nthe game is 32-bit, they are 64-bit only.\n";
 
 #if ENABLE_SMAA
-      // Core auto-registers the 6 SMAA passes. Added here: the linear decode the neighborhood blend reads, and the
-      // predication CS turning scene alpha into R16F edge-ness in [0,1].
-      native_shaders_definitions.emplace(CompileTimeStringHash("ME1 SMAA Linearize CS"),
-         ShaderDefinition("Luma_ME1_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
+      // Core auto-registers the 6 SMAA passes. Added here: the predication CS turning scene alpha into R16F edge-ness in [0,1].
       native_shaders_definitions.emplace(CompileTimeStringHash("ME1 Depth Extract CS"),
          ShaderDefinition("Luma_ME1_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
       // RCAS PS, drawn via core "Copy VS" + DrawCustomPixelShader.
@@ -2070,7 +2066,7 @@ public:
       mr.shader_resource_views[CompileTimeStringHash("smaa_blending_weight_calculation")].reset();
    }
 
-   // SMAA after the grade, before the HUD (TW2/BL2 chain): snapshot -> linear decode -> DrawSMAA -> [RCAS] -> canvas. Without
+   // SMAA after the grade, before the HUD (TW2/BL2 chain): snapshot -> DrawSMAA (its blend filters the snapshot in linear light) -> [RCAS] -> canvas. Without
    // "smaa" (the upscaler antialiased the frame, SR4's shape) only RCAS runs: snapshot -> RCAS -> canvas.
    void RunPostFinalGradeSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, ID3D11Resource* canvas_res, ID3D11RenderTargetView* canvas_rtv, bool smaa)
    {
@@ -2133,11 +2129,10 @@ public:
          sharpen(gd.srv_input.get());
          return;
       }
+      gd.smaa_idle_frames = 0;
 
       // Shader-readiness gate (async loader / dev live-reload): skip SMAA this frame if anything is missing.
-      auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("ME1 SMAA Linearize CS"));
-      const bool smaa_ready = linearize_cs != nullptr &&
-                              AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) && AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
+      const bool smaa_ready = AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) && AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
       if (!smaa_ready)
          return;
 
@@ -2196,37 +2191,16 @@ public:
             do_sharpen = false; // allocation failed: fall back to the un-sharpened chain rather than dropping SMAA
       }
 
-      if (!gd.srv_input || !gd.uav_input_linear || !gd.srv_input_linear)
+      if (!gd.srv_input)
       {
-         gd.srv_input.reset();
          gd.tex_input.reset();
-         gd.uav_input_linear.reset();
-         gd.srv_input_linear.reset();
-         if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input, cfmt) &&
-             CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, gd.tex_input_linear, DXGI_FORMAT_R16G16B16A16_FLOAT))
-         {
+         if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input, cfmt))
             native_device->CreateShaderResourceView(gd.tex_input.get(), nullptr, gd.srv_input.put());
-            native_device->CreateUnorderedAccessView(gd.tex_input_linear.get(), nullptr, gd.uav_input_linear.put());
-            native_device->CreateShaderResourceView(gd.tex_input_linear.get(), nullptr, gd.srv_input_linear.put());
-         }
       }
-      if (!gd.srv_input || !gd.uav_input_linear || !gd.srv_input_linear)
+      if (!gd.srv_input)
          return;
 
       native_device_context->CopyResource(gd.tex_input.get(), canvas_res);
-
-      // Linear-light decode of the snapshot for the neighborhood blend (Luma_ME1_SMAALinearize.hlsl).
-      {
-         DrawStateStack<DrawStateStackType::Compute> linearize_state;
-         linearize_state.Cache(native_device_context, device_data.uav_max_count);
-         ID3D11ShaderResourceView* lin_srv = gd.srv_input.get();
-         ID3D11UnorderedAccessView* lin_uav = gd.uav_input_linear.get();
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &lin_srv);
-         native_device_context->CSSetShader(linearize_cs, nullptr, 0);
-         native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-         linearize_state.Restore(native_device_context);
-      }
 
       // Scene alpha -> plane-deviation edge-ness (R16F); why an edge test, not a rescale: Luma_ME1_DepthExtract.hlsl.
       if (pred_ok)
@@ -2281,7 +2255,7 @@ public:
       native_device_context->PSSetConstantBuffers(1, 1, &mcb);
 
       // Reading the canvas as the target is safe: the chain samples the snapshot, never the canvas itself.
-      DrawSMAA(native_device, native_device_context, device_data, do_sharpen ? gd.tex_smaa_out_rtv.get() : canvas_rtv, gd.srv_input_linear.get(), gd.srv_input.get(), pred_ok ? gd.srv_pred.get() : nullptr /*predication signal*/);
+      DrawSMAA(native_device, native_device_context, device_data, do_sharpen ? gd.tex_smaa_out_rtv.get() : canvas_rtv, gd.srv_input.get(), gd.srv_input.get(), pred_ok ? gd.srv_pred.get() : nullptr /*predication signal*/);
 
       if (do_sharpen)
          sharpen(gd.tex_smaa_out_srv.get());
@@ -2651,6 +2625,11 @@ public:
    }
 #endif
 
+   void CleanExtraSRResources(DeviceData& device_data) override
+   {
+      GetGameDeviceData(device_data).release_sr_resources = true;
+   }
+
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -2666,6 +2645,39 @@ public:
       device_data.has_drawn_sr = false;
       gd.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       gd.mv_active = IsSRActive(device_data) || g_mv_enable;
+      // None picked: re-initializing the SR bridge's instances stops the helper (the upscaler's GPU memory) and drops the bridge's
+      // copies and references (Core keeps the instances across selections), then our upscaler inputs and output go. Recreated
+      // when an upscaler is picked again (the helper takes seconds to start).
+      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
+      {
+         com_ptr<IDXGIDevice> dxgi_device;
+         com_ptr<IDXGIAdapter> adapter;
+         if (SUCCEEDED(native_device->QueryInterface(&dxgi_device)) && SUCCEEDED(dxgi_device->GetAdapter(&adapter)))
+         {
+            for (auto& [type, instance] : device_data.sr_implementations_instances)
+            {
+               if (instance)
+                  sr_implementations[type]->Init(instance, native_device, adapter.get());
+            }
+         }
+         gd.sr_output_srv.reset();
+         if (!g_mv_enable)
+         {
+            const std::unique_lock lock(gd.mv_mutex);
+            gd.mv_texture.reset();
+            gd.mv_rtv.reset();
+            gd.mv_uav.reset();
+            gd.mv_device_depth.reset();
+            gd.mv_device_depth_uav.reset();
+            gd.mv_reactive.reset();
+            gd.mv_reactive_uav.reset();
+            gd.mv_transparency.reset();
+            gd.mv_transparency_uav.reset();
+            gd.mv_reactive_target.reset();
+            gd.mv_reactive_target_rtv.reset();
+            gd.mv_reactive_target_srv.reset();
+         }
+      }
 #if DEVELOPMENT
       gd.mv_dumping = std::exchange(g_mv_dump_scene, false);
       gd.mv_dump_index = 0;
@@ -2880,24 +2892,36 @@ public:
       gd.srv_scene.reset(); // recaptured every frame; never held across one
 
 #if ENABLE_BLOOM
-      // Give the address space back on the render thread: core's DrawKarisAverage output, ~66 MB at 4K. Core drops only
-      // the UAV on swapchain init, so both views go here. Unconditional while off: resetting empty entries is two lookups.
+      // Give the memory back on the render thread: core's DrawKarisAverage output (~66 MB at 4K; core drops only the UAV on
+      // swapchain init, so both views go here) and DrawBloom's mip chains (~66 MB). Unconditional while off: resetting empty
+      // entries is a few lookups.
       if (!g_luma_bloom_enable)
       {
          auto& mr = device_data.managed_resources;
          mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
          mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
+         ReleaseBloom();
       }
 #endif
 
 #if ENABLE_SMAA
-      // Released here, not in the ImGui handler, so it happens on the render thread and never mid-frame.
-      // FSR's RCAS keeps the snapshot
-      if (!g_smaa_enable && !(IsSRActive(device_data) && g_rcas_sharpness > 0.f) && gd.tex_input)
+      // Released here, not in the ImGui handler, so it happens on the render thread and never mid-frame. Also once SMAA stopped
+      // running (the upscaler antialiases every frame it draws). RCAS on the upscaler keeps the snapshot.
+      const bool smaa_idle = !g_smaa_enable || ++gd.smaa_idle_frames > smaa_idle_release_frames;
+      if (smaa_idle)
       {
-         gd.ReleaseSMAAScratch();
+         // Unconditional while idle, as the bloom's above
+         if (IsSRActive(device_data) && g_rcas_sharpness > 0.f)
+         {
+            gd.ReleasePredicationScratch();
+            gd.ReleaseSharpenScratch();
+         }
+         else if (gd.tex_input)
+         {
+            gd.ReleaseSMAAScratch();
+            gd.smaa_w = gd.smaa_h = 0; // core recreates lazily; keep the latch from claiming anything is current
+         }
          ReleaseCoreSMAAIntermediates(device_data);
-         gd.smaa_w = gd.smaa_h = 0; // core recreates lazily; keep the latch from claiming anything is current
       }
       else
       {

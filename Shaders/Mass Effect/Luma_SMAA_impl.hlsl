@@ -2,7 +2,7 @@
 
 // SMAA ULTRA + colour edge detection, ported from BL2/TPS and Witcher 2 (same dgVoodoo stack). ADDS antialiasing: the
 // game ships none. Injected after the gamma pass 0x17CE0932, before the HUD; Display Composition runs after. Edges are
-// detected on the GAMMA canvas, the neighborhood blend runs in linear light (Luma_ME1_SMAALinearize) and re-encodes.
+// detected on the GAMMA canvas, the neighborhood blend filters it in linear light (below) and re-encodes.
 // The predication mask comes from Luma_ME1_DepthExtract.
 
 #include "Includes/Common.hlsl"
@@ -28,6 +28,38 @@ cbuffer SmaaMetricsCB : register(b1)
 
 // Edge detection: tex0 = colorTexGamma (gamma-encoded graded canvas)
 // tex1 = predicationTex (edge-ness in [0,1]; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
-// Neighborhood blending: tex0 = colorTex (linear copy), tex1 = blendTex. Re-encode to the canvas' gamma.
+// Neighborhood blending: tex0 = colorTex (the gamma snapshot), tex1 = blendTex. It averages the pixel with a neighbor through a
+// bilinear fetch, which must happen in linear light: the fetch is done by hand, the footprint's texels decoded before weighting
+// (clamped as the linear sampler). The same as the hardware bilinear of a linear copy, without the copy. An axis within the
+// hardware's 8 bit filter weights of a texel center is on it: the interpolated coordinate's float error would otherwise weight in
+// the neighbor a little, visibly so for an HDR one next to a dark pixel. On a texel center on both (every pixel that doesn't
+// blend) the fetch is that texel.
+float4 SampleGammaInLinear(Texture2D tex, float2 coord)
+{
+   const float2 nearest = round(coord * SMAA_RT_METRICS.zw - 0.5);
+   const float2 texel = abs(coord * SMAA_RT_METRICS.zw - 0.5 - nearest) < 1.0 / 512.0 ? nearest : coord * SMAA_RT_METRICS.zw - 0.5;
+   const int2 last = int2(SMAA_RT_METRICS.zw) - 1;
+   float4 color;
+   [branch] if (all(texel == nearest))
+   {
+      color = tex.Load(int3(clamp(int2(nearest), 0, last), 0));
+      color.rgb = gamma_to_linear(color.rgb, GCT_MIRROR);
+   }
+   else
+   {
+      const float2 base = floor(texel);
+      const float2 f = texel - base;
+      float4 c[4];
+      [unroll] for (uint i = 0; i < 4; i++)
+      {
+         c[i] = tex.Load(int3(clamp(int2(base) + int2(i & 1, i >> 1), 0, last), 0));
+         c[i].rgb = gamma_to_linear(c[i].rgb, GCT_MIRROR);
+      }
+      color = lerp(lerp(c[0], c[1], f.x), lerp(c[2], c[3], f.x), f.y);
+   }
+   return color;
+}
+#define SMAA_NEIGHBORHOOD_SAMPLE(tex, coord) SampleGammaInLinear(tex, coord)
+// Re-encode to the canvas' gamma.
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 #include "../Includes/SMAA_Passes.hlsl"
