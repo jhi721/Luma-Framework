@@ -177,6 +177,7 @@
 #include "dlss/DLSS.h" // see "ENABLE_NGX"
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
 #include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
+#include "includes/reflex.h" // see "ENABLE_NVAPI"
 
 #include "includes/containers.h"
 #include "includes/globals.h"
@@ -419,6 +420,9 @@ namespace
    bool strip_original_shaders_debug_data = false;
 #endif
    bool use_os_reference_white_level = true;
+#if ENABLE_NVAPI
+   Reflex::Mode reflex_mode = Reflex::Mode::On;
+#endif
 
 #if ENABLE_SR
    SR::UserType sr_user_type = SR::UserType::Auto; // If set to a non "None" value, some SR tech is enabled by the user (but not necessarily supported+initialized correctly, that's by device)
@@ -5660,6 +5664,30 @@ namespace
       }
    }
 
+#if ENABLE_NVAPI
+   // Reflex follows the device's first swapchain (the only one expected), so there's one sleep per frame
+   bool IsReflexSwapchain(DeviceData& device_data, reshade::api::swapchain* swapchain)
+   {
+      const std::shared_lock lock(device_data.mutex);
+      return !device_data.swapchains.empty() && *device_data.swapchains.begin() == swapchain;
+   }
+
+   void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
+
+      DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
+      if (!IsReflexSwapchain(device_data, swapchain))
+         return;
+      Reflex::Mode mode;
+      {
+         const std::shared_lock lock_reshade(s_mutex_reshade);
+         mode = reflex_mode;
+      }
+      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), device_data.reflex, mode);
+   }
+#endif
+
    void OnPresent(
       reshade::api::command_queue* queue,
       reshade::api::swapchain* swapchain,
@@ -5676,6 +5704,11 @@ namespace
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
+
+#if ENABLE_NVAPI
+      if (IsReflexSwapchain(device_data, swapchain))
+         Reflex::OnPresent(native_device, device_data.reflex);
+#endif
 
 #if DEVELOPMENT
       // Allow to tank performance to test auto rendering resolution scaling etc
@@ -14363,6 +14396,35 @@ namespace
             }
 #endif // ENABLE_SR
 
+#if ENABLE_NVAPI
+            {
+               const Reflex::State reflex_state = device_data.reflex.state;
+               const char* const reflex_modes[] = {"Off", "On", "On + Boost"};
+               int reflex_mode_i = int(reflex_mode);
+               ImGui::BeginDisabled(reflex_state != Reflex::State::Inactive && reflex_state != Reflex::State::Running);
+               if (ImGui::Combo("NVIDIA Reflex", &reflex_mode_i, reflex_modes, IM_ARRAYSIZE(reflex_modes)))
+               {
+                  reflex_mode = Reflex::Mode(reflex_mode_i);
+                  reshade::set_config_value(runtime, NAME, "ReflexMode", reflex_mode_i);
+               }
+               ImGui::EndDisabled();
+               if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+               {
+                  switch (reflex_state)
+                  {
+                  case Reflex::State::Unsupported:
+                     ImGui::SetTooltip("Requires an NVIDIA GPU and driver."); break;
+                  case Reflex::State::Game:
+                     ImGui::SetTooltip("The game already runs NVIDIA Reflex, Luma leaves it to the game."); break;
+                  case Reflex::State::DisplayCommander:
+                     ImGui::SetTooltip("Display Commander is loaded, use its Reflex settings."); break;
+                  default:
+                     ImGui::SetTooltip("Lowers input latency when the GPU limits the frame rate, by not letting the CPU queue frames ahead.\n\"On + Boost\" also keeps the GPU clocks at their maximum."); break;
+                  }
+               }
+            }
+#endif // ENABLE_NVAPI
+
             auto ChangeDisplayMode = [&](DisplayModeType display_mode, bool enable_hdr_on_display = true, IDXGISwapChain3* swapchain = nullptr)
                {
                   int display_mode_i = int(display_mode);
@@ -16218,6 +16280,11 @@ void Init(bool async)
       reshade::get_config_value(runtime, NAME, "DLSSRenderPreset", dlss_render_preset_i);
       dlss_render_preset = static_cast<unsigned int>(dlss_render_preset_i);
 #endif
+#if ENABLE_NVAPI
+      int reflex_mode_i = int(reflex_mode);
+      reshade::get_config_value(runtime, NAME, "ReflexMode", reflex_mode_i);
+      reflex_mode = Reflex::Mode(std::clamp(reflex_mode_i, int(Reflex::Mode::Off), int(Reflex::Mode::Boost)));
+#endif
       int display_mode_i = int(cb_luma_global_settings.DisplayMode);
       reshade::get_config_value(runtime, NAME, "DisplayMode", display_mode_i);
       cb_luma_global_settings.DisplayMode = DisplayModeType(display_mode_i);
@@ -16668,6 +16735,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+#if ENABLE_NVAPI
+      reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
+#endif
 
       reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
 
@@ -16790,6 +16860,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+#if ENABLE_NVAPI
+      reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
+#endif
 
       reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
 
