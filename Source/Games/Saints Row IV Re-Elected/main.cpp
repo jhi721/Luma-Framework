@@ -654,6 +654,11 @@ class SaintsRowIV final : public Game
 #endif
 
 #if DEVELOPMENT
+   // A mode that sets an upscaler this GPU doesn't have can't run
+   static bool IsPerfTestModeAvailable(const DeviceData& device_data, const PerfTestMode& mode)
+   {
+      return !mode.set_aa || mode.sr_type == SR::Type::None || device_data.sr_implementations_instances.contains(mode.sr_type);
+   }
    // "Performance Test": switches to a mode, setting its anti-aliasing as Core's "Super Resolution" and "DLSS Preset" selection do, and
    // its render scale and GTAO resolution (without saving), keeping the user's while any mode that sets its own runs and restoring them after
    static void ApplyPerfTestMode(DeviceData& device_data, int mode_index)
@@ -2264,6 +2269,9 @@ public:
             if (!scene_was_open && game_device_data.mv_scene_open)
                ScaleSceneViewport(native_device_context, device_data, &original_shader_hashes);
             const bool jittered = motion_vectors || DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv.get());
+#if DEVELOPMENT
+            Mcp::Annotate(cmd_list_data, motion_vectors ? "mv" : (jittered ? "jitter" : "unpatched"));
+#endif
             if (jittered)
                return DrawOrDispatchOverrideType::Replaced;
          }
@@ -2539,6 +2547,38 @@ public:
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool (the counters are the last complete frame's)
+      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter}});
+      Mcp::RegisterCounters({{"msaa_resolves", &g_msaa_resolves_last_frame}, {"finals", &g_finals_last_frame}, {"pixel_steps_overrides", &g_pixel_steps_overrides_last_frame},
+         {"sub_rect_draws", &g_sub_rect_draws_last_frame}});
+      Mcp::RegisterToggles({{"luma_msaa_enable", &g_luma_msaa_enable}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_edges_debug", &g_smaa_edges_debug},
+         {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, {"perf_hook_timers", &g_perf_hook_timers}});
+      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"render_scale", &g_render_scale, min_render_scale, 1.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
+         {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}, {"gtao_thin_occluder_override", &g_gtao_thin_occluder_override, 0.f, 1.f}});
+      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_noise_per_frame", &g_gtao_noise_per_frame, 0, 2}, {"gtao_single_denoise", &g_gtao_single_denoise, 0, 2},
+         {"gtao_full_res", &g_gtao_full_res, 0, 2},
+         {"perf_test", &g_perf_test, 0, int(std::size(perf_test_modes)) - 1, [](DeviceData& device_data, double value)
+            {
+               // As the "Performance Test" combo
+               const PerfTestMode& mode = perf_test_modes[int(value)];
+               if (!IsPerfTestModeAvailable(device_data, mode))
+                  return std::format("{} needs an upscaler this GPU doesn't have", mode.name);
+               g_perf_sweep = false;
+               ApplyPerfTestMode(device_data, int(value));
+               return std::string();
+            }}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", smaa_gamma_texture),
+         MCP_GAME_TEXTURE("smaa.input_linear", smaa_linear_srv),
+         MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
+         MCP_GAME_TEXTURE("blend_limit.base", blend_limit_base_texture),
+         MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips_texture),
+         MCP_GAME_TEXTURE("gtao.output", gtao_final_texture),
+         MCP_GAME_TEXTURE("mv.velocity", mv_texture),
+         MCP_GAME_TEXTURE("mv.depth", mv_frame_depth),
+         MCP_GAME_TEXTURE("render_scale.depth_copy", sub_rect_depth_copy),
+         MCP_GAME_TEXTURE("render_scale.color_copy", sub_rect_color_copy)});
+#endif
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
@@ -2996,7 +3036,7 @@ public:
          for (int i = 0; i < int(std::size(perf_test_modes)); i++)
          {
             const PerfTestMode& mode = perf_test_modes[i];
-            ImGui::BeginDisabled(mode.set_aa && mode.sr_type != SR::Type::None && !device_data.sr_implementations_instances.contains(mode.sr_type));
+            ImGui::BeginDisabled(!IsPerfTestModeAvailable(device_data, mode));
             if (ImGui::Selectable(mode.name, !g_perf_sweep && g_perf_test == i) && (g_perf_sweep || g_perf_test != i))
             {
                g_perf_sweep = false;
