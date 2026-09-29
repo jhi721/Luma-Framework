@@ -23,6 +23,10 @@
 #include "..\..\Core\includes\patched_draws.h"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 #include <unordered_set>
+#if DEVELOPMENT
+#include <dxgi1_4.h> // "Memory Sweep": IDXGIAdapter3::QueryVideoMemoryInfo
+#include <psapi.h>   // "Memory Sweep": GetProcessMemoryInfo
+#endif
 
 // Both replaced, separate register maps. The gamma correction pass ends every frame; the uber runs first when it
 // runs at all - the engine skips it in elevators and some loading scenes, which b12 UberRanThisFrame reports.
@@ -117,7 +121,32 @@ static int GetPerfMotionVectorDraws()
 {
    return perf_test_modes[g_perf_test].motion_vector_draws;
 }
-static bool g_mv_dump_scene = false; // One frame of the scene's draws to ReShade.log (route, blend, depth)
+// "Memory Sweep": these modes in order, one "[ME1 Mem]" log line each once settled (the upscaler ready, then a fixed frame count),
+// so the deltas between lines are each feature's cost. The user's settings are restored at the end.
+struct MemorySweepMode
+{
+   const char* name;
+   SR::Type sr_type = SR::Type::None;
+   bool smaa = false;
+   bool bloom = false;
+   float rcas = 0.f;
+   bool reactive_mask = false;
+};
+constexpr MemorySweepMode memory_sweep_modes[] = {
+   {"No AA, No Bloom"},
+   {"SMAA", SR::Type::None, true},
+   {"SMAA + Bloom", SR::Type::None, true, true},
+   {"SMAA + Bloom + RCAS", SR::Type::None, true, true, 0.5f},
+   {"DLSS + SMAA On + Bloom", SR::Type::DLSS, true, true},
+   {"DLSS + SMAA Off + Bloom", SR::Type::DLSS, false, true},
+   {"FSR 3 + Reactive Mask + Bloom", SR::Type::FSR, false, true, 0.f, true},
+   {"No AA + Bloom (after SR)", SR::Type::None, false, true},
+   {"No AA, No Bloom (after all)"},
+};
+constexpr int memory_sweep_settle_frames = 720;    // Past SMAA's idle release ("smaa_idle_release_frames")
+constexpr int memory_sweep_max_wait_frames = 3000; // For the upscaler to get ready
+static int g_memory_sweep_step = -1;               // -1 off
+static bool g_mv_dump_scene = false;               // One frame of the scene's draws to ReShade.log (route, blend, depth)
 static bool g_sr_reactive_debug_view = false;
 static bool g_sr_tc_from_mask = false;       // The reactive mask as FSR's transparency & composition mask too, instead of the draws' own (OptiScaler does it)
 static bool g_sr_reactive_pass = true;       // Off: the mask still runs, FSR doesn't get it (isolation test)
@@ -154,6 +183,9 @@ static float g_smaa_pred_tolerance = 0.02f; // a fraction of view depth
 // SMAA's resources go after this many presents without it (the upscaler antialiasing, see "OnPresent"): ~5 s, so menus and
 // loading screens between upscaled frames, which run SMAA, don't recreate them each time
 constexpr uint32_t smaa_idle_release_frames = 600;
+#if DEVELOPMENT
+static_assert(memory_sweep_settle_frames > int(smaa_idle_release_frames));
+#endif
 // RCAS on the SMAA output, opt-in (BL2/TW2): at 0 the pass never runs and its full-res intermediate is not allocated.
 static float g_rcas_sharpness = 0.f;
 #if DEVELOPMENT
@@ -277,6 +309,15 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    int perf_sweep_step = 0;
    int perf_sweep_windows_done = 0;
    std::vector<std::array<double, 9>> perf_sweep_results[std::size(perf_test_modes)];
+   // "Memory Sweep": frames left before the current mode's log line, frames waited for the upscaler, and the user's settings to restore
+   int memory_sweep_settle_frames = 0;
+   int memory_sweep_wait_frames = 0;
+   std::unordered_set<uint64_t> canvas_resources_seen; // The final pass's render targets (mirrors when upgraded), tagged in the report
+   SR::Type memory_user_sr_type = SR::Type::None;
+   bool memory_user_smaa = false;
+   bool memory_user_bloom = false;
+   float memory_user_rcas = 0.f;
+   bool memory_user_reactive_mask = true;
 #endif
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
@@ -2535,6 +2576,8 @@ public:
             canvas_rtv->GetResource(gd.canvas_res.put());
 
 #if DEVELOPMENT
+         if (gd.canvas_res && gd.canvas_resources_seen.insert(uint64_t(gd.canvas_res.get())).second)
+            reshade::log::message(reshade::log::level::info, std::format("[ME1 Mem] new canvas 0x{:X} (#{}) at frame {}: sr={} drawn={} smaa={} uber={}", uint64_t(gd.canvas_res.get()), gd.canvas_resources_seen.size(), cb_luma_global_settings.FrameIndex, int(device_data.sr_type), device_data.has_drawn_sr.load(), g_smaa_enable, gd.uber_ran_this_frame).c_str());
          // The devkit only sees the original r8g8b8a8 resource; the render target bound here is the only honest read.
          if (!gd.diag_logged_rt)
          {
@@ -2591,6 +2634,107 @@ public:
          g_sr_reactive_enable = mode.set_aa ? mode.reactive_mask : gd.perf_user_reactive_mask;
       }
       g_perf_test = mode_index;
+   }
+
+   static void ApplyMemorySweepMode(DeviceData& device_data, int step)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      if (g_memory_sweep_step < 0)
+      {
+         gd.memory_user_sr_type = device_data.sr_type;
+         gd.memory_user_smaa = g_smaa_enable;
+         gd.memory_user_bloom = g_luma_bloom_enable;
+         gd.memory_user_rcas = g_rcas_sharpness;
+         gd.memory_user_reactive_mask = g_sr_reactive_enable;
+      }
+      const bool restore = step < 0;
+      const MemorySweepMode& mode = memory_sweep_modes[restore ? 0 : step];
+      const SR::Type sr_type = restore ? gd.memory_user_sr_type : mode.sr_type;
+      // As Core's selection change to None
+      if (sr_type == SR::Type::None && device_data.sr_type != SR::Type::None)
+      {
+         device_data.sr_output_color = nullptr;
+         gd.release_sr_resources = true;
+      }
+      device_data.sr_type = sr_type;
+      device_data.sr_suppressed = false;
+      g_smaa_enable = restore ? gd.memory_user_smaa : mode.smaa;
+      g_luma_bloom_enable = restore ? gd.memory_user_bloom : mode.bloom;
+      g_rcas_sharpness = restore ? gd.memory_user_rcas : mode.rcas;
+      g_sr_reactive_enable = restore ? gd.memory_user_reactive_mask : mode.reactive_mask;
+      g_memory_sweep_step = step;
+      gd.memory_sweep_settle_frames = memory_sweep_settle_frames;
+      gd.memory_sweep_wait_frames = 0;
+   }
+
+   // The process's GPU memory (DXGI, this process only: the SR bridge's helper is not in it), commit and address space, plus the
+   // mod's own bookkeeping: fp16 mirrors (single mip size), the per pipeline bytecode copies and the motion vector constants copies
+   static void LogMemoryReport(ID3D11Device* native_device, DeviceData& device_data, const char* label)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, non_local = {};
+      com_ptr<IDXGIDevice> dxgi_device;
+      com_ptr<IDXGIAdapter> adapter;
+      com_ptr<IDXGIAdapter3> adapter3;
+      if (SUCCEEDED(native_device->QueryInterface(&dxgi_device)) && SUCCEEDED(dxgi_device->GetAdapter(&adapter)) && SUCCEEDED(adapter->QueryInterface(&adapter3)))
+      {
+         adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
+         adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non_local);
+      }
+      PROCESS_MEMORY_COUNTERS_EX pmc = {sizeof(pmc)};
+      GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+      size_t free_va = 0, largest_free_va = 0;
+      MEMORY_BASIC_INFORMATION mbi;
+      for (uintptr_t address = 0; VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)); address = uintptr_t(mbi.BaseAddress) + mbi.RegionSize)
+      {
+         if (mbi.State == MEM_FREE)
+         {
+            free_va += mbi.RegionSize;
+            largest_free_va = (std::max)(largest_free_va, size_t(mbi.RegionSize));
+         }
+         if (uintptr_t(mbi.BaseAddress) + mbi.RegionSize < uintptr_t(mbi.BaseAddress))
+            break;
+      }
+      size_t mirrors = 0, mirror_bytes = 0;
+      std::string mirror_list;
+      {
+         const std::shared_lock lock(device_data.mutex);
+         for (const auto& [original, mirror] : device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources)
+         {
+            mirrors++;
+            mirror_bytes += size_t(mirror.mirror_width) * mirror.mirror_height * 8;
+            // Which ones: the original's format, size, mips and bind flags
+            com_ptr<ID3D11Texture2D> texture;
+            D3D11_TEXTURE2D_DESC desc = {};
+            if (SUCCEEDED(reinterpret_cast<ID3D11Resource*>(original)->QueryInterface(&texture)))
+               texture->GetDesc(&desc);
+            mirror_list += std::format(" [{}x{} format {} mips {} bind 0x{:X} misc 0x{:X}{}{}]", desc.Width, desc.Height, int(desc.Format), desc.MipLevels, desc.BindFlags, desc.MiscFlags, mirror.is_scaled ? " scaled" : "", gd.canvas_resources_seen.contains(mirror.mirror_handle) || gd.canvas_resources_seen.contains(original) ? " canvas" : "");
+         }
+      }
+      size_t pipelines = 0, bytecode_bytes = 0;
+      {
+         const std::shared_lock lock(s_mutex_generic);
+         for (const auto& [handle, pipeline] : device_data.pipeline_cache_by_pipeline_handle)
+         {
+            pipelines++;
+            if (pipeline->subobjects_cache && pipeline->subobjects_cache[0].data)
+               bytecode_bytes += static_cast<const reshade::api::shader_desc*>(pipeline->subobjects_cache[0].data)->code_size;
+         }
+      }
+      size_t constants_copies = 0, constants_bytes = 0;
+      {
+         const std::scoped_lock lock(gd.mv_constants_mutex);
+         for (const auto& [buffer, copy] : gd.mv_constants_copies)
+         {
+            constants_copies++;
+            constants_bytes += copy ? copy->size() : 0;
+         }
+      }
+      constexpr double MiB = 1024.0 * 1024.0;
+      reshade::log::message(reshade::log::level::info, std::format("[ME1 Mem] \"{}\" vram local={:.1f} non-local={:.1f} MiB private={:.1f} MiB va free={:.1f} largest={:.1f} MiB mirrors={} ({:.1f} MiB) pipelines={} (bytecode {:.1f} MiB) mv constants copies={} ({:.1f} MiB) mv shaders vs={} ps={} output={}x{}",
+                                                          label, local.CurrentUsage / MiB, non_local.CurrentUsage / MiB, pmc.PrivateUsage / MiB, free_va / MiB, largest_free_va / MiB, mirrors, mirror_bytes / MiB, pipelines, bytecode_bytes / MiB, constants_copies, constants_bytes / MiB, gd.mv_vertex_shaders.size(), gd.mv_pixel_shaders.size(), uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y))
+                                                          .c_str());
+      reshade::log::message(reshade::log::level::info, std::format("[ME1 Mem] \"{}\" mirrored originals:{}", label, mirror_list).c_str());
    }
 #endif
 
@@ -2681,6 +2825,19 @@ public:
 #if DEVELOPMENT
       gd.mv_dumping = std::exchange(g_mv_dump_scene, false);
       gd.mv_dump_index = 0;
+      // "Memory Sweep": a mode settles for a fixed frame count after the upscaler is ready (lazy targets created, released ones
+      // flushed), or logs anyway once the helper failed to get ready in time
+      if (g_memory_sweep_step >= 0)
+      {
+         const bool not_ready = IsSRActive(device_data) && !sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData());
+         if (not_ready && ++gd.memory_sweep_wait_frames < memory_sweep_max_wait_frames)
+            gd.memory_sweep_settle_frames = memory_sweep_settle_frames;
+         else if (--gd.memory_sweep_settle_frames <= 0)
+         {
+            LogMemoryReport(native_device, device_data, std::format("{}{}", memory_sweep_modes[g_memory_sweep_step].name, not_ready ? " (upscaler not ready)" : "").c_str());
+            ApplyMemorySweepMode(device_data, g_memory_sweep_step + 1 < int(std::size(memory_sweep_modes)) ? g_memory_sweep_step + 1 : -1);
+         }
+      }
       // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, the first 30
       // after a settings change or a pause skipped), opens the next frame's
       com_ptr<ID3D11DeviceContext> perf_context;
@@ -3034,6 +3191,14 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([ME1 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill with the reactive mask, the upscaler, copies) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still; compare by toggling FSR and the mask. \"Sweep\" runs every mode, 3 rounds, then logs medians. Not saved.");
+      const std::string memory_sweep_label = g_memory_sweep_step >= 0 ? std::format("Memory Sweep ({}/{})", g_memory_sweep_step + 1, std::size(memory_sweep_modes)) : std::string("Memory Sweep");
+      if (ImGui::Button(memory_sweep_label.c_str()) && g_memory_sweep_step < 0 && g_perf_test == 0)
+      {
+         LogMemoryReport(device_data.native_device, device_data, "Current Settings");
+         ApplyMemorySweepMode(device_data, 0);
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Runs each mode (no AA, SMAA, bloom, RCAS, DLSS with and without SMAA, FSR 3 with the mask, back to none) and logs the\nprocess's GPU memory, commit and address space once each settles ([ME1 Mem] in ReShade.log), then restores the settings.\nKeep the camera still. Not with a Performance Test. Not saved.");
       if (ImGui::Button("MV Dump Scene Draws"))
          g_mv_dump_scene = true;
       if (ImGui::IsItemHovered())
