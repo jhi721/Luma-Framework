@@ -29,7 +29,6 @@ namespace MotionVectorPatches
    constexpr uint32_t previous_position_register = 15;
    // Past the game's targets (the G-buffer writes 2-3, the material pass 1, only 2 shaders reach o3), within SM4's 8
    constexpr uint32_t target_slot = 4;
-   constexpr char semantic_name[] = "LUMAMV";
 
    // For Core's patches ("motion_vector_patch.h")
    constexpr MotionVectorPatch::Layout layout = {object_slot, previous_slots, jitter_slot, resource_slots, previous_resources_slot,
@@ -54,13 +53,8 @@ namespace MotionVectorPatches
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
          return (*error = "container", std::vector<uint8_t>());
-      Chunk* program = nullptr;
-      for (Chunk& chunk : chunks)
-      {
-         if (chunk.fourcc == FourCC("SHEX") || chunk.fourcc == FourCC("SHDR"))
-            program = &chunk;
-      }
-      if (!program || program->data.size() % 4 != 0)
+      Chunk* const program = FindChunk(&chunks, FourCC("SHEX"), FourCC("SHDR"));
+      if (!program)
          return (*error = "chunks", std::vector<uint8_t>());
       std::vector<uint32_t> tokens;
       std::vector<Instruction> instructions;
