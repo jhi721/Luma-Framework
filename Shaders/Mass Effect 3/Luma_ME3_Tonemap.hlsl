@@ -23,7 +23,7 @@
 #include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
 #include "../Includes/DICE.hlsl"
 #include "../Includes/Reinhard.hlsl"        // ReinhardRange (grade proxy), ReinhardPiecewise (ALU hue reference)
-#include "Includes/MacLeodBoynton.hlsl"     // Byte-identical copy of the BL GOTY production model: sync it from "Borderlands GOTY Enhanced/Includes", do not edit here
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
 #include "Includes/GameBindings.hlsl"
 // clang-format on
 

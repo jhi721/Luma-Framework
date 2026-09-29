@@ -6,9 +6,8 @@
 //   src/games/borderlandsgotyenhanced/common.hlsli            ApplyHueAndPurityGrading, its hue/purity emulation
 //   src/shaders/math.hlsl, deprecated.hlsl, color/rgb.hlsl    Invert3x3, DivideSafe, SafeDivision, matrices, xyY
 // The constants, the expressions and their order are RenoDX's; the organisation and the API are Luma's, and the
-// unused purity modes are kept until the specialised entry points have proven what they need.
-// _tools/bl1_bridge/mb_equiv compiles this file, the RenoDX source and the previous BL1 port side by side under
-// fxc and holds their listings byte-identical.
+// unused purity modes are kept until the specialised entry points have proven what they need. Its fxc listings were held
+// byte-identical to the RenoDX source's.
 //
 // The model: RGB -> XYZ -> LMS (CIE 2006), hue as MacLeod–Boynton ratios r = L/(L+M), b = S/(L+M) around an
 // adapted white, intensity anchored on T = L + M, purity as the fraction of the distance from white to the RGB
@@ -547,7 +546,7 @@ float3 HueAndPurityEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt20
 // Reference hue direction on the target's own purity and T; nothing of the reference's purity is taken.
 // Deliberately a plain call: a hand-specialised copy (reference purity solve and chrominance branch removed)
 // compiles to byte-identical DXBC, since fxc already eliminates that dead work, so it would only duplicate
-// the hue block. Measured on both BL1 wrappers and held bit-exact over random pairs before being dropped.
+// the hue block. Measured bit-exact over random pairs before being dropped.
 float3 HueOnlyBT2020(float3 ungraded_bt2020, float3 reference_bt2020)
 {
    return HueAndPurityEmulationBT2020(ungraded_bt2020, reference_bt2020, 1.f, 0.f);

@@ -32,7 +32,7 @@
 #include "../../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
 #include "../../Includes/DICE.hlsl"
 #include "../../Includes/Reinhard.hlsl"
-#include "MacLeodBoynton.hlsl"                 // Byte-identical copy of the BL GOTY production model: do not edit here, sync it from "Borderlands GOTY Enhanced/Includes"
+#include "../../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
 // clang-format on
 
 #ifndef CCR_HLS
