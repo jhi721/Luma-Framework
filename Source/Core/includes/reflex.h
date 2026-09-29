@@ -5,6 +5,8 @@
 // The markers are only an approximation of the game's frame (simulation and render submission span the whole CPU frame),
 // so they aren't used for driver optimizations ("bUseMarkersToOptimize").
 #if ENABLE_REFLEX
+#include <atomic>
+
 #include "nvapi.h"
 
 namespace Reflex
@@ -65,6 +67,8 @@ namespace Reflex
       bool markers = false;               // The frame "frame_id" has Luma's markers
       uint32_t mode_presents = 0;         // Since Luma last set the sleep mode, or since the driver last agreed with it
       const char* other_reason = nullptr; // Why the state became "Other"
+      // The device's first swapchain, the only one followed (only compared)
+      std::atomic<void*> swapchain = nullptr;
 #if DEVELOPMENT
       LatencyStats latency_stats;
       uint32_t latency_stats_presents = 0;
@@ -97,7 +101,7 @@ namespace Reflex
    }
 
 #if DEVELOPMENT
-   void UpdateLatencyStats(IUnknown* device, DeviceData& data)
+   void UpdateLatencyStats(IUnknown* device, DeviceData* data)
    {
       LatencyStats stats;
       if (const NV_LATENCY_RESULT_PARAMS* const latency = GetLatencyReports(device))
@@ -110,7 +114,7 @@ namespace Reflex
             stats.gpu_ms += frame.gpuActiveRenderTimeUs;
             stats.gpu_frame_ms += frame.gpuFrameTimeUs;
             stats.frames++;
-            stats.other_markers |= IsOtherFrame(frame.frameID, data.frame_id);
+            stats.other_markers |= IsOtherFrame(frame.frameID, data->frame_id);
          }
          // From microseconds
          if (stats.frames != 0)
@@ -126,11 +130,11 @@ namespace Reflex
          stats.driver_low_latency = status.bLowLatencyMode;
          stats.driver_game_sleep = status.bUseGameSleep;
       }
-      stats.sleep_ms = data.sleeps != 0 ? double(data.sleep_ns) / data.sleeps / 1e6 : 0.0;
-      data.sleep_ns = 0;
-      data.sleeps = 0;
-      data.latency_stats = stats;
-      data.log_due = data.latency_stats_presents % (check_interval * 10) == 0;
+      stats.sleep_ms = data->sleeps != 0 ? double(data->sleep_ns) / data->sleeps / 1e6 : 0.0;
+      data->sleep_ns = 0;
+      data->sleeps = 0;
+      data->latency_stats = stats;
+      data->log_due = data->latency_stats_presents % (check_interval * 10) == 0;
    }
 #endif
 
@@ -153,73 +157,73 @@ namespace Reflex
    }
 
    // After the game's present returned: the frame ends, and the next one starts after the sleep
-   void OnFinishPresent(IUnknown* device, DeviceData& data, Mode mode)
+   void OnFinishPresent(IUnknown* device, DeviceData* data, Mode mode)
    {
 #if DEVELOPMENT
-      if (data.state != State::Unsupported && ++data.latency_stats_presents % check_interval == 0)
+      if (data->state != State::Unsupported && ++data->latency_stats_presents % check_interval == 0)
          UpdateLatencyStats(device, data);
 #endif
       // Every return but the last leaves the next frame unmarked
-      const bool had_markers = std::exchange(data.markers, false);
-      if (data.state > State::Running)
+      const bool had_markers = std::exchange(data->markers, false);
+      if (data->state > State::Running)
          return;
-      if (data.presents < detection_presents)
+      if (data->presents < detection_presents)
       {
          NV_GET_SLEEP_STATUS_PARAMS status = {NV_GET_SLEEP_STATUS_PARAMS_VER};
          if (NvAPI_D3D_GetSleepStatus(device, &status) != NVAPI_OK) // Also when NVAPI didn't initialize
-            data.state = State::Unsupported;
+            data->state = State::Unsupported;
          // Its present layer, loaded with the device
          else if (GetModuleHandleW(sizeof(void*) == 8 ? L"NvPresent64.dll" : L"NvPresent.dll"))
-            data.state = State::SmoothMotion;
+            data->state = State::SmoothMotion;
          // Not "bLowLatencyMode" alone: the control panel's "Low Latency Mode" can set it (Reflex-Best-Practices RXL-G1)
          else if (status.bUseGameSleep)
          {
-            data.state = State::Other;
-            data.other_reason = "sleep status at start";
+            data->state = State::Other;
+            data->other_reason = "sleep status at start";
          }
-         data.presents++;
+         data->presents++;
          return;
       }
 
       // Another Reflex (the game's or a tool's) started later: leave it to that (and its sleep mode)
-      if (((had_markers && data.frame_id % check_interval == 0) || (data.applied_mode == Mode::Off && mode != Mode::Off)) && HasOtherMarkers(device, data.frame_id))
+      if (((had_markers && data->frame_id % check_interval == 0) || (data->applied_mode == Mode::Off && mode != Mode::Off)) && HasOtherMarkers(device, data->frame_id))
       {
-         data.state = State::Other;
-         data.other_reason = "other markers";
+         data->state = State::Other;
+         data->other_reason = "other markers";
          return;
       }
 
-      if (data.applied_mode != mode)
+      if (data->applied_mode != mode)
       {
          NV_SET_SLEEP_MODE_PARAMS params = {NV_SET_SLEEP_MODE_PARAMS_VER};
          params.bLowLatencyMode = mode != Mode::Off;
          params.bLowLatencyBoost = mode == Mode::Boost;
          if (NvAPI_D3D_SetSleepMode(device, &params) != NVAPI_OK)
          {
-            data.state = State::Unsupported;
+            data->state = State::Unsupported;
             return;
          }
-         data.applied_mode = mode;
-         data.mode_presents = 0;
+         data->applied_mode = mode;
+         data->mode_presents = 0;
       }
       // Another owner of the sleep mode without markers of its own, or started later: while Luma's is on, the driver's stays off
       // or never sees Luma's sleep (e.g. Display Commander, which takes Luma's calls for the game's and applies its own mode).
       // The driver's on while Luma's is off isn't one: the control panel's "Low Latency Mode" does that too.
-      else if (mode != Mode::Off && ++data.mode_presents >= detection_presents && data.mode_presents % check_interval == 0)
+      else if (mode != Mode::Off && ++data->mode_presents >= detection_presents && data->mode_presents % check_interval == 0)
       {
          NV_GET_SLEEP_STATUS_PARAMS status = {NV_GET_SLEEP_STATUS_PARAMS_VER};
          if (NvAPI_D3D_GetSleepStatus(device, &status) != NVAPI_OK || (status.bLowLatencyMode && status.bUseGameSleep))
-            data.mode_presents = detection_presents;
-         else if (data.mode_presents >= detection_presents + owner_presents)
+            data->mode_presents = detection_presents;
+         else if (data->mode_presents >= detection_presents + owner_presents)
          {
-            data.state = State::Other;
-            data.other_reason = !status.bLowLatencyMode ? "driver low latency off, Luma on" : "driver sees no sleep, Luma on";
+            data->state = State::Other;
+            data->other_reason = !status.bLowLatencyMode ? "driver low latency off, Luma on" : "driver sees no sleep, Luma on";
             return;
          }
       }
       if (had_markers)
-         SetMarker(device, data.frame_id, PRESENT_END);
-      data.state = mode == Mode::Off ? State::Inactive : State::Running;
+         SetMarker(device, data->frame_id, PRESENT_END);
+      data->state = mode == Mode::Off ? State::Inactive : State::Running;
       // DEV also marks the frames with Reflex off (no sleep), to compare their latency
       if (mode == Mode::Off && !DEVELOPMENT)
          return;
@@ -230,14 +234,14 @@ namespace Reflex
 #endif
          NvAPI_D3D_Sleep(device);
 #if DEVELOPMENT
-         data.sleep_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - sleep_start).count();
-         data.sleeps++;
+         data->sleep_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - sleep_start).count();
+         data->sleeps++;
 #endif
       }
-      data.frame_id++;
-      data.markers = true;
-      SetMarker(device, data.frame_id, SIMULATION_START);
-      SetMarker(device, data.frame_id, RENDERSUBMIT_START);
+      data->frame_id++;
+      data->markers = true;
+      SetMarker(device, data->frame_id, SIMULATION_START);
+      SetMarker(device, data->frame_id, RENDERSUBMIT_START);
    }
 } // namespace Reflex
 #endif // ENABLE_REFLEX

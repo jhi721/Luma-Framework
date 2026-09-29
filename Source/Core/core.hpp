@@ -3222,6 +3222,10 @@ namespace
          const std::unique_lock lock(device_data.mutex);
          device_data.swapchains.emplace(swapchain);
          ASSERT_ONCE(device_data.swapchains.size() == 1); // Having more than one swapchain per device is probably supported but unexpected
+#if ENABLE_REFLEX
+         void* expected = nullptr;
+         device_data.reflex.swapchain.compare_exchange_strong(expected, swapchain);
+#endif
 
          for (uint32_t index = 0; index < back_buffer_count; index++)
          {
@@ -3453,6 +3457,11 @@ namespace
          {
             const std::unique_lock lock_device(device_data.mutex);
             device_data.swapchains.erase(swapchain);
+#if ENABLE_REFLEX
+            // Another one left takes over (a resize adds the same one back)
+            if (device_data.reflex.swapchain == swapchain)
+               device_data.reflex.swapchain = device_data.swapchains.empty() ? nullptr : *device_data.swapchains.begin();
+#endif
             for (const uint64_t handle : swapchain_data.back_buffers)
             {
                device_data.back_buffers.erase(handle);
@@ -5672,23 +5681,16 @@ namespace
    }
 
 #if ENABLE_REFLEX
-   // Reflex follows the device's first swapchain (the only one expected), so there's one sleep per frame
-   bool IsReflexSwapchain(DeviceData& device_data, reshade::api::swapchain* swapchain)
-   {
-      const std::shared_lock lock(device_data.mutex);
-      return !device_data.swapchains.empty() && *device_data.swapchains.begin() == swapchain;
-   }
-
    void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
    {
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
-      // Final states only update the DEV stats
-      if ((!DEVELOPMENT && device_data.reflex.state > Reflex::State::Running) || !IsReflexSwapchain(device_data, swapchain))
+      // Final states only update the DEV stats. Only the device's first swapchain (the only one expected), so there's one sleep per frame.
+      if ((!DEVELOPMENT && device_data.reflex.state > Reflex::State::Running) || device_data.reflex.swapchain != swapchain)
          return;
       // The UI's setting, read without the lock like the other per frame settings
-      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), device_data.reflex, reflex_mode);
+      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), &device_data.reflex, reflex_mode);
 #if DEVELOPMENT
       if (std::exchange(device_data.reflex.log_due, false))
       {
@@ -5717,7 +5719,7 @@ namespace
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
 
 #if ENABLE_REFLEX
-      if (device_data.reflex.markers && IsReflexSwapchain(device_data, swapchain))
+      if (device_data.reflex.markers && device_data.reflex.swapchain == swapchain)
          Reflex::OnPresent(native_device, device_data.reflex);
 #endif
 
