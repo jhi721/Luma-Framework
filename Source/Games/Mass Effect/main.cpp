@@ -3174,6 +3174,18 @@ public:
             gd.mv_reactive_target.reset();
             gd.mv_reactive_target_rtv.reset();
             gd.mv_reactive_target_srv.reset();
+            // The game's scene, depth and scene copy (taken again at the next scene), so a resize after None doesn't keep the old
+            // ones alive; and the vc4 copies the object tables and the cameras hold (heap, 4.4 KB each)
+            gd.mv_depth.reset();
+            gd.mv_scene_color.reset();
+            gd.mv_scene_rtv.reset();
+            gd.mv_scene_srv.reset();
+            gd.mv_scene_copy.reset();
+            gd.mv_scene_copy_rtv.reset();
+            gd.mv_objects.clear();
+            gd.mv_previous_objects.clear();
+            gd.mv_camera.reset();
+            gd.mv_previous_camera.reset();
             const std::lock_guard constants_lock(gd.mv_constants_mutex);
             gd.mv_constants_pool.clear();
             gd.mv_constants_pool_free.clear();
