@@ -143,6 +143,9 @@ EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Call of Duty DX11", "Source\Games\Call of Duty DX11\Call of Duty DX11.vcxproj", "{A6A0EC5F-AFD4-4699-B489-A621FB82C431}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mass Effect", "Source\Games\Mass Effect\Mass Effect.vcxproj", "{A8505E49-DA6F-4C05-ADF0-3480DC27B3FC}"
+	ProjectSection(ProjectDependencies) = postProject
+		{1A1AC095-1247-455C-8FF4-D8D6051AA52A} = {1A1AC095-1247-455C-8FF4-D8D6051AA52A}
+	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mass Effect 2", "Source\Games\Mass Effect 2\Mass Effect 2.vcxproj", "{B7C1D4E2-3F58-4A6D-9C21-5E8074A1B932}"
 EndProject
