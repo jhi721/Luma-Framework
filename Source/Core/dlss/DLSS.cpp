@@ -97,8 +97,12 @@ namespace NGX
 				return DLSSInternalInstance();
 			}
 
-			// Otherwise NGX keeps a released feature's memory until its shutdown (read from the creation parameters, as Unreal's DLSS plugin does by default)
-			runtime_params->Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
+			// Otherwise NGX keeps a released feature's memory until its shutdown (read from the creation parameters, as Unreal's DLSS plugin does by default).
+			// Not with dynamic resolution: the feature is recreated at every render size change, and the kept memory makes that cheap.
+			if (!settings_data.dynamic_resolution)
+			{
+				runtime_params->Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
+			}
 
 			NVSDK_NGX_Handle* feature = nullptr;
 
