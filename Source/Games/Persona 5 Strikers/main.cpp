@@ -74,6 +74,8 @@ namespace
 
 #if DEVELOPMENT
    int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
+   // See "PatchedDraws::CountTieBreakCollisions"
+   uint32_t g_mv_tiebreak_collisions_last_frame = 0;
    bool g_smaa_predication = true;
    int g_smaa_debug_view = 0; // 0 off, 1 edges, 2 predication
    // Upscaling A/B: the post process at the output resolution (see "RedirectPostDraw"), else the previous way (see
@@ -588,6 +590,10 @@ class Persona5Strikers final : public Game
       game_device_data.mv_view_projection_valid = false;
       game_device_data.mv_frame_present = game_device_data.mv_presents;
       game_device_data.mv_previous_objects = std::move(game_device_data.mv_objects);
+#if DEVELOPMENT
+      g_mv_tiebreak_collisions_last_frame = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
+         { return a.globals == b.globals; });
+#endif
       game_device_data.mv_objects.clear();
       game_device_data.mv_objects.reserve(game_device_data.mv_previous_objects.size());
       if (!game_device_data.mv_previous_view_projection_valid)
@@ -1115,6 +1121,7 @@ public:
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
       Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"smaa_predication", &g_smaa_predication}, {"post_output_resolution", &g_post_output_resolution}});
+      Mcp::RegisterCounter("mv.tiebreak_collisions", &g_mv_tiebreak_collisions_last_frame);
       Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 200.f}});
       Mcp::RegisterInts({{"render_scale", &g_render_scale, 5, 10}, {"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"smaa_debug_view", &g_smaa_debug_view, 0, 2},
          {"perf_test", &g_perf_test, 0, int(std::size(perf_test_modes)) - 1, [](DeviceData& device_data, double value)
