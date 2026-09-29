@@ -1656,15 +1656,34 @@ struct alignas(16) CBLumaBloomData
    float sigma;
 };
 
+// "DrawBloom"'s mip chains, sized from the scene (rebuilt on a scene size or mip count change)
+// TODO: Reorganize this better.
+static struct
+{
+   std::vector<ID3D11RenderTargetView*> rtv_mips_x;
+   std::vector<ID3D11ShaderResourceView*> srv_mips_x;
+   std::vector<ID3D11RenderTargetView*> rtv_mips_y;
+   std::vector<ID3D11ShaderResourceView*> srv_mips_y;
+   UINT last_scene_width = 0;
+   UINT last_scene_height = 0;
+   int last_nmips = -1;
+} bloom_mips;
+
+// Frees "DrawBloom"'s mip chains (e.g. while a game's bloom is off); its next draw rebuilds them
+void ReleaseBloom()
+{
+   ResetCOMArray(bloom_mips.rtv_mips_x);
+   ResetCOMArray(bloom_mips.srv_mips_x);
+   ResetCOMArray(bloom_mips.rtv_mips_y);
+   ResetCOMArray(bloom_mips.srv_mips_y);
+   bloom_mips.last_nmips = -1;
+}
+
 void DrawBloom(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_scene, int nmips, const float* sigmas, ID3D11ShaderResourceView** srv_bloom)
 {
    auto& managed_resources = device_data.managed_resources;
 
-   // TODO: Reorganize this better.
-   static std::vector<ID3D11RenderTargetView*> rtv_mips_x;
-   static std::vector<ID3D11ShaderResourceView*> srv_mips_x;
-   static std::vector<ID3D11RenderTargetView*> rtv_mips_y;
-   static std::vector<ID3D11ShaderResourceView*> srv_mips_y;
+   auto& [rtv_mips_x, srv_mips_x, rtv_mips_y, srv_mips_y, last_scene_width, last_scene_height, last_nmips] = bloom_mips;
 
    // Backup IA.
    D3D11_PRIMITIVE_TOPOLOGY primitive_topology_original;
@@ -1718,9 +1737,6 @@ void DrawBloom(ID3D11Device* device, ID3D11DeviceContext* device_context, Device
 
    // The bloom mips are sized from the scene; reset them when the scene size or mip count changes
    // Needed for proper support of the new resource scaling feature.
-   static UINT last_scene_width = 0;
-   static UINT last_scene_height = 0;
-   static int last_nmips = -1;
    if (nmips != last_nmips || scene_width != last_scene_width || scene_height != last_scene_height)
    {
       ResetCOMArray(rtv_mips_x);
