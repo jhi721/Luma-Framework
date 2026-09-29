@@ -2347,7 +2347,7 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
-      sr_game_tooltip = "DLAA or FSR 3 native anti-aliasing (the game has none of its own). They run in Luma-Upscaler.exe next to the game's exe:\nthe game is 32-bit, they are 64-bit only.\n";
+      sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
 
 #if ENABLE_SMAA
       // Core auto-registers the 6 SMAA passes. Added here: the predication CS turning scene alpha into R16F edge-ness in [0,1].
@@ -3940,7 +3940,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Mass Effect\" (2007) is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, HDR bloom, SMAA anti-aliasing, and 16x anisotropic filtering.\n"
+         "It adds HDR, DLAA or FSR 3 native anti-aliasing, HDR bloom and SMAA anti-aliasing, plus 16x anisotropic filtering.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -3982,7 +3982,8 @@ public:
                   "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
-                  "\nAMD FidelityFX (RCAS)"
+                  "\nAMD FidelityFX (RCAS + FSR 3)"
+                  "\nNVIDIA NGX (DLSS)"
                   "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
    }
 };
