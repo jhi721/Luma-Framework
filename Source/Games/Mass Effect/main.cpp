@@ -1089,8 +1089,9 @@ class MassEffect final : public Game
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
       gd.mv_reactive_blend = 0;
-      // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
-      const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
+      // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's
+      // helper starting shows the scene as it is, antialiased with SMAA).
+      const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) && sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData()) ? device_data.GetSRInstanceData() : nullptr;
       const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
       gd.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter && GetPerfMotionVectorDraws() != 0
                         ? std::array<float, 2>{SR::HaltonSequence(phase, 2),
@@ -1742,7 +1743,8 @@ class MassEffect final : public Game
 #endif
       if (gd.mv_scene_copy && !copy_only)
          native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
-      device_data.has_drawn_sr = true;
+      // Not while the bridge's helper starts (the color copied as it is): SMAA stays on and the next frame resets
+      device_data.has_drawn_sr = sr_implementations[device_data.sr_type]->IsReady(sr_instance_data);
       device_data.has_drawn_main_post_processing = true; // Core's upscaler status icon
       return true;
    }
