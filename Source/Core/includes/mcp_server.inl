@@ -2094,6 +2094,15 @@ namespace Mcp
                while (!refused && !server_stop && !(finished = WaitForSingleObject(job->done, 50) == WAIT_OBJECT_0) && GetTickCount64() - start < timeout_ms)
                {
                }
+               // A timed out job that never started is dropped (nobody reads its result), a started one finishes (and restores the dev UI state) on its own
+               bool dropped = false;
+               if (!refused && !finished)
+               {
+                  const std::lock_guard lock(s_mutex_jobs);
+                  dropped = std::erase(pending_jobs, job) != 0;
+                  has_pending_jobs = !pending_jobs.empty();
+               }
+               const std::string_view timeout_reason = (dropped ? "it was queued behind an earlier call that is still running, and was dropped" : "the game might not be presenting (minimized or paused?) or the job is waiting for a pass that doesn't draw");
                const auto path_error = [](std::string_view error, std::string_view key, const std::filesystem::path& path)
                {
                   JsonWriter w;
@@ -2101,11 +2110,10 @@ namespace Mcp
                   return std::move(w.out);
                };
                constexpr std::string_view outside_root = "out_dir must be the \"root\" folder or a subfolder of it";
-               // A timed out job stays queued and finishes (and restores the dev UI state) on its own later
                std::string response = refused ? path_error(outside_root, "root", ReadbackRoot())
                                       : finished
                                          ? std::move(job->result.out)
-                                         : std::format("{{\"ok\":false,\"error\":\"Timed out after {} ms, the game might not be presenting (minimized or paused?) or the job is waiting for a pass that doesn't draw\"}}", timeout_ms);
+                                         : std::format("{{\"ok\":false,\"error\":\"Timed out after {} ms, {}\"}}", timeout_ms, timeout_reason);
                // Readbacks are written here rather than on the render thread
                for (const auto& [path, bytes] : job->files)
                {
