@@ -35,6 +35,9 @@ namespace SRBridge
 
       virtual int GetJitterPhases(const SR::InstanceData* data) const override;
 
+      // Once the helper created the upscaler
+      virtual bool IsReady(const SR::InstanceData* data) const override;
+
    private:
       SR::Type type;
    };

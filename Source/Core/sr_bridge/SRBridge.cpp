@@ -373,6 +373,11 @@ namespace SRBridge
       return true;
    }
 
+   bool Bridge::IsReady(const SR::InstanceData* data) const
+   {
+      return data && static_cast<const BridgeInstanceData*>(data)->ready;
+   }
+
    // NVIDIA's formula (as Core's DLSS), which FSR's matches
    int Bridge::GetJitterPhases(const SR::InstanceData* data) const
    {

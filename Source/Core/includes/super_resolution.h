@@ -198,6 +198,9 @@ namespace SR
 		// All implementations work well with Halton for now, so always use that.
 		virtual int GetJitterPhases(const SR::InstanceData* data) const { return 1 /*jitters disabled*/; }
 
+		// Whether "Draw()" upscales, rather than still preparing (e.g. the SR bridge's helper starting, which copies the color as it is)
+		virtual bool IsReady(const InstanceData* data) const { return true; }
+
 		// Returns the suggested mip lod bias for the current resolution scale.
 		// This assumes the jitter phases are increased with lower resolution scales.
 		// -1 at native resolution as we'd still be running TAA.
