@@ -9,6 +9,7 @@
 #include <memory>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -181,4 +182,34 @@ namespace PatchedDraws
          }
       }
    };
+
+   // A development check of a frame's motion vector objects by draw key: those with another object's "translation" but other
+   // constants. Their previous frame match is arbitrary (a tie-break translation that isn't per object, e.g. a bone row); 0 when
+   // the tie-break works.
+   template <typename Object, typename SameConstants>
+   uint32_t CountTieBreakCollisions(const std::unordered_map<uint64_t, std::vector<Object>>& objects_by_key, SameConstants same_constants)
+   {
+      uint32_t collisions = 0;
+      for (const auto& [key, objects] : objects_by_key)
+      {
+         for (size_t i = 0; i < objects.size(); i++)
+         {
+            for (size_t j = 0; j < objects.size(); j++)
+            {
+               if (i != j && objects[i].translation == objects[j].translation && !same_constants(objects[i], objects[j]))
+               {
+                  collisions++;
+                  break;
+               }
+            }
+         }
+      }
+      return collisions;
+   }
+
+   // Constant copies (shared, null until a buffer's first upload) holding the same bytes, for "CountTieBreakCollisions"
+   inline bool SameBytes(const std::shared_ptr<const std::vector<uint8_t>>& a, const std::shared_ptr<const std::vector<uint8_t>>& b)
+   {
+      return a == b || (a && b && *a == *b);
+   }
 } // namespace PatchedDraws
