@@ -64,6 +64,16 @@ namespace SR
 
 	// 8 is usually great for native resolution TAA
 	constexpr int GetDefaultJitterPhases() { return 8; }
+	// NVIDIA's suggested formula, from the default at native resolution (Y resolution, as it's generally more reliable)
+	static int GetDlssJitterPhases(unsigned int render_height, unsigned int output_height)
+	{
+		return std::lrintf(float(GetDefaultJitterPhases()) * std::pow((std::max)(float(output_height) / float(render_height), 1.f), 2.f));
+	}
+	// FidelityFX's "ffxFsr3UpscalerGetJitterPhaseCount()", for builds without FSR (x86)
+	static int GetFsrJitterPhases(unsigned int render_width, unsigned int output_width)
+	{
+		return int(8.f * std::pow(float(output_width) / float(render_width), 2.f));
+	}
 	
 	static float GetMipLODBias(float render_height, float output_height)
 	{

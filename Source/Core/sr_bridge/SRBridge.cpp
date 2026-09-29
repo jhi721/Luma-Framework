@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -305,7 +304,7 @@ namespace SRBridge
       {
          // A dead process's fences read UINT64_MAX, so no GPU wait is left hanging
          if (WaitForSingleObject(custom_data.process, 0) == WAIT_OBJECT_0 || custom_data.fences[1]->GetCompletedValue() == UINT64_MAX)
-            return custom_data.Fail("the helper exited (see Luma-Upscaler.log next to the game's exe)");
+            return custom_data.Fail(std::format("the helper exited (see {} next to the game's exe)", std::filesystem::path(kLogName).string()));
          if (!std::equal(std::begin(resources), std::end(resources), std::begin(custom_data.sources), [](ID3D11Resource* resource, const ComPtr<ID3D11Resource>& source)
                 { return resource == source.Get(); }))
             custom_data.Stop(); // Recreated: the helper restarts on them
@@ -373,11 +372,11 @@ namespace SRBridge
       return data && static_cast<const BridgeInstanceData*>(data)->frame != 0;
    }
 
-   // NVIDIA's formula (as Core's DLSS), which FSR's matches
+   // Each upscaler's own formula (as Core's DLSS and FSR)
    int Bridge::GetJitterPhases(const SR::InstanceData* data) const
    {
-      const float scale = (std::max)(float(data->settings_data.output_height) / float(data->settings_data.render_height), 1.f);
-      return std::lrintf(float(SR::GetDefaultJitterPhases()) * scale * scale);
+      const SR::SettingsData& settings = data->settings_data;
+      return type == SR::Type::DLSS ? SR::GetDlssJitterPhases(settings.render_height, settings.output_height) : SR::GetFsrJitterPhases(settings.render_width, settings.output_width);
    }
 } // namespace SRBridge
 
