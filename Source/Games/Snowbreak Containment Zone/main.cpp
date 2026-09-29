@@ -781,11 +781,9 @@ public:
                         settings_data.mvs_x_scale = sr_mvs_x_scale;
                         settings_data.mvs_y_scale = sr_mvs_y_scale;
                         LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height, mv_size_plausible);
-                        // Hand OptiScaler a change only when one of the eleven
-                        // compared fields actually moved. Re-sending an
-                        // identical tuple is a no-op for it but the comparison
-                        // itself runs on every one of the ~80 calls/s this pass
-                        // makes.
+                        // Every call: an identical tuple is a no-op for the implementation (it compares
+                        // them itself), and it recreates what a deselection released ("ReleaseResources()").
+                        // Only the count of distinct tuples is kept here.
                         static SR::SettingsData sr_last_settings;
                         static bool sr_last_settings_valid = false;
                         if (!sr_last_settings_valid || !(sr_last_settings == settings_data))
@@ -793,8 +791,8 @@ public:
                            sr_last_settings = settings_data;
                            sr_last_settings_valid = true;
                            sr_update_calls++;
-                           sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
                         }
+                        sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
                         constexpr bool sr_use_native_uav = true;
                         bool sr_output_supports_uav = sr_use_native_uav && (upscale_output_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
