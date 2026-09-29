@@ -163,6 +163,32 @@ static constexpr uint32_t kScenePostHashes[] = {
 
 // Motion vectors for the upscaler (the game renders none, see MotionVectorPatches.h): the opaque draws into the fp16 scene draw with patched
 // shaders that also write an extra target, the vertex shader's second run reading the draw's previous frame vc4.
+// CPU optimizations of the hooks, each one off in its own "Performance Test" modes (A/B in the "CPU Sweep"). Always on outside
+// DEVELOPMENT.
+enum CpuOptimization : uint32_t
+{
+   // The buffer hooks tell the registered vc4 buffers apart without the lock and the lookup (every Map/Unmap of any resource paid
+   // them), with their size kept (no GetDesc per copy)
+   kCpuVc4Filter = 1 << 0,
+   // A vc4 copy reuses a copy nobody holds anymore instead of a new allocation (4.4 KB per Unmap)
+   kCpuVc4Pool = 1 << 1,
+   // The per-target blend repair's checks remembered for the bound blend state (a GetDesc and a loop on every draw of the frame)
+   kCpuBlendMemo = 1 << 2,
+   kCpuAll = (1 << 3) - 1,
+};
+#if DEVELOPMENT
+static uint32_t g_cpu_optimizations = kCpuAll;
+static uint32_t g_perf_cpu_optimizations_off = 0; // The running "Performance Test" mode's
+static bool IsCpuOptimized(uint32_t optimization)
+{
+   return (g_cpu_optimizations & ~g_perf_cpu_optimizations_off & optimization) != 0;
+}
+#else
+constexpr bool IsCpuOptimized(uint32_t optimization)
+{
+   return true;
+}
+#endif
 #if DEVELOPMENT
 static float g_sr_reactive_scale = 1.f;      // FSR reactive mask: the alpha blended draws' reactivity, scaled (AMD's default 1)
 static float g_sr_reactive_threshold = 0.5f; // Under it 0, over it 0.9 (AMD's 0.2; 0.5 tuned in game 2026-09-28: lower shakes static glows); 0: the scaled reactivity itself
@@ -180,7 +206,8 @@ struct PerfTestMode
    SR::Type sr_type = SR::Type::None;
    bool smaa = false;
    bool reactive_mask = false;
-   int motion_vector_draws = 2; // 2 patched (motion vectors and jitter), 1 jitter only, 0 untouched (unjittered)
+   int motion_vector_draws = 2;        // 2 patched (motion vectors and jitter), 1 jitter only, 0 untouched (unjittered)
+   uint32_t cpu_optimizations_off = 0; // "CpuOptimization" bits
 };
 constexpr PerfTestMode perf_test_modes[] = {
    {"Off"},
@@ -192,6 +219,11 @@ constexpr PerfTestMode perf_test_modes[] = {
    {"FSR 3 Without Motion Vector Draws", true, SR::Type::FSR, false, false, 0},
    {"SMAA", true, SR::Type::None, true},
    {"No AA", true, SR::Type::None, false},
+   {"FSR 3 No CPU Optimizations", true, SR::Type::FSR, false, false, 2, kCpuAll},
+   {"FSR 3 Without vc4 Filter", true, SR::Type::FSR, false, false, 2, kCpuVc4Filter},
+   {"FSR 3 Without vc4 Pool", true, SR::Type::FSR, false, false, 2, kCpuVc4Pool},
+   {"FSR 3 Without Blend Memo", true, SR::Type::FSR, false, false, 2, kCpuBlendMemo},
+   {"No AA No CPU Optimizations", true, SR::Type::None, false, false, 2, kCpuAll},
 };
 // "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a
 // median per mode against the last one ("No AA")
@@ -205,7 +237,12 @@ static bool g_perf_hook_timers = true;
 static bool g_bridge_flush_before = false;
 static int g_gpu_thread_priority = 0;
 constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7, 8};
+// "CPU Sweep": the CPU optimizations each off in turn, with and without an upscaler
+constexpr int perf_cpu_sweep_modes[] = {4, 9, 10, 11, 12, 13, 8};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
+static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[std::size(perf_cpu_sweep_modes) - 1]].name) == "No AA");
+static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[5]].name) == "No AA No CPU Optimizations");
+static std::span<const int> g_perf_sweep_list = perf_sweep_modes; // The running sweep's
 constexpr int perf_sweep_rounds = 3;
 constexpr int perf_sweep_windows = 1;  // Per mode and round (120 frames)
 constexpr int perf_settle_frames = 30; // Skipped after a settings change (history reset, targets rebuilt) and the upscaler being ready
@@ -486,6 +523,17 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::mutex mv_constants_mutex;
    std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
    std::unordered_map<uint64_t, void*> mv_mapped_constants; // Registered buffers mapped now, until their Unmap
+   // "kCpuVc4Filter": the first registered buffers and their sizes, read by the buffer hooks without the lock (written under it, on
+   // the immediate context's thread as the hooks). With more registered, every buffer takes the lock as without the filter.
+   static constexpr uint32_t kMaxFilteredBuffers = 8;
+   std::array<std::atomic<uint64_t>, kMaxFilteredBuffers> mv_filtered_buffers = {};
+   std::array<UINT, kMaxFilteredBuffers> mv_filtered_buffer_sizes = {};
+   std::atomic<uint32_t> mv_filtered_buffer_count = 0;
+   std::atomic<bool> mv_filter_overflow = false;
+   // "kCpuVc4Pool": every pooled copy, and those nobody held anymore at the last scene opening (taken by the next copies). Under
+   // "mv_constants_mutex".
+   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
+   std::vector<uint32_t> mv_constants_pool_free;
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with a world translation and vc4. A draw takes the previous
@@ -758,26 +806,45 @@ class MassEffect final : public Game
       if (!blend_state)
          return false; // no state object = default (blending off everywhere)
 
-      D3D11_BLEND_DESC bd;
-      blend_state->GetDesc(&bd);
-      if (!bd.IndependentBlendEnable)
-         return false; // one state for all targets: already D3D9-shaped
-
-      const bool rt0_blending = bd.RenderTarget[0].BlendEnable != FALSE;
-#if !DEVELOPMENT
-      // Only "RT0 off, RTn on" is repaired, so outside DEVELOPMENT a blending RT0 skips the scan and the RT query.
-      if (rt0_blending)
-         return false;
-#endif
-
       // Only BOUND game targets count: stale BlendEnable in unused slots would match nearly every single-target draw, and
       // Luma's own slots (from "MotionVectorPatches::target_slot") differ by design (see "OnCreateBlendState").
       constexpr UINT game_targets = MotionVectorPatches::target_slot;
-      bool disagreement = false;
-      for (UINT i = 1; i < game_targets && !disagreement; i++)
-         disagreement = bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
-      if (!disagreement)
-         return false;
+      // "kCpuBlendMemo": the checks on the state alone, remembered for it. Per thread (this runs on every context) and per frame (a
+      // released state's pointer can come back as another's).
+      struct BlendMemo
+      {
+         ID3D11BlendState* state = nullptr;
+         uint32_t frame = UINT32_MAX;
+         bool candidate = false;
+         D3D11_BLEND_DESC desc;
+      };
+      thread_local BlendMemo memo;
+      D3D11_BLEND_DESC bd;
+      if (IsCpuOptimized(kCpuBlendMemo) && memo.state == blend_state.get() && memo.frame == cb_luma_global_settings.FrameIndex)
+      {
+         if (!memo.candidate)
+            return false;
+         bd = memo.desc;
+      }
+      else
+      {
+         blend_state->GetDesc(&bd);
+         // One state for all targets is already D3D9-shaped
+         bool candidate = bd.IndependentBlendEnable;
+#if !DEVELOPMENT
+         // Only "RT0 off, RTn on" is repaired, so outside DEVELOPMENT a blending RT0 skips the scan and the RT query.
+         candidate &= !bd.RenderTarget[0].BlendEnable;
+#endif
+         bool disagreement = false;
+         for (UINT i = 1; i < game_targets && !disagreement; i++)
+            disagreement = bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
+         candidate &= disagreement;
+         if (IsCpuOptimized(kCpuBlendMemo))
+            memo = {blend_state.get(), cb_luma_global_settings.FrameIndex, candidate, bd};
+         if (!candidate)
+            return false;
+      }
+      const bool rt0_blending = bd.RenderTarget[0].BlendEnable != FALSE;
 
       // RT0's blend bit is loop-invariant, so the two shapes are mutually exclusive: one flag out of the loop.
       ID3D11RenderTargetView* rtvs[game_targets] = {};
@@ -992,6 +1059,71 @@ class MassEffect final : public Game
       return GetGameDeviceData(device_data).sr_active;
    }
 
+   // "kCpuVc4Filter": false if the buffer surely isn't a registered vc4 one; "size" its size if known (else 0). Lock free.
+   static bool MayBeRegisteredBuffer(const MassEffectGameDeviceData& gd, uint64_t handle, UINT* size)
+   {
+      *size = 0;
+      if (!IsCpuOptimized(kCpuVc4Filter) || gd.mv_filter_overflow.load(std::memory_order_relaxed))
+         return true;
+      const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_acquire);
+      for (uint32_t i = 0; i < count; i++)
+      {
+         if (gd.mv_filtered_buffers[i].load(std::memory_order_relaxed) == handle)
+         {
+            *size = gd.mv_filtered_buffer_sizes[i];
+            return true;
+         }
+      }
+      return false;
+   }
+
+   // A buffer registered in "mv_constants_copies" joins the filter ("kCpuVc4Filter"). Under "mv_constants_mutex".
+   static void AddFilteredBuffer(MassEffectGameDeviceData& gd, ID3D11Buffer* buffer)
+   {
+      const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_relaxed);
+      if (count >= MassEffectGameDeviceData::kMaxFilteredBuffers)
+      {
+         gd.mv_filter_overflow = true;
+         return;
+      }
+      D3D11_BUFFER_DESC desc;
+      buffer->GetDesc(&desc);
+      gd.mv_filtered_buffer_sizes[count] = desc.ByteWidth;
+      gd.mv_filtered_buffers[count].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_relaxed);
+      gd.mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
+   }
+
+   static UINT GetBufferSize(uint64_t handle, UINT known_size)
+   {
+      if (known_size != 0)
+         return known_size;
+      D3D11_BUFFER_DESC desc;
+      reinterpret_cast<ID3D11Buffer*>(handle)->GetDesc(&desc);
+      return desc.ByteWidth;
+   }
+
+   // A vc4 copy of "size" bytes (filled from "bytes" if given): one nobody held anymore at the scene opening ("kCpuVc4Pool"), else
+   // a new one. Under "mv_constants_mutex".
+   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MassEffectGameDeviceData& gd, const uint8_t* bytes, size_t size)
+   {
+      std::shared_ptr<std::vector<uint8_t>> copy;
+      if (IsCpuOptimized(kCpuVc4Pool) && !gd.mv_constants_pool_free.empty())
+      {
+         copy = gd.mv_constants_pool[gd.mv_constants_pool_free.back()];
+         gd.mv_constants_pool_free.pop_back();
+         copy->resize(size);
+      }
+      else
+      {
+         copy = std::make_shared<std::vector<uint8_t>>(size);
+         if (IsCpuOptimized(kCpuVc4Pool))
+            gd.mv_constants_pool.push_back(copy);
+      }
+      if (bytes)
+         std::memcpy(copy->data(), bytes, size);
+      return copy;
+   }
+
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite,
    // remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device,
@@ -1007,6 +1139,9 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       const PerfHookTimer perf_timer{gd.perf_hook_ns};
 #endif
+      UINT buffer_size;
+      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+         return;
       const std::lock_guard lock(gd.mv_constants_mutex);
       if (!gd.mv_constants_copies.contains(resource.handle))
          return;
@@ -1032,16 +1167,14 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       const PerfHookTimer perf_timer{gd.perf_hook_ns};
 #endif
+      UINT buffer_size;
+      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+         return;
       const std::lock_guard lock(gd.mv_constants_mutex);
       const auto mapped = gd.mv_mapped_constants.find(resource.handle);
       if (mapped == gd.mv_mapped_constants.end())
          return;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
-      const auto* const bytes = static_cast<const uint8_t*>(mapped->second);
-      gd.mv_constants_copies[resource.handle] =
-         std::make_shared<const std::vector<uint8_t>>(bytes,
-            bytes + desc.ByteWidth);
+      gd.mv_constants_copies[resource.handle] = NewConstantsCopy(gd, static_cast<const uint8_t*>(mapped->second), GetBufferSize(resource.handle, buffer_size));
       gd.mv_mapped_constants.erase(mapped);
 #if DEVELOPMENT
       gd.mv_stats.maps++;
@@ -1064,27 +1197,29 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       const PerfHookTimer perf_timer{gd.perf_hook_ns};
 #endif
+      UINT known_size;
+      if (!MayBeRegisteredBuffer(gd, resource.handle, &known_size))
+         return false;
       const std::lock_guard lock(gd.mv_constants_mutex);
       const auto copy = gd.mv_constants_copies.find(resource.handle);
       if (copy == gd.mv_constants_copies.end())
          return false;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
-      if (offset >= desc.ByteWidth)
+      const UINT buffer_size = GetBufferSize(resource.handle, known_size);
+      if (offset >= buffer_size)
          return false;
       const size_t updated_size =
-         size_t((std::min)(size, uint64_t(desc.ByteWidth) - offset));
+         size_t((std::min)(size, uint64_t(buffer_size) - offset));
       const auto* const bytes = static_cast<const uint8_t*>(data);
-      if (updated_size == desc.ByteWidth)
+      if (updated_size == buffer_size)
       {
-         copy->second = std::make_shared<const std::vector<uint8_t>>(
-            bytes, bytes + updated_size);
+         copy->second = NewConstantsCopy(gd, bytes, updated_size);
       }
       else
       {
-         auto updated = copy->second && copy->second->size() == desc.ByteWidth
-                           ? std::make_shared<std::vector<uint8_t>>(*copy->second)
-                           : std::make_shared<std::vector<uint8_t>>(desc.ByteWidth);
+         const bool merge = copy->second && copy->second->size() == buffer_size;
+         auto updated = NewConstantsCopy(gd, merge ? copy->second->data() : nullptr, buffer_size);
+         if (!merge)
+            std::fill(updated->begin(), updated->end(), uint8_t(0));
          std::memcpy(updated->data() + offset, bytes, updated_size);
          copy->second = std::move(updated);
       }
@@ -1457,6 +1592,15 @@ class MassEffect final : public Game
             entry.second.clear();
          if (!previous_valid)
             gd.mv_previous_objects.clear();
+         {
+            const std::lock_guard lock(gd.mv_constants_mutex);
+            gd.mv_constants_pool_free.clear();
+            for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
+            {
+               if (gd.mv_constants_pool[i].use_count() == 1)
+                  gd.mv_constants_pool_free.push_back(i);
+            }
+         }
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it
@@ -1481,7 +1625,13 @@ class MassEffect final : public Game
       {
          const std::lock_guard lock(gd.mv_constants_mutex);
          // The buffer's CPU copy (null until its first upload); the lookup registers it for a copy at every upload
-         constants = current ? gd.mv_constants_copies[reinterpret_cast<uint64_t>(current.get())] : nullptr;
+         if (current)
+         {
+            const auto [copy, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current.get()));
+            constants = copy->second;
+            if (registered)
+               AddFilteredBuffer(gd, current.get());
+         }
       }
       // The previous frame's vc4: the same object's from last frame, else this
       // draw's with last frame's camera (no object motion). None (no CPU copy yet,
@@ -2805,6 +2955,7 @@ public:
          g_smaa_enable = mode.set_aa ? mode.smaa : gd.perf_user_smaa;
          g_sr_reactive_enable = mode.set_aa ? mode.reactive_mask : gd.perf_user_reactive_mask;
       }
+      g_perf_cpu_optimizations_off = mode.cpu_optimizations_off;
       g_perf_test = mode_index;
    }
 
@@ -2981,6 +3132,9 @@ public:
             gd.mv_reactive_target.reset();
             gd.mv_reactive_target_rtv.reset();
             gd.mv_reactive_target_srv.reset();
+            const std::lock_guard constants_lock(gd.mv_constants_mutex);
+            gd.mv_constants_pool.clear();
+            gd.mv_constants_pool_free.clear();
          }
       }
 #if DEVELOPMENT
@@ -3175,7 +3329,7 @@ public:
       {
          const auto now = std::chrono::steady_clock::now();
          const std::string aa = IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : "none");
-         const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, g_perf_hook_timers, aa, IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
+         const std::string settings = std::format("mode=\"{}\" hook_timers={} cpu_optimizations=0x{:02X} aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, g_perf_hook_timers, g_cpu_optimizations & ~g_perf_cpu_optimizations_off, aa, IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
          // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile)
          if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250) ||
              (IsSRActive(device_data) && !sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData())))
@@ -3251,9 +3405,9 @@ public:
                   {
                      gd.perf_sweep_windows_done = 0;
                      const int step = ++gd.perf_sweep_step;
-                     if (step < perf_sweep_rounds * int(std::size(perf_sweep_modes)))
+                     if (step < perf_sweep_rounds * int(g_perf_sweep_list.size()))
                      {
-                        ApplyPerfTestMode(device_data, perf_sweep_modes[step % std::size(perf_sweep_modes)]);
+                        ApplyPerfTestMode(device_data, g_perf_sweep_list[step % g_perf_sweep_list.size()]);
                      }
                      else
                      {
@@ -3265,9 +3419,9 @@ public:
                            std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
                            return values.empty() ? 0.0 : values[values.size() / 2];
                         };
-                        constexpr int baseline_mode = perf_sweep_modes[std::size(perf_sweep_modes) - 1];
+                        const int baseline_mode = g_perf_sweep_list.back();
                         const double baseline = median(baseline_mode, 0);
-                        for (const int mode : perf_sweep_modes)
+                        for (const int mode : g_perf_sweep_list)
                         {
                            const double cpu_frame = median(mode, 4);
                            reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" hook_timers={} windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, g_perf_hook_timers, gd.perf_sweep_results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, median(mode, 0), median(mode, 0) - baseline, perf_test_modes[baseline_mode].name, median(mode, 1), median(mode, 2), median(mode, 5), median(mode, 6), median(mode, 7), median(mode, 8), median(mode, 3)).c_str());
@@ -3486,7 +3640,8 @@ public:
       ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("No projection jitter under the upscaler (it gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
-      const std::string sweep_label = std::format("Sweep ({}/{})", GetGameDeviceData(device_data).perf_sweep_step + 1, perf_sweep_rounds * std::size(perf_sweep_modes));
+      const std::string sweep_label = std::format("{} ({}/{})", g_perf_sweep_list.data() == perf_cpu_sweep_modes ? "CPU Sweep" : "Sweep", GetGameDeviceData(device_data).perf_sweep_step + 1,
+         perf_sweep_rounds * g_perf_sweep_list.size());
       if (ImGui::BeginCombo("Performance Test", g_perf_sweep ? sweep_label.c_str() : perf_test_modes[g_perf_test].name))
       {
          for (int i = 0; i < int(std::size(perf_test_modes)); i++)
@@ -3497,20 +3652,34 @@ public:
                ApplyPerfTestMode(device_data, i);
             }
          }
-         if (ImGui::Selectable("Sweep", g_perf_sweep) && !g_perf_sweep)
+         for (const std::span<const int> list : {std::span<const int>(perf_sweep_modes), std::span<const int>(perf_cpu_sweep_modes)})
          {
-            auto& gd = GetGameDeviceData(device_data);
-            gd.perf_sweep_step = 0;
-            gd.perf_sweep_windows_done = 0;
-            for (auto& results : gd.perf_sweep_results)
-               results.clear();
-            ApplyPerfTestMode(device_data, perf_sweep_modes[0]);
-            g_perf_sweep = true;
+            const bool cpu = list.data() == perf_cpu_sweep_modes;
+            if (ImGui::Selectable(cpu ? "CPU Sweep" : "Sweep", g_perf_sweep && g_perf_sweep_list.data() == list.data()) && !g_perf_sweep)
+            {
+               auto& gd = GetGameDeviceData(device_data);
+               gd.perf_sweep_step = 0;
+               gd.perf_sweep_windows_done = 0;
+               for (auto& results : gd.perf_sweep_results)
+                  results.clear();
+               g_perf_sweep_list = list;
+               ApplyPerfTestMode(device_data, list[0]);
+               g_perf_sweep = true;
+            }
          }
          ImGui::EndCombo();
       }
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([ME1 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill with the reactive mask, the upscaler, copies) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still; compare by toggling FSR and the mask. \"Sweep\" runs every mode, 3 rounds, then logs medians. Not saved.");
+         ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([ME1 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill with the reactive mask, the upscaler, copies) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still; compare by toggling FSR and the mask. \"Sweep\" runs every mode, 3 rounds, then logs medians;\n\"CPU Sweep\" the CPU optimizations each off in turn (FSR 3, then no AA), the same way. Not saved.");
+      if (ImGui::TreeNode("CPU Optimizations"))
+      {
+         static constexpr std::pair<uint32_t, const char*> optimizations[] = {{kCpuVc4Filter, "vc4 Filter"}, {kCpuVc4Pool, "vc4 Pool"}, {kCpuBlendMemo, "Blend Memo"}};
+         for (const auto& [bit, name] : optimizations)
+            ImGui::CheckboxFlags(name, &g_cpu_optimizations, bit);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The hooks' CPU optimizations (always on in Publishing); a \"Performance Test\" mode can turn some off on top. Not saved.");
+         ImGui::TreePop();
+      }
       ImGui::Checkbox("Hook Timers", &g_perf_hook_timers);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. The test also turns off the per draw diagnostics.");
