@@ -1112,6 +1112,34 @@ public:
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"smaa_predication", &g_smaa_predication}, {"post_output_resolution", &g_post_output_resolution}});
+      Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 200.f}});
+      Mcp::RegisterInts({{"render_scale", &g_render_scale, 5, 10}, {"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"smaa_debug_view", &g_smaa_debug_view, 0, 2},
+         {"perf_test", &g_perf_test, 0, int(std::size(perf_test_modes)) - 1, [](DeviceData& device_data, double value)
+            {
+               // As the "Performance Test" combo
+               if (value != 0.0 && !IsSRActive(device_data))
+                  return std::string("Needs DLSS or FSR");
+               if (g_perf_test != int(value))
+               {
+                  g_perf_test = int(value);
+                  auto& game_device_data = GetGameDeviceData(device_data);
+                  const std::lock_guard lock(game_device_data.perf_mutex);
+                  game_device_data.perf_settle_frames = 60;
+               }
+               return std::string();
+            }}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input_linear", smaa_linear_texture),
+         MCP_GAME_TEXTURE("smaa.input", smaa_gamma_srv),
+         MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
+         MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips_srv),
+         MCP_GAME_TEXTURE("gtao.output", gtao_final_texture),
+         MCP_GAME_TEXTURE("mv.velocity", mv_texture),
+         MCP_GAME_TEXTURE("mv.depth", mv_scene_depth_srv),
+         MCP_GAME_TEXTURE("sr.output", sr_upscaled_output)});
+#endif
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (reference)\n1 - HDR: LUT grade extended above mid gray + DICE display map", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
