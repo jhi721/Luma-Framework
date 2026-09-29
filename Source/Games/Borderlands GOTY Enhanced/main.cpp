@@ -497,6 +497,7 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    struct MotionVectorStats
    {
       uint32_t motion_vector_draws = 0, jitter_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, updates = 0, sr_draws = 0;
+      uint32_t tiebreak_collisions = 0; // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
       uint32_t ended_by = 0;
       uint32_t rejected[8] = {};                                                                     // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
@@ -1110,6 +1111,10 @@ class BorderlandsGoty final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
          // two frames go
          game_device_data.mv_previous_objects.swap(game_device_data.mv_objects);
+#if DEVELOPMENT
+         game_device_data.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
+            { return PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones); });
+#endif
          std::erase_if(game_device_data.mv_objects, [](const auto& entry)
             { return entry.second.empty(); });
          for (auto& entry : game_device_data.mv_objects)
@@ -1676,7 +1681,7 @@ public:
       // For the MCP "luma_dev_values" tool: the last complete frame's counts
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.matched", &stats.matched}, {"mv.camera_only", &stats.camera_only},
-         {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.updates", &stats.updates}, {"mv.sr_draws", &stats.sr_draws}, {"mv.ended_by_hash", &stats.ended_by}}, &device_data);
+         {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.updates", &stats.updates}, {"mv.sr_draws", &stats.sr_draws}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by}}, &device_data);
       constexpr const char* reject_names[] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
       for (size_t i = 0; i < std::size(reject_names); i++)
          Mcp::RegisterCounter(std::string("mv.rejected.") + reject_names[i], &stats.rejected[i], &device_data);
