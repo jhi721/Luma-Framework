@@ -784,6 +784,17 @@ class MassEffect3Game final : public Game
 public:
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"track_cb_rows", &g_track_cb_rows}, {"dump_cb", &g_dump_cb}, {"log_frame", &g_log_frame}});
+#if ENABLE_SMAA
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure}});
+      Mcp::RegisterValues({{"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input_linear", tex_input_linear),
+         MCP_GAME_TEXTURE("smaa.pred_mask", tex_pred),
+         MCP_GAME_TEXTURE("smaa.output", tex_smaa_out)});
+#endif
+#endif
       // Shaders/Mass Effect 3/Luma_ME3_Tonemap.hlsl, shared by every uber perm replacement and GammaCorrection.
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", /*default value*/ '1', true, false, /*tooltip*/ "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", /*max value*/ 1},
