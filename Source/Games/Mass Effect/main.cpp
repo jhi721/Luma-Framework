@@ -32,6 +32,15 @@
 // "SR Bridge Profile": 600 upscaled frames of the SR bridge's steps (a GPU timestamp and a QPC time each, from "SR_BRIDGE_PROFILE")
 // and of the frame (present to present) into "LumaBridgeProfile\game.csv" next to the exe, the helper's own into "helper.csv"
 // ("LUMA_UPSCALER_PROFILE", set in this process only, for the restarted helper), joined by their bridge frame numbers.
+// The median of "values" (0 without any), for the sweeps
+static double Median(std::vector<double> values)
+{
+   if (values.empty())
+      return 0.0;
+   std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+   return values[values.size() / 2];
+}
+
 namespace BridgeProfile
 {
    constexpr int kSteps = 6; // SRBridge.cpp's "SR_BRIDGE_PROFILE" steps
@@ -42,7 +51,6 @@ namespace BridgeProfile
       uint64_t bridge_n = 0; // The bridge's frame number (0: it didn't upscale)
       int64_t cpu_begin = 0, cpu_end = 0, cpu_step[kSteps] = {};
       com_ptr<ID3D11Query> disjoint, gpu_begin, gpu_end, gpu_step[kSteps];
-      bool stepped = false;
    };
    enum class State
    {
@@ -69,10 +77,11 @@ namespace BridgeProfile
       {"FSR 3", SR::Type::FSR},
    };
    constexpr int kSweepRounds = 2;
+   constexpr int kSweepSteps = int(std::size(kSweepModes)) * kSweepRounds;
    int sweep_step = -1; // -1: off
    SR::Type sweep_user_sr_type = SR::Type::None;
-   // Per mode, per run: the frame's GPU time, the bridge's on the game's GPU queue and its CPU time in "Draw" (medians, ms)
-   std::vector<std::array<double, 3>> sweep_results[std::size(kSweepModes)];
+   // Per mode: each run's frame GPU time, the bridge's on the game's GPU queue and its CPU time in "Draw" (medians, ms)
+   std::vector<double> sweep_results[std::size(kSweepModes)][3];
    std::filesystem::path sweep_directory;
 
    int64_t Now()
@@ -96,6 +105,14 @@ namespace BridgeProfile
    {
       return System::GetModulePath().parent_path() / "LumaBridgeProfile";
    }
+
+   // "HHMMSS" now, for the output folders
+   std::string TimeStamp()
+   {
+      SYSTEMTIME time;
+      GetLocalTime(&time);
+      return std::format("{:02}{:02}{:02}", time.wHour, time.wMinute, time.wSecond);
+   }
 } // namespace BridgeProfile
 
 // Called by Core's SR bridge at each step of its frame (see "BridgeProfile.h")
@@ -104,7 +121,6 @@ void ProfileBridgeStep(ID3D11DeviceContext* context, int step, unsigned long lon
    auto* const frame = BridgeProfile::current;
    if (!frame)
       return;
-   frame->stepped = true;
    frame->bridge_n = bridge_frame; // The frame's own from the step after its input copies on
    frame->gpu_step[step] = BridgeProfile::Query(context, D3D11_QUERY_TIMESTAMP);
    context->End(frame->gpu_step[step].get());
@@ -241,8 +257,13 @@ constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7, 8};
 constexpr int perf_cpu_sweep_modes[] = {4, 9, 10, 11, 12, 13, 8};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
 static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[std::size(perf_cpu_sweep_modes) - 1]].name) == "No AA");
-static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[5]].name) == "No AA No CPU Optimizations");
-static std::span<const int> g_perf_sweep_list = perf_sweep_modes; // The running sweep's
+struct PerfSweep
+{
+   const char* name;
+   std::span<const int> modes;
+};
+constexpr PerfSweep perf_sweeps[] = {{"Sweep", perf_sweep_modes}, {"CPU Sweep", perf_cpu_sweep_modes}};
+static const PerfSweep* g_perf_sweep_running = &perf_sweeps[0];
 constexpr int perf_sweep_rounds = 3;
 constexpr int perf_sweep_windows = 1;  // Per mode and round (120 frames)
 constexpr int perf_settle_frames = 30; // Skipped after a settings change (history reset, targets rebuilt) and the upscaler being ready
@@ -451,12 +472,18 @@ struct MassEffectGameDeviceData final : public GameDeviceData
 #endif
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
-   std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> mv_vertex_shaders;
-   // The bytes of vc4 each one reads ("DXBC::ConstantBufferBytes"): the previous frame's copy uploads only those
-   std::unordered_map<uint32_t, UINT> mv_vertex_read_sizes;
-   std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_pixel_shaders;
+   // A game shader's patched version (null if refused) by its hash; a vertex shader's with the bytes of vc4 it reads
+   // ("DXBC::ConstantBufferBytes"): the previous frame's copy uploads only those
+   template <typename T>
+   struct PatchedShader
+   {
+      com_ptr<T> shader;
+      UINT read_size = 0;
+   };
+   std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
+   std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_pixel_shaders;
    // The alpha blended draws' pixel shaders with the mask target, by blend (see "ClassifyBoundBlend", index - 1)
-   std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_reactive_pixel_shaders[2];
+   std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_reactive_pixel_shaders[2];
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no upscaler)
@@ -819,15 +846,13 @@ class MassEffect final : public Game
          D3D11_BLEND_DESC desc;
       };
       thread_local BlendMemo memo;
-      D3D11_BLEND_DESC bd;
-      if (IsCpuOptimized(kCpuBlendMemo) && memo.state == blend_state.get() && memo.frame == cb_luma_global_settings.FrameIndex)
+      const bool memoized = IsCpuOptimized(kCpuBlendMemo) && memo.state == blend_state.get() && memo.frame == cb_luma_global_settings.FrameIndex;
+      if (memoized && !memo.candidate)
+         return false;
+      D3D11_BLEND_DESC queried;
+      if (!memoized)
       {
-         if (!memo.candidate)
-            return false;
-         bd = memo.desc;
-      }
-      else
-      {
+         D3D11_BLEND_DESC& bd = queried;
          blend_state->GetDesc(&bd);
          // One state for all targets is already D3D9-shaped
          bool candidate = bd.IndependentBlendEnable;
@@ -840,10 +865,17 @@ class MassEffect final : public Game
             disagreement = bd.RenderTarget[i].BlendEnable != bd.RenderTarget[0].BlendEnable;
          candidate &= disagreement;
          if (IsCpuOptimized(kCpuBlendMemo))
-            memo = {blend_state.get(), cb_luma_global_settings.FrameIndex, candidate, bd};
+         {
+            memo.state = blend_state.get();
+            memo.frame = cb_luma_global_settings.FrameIndex;
+            memo.candidate = candidate;
+            if (candidate)
+               memo.desc = bd;
+         }
          if (!candidate)
             return false;
       }
+      const D3D11_BLEND_DESC& bd = memoized ? memo.desc : queried;
       const bool rt0_blending = bd.RenderTarget[0].BlendEnable != FALSE;
 
       // RT0's blend bit is loop-invariant, so the two shapes are mutually exclusive: one flag out of the loop.
@@ -1102,25 +1134,23 @@ class MassEffect final : public Game
       return desc.ByteWidth;
    }
 
-   // A vc4 copy of "size" bytes (filled from "bytes" if given): one nobody held anymore at the scene opening ("kCpuVc4Pool"), else
-   // a new one. Under "mv_constants_mutex".
+   // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the scene opening ("kCpuVc4Pool"), else a
+   // new one. Under "mv_constants_mutex".
    static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MassEffectGameDeviceData& gd, const uint8_t* bytes, size_t size)
    {
-      std::shared_ptr<std::vector<uint8_t>> copy;
       if (IsCpuOptimized(kCpuVc4Pool) && !gd.mv_constants_pool_free.empty())
       {
-         copy = gd.mv_constants_pool[gd.mv_constants_pool_free.back()];
+         auto copy = gd.mv_constants_pool[gd.mv_constants_pool_free.back()];
          gd.mv_constants_pool_free.pop_back();
-         copy->resize(size);
+         if (bytes)
+            copy->assign(bytes, bytes + size);
+         else
+            copy->assign(size, 0);
+         return copy;
       }
-      else
-      {
-         copy = std::make_shared<std::vector<uint8_t>>(size);
-         if (IsCpuOptimized(kCpuVc4Pool))
-            gd.mv_constants_pool.push_back(copy);
-      }
-      if (bytes)
-         std::memcpy(copy->data(), bytes, size);
+      auto copy = bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size);
+      if (IsCpuOptimized(kCpuVc4Pool))
+         gd.mv_constants_pool.push_back(copy);
       return copy;
    }
 
@@ -1218,8 +1248,6 @@ class MassEffect final : public Game
       {
          const bool merge = copy->second && copy->second->size() == buffer_size;
          auto updated = NewConstantsCopy(gd, merge ? copy->second->data() : nullptr, buffer_size);
-         if (!merge)
-            std::fill(updated->begin(), updated->end(), uint8_t(0));
          std::memcpy(updated->data() + offset, bytes, updated_size);
          copy->second = std::move(updated);
       }
@@ -1234,9 +1262,9 @@ class MassEffect final : public Game
    // first use (null if it can't be, e.g. a vertex shader that doesn't place
    // vertices with the view projection)
    template <typename T>
-   static com_ptr<T>
+   static MassEffectGameDeviceData::PatchedShader<T>
    GetMotionVectorShader(ID3D11Device* native_device, DeviceData& device_data,
-      std::unordered_map<uint32_t, com_ptr<T>>* shaders,
+      std::unordered_map<uint32_t, MassEffectGameDeviceData::PatchedShader<T>>* shaders,
       uint32_t hash, reshade::api::pipeline pipeline, uint8_t reactive = 0)
    {
       constexpr bool vertex = std::is_same_v<T, ID3D11VertexShader>;
@@ -1296,9 +1324,7 @@ class MassEffect final : public Game
                shader ? "patched" : error)
                .c_str());
       const std::unique_lock lock(gd.mv_mutex);
-      if constexpr (vertex)
-         gd.mv_vertex_read_sizes.try_emplace(hash, read_size);
-      return shaders->try_emplace(hash, shader).first->second;
+      return shaders->try_emplace(hash, MassEffectGameDeviceData::PatchedShader<T>{shader, read_size}).first->second;
    }
 
    // The bound vertex shader's patched version (null if refused), looked up again
@@ -1311,16 +1337,9 @@ class MassEffect final : public Game
       auto& gd = GetGameDeviceData(device_data);
       if (hash != gd.mv_last_vertex_shader_hash)
       {
-         gd.mv_last_vertex_shader =
-            GetMotionVectorShader(
-               native_device, device_data, &gd.mv_vertex_shaders, hash,
-               cmd_list_data.pipeline_state_original_vertex_shader)
-               .get();
-         {
-            const std::shared_lock lock(gd.mv_mutex);
-            const auto read_size = gd.mv_vertex_read_sizes.find(hash);
-            gd.mv_last_vertex_read_size = read_size != gd.mv_vertex_read_sizes.end() ? read_size->second : 0;
-         }
+         const auto patched = GetMotionVectorShader(native_device, device_data, &gd.mv_vertex_shaders, hash, cmd_list_data.pipeline_state_original_vertex_shader);
+         gd.mv_last_vertex_shader = patched.shader.get();
+         gd.mv_last_vertex_read_size = patched.read_size;
          gd.mv_last_vertex_shader_hash = hash;
       }
       return gd.mv_last_vertex_shader;
@@ -1551,7 +1570,7 @@ class MassEffect final : public Game
             GetMotionVectorShader(
                native_device, device_data, &gd.mv_pixel_shaders, pixel_shader_hash,
                cmd_list_data.pipeline_state_original_pixel_shader)
-               .get();
+               .shader.get();
          gd.mv_last_pixel_shader_hash = pixel_shader_hash;
       }
       ID3D11PixelShader* const pixel_shader = gd.mv_last_pixel_shader;
@@ -1838,7 +1857,7 @@ class MassEffect final : public Game
          if (const uint8_t blend = gd.mv_reactive_blend; blend != 0)
             reactive_shader = GetMotionVectorShader(native_device, device_data, &gd.mv_reactive_pixel_shaders[blend - 1],
                original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, blend)
-                                 .get();
+                                 .shader.get();
       }
 
       // The patched vertex shader and the jitter stay bound after the draw (see
@@ -2007,8 +2026,6 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       gd.mv_stats.near_plane = draw_data.near_plane;
       gd.mv_stats.far_plane = draw_data.far_plane;
-#endif
-#if DEVELOPMENT
       if (g_bridge_flush_before)
          native_device_context->Flush();
 #endif
@@ -2959,6 +2976,40 @@ public:
       g_perf_test = mode_index;
    }
 
+   // A sweep picks the upscaler as Core's selection change does: the previous one's resources go ("ReleaseResources"), and on None
+   // our upscaler inputs and output ("CleanExtraSRResources")
+   static void SetSRType(DeviceData& device_data, SR::Type sr_type)
+   {
+      if (sr_type != device_data.sr_type)
+      {
+         if (auto* instance = device_data.GetSRInstanceData())
+            sr_implementations[device_data.sr_type]->ReleaseResources(instance);
+         if (sr_type == SR::Type::None)
+         {
+            device_data.sr_output_color = nullptr;
+            GetGameDeviceData(device_data).release_sr_resources = true;
+         }
+      }
+      device_data.sr_type = sr_type;
+      device_data.sr_suppressed = false;
+   }
+
+#if ENABLE_SR_BRIDGE
+   // "SR Bridge Profile Sweep": the next mode whose upscaler this device supports ("sweep_step" -1 to start), its profile requested
+   // at the next present (which latches the upscaler). False when none is left.
+   static bool AdvanceBridgeProfileSweep(DeviceData& device_data)
+   {
+      using namespace BridgeProfile;
+      while (++sweep_step < kSweepSteps && !device_data.sr_implementations_instances.contains(kSweepModes[sweep_step % std::size(kSweepModes)].sr_type))
+         ;
+      if (sweep_step >= kSweepSteps)
+         return false;
+      SetSRType(device_data, kSweepModes[sweep_step % std::size(kSweepModes)].sr_type);
+      state = State::Requested;
+      return true;
+   }
+#endif
+
    static void ApplyMemorySweepMode(DeviceData& device_data, int step)
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -2972,15 +3023,7 @@ public:
       }
       const bool restore = step < 0;
       const MemorySweepMode& mode = memory_sweep_modes[restore ? 0 : step];
-      const SR::Type sr_type = restore ? gd.memory_user_sr_type : mode.sr_type;
-      // As Core's selection change to None
-      if (sr_type == SR::Type::None && device_data.sr_type != SR::Type::None)
-      {
-         device_data.sr_output_color = nullptr;
-         gd.release_sr_resources = true;
-      }
-      device_data.sr_type = sr_type;
-      device_data.sr_suppressed = false;
+      SetSRType(device_data, restore ? gd.memory_user_sr_type : mode.sr_type);
       g_smaa_enable = restore ? gd.memory_user_smaa : mode.smaa;
       g_luma_bloom_enable = restore ? gd.memory_user_bloom : mode.bloom;
       g_rcas_sharpness = restore ? gd.memory_user_rcas : mode.rcas;
@@ -3153,7 +3196,8 @@ public:
       {
          using namespace BridgeProfile;
          com_ptr<ID3D11DeviceContext> context;
-         native_device->GetImmediateContext(&context);
+         if (current || state != State::Off)
+            native_device->GetImmediateContext(&context);
          if (current)
          {
             current->gpu_end = Query(context.get(), D3D11_QUERY_TIMESTAMP);
@@ -3165,9 +3209,7 @@ public:
          if (state == State::Requested)
          {
             state = State::Off;
-            SYSTEMTIME time;
-            GetLocalTime(&time);
-            run_directory = (sweep_step >= 0 ? sweep_directory : OutputDirectory()) / std::format("{}-{:02}{:02}{:02}{}{}", device_data.sr_type == SR::Type::DLSS ? "dlss" : "fsr", time.wHour, time.wMinute, time.wSecond,
+            run_directory = (sweep_step >= 0 ? sweep_directory : OutputDirectory()) / std::format("{}-{}{}{}", device_data.sr_type == SR::Type::DLSS ? "dlss" : "fsr", TimeStamp(),
                                                                                          g_bridge_flush_before ? "-flush" : "", g_gpu_thread_priority != 0 ? std::format("-priority{}", g_gpu_thread_priority) : "");
             std::error_code error;
             std::filesystem::create_directories(run_directory, error);
@@ -3227,8 +3269,8 @@ public:
                csv += std::format("{},{},{},{}", i, frame.bridge_n, frame.cpu_begin, frame.cpu_end);
                for (int j = 0; j < kSteps; j++)
                   csv += std::format(",{}", frame.cpu_step[j]);
-               const uint64_t gpu_begin = read(frame.gpu_begin.get());
-               csv += std::format(",{},{},{}", gpu_begin, gpu_begin, read(frame.gpu_end.get())); // No load span: "gpu_loaded" is the begin
+               const uint64_t gpu_begin = read(frame.gpu_begin.get()), gpu_end = read(frame.gpu_end.get());
+               csv += std::format(",{},{},{}", gpu_begin, gpu_begin, gpu_end); // No load span: "gpu_loaded" is the begin
                uint64_t gpu_steps[kSteps];
                for (int j = 0; j < kSteps; j++)
                {
@@ -3239,7 +3281,7 @@ public:
                if (frame.bridge_n && !disjoint.Disjoint && disjoint.Frequency)
                {
                   const double gpu_ms = 1000.0 / double(disjoint.Frequency), cpu_ms = 1000.0 / double(qpc_frequency.QuadPart);
-                  frame_gpu_ms.push_back(double(read(frame.gpu_end.get()) - gpu_begin) * gpu_ms);
+                  frame_gpu_ms.push_back(double(gpu_end - gpu_begin) * gpu_ms);
                   bridge_gpu_ms.push_back(double(gpu_steps[kSteps - 1] - gpu_steps[0]) * gpu_ms);
                   draw_cpu_ms.push_back(double(frame.cpu_step[kSteps - 1] - frame.cpu_step[0]) * cpu_ms);
                }
@@ -3251,51 +3293,26 @@ public:
             frames.clear();
             state = State::Off;
             reshade::log::message(reshade::log::level::info, std::format("[ME1 Bridge] profile of {} frames written to \"{}\"", kFrames, run_directory.string()).c_str());
-            const auto median = [](std::vector<double> values)
-            {
-               if (values.empty())
-                  return 0.0;
-               std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
-               return values[values.size() / 2];
-            };
             if (sweep_step >= 0)
             {
-               sweep_results[sweep_step % std::size(kSweepModes)].push_back({median(frame_gpu_ms), median(bridge_gpu_ms), median(draw_cpu_ms)});
-               // The next mode whose upscaler this device supports
-               while (++sweep_step < int(std::size(kSweepModes)) * kSweepRounds && !device_data.sr_implementations_instances.contains(kSweepModes[sweep_step % std::size(kSweepModes)].sr_type))
-                  ;
-               if (sweep_step < int(std::size(kSweepModes)) * kSweepRounds)
-               {
-                  const SweepMode& mode = kSweepModes[sweep_step % std::size(kSweepModes)];
-                  device_data.sr_type = mode.sr_type;
-                  device_data.sr_suppressed = false;
-                  state = State::Requested; // At the next present, which latches the upscaler
-               }
-               else
+               auto& results = sweep_results[sweep_step % std::size(kSweepModes)];
+               results[0].push_back(Median(frame_gpu_ms));
+               results[1].push_back(Median(bridge_gpu_ms));
+               results[2].push_back(Median(draw_cpu_ms));
+               if (!AdvanceBridgeProfileSweep(device_data))
                {
                   std::string summary;
                   for (size_t i = 0; i < std::size(kSweepModes); i++)
                   {
-                     std::vector<double> columns[3];
-                     for (const auto& run : sweep_results[i])
-                        for (int c = 0; c < 3; c++)
-                           columns[c].push_back(run[c]);
-                     if (columns[0].empty())
+                     if (sweep_results[i][0].empty())
                         continue;
-                     const std::array<double, 3> result = {median(columns[0]), median(columns[1]), median(columns[2])};
                      const std::string line = std::format("[ME1 Bridge] sweep mode=\"{}\" runs={} frame GPU median={:.3f} ms bridge GPU median={:.3f} ms bridge CPU in Draw median={:.3f} ms",
-                        kSweepModes[i].name, sweep_results[i].size(), result[0], result[1], result[2]);
+                        kSweepModes[i].name, sweep_results[i][0].size(), Median(sweep_results[i][0]), Median(sweep_results[i][1]), Median(sweep_results[i][2]));
                      reshade::log::message(reshade::log::level::info, line.c_str());
                      summary += line + "\n";
                   }
                   std::ofstream(sweep_directory / "sweep.txt", std::ios::binary) << summary;
-                  device_data.sr_type = sweep_user_sr_type;
-                  device_data.sr_suppressed = false;
-                  if (sweep_user_sr_type == SR::Type::None)
-                  {
-                     device_data.sr_output_color = nullptr; // As Core's selection change to None
-                     gd.release_sr_resources = true;
-                  }
+                  SetSRType(device_data, sweep_user_sr_type);
                   sweep_step = -1;
                }
             }
@@ -3405,9 +3422,9 @@ public:
                   {
                      gd.perf_sweep_windows_done = 0;
                      const int step = ++gd.perf_sweep_step;
-                     if (step < perf_sweep_rounds * int(g_perf_sweep_list.size()))
+                     if (step < perf_sweep_rounds * int(g_perf_sweep_running->modes.size()))
                      {
-                        ApplyPerfTestMode(device_data, g_perf_sweep_list[step % g_perf_sweep_list.size()]);
+                        ApplyPerfTestMode(device_data, g_perf_sweep_running->modes[step % g_perf_sweep_running->modes.size()]);
                      }
                      else
                      {
@@ -3416,12 +3433,11 @@ public:
                            std::vector<double> values;
                            for (const auto& result : gd.perf_sweep_results[mode])
                               values.push_back(result[column]);
-                           std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
-                           return values.empty() ? 0.0 : values[values.size() / 2];
+                           return Median(std::move(values));
                         };
-                        const int baseline_mode = g_perf_sweep_list.back();
+                        const int baseline_mode = g_perf_sweep_running->modes.back();
                         const double baseline = median(baseline_mode, 0);
-                        for (const int mode : g_perf_sweep_list)
+                        for (const int mode : g_perf_sweep_running->modes)
                         {
                            const double cpu_frame = median(mode, 4);
                            reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" hook_timers={} windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, g_perf_hook_timers, gd.perf_sweep_results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, median(mode, 0), median(mode, 0) - baseline, perf_test_modes[baseline_mode].name, median(mode, 1), median(mode, 2), median(mode, 5), median(mode, 6), median(mode, 7), median(mode, 8), median(mode, 3)).c_str());
@@ -3640,8 +3656,7 @@ public:
       ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("No projection jitter under the upscaler (it gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
-      const std::string sweep_label = std::format("{} ({}/{})", g_perf_sweep_list.data() == perf_cpu_sweep_modes ? "CPU Sweep" : "Sweep", GetGameDeviceData(device_data).perf_sweep_step + 1,
-         perf_sweep_rounds * g_perf_sweep_list.size());
+      const std::string sweep_label = std::format("{} ({}/{})", g_perf_sweep_running->name, GetGameDeviceData(device_data).perf_sweep_step + 1, perf_sweep_rounds * g_perf_sweep_running->modes.size());
       if (ImGui::BeginCombo("Performance Test", g_perf_sweep ? sweep_label.c_str() : perf_test_modes[g_perf_test].name))
       {
          for (int i = 0; i < int(std::size(perf_test_modes)); i++)
@@ -3652,18 +3667,17 @@ public:
                ApplyPerfTestMode(device_data, i);
             }
          }
-         for (const std::span<const int> list : {std::span<const int>(perf_sweep_modes), std::span<const int>(perf_cpu_sweep_modes)})
+         for (const PerfSweep& sweep : perf_sweeps)
          {
-            const bool cpu = list.data() == perf_cpu_sweep_modes;
-            if (ImGui::Selectable(cpu ? "CPU Sweep" : "Sweep", g_perf_sweep && g_perf_sweep_list.data() == list.data()) && !g_perf_sweep)
+            if (ImGui::Selectable(sweep.name, g_perf_sweep && g_perf_sweep_running == &sweep) && !g_perf_sweep)
             {
                auto& gd = GetGameDeviceData(device_data);
                gd.perf_sweep_step = 0;
                gd.perf_sweep_windows_done = 0;
                for (auto& results : gd.perf_sweep_results)
                   results.clear();
-               g_perf_sweep_list = list;
-               ApplyPerfTestMode(device_data, list[0]);
+               g_perf_sweep_running = &sweep;
+               ApplyPerfTestMode(device_data, sweep.modes[0]);
                g_perf_sweep = true;
             }
          }
@@ -3698,26 +3712,16 @@ public:
          ImGui::SetTooltip("With DLSS or FSR 3 picked: restarts the helper with its profile, then records %u upscaled frames of the bridge's steps\n(GPU timestamps and CPU times) into \"LumaBridgeProfile\\<upscaler>-<time>\" next to the exe: game.csv and helper.csv.\nThe helper restarts again at the end. Keep the camera still.", BridgeProfile::kFrames);
       {
          using namespace BridgeProfile;
-         const std::string sweep_label = sweep_step >= 0 ? std::format("SR Bridge Profile Sweep ({}/{})", sweep_step + 1, std::size(kSweepModes) * kSweepRounds) : std::string("SR Bridge Profile Sweep");
+         const std::string sweep_label = sweep_step >= 0 ? std::format("SR Bridge Profile Sweep ({}/{})", sweep_step + 1, kSweepSteps) : std::string("SR Bridge Profile Sweep");
          if (ImGui::Button(sweep_label.c_str()) && sweep_step < 0 && state == State::Off)
          {
             sweep_user_sr_type = device_data.sr_type;
             for (auto& results : sweep_results)
-               results.clear();
-            SYSTEMTIME time;
-            GetLocalTime(&time);
-            sweep_directory = OutputDirectory() / std::format("sweep-{:02}{:02}{:02}", time.wHour, time.wMinute, time.wSecond);
+               for (auto& column : results)
+                  column.clear();
+            sweep_directory = OutputDirectory() / ("sweep-" + TimeStamp());
             sweep_step = -1;
-            while (++sweep_step < int(std::size(kSweepModes)) * kSweepRounds && !device_data.sr_implementations_instances.contains(kSweepModes[sweep_step % std::size(kSweepModes)].sr_type))
-               ;
-            if (sweep_step < int(std::size(kSweepModes)) * kSweepRounds)
-            {
-               const SweepMode& mode = kSweepModes[sweep_step % std::size(kSweepModes)];
-               device_data.sr_type = mode.sr_type;
-               device_data.sr_suppressed = false;
-               state = State::Requested;
-            }
-            else
+            if (!AdvanceBridgeProfileSweep(device_data))
                sweep_step = -1;
          }
          if (ImGui::IsItemHovered())
