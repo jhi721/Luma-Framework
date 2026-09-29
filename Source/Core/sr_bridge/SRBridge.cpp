@@ -63,8 +63,7 @@ namespace SRBridge
       ComPtr<ID3D11Resource> sources[kCount];
       ComPtr<ID3D11Texture2D> shared[kCount]; // What it opened: the game's own when NT-handle shared already, else copies
       bool copied[kCount] = {};
-      uint64_t frame = 0;
-      bool ready = false;
+      uint64_t frame = 0;            // 0 until the helper is ready, then the last frame sent (from "kReady")
       bool settings_pending = false; // Changed since the helper started: sent before the next frame
 
       bool failed = false;
@@ -77,6 +76,7 @@ namespace SRBridge
 
       void Stop();
       bool Fail(const std::string& reason);
+      bool Send(const std::string& line);
       bool Start(ID3D11DeviceContext* command_list, ID3D11Resource* const* resources);
    };
 
@@ -104,7 +104,6 @@ namespace SRBridge
          copied[i] = false;
       }
       frame = 0;
-      ready = false;
       settings_pending = false;
       if (running == this)
          running = nullptr;
@@ -117,6 +116,13 @@ namespace SRBridge
       failure_time = std::chrono::steady_clock::now();
       Log(reshade::log::level::warning, reason);
       return false;
+   }
+
+   // False (failed) if the pipe broke
+   bool BridgeInstanceData::Send(const std::string& line)
+   {
+      DWORD written = 0;
+      return WriteFile(pipe, line.data(), DWORD(line.size()), &written, nullptr) || Fail("the helper's pipe broke");
    }
 
    bool BridgeInstanceData::Start(ID3D11DeviceContext* command_list, ID3D11Resource* const* resources)
@@ -210,9 +216,8 @@ namespace SRBridge
       if (!started)
          return fail(std::format("the helper couldn't start (error {}): {}", error, helper_path.string()));
 
-      const SR::SettingsData& settings = settings_data;
       std::string message =
-         std::format("bridge {} {} {} {} {}", kVersion, type == SR::Type::DLSS ? int(kDlss) : int(kFsr), luid.LowPart, luid.HighPart, FormatSettings(settings));
+         std::format("bridge {} {} {} {} {}", kVersion, type == SR::Type::DLSS ? int(kDlss) : int(kFsr), luid.LowPart, luid.HighPart, FormatSettings(settings_data));
       for (HANDLE handle : handles)
       {
          HANDLE remote = nullptr;
@@ -223,12 +228,11 @@ namespace SRBridge
             CloseHandle(handle);
       }
       message += "\n";
-      DWORD written = 0;
-      if (!WriteFile(pipe, message.data(), DWORD(message.size()), &written, nullptr))
-         return Fail("the helper's pipe broke");
+      if (!Send(message))
+         return false;
       running = this;
-      Log(reshade::log::level::info, std::format("started the helper for {} ({}x{} -> {}x{})", type == SR::Type::DLSS ? "DLSS" : "FSR 3", settings.render_width,
-                                        settings.render_height, settings.output_width, settings.output_height));
+      Log(reshade::log::level::info, std::format("started the helper for {} ({}x{} -> {}x{})", type == SR::Type::DLSS ? "DLSS" : "FSR 3", settings_data.render_width,
+                                        settings_data.render_height, settings_data.output_width, settings_data.output_height));
       return true;
    }
 
@@ -255,12 +259,8 @@ namespace SRBridge
       custom_data->requires_unordered_access_output_texture = false; // The helper writes its own copy
       if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&custom_data->device))))
          return false;
-      ComPtr<IDXGIAdapter> device_adapter = adapter;
-      ComPtr<IDXGIDevice> dxgi_device;
-      if (!device_adapter && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgi_device))))
-         dxgi_device->GetAdapter(&device_adapter);
       DXGI_ADAPTER_DESC adapter_desc = {};
-      if (!device_adapter || FAILED(device_adapter->GetDesc(&adapter_desc)))
+      if (!adapter || FAILED(adapter->GetDesc(&adapter_desc)))
          return false;
       custom_data->luid = adapter_desc.AdapterLuid;
       const std::filesystem::path directory = System::GetModulePath().parent_path();
@@ -313,7 +313,7 @@ namespace SRBridge
       if (!custom_data.process && !custom_data.Start(command_list, resources))
          return false;
 
-      if (!custom_data.ready)
+      if (custom_data.frame == 0)
       {
          if (custom_data.fences[1]->GetCompletedValue() < kReady)
          {
@@ -330,17 +330,14 @@ namespace SRBridge
             }
             return true;
          }
-         custom_data.ready = true;
          custom_data.frame = kReady;
          Log(reshade::log::level::info, custom_data.type == SR::Type::DLSS ? "running DLSS" : "running FSR 3");
       }
       if (custom_data.settings_pending)
       {
          // Once ready, so changes while it's starting become one
-         const std::string line = "settings " + FormatSettings(custom_data.settings_data) + "\n";
-         DWORD written = 0;
-         if (!WriteFile(custom_data.pipe, line.data(), DWORD(line.size()), &written, nullptr))
-            return custom_data.Fail("the helper's pipe broke");
+         if (!custom_data.Send("settings " + FormatSettings(custom_data.settings_data) + "\n"))
+            return false;
          custom_data.settings_pending = false;
          Log(reshade::log::level::info, std::format("new settings for the helper ({}x{} -> {}x{})", custom_data.settings_data.render_width,
                                            custom_data.settings_data.render_height, custom_data.settings_data.output_width, custom_data.settings_data.output_height));
@@ -357,13 +354,11 @@ namespace SRBridge
       custom_data.context->Signal(custom_data.fences[0].Get(), frame);
       command_list->Flush();
       SR_BRIDGE_PROFILE(command_list, 2);
-      const std::string line = std::format("frame {} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0,
-         draw_data.render_width ? draw_data.render_width : custom_data.settings_data.render_width,
-         draw_data.render_height ? draw_data.render_height : custom_data.settings_data.render_height, draw_data.pre_exposure, draw_data.user_sharpness,
-         draw_data.near_plane, draw_data.far_plane, draw_data.vert_fov);
-      DWORD written = 0;
-      if (!WriteFile(custom_data.pipe, line.data(), DWORD(line.size()), &written, nullptr))
-         return custom_data.Fail("the helper's pipe broke");
+      if (!custom_data.Send(std::format("frame {} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0,
+             draw_data.render_width ? draw_data.render_width : custom_data.settings_data.render_width,
+             draw_data.render_height ? draw_data.render_height : custom_data.settings_data.render_height, draw_data.pre_exposure, draw_data.user_sharpness,
+             draw_data.near_plane, draw_data.far_plane, draw_data.vert_fov)))
+         return false;
       SR_BRIDGE_PROFILE(command_list, 3);
       custom_data.context->Wait(custom_data.fences[1].Get(), frame);
       SR_BRIDGE_PROFILE(command_list, 4);
@@ -375,7 +370,7 @@ namespace SRBridge
 
    bool Bridge::IsReady(const SR::InstanceData* data) const
    {
-      return data && static_cast<const BridgeInstanceData*>(data)->ready;
+      return data && static_cast<const BridgeInstanceData*>(data)->frame != 0;
    }
 
    // NVIDIA's formula (as Core's DLSS), which FSR's matches
