@@ -403,9 +403,10 @@ def parse_rows(spec):
 
 
 def dword_views(hex_string):
+    # The backend prints each dword as "{:08X}", most significant byte first
     dwords = bytes.fromhex(hex_string)
     count = len(dwords) // 4
-    return struct.unpack(f"<{count}f", dwords[: count * 4]), struct.unpack(f"<{count}I", dwords[: count * 4])
+    return struct.unpack(f">{count}f", dwords[: count * 4]), struct.unpack(f">{count}I", dwords[: count * 4])
 
 
 def format_row(floats, uints, row):
