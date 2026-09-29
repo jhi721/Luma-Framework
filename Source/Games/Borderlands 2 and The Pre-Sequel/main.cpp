@@ -516,6 +516,18 @@ class Borderlands2 final : public Game
 public:
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
+         {"hide_ui", &g_hide_ui}});
+      Mcp::RegisterMirroredToggle("luma_bloom_enable", &g_luma_bloom_enable, &cb_luma_global_settings.GameSettings.LumaBloomEnable);
+      Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
+      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", tex_input_encoded),
+         MCP_GAME_TEXTURE("smaa.input_linear", tex_input_linear),
+         MCP_GAME_TEXTURE("smaa.pred_mask", tex_pred),
+         MCP_GAME_TEXTURE("smaa.output", tex_smaa_out)});
+#endif
       // Game-specific toggle consumed by the tonemap replacement (Luma_BL2TPS_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla grade (reference)\n1 - HDR: native grade + reconstructed luminance + DICE display map", 1},
