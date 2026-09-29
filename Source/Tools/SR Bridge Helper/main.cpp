@@ -299,7 +299,7 @@ namespace
             fprintf(csv, "n,line,evaluate_call,evaluate_return,flushed,gpu_queued,gpu_waited,gpu_evaluated,gpu_frequency,disjoint\n");
       }
 
-      void Read(ID3D11DeviceContext* context, Slot& slot) const
+      void Read(ID3D11DeviceContext* context, const Slot& slot) const
       {
          D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
          uint64_t gpu[3] = {};
