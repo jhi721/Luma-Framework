@@ -28,6 +28,90 @@
 #include <psapi.h>   // "Memory Sweep": GetProcessMemoryInfo
 #endif
 
+#if DEVELOPMENT
+// "SR Bridge Profile": 600 upscaled frames of the SR bridge's steps (a GPU timestamp and a QPC time each, from "SR_BRIDGE_PROFILE")
+// and of the frame (present to present) into "LumaBridgeProfile\game.csv" next to the exe, the helper's own into "helper.csv"
+// ("LUMA_UPSCALER_PROFILE", set in this process only, for the restarted helper), joined by their bridge frame numbers.
+namespace BridgeProfile
+{
+   constexpr int kSteps = 6; // SRBridge.cpp's "SR_BRIDGE_PROFILE" steps
+   constexpr uint32_t kFrames = 600;
+   constexpr uint32_t kWarmupFrames = 60; // After the helper is ready
+   struct Frame
+   {
+      uint64_t bridge_n = 0; // The bridge's frame number (0: it didn't upscale)
+      int64_t cpu_begin = 0, cpu_end = 0, cpu_step[kSteps] = {};
+      com_ptr<ID3D11Query> disjoint, gpu_begin, gpu_end, gpu_step[kSteps];
+      bool stepped = false;
+   };
+   enum class State
+   {
+      Off,
+      Requested, // The helper restarts with the profile
+      WarmingUp,
+      Recording,
+   };
+   State state = State::Off;
+   uint32_t warmup = 0;
+   std::filesystem::path run_directory; // This profile's: the upscaler, the time and the experiments in its name
+   std::vector<Frame> frames;
+   Frame* current = nullptr; // The frame being recorded, until the next present
+
+   // "SR Bridge Profile Sweep": these modes in turn, over rounds (interleaved, so the scene's drift averages out), a profile each,
+   // then a "[ME1 Bridge] sweep" line per mode (the median of its runs' medians). The user's upscaler comes back.
+   struct SweepMode
+   {
+      const char* name;
+      SR::Type sr_type;
+   };
+   constexpr SweepMode kSweepModes[] = {
+      {"DLSS", SR::Type::DLSS},
+      {"FSR 3", SR::Type::FSR},
+   };
+   constexpr int kSweepRounds = 2;
+   int sweep_step = -1; // -1: off
+   SR::Type sweep_user_sr_type = SR::Type::None;
+   // Per mode, per run: the frame's GPU time, the bridge's on the game's GPU queue and its CPU time in "Draw" (medians, ms)
+   std::vector<std::array<double, 3>> sweep_results[std::size(kSweepModes)];
+   std::filesystem::path sweep_directory;
+
+   int64_t Now()
+   {
+      LARGE_INTEGER time;
+      QueryPerformanceCounter(&time);
+      return time.QuadPart;
+   }
+
+   com_ptr<ID3D11Query> Query(ID3D11DeviceContext* context, D3D11_QUERY type)
+   {
+      com_ptr<ID3D11Device> device;
+      context->GetDevice(&device);
+      const D3D11_QUERY_DESC desc = {type, 0};
+      com_ptr<ID3D11Query> query;
+      device->CreateQuery(&desc, &query);
+      return query;
+   }
+
+   std::filesystem::path OutputDirectory()
+   {
+      return System::GetModulePath().parent_path() / "LumaBridgeProfile";
+   }
+} // namespace BridgeProfile
+
+// Called by Core's SR bridge at each step of its frame (see "BridgeProfile.h")
+void ProfileBridgeStep(ID3D11DeviceContext* context, int step, unsigned long long bridge_frame)
+{
+   auto* const frame = BridgeProfile::current;
+   if (!frame)
+      return;
+   frame->stepped = true;
+   frame->bridge_n = bridge_frame; // The frame's own from the step after its input copies on
+   frame->gpu_step[step] = BridgeProfile::Query(context, D3D11_QUERY_TIMESTAMP);
+   context->End(frame->gpu_step[step].get());
+   frame->cpu_step[step] = BridgeProfile::Now();
+}
+#endif
+
 // Both replaced, separate register maps. The gamma correction pass ends every frame; the uber runs first when it
 // runs at all - the engine skips it in elevators and some loading scenes, which b12 UberRanThisFrame reports.
 static constexpr uint32_t kUberPostHash = 0xAC8341E0;        // HDR grade -> fp16 intermediate
@@ -112,6 +196,14 @@ constexpr PerfTestMode perf_test_modes[] = {
 // "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a
 // median per mode against the last one ("No AA")
 static bool g_perf_sweep = false;
+// The hooks' CPU time for "cpu hooks": two clock reads per timed draw and buffer upload, themselves a cost (a Sweep with it off
+// shows it in the frame times)
+static bool g_perf_hook_timers = true;
+// Experiments on the game to helper handoff of the SR bridge ("in", see "SR Bridge Profile"): a flush right before the bridge's
+// frame (the frame's work submitted first, the input copies and the signal on their own), and the game device's GPU thread
+// priority ("IDXGIDevice::SetGPUThreadPriority", -7 to 7). Not saved.
+static bool g_bridge_flush_before = false;
+static int g_gpu_thread_priority = 0;
 constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7, 8};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
 constexpr int perf_sweep_rounds = 3;
@@ -312,6 +404,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // "Memory Sweep": frames left before the current mode's log line, frames waited for the upscaler, and the user's settings to restore
    int memory_sweep_settle_frames = 0;
    int memory_sweep_wait_frames = 0;
+   int gpu_thread_priority = 0;                        // "g_gpu_thread_priority" as last set on the device
    std::unordered_set<uint64_t> canvas_resources_seen; // The final pass's render targets (mirrors when upgraded), tagged in the report
    SR::Type memory_user_sr_type = SR::Type::None;
    bool memory_user_smaa = false;
@@ -908,6 +1001,9 @@ class MassEffect final : public Game
           !GetGameDeviceData(*device_data).mv_active || !data || !*data)
          return;
       auto& gd = GetGameDeviceData(*device_data);
+#if DEVELOPMENT
+      const PerfHookTimer perf_timer{gd.perf_hook_ns};
+#endif
       const std::lock_guard lock(gd.mv_constants_mutex);
       if (!gd.mv_constants_copies.contains(resource.handle))
          return;
@@ -930,6 +1026,9 @@ class MassEffect final : public Game
           !GetGameDeviceData(*device_data).mv_active)
          return;
       auto& gd = GetGameDeviceData(*device_data);
+#if DEVELOPMENT
+      const PerfHookTimer perf_timer{gd.perf_hook_ns};
+#endif
       const std::lock_guard lock(gd.mv_constants_mutex);
       const auto mapped = gd.mv_mapped_constants.find(resource.handle);
       if (mapped == gd.mv_mapped_constants.end())
@@ -959,6 +1058,9 @@ class MassEffect final : public Game
           !GetGameDeviceData(*device_data).mv_active)
          return false;
       auto& gd = GetGameDeviceData(*device_data);
+#if DEVELOPMENT
+      const PerfHookTimer perf_timer{gd.perf_hook_ns};
+#endif
       const std::lock_guard lock(gd.mv_constants_mutex);
       const auto copy = gd.mv_constants_copies.find(resource.handle);
       if (copy == gd.mv_constants_copies.end())
@@ -1350,7 +1452,8 @@ class MassEffect final : public Game
       native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot,
          1, &current);
 #if DEVELOPMENT
-      if (gd.mv_previous_constants.ring_context)
+      // Diagnostics, off while a "Performance Test" runs (they cost CPU on every draw that Publishing doesn't pay)
+      if (g_perf_test == 0 && gd.mv_previous_constants.ring_context)
       {
          com_ptr<ID3D11Buffer> bound;
          UINT first_constant = 0, constant_count = 0;
@@ -1738,6 +1841,10 @@ class MassEffect final : public Game
       gd.mv_stats.near_plane = draw_data.near_plane;
       gd.mv_stats.far_plane = draw_data.far_plane;
 #endif
+#if DEVELOPMENT
+      if (g_bridge_flush_before)
+         native_device_context->Flush();
+#endif
       if (!sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data))
       {
          // Back to SMAA until the upscaler is picked again
@@ -1896,14 +2003,14 @@ class MassEffect final : public Game
             ID3D11UnorderedAccessView* const uavs[4] = {gd.mv_uav.get(), gd.mv_device_depth_uav.get(), write_reactive ? gd.mv_reactive_uav.get() : nullptr, write_reactive ? gd.mv_transparency_uav.get() : nullptr};
             native_device_context->CSSetConstantBuffers(0, 1, &buffer);
             native_device_context->CSSetShaderResources(0, 2, srvs);
-            native_device_context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+            native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(uavs)), uavs, nullptr);
             native_device_context->CSSetShader(fill_shader, nullptr, 0);
             native_device_context->Dispatch(
                (uint32_t(device_data.output_resolution.x) + 7) / 8,
                (uint32_t(device_data.output_resolution.y) + 7) / 8, 1);
-            ID3D11UnorderedAccessView* const null_uavs[4] = {};
+            ID3D11UnorderedAccessView* const null_uavs[std::size(uavs)] = {};
             ID3D11ShaderResourceView* const null_srvs[2] = {};
-            native_device_context->CSSetUnorderedAccessViews(0, 4, null_uavs, nullptr);
+            native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(null_uavs)), null_uavs, nullptr);
             native_device_context->CSSetShaderResources(0, 2, null_srvs);
             filled = true;
 #if DEVELOPMENT
@@ -2378,7 +2485,8 @@ public:
 #if DEVELOPMENT
       // Whether anything reads the upscaled scene itself after its end, while the post passes read a copy of it (the upscaler's
       // output could then go to the copy only)
-      if (gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
+      // (off while a "Performance Test" runs: every draw after the scene reads all its views here)
+      if (g_perf_test == 0 && gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
       {
          com_ptr<ID3D11ShaderResourceView> srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
          if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
@@ -2407,18 +2515,7 @@ public:
       if (gd.mv_active && is_immediate)
       {
 #if DEVELOPMENT
-         // "Performance Test": this branch's CPU time (the draws' own submission included)
-         struct PerfHookTimer
-         {
-            std::atomic<int64_t>& total_ns;
-            const bool enabled = g_perf_test != 0;
-            const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            ~PerfHookTimer()
-            {
-               if (enabled)
-                  total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-            }
-         } const perf_timer{gd.perf_hook_ns};
+         const PerfHookTimer perf_timer{gd.perf_hook_ns}; // The draws' own submission included
 #endif
          if (!gd.mv_scene_done && std::ranges::any_of(kScenePostHashes, [&](uint32_t hash)
                                      { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); }))
@@ -2671,6 +2768,19 @@ public:
    }
 
 #if DEVELOPMENT
+   // "Performance Test": adds the scope's CPU time to the motion vector hooks' total, while the test runs with "Hook Timers"
+   struct PerfHookTimer
+   {
+      std::atomic<int64_t>& total_ns;
+      const bool enabled = g_perf_test != 0 && g_perf_hook_timers;
+      const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      ~PerfHookTimer()
+      {
+         if (enabled)
+            total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+      }
+   };
+
    static void ApplyPerfTestMode(DeviceData& device_data, int mode_index)
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -2825,6 +2935,21 @@ public:
    }
 #endif
 
+   // Re-initializing the SR bridge's instances stops the helper (the upscaler's GPU memory, a profile's end) and drops the bridge's
+   // copies and references; the next upscaled draw starts a new helper
+   static void RestartSRBridge(ID3D11Device* native_device, DeviceData& device_data)
+   {
+      com_ptr<IDXGIDevice> dxgi_device;
+      com_ptr<IDXGIAdapter> adapter;
+      if (FAILED(native_device->QueryInterface(&dxgi_device)) || FAILED(dxgi_device->GetAdapter(&adapter)))
+         return;
+      for (auto& [type, instance] : device_data.sr_implementations_instances)
+      {
+         if (instance)
+            sr_implementations[type]->Init(instance, native_device, adapter.get());
+      }
+   }
+
    void CleanExtraSRResources(DeviceData& device_data) override
    {
       GetGameDeviceData(device_data).release_sr_resources = true;
@@ -2845,21 +2970,11 @@ public:
       device_data.has_drawn_sr = false;
       gd.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       gd.mv_active = IsSRActive(device_data) || g_mv_enable;
-      // None picked: re-initializing the SR bridge's instances stops the helper (the upscaler's GPU memory) and drops the bridge's
-      // copies and references (Core keeps the instances across selections), then our upscaler inputs and output go. Recreated
-      // when an upscaler is picked again (the helper takes seconds to start).
+      // None picked: the SR bridge restarts empty (Core keeps the instances across selections), then our upscaler inputs and
+      // output go. Recreated when an upscaler is picked again (the helper takes seconds to start).
       if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
       {
-         com_ptr<IDXGIDevice> dxgi_device;
-         com_ptr<IDXGIAdapter> adapter;
-         if (SUCCEEDED(native_device->QueryInterface(&dxgi_device)) && SUCCEEDED(dxgi_device->GetAdapter(&adapter)))
-         {
-            for (auto& [type, instance] : device_data.sr_implementations_instances)
-            {
-               if (instance)
-                  sr_implementations[type]->Init(instance, native_device, adapter.get());
-            }
-         }
+         RestartSRBridge(native_device, device_data);
          gd.sr_output_srv.reset();
          if (!g_mv_enable)
          {
@@ -2881,6 +2996,167 @@ public:
 #if DEVELOPMENT
       gd.mv_dumping = std::exchange(g_mv_dump_scene, false);
       gd.mv_dump_index = 0;
+      if (gd.gpu_thread_priority != g_gpu_thread_priority)
+      {
+         com_ptr<IDXGIDevice> dxgi_device;
+         if (SUCCEEDED(native_device->QueryInterface(&dxgi_device)) && SUCCEEDED(dxgi_device->SetGPUThreadPriority(g_gpu_thread_priority)))
+            gd.gpu_thread_priority = g_gpu_thread_priority;
+         else
+            g_gpu_thread_priority = gd.gpu_thread_priority;
+      }
+#if ENABLE_SR_BRIDGE
+      // "SR Bridge Profile" (see "BridgeProfile"): a frame is recorded from present to present
+      {
+         using namespace BridgeProfile;
+         com_ptr<ID3D11DeviceContext> context;
+         native_device->GetImmediateContext(&context);
+         if (current)
+         {
+            current->gpu_end = Query(context.get(), D3D11_QUERY_TIMESTAMP);
+            context->End(current->gpu_end.get());
+            context->End(current->disjoint.get());
+            current->cpu_end = Now();
+            current = nullptr;
+         }
+         if (state == State::Requested)
+         {
+            state = State::Off;
+            SYSTEMTIME time;
+            GetLocalTime(&time);
+            run_directory = (sweep_step >= 0 ? sweep_directory : OutputDirectory()) / std::format("{}-{:02}{:02}{:02}{}{}", device_data.sr_type == SR::Type::DLSS ? "dlss" : "fsr", time.wHour, time.wMinute, time.wSecond,
+                                                                                         g_bridge_flush_before ? "-flush" : "", g_gpu_thread_priority != 0 ? std::format("-priority{}", g_gpu_thread_priority) : "");
+            std::error_code error;
+            std::filesystem::create_directories(run_directory, error);
+            if (!IsSRActive(device_data))
+               reshade::log::message(reshade::log::level::warning, "[ME1 Bridge] the profile needs DLSS or FSR 3 picked");
+            else if (std::filesystem::is_directory(run_directory, error))
+            {
+               SetEnvironmentVariableW(L"LUMA_UPSCALER_PROFILE", (run_directory / "helper.csv").c_str());
+               RestartSRBridge(native_device, device_data); // The profile starts with the helper
+               frames.clear();
+               frames.reserve(kFrames); // "current" points into it
+               warmup = 0;
+               state = State::WarmingUp;
+            }
+         }
+         else if (state == State::WarmingUp && IsSRActive(device_data) && sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData()) && ++warmup >= kWarmupFrames)
+         {
+            state = State::Recording;
+         }
+         if (state == State::Recording && frames.size() < kFrames)
+         {
+            auto& frame = frames.emplace_back();
+            frame.cpu_begin = Now();
+            frame.disjoint = Query(context.get(), D3D11_QUERY_TIMESTAMP_DISJOINT);
+            context->Begin(frame.disjoint.get());
+            frame.gpu_begin = Query(context.get(), D3D11_QUERY_TIMESTAMP);
+            context->End(frame.gpu_begin.get());
+            current = &frame;
+         }
+         else if (state == State::Recording)
+         {
+            // All recorded: read back (a one-time wait), write, then the helper restarts without the profile (it writes its
+            // file's end on exit)
+            const auto read = [&](ID3D11Query* query) -> uint64_t
+            {
+               uint64_t value = 0;
+               while (query && context->GetData(query, &value, sizeof(value), 0) == S_FALSE)
+                  Sleep(0);
+               return value;
+            };
+            LARGE_INTEGER qpc_frequency;
+            QueryPerformanceFrequency(&qpc_frequency);
+            std::vector<double> frame_gpu_ms, bridge_gpu_ms, draw_cpu_ms;
+            std::string csv = "frame,bridge_n,cpu_begin,cpu_end";
+            for (int i = 0; i < kSteps; i++)
+               csv += std::format(",cpu_step{}", i);
+            csv += ",gpu_begin,gpu_loaded,gpu_end";
+            for (int i = 0; i < kSteps; i++)
+               csv += std::format(",gpu_step{}", i);
+            csv += ",gpu_frequency,disjoint,qpc_frequency\n";
+            for (size_t i = 0; i < frames.size(); i++)
+            {
+               const Frame& frame = frames[i];
+               D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+               while (context->GetData(frame.disjoint.get(), &disjoint, sizeof(disjoint), 0) == S_FALSE)
+                  Sleep(0);
+               csv += std::format("{},{},{},{}", i, frame.bridge_n, frame.cpu_begin, frame.cpu_end);
+               for (int j = 0; j < kSteps; j++)
+                  csv += std::format(",{}", frame.cpu_step[j]);
+               const uint64_t gpu_begin = read(frame.gpu_begin.get());
+               csv += std::format(",{},{},{}", gpu_begin, gpu_begin, read(frame.gpu_end.get())); // No load span: "gpu_loaded" is the begin
+               uint64_t gpu_steps[kSteps];
+               for (int j = 0; j < kSteps; j++)
+               {
+                  gpu_steps[j] = read(frame.gpu_step[j].get());
+                  csv += std::format(",{}", gpu_steps[j]);
+               }
+               csv += std::format(",{},{},{}\n", disjoint.Frequency, int(disjoint.Disjoint), qpc_frequency.QuadPart);
+               if (frame.bridge_n && !disjoint.Disjoint && disjoint.Frequency)
+               {
+                  const double gpu_ms = 1000.0 / double(disjoint.Frequency), cpu_ms = 1000.0 / double(qpc_frequency.QuadPart);
+                  frame_gpu_ms.push_back(double(read(frame.gpu_end.get()) - gpu_begin) * gpu_ms);
+                  bridge_gpu_ms.push_back(double(gpu_steps[kSteps - 1] - gpu_steps[0]) * gpu_ms);
+                  draw_cpu_ms.push_back(double(frame.cpu_step[kSteps - 1] - frame.cpu_step[0]) * cpu_ms);
+               }
+            }
+            std::ofstream(run_directory / "game.csv", std::ios::binary) << csv;
+            SetEnvironmentVariableW(L"LUMA_UPSCALER_PROFILE", nullptr);
+            RestartSRBridge(native_device, device_data);
+            frames.clear();
+            state = State::Off;
+            reshade::log::message(reshade::log::level::info, std::format("[ME1 Bridge] profile of {} frames written to \"{}\"", kFrames, run_directory.string()).c_str());
+            const auto median = [](std::vector<double> values)
+            {
+               if (values.empty())
+                  return 0.0;
+               std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+               return values[values.size() / 2];
+            };
+            if (sweep_step >= 0)
+            {
+               sweep_results[sweep_step % std::size(kSweepModes)].push_back({median(frame_gpu_ms), median(bridge_gpu_ms), median(draw_cpu_ms)});
+               // The next mode whose upscaler this device supports
+               while (++sweep_step < int(std::size(kSweepModes)) * kSweepRounds && !device_data.sr_implementations_instances.contains(kSweepModes[sweep_step % std::size(kSweepModes)].sr_type))
+                  ;
+               if (sweep_step < int(std::size(kSweepModes)) * kSweepRounds)
+               {
+                  const SweepMode& mode = kSweepModes[sweep_step % std::size(kSweepModes)];
+                  device_data.sr_type = mode.sr_type;
+                  device_data.sr_suppressed = false;
+                  state = State::Requested; // At the next present, which latches the upscaler
+               }
+               else
+               {
+                  std::string summary;
+                  for (size_t i = 0; i < std::size(kSweepModes); i++)
+                  {
+                     std::vector<double> columns[3];
+                     for (const auto& run : sweep_results[i])
+                        for (int c = 0; c < 3; c++)
+                           columns[c].push_back(run[c]);
+                     if (columns[0].empty())
+                        continue;
+                     const std::array<double, 3> result = {median(columns[0]), median(columns[1]), median(columns[2])};
+                     const std::string line = std::format("[ME1 Bridge] sweep mode=\"{}\" runs={} frame GPU median={:.3f} ms bridge GPU median={:.3f} ms bridge CPU in Draw median={:.3f} ms",
+                        kSweepModes[i].name, sweep_results[i].size(), result[0], result[1], result[2]);
+                     reshade::log::message(reshade::log::level::info, line.c_str());
+                     summary += line + "\n";
+                  }
+                  std::ofstream(sweep_directory / "sweep.txt", std::ios::binary) << summary;
+                  device_data.sr_type = sweep_user_sr_type;
+                  device_data.sr_suppressed = false;
+                  if (sweep_user_sr_type == SR::Type::None)
+                  {
+                     device_data.sr_output_color = nullptr; // As Core's selection change to None
+                     gd.release_sr_resources = true;
+                  }
+                  sweep_step = -1;
+               }
+            }
+         }
+      }
+#endif
       // "Memory Sweep": a mode settles for a fixed frame count after the upscaler is ready (lazy targets created, released ones
       // flushed), or logs anyway once the helper failed to get ready in time
       if (g_memory_sweep_step >= 0)
@@ -2908,7 +3184,7 @@ public:
       {
          const auto now = std::chrono::steady_clock::now();
          const std::string aa = IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : "none");
-         const std::string settings = std::format("mode=\"{}\" aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, aa, IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
+         const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, g_perf_hook_timers, aa, IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
          // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile)
          if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250) ||
              (IsSRActive(device_data) && !sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData())))
@@ -3003,7 +3279,7 @@ public:
                         for (const int mode : perf_sweep_modes)
                         {
                            const double cpu_frame = median(mode, 4);
-                           reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, gd.perf_sweep_results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, median(mode, 0), median(mode, 0) - baseline, perf_test_modes[baseline_mode].name, median(mode, 1), median(mode, 2), median(mode, 5), median(mode, 6), median(mode, 7), median(mode, 8), median(mode, 3)).c_str());
+                           reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" hook_timers={} windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, g_perf_hook_timers, gd.perf_sweep_results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, median(mode, 0), median(mode, 0) - baseline, perf_test_modes[baseline_mode].name, median(mode, 1), median(mode, 2), median(mode, 5), median(mode, 6), median(mode, 7), median(mode, 8), median(mode, 3)).c_str());
                         }
                         g_perf_sweep = false;
                         ApplyPerfTestMode(device_data, 0);
@@ -3247,6 +3523,9 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([ME1 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill with the reactive mask, the upscaler, copies) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still; compare by toggling FSR and the mask. \"Sweep\" runs every mode, 3 rounds, then logs medians. Not saved.");
+      ImGui::Checkbox("Hook Timers", &g_perf_hook_timers);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. The test also turns off the per draw diagnostics.");
       const std::string memory_sweep_label = g_memory_sweep_step >= 0 ? std::format("Memory Sweep ({}/{})", g_memory_sweep_step + 1, std::size(memory_sweep_modes)) : std::string("Memory Sweep");
       if (ImGui::Button(memory_sweep_label.c_str()) && g_memory_sweep_step < 0 && g_perf_test == 0)
       {
@@ -3255,6 +3534,45 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Runs each mode (no AA, SMAA, bloom, RCAS, DLSS with and without SMAA, FSR 3 with the mask, back to none) and logs the\nprocess's GPU memory, commit and address space once each settles ([ME1 Mem] in ReShade.log), then restores the settings.\nKeep the camera still. Not with a Performance Test. Not saved.");
+#if ENABLE_SR_BRIDGE
+      if (ImGui::Button(BridgeProfile::state == BridgeProfile::State::Off ? "SR Bridge Profile" : "SR Bridge Profile (running)") && BridgeProfile::state == BridgeProfile::State::Off)
+         BridgeProfile::state = BridgeProfile::State::Requested;
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("With DLSS or FSR 3 picked: restarts the helper with its profile, then records %u upscaled frames of the bridge's steps\n(GPU timestamps and CPU times) into \"LumaBridgeProfile\\<upscaler>-<time>\" next to the exe: game.csv and helper.csv.\nThe helper restarts again at the end. Keep the camera still.", BridgeProfile::kFrames);
+      {
+         using namespace BridgeProfile;
+         const std::string sweep_label = sweep_step >= 0 ? std::format("SR Bridge Profile Sweep ({}/{})", sweep_step + 1, std::size(kSweepModes) * kSweepRounds) : std::string("SR Bridge Profile Sweep");
+         if (ImGui::Button(sweep_label.c_str()) && sweep_step < 0 && state == State::Off)
+         {
+            sweep_user_sr_type = device_data.sr_type;
+            for (auto& results : sweep_results)
+               results.clear();
+            SYSTEMTIME time;
+            GetLocalTime(&time);
+            sweep_directory = OutputDirectory() / std::format("sweep-{:02}{:02}{:02}", time.wHour, time.wMinute, time.wSecond);
+            sweep_step = -1;
+            while (++sweep_step < int(std::size(kSweepModes)) * kSweepRounds && !device_data.sr_implementations_instances.contains(kSweepModes[sweep_step % std::size(kSweepModes)].sr_type))
+               ;
+            if (sweep_step < int(std::size(kSweepModes)) * kSweepRounds)
+            {
+               const SweepMode& mode = kSweepModes[sweep_step % std::size(kSweepModes)];
+               device_data.sr_type = mode.sr_type;
+               device_data.sr_suppressed = false;
+               state = State::Requested;
+            }
+            else
+               sweep_step = -1;
+         }
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Profiles DLSS and FSR 3, %d rounds interleaved\n(~10 s a run), into \"LumaBridgeProfile\\sweep-<time>\", then logs \"[ME1 Bridge] sweep\" lines (medians) and restores\nthe upscaler. Keep the camera still and the overlay closed.", kSweepRounds);
+      }
+      ImGui::Checkbox("SR Bridge Flush Before", &g_bridge_flush_before);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Flushes the game's commands right before the SR bridge's frame, so its input copies and signal to the helper go on\ntheir own. An experiment on the handoff's latency (profile with and without). Not saved.");
+      ImGui::SliderInt("GPU Thread Priority", &g_gpu_thread_priority, -7, 7);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("IDXGIDevice::SetGPUThreadPriority on the game's device (0 = default). An experiment on the SR bridge's handoff. Not saved.");
+#endif
       if (ImGui::Button("MV Dump Scene Draws"))
          g_mv_dump_scene = true;
       if (ImGui::IsItemHovered())

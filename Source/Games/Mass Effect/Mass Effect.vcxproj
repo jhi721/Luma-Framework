@@ -307,7 +307,10 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\Core\unity_build.cpp" />
+    <ClCompile Include="..\..\Core\unity_build.cpp">
+      <!-- "SR Bridge Profile": the SR bridge's step hook (see BridgeProfile.h) -->
+      <ForcedIncludeFiles Condition="$(Configuration.StartsWith('Development'))">$(ProjectDir)BridgeProfile.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+    </ClCompile>
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <Import Project="..\Luma.DXP.props" Condition="Exists('..\Luma.DXP.props')" />
