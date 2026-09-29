@@ -35,9 +35,8 @@ namespace MotionVectorPatches
    constexpr uint32_t target_slot = 4;
    // FSR's reactive mask, written by the scene's alpha blended draws (their pixel shaders patched with "PatchPixelShaderReactive")
    constexpr uint32_t reactive_slot = 5;
-   constexpr char semantic_name[] = "LUMAMV";
 
-   // For Core's vertex shader patch ("motion_vector_patch.h"; the pixel shader patches are this game's own, below)
+   // For Core's patches ("motion_vector_patch.h"; its pixel shader patch only on the shaders "ReadPixelShader" accepts)
    constexpr MotionVectorPatch::Layout layout = {object_slot, previous_slots, jitter_slot, resource_slots, previous_resources_slot,
       current_position_register, previous_position_register, target_slot, view_projection_row};
 
@@ -62,16 +61,10 @@ namespace MotionVectorPatches
    {
       if (!ReadChunks(code, size, &shader->chunks))
          return (*error = "container", false);
-      for (Chunk& chunk : shader->chunks)
-      {
-         if (chunk.fourcc == FourCC("SHEX") || chunk.fourcc == FourCC("SHDR"))
-            shader->program = &chunk;
-         else if (chunk.fourcc == FourCC("ISGN"))
-            shader->input_signature = &chunk;
-         else if (chunk.fourcc == FourCC("OSGN"))
-            shader->output_signature = &chunk;
-      }
-      if (!shader->program || !shader->input_signature || !shader->output_signature || shader->program->data.size() % 4 != 0 || !ReadSignature(shader->input_signature->data, &shader->inputs) || !ReadSignature(shader->output_signature->data, &shader->outputs))
+      shader->program = FindChunk(&shader->chunks, FourCC("SHEX"), FourCC("SHDR"));
+      shader->input_signature = FindChunk(&shader->chunks, FourCC("ISGN"));
+      shader->output_signature = FindChunk(&shader->chunks, FourCC("OSGN"));
+      if (!shader->program || !shader->input_signature || !shader->output_signature || !ReadSignature(shader->input_signature->data, &shader->inputs) || !ReadSignature(shader->output_signature->data, &shader->outputs))
          return (*error = "chunks", false);
       // Targets are known by name, their system value is left undefined in the signature
       const auto is_target = [](const SignatureElement& element)
@@ -93,72 +86,11 @@ namespace MotionVectorPatches
       return true;
    }
 
-   // A target output like the game's, at "slot" with the "mask" components (signature masks are plain component bits, x = 1,
-   // unlike operand token masks)
-   inline SignatureElement AddedTarget(const PixelShader& shader, uint32_t slot, uint8_t mask)
-   {
-      SignatureElement output = shader.target;
-      output.semantic_index = slot;
-      output.reg = slot;
-      output.mask = mask;
-      output.rw_mask = 0;
-      return output;
-   }
-
    // The pixel shader with the motion vector target, or empty if unpatchable
    inline std::vector<uint8_t> PatchPixelShader(const uint8_t* code, size_t size, std::string* error)
    {
       PixelShader shader;
-      if (!ReadPixelShader(code, size, &shader, error))
-         return {};
-      auto& [chunks, program, input_signature, output_signature, inputs, outputs, target, tokens, instructions, first_body] = shader;
-
-      // The two inputs after the last input (or before the outputs), the target after the last output
-      const size_t first_output = size_t(std::ranges::find_if(instructions.begin(), instructions.begin() + first_body, [](const Instruction& instruction)
-                                            { return instruction.opcode == D3D10_SB_OPCODE_DCL_OUTPUT; }) -
-                                         instructions.begin());
-      if (first_output == first_body || first_output == 0)
-         return (*error = "no outputs", std::vector<uint8_t>());
-      size_t last_input = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_INPUT_PS, D3D10_SB_OPCODE_DCL_INPUT_PS_SGV, D3D10_SB_OPCODE_DCL_INPUT_PS_SIV});
-      if (last_input == first_body)
-         last_input = first_output - 1;
-      const size_t last_output = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_OUTPUT});
-      uint32_t temp;
-      std::vector<uint32_t> declarations = CopyDeclarations(tokens, instructions, first_body, 2, &temp, [&](size_t i)
-         {
-            std::vector<uint32_t> added;
-            if (i == last_input)
-            {
-               for (const uint32_t reg : {current_position_register, previous_position_register})
-                  added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_INPUT_PS) | ENCODE_D3D10_SB_INPUT_INTERPOLATION_MODE(D3D10_SB_INTERPOLATION_LINEAR) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_INPUT, mask_xyw), reg});
-            }
-            if (i == last_output)
-               added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), target_slot});
-            return added; });
-
-      // Before the final ret, in UV space: (previous.xy / previous.w - current.xy / current.w) * (0.5, -0.5)
-      const uint32_t current = temp;
-      const uint32_t previous = temp + 1;
-      constexpr uint32_t div = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DIV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7);
-      const std::vector<uint32_t> motion_vector = {
-         div, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), current, Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 1, 0, 0), current_position_register, Source(D3D10_SB_OPERAND_TYPE_INPUT, 3, 3, 3, 3), current_position_register,
-         div, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), previous, Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 1, 0, 0), previous_position_register, Source(D3D10_SB_OPERAND_TYPE_INPUT, 3, 3, 3, 3), previous_position_register,
-         ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_ADD) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8), Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), current, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0), previous, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0) | ENCODE_D3D10_SB_OPERAND_EXTENDED(true), ENCODE_D3D10_SB_EXTENDED_OPERAND_MODIFIER(D3D10_SB_OPERAND_MODIFIER_NEG), current,
-         ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(10), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), target_slot, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0), current,
-         ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32), std::bit_cast<uint32_t>(0.5f), std::bit_cast<uint32_t>(-0.5f), 0, 0};
-      const size_t last = instructions.back().begin;
-      declarations.insert(declarations.end(), tokens.begin() + instructions[first_body].begin, tokens.begin() + last);
-      declarations.insert(declarations.end(), motion_vector.begin(), motion_vector.end());
-      declarations.insert(declarations.end(), tokens.begin() + last, tokens.end());
-      WriteProgram(&declarations, program);
-
-      // Signature masks are plain component bits (x = 1), unlike the operand token masks above
-      inputs.push_back({semantic_name, 0, 0, 3, current_position_register, 0xF, 0xB});
-      inputs.push_back({semantic_name, 1, 0, 3, previous_position_register, 0xF, 0xB});
-      input_signature->data = WriteSignature(inputs);
-      outputs.push_back(AddedTarget(shader, target_slot, 0x3));
-      output_signature->data = WriteSignature(outputs);
-      return WriteChunks(chunks);
+      return ReadPixelShader(code, size, &shader, error) ? MotionVectorPatch::PatchPixelShader(code, size, layout, error) : std::vector<uint8_t>();
    }
 
    // The pixel shader with the mask target: the color goes to a temp, copied to the target before the final ret, then the draw's
@@ -278,7 +210,13 @@ namespace MotionVectorPatches
       declarations.insert(declarations.end(), tokens.begin() + instructions.back().begin, tokens.end());
       WriteProgram(&declarations, program);
 
-      outputs.push_back(AddedTarget(shader, reactive_slot, 0x3));
+      // A target like the game's (signature masks are plain component bits, x = 1, unlike operand token masks)
+      SignatureElement output = target;
+      output.semantic_index = reactive_slot;
+      output.reg = reactive_slot;
+      output.mask = 0x3;
+      output.rw_mask = 0;
+      outputs.push_back(output);
       output_signature->data = WriteSignature(outputs);
       return WriteChunks(chunks);
    }
