@@ -681,6 +681,21 @@ class MedalOfHonor final : public Game
 public:
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}});
+#if ENABLE_BLOOM
+      Mcp::RegisterMirroredToggle("luma_bloom_enable", &g_luma_bloom_enable, &cb_luma_global_settings.GameSettings.LumaBloomEnable);
+#endif
+#if ENABLE_SMAA
+      Mcp::RegisterMirroredToggle("smaa_enable", &g_smaa_enable, &cb_luma_global_settings.GameSettings.SMAAEnable);
+      Mcp::RegisterToggles({{"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}});
+      Mcp::RegisterValues({{"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.001f, 0.2f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", tex_input),
+         MCP_GAME_TEXTURE("smaa.pred_mask", tex_pred),
+         MCP_GAME_TEXTURE("smaa.output", tex_smaa_out)});
+#endif
+#endif
       // Game-specific toggle consumed by the replaced pass (Luma_MOH_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: recover highlights + DICE display map"},
