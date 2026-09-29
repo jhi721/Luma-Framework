@@ -279,7 +279,7 @@ namespace Mcp
    std::atomic<bool> client_connected = false; // Skips the per draw bookkeeping nobody would read
    std::wstring pipe_name;
 
-   // Game dev values (toggles, tweakables, counters and textures) exposed to "luma_dev_values", registered by the game code (DEVELOPMENT only).
+   // Game dev values (toggles, tweakables, counters and textures) exposed to "luma_dev_values", registered by the game code.
    // Values are read and written on the render thread at present, where games usually swap their per frame counters.
    // Some are persisted user settings: writing them here bypasses the config, fine for A/B tests.
    enum class DevValueKind : uint8_t
@@ -301,7 +301,7 @@ namespace Mcp
       DevValueKind kind;
       void* value;
       const void* owner = nullptr; // Lets per device values be removed together (e.g. "&device_data")
-      double min = -DBL_MAX;       // Floats and ints (games index arrays with them)
+      double min = -DBL_MAX;       // Range of floats and ints (games index arrays with the ints)
       double max = DBL_MAX;
       DevTextureGetter texture = nullptr;
       DevValueSetter set; // Optional
@@ -1075,7 +1075,7 @@ namespace Mcp
             w->Key(sr_resource_names[i]);
             if (resource.resource.empty())
             {
-               w->Value("none"); // Or recorded before a client connected
+               w->Value("none"); // Or drawn before a client connected, see "client_connected"
                continue;
             }
             w->BeginObject().Format("format", resource.format).Key("size").BeginArray().Value(resource.size.x).Value(resource.size.y).Value(resource.size.z).EndArray().Field("resource", resource.resource).EndObject();
@@ -1185,7 +1185,7 @@ namespace Mcp
       return false;
    }
 
-   // Returns true when the job finished (successfully or not)
+   // Every "Run*" returns true once its job finished (successfully or not), false to run again next present
    bool RunStatus(Job* job, DeviceData& device_data)
    {
       auto& w = job->result;
