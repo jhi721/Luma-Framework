@@ -149,6 +149,11 @@ public:
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool (the SR ones have no UI, 0 = ignored)
+      Mcp::RegisterToggles({{"xegtao_enable", &g_xegtao_enable}, {"disable_taa_jitters", &disable_taa_jitters}});
+      Mcp::RegisterValues({{"sr_custom_exposure", &sr_custom_exposure, 0.f}, {"sr_custom_pre_exposure", &sr_custom_pre_exposure, 0.f}});
+#endif
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('1');
       GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).SetDefaultValue('1');
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('3');
