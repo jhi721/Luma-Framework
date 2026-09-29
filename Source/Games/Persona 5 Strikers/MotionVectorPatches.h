@@ -1,7 +1,5 @@
 #pragma once
 
-#include <bit>
-
 #include "..\..\Core\includes\motion_vector_patch.h"
 
 // Motion vectors for a game that renders none, by patching whole DXBC containers (Core's
