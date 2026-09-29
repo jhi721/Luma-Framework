@@ -422,6 +422,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
+   int mv_draw_reject = -1;               // The current draw's "MV_REJECT" reason (-1 for none), for the MCP trace note
    uint64_t mv_scene_reads_after_end = 0; // The session's total of "MotionVectorStats::scene_reads_after_end"
    bool mv_scene_overwritten = false;     // A pass or copy wrote the scene after its end (later reads see that, not the upscaled scene)
 #endif
@@ -1157,7 +1158,7 @@ class MassEffect final : public Game
 
 #if DEVELOPMENT
 #define MV_REJECT(reason) \
-   (GetGameDeviceData(device_data).mv_stats.rejected[reason]++, false)
+   ([&](auto& gd) { gd.mv_stats.rejected[reason]++; gd.mv_draw_reject = int(reason); return false; }(GetGameDeviceData(device_data)))
 #else
 #define MV_REJECT(reason) false
 #endif
@@ -1994,6 +1995,40 @@ public:
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_dump_scene", &g_mv_dump_scene},
+         {"sr_reactive_enable", &g_sr_reactive_enable}, {"sr_reactive_debug_view", &g_sr_reactive_debug_view}, {"sr_tc_from_mask", &g_sr_tc_from_mask}, {"sr_reactive_pass", &g_sr_reactive_pass},
+         {"sr_reactive_skip_fill", &g_sr_reactive_skip_fill}, { "sr_reactive_zero_test",
+            &g_sr_reactive_zero_test }});
+      Mcp::RegisterValues({{"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, { "dump_pass_cb",
+                               &g_dump_pass_cb }});
+      Mcp::RegisterInts({{ "perf_test",
+         &g_perf_test,
+         0,
+         int(std::size(perf_test_modes)) - 1,
+         [](DeviceData& device_data, double value)
+         {
+            g_perf_sweep = false; // As the "Performance Test" combo
+            ApplyPerfTestMode(device_data, int(value));
+            return std::string();
+         } }});
+      Mcp::RegisterMirroredToggle("luma_bloom_enable", &g_luma_bloom_enable, &cb_luma_global_settings.GameSettings.LumaBloomEnable);
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("mv.velocity", mv_texture),
+         MCP_GAME_TEXTURE("mv.depth", mv_device_depth),
+         MCP_GAME_TEXTURE("sr.reactive", mv_reactive),
+         MCP_GAME_TEXTURE("sr.transparency", mv_transparency),
+         MCP_GAME_TEXTURE("sr.draws_mask", mv_reactive_target)});
+#if ENABLE_SMAA
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, { "smaa_pred_measure",
+                               &g_smaa_pred_measure }});
+      Mcp::RegisterValues({{"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", tex_input),
+         MCP_GAME_TEXTURE("smaa.pred_mask", tex_pred),
+         MCP_GAME_TEXTURE("smaa.output", tex_smaa_out)});
+#endif
+#endif
       // Game-specific toggles consumed by the uber and gamma replacements (Luma_ME1_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map"},
@@ -2080,11 +2115,27 @@ public:
    {
       device_data.game = new MassEffectGameDeviceData;
       device_data.taa_detected = true; // No TAA to replace, but Core's upscaler status checks for it
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool: the last complete frame's counts
+      const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
+      Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.reactive_draws", &stats.reactive_draws}, {"mv.matched", &stats.matched},
+                               {"mv.camera_only", &stats.camera_only}, {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.maps", &stats.maps}, {"mv.updates", &stats.updates},
+                               {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.offset_bindings", &stats.offset_bindings}, {"mv.ended_by_hash", &stats.ended_by},
+                               {"mv.scene_reads_after_end", &stats.scene_reads_after_end}, { "mv.scene_reader_hash",
+                                  &stats.scene_reader }},
+         &device_data);
+      constexpr const char* reject_names[] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
+      for (size_t i = 0; i < std::size(reject_names); i++)
+         Mcp::RegisterCounter(std::string("mv.rejected.") + reject_names[i], &stats.rejected[i], &device_data);
+#endif
    }
 
    // Core's default deletes through GameDeviceData*, which has no virtual destructor: delete the concrete type.
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
+#if DEVELOPMENT
+      Mcp::Unregister(&device_data);
+#endif
       delete static_cast<MassEffectGameDeviceData*>(device_data.game);
       device_data.game = nullptr;
    }
@@ -2423,6 +2474,11 @@ public:
             };
             const bool motion_vectors = DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, draw, rtvs, dsv.get());
             const bool jitter = !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, draw, rtvs, dsv.get());
+#if DEVELOPMENT
+            Mcp::Annotate(cmd_list_data, motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched"));
+            if (const int reject = std::exchange(gd.mv_draw_reject, -1); reject >= 0)
+               Mcp::Annotate(cmd_list_data, "mv_reject", reject);
+#endif
 #if DEVELOPMENT
             if (gd.mv_dumping && gd.mv_scene_open)
             {
