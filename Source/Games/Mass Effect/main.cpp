@@ -324,8 +324,10 @@ static constexpr uint32_t kLumaBloomSlot = 6;
 static constexpr float g_bloom_sigmas[] = {1.5f, 2.f, 2.f, 2.f, 1.f, 0.5f};
 
 static bool g_hide_ui = false; // session-only, never persisted
+#if DEVELOPMENT
 // ReShade's runtime for "Take Screenshot" (the settings callback isn't given it)
 static reshade::api::effect_runtime* g_effect_runtime = nullptr;
+#endif
 #if ENABLE_SMAA
 static bool g_smaa_enable = true;
 static bool g_smaa_predication = true;      // on geometry, from the depth in the scene buffer's alpha
@@ -2261,6 +2263,7 @@ class MassEffect final : public Game
       return false;
    }
 
+#if DEVELOPMENT
    static void OnInitEffectRuntime(reshade::api::effect_runtime* runtime)
    {
       g_effect_runtime = runtime;
@@ -2271,6 +2274,7 @@ class MassEffect final : public Game
       if (g_effect_runtime == runtime)
          g_effect_runtime = nullptr;
    }
+#endif
 
 public:
    static void UnregisterEvents()
@@ -2279,8 +2283,10 @@ public:
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+#if DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
       reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+#endif
    }
 
    void OnInit(bool async) override
@@ -2345,8 +2351,10 @@ public:
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+#if DEVELOPMENT
       reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
       reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+#endif
 
       // Address-space ceiling, PROBED: no LARGE_ADDRESS_AWARE (0x0102 measured) = 2 GB, Luma's 4K scratch ~365 MB.
       static bool address_space_checked = false;
@@ -3902,12 +3910,14 @@ public:
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only: a stuck "on" would look like a broken HUD.
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
+#if DEVELOPMENT
       ImGui::BeginDisabled(g_effect_runtime == nullptr);
       if (ImGui::Button("Take Screenshot"))
          g_effect_runtime->save_screenshot();
       ImGui::EndDisabled();
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Saves a screenshot through ReShade (its screenshot folder and format; HDR PNG in HDR). The Luma panel isn't captured.");
+#endif
    }
 
    void PrintImGuiAbout() override
