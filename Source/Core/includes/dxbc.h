@@ -50,6 +50,14 @@ namespace DXBC
       return true;
    }
 
+   // The first chunk with the code (or the alternative one: the program is SHEX or SHDR), or null
+   inline Chunk* FindChunk(std::vector<Chunk>* chunks, uint32_t fourcc, uint32_t alternative = 0)
+   {
+      const auto chunk = std::ranges::find_if(*chunks, [&](const Chunk& chunk)
+         { return chunk.fourcc == fourcc || chunk.fourcc == alternative; });
+      return chunk != chunks->end() ? &*chunk : nullptr;
+   }
+
    // A new container (sizes, offsets, checksum)
    inline std::vector<uint8_t> WriteChunks(const std::vector<Chunk>& chunks)
    {
@@ -234,11 +242,6 @@ namespace DXBC
       return i == end;
    }
 
-   inline bool IsDeclaration(D3D10_SB_OPCODE_TYPE opcode)
-   {
-      return opcode == D3D10_SB_OPCODE_CUSTOMDATA || ShaderPatching::opcodes_dcl.contains(opcode);
-   }
-
    // Operand tokens for the instructions added here
    constexpr uint32_t RegisterOperand(D3D10_SB_OPERAND_TYPE type)
    {
@@ -298,12 +301,14 @@ namespace DXBC
    // The program's tokens, split into instructions, and the index of the first one past the declarations; false on a broken length
    inline bool ReadProgram(const Chunk& program, std::vector<uint32_t>* tokens, std::vector<Instruction>* instructions, size_t* first_body)
    {
+      if (program.data.size() % 4 != 0)
+         return false;
       tokens->resize(program.data.size() / 4);
       std::memcpy(tokens->data(), program.data.data(), program.data.size());
       if (!SplitInstructions(*tokens, instructions))
          return false;
       *first_body = size_t(std::ranges::find_if(*instructions, [](const Instruction& instruction)
-                              { return !IsDeclaration(instruction.opcode); }) -
+                              { return instruction.opcode != D3D10_SB_OPCODE_CUSTOMDATA && !ShaderPatching::opcodes_dcl.contains(instruction.opcode); }) -
                            instructions->begin());
       return true;
    }

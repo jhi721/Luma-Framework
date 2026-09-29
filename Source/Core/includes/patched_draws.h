@@ -2,6 +2,7 @@
 
 #include <d3d11_1.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <format>
@@ -107,7 +108,6 @@ namespace PatchedDraws
       void Bind(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, std::span<const std::pair<uint32_t, uint32_t>> slots,
          std::span<const std::vector<uint8_t>* const> uploads, std::span<ID3D11Buffer* const> current, const char* log_tag)
       {
-         const size_t count = slots.size();
          if (!std::exchange(checked, true))
          {
             D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
@@ -125,11 +125,12 @@ namespace PatchedDraws
          }
 
          constexpr size_t max_slots = 8;
-         assert(count <= max_slots && uploads.size() >= count && current.size() >= count);
+         const size_t count = (std::min)(slots.size(), max_slots);
+         assert(slots.size() <= max_slots && uploads.size() >= count && current.size() >= count);
          ID3D11Buffer* buffers_to_bind[max_slots];
          UINT sizes[max_slots] = {};
          UINT total = 0;
-         for (size_t i = 0; i < count && i < max_slots; i++)
+         for (size_t i = 0; i < count; i++)
          {
             buffers_to_bind[i] = current[i];
             // "FirstConstant" and "NumConstants" are multiples of 16 constants (256 bytes)
@@ -144,7 +145,7 @@ namespace PatchedDraws
             {
                UINT offset = restart ? 0u : ring_offset;
                UINT first_constants[max_slots], constant_counts[max_slots];
-               for (size_t i = 0; i < count && i < max_slots; i++)
+               for (size_t i = 0; i < count; i++)
                {
                   if (!uploads[i])
                      continue;
@@ -156,7 +157,7 @@ namespace PatchedDraws
                native_device_context->Unmap(ring.get(), 0);
                ring_offset = offset;
                ID3D11Buffer* const ring_buffer = ring.get();
-               for (size_t i = 0; i < count && i < max_slots; i++)
+               for (size_t i = 0; i < count; i++)
                {
                   if (uploads[i])
                      ring_context->VSSetConstantBuffers1(slots[i].second, 1, &ring_buffer, &first_constants[i], &constant_counts[i]);
@@ -167,7 +168,7 @@ namespace PatchedDraws
             }
          }
          buffers.resize(count);
-         for (size_t i = 0; i < count && i < max_slots; i++)
+         for (size_t i = 0; i < count; i++)
          {
             if (uploads[i] && WriteDynamicConstants(native_device, native_device_context, std::addressof(buffers[i]), uploads[i]->data(), UINT(uploads[i]->size())))
                buffers_to_bind[i] = buffers[i].get();

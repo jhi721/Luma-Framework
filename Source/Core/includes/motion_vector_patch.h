@@ -61,17 +61,10 @@ namespace MotionVectorPatch
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
          return (*error = "container", std::vector<uint8_t>());
-      Chunk* program = nullptr;
-      Chunk* output_signature = nullptr;
-      for (Chunk& chunk : chunks)
-      {
-         if (chunk.fourcc == FourCC("SHEX") || chunk.fourcc == FourCC("SHDR"))
-            program = &chunk;
-         else if (chunk.fourcc == FourCC("OSGN"))
-            output_signature = &chunk;
-      }
+      Chunk* const program = FindChunk(&chunks, FourCC("SHEX"), FourCC("SHDR"));
+      Chunk* const output_signature = FindChunk(&chunks, FourCC("OSGN"));
       std::vector<SignatureElement> outputs;
-      if (!program || !output_signature || program->data.size() % 4 != 0 || !ReadSignature(output_signature->data, &outputs))
+      if (!program || !output_signature || !ReadSignature(output_signature->data, &outputs))
          return (*error = "chunks", std::vector<uint8_t>());
       const auto position = std::ranges::find_if(outputs, [](const SignatureElement& element)
          { return element.system_value == 1; }); // D3D_NAME_POSITION
@@ -93,7 +86,6 @@ namespace MotionVectorPatch
       // again at the second run's slots, the jitter buffer, the two outputs, one temp
       const auto is_resource_declaration = [](D3D10_SB_OPCODE_TYPE opcode)
       { return opcode == D3D10_SB_OPCODE_DCL_RESOURCE || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_RAW || opcode == D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED; };
-      std::vector<size_t> object_indices;
       size_t object_index = first_body;
       for (size_t i = 0; i < first_body; i++)
       {
@@ -109,8 +101,6 @@ namespace MotionVectorPatch
             if (slot == layout.jitter_slot || std::ranges::any_of(layout.previous_slots, [&](const auto& slots)
                                                  { return slots.second == slot; }))
                return (*error = "slot taken", std::vector<uint8_t>());
-            if (layout.PreviousSlot(slot) != slot)
-               object_indices.push_back(i);
             if (slot == layout.object_slot)
                object_index = i;
          }
@@ -121,16 +111,15 @@ namespace MotionVectorPatch
       uint32_t scratch;
       std::vector<uint32_t> declarations = CopyDeclarations(tokens, instructions, first_body, 1, &scratch, [&](size_t i)
          {
+            const Instruction& instruction = instructions[i];
             std::vector<uint32_t> added;
-            if (is_resource_declaration(instructions[i].opcode))
+            if (is_resource_declaration(instruction.opcode))
             {
-               const Instruction& instruction = instructions[i];
                added.assign(tokens.begin() + instruction.begin, tokens.begin() + instruction.begin + instruction.length);
                added[2] += layout.previous_resources_slot;
             }
-            if (std::ranges::find(object_indices, i) != object_indices.end())
+            else if (instruction.opcode == D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER && instruction.length == 4 && layout.PreviousSlot(tokens[instruction.begin + 2]) != tokens[instruction.begin + 2])
             {
-               const Instruction& instruction = instructions[i];
                added.assign(tokens.begin() + instruction.begin, tokens.begin() + instruction.begin + instruction.length);
                added[2] = layout.PreviousSlot(added[2]);
                if (i == object_index)
@@ -260,20 +249,11 @@ namespace MotionVectorPatch
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
          return (*error = "container", std::vector<uint8_t>());
-      Chunk* program = nullptr;
-      Chunk* input_signature = nullptr;
-      Chunk* output_signature = nullptr;
-      for (Chunk& chunk : chunks)
-      {
-         if (chunk.fourcc == FourCC("SHEX") || chunk.fourcc == FourCC("SHDR"))
-            program = &chunk;
-         else if (chunk.fourcc == FourCC("ISGN"))
-            input_signature = &chunk;
-         else if (chunk.fourcc == FourCC("OSGN"))
-            output_signature = &chunk;
-      }
+      Chunk* const program = FindChunk(&chunks, FourCC("SHEX"), FourCC("SHDR"));
+      Chunk* const input_signature = FindChunk(&chunks, FourCC("ISGN"));
+      Chunk* const output_signature = FindChunk(&chunks, FourCC("OSGN"));
       std::vector<SignatureElement> inputs, outputs;
-      if (!program || !input_signature || !output_signature || program->data.size() % 4 != 0 || !ReadSignature(input_signature->data, &inputs) || !ReadSignature(output_signature->data, &outputs))
+      if (!program || !input_signature || !output_signature || !ReadSignature(input_signature->data, &inputs) || !ReadSignature(output_signature->data, &outputs))
          return (*error = "chunks", std::vector<uint8_t>());
       // Targets are known by name, their system value is left undefined in the signature
       const auto is_target = [](const SignatureElement& element)
