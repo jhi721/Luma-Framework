@@ -17,6 +17,7 @@ import re
 import struct
 import sys
 import tempfile
+import threading
 import time
 import zlib
 
@@ -24,12 +25,18 @@ import numpy as np
 
 PIPE_DIR = "\\\\.\\pipe\\"
 PIPE_PREFIX = "luma-mcp-"
-PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+# Dual era: modern requests carry their version in "_meta" (stateless), legacy clients open with "initialize"
+MODERN_VERSIONS = ("2026-07-28",)
+LEGACY_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+META = "io.modelcontextprotocol/"
+SERVER_INFO = {"name": "luma", "version": "1"}
+LIST_TTL_MS = 3_600_000  # The tool list is fixed for the process lifetime
 
-# Every tool also takes "pid" (pick a game when several run) and "timeout_ms".
+# Every tool also takes "pid" (pick a game when several run) and "timeout_ms" (the backend's default and clamp).
+TIMEOUT_MS, TIMEOUT_MS_RANGE = 15000, (100, 600000)
 COMMON = {
     "pid": {"type": "integer", "description": "Game process id, only needed when several Luma games run (see luma_list_games)"},
-    "timeout_ms": {"type": "integer", "description": "How long to wait for the game (default 15000)"},
+    "timeout_ms": {"type": "integer", "description": f"How long to wait for the game (default {TIMEOUT_MS})"},
 }
 TARGET = {
     "index": {"type": "integer", "description": "Entry index from luma_trace_list (preferred)"},
@@ -44,14 +51,22 @@ ANALYSIS = {
     "laplacian": {"type": "boolean", "description": "Variance of the Laplacian of mean(rgb), a sharpness measure (inside/outside region too)"},
     "threshold": {"type": "number", "description": "Count values whose magnitude (first 2 channels, e.g. motion vectors) is above it"},
 }
+OUT_DIR = {"out_dir": {"type": "string", "description": "%TEMP%\\luma-mcp (default) or a subfolder of it"}}  # The backend refuses anything else
 BRIDGE_ONLY_ARGS = set(ANALYSIS) | {"rows", "save_as"}
 
 
-def tool(name, description, properties=None, required=None):
+# Captures and readbacks leave only artifacts in %TEMP%\luma-mcp
+READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
+# Live state changes (not saved to the config) or a dump file
+LIVE_WRITE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+ONE_SHOT = {**LIVE_WRITE, "idempotentHint": False}  # Some knobs fire once (perf_test, dump_*)
+
+
+def tool(name, description, properties=None, required=None, annotations=READ_ONLY):
     schema = {"type": "object", "properties": {**(properties or {}), **COMMON}}
     if required:
         schema["required"] = required
-    return {"name": name, "description": description, "inputSchema": schema}
+    return {"name": name, "description": description, "inputSchema": schema, "annotations": annotations}
 
 
 TOOLS = [
@@ -108,7 +123,7 @@ TOOLS = [
          "slot": {"type": "integer", "description": "View slot (default 0)"},
          "mip": {"type": "integer"},
          "replaced": {"type": "boolean", "description": "Read the bindings of Luma's replaced pass (default true) or the original ones"},
-         "out_dir": {"type": "string", "description": "Default %TEMP%\\luma-mcp"},
+         **OUT_DIR,
          **ANALYSIS},
     ),
     tool(
@@ -132,7 +147,8 @@ TOOLS = [
     tool("luma_set_dev_value", "Change a registered toggle, float or int live (A/B tests; counters and textures are read only). Ints are range checked. "
          "Some are persisted user settings (smaa_enable, rcas_sharpness, gtao_*...): this bypasses the config, nothing is saved. perf_test runs the "
          "game's Performance Test mode like its combo. One-shots (smaa_pred_measure, dump_*) disarm themselves; read their result with luma_log.",
-         {"name": {"type": "string"}, "value": {"type": "string", "description": "true/false or 1/0 for toggles, a number otherwise"}}, ["name", "value"]),
+         {"name": {"type": "string"}, "value": {"type": "string", "description": "true/false or 1/0 for toggles, a number otherwise"}}, ["name", "value"],
+         annotations=ONE_SHOT),
     tool(
         "luma_sr_state",
         "What the game feeds DLSS/FSR: settings (render/output size, hdr, inverted depth, MV scale, jittered MVs, auto exposure, preset), the last draw "
@@ -142,27 +158,29 @@ TOOLS = [
     tool(
         "luma_sr_capture",
         "Copy the next DLSS/FSR draw's inputs (color, motion vectors, depth, exposure, reactive/T&C masks) and output, and read them back with stats and previews.",
-        {"max_frames": {"type": "integer", "description": "Frames to wait for an upscaler draw (default 30)"}, "out_dir": {"type": "string"}, **ANALYSIS},
+        {"max_frames": {"type": "integer", "description": "Frames to wait for an upscaler draw (default 30)"},
+         **OUT_DIR, **ANALYSIS},
     ),
     tool("luma_shader_list", "Live shaders the game created: hash, stage, replaced, pipelines, shader model, size, and used slots (cbs/srvs/uavs/rtvs/samplers) from reflection.",
          {"stage": {"type": "string", "description": "VS, PS, CS, GS"}, "replaced_only": {"type": "boolean"},
-          "include_unloaded": {"type": "boolean", "description": "Also shaders loaded earlier without a live pipeline now"}, "limit": {"type": "integer"}}),
+          "include_unloaded": {"type": "boolean", "description": "Also shaders loaded earlier without a live pipeline now"},
+          "offset": {"type": "integer"}, "limit": {"type": "integer", "description": "Default 200, 'matched' vs 'returned' says more remain"}}),
     tool("luma_dump_shader", "Write a loaded shader's original bytecode (.cso) to Luma's dump folder, for offline disassembly (Scripts/dxbc.py).",
-         {"hash": {"type": "string"}}, ["hash"]),
+         {"hash": {"type": "string"}}, ["hash"], annotations=LIVE_WRITE),
     tool(
         "luma_shader_state",
         "Without hash: every replaced pipeline (file or patch) and the compilation error log. With hash: its pipelines, replacement kind, custom shader file and errors.",
         {"hash": {"type": "string"}, "disasm": {"type": "boolean", "description": "Include the replacement's disassembly"}},
     ),
     tool("luma_reload_shaders", "Recompile and reload Luma's custom shaders (like the dev UI button) and return the compilation error log.",
-         {"unload": {"type": "boolean", "description": "Unload them instead"}}),
+         {"unload": {"type": "boolean", "description": "Unload them instead"}}, annotations=LIVE_WRITE),
     tool("luma_get_settings", "Luma global settings (display mode, peak/paper white), the 10 dev settings with names/ranges, raw game settings slots, and shader defines."),
     tool(
         "luma_set_setting",
         "Change a setting live (not saved to the config). name: scene_peak_white, scene_paper_white, ui_paper_white, dev:<index>, game:<index>, define:<NAME> "
         "(defines need luma_reload_shaders).",
         {"name": {"type": "string"}, "value": {"type": "string"}, "as_uint": {"type": "boolean", "description": "For game:<index>, write the raw uint bits"}},
-        ["name", "value"],
+        ["name", "value"], annotations=LIVE_WRITE,
     ),
 ]
 TOOL_NAMES = {t["name"] for t in TOOLS}
@@ -574,28 +592,57 @@ class Backend:
             except FileNotFoundError:
                 time.sleep(0.1)
             except OSError as e:
-                raise RuntimeError(f"Could not open the pipe of pid {pid} (another client connected?): {e}")
+                raise RuntimeError(f"Could not open the pipe of pid {pid} (another client connected, or a timed out call still holds it?): {e}")
         raise RuntimeError(f"The pipe of pid {pid} did not come back")
 
-    def read_exact(self, size):
+    @staticmethod
+    def read_exact(pipe, size):
         data = bytearray()
         while len(data) < size:
-            chunk = self.pipe.read(size - len(data))
+            chunk = pipe.read(size - len(data))
             if not chunk:
                 raise OSError("pipe closed")
             data += chunk
         return bytes(data)
 
+    def exchange(self, payload, wait_s):
+        # A game suspended in a debugger freezes its pipe thread too (no backend timeout): read on a worker, drop the connection after "wait_s"
+        pipe, reply = self.pipe, {}
+
+        def run():
+            try:
+                pipe.write(struct.pack("<I", len(payload)) + payload)
+                reply["data"] = self.read_exact(pipe, struct.unpack("<I", self.read_exact(pipe, 4))[0])
+            except OSError as e:
+                reply["error"] = e
+            finally:
+                if pipe is not self.pipe:  # Abandoned
+                    pipe.close()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(wait_s)
+        if worker.is_alive():
+            # ponytail: the 5 s margin also covers the backend writing the readback files (a huge sr_capture on a slow disk can exceed it:
+            # raise it, or send progress notifications). The abandoned worker keeps the single pipe instance until the game answers or exits, so reconnects fail as busy
+            # meanwhile; CancelSynchronousIo on the worker (ctypes) would free it at once if that ever matters
+            self.pipe, self.pid = None, None
+            raise RuntimeError(f"The game did not answer within {wait_s:.0f} s (suspended in a debugger, or its pipe thread is stuck), dropped the connection")
+        if "error" in reply:
+            raise reply["error"]
+        return json.loads(reply["data"].decode("utf-8", errors="replace"))
+
     def call(self, name, args):
         pid = args.pop("pid", None)
         lines = [name] + [f"{k}={int(v) if isinstance(v, bool) else v}" for k, v in args.items() if v is not None]
         payload = "\n".join(lines).encode()
+        # The backend's own job timeout (same default and clamp), plus a margin for it to answer
+        timeout_ms = args.get("timeout_ms")
+        wait_s = min(max(TIMEOUT_MS if timeout_ms is None else int(timeout_ms), TIMEOUT_MS_RANGE[0]), TIMEOUT_MS_RANGE[1]) / 1000 + 5
         for attempt in range(2):
             self.connect(pid)
             try:
-                self.pipe.write(struct.pack("<I", len(payload)) + payload)
-                size = struct.unpack("<I", self.read_exact(4))[0]
-                return json.loads(self.read_exact(size).decode("utf-8", errors="replace"))
+                return self.exchange(payload, wait_s)
             except OSError:
                 # The game restarted or closed, retry once on a fresh connection
                 self.close()
@@ -635,28 +682,68 @@ def call_tool(name, args):
     return result
 
 
+# Loaded up front even when the tools are deferred (Claude Code truncates it at 2048 chars)
+INSTRUCTIONS = (
+    "Live inspection of a running Luma Development build (pipe \\\\.\\pipe\\luma-mcp-<pid>, one game at a time; luma_list_games when several run). "
+    "Prefer it over the RenoDX DevKit for what only Luma sees: its injected passes (DLSS/FSR, SMAA, bloom, AO, display composition), merged deferred "
+    "context work, which shader variant/replacement ran, the game mod's dev knobs and counters.\n"
+    "Flow: luma_status -> luma_trace_capture (trigger=<hash> for a pass that doesn't draw every frame) -> luma_trace_list -> luma_trace_get / "
+    "luma_read_resource / luma_read_cbuffer by entry index.\n"
+    "Readbacks are files in %TEMP%\\luma-mcp (.bin + .json + a .png preview to open with Read) plus channel stats in the result; luma_compare diffs two .bin.\n"
+    "A/B: luma_dev_values -> luma_set_dev_value (live, not saved), then read back again; one-shot knobs report in luma_log.\n"
+    "'ignored_args' in a result means a misspelt or unknown argument. A timeout usually means the game isn't presenting (minimized, paused, "
+    "in a loading screen or a debugger)."
+)
+
+
+class RpcError(Exception):
+    def __init__(self, code, message, data=None):
+        super().__init__(message)
+        self.code, self.data = code, data
+
+
 def handle(message):
     method = message.get("method")
+    params = message.get("params") or {}
+    if not isinstance(params, dict) or not isinstance(params.get("_meta", {}), dict):
+        raise RpcError(-32602, "params and its _meta must be objects")
+    version = params.get("_meta", {}).get(META + "protocolVersion")
+    if version is None:  # Legacy
+        return dispatch(method, params)
+    if version not in MODERN_VERSIONS:
+        raise RpcError(-32022, "Unsupported protocol version", {"supported": list(MODERN_VERSIONS), "requested": version})
+    if META + "clientCapabilities" not in params["_meta"]:
+        raise RpcError(-32602, f"Missing {META}clientCapabilities in _meta")
+    if method == "server/discover":  # Modern only, a legacy client gets "unknown method" as before
+        result = {"supportedVersions": list(MODERN_VERSIONS), "capabilities": {"tools": {}}, "instructions": INSTRUCTIONS}
+    else:
+        result = dispatch(method, params)
+    result.update(resultType="complete", _meta={META + "serverInfo": SERVER_INFO})
+    if method in ("server/discover", "tools/list"):
+        result.update(ttlMs=LIST_TTL_MS, cacheScope="public")
+    return result
+
+
+def dispatch(method, params):
     if method == "initialize":
-        requested = message.get("params", {}).get("protocolVersion")
-        return {"protocolVersion": requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "luma", "version": "1"},
-                "instructions": "Live inspection of a running Luma Development build. Start with luma_status, then luma_trace_capture and luma_trace_list."}
+        requested = params.get("protocolVersion")
+        return {"protocolVersion": requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0],
+                "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": INSTRUCTIONS}
     if method == "tools/list":
         return {"tools": TOOLS}
     if method == "tools/call":
-        params = message.get("params", {})
         name, args = params.get("name"), dict(params.get("arguments") or {})
         if name not in TOOL_NAMES:
-            raise KeyError(f"Unknown tool {name}")
+            raise RpcError(-32602, f"Unknown tool {name}")
+        # Execution failures (a missing file, a bad regex, a lost game) go back as tool results the model can act on, not protocol errors
         try:
             result = call_tool(name, args)
-        except RuntimeError as e:
-            result = {"ok": False, "error": str(e)}
+        except Exception as e:
+            result = {"ok": False, "error": str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"}
         return {"content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}], "isError": not result.get("ok", False)}
-    if method == "ping":
+    if method == "ping":  # Legacy only, harmless to answer in the modern era too
         return {}
-    raise KeyError(f"Unknown method {method}")
+    raise RpcError(-32601, f"Unknown method {method}")
 
 
 def main():
@@ -669,7 +756,11 @@ def main():
         try:
             response = {"jsonrpc": "2.0", "id": message["id"], "result": handle(message)}
         except Exception as e:  # Report every failure to the client instead of dying
-            response = {"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601 if isinstance(e, KeyError) else -32603, "message": str(e)}}
+            code, data = (e.code, e.data) if isinstance(e, RpcError) else (-32603, None)
+            error = {"code": code, "message": str(e)}
+            if data is not None:
+                error["data"] = data
+            response = {"jsonrpc": "2.0", "id": message["id"], "error": error}
         sys.stdout.buffer.write(json.dumps(response).encode() + b"\n")
         sys.stdout.buffer.flush()
 
