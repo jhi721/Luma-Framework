@@ -249,6 +249,10 @@ public:
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"xegtao_enable", &g_xegtao_enable}});
+#endif
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
