@@ -101,6 +101,12 @@ namespace Mcp
       {
          return Field(key, GetFormatNameSafe(format));
       }
+      // As UTF-8: "path::string()" uses the ANSI code page and throws on characters outside it
+      JsonWriter& Path(std::string_view key, const std::filesystem::path& path)
+      {
+         const std::u8string utf8 = path.u8string();
+         return Field(key, std::string_view(reinterpret_cast<const char*>(utf8.data()), utf8.size()));
+      }
 
    private:
       bool comma = false;
@@ -458,7 +464,7 @@ namespace Mcp
    void WriteCustomShader(JsonWriter* w, const Shader::CachedCustomShader& custom_shader, bool with_disasm)
    {
       w->Key("custom_shader").BeginObject();
-      w->Field("file", custom_shader.file_path.string());
+      w->Path("file", custom_shader.file_path);
       w->Field("is_hlsl", custom_shader.is_hlsl);
       w->Field("is_luma_native", custom_shader.is_luma_native);
       w->Field("compilation_failed", custom_shader.compilation_error);
@@ -924,7 +930,7 @@ namespace Mcp
       }
 
       auto& w = job->result;
-      w.Field("path", path.string());
+      w.Path("path", path);
       w.Field("dimension", dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D ? "3d" : (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? "1d" : "2d"));
       w.Field("width", mip_width).Field("height", mip_height).Field("depth", mip_depth).Field("slices", layout.slices);
       w.Field("mip", mip).Field("mips", layout.mips).Field("samples", samples);
@@ -1134,16 +1140,40 @@ namespace Mcp
       uint32_t resets = 0;
    };
 
+   // Where readbacks go ("out_dir" can only pick a subfolder): an elevated game must not write where a non elevated client asks.
+   // Not under the game's "Luma" folder, a non empty one there would shadow the repository shaders.
+   std::filesystem::path ReadbackRoot()
+   {
+      wchar_t temp_path[MAX_PATH] = {};
+      GetTempPathW(MAX_PATH, temp_path);
+      return std::filesystem::path(temp_path) / "luma-mcp";
+   }
+
+   // Request arguments are UTF-8 (a narrow "path" would read them in the ANSI code page)
+   std::filesystem::path Utf8Path(std::string_view utf8)
+   {
+      return std::u8string_view(reinterpret_cast<const char8_t*>(utf8.data()), utf8.size());
+   }
+
+   // "dir" is "ReadbackRoot()" or inside it, ".." and junctions resolved. Never throws (pipe thread).
+   // ponytail: checked, then written (a junction swapped in between wins), fine for a DEVELOPMENT only tool
+   bool IsInReadbackRoot(const std::filesystem::path& dir)
+   {
+      std::error_code ec;
+      const std::filesystem::path root = std::filesystem::weakly_canonical(ReadbackRoot(), ec);
+      if (ec || root.empty())
+         return false;
+      const std::filesystem::path canonical_dir = std::filesystem::weakly_canonical(dir, ec);
+      return !ec && std::mismatch(root.begin(), root.end(), canonical_dir.begin(), canonical_dir.end()).first == root.end();
+   }
+
    // "<out_dir>/<stem>_f<frame>.bin"
    std::filesystem::path ReadbackPath(const Job& job, std::string_view stem)
    {
       const std::string file = std::format("{}_f{}.bin", stem, cb_luma_global_settings.FrameIndex);
       if (const std::string* out_dir = job.Arg("out_dir"))
-         return std::filesystem::path(*out_dir) / file;
-      // Not under the game's "Luma" folder, a non empty one there would shadow the repository shaders
-      wchar_t temp_path[MAX_PATH] = {};
-      GetTempPathW(MAX_PATH, temp_path);
-      return std::filesystem::path(temp_path) / "luma-mcp" / file;
+         return Utf8Path(*out_dir) / file;
+      return ReadbackRoot() / file;
    }
 
    // A readback's pass may not draw in the frame after the request: false (and the error) once its miss budget is spent
@@ -1161,7 +1191,7 @@ namespace Mcp
       auto& w = job->result;
       w.Field("game", Globals::GAME_NAME).Field("version", Globals::VERSION);
       w.Field("pid", GetCurrentProcessId()).Field("bits", sizeof(void*) * 8);
-      w.Field("exe_path", System::GetModulePath().string()); // ReShade writes its log next to it by default
+      w.Path("exe_path", System::GetModulePath()); // ReShade writes its log next to it by default
       w.Field("frame_index", cb_luma_global_settings.FrameIndex);
       w.Key("output_resolution").BeginArray().Value(device_data.output_resolution.x).Value(device_data.output_resolution.y).EndArray();
       w.Key("render_resolution").BeginArray().Value(device_data.render_resolution.x).Value(device_data.render_resolution.y).EndArray();
@@ -1682,13 +1712,18 @@ namespace Mcp
    {
       const std::string* stage = job->Arg("stage");
       const bool replaced_only = job->BoolArg("replaced_only", false);
-      const size_t limit = size_t(job->IntArg("limit", 2000, 1, 100000));
+      // Paged like "trace_list", ~150 B per entry: the default stays under an agent's tool output cap
+      const size_t offset = size_t((std::max)(job->IntArg("offset", 0), int64_t(0)));
+      const size_t limit = size_t(job->IntArg("limit", 200, 1, 100000));
       const std::shared_lock lock_generic(s_mutex_generic);
       const std::lock_guard lock_dumping(s_mutex_dumping);
       auto& w = job->result;
-      size_t written = 0;
+      size_t matched = 0;
       const auto write_shader = [&](uint32_t hash, const Shader::CachedPipeline* pipeline, size_t pipelines)
       {
+         const size_t index = matched++;
+         if (index < offset || index >= offset + limit)
+            return;
          const auto cached_it = shader_cache.find(hash);
          const auto* cached = cached_it != shader_cache.end() ? cached_it->second : nullptr;
          w.BeginObject().Hash("hash", hash);
@@ -1717,7 +1752,6 @@ namespace Mcp
             }
          }
          w.EndObject();
-         written++;
       };
       w.Key("shaders").BeginArray();
       size_t live = 0;
@@ -1727,7 +1761,7 @@ namespace Mcp
             continue;
          live++;
          const auto* pipeline = *pipelines.begin();
-         if ((stage && _stricmp(stage->c_str(), pipeline->StageName()) != 0) || (replaced_only && !IsReplaced(*pipeline)) || written >= limit)
+         if ((stage && _stricmp(stage->c_str(), pipeline->StageName()) != 0) || (replaced_only && !IsReplaced(*pipeline)))
             continue;
          write_shader(hash, pipeline, pipelines.size());
       }
@@ -1737,14 +1771,15 @@ namespace Mcp
          for (const auto& [hash, cached] : shader_cache)
          {
             const auto live_it = device_data.pipeline_caches_by_shader_hash.find(hash);
-            if ((live_it != device_data.pipeline_caches_by_shader_hash.end() && !live_it->second.empty()) || written >= limit)
+            if (live_it != device_data.pipeline_caches_by_shader_hash.end() && !live_it->second.empty())
                continue;
             if (stage && (cached->type_and_version.size() < 2 || _strnicmp(stage->c_str(), cached->type_and_version.c_str(), 2) != 0))
                continue;
             write_shader(hash, nullptr, 0);
          }
       }
-      w.EndArray().Field("live", live).Field("loaded", shader_cache.size()).Field("returned", written);
+      w.EndArray().Field("live", live).Field("loaded", shader_cache.size());
+      w.Field("matched", matched).Field("offset", offset).Field("returned", matched > offset ? (std::min)(matched - offset, limit) : 0);
       return true;
    }
 
@@ -1765,7 +1800,7 @@ namespace Mcp
       DumpShader(*hash);
       // The name "DumpShader()" writes (plus a ".meta" in DEVELOPMENT)
       const std::string& version = shader_cache[*hash]->type_and_version;
-      job->result.Field("file", (shaders_dump_path / (Shader::Hash_NumToStr(*hash, true) + (version.empty() ? "" : "." + version) + ".cso")).string());
+      job->result.Path("file", shaders_dump_path / (Shader::Hash_NumToStr(*hash, true) + (version.empty() ? "" : "." + version) + ".cso"));
       return true;
    }
 
@@ -1799,7 +1834,7 @@ namespace Mcp
             continue;
          w.BeginObject().Hash("hash", pipeline->shader_hashes[0]).Field("stage", pipeline->StageName()).Field("replaced", ReplacementName(*pipeline));
          if (const auto* custom_shader = FindCustomShader(pipeline->shader_hashes[0]))
-            w.Field("file", custom_shader->file_path.filename().string());
+            w.Path("file", custom_shader->file_path.filename());
          w.EndObject();
       }
       w.EndArray();
@@ -2027,8 +2062,7 @@ namespace Mcp
 
       while (!server_stop)
       {
-         HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0,
-            security_attributes.lpSecurityDescriptor ? &security_attributes : nullptr);
+         HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, &security_attributes);
          if (pipe == INVALID_HANDLE_VALUE)
          {
             Sleep(1000);
@@ -2044,7 +2078,12 @@ namespace Mcp
                if (!ReadExact(pipe, request.data(), size))
                   break;
                auto job = ParseRequest(request);
-               const DWORD timeout_ms = DWORD(job->IntArg("timeout_ms", 15000, 100, 600000));
+               const DWORD timeout_ms = DWORD(job->IntArg("timeout_ms", 15000, 100, 600000)); // Mirrored by "TIMEOUT_MS" in "Scripts/luma_mcp.py"
+               // Readbacks may only land inside "ReadbackRoot()": refused before the job runs, and checked again per file below (the stems come from arguments too)
+               // Not "Arg()", so a tool that doesn't take it still reports it in "ignored_args"
+               const auto out_dir = job->args.find("out_dir");
+               const bool refused = out_dir != job->args.end() && !out_dir->second.empty() && !IsInReadbackRoot(Utf8Path(out_dir->second));
+               if (!refused)
                {
                   const std::lock_guard lock(s_mutex_jobs);
                   pending_jobs.push_back(job);
@@ -2052,20 +2091,35 @@ namespace Mcp
                }
                const ULONGLONG start = GetTickCount64();
                bool finished = false;
-               while (!server_stop && !(finished = WaitForSingleObject(job->done, 50) == WAIT_OBJECT_0) && GetTickCount64() - start < timeout_ms)
+               while (!refused && !server_stop && !(finished = WaitForSingleObject(job->done, 50) == WAIT_OBJECT_0) && GetTickCount64() - start < timeout_ms)
                {
                }
+               const auto path_error = [](std::string_view error, std::string_view key, const std::filesystem::path& path)
+               {
+                  JsonWriter w;
+                  w.BeginObject().Field("ok", false).Field("error", error).Path(key, path).EndObject();
+                  return std::move(w.out);
+               };
+               constexpr std::string_view outside_root = "out_dir must be the \"root\" folder or a subfolder of it";
                // A timed out job stays queued and finishes (and restores the dev UI state) on its own later
-               std::string response = finished ? std::move(job->result.out) : std::format("{{\"ok\":false,\"error\":\"Timed out after {} ms, the game might not be presenting (minimized or paused?) or the job is waiting for a pass that doesn't draw\"}}", timeout_ms);
+               std::string response = refused ? path_error(outside_root, "root", ReadbackRoot())
+                                      : finished
+                                         ? std::move(job->result.out)
+                                         : std::format("{{\"ok\":false,\"error\":\"Timed out after {} ms, the game might not be presenting (minimized or paused?) or the job is waiting for a pass that doesn't draw\"}}", timeout_ms);
                // Readbacks are written here rather than on the render thread
                for (const auto& [path, bytes] : job->files)
                {
+                  if (!IsInReadbackRoot(path.parent_path()))
+                  {
+                     response = path_error(outside_root, "root", ReadbackRoot());
+                     break;
+                  }
                   std::error_code ec;
                   std::filesystem::create_directories(path.parent_path(), ec);
                   std::ofstream file(path, std::ios::binary | std::ios::trunc);
                   if (!file.write(bytes.data(), std::streamsize(bytes.size())))
                   {
-                     response = std::format("{{\"ok\":false,\"error\":\"Failed to write {}\"}}", path.filename().string());
+                     response = path_error("Failed to write", "path", path);
                      break;
                   }
                }
