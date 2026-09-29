@@ -3643,11 +3643,16 @@ public:
    {
 #if ENABLE_SMAA
       ImGui::SeparatorText("Anti-Aliasing");
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
+      const bool sr_active = IsSRActive(device_data);
+      // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
+      ImGui::BeginDisabled(sr_active);
+      bool smaa_shown = g_smaa_enable && !sr_active;
+      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Adds SMAA anti-aliasing (the game has none of its own).");
-      if (g_smaa_enable)
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Adds SMAA anti-aliasing (the game has none of its own; not used with DLSS/FSR).");
+      ImGui::EndDisabled();
+      if (g_smaa_enable && !sr_active)
       {
 #if DEVELOPMENT
          // Not a preference: on geometry it relaxes the threshold back to base ULTRA, never below. A bisect switch.
@@ -3668,7 +3673,7 @@ public:
             ImGui::SetTooltip("Log the mask's coverage above 0.5 plus percentiles to ReShade.log.\nReal silhouettes are ~1% of a typical frame; a working mask barely moves across a 20x tolerance sweep.\nStalls the GPU for one frame.");
 #endif
       }
-      if (g_smaa_enable || IsSRActive(device_data))
+      if (g_smaa_enable || sr_active)
       {
          if (ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f))
             reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
