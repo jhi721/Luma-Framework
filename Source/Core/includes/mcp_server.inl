@@ -973,6 +973,10 @@ namespace Mcp
          deinit_count++;
          inner->Deinit(data, optional_device);
       }
+      void ReleaseResources(SR::InstanceData* data) override
+      {
+         inner->ReleaseResources(data);
+      }
       bool UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* command_list, const SR::SettingsData& settings_data) override
       {
          const bool succeeded = inner->UpdateSettings(data, command_list, settings_data);

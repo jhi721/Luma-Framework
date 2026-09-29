@@ -79,7 +79,7 @@ namespace SRBridge
       bool Start(ID3D11DeviceContext* command_list, ID3D11Resource* const* resources);
    };
 
-   // One helper at a time: Core only deinitializes the selected type, so a previous selection's instance stops its own here
+   // One helper at a time: another instance that's still running stops here
    BridgeInstanceData* running = nullptr;
 
    void BridgeInstanceData::Stop()
@@ -273,6 +273,12 @@ namespace SRBridge
    {
       delete static_cast<BridgeInstanceData*>(data);
       data = nullptr;
+   }
+
+   void Bridge::ReleaseResources(SR::InstanceData* data)
+   {
+      if (data)
+         static_cast<BridgeInstanceData*>(data)->Stop();
    }
 
    // The helper starts on the next draw with these, or a running one recreates the upscaler with them

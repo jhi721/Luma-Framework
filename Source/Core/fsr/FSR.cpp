@@ -109,19 +109,30 @@ namespace FidelityFX
    {
       auto& custom_data = reinterpret_cast<FSRInstanceData*&>(data);
 
-      if (custom_data->has_context)
-      {
-         FfxErrorCode err_code = ffxFsr3ContextDestroy(&custom_data->context);
-         if (err_code != FFX_OK)
-         {
-            printf_s("FSR3: ffxFsr3ContextDestroy failed, error = %d\n", static_cast<int>(err_code));
-         }
-
-         free(custom_data->scratch_buffer);
-      }
+      ReleaseResources(custom_data);
 
       delete custom_data;
       custom_data = nullptr;
+   }
+
+   // The context (FSR's own textures). The next "UpdateSettings()" creates it again.
+   void FidelityFX::FSR::ReleaseResources(SR::InstanceData* data)
+   {
+      auto* custom_data = static_cast<FSRInstanceData*>(data);
+      if (!custom_data || !custom_data->has_context)
+      {
+         return;
+      }
+      FfxErrorCode err_code = ffxFsr3ContextDestroy(&custom_data->context);
+      if (err_code != FFX_OK)
+      {
+         printf_s("FSR3: ffxFsr3ContextDestroy failed, error = %d\n", static_cast<int>(err_code));
+      }
+      memset(&custom_data->context, 0, sizeof(FfxFsr3Context));
+      custom_data->has_context = false;
+
+      free(custom_data->scratch_buffer);
+      custom_data->scratch_buffer = nullptr;
    }
 
    bool FidelityFX::FSR::HasInit(const SR::InstanceData* data) const
@@ -235,19 +246,7 @@ namespace FidelityFX
 #endif
 
       // Destroy any possible previously created context
-      if (custom_data->has_context)
-      {
-         err_code = ffxFsr3ContextDestroy(&custom_data->context);
-         if (err_code != FFX_OK)
-         {
-            printf_s("FSR3: ffxFsr3ContextDestroy failed, error = %d\n", static_cast<int>(err_code));
-         }
-         //custom_data->context = {}; // Probably not very useful
-         memset(&custom_data->context, 0, sizeof(FfxFsr3Context));
-         custom_data->has_context = false;
-
-         free(custom_data->scratch_buffer);
-      }
+      ReleaseResources(custom_data);
 
       err_code = ffxFsr3ContextCreate(&custom_data->context, &context_desc);
       if (err_code != FFX_OK)
@@ -277,6 +276,11 @@ namespace FidelityFX
    bool FidelityFX::FSR::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data)
    {
       auto& custom_data = reinterpret_cast<const FSRInstanceData*&>(data);
+      // No context: "UpdateSettings()" failed or wasn't called since "ReleaseResources()"
+      if (!custom_data->has_context)
+      {
+         return false;
+      }
 
       FfxFsr3DispatchUpscaleDescription dispatch_upscale{};
 

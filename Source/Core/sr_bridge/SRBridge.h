@@ -27,6 +27,8 @@ namespace SRBridge
 
       virtual bool Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter* adapter = nullptr) override;
       virtual void Deinit(SR::InstanceData*& data, ID3D11Device* optional_device = nullptr) override;
+      // Stops the helper (the upscaler's GPU memory) and drops the bridge's copies and references; the next draw starts a new one
+      virtual void ReleaseResources(SR::InstanceData* data) override;
 
       virtual bool UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* command_list, const SR::SettingsData& settings_data) override;
 

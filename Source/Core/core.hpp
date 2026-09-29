@@ -3020,11 +3020,15 @@ namespace
       }
 
 #if ENABLE_SR
-      auto* sr_instance_data = device_data.GetSRInstanceData();
-      if (sr_instance_data)
+      // Every supported type was initialized at device creation, not just the selected one (see "OnInitDevice()")
+      for (auto& [sr_type, sr_instance_data] : device_data.sr_implementations_instances)
       {
-         sr_implementations[device_data.sr_type]->Deinit(sr_instance_data); // NOTE: this could stutter the game on closure as it forces unloading the SR DLL (if it's the last device instance?), but we can't avoid it
+         if (sr_instance_data)
+         {
+            sr_implementations[sr_type]->Deinit(sr_instance_data); // NOTE: this could stutter the game on closure as it forces unloading the SR DLL (if it's the last device instance?), but we can't avoid it
+         }
       }
+      device_data.sr_implementations_instances.clear();
 #endif // ENABLE_SR
 
       // Execute all Luma callbacks.
@@ -14383,6 +14387,8 @@ namespace
                auto* sr_instance_data = device_data.GetSRInstanceData();
                if (sr_instance_data)
                {
+                  // Its own resources (e.g. DLSS's feature, the SR bridge's helper) go, the implementation stays loaded
+                  sr_implementations[device_data.sr_type]->ReleaseResources(sr_instance_data);
 #if 0 // This would actually unload the previously selected SR DLL and all, making the game hitch, so it's better to just keep it in memory, especially because otherwise we need to check for compatibily again and load them again etc
                   sr_implementations[device_data.sr_type]->Deinit(sr_instance_data);
                   sr_instance_data = nullptr;
