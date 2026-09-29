@@ -5684,14 +5684,18 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
-      if (!IsReflexSwapchain(device_data, swapchain))
+      // Final states only update the DEV stats
+      if ((!DEVELOPMENT && device_data.reflex.state > Reflex::State::Running) || !IsReflexSwapchain(device_data, swapchain))
          return;
-      Reflex::Mode mode;
+      // The UI's setting, read without the lock like the other per frame settings
+      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), device_data.reflex, reflex_mode);
+#if DEVELOPMENT
+      if (std::exchange(device_data.reflex.log_due, false))
       {
-         const std::shared_lock lock_reshade(s_mutex_reshade);
-         mode = reflex_mode;
+         const Reflex::LatencyStats& stats = device_data.reflex.latency_stats;
+         reshade::log::message(reshade::log::level::info, std::format("[Reflex] mode {} state {}{}{}: latency {:.2f} ms, GPU {:.2f} ms, GPU frame {:.2f} ms ({} frames, {} markers), Luma sleep {:.2f} ms/frame, driver low latency {} game sleep {}", int(reflex_mode), Reflex::state_names[int(device_data.reflex.state)], device_data.reflex.other_reason ? " - " : "", device_data.reflex.other_reason ? device_data.reflex.other_reason : "", stats.latency_ms, stats.gpu_ms, stats.gpu_frame_ms, stats.frames, stats.other_markers ? "other" : "Luma's", stats.sleep_ms, int(stats.driver_low_latency), int(stats.driver_game_sleep)).c_str());
       }
-      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), device_data.reflex, mode);
+#endif
    }
 #endif
 
@@ -5713,7 +5717,7 @@ namespace
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
 
 #if ENABLE_REFLEX
-      if (IsReflexSwapchain(device_data, swapchain))
+      if (device_data.reflex.markers && IsReflexSwapchain(device_data, swapchain))
          Reflex::OnPresent(native_device, device_data.reflex);
 #endif
 
@@ -14407,30 +14411,62 @@ namespace
             {
                const Reflex::State reflex_state = device_data.reflex.state;
                const char* const reflex_modes[] = {"Off", "On", "On + Boost"};
-               int reflex_mode_i = int(reflex_mode);
-               ImGui::BeginDisabled(reflex_state != Reflex::State::Inactive && reflex_state != Reflex::State::Running);
-               if (ImGui::Combo("NVIDIA Reflex", &reflex_mode_i, reflex_modes, IM_ARRAYSIZE(reflex_modes)))
+               const int reflex_mode_i = int(reflex_mode);
+               // Disabled, it shows who has Reflex instead of Luma's unused mode
+               const char* reflex_preview = reflex_modes[reflex_mode_i];
+               const char* reflex_tooltip = "NVIDIA Reflex reduces system latency and increases PC responsiveness.\n\"On + Boost\" can slightly increase GPU power draw.";
+               switch (reflex_state)
                {
-                  reflex_mode = Reflex::Mode(reflex_mode_i);
-                  reshade::set_config_value(runtime, NAME, "ReflexMode", reflex_mode_i);
+               case Reflex::State::Unsupported:
+                  reflex_preview = "Unsupported";
+                  reflex_tooltip = "Requires an NVIDIA GPU and driver.";
+                  break;
+               case Reflex::State::Other:
+                  reflex_preview = "Handled by the game or a tool";
+                  reflex_tooltip = "The game or another tool (e.g. Display Commander) already runs NVIDIA Reflex, Luma leaves it to them.";
+                  break;
+               case Reflex::State::SmoothMotion:
+                  reflex_preview = "Off (NVIDIA Smooth Motion)";
+                  reflex_tooltip = "Off while NVIDIA Smooth Motion is on for this game: it already turns on the driver's low latency mode itself,\nand NVIDIA Reflex on top of it gains nothing.";
+                  break;
+               default: break;
+               }
+               ImGui::BeginDisabled(reflex_state > Reflex::State::Running);
+               if (ImGui::BeginCombo("NVIDIA Reflex Low Latency", reflex_preview))
+               {
+                  for (int i = 0; i < IM_ARRAYSIZE(reflex_modes); i++)
+                  {
+                     const bool selected = i == reflex_mode_i;
+                     if (ImGui::Selectable(reflex_modes[i], selected))
+                     {
+                        reflex_mode = Reflex::Mode(i);
+                        reshade::set_config_value(runtime, NAME, "ReflexMode", i);
+                     }
+                     if (selected)
+                        ImGui::SetItemDefaultFocus();
+                  }
+                  ImGui::EndCombo();
                }
                ImGui::EndDisabled();
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                  ImGui::SetTooltip("%s", reflex_tooltip);
+#if DEVELOPMENT
+               // The driver's reports, also with Reflex off (Luma then sets markers without the sleep), to compare
+               const Reflex::LatencyStats latency_stats = device_data.reflex.latency_stats;
+               if (latency_stats.frames != 0)
                {
-                  switch (reflex_state)
-                  {
-                  case Reflex::State::Unsupported:
-                     ImGui::SetTooltip("Requires an NVIDIA GPU and driver."); break;
-                  case Reflex::State::Game:
-                     ImGui::SetTooltip("The game already runs NVIDIA Reflex, Luma leaves it to the game."); break;
-                  case Reflex::State::DisplayCommander:
-                     ImGui::SetTooltip("Display Commander is loaded, use its Reflex settings."); break;
-                  default:
-                     ImGui::SetTooltip("Lowers input latency when the GPU limits the frame rate, by not letting the CPU queue frames ahead.\n\"On + Boost\" also keeps the GPU clocks at their maximum."); break;
-                  }
+                  ImGui::Text("Latency:   %6.2f ms (frame start to GPU end)", latency_stats.latency_ms);
+                  ImGui::Text("GPU:       %6.2f ms", latency_stats.gpu_ms);
+                  ImGui::Text("GPU frame: %6.2f ms", latency_stats.gpu_frame_ms);
+                  ImGui::Text("Frames:    %6u (%s markers)", latency_stats.frames, latency_stats.other_markers ? "other" : "Luma's");
+                  ImGui::Text("Sleep:     %6.2f ms (Luma's, per frame)", latency_stats.sleep_ms);
+                  ImGui::Text("Driver:    low latency %d, game sleep %d", int(latency_stats.driver_low_latency), int(latency_stats.driver_game_sleep));
                }
+               else
+                  ImGui::TextUnformatted("Latency: no driver reports");
+#endif
             }
-#endif // ENABLE_NVAPI
+#endif // ENABLE_REFLEX
 
             auto ChangeDisplayMode = [&](DisplayModeType display_mode, bool enable_hdr_on_display = true, IDXGISwapChain3* swapchain = nullptr)
                {
