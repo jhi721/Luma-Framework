@@ -1359,6 +1359,32 @@ void SanitizeNaNs(ID3D11Device* device, ID3D11DeviceContext* device_context, ID3
    }
 }
 
+// Frees "DrawSMAA"'s size dependent intermediates, views included (a view keeps its texture alive); its next draw recreates them
+void ReleaseSMAA(DeviceData& device_data)
+{
+   auto& managed_resources = device_data.managed_resources;
+   managed_resources.depth_stencil_views["smaa_dsv"_h].reset();
+   managed_resources.render_target_views["smaa_edge_detection"_h].reset();
+   managed_resources.shader_resource_views["smaa_edge_detection"_h].reset();
+   managed_resources.render_target_views["smaa_blending_weight_calculation"_h].reset();
+   managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].reset();
+}
+
+// The size of the texture behind a view (0x0 without one)
+uint2 GetViewTextureSize(ID3D11View* view)
+{
+   D3D11_TEXTURE2D_DESC desc = {};
+   ComPtr<ID3D11Resource> resource;
+   ComPtr<ID3D11Texture2D> texture;
+   if (view)
+   {
+      view->GetResource(resource.put());
+      if (SUCCEEDED(resource->QueryInterface(texture.put())))
+         texture->GetDesc(&desc);
+   }
+   return uint2{desc.Width, desc.Height};
+}
+
 void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11RenderTargetView* rtv, ID3D11ShaderResourceView* srv_color_tex, ID3D11ShaderResourceView* srv_color_tex_gamma, ID3D11ShaderResourceView* srv_predication_tex = nullptr)
 {
    auto& managed_resources = device_data.managed_resources;
@@ -1412,6 +1438,12 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    ensure(resource->QueryInterface(tex.put()), >= 0);
    D3D11_TEXTURE2D_DESC tex_desc;
    tex->GetDesc(&tex_desc);
+
+   // A new size without a swapchain change (e.g. the render resolution): the intermediates are recreated at it
+   if (ID3D11View* edges = managed_resources.render_target_views["smaa_edge_detection"_h].get(); edges && GetViewTextureSize(edges) != uint2{tex_desc.Width, tex_desc.Height})
+   {
+      ReleaseSMAA(device_data);
+   }
 
    // EdgeDetection pass
    //
@@ -1526,6 +1558,7 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    [[unlikely]] if (!managed_resources.render_target_views["smaa_blending_weight_calculation"_h])
    {
       tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; // Not left to the branches above, which might not have run
       ensure(device->CreateTexture2D(&tex_desc, nullptr, tex.put()), >= 0);
       ensure(device->CreateRenderTargetView(tex.get(), nullptr, managed_resources.render_target_views["smaa_blending_weight_calculation"_h].put()), >= 0);
       ensure(device->CreateShaderResourceView(tex.get(), nullptr, managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].put()), >= 0); 
@@ -1560,11 +1593,9 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
 
    // Reset resolution dependent resources on init swapchain.
    // Some are intentionaly left out, we will recreate them here (in the DrawSMAA function).
-   auto on_init_swapchain = [&]()
+   auto on_init_swapchain = [&device_data]()
    {
-      managed_resources.depth_stencil_views["smaa_dsv"_h].reset();
-      managed_resources.render_target_views["smaa_edge_detection"_h].reset();
-      managed_resources.render_target_views["smaa_blending_weight_calculation"_h].reset();
+      ReleaseSMAA(device_data);
    };
 
    LumaCallbacks::on_init_swapchain.try_emplace("luma_smaa"_h, on_init_swapchain);
@@ -1588,6 +1619,13 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    release_com_array(ps_srvs_original);
 }
 
+// Frees "DrawKarisAverage"'s output, both views (e.g. while a game's bloom is off); its next draw recreates it
+void ReleaseKarisAverage(DeviceData& device_data)
+{
+   device_data.managed_resources.unordered_access_views["luma_karis_average"_h].reset();
+   device_data.managed_resources.shader_resource_views["luma_karis_average"_h].reset();
+}
+
 void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_source, ID3D11ShaderResourceView** srv_out)
 {
    auto& managed_resources = device_data.managed_resources;
@@ -1607,6 +1645,12 @@ void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context,
    ensure(resource->QueryInterface(tex.put()), >= 0);
    D3D11_TEXTURE2D_DESC tex_desc;
    tex->GetDesc(&tex_desc);
+
+   // A new source size (e.g. the render resolution): recreated at it
+   if (ID3D11View* output = managed_resources.unordered_access_views["luma_karis_average"_h].get(); output && GetViewTextureSize(output) != uint2{tex_desc.Width, tex_desc.Height})
+   {
+      ReleaseKarisAverage(device_data);
+   }
 
    // Create RT and views.
    if (!managed_resources.unordered_access_views["luma_karis_average"_h])
@@ -1639,9 +1683,9 @@ void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context,
 
    // Reset resolution dependent resources on init swapchain.
    // Some are intentioanlly left out, we will recreate/reset them here.
-   auto on_init_swapchain = [&]()
+   auto on_init_swapchain = [&device_data]()
    {
-      managed_resources.unordered_access_views["luma_karis_average"_h].reset();
+      ReleaseKarisAverage(device_data);
    };
 
    LumaCallbacks::on_init_swapchain.try_emplace("luma_karis_average"_h, on_init_swapchain);
