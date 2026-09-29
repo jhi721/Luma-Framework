@@ -403,6 +403,7 @@ namespace
    uint32_t g_final_perm = 0;
    uint32_t g_finals_this_frame = 0;
    uint32_t g_finals_last_frame = 0;
+   uint32_t g_mv_tiebreak_collisions_last_frame = 0; // See "PatchedDraws::CountTieBreakCollisions"
 #endif
 } // namespace
 
@@ -1209,6 +1210,10 @@ class SaintsRowIV final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
          // two frames go
          game_device_data.mv_previous_objects.swap(game_device_data.mv_objects);
+#if DEVELOPMENT
+         g_mv_tiebreak_collisions_last_frame = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
+            { return PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones); });
+#endif
          std::erase_if(game_device_data.mv_objects, [](const auto& entry)
             { return entry.second.empty(); });
          for (auto& entry : game_device_data.mv_objects)
@@ -2551,7 +2556,7 @@ public:
       // For the MCP "luma_dev_values" tool (the counters are the last complete frame's)
       Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter}});
       Mcp::RegisterCounters({{"msaa_resolves", &g_msaa_resolves_last_frame}, {"finals", &g_finals_last_frame}, {"pixel_steps_overrides", &g_pixel_steps_overrides_last_frame},
-         {"sub_rect_draws", &g_sub_rect_draws_last_frame}});
+         {"sub_rect_draws", &g_sub_rect_draws_last_frame}, {"mv.tiebreak_collisions", &g_mv_tiebreak_collisions_last_frame}});
       Mcp::RegisterToggles({{"luma_msaa_enable", &g_luma_msaa_enable}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_edges_debug", &g_smaa_edges_debug},
          {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, {"perf_hook_timers", &g_perf_hook_timers}});
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"render_scale", &g_render_scale, min_render_scale, 1.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
