@@ -157,6 +157,9 @@ namespace SR
 	class SuperResolutionImpl
 	{
 	public:
+		// The implementations are owned and deleted through this base.
+		// A new virtual must also be forwarded by the DEVELOPMENT MCP wrapper ("Mcp::SrTap"), or it silently gets the defaults below there.
+		virtual ~SuperResolutionImpl() = default;
 		virtual bool HasInit(const InstanceData* data) const { return false; }
 		// Needs init to be called first
 		virtual bool IsSupported(const InstanceData* data) const { return false; }

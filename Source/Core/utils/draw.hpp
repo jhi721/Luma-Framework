@@ -431,23 +431,19 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
       assert(cached_shader);
       if (pipeline->HasPixelShader())
       {
-         UINT scissor_viewport_num = 0;
-         native_device_context->RSGetScissorRects(&scissor_viewport_num, nullptr); // This will get the number of scissor rects used
-         UINT scissor_viewport_num_max = min(scissor_viewport_num, 1);
-         D3D11_RECT scissor_rects;
-         native_device_context->RSGetScissorRects(&scissor_viewport_num_max, &scissor_rects); // This is useless
-         if (scissor_viewport_num_max >= 1)
-         {
-            trace_draw_call_data.scissors = true;
-         }
+         // The first call gets the number of bound rects/viewports
+         native_device_context->RSGetScissorRects(&trace_draw_call_data.scissor_count, nullptr);
+         native_device_context->RSGetScissorRects(&trace_draw_call_data.scissor_count, trace_draw_call_data.scissor_rects);
 
-         native_device_context->RSGetViewports(&scissor_viewport_num, nullptr); // This will get the number of viewports used
-         scissor_viewport_num_max = min(scissor_viewport_num, 1);
-         D3D11_VIEWPORT viewport;
-         native_device_context->RSGetViewports(&scissor_viewport_num_max, &viewport);
-         if (scissor_viewport_num_max >= 1)
+         native_device_context->RSGetViewports(&trace_draw_call_data.viewport_count, nullptr);
+         native_device_context->RSGetViewports(&trace_draw_call_data.viewport_count, trace_draw_call_data.viewports);
+
+         com_ptr<ID3D11RasterizerState> rasterizer_state;
+         native_device_context->RSGetState(&rasterizer_state);
+         trace_draw_call_data.has_rasterizer_state = rasterizer_state.get() != nullptr;
+         if (rasterizer_state)
          {
-            trace_draw_call_data.viewport_0 = { viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height };
+            rasterizer_state->GetDesc(&trace_draw_call_data.rasterizer_desc);
          }
 
          com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -459,10 +455,13 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
          com_ptr<ID3D11DepthStencilState> depth_stencil_state;
          UINT stencil_ref;
          native_device_context->OMGetDepthStencilState(&depth_stencil_state, &stencil_ref);
+         trace_draw_call_data.stencil_ref = stencil_ref;
          if (depth_stencil_state)
          {
             D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
             depth_stencil_state->GetDesc(&depth_stencil_desc);
+            trace_draw_call_data.has_depth_stencil_state = true;
+            trace_draw_call_data.depth_stencil_desc = depth_stencil_desc;
 
             D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
             if (dsv.get())
@@ -1667,23 +1666,23 @@ static struct
    UINT last_scene_width = 0;
    UINT last_scene_height = 0;
    int last_nmips = -1;
-} bloom_mips;
+} draw_bloom_mips;
 
 // Frees "DrawBloom"'s mip chains (e.g. while a game's bloom is off); its next draw rebuilds them
 void ReleaseBloom()
 {
-   ResetCOMArray(bloom_mips.rtv_mips_x);
-   ResetCOMArray(bloom_mips.srv_mips_x);
-   ResetCOMArray(bloom_mips.rtv_mips_y);
-   ResetCOMArray(bloom_mips.srv_mips_y);
-   bloom_mips.last_nmips = -1;
+   ResetCOMArray(draw_bloom_mips.rtv_mips_x);
+   ResetCOMArray(draw_bloom_mips.srv_mips_x);
+   ResetCOMArray(draw_bloom_mips.rtv_mips_y);
+   ResetCOMArray(draw_bloom_mips.srv_mips_y);
+   draw_bloom_mips.last_nmips = -1;
 }
 
 void DrawBloom(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_scene, int nmips, const float* sigmas, ID3D11ShaderResourceView** srv_bloom)
 {
    auto& managed_resources = device_data.managed_resources;
 
-   auto& [rtv_mips_x, srv_mips_x, rtv_mips_y, srv_mips_y, last_scene_width, last_scene_height, last_nmips] = bloom_mips;
+   auto& [rtv_mips_x, srv_mips_x, rtv_mips_y, srv_mips_y, last_scene_width, last_scene_height, last_nmips] = draw_bloom_mips;
 
    // Backup IA.
    D3D11_PRIMITIVE_TOPOLOGY primitive_topology_original;
