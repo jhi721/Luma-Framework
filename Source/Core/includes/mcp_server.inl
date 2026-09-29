@@ -2004,9 +2004,31 @@ namespace Mcp
 
    void ServerThread()
    {
+      // The default pipe security of an elevated game (e.g. a "Run as administrator" compatibility flag) has a high integrity label and no
+      // write access for its user, so a non elevated bridge couldn't talk to it: grant the game's user and lower the label to medium
+      std::wstring sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+      HANDLE token = nullptr;
+      if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+      {
+         alignas(TOKEN_USER) BYTE token_user[256];
+         DWORD size = 0;
+         LPWSTR user_sid = nullptr;
+         if (GetTokenInformation(token, TokenUser, token_user, sizeof(token_user), &size) && ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(token_user)->User.Sid, &user_sid))
+         {
+            sddl += std::format(L"(A;;GA;;;{})", user_sid);
+            LocalFree(user_sid);
+         }
+         CloseHandle(token);
+      }
+      sddl += L"S:(ML;;NW;;;ME)";
+      SECURITY_ATTRIBUTES security_attributes = {sizeof(SECURITY_ATTRIBUTES)};
+      if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &security_attributes.lpSecurityDescriptor, nullptr))
+         security_attributes.lpSecurityDescriptor = nullptr;
+
       while (!server_stop)
       {
-         HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, nullptr);
+         HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0,
+            security_attributes.lpSecurityDescriptor ? &security_attributes : nullptr);
          if (pipe == INVALID_HANDLE_VALUE)
          {
             Sleep(1000);
@@ -2057,6 +2079,7 @@ namespace Mcp
          DisconnectNamedPipe(pipe);
          CloseHandle(pipe);
       }
+      LocalFree(security_attributes.lpSecurityDescriptor);
       server_running = false;
    }
 

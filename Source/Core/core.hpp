@@ -26,6 +26,7 @@
 #pragma comment(lib, "Gdi32.lib") // For "SetDeviceGammaRamp"
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "Dxva2.lib")   // For "SetMonitorBrightness"
+#pragma comment(lib, "Advapi32.lib") // For the MCP pipe's security descriptor
 
 #define _USE_MATH_DEFINES
 
@@ -38,6 +39,7 @@
 #include <dxgi.h>
 #include <dxgi1_6.h>
 #include <Windows.h>
+#include <sddl.h>
 #include <HighLevelMonitorConfigurationAPI.h> // For "SetMonitorBrightness"
 
 #include <cstdio>
