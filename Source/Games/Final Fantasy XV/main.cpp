@@ -163,6 +163,13 @@ public:
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"enable_directional_shadows", &enable_directional_shadows}});
+#if ENABLE_BLOOM
+      Mcp::RegisterToggles({{"luma_bloom_enable", &g_luma_bloom_enable}});
+#endif
+#endif
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('1');
       GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('0');
