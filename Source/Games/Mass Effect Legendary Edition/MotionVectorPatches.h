@@ -1,6 +1,5 @@
 #pragma once
 
-#include <bit>
 #include <utility>
 
 #include "..\..\Core\includes\motion_vector_patch.h"
