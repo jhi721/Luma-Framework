@@ -1190,7 +1190,7 @@ class BorderlandsGoty final : public Game
             game_device_data.mv_stats.matched++;
 #endif
          }
-         else if (game_device_data.mv_previous_camera && copy_size(game_device_data.mv_previous_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0)
+         else if (game_device_data.mv_previous_camera && copy_size(game_device_data.mv_previous_camera) == camera->size() && (camera == game_device_data.mv_camera || std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0))
          {
             // Not found, drawn with the world camera: its own constants with last frame's world camera (camera motion only)
             uploads[1] = game_device_data.mv_previous_camera.get();
