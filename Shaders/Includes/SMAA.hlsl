@@ -1249,6 +1249,11 @@ float4 SMAABlendingWeightCalculationPS(float2 texcoord,
 //-----------------------------------------------------------------------------
 // Neighborhood Blending Pixel Shader (Third Pass)
 
+// Luma: the color fetch, overridable (e.g. to filter a gamma encoded colorTex in linear light by hand)
+#ifndef SMAA_NEIGHBORHOOD_SAMPLE
+#define SMAA_NEIGHBORHOOD_SAMPLE(tex, coord) SMAASampleLevelZero(tex, coord)
+#endif
+
 float4 SMAANeighborhoodBlendingPS(float2 texcoord,
                                   float4 offset,
                                   SMAATexture2D(colorTex),
@@ -1266,7 +1271,7 @@ float4 SMAANeighborhoodBlendingPS(float2 texcoord,
     // Is there any blending weight with a value greater than 0.0?
     SMAA_BRANCH
     if (dot(a, float4(1.0, 1.0, 1.0, 1.0)) < 1e-5) {
-        float4 color = SMAASampleLevelZero(colorTex, texcoord);
+        float4 color = SMAA_NEIGHBORHOOD_SAMPLE(colorTex, texcoord);
 
         #if SMAA_REPROJECTION
         float2 velocity = SMAA_DECODE_VELOCITY(SMAASampleLevelZero(velocityTex, texcoord));
@@ -1291,8 +1296,8 @@ float4 SMAANeighborhoodBlendingPS(float2 texcoord,
 
         // We exploit bilinear filtering to mix current pixel with the chosen
         // neighbor:
-        float4 color = blendingWeight.x * SMAASampleLevelZero(colorTex, blendingCoord.xy);
-        color += blendingWeight.y * SMAASampleLevelZero(colorTex, blendingCoord.zw);
+        float4 color = blendingWeight.x * SMAA_NEIGHBORHOOD_SAMPLE(colorTex, blendingCoord.xy);
+        color += blendingWeight.y * SMAA_NEIGHBORHOOD_SAMPLE(colorTex, blendingCoord.zw);
 
         #if SMAA_REPROJECTION
         // Antialias velocity for proper reprojection in a later stage:
