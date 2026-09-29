@@ -6,15 +6,18 @@
 // (Source/Tools/SR Bridge Helper), which runs DLSS or FSR 3 (both x64 only) on NT-handle shared textures between two shared fences.
 // Text lines over the helper's stdin, its stdout and stderr go to "Luma-Upscaler.log" next to the exe.
 //
-// Start line: "bridge <version> <upscaler> <luid low> <luid high> <render width> <render height> <output width> <output height>
-//   <hdr> <inverted depth> <jittered motion vectors> <auto exposure> <dynamic resolution> <motion vector scale x> <motion vector scale y>
-//   <DLSS render preset> <a handle per "Resource" (0: none)> <fence in> <fence out>"
+// Settings: "<render width> <render height> <output width> <output height> <hdr> <inverted depth> <jittered motion vectors>
+//   <auto exposure> <dynamic resolution> <motion vector scale x> <motion vector scale y> <DLSS render preset>"
+// Start line: "bridge <version> <upscaler> <luid low> <luid high> <settings> <a handle per "Resource" (0: none)> <fence in> <fence out>"
 // The helper signals "out" at "kReady" once the upscaler exists (it exits if it can't create it).
-// Frame line: "<n> <jitter x> <jitter y> <reset> <render width> <render height> <pre exposure> <sharpness> <near> <far>
-//   <vertical fov>": the helper waits for "in" n, upscales and signals "out" n (n past "kReady"). EOF ends it.
+// Then a line per message:
+// "settings <settings>": the helper recreates the upscaler on the same textures (it exits if it can't).
+// "frame <n> <jitter x> <jitter y> <reset> <render width> <render height> <pre exposure> <sharpness> <near> <far> <vertical fov>":
+//   the helper waits for "in" n, upscales and signals "out" n (n past "kReady").
+// EOF ends it.
 namespace SRBridgeProtocol
 {
-   constexpr int kVersion = 2;
+   constexpr int kVersion = 3;
 
    constexpr const wchar_t* kHelperName = L"Luma-Upscaler.exe";
    constexpr const wchar_t* kLogName = L"Luma-Upscaler.log";

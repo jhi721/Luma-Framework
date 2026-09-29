@@ -32,6 +32,14 @@ namespace SRBridge
 
       // Before trying again after the helper failed, so a game that keeps drawing doesn't start one per frame
       constexpr auto retry_delay = std::chrono::seconds(2);
+
+      // The protocol's "<settings>"
+      std::string FormatSettings(const SR::SettingsData& settings)
+      {
+         return std::format("{} {} {} {} {} {} {} {} {} {} {} {}", settings.render_width, settings.render_height, settings.output_width, settings.output_height,
+            int(settings.hdr), int(settings.inverted_depth), int(settings.mvs_jittered), int(settings.auto_exposure), int(settings.dynamic_resolution), settings.mvs_x_scale,
+            settings.mvs_y_scale, settings.render_preset);
+      }
    } // namespace
 
    struct BridgeInstanceData : public SR::InstanceData
@@ -51,6 +59,7 @@ namespace SRBridge
       bool copied[kCount] = {};
       uint64_t frame = 0;
       bool ready = false;
+      bool settings_pending = false; // Changed since the helper started: sent before the next frame
 
       bool failed = false;
       std::chrono::steady_clock::time_point failure_time;
@@ -90,6 +99,7 @@ namespace SRBridge
       }
       frame = 0;
       ready = false;
+      settings_pending = false;
       if (running == this)
          running = nullptr;
    }
@@ -195,9 +205,8 @@ namespace SRBridge
          return fail(std::format("the helper couldn't start (error {}): {}", error, helper_path.string()));
 
       const SR::SettingsData& settings = settings_data;
-      std::string message = std::format("bridge {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}", kVersion, type == SR::Type::DLSS ? int(kDlss) : int(kFsr), luid.LowPart,
-         luid.HighPart, settings.render_width, settings.render_height, settings.output_width, settings.output_height, int(settings.hdr), int(settings.inverted_depth),
-         int(settings.mvs_jittered), int(settings.auto_exposure), int(settings.dynamic_resolution), settings.mvs_x_scale, settings.mvs_y_scale, settings.render_preset);
+      std::string message =
+         std::format("bridge {} {} {} {} {}", kVersion, type == SR::Type::DLSS ? int(kDlss) : int(kFsr), luid.LowPart, luid.HighPart, FormatSettings(settings));
       for (HANDLE handle : handles)
       {
          HANDLE remote = nullptr;
@@ -261,7 +270,7 @@ namespace SRBridge
       data = nullptr;
    }
 
-   // The helper (re)starts on the next draw with these
+   // The helper starts on the next draw with these, or a running one recreates the upscaler with them
    bool Bridge::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* command_list, const SR::SettingsData& settings_data)
    {
       auto* const custom_data = static_cast<BridgeInstanceData*>(data);
@@ -269,8 +278,8 @@ namespace SRBridge
          return false;
       if (settings_data == custom_data->settings_data)
          return !custom_data->failed;
-      custom_data->Stop();
       custom_data->settings_data = settings_data;
+      custom_data->settings_pending = custom_data->process != nullptr;
       custom_data->failed = false;
       return true;
    }
@@ -296,6 +305,17 @@ namespace SRBridge
       }
       if (!custom_data.process && !custom_data.Start(command_list, resources))
          return false;
+      if (custom_data.settings_pending)
+      {
+         // Buffered by the pipe while it's still starting
+         const std::string line = "settings " + FormatSettings(custom_data.settings_data) + "\n";
+         DWORD written = 0;
+         if (!WriteFile(custom_data.pipe, line.data(), DWORD(line.size()), &written, nullptr))
+            return custom_data.Fail("the helper's pipe broke");
+         custom_data.settings_pending = false;
+         Log(reshade::log::level::info, std::format("new settings for the helper ({}x{} -> {}x{})", custom_data.settings_data.render_width,
+                                           custom_data.settings_data.render_height, custom_data.settings_data.output_width, custom_data.settings_data.output_height));
+      }
 
       if (!custom_data.ready)
       {
@@ -327,7 +347,7 @@ namespace SRBridge
       const uint64_t frame = ++custom_data.frame;
       custom_data.context->Signal(custom_data.fences[0].Get(), frame);
       command_list->Flush();
-      const std::string line = std::format("{} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0,
+      const std::string line = std::format("frame {} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0,
          draw_data.render_width ? draw_data.render_width : custom_data.settings_data.render_width,
          draw_data.render_height ? draw_data.render_height : custom_data.settings_data.render_height, draw_data.pre_exposure, draw_data.user_sharpness,
          draw_data.near_plane, draw_data.far_plane, draw_data.vert_fov);
