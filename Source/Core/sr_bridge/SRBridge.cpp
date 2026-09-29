@@ -53,8 +53,9 @@ namespace SRBridge
       HANDLE process = nullptr;
       HANDLE pipe = nullptr; // Its stdin
       ComPtr<ID3D11DeviceContext4> context;
-      ComPtr<ID3D11Fence> fences[2];          // "in": a frame's inputs copied, "out": its output written (first "kReady")
-      ID3D11Resource* sources[kCount] = {};   // The game's resources it was started for (compared only)
+      ComPtr<ID3D11Fence> fences[2]; // "in": a frame's inputs copied, "out": its output written (first "kReady")
+      // The game's resources it was started for (compared only). Referenced, so a recreated one (e.g. at a new size) can't reuse the address
+      ComPtr<ID3D11Resource> sources[kCount];
       ComPtr<ID3D11Texture2D> shared[kCount]; // What it opened: the game's own when NT-handle shared already, else copies
       bool copied[kCount] = {};
       uint64_t frame = 0;
@@ -93,7 +94,7 @@ namespace SRBridge
          fence.Reset();
       for (int i = 0; i < kCount; i++)
       {
-         sources[i] = nullptr;
+         sources[i].Reset();
          shared[i].Reset();
          copied[i] = false;
       }
@@ -300,22 +301,12 @@ namespace SRBridge
          // A dead process's fences read UINT64_MAX, so no GPU wait is left hanging
          if (WaitForSingleObject(custom_data.process, 0) == WAIT_OBJECT_0 || custom_data.fences[1]->GetCompletedValue() == UINT64_MAX)
             return custom_data.Fail("the helper exited (see Luma-Upscaler.log next to the game's exe)");
-         if (!std::equal(std::begin(resources), std::end(resources), std::begin(custom_data.sources)))
+         if (!std::equal(std::begin(resources), std::end(resources), std::begin(custom_data.sources), [](ID3D11Resource* resource, const ComPtr<ID3D11Resource>& source)
+                { return resource == source.Get(); }))
             custom_data.Stop(); // Recreated: the helper restarts on them
       }
       if (!custom_data.process && !custom_data.Start(command_list, resources))
          return false;
-      if (custom_data.settings_pending)
-      {
-         // Buffered by the pipe while it's still starting
-         const std::string line = "settings " + FormatSettings(custom_data.settings_data) + "\n";
-         DWORD written = 0;
-         if (!WriteFile(custom_data.pipe, line.data(), DWORD(line.size()), &written, nullptr))
-            return custom_data.Fail("the helper's pipe broke");
-         custom_data.settings_pending = false;
-         Log(reshade::log::level::info, std::format("new settings for the helper ({}x{} -> {}x{})", custom_data.settings_data.render_width,
-                                           custom_data.settings_data.render_height, custom_data.settings_data.output_width, custom_data.settings_data.output_height));
-      }
 
       if (!custom_data.ready)
       {
@@ -337,6 +328,17 @@ namespace SRBridge
          custom_data.ready = true;
          custom_data.frame = kReady;
          Log(reshade::log::level::info, custom_data.type == SR::Type::DLSS ? "running DLSS" : "running FSR 3");
+      }
+      if (custom_data.settings_pending)
+      {
+         // Once ready, so changes while it's starting become one
+         const std::string line = "settings " + FormatSettings(custom_data.settings_data) + "\n";
+         DWORD written = 0;
+         if (!WriteFile(custom_data.pipe, line.data(), DWORD(line.size()), &written, nullptr))
+            return custom_data.Fail("the helper's pipe broke");
+         custom_data.settings_pending = false;
+         Log(reshade::log::level::info, std::format("new settings for the helper ({}x{} -> {}x{})", custom_data.settings_data.render_width,
+                                           custom_data.settings_data.render_height, custom_data.settings_data.output_width, custom_data.settings_data.output_height));
       }
 
       for (int i = 0; i < kCount; i++)
