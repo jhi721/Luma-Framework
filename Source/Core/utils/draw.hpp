@@ -429,6 +429,9 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
       const auto pipeline = pipeline_pair->second;
       const CachedShader* cached_shader = (!pipeline->shader_hashes.empty() && shader_cache.contains(pipeline->shader_hashes[0])) ? shader_cache[pipeline->shader_hashes[0]] : nullptr; // DX10/11 exclusive behaviour
       assert(cached_shader);
+      trace_draw_call_data.draw_dispatch_data = draw_dispatch_data;
+      if (!pipeline->HasComputeShader())
+         native_device_context->IAGetPrimitiveTopology(&trace_draw_call_data.primitive_topology);
       if (pipeline->HasPixelShader())
       {
          // The first call gets the number of bound rects/viewports
@@ -721,8 +724,6 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
             }
          }
 
-         trace_draw_call_data.draw_dispatch_data = draw_dispatch_data;
-
          com_ptr<ID3D11Buffer> index_buffer;
          native_device_context->IAGetIndexBuffer(&index_buffer, &trace_draw_call_data.index_buffer_format, &trace_draw_call_data.index_buffer_offset);
          com_ptr<ID3D11InputLayout> input_layout;
@@ -743,8 +744,6 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
                trace_draw_call_data.vertex_buffer_hashes.push_back(std::to_string(std::hash<void*>{}(vertex_buffer.get())));
             }
          }
-
-         native_device_context->IAGetPrimitiveTopology(&trace_draw_call_data.primitive_topology);
 
          com_ptr<ID3D11Buffer> cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
          UINT cbs_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
@@ -827,8 +826,6 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
                trace_draw_call_data.uav_size[i] = GetTextureMipSize(base_size, trace_draw_call_data.uav_mip[i]);
             }
          }
-
-         trace_draw_call_data.draw_dispatch_data = draw_dispatch_data;
 
          com_ptr<ID3D11Buffer> cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
          UINT cbs_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
