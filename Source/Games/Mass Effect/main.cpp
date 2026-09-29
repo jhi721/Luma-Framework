@@ -2080,7 +2080,6 @@ class MassEffect final : public Game
          native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
       // Not while the bridge's helper starts (the color copied as it is): SMAA stays on and the next frame resets
       device_data.has_drawn_sr = sr_implementations[device_data.sr_type]->IsReady(sr_instance_data);
-      device_data.has_drawn_main_post_processing = true; // Core's upscaler status icon
       return true;
    }
 
