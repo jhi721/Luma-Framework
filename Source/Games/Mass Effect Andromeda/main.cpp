@@ -450,6 +450,11 @@ public: // OnMapBufferRegion is referenced from DllMain (DLL_PROCESS_DETACH unre
 
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}});
+      Mcp::RegisterValues({{"smaa_sharpness", &g_smaa_sharpness, 0.f, 1.f}});
+#endif
       // DLAA-only: we replace no shaders and upload no Luma CBs → disable all three (-1 = unused).
       luma_settings_cbuffer_index = -1;
       luma_data_cbuffer_index = -1;
