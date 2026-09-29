@@ -33,6 +33,13 @@ namespace
       int render_preset = 0;
    };
 
+   // The protocol's "<settings>"
+   std::istream& operator>>(std::istream& stream, Settings& settings)
+   {
+      return stream >> settings.render_width >> settings.render_height >> settings.output_width >> settings.output_height >> settings.hdr >> settings.inverted_depth >>
+             settings.mvs_jittered >> settings.auto_exposure >> settings.dynamic_resolution >> settings.mvs_x_scale >> settings.mvs_y_scale >> settings.render_preset;
+   }
+
    struct Frame
    {
       uint64_t n = 0;
@@ -54,10 +61,9 @@ namespace
       NVSDK_NGX_Handle* feature = nullptr;
       Settings settings;
 
-      bool Create(ID3D11Device* device_, ID3D11DeviceContext* context, const Settings& settings_)
+      bool Init(ID3D11Device* device_)
       {
-         settings = settings_;
-         NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", L".", device_);
+         const NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", L".", device_);
          if (NVSDK_NGX_FAILED(result))
             return printf("[Luma Upscaler] NGX init 0x%08X\n", unsigned(result)), false;
          device = device_;
@@ -67,6 +73,14 @@ namespace
             capabilities->Get(NVSDK_NGX_EParameter_SuperSampling_Available, &available);
          if (!available)
             return printf("[Luma Upscaler] DLSS not available\n"), false;
+         return true;
+      }
+
+      // Replaces the previous feature
+      bool CreateFeature(ID3D11DeviceContext* context, const Settings& settings_)
+      {
+         settings = settings_;
+         ReleaseFeature();
 
          // The mode whose optimal render resolution matches, else the closest one in range
          int quality = NVSDK_NGX_PerfQuality_Value_Balanced;
@@ -116,7 +130,7 @@ namespace
          create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | (settings.inverted_depth ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0) |
                                        (settings.mvs_jittered ? NVSDK_NGX_DLSS_Feature_Flags_MVJittered : 0) |
                                        (settings.auto_exposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0) | (settings.hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0);
-         result = NGX_D3D11_CREATE_DLSS_EXT(context, &feature, parameters, &create);
+         NVSDK_NGX_Result result = NGX_D3D11_CREATE_DLSS_EXT(context, &feature, parameters, &create);
          if (NVSDK_NGX_FAILED(result))
          {
             // The quality mode can be refused (only the resolutions matter): the default preset and Balanced
@@ -149,12 +163,19 @@ namespace
          return NVSDK_NGX_SUCCEED(NGX_D3D11_EVALUATE_DLSS_EXT(context, feature, parameters, &evaluate));
       }
 
-      ~Dlss()
+      void ReleaseFeature()
       {
          if (feature)
             NVSDK_NGX_D3D11_ReleaseFeature(feature);
          if (parameters)
             NVSDK_NGX_D3D11_DestroyParameters(parameters);
+         feature = nullptr;
+         parameters = nullptr;
+      }
+
+      ~Dlss()
+      {
+         ReleaseFeature();
          if (capabilities)
             NVSDK_NGX_D3D11_DestroyParameters(capabilities);
          if (device)
@@ -170,9 +191,14 @@ namespace
       bool created = false;
       Settings settings;
 
+      // Replaces the previous context
       bool Create(ID3D11Device* device, const Settings& settings_)
       {
          settings = settings_;
+         if (created)
+            ffxFsr3ContextDestroy(&context);
+         context = {};
+         created = false;
          scratch.resize(ffxGetScratchMemorySizeDX11(1));
          FfxFsr3ContextDescription create = {};
          FfxErrorCode result = ffxGetInterfaceDX11(&create.backendInterfaceUpscaling, ffxGetDeviceDX11(device), scratch.data(), scratch.size(), 1);
@@ -264,9 +290,7 @@ int main()
    std::cin >> mode >> version;
    if (mode != "bridge" || version != kVersion)
       return printf("[Luma Upscaler] FAIL protocol \"%s\" %d, expected \"bridge\" %d\n", mode.c_str(), version, kVersion), 1;
-   std::cin >> settings.upscaler >> luid.LowPart >> luid.HighPart >> settings.render_width >> settings.render_height >> settings.output_width >> settings.output_height >>
-      settings.hdr >> settings.inverted_depth >> settings.mvs_jittered >> settings.auto_exposure >> settings.dynamic_resolution >> settings.mvs_x_scale >>
-      settings.mvs_y_scale >> settings.render_preset;
+   std::cin >> settings.upscaler >> luid.LowPart >> luid.HighPart >> settings;
    for (uint64_t& handle : handles)
       std::cin >> handle;
    std::cin >> fence_handles[0] >> fence_handles[1];
@@ -304,7 +328,7 @@ int main()
    if (settings.upscaler == kDlss)
    {
       dlss = std::make_unique<Dlss>();
-      if (!dlss->Create(device.Get(), context.Get(), settings))
+      if (!dlss->Init(device.Get()) || !dlss->CreateFeature(context.Get(), settings))
          return 1;
    }
    else
@@ -320,9 +344,23 @@ int main()
 
    Frame frame;
    uint32_t frames = 0, failures = 0;
-   while (std::cin >> frame.n >> frame.jitter_x >> frame.jitter_y >> frame.reset >> frame.render_width >> frame.render_height >> frame.pre_exposure >> frame.sharpness >>
-          frame.near_plane >> frame.far_plane >> frame.vert_fov)
+   std::string message;
+   while (std::cin >> message)
    {
+      if (message == "settings")
+      {
+         if (!(std::cin >> settings))
+            return printf("[Luma Upscaler] FAIL bad settings line\n"), 1;
+         if (dlss ? !dlss->CreateFeature(context.Get(), settings) : !fsr->Create(device.Get(), settings))
+            return 1;
+         printf("[Luma Upscaler] recreated: %ux%u -> %ux%u, preset %d\n", settings.render_width, settings.render_height, settings.output_width, settings.output_height,
+            settings.render_preset);
+         fflush(stdout);
+         continue;
+      }
+      if (message != "frame" || !(std::cin >> frame.n >> frame.jitter_x >> frame.jitter_y >> frame.reset >> frame.render_width >> frame.render_height >> frame.pre_exposure >>
+                                   frame.sharpness >> frame.near_plane >> frame.far_plane >> frame.vert_fov))
+         return printf("[Luma Upscaler] FAIL bad line \"%s\"\n", message.c_str()), 1;
       context4->Wait(fence_in.Get(), frame.n);
       const bool drawn = dlss ? dlss->Evaluate(context.Get(), raw, frame) : fsr->Evaluate(context.Get(), raw, frame);
       context4->Signal(fence_out.Get(), frame.n);
