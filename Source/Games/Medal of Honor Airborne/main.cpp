@@ -843,14 +843,11 @@ public:
       // --- Feature-off releases: give the address space back here rather than in the ImGui handler, so it happens on
       // the render thread, never while a frame is mid-flight ---
 #if ENABLE_BLOOM
-      // Only core's DrawKarisAverage output is reachable: full-res fp16, ~66 MB at 4K, and core drops only its UAV,
-      // only on swapchain init, so both views go here. Unconditional while off: resetting empty entries is two map
-      // lookups.
+      // Only core's DrawKarisAverage output is reachable: full-res fp16, ~66 MB at 4K. Unconditional while off: resetting
+      // empty entries is two map lookups.
       if (!g_luma_bloom_enable)
       {
-         auto& mr = device_data.managed_resources;
-         mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
-         mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
+         ReleaseKarisAverage(device_data);
       }
 #endif
 #if ENABLE_SMAA

@@ -1573,6 +1573,7 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    [[unlikely]] if (!managed_resources.render_target_views["smaa_blending_weight_calculation"_h])
    {
       tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; // Not left to the branches above, which might not have run
       ensure(device->CreateTexture2D(&tex_desc, nullptr, tex.put()), >= 0);
       ensure(device->CreateRenderTargetView(tex.get(), nullptr, managed_resources.render_target_views["smaa_blending_weight_calculation"_h].put()), >= 0);
       ensure(device->CreateShaderResourceView(tex.get(), nullptr, managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].put()), >= 0); 
@@ -1676,6 +1677,13 @@ void DrawRCAS(ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D
 }
 #endif // ENABLE_RCAS
 
+// Frees "DrawKarisAverage"'s output, both views (e.g. while a game's bloom is off); its next draw recreates it
+void ReleaseKarisAverage(DeviceData& device_data)
+{
+   device_data.managed_resources.unordered_access_views["luma_karis_average"_h].reset();
+   device_data.managed_resources.shader_resource_views["luma_karis_average"_h].reset();
+}
+
 void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_source, ID3D11ShaderResourceView** srv_out)
 {
    auto& managed_resources = device_data.managed_resources;
@@ -1695,6 +1703,18 @@ void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context,
    ensure(resource->QueryInterface(tex.put()), >= 0);
    D3D11_TEXTURE2D_DESC tex_desc;
    tex->GetDesc(&tex_desc);
+
+   // Rebuild the output whenever the source size changes (e.g. a game's resolution scale), not only with the swapchain.
+   if (const auto& output_uav = managed_resources.unordered_access_views["luma_karis_average"_h])
+   {
+      uint4 output_size = {};
+      DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
+      GetResourceInfo(output_uav.get(), output_size, output_format);
+      if (output_size.x != tex_desc.Width || output_size.y != tex_desc.Height)
+      {
+         ReleaseKarisAverage(device_data);
+      }
+   }
 
    // Create RT and views.
    if (!managed_resources.unordered_access_views["luma_karis_average"_h])
@@ -1727,9 +1747,9 @@ void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context,
 
    // Reset resolution dependent resources on init swapchain.
    // Some are intentioanlly left out, we will recreate/reset them here.
-   auto on_init_swapchain = [&]()
+   auto on_init_swapchain = [&device_data]()
    {
-      managed_resources.unordered_access_views["luma_karis_average"_h].reset();
+      ReleaseKarisAverage(device_data);
    };
 
    LumaCallbacks::on_init_swapchain.try_emplace("luma_karis_average"_h, on_init_swapchain);

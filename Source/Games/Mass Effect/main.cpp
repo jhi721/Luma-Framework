@@ -1044,13 +1044,11 @@ public:
       gd.srv_scene.reset(); // recaptured every frame; never held across one
 
 #if ENABLE_BLOOM
-      // Give the address space back on the render thread: core's DrawKarisAverage output, ~66 MB at 4K. Core drops only
-      // the UAV on swapchain init, so both views go here. Unconditional while off: resetting empty entries is two lookups.
+      // Give the address space back on the render thread: core's DrawKarisAverage output, ~66 MB at 4K. Unconditional
+      // while off: resetting empty entries is two lookups.
       if (!g_luma_bloom_enable)
       {
-         auto& mr = device_data.managed_resources;
-         mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
-         mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
+         ReleaseKarisAverage(device_data);
       }
 #endif
 
