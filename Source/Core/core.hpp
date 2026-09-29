@@ -110,6 +110,13 @@
 #ifndef ENABLE_NVAPI
 #define ENABLE_NVAPI 0
 #endif // ENABLE_NVAPI
+// NVIDIA Reflex injected at present (see "includes/reflex.h"). Needs NVAPI; a game can define it to 0 to leave latency to the game
+#if !ENABLE_NVAPI
+#undef ENABLE_REFLEX
+#define ENABLE_REFLEX 0
+#elif !defined(ENABLE_REFLEX)
+#define ENABLE_REFLEX 1
+#endif // ENABLE_REFLEX
 #ifndef PROJECT_NAME
 // Matches "Globals::MOD_NAME"
 #define PROJECT_NAME "Luma"
@@ -177,7 +184,7 @@
 #include "dlss/DLSS.h" // see "ENABLE_NGX"
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
 #include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
-#include "includes/reflex.h" // see "ENABLE_NVAPI"
+#include "includes/reflex.h" // see "ENABLE_REFLEX"
 
 #include "includes/containers.h"
 #include "includes/globals.h"
@@ -420,7 +427,7 @@ namespace
    bool strip_original_shaders_debug_data = false;
 #endif
    bool use_os_reference_white_level = true;
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
    Reflex::Mode reflex_mode = Reflex::Mode::On;
 #endif
 
@@ -5664,7 +5671,7 @@ namespace
       }
    }
 
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
    // Reflex follows the device's first swapchain (the only one expected), so there's one sleep per frame
    bool IsReflexSwapchain(DeviceData& device_data, reshade::api::swapchain* swapchain)
    {
@@ -5705,7 +5712,7 @@ namespace
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
 
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
       if (IsReflexSwapchain(device_data, swapchain))
          Reflex::OnPresent(native_device, device_data.reflex);
 #endif
@@ -14396,7 +14403,7 @@ namespace
             }
 #endif // ENABLE_SR
 
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
             {
                const Reflex::State reflex_state = device_data.reflex.state;
                const char* const reflex_modes[] = {"Off", "On", "On + Boost"};
@@ -16280,7 +16287,7 @@ void Init(bool async)
       reshade::get_config_value(runtime, NAME, "DLSSRenderPreset", dlss_render_preset_i);
       dlss_render_preset = static_cast<unsigned int>(dlss_render_preset_i);
 #endif
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
       int reflex_mode_i = int(reflex_mode);
       reshade::get_config_value(runtime, NAME, "ReflexMode", reflex_mode_i);
       reflex_mode = Reflex::Mode(std::clamp(reflex_mode_i, int(Reflex::Mode::Off), int(Reflex::Mode::Boost)));
@@ -16735,7 +16742,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
       reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
 #endif
 
@@ -16860,7 +16867,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
       reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
 #endif
 

@@ -4,7 +4,7 @@
 // (where most engines start simulating the next frame) keeps the render queue empty when GPU bound.
 // The markers are only an approximation of the game's frame (simulation and render submission span the whole CPU frame),
 // so they aren't used for driver optimizations ("bUseMarkersToOptimize").
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
 #include "nvapi.h"
 
 #include <psapi.h>
@@ -117,4 +117,4 @@ namespace Reflex
       SetMarker(device, data.frame_id, RENDERSUBMIT_START);
    }
 } // namespace Reflex
-#endif // ENABLE_NVAPI
+#endif // ENABLE_REFLEX

@@ -541,7 +541,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 #endif
 
    std::unordered_set<reshade::api::swapchain*> swapchains;
-#if ENABLE_NVAPI
+#if ENABLE_REFLEX
    Reflex::DeviceData reflex; // For the first swapchain (the only one expected)
 #endif
    std::unordered_set<uint64_t> back_buffers; // From all the swapchains (whether they are upgraded or not)
