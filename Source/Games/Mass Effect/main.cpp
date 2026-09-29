@@ -415,6 +415,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> mv_vertex_shaders;
+   // The bytes of vc4 each one reads ("DXBC::ConstantBufferBytes"): the previous frame's copy uploads only those
+   std::unordered_map<uint32_t, UINT> mv_vertex_read_sizes;
    std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_pixel_shaders;
    // The alpha blended draws' pixel shaders with the mask target, by blend (see "ClassifyBoundBlend", index - 1)
    std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_reactive_pixel_shaders[2];
@@ -472,6 +474,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    uint8_t mv_reactive_blend = 0;
    uint32_t mv_last_vertex_shader_hash = 0;
    ID3D11VertexShader* mv_last_vertex_shader = nullptr;
+   UINT mv_last_vertex_read_size = 0;
    uint32_t mv_last_pixel_shader_hash = 0;
    ID3D11PixelShader* mv_last_pixel_shader = nullptr;
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
@@ -1110,6 +1113,7 @@ class MassEffect final : public Game
       }
       std::vector<uint8_t> patched;
       std::string error = "no bytecode";
+      UINT read_size = 0;
       {
          const std::shared_lock lock(s_mutex_generic);
          if (const auto it =
@@ -1121,7 +1125,10 @@ class MassEffect final : public Game
                it->second->subobjects_cache[0].data);
             const auto* code = static_cast<const uint8_t*>(desc->code);
             if constexpr (vertex)
+            {
                patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error);
+               read_size = DXBC::ConstantBufferBytes(code, desc->code_size, MotionVectorPatches::object_slot);
+            }
             else if (reactive != 0)
                patched = MotionVectorPatches::PatchPixelShaderReactive(code,
                   desc->code_size, reactive == 2, &error);
@@ -1154,6 +1161,8 @@ class MassEffect final : public Game
                shader ? "patched" : error)
                .c_str());
       const std::unique_lock lock(gd.mv_mutex);
+      if constexpr (vertex)
+         gd.mv_vertex_read_sizes.try_emplace(hash, read_size);
       return shaders->try_emplace(hash, shader).first->second;
    }
 
@@ -1172,6 +1181,11 @@ class MassEffect final : public Game
                native_device, device_data, &gd.mv_vertex_shaders, hash,
                cmd_list_data.pipeline_state_original_vertex_shader)
                .get();
+         {
+            const std::shared_lock lock(gd.mv_mutex);
+            const auto read_size = gd.mv_vertex_read_sizes.find(hash);
+            gd.mv_last_vertex_read_size = read_size != gd.mv_vertex_read_sizes.end() ? read_size->second : 0;
+         }
          gd.mv_last_vertex_shader_hash = hash;
       }
       return gd.mv_last_vertex_shader;
@@ -1548,7 +1562,10 @@ class MassEffect final : public Game
          {
             // Not found, drawn with the frame's camera: its own constants with last
             // frame's camera (camera motion only)
-            gd.mv_camera_only_copy.assign(constants->begin(), constants->end());
+            // Only what the shader reads (at least the camera)
+            const size_t copy_size = gd.mv_last_vertex_read_size != 0 ? std::clamp<size_t>(gd.mv_last_vertex_read_size, kViewProjectionOffset + kCameraSize, constants->size())
+                                                                      : constants->size();
+            gd.mv_camera_only_copy.assign(constants->begin(), constants->begin() + copy_size);
             std::memcpy(gd.mv_camera_only_copy.data() + kViewProjectionOffset,
                gd.mv_previous_camera->data() + kViewProjectionOffset,
                kCameraSize);
@@ -1576,7 +1593,7 @@ class MassEffect final : public Game
       if (GetPerfMotionVectorDraws() < 2)
          return false;
       ID3D11Buffer* const previous_current[] = {current.get()};
-      gd.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, {&upload, 1}, previous_current, "ME1");
+      gd.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, {&upload, 1}, previous_current, "ME1", {&gd.mv_last_vertex_read_size, 1});
       ID3D11Buffer* const jitter = gd.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot,
          1, &jitter);
@@ -2255,16 +2272,6 @@ public:
 
 #if ENABLE_SMAA
    // Core's DrawSMAA intermediates, ~83 MB at 4K, dropped only on swapchain init. Views hold references: release all.
-   static void ReleaseCoreSMAAIntermediates(DeviceData& device_data)
-   {
-      auto& mr = device_data.managed_resources;
-      mr.depth_stencil_views[CompileTimeStringHash("smaa_dsv")].reset();
-      mr.render_target_views[CompileTimeStringHash("smaa_edge_detection")].reset();
-      mr.render_target_views[CompileTimeStringHash("smaa_blending_weight_calculation")].reset();
-      mr.shader_resource_views[CompileTimeStringHash("smaa_edge_detection")].reset();
-      mr.shader_resource_views[CompileTimeStringHash("smaa_blending_weight_calculation")].reset();
-   }
-
    // SMAA after the grade, before the HUD (TW2/BL2 chain): snapshot -> DrawSMAA (its blend filters the snapshot in linear light) -> [RCAS] -> canvas. Without
    // "smaa" (the upscaler antialiased the frame, SR4's shape) only RCAS runs: snapshot -> RCAS -> canvas.
    void RunPostFinalGradeSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, ID3D11Resource* canvas_res, ID3D11RenderTargetView* canvas_rtv, bool smaa)
@@ -2276,14 +2283,13 @@ public:
       if (w == 0 || h == 0 || cfmt == DXGI_FORMAT_UNKNOWN)
          return;
 
-      // Resolution change: drop every size-bound resource, ours and DrawSMAA's core-managed intermediates, so each is
-      // recreated at the new size (below, or by core). The predication CB does not depend on the size and stays.
+      // Resolution change: drop every size-bound resource of ours, so each is recreated at the new size (below; Core's
+      // DrawSMAA checks its own). The predication CB does not depend on the size and stays.
       if (gd.smaa_w != w || gd.smaa_h != h)
       {
          gd.ReleaseSMAAScratch();
          gd.cb_smaa_metrics.reset();
          gd.cb_sharpen.reset();
-         ReleaseCoreSMAAIntermediates(device_data);
          gd.smaa_w = w;
          gd.smaa_h = h;
       }
@@ -2935,21 +2941,6 @@ public:
    }
 #endif
 
-   // Re-initializing the SR bridge's instances stops the helper (the upscaler's GPU memory, a profile's end) and drops the bridge's
-   // copies and references; the next upscaled draw starts a new helper
-   static void RestartSRBridge(ID3D11Device* native_device, DeviceData& device_data)
-   {
-      com_ptr<IDXGIDevice> dxgi_device;
-      com_ptr<IDXGIAdapter> adapter;
-      if (FAILED(native_device->QueryInterface(&dxgi_device)) || FAILED(dxgi_device->GetAdapter(&adapter)))
-         return;
-      for (auto& [type, instance] : device_data.sr_implementations_instances)
-      {
-         if (instance)
-            sr_implementations[type]->Init(instance, native_device, adapter.get());
-      }
-   }
-
    void CleanExtraSRResources(DeviceData& device_data) override
    {
       GetGameDeviceData(device_data).release_sr_resources = true;
@@ -2970,11 +2961,10 @@ public:
       device_data.has_drawn_sr = false;
       gd.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       gd.mv_active = IsSRActive(device_data) || g_mv_enable;
-      // None picked: the SR bridge restarts empty (Core keeps the instances across selections), then our upscaler inputs and
-      // output go. Recreated when an upscaler is picked again (the helper takes seconds to start).
+      // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when
+      // an upscaler is picked again (the helper takes seconds to start).
       if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
       {
-         RestartSRBridge(native_device, device_data);
          gd.sr_output_srv.reset();
          if (!g_mv_enable)
          {
@@ -3032,7 +3022,7 @@ public:
             else if (std::filesystem::is_directory(run_directory, error))
             {
                SetEnvironmentVariableW(L"LUMA_UPSCALER_PROFILE", (run_directory / "helper.csv").c_str());
-               RestartSRBridge(native_device, device_data); // The profile starts with the helper
+               sr_implementations[device_data.sr_type]->ReleaseResources(device_data.GetSRInstanceData()); // The profile starts with the helper
                frames.clear();
                frames.reserve(kFrames); // "current" points into it
                warmup = 0;
@@ -3102,7 +3092,8 @@ public:
             }
             std::ofstream(run_directory / "game.csv", std::ios::binary) << csv;
             SetEnvironmentVariableW(L"LUMA_UPSCALER_PROFILE", nullptr);
-            RestartSRBridge(native_device, device_data);
+            if (auto* instance = device_data.GetSRInstanceData())
+               sr_implementations[device_data.sr_type]->ReleaseResources(instance);
             frames.clear();
             state = State::Off;
             reshade::log::message(reshade::log::level::info, std::format("[ME1 Bridge] profile of {} frames written to \"{}\"", kFrames, run_directory.string()).c_str());
@@ -3381,14 +3372,11 @@ public:
       gd.srv_scene.reset(); // recaptured every frame; never held across one
 
 #if ENABLE_BLOOM
-      // Give the memory back on the render thread: core's DrawKarisAverage output (~66 MB at 4K; core drops only the UAV on
-      // swapchain init, so both views go here) and DrawBloom's mip chains (~66 MB). Unconditional while off: resetting empty
-      // entries is a few lookups.
+      // Give the memory back on the render thread: core's DrawKarisAverage output (~66 MB at 4K) and DrawBloom's mip chains
+      // (~66 MB). Unconditional while off: resetting empty entries is a few lookups.
       if (!g_luma_bloom_enable)
       {
-         auto& mr = device_data.managed_resources;
-         mr.unordered_access_views[CompileTimeStringHash("luma_karis_average")].reset();
-         mr.shader_resource_views[CompileTimeStringHash("luma_karis_average")].reset();
+         ReleaseKarisAverage(device_data);
          ReleaseBloom();
       }
 #endif
@@ -3410,7 +3398,7 @@ public:
             gd.ReleaseSMAAScratch();
             gd.smaa_w = gd.smaa_h = 0; // core recreates lazily; keep the latch from claiming anything is current
          }
-         ReleaseCoreSMAAIntermediates(device_data);
+         ReleaseSMAA(device_data);
       }
       else
       {
