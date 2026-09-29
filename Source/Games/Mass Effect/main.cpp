@@ -1091,7 +1091,10 @@ class MassEffect final : public Game
       gd.mv_reactive_blend = 0;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's
       // helper starting shows the scene as it is, antialiased with SMAA).
-      const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) && sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData()) ? device_data.GetSRInstanceData() : nullptr;
+      // (SR stays latched active until the next present after "None" is picked: no implementation then, nor instance data)
+      const SR::InstanceData* sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
+      if (sr_instance_data && !sr_implementations[device_data.sr_type]->IsReady(sr_instance_data))
+         sr_instance_data = nullptr;
       const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
       gd.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter && GetPerfMotionVectorDraws() != 0
                         ? std::array<float, 2>{SR::HaltonSequence(phase, 2),
