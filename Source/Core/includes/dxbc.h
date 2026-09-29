@@ -360,6 +360,31 @@ namespace DXBC
       return relative ? declared : (std::min)(declared, rows * 16);
    }
 
+   // Whether the shader reads row "row" of constant buffer "slot" by an immediate index (unlike "ConstantBufferBytes", it tells which
+   // rows a shader declaring the whole buffer uses, e.g. a skinned vertex shader's world matrix past its relatively indexed bones)
+   inline bool ReadsConstantRow(const uint8_t* code, size_t size, uint32_t slot, uint32_t row)
+   {
+      std::vector<Chunk> chunks;
+      if (!ReadChunks(code, size, &chunks))
+         return false;
+      const Chunk* const program = FindChunk(&chunks, FourCC("SHEX"), FourCC("SHDR"));
+      std::vector<uint32_t> tokens;
+      std::vector<Instruction> instructions;
+      size_t first_body;
+      if (!program || !ReadProgram(*program, &tokens, &instructions, &first_body))
+         return false;
+      bool reads = false;
+      for (size_t i = first_body; i < instructions.size() && !reads; i++)
+         WalkOperands(tokens, instructions[i], [&](size_t token_position, size_t index_position)
+            {
+               const uint32_t token = tokens[token_position];
+               reads |= DECODE_D3D10_SB_OPERAND_TYPE(token) == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER && index_position != no_index && tokens[index_position] == slot &&
+                        DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) == D3D10_SB_OPERAND_INDEX_2D && DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) == D3D10_SB_OPERAND_INDEX_IMMEDIATE32 &&
+                        tokens[index_position + 1] == row;
+               return true; });
+      return reads;
+   }
+
    // The patched tokens as the program, with their length token set
    inline void WriteProgram(std::vector<uint32_t>* tokens, Chunk* program)
    {
