@@ -97,7 +97,7 @@ struct PerfTestMode
 constexpr PerfTestMode perf_test_modes[] = {
    {"Off"},
    {"Current Settings"},
-   {"DLSS + Reactive Mask", true, SR::Type::DLSS, false, true},
+   {"DLSS", true, SR::Type::DLSS},
    {"FSR 3 + Reactive Mask", true, SR::Type::FSR, false, true},
    {"FSR 3", true, SR::Type::FSR},
    {"FSR 3 Jitter Only", true, SR::Type::FSR, false, false, 1},
@@ -1516,7 +1516,7 @@ class MassEffect final : public Game
       // transparency & composition (its pixel shader patched, the mask target
       // added past the motion vector one)
       ID3D11PixelShader* reactive_shader = nullptr;
-      if (g_sr_reactive_enable && IsSRActive(device_data) &&
+      if (g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR &&
           gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
       {
          ClassifyBoundBlend(native_device_context, &gd);
@@ -1783,8 +1783,9 @@ class MassEffect final : public Game
          if (srv_resource != gd.mv_scene_color)
             gd.mv_scene_srv.reset();
       }
-      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote
-      const bool reactive = IsSRActive(device_data) && g_sr_reactive_enable && gd.mv_reactive_target_srv && !g_sr_reactive_skip_fill;
+      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote. FSR only:
+      // DLSS's current presets ignore them (DLSS-Best-Practices TRN-2)
+      const bool reactive = IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable && gd.mv_reactive_target_srv && !g_sr_reactive_skip_fill;
       if (reactive)
       {
          D3D11_TEXTURE2D_DESC desc = {};
@@ -2677,7 +2678,7 @@ public:
       {
          const auto now = std::chrono::steady_clock::now();
          const std::string aa = IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : "none");
-         const std::string settings = std::format("mode=\"{}\" aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, aa, IsSRActive(device_data) && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
+         const std::string settings = std::format("mode=\"{}\" aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, aa, IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
          // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile)
          if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250) ||
              (IsSRActive(device_data) && !sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData())))
