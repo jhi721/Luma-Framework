@@ -4693,11 +4693,13 @@ namespace
 
             if (cached_pipeline != nullptr)
             {
-               // Clean other references to the pipeline
-               for (auto& pipelines_cache_pair : device_data.pipeline_caches_by_shader_hash)
+               // Clean other references to the pipeline (it's only listed under its own hashes, see "OnInitPipeline()")
+               for (const auto shader_hash : cached_pipeline->shader_hashes)
                {
-                  auto& cached_pipelines = pipelines_cache_pair.second;
-                  cached_pipelines.erase(cached_pipeline);
+                  if (auto pipelines_pair = device_data.pipeline_caches_by_shader_hash.find(shader_hash); pipelines_pair != device_data.pipeline_caches_by_shader_hash.end())
+                  {
+                     pipelines_pair->second.erase(cached_pipeline);
+                  }
                }
 
                // Destroy our cloned subojects
