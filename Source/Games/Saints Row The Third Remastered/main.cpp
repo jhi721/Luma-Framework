@@ -782,6 +782,20 @@ class SaintsRowTheThirdRemastered final : public Game
 public:
    void OnInit(bool async) override
    {
+#if DEVELOPMENT
+      // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"fix_native_taa_jitter", &g_fix_native_taa_jitter}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_dump", &g_smaa_dump},
+         {"gtao_enable", &g_gtao_enable}});
+      Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+      Mcp::RegisterInts({{"smaa_debug_view", &g_smaa_debug_view, 0, 2}, {"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input_linear", smaa_linear_srv),
+         MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
+         MCP_GAME_TEXTURE("gtao.depth_mips", gtao_scratch.depth_mips_srv)});
+#if ENABLE_SR
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("sr.motion_vectors", sr_motion_vectors),
+         MCP_GAME_TEXTURE("sr.depth", sr_depth)});
+#endif
+#endif
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (reference)\n1 - HDR: native grade + reconstructed luminance + DICE display map", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
