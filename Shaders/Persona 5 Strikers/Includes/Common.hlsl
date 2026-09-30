@@ -15,6 +15,12 @@
 // HDR displays too: no extension, DICE or dither (scene sliders still apply).
 #define P5S_HDR_SCENE (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
 
+// The display's peak relative to UI paper white, in swapchain units (1 outside HDR): what the UI's additive blends and RCAS may reach
+float P5S_UIPeak()
+{
+   return LumaSettings.DisplayMode == 1 ? LumaSettings.PeakWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0) : 1.0;
+}
+
 // The Katana post process's RGB weights (bloom threshold, Karis averages, DOF): a weighted sum of the linear scene RGB
 static const float3 P5S_PostWeights = float3(0.222015, 0.706655, 0.071330);
 

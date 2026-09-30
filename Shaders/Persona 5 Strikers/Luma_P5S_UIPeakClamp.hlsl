@@ -3,6 +3,5 @@
 
 float4 main() : SV_Target
 {
-   const float peak = LumaSettings.DisplayMode == 1 ? LumaSettings.PeakWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0) : 1.0;
-   return float4(peak, peak, peak, 1.0);
+   return float4(P5S_UIPeak().xxx, 1.0);
 }

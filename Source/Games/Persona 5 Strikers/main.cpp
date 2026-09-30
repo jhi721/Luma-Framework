@@ -25,6 +25,9 @@ namespace
    constexpr uint32_t composite_hash = 0x45A96F2D;
    // FXAA 3 from a swapchain copy (after the UI) back into it
    constexpr uint32_t fxaa_hash = 0xED2D9823;
+   // SMAA's scratch is freed after this many frames without SMAA (DLSS/FSR antialias), the copies after as many without SMAA or RCAS
+   // (~10 s at the game's 60 fps cap)
+   constexpr uint32_t smaa_idle_release_frames = 600;
    // PostEffect3 ApplyFxaa{,Repair,Console,Quality}PS: the engine's FXAA (plus radial blur), from an intermediate composite target into
    // the swapchain. Never captured yet.
    const ShaderHashesList shader_hashes_apply_fxaa = {.pixel_shaders = {0x0B6569A5, 0xC8A7BA1C, 0x95F3321A, 0xED7941FD}};
@@ -85,8 +88,14 @@ namespace
    int g_perf_test = 0;
    constexpr int perf_test_render_scales[] = {0, 10, 10, 7, 5};
    constexpr const char* perf_test_modes[] = {"Off", "DLAA", "DLAA Without Motion Vector Draws", "Quality (70%)", "Performance (50%)"};
+   // A/B for the buffer hooks' lock free $Globals filter (see "MayBeGlobalsBuffer")
+   bool g_mv_globals_filter = true;
+   // A/B for the motion vector target's format: R16G16_FLOAT, else R32G32_FLOAT
+   bool g_mv_half_float = true;
 #else
    constexpr int g_gtao_debug_view = 0;
+   constexpr bool g_mv_globals_filter = true;
+   constexpr bool g_mv_half_float = true;
    constexpr bool g_smaa_predication = true;
    constexpr bool g_post_output_resolution = true;
 #endif
@@ -115,9 +124,9 @@ namespace
       return resource;
    }
 
-   // Draws with a Luma clone of a layer's vertex shader (see "Includes/LayerCorner.hlsl") and uv scale, or as is without one, bypassing
-   // Core's state tracking.
-   void DrawWithLayerVertexShader(ID3D11DeviceContext* native_device_context, ID3D11VertexShader* vertex_shader, ID3D11Buffer* uv_scale_buffer, const std::function<void()>& draw)
+   // Draws with a Luma vertex shader (a layer's clone, see "Includes/LayerCorner.hlsl", or a motion vector patch) and one of its
+   // constant buffers (the layer's uv scale, the jitter), or as is without one, bypassing Core's state tracking: restores the game's.
+   void DrawWithVertexShader(ID3D11DeviceContext* native_device_context, ID3D11VertexShader* vertex_shader, UINT cb_slot, ID3D11Buffer* buffer, const std::function<void()>& draw)
    {
       if (!vertex_shader)
       {
@@ -125,15 +134,24 @@ namespace
          return;
       }
       com_ptr<ID3D11VertexShader> original_vertex_shader;
-      com_ptr<ID3D11Buffer> original_uv_scale_buffer;
+      com_ptr<ID3D11Buffer> original_buffer;
       native_device_context->VSGetShader(&original_vertex_shader, nullptr, nullptr);
-      native_device_context->VSGetConstantBuffers(layer_uv_scale_cb_slot, 1, &original_uv_scale_buffer);
-      native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &uv_scale_buffer);
+      native_device_context->VSGetConstantBuffers(cb_slot, 1, &original_buffer);
+      native_device_context->VSSetConstantBuffers(cb_slot, 1, &buffer);
       native_device_context->VSSetShader(vertex_shader, nullptr, 0);
       draw();
-      ID3D11Buffer* const buffer = original_uv_scale_buffer.get();
-      native_device_context->VSSetConstantBuffers(layer_uv_scale_cb_slot, 1, &buffer);
+      ID3D11Buffer* const restored_buffer = original_buffer.get();
+      native_device_context->VSSetConstantBuffers(cb_slot, 1, &restored_buffer);
       native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
+   }
+
+   // Viewport and scissor over a whole target (the game scissors its passes)
+   void SetFullTargetViewport(ID3D11DeviceContext* native_device_context, UINT width, UINT height, float min_depth = 0.f, float max_depth = 1.f)
+   {
+      const D3D11_VIEWPORT viewport = {0.f, 0.f, float(width), float(height), min_depth, max_depth};
+      const D3D11_RECT scissor = {0, 0, LONG(width), LONG(height)};
+      native_device_context->RSSetViewports(1, &viewport);
+      native_device_context->RSSetScissorRects(1, &scissor);
    }
 
 } // namespace
@@ -150,6 +168,18 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11UnorderedAccessView> smaa_gamma_uav;
    com_ptr<ID3D11ShaderResourceView> smaa_predication_srv;
    com_ptr<ID3D11UnorderedAccessView> smaa_predication_uav;
+   // Composite only: the frame SMAA last ran, and SMAA or RCAS (both use the copies), for "smaa_idle_release_frames"
+   uint32_t smaa_frame = 0;
+   uint32_t smaa_copies_frame = 0;
+
+   void ReleaseSMAACopies()
+   {
+      smaa_linear_texture.reset();
+      smaa_linear_srv.reset();
+      smaa_gamma_srv.reset();
+      smaa_gamma_rtv.reset();
+      smaa_gamma_uav.reset();
+   }
 
    // Full res scene depth (SSAO depth downsample's t0) for predication, and for motion vectors when the G-buffer's is unreadable.
    // Kept across frames (the texture persists, rewritten before post): SSAO and post record on different deferred contexts, so per frame
@@ -208,6 +238,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    {
       UINT view_projection = UINT_MAX;
       UINT world = UINT_MAX;
+      uint32_t resource_slots = (1u << MotionVectorPatches::resource_slots) - 1; // A bit per t-slot the shader reads (all without reflection)
    };
    std::unordered_map<uint32_t, GlobalsLayout> mv_globals_layouts;
    // The scene records on one deferred context: after its first post pass, the next scene depth draw (depth prepass, else G-buffer)
@@ -216,14 +247,27 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Resource> mv_scene_depth;          // The G-buffer's depth, which the forward redraws share
    ID3D11DeviceContext* mv_scene_context = nullptr; // Only compared
 
-   // CPU copies of the $Globals buffers patched draws bind (mapped with discard before nearly every draw; some draws reuse the last
-   // contents): each Map's pointer, copied at Unmap
+   // The $Globals buffers patched draws bind (mapped with discard before nearly every draw; some draws reuse the last contents): each
+   // Map's pointer, and at Unmap a CPU snapshot of it that the draws (and the object history) share
+   using GlobalsCopy = std::shared_ptr<const std::vector<uint8_t>>;
+   struct GlobalsBuffer
+   {
+      void* mapped = nullptr; // Between a Map and its Unmap
+      UINT size = 0;
+      GlobalsCopy copy; // Null until the first Unmap after the buffer's registration
+   };
    std::mutex mv_globals_mutex;
-   std::unordered_set<uint64_t> mv_globals_buffers;
-   std::unordered_map<uint64_t, void*> mv_mapped_globals;
-   std::unordered_map<uint64_t, std::vector<uint8_t>> mv_globals_copies;
-   // Scene context only: the previous frame's $Globals uploads, one dynamic buffer per size
+   std::unordered_map<uint64_t, GlobalsBuffer> mv_globals_buffers;
+   // "mv_globals_buffers" again, for the buffer hooks to skip the game's other buffers without the lock (see "MayBeGlobalsBuffer"): an
+   // open addressing set (0 = empty slot), filled under "mv_globals_mutex" up to 3/4, then a count above that lets every buffer through
+   static constexpr uint32_t filtered_globals_buffer_slots = 256; // A power of two
+   static constexpr uint32_t max_filtered_globals_buffers = filtered_globals_buffer_slots / 4 * 3;
+   std::array<std::atomic<uint64_t>, filtered_globals_buffer_slots> mv_filtered_globals_buffers = {};
+   std::atomic<uint32_t> mv_filtered_globals_buffer_count = 0;
+   // Scene context only: the previous frame's $Globals uploads, one dynamic buffer per size, and a draw's $Globals with last frame's
+   // camera before its upload
    std::unordered_map<UINT, com_ptr<ID3D11Buffer>> mv_previous_globals_buffers;
+   std::vector<uint8_t> mv_globals_scratch;
    // Scene context only: this and last frame's copies of each resource the patched vertex shaders read (wind and interaction buffers,
    // ocean maps), taken at first use in a frame; the latter feeds the vertex shader's second run. Held until a frame passes without it,
    // so its address can't be reused.
@@ -242,15 +286,15 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    struct MotionVectorObject
    {
       std::array<float, 3> translation;
-      std::vector<uint8_t> globals;
+      GlobalsCopy globals; // Never null
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
    // This frame's projection jitter (pixels, +y down) and its VS cbuffer ("MotionVectorPatches::jitter_slot": NDC offset)
    std::array<float, 2> mv_jitter = {};
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
-   // Camera motion fill of pixels no patched draw wrote (see "Luma_P5S_MotionVectorFill.hlsl"; frame start marks them FLT_MAX): the
-   // target's UAV (if the GPU loads R32G32_FLOAT from UAVs), its constants, and the frame's depth (also the upscaler's)
+   // Camera motion fill of pixels no patched draw wrote (see "Luma_P5S_MotionVectorFill.hlsl"; frame start marks them 65504, the largest
+   // float16): the target's UAV (if the GPU loads its format from UAVs), its constants, and the frame's depth (also the upscaler's)
    com_ptr<ID3D11UnorderedAccessView> mv_uav;
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    bool mv_fill_pending = false;
@@ -356,8 +400,6 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // The game's "RenderScale" in memory (see "FindRenderScaleSetting"), null if not found. Present thread only.
    int32_t* render_scale_setting = nullptr;
    bool render_scale_searched = false;
-   int32_t render_scale_applied = 0; // The value the game last rebuilt its targets at (as known)
-   int32_t render_scale_memory = 0;  // The value Luma last left in the setting
    // The main menu: presents without a scene frame whose composite draws into a render resolution target (its background); the
    // pause screen has neither. Reset by any scene frame.
    std::atomic<bool> scene_drawn = false;
@@ -429,6 +471,28 @@ class Persona5Strikers final : public Game
       return device_data && device_data->game ? device_data : nullptr;
    }
 
+   // A buffer's first slot in "mv_filtered_globals_buffers" (Fibonacci hashing of the pointer, whose low bits are alignment)
+   static uint32_t FilteredGlobalsBufferSlot(uint64_t handle)
+   {
+      return uint32_t(((handle >> 4) * 0x9E3779B97F4A7C15ull) >> 56) & (Persona5StrikersGameDeviceData::filtered_globals_buffer_slots - 1);
+   }
+
+   // False if the buffer surely isn't one of "mv_globals_buffers". Lock free: the buffer hooks see every Map/Unmap of the game.
+   static bool MayBeGlobalsBuffer(const Persona5StrikersGameDeviceData& game_device_data, uint64_t handle)
+   {
+      if (!g_mv_globals_filter || game_device_data.mv_filtered_globals_buffer_count.load(std::memory_order_relaxed) > Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
+         return true;
+      // Ends at an empty slot: the set is never more than 3/4 full
+      for (uint32_t i = FilteredGlobalsBufferSlot(handle);; i = (i + 1) & (Persona5StrikersGameDeviceData::filtered_globals_buffer_slots - 1))
+      {
+         const uint64_t slot = game_device_data.mv_filtered_globals_buffers[i].load(std::memory_order_acquire);
+         if (slot == handle)
+            return true;
+         if (slot == 0)
+            return false;
+      }
+   }
+
    // Motion vectors: the mapped pointer of a $Globals buffer a patched draw binds, copied at Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
@@ -439,11 +503,11 @@ class Persona5Strikers final : public Game
 #if DEVELOPMENT
       const PerfHookTimer timer{game_device_data.perf_hook_ns};
 #endif
-      if (access == reshade::api::map_access::write_discard && data && *data)
+      if (access == reshade::api::map_access::write_discard && data && *data && MayBeGlobalsBuffer(game_device_data, resource.handle))
       {
          const std::lock_guard lock(game_device_data.mv_globals_mutex);
-         if (game_device_data.mv_globals_buffers.contains(resource.handle))
-            game_device_data.mv_mapped_globals[resource.handle] = *data;
+         if (const auto buffer = game_device_data.mv_globals_buffers.find(resource.handle); buffer != game_device_data.mv_globals_buffers.end())
+            buffer->second.mapped = *data;
       }
       // A deferred context's first map of a dynamic buffer in a command list must discard, so the split discards these (see "sr_no_overwrite_buffers")
       else if (access == reshade::api::map_access::write_only)
@@ -464,26 +528,24 @@ class Persona5Strikers final : public Game
       }
    }
 
-   // Motion vectors: copies a written $Globals buffer's mapped memory to the CPU at Unmap
+   // Motion vectors: snapshots a written $Globals buffer's mapped memory at Unmap
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = GetDeviceData(device);
-      auto* const game_device_data = device_data && IsSRActive(*device_data) ? &GetGameDeviceData(*device_data) : nullptr;
-      if (!game_device_data)
+      if (!device_data || !IsSRActive(*device_data))
          return;
+      auto& game_device_data = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
-      const PerfHookTimer timer{game_device_data->perf_hook_ns};
+      const PerfHookTimer timer{game_device_data.perf_hook_ns};
 #endif
-      const std::lock_guard lock(game_device_data->mv_globals_mutex);
-      const auto mapped = game_device_data->mv_mapped_globals.find(resource.handle);
-      if (mapped == game_device_data->mv_mapped_globals.end())
+      if (!MayBeGlobalsBuffer(game_device_data, resource.handle))
          return;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
-      auto& copy = game_device_data->mv_globals_copies[resource.handle];
-      copy.resize(desc.ByteWidth);
-      std::memcpy(copy.data(), mapped->second, desc.ByteWidth);
-      game_device_data->mv_mapped_globals.erase(mapped);
+      const std::lock_guard lock(game_device_data.mv_globals_mutex);
+      const auto buffer = game_device_data.mv_globals_buffers.find(resource.handle);
+      if (buffer == game_device_data.mv_globals_buffers.end() || !buffer->second.mapped)
+         return;
+      const auto* const mapped = static_cast<const uint8_t*>(std::exchange(buffer->second.mapped, nullptr));
+      buffer->second.copy = std::make_shared<const std::vector<uint8_t>>(mapped, mapped + buffer->second.size);
    }
 
    // The bound shader's motion vector version, patched from Core's bytecode copy on first use (null if it can't be)
@@ -517,6 +579,19 @@ class Persona5Strikers final : public Game
                   layout.view_projection = variable.StartOffset;
                if (SUCCEEDED(globals->GetVariableByName("mL2W")->GetDesc(&variable)) && variable.Size >= 48)
                   layout.world = variable.StartOffset;
+               D3D11_SHADER_DESC shader_desc;
+               if (SUCCEEDED(reflection->GetDesc(&shader_desc)))
+               {
+                  layout.resource_slots = 0;
+                  for (UINT i = 0; i < shader_desc.BoundResources; i++)
+                  {
+                     D3D11_SHADER_INPUT_BIND_DESC bind;
+                     if (FAILED(reflection->GetResourceBindingDesc(i, &bind)) || (bind.Type != D3D_SIT_TEXTURE && bind.Type != D3D_SIT_TBUFFER && bind.Type != D3D_SIT_STRUCTURED && bind.Type != D3D_SIT_BYTEADDRESS))
+                        continue;
+                     for (UINT slot = bind.BindPoint; slot < bind.BindPoint + bind.BindCount && slot < MotionVectorPatches::resource_slots; slot++)
+                        layout.resource_slots |= 1u << slot;
+                  }
+               }
             }
          }
       }
@@ -575,7 +650,7 @@ class Persona5Strikers final : public Game
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          game_device_data.mv_fill_pending = game_device_data.mv_uav && HasShaders(device_data.native_compute_shaders, "P5S Motion Vector Fill CS"_h);
       }
-      const FLOAT clear_value = game_device_data.mv_fill_pending ? FLT_MAX : 0.f;
+      const FLOAT clear_value = game_device_data.mv_fill_pending ? 65504.f : 0.f;
       const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
       native_device_context->ClearRenderTargetView(game_device_data.mv_rtv.get(), clear);
       game_device_data.mv_frame_ended = false;
@@ -589,13 +664,16 @@ class Persona5Strikers final : public Game
       game_device_data.mv_previous_view_projection_valid = game_device_data.mv_view_projection_valid && game_device_data.mv_presents - game_device_data.mv_frame_present <= 1;
       game_device_data.mv_view_projection_valid = false;
       game_device_data.mv_frame_present = game_device_data.mv_presents;
-      game_device_data.mv_previous_objects = std::move(game_device_data.mv_objects);
+      // Last frame's objects become the previous ones; keys drawn two frames ago keep their node and capacity for this frame
+      std::swap(game_device_data.mv_objects, game_device_data.mv_previous_objects);
 #if DEVELOPMENT
       g_mv_tiebreak_collisions_last_frame = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
-         { return a.globals == b.globals; });
+         { return PatchedDraws::SameBytes(a.globals, b.globals); });
 #endif
-      game_device_data.mv_objects.clear();
-      game_device_data.mv_objects.reserve(game_device_data.mv_previous_objects.size());
+      std::erase_if(game_device_data.mv_objects, [](const auto& entry)
+         { return entry.second.empty(); });
+      for (auto& [key, objects] : game_device_data.mv_objects)
+         objects.clear();
       if (!game_device_data.mv_previous_view_projection_valid)
          game_device_data.mv_previous_objects.clear();
       std::erase_if(game_device_data.mv_previous_resources, [&](const auto& entry)
@@ -603,7 +681,7 @@ class Persona5Strikers final : public Game
 
       // Halton (2, 3) over the upscaler's phase count (from its last settings; more at lower render scales)
       const bool jitter = IsSRActive(device_data);
-      const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
+      const SR::InstanceData* const sr_instance_data = jitter ? device_data.GetSRInstanceData() : nullptr;
       const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
       game_device_data.mv_jitter = jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{};
       // Pixels to NDC (y up)
@@ -624,14 +702,29 @@ class Persona5Strikers final : public Game
       return it != game_device_data->mv_globals_layouts.end() ? it->second : Persona5StrikersGameDeviceData::GlobalsLayout{};
    }
 
-   // A $Globals buffer's CPU copy (empty until its first Unmap); registers it for a copy at every Unmap
-   static std::vector<uint8_t> GetGlobalsCopy(Persona5StrikersGameDeviceData* game_device_data, ID3D11Buffer* buffer)
+   // A $Globals buffer's CPU copy (null until its first Unmap); registers it for a copy at every Unmap
+   static Persona5StrikersGameDeviceData::GlobalsCopy GetGlobalsCopy(Persona5StrikersGameDeviceData* game_device_data, ID3D11Buffer* buffer)
    {
       const std::lock_guard lock(game_device_data->mv_globals_mutex);
       const uint64_t handle = reinterpret_cast<uint64_t>(buffer);
-      game_device_data->mv_globals_buffers.insert(handle);
-      const auto copy = game_device_data->mv_globals_copies.find(handle);
-      return copy != game_device_data->mv_globals_copies.end() ? copy->second : std::vector<uint8_t>{};
+      const auto [entry, inserted] = game_device_data->mv_globals_buffers.try_emplace(handle);
+      if (inserted)
+      {
+         D3D11_BUFFER_DESC desc;
+         buffer->GetDesc(&desc);
+         entry->second.size = desc.ByteWidth;
+         const uint32_t count = game_device_data->mv_filtered_globals_buffer_count.load(std::memory_order_relaxed);
+         if (count < Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
+         {
+            uint32_t i = FilteredGlobalsBufferSlot(handle);
+            while (game_device_data->mv_filtered_globals_buffers[i].load(std::memory_order_relaxed) != 0)
+               i = (i + 1) & (Persona5StrikersGameDeviceData::filtered_globals_buffer_slots - 1);
+            game_device_data->mv_filtered_globals_buffers[i].store(handle, std::memory_order_release);
+         }
+         if (count <= Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
+            game_device_data->mv_filtered_globals_buffer_count.store(count + 1, std::memory_order_relaxed);
+      }
+      return entry->second.copy;
    }
 
    // A scene frame ends at its first post pass: picks the frame's depth (the upscaler's) and fills camera motion where no patched draw wrote
@@ -669,59 +762,29 @@ class Persona5Strikers final : public Game
       {
          game_device_data.mv_fill_pending = false;
          // Current clip space to the previous frame's, for row vectors: inverse(current) * previous, in double so the world translation
-         // (centimetres) cancels out.
-         double reprojection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+         // (centimetres) cancels out. Identity until both cameras are known, or if the current one can't be inverted.
+         Math::Matrix44D reprojection;
+         reprojection.SetIdentity();
          if (game_device_data.mv_view_projection_valid && game_device_data.mv_previous_view_projection_valid)
          {
-            // Gauss-Jordan with partial pivoting on [current | identity]
-            double a[4][8] = {};
-            for (int row = 0; row < 4; row++)
-            {
-               for (int column = 0; column < 4; column++)
-                  a[row][column] = game_device_data.mv_view_projection[row * 4 + column];
-               a[row][4 + row] = 1.0;
-            }
-            bool invertible = true;
-            for (int column = 0; column < 4 && invertible; column++)
-            {
-               int pivot = column;
-               for (int row = column + 1; row < 4; row++)
-               {
-                  if (std::abs(a[row][column]) > std::abs(a[pivot][column]))
-                     pivot = row;
-               }
-               invertible = std::abs(a[pivot][column]) > 1e-30;
-               std::swap(a[column], a[pivot]);
-               const double scale = invertible ? 1.0 / a[column][column] : 0.0;
-               for (double& value : a[column])
-                  value *= scale;
-               for (int row = 0; row < 4; row++)
-               {
-                  const double factor = row == column ? 0.0 : a[row][column];
-                  for (int i = 0; i < 8; i++)
-                     a[row][i] -= factor * a[column][i];
-               }
-            }
-            for (int row = 0; row < 4 && invertible; row++)
-            {
-               for (int column = 0; column < 4; column++)
-               {
-                  reprojection[row * 4 + column] = 0.0;
-                  for (int k = 0; k < 4; k++)
-                     reprojection[row * 4 + column] += a[row][4 + k] * double(game_device_data.mv_previous_view_projection[k * 4 + column]);
-               }
-            }
+            Math::Matrix44D current, previous;
+            std::copy_n(game_device_data.mv_view_projection.data(), 16, current.GetData());
+            std::copy_n(game_device_data.mv_previous_view_projection.data(), 16, previous.GetData());
+            const Math::Matrix44D candidate = current.GetInverted() * previous;
+            if (std::all_of(candidate.GetData(), candidate.GetData() + 16, [](double value)
+                   { return std::isfinite(value); }))
+               reprojection = candidate;
          }
          D3D11_TEXTURE2D_DESC mv_desc;
          game_device_data.mv_texture->GetDesc(&mv_desc);
          float constants[20] = {};
          for (int i = 0; i < 16; i++)
-            constants[i] = float(reprojection[i]);
+            constants[i] = float(reprojection.GetData()[i]);
          constants[16] = game_device_data.mv_jitter[0] * 2.f / float(mv_desc.Width);
          constants[17] = game_device_data.mv_jitter[1] * -2.f / float(mv_desc.Height);
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          const com_ptr<ID3D11ComputeShader> fill_shader = FindShader(device_data.native_compute_shaders, "P5S Motion Vector Fill CS"_h);
-         // ponytail: a shader reload between the clear and here (DEV) leaves the FLT_MAX marker for a frame
+         // ponytail: a shader reload between the clear and here (DEV) leaves the 65504 marker for a frame
          if (depth_srv && fill_shader && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
          {
             DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
@@ -773,18 +836,7 @@ class Persona5Strikers final : public Game
          return false;
 #endif
 
-      com_ptr<ID3D11VertexShader> original_vertex_shader;
-      native_device_context->VSGetShader(&original_vertex_shader, nullptr, nullptr);
-      com_ptr<ID3D11Buffer> original_jitter;
-      native_device_context->VSGetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &original_jitter);
-      ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
-      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
-      native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
-      draw();
-      // Set directly, bypassing Core's state tracking: restore the game's
-      native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
-      ID3D11Buffer* const restored_jitter = original_jitter.get();
-      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &restored_jitter);
+      DrawWithVertexShader(native_device_context, vertex_shader.get(), MotionVectorPatches::jitter_slot, game_device_data.mv_jitter_buffer.get(), draw);
       return true;
    }
 
@@ -846,14 +898,16 @@ class Persona5Strikers final : public Game
             D3D11_TEXTURE2D_DESC desc = {};
             if (game_device_data.mv_texture)
                game_device_data.mv_texture->GetDesc(&desc);
-            if (desc.Width != depth_size.x || desc.Height != depth_size.y)
+            // R16G16_FLOAT: the patched draws' motion is analytic, and float16 keeps it within 0.1 % at less bandwidth (DLSS-Best-Practices MV-1)
+            const DXGI_FORMAT mv_format = g_mv_half_float ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32G32_FLOAT;
+            if (desc.Width != depth_size.x || desc.Height != depth_size.y || desc.Format != mv_format)
             {
                game_device_data.mv_texture.reset();
                game_device_data.mv_rtv.reset();
                game_device_data.mv_uav.reset();
-               D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {DXGI_FORMAT_R32G32_FLOAT};
+               D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {mv_format};
                const bool typed_uav_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
-               desc = {depth_size.x, depth_size.y, 1, 1, DXGI_FORMAT_R32G32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
+               desc = {depth_size.x, depth_size.y, 1, 1, mv_format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
                if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.mv_texture)) || FAILED(native_device->CreateRenderTargetView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_rtv)))
                {
                   game_device_data.mv_texture.reset();
@@ -873,18 +927,12 @@ class Persona5Strikers final : public Game
          return false;
 #endif
 
-      com_ptr<ID3D11VertexShader> original_vertex_shader;
       com_ptr<ID3D11PixelShader> original_pixel_shader;
-      native_device_context->VSGetShader(&original_vertex_shader, nullptr, nullptr);
       native_device_context->PSGetShader(&original_pixel_shader, nullptr, nullptr);
       com_ptr<ID3D11Buffer> globals;
       com_ptr<ID3D11Buffer> original_previous_globals;
       native_device_context->VSGetConstantBuffers(0, 1, &globals);
       native_device_context->VSGetConstantBuffers(MotionVectorPatches::previous_globals_slot, 1, &original_previous_globals);
-      com_ptr<ID3D11Buffer> original_jitter;
-      native_device_context->VSGetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &original_jitter);
-      ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
-      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
 
       ID3D11RenderTargetView* targets[MotionVectorPatches::target_slot + 1] = {};
       std::copy_n(rtvs, MotionVectorPatches::target_slot, targets);
@@ -892,11 +940,11 @@ class Persona5Strikers final : public Game
       native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
       // The previous frame's $Globals: the same object's from last frame, else this draw's with last frame's camera (no object motion).
       // Draws of a buffer without a CPU copy yet get the current data (zero motion).
-      std::vector<uint8_t> previous_globals_data = GetGlobalsCopy(&game_device_data, globals.get());
+      const Persona5StrikersGameDeviceData::GlobalsCopy globals_copy = GetGlobalsCopy(&game_device_data, globals.get());
       ID3D11Buffer* previous_globals = globals.get();
-      if (!previous_globals_data.empty() && layout.view_projection != UINT_MAX && layout.view_projection + 64 <= previous_globals_data.size())
+      if (globals_copy && layout.view_projection != UINT_MAX && layout.view_projection + 64 <= globals_copy->size())
       {
-         uint8_t* const view_projection = previous_globals_data.data() + layout.view_projection;
+         const uint8_t* const view_projection = globals_copy->data() + layout.view_projection;
          // The frame's first draw has the camera
          if (!game_device_data.mv_view_projection_valid)
          {
@@ -913,13 +961,13 @@ class Persona5Strikers final : public Game
          UINT index_offset = 0;
          native_device_context->IAGetIndexBuffer(&index_buffer, &index_format, &index_offset);
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
-         uint64_t key = 14695981039346656037ull; // FNV-1a over the key's values
+         uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
-            key = (key ^ value) * 1099511628211ull;
+            HashCombine(key, value);
          std::array<float, 3> translation = {};
-         if (layout.world != UINT_MAX && layout.world + 48 <= previous_globals_data.size())
+         if (layout.world != UINT_MAX && layout.world + 48 <= globals_copy->size())
          {
-            const float* const world = reinterpret_cast<const float*>(previous_globals_data.data() + layout.world);
+            const float* const world = reinterpret_cast<const float*>(globals_copy->data() + layout.world);
             translation = {world[3], world[7], world[11]};
          }
 
@@ -932,31 +980,41 @@ class Persona5Strikers final : public Game
             {
                const float dx = object.translation[0] - translation[0], dy = object.translation[1] - translation[1], dz = object.translation[2] - translation[2];
                const float distance = dx * dx + dy * dy + dz * dz;
-               if (object.globals.size() == previous_globals_data.size() && distance < nearest)
+               if (object.globals->size() == globals_copy->size() && distance < nearest)
                {
                   nearest = distance;
                   match = &object;
                }
             }
          }
-         // Kept as drawn for the next frame (moved when the match's is uploaded)
-         game_device_data.mv_objects[key].push_back({translation, match ? std::move(previous_globals_data) : previous_globals_data});
+         // Kept as drawn for the next frame
+         game_device_data.mv_objects[key].push_back({translation, globals_copy});
+         const std::vector<uint8_t>* upload_data = match ? match->globals.get() : globals_copy.get();
          // Not found: last frame's camera, if this is the frame's view projection (others are left as is)
          if (!match && game_device_data.mv_previous_view_projection_valid && std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) == 0)
-            std::memcpy(view_projection, game_device_data.mv_previous_view_projection.data(), sizeof(game_device_data.mv_previous_view_projection));
+         {
+            game_device_data.mv_globals_scratch = *globals_copy;
+            std::memcpy(game_device_data.mv_globals_scratch.data() + layout.view_projection, game_device_data.mv_previous_view_projection.data(), sizeof(game_device_data.mv_previous_view_projection));
+            upload_data = &game_device_data.mv_globals_scratch;
+         }
 
-         const std::vector<uint8_t>& upload_data = match ? match->globals : previous_globals_data;
-         com_ptr<ID3D11Buffer>& upload = game_device_data.mv_previous_globals_buffers[UINT(upload_data.size())];
-         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(upload), upload_data.data(), UINT(upload_data.size())))
+         com_ptr<ID3D11Buffer>& upload = game_device_data.mv_previous_globals_buffers[UINT(upload_data->size())];
+         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(upload), upload_data->data(), UINT(upload_data->size())))
             previous_globals = upload.get();
       }
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_globals_slot, 1, &previous_globals);
-      // Second run resources: the previous frame's copies, else the current ones (immutable, or no previous copy)
+      // Second run resources, in the slots the shader reads: the previous frame's copies, else the current ones (immutable, or no
+      // previous copy)
       com_ptr<ID3D11ShaderResourceView> srvs[MotionVectorPatches::resource_slots];
-      native_device_context->VSGetShaderResources(0, MotionVectorPatches::resource_slots, &srvs[0]);
+      if (layout.resource_slots != 0)
+      {
+         native_device_context->VSGetShaderResources(0, MotionVectorPatches::resource_slots, &srvs[0]);
+      }
       ID3D11ShaderResourceView* previous_srvs[MotionVectorPatches::resource_slots] = {};
       for (UINT slot = 0; slot < MotionVectorPatches::resource_slots; slot++)
       {
+         if ((layout.resource_slots & (1u << slot)) == 0)
+            continue;
          previous_srvs[slot] = srvs[slot].get();
          const com_ptr<ID3D11Resource> resource = GetViewResource(srvs[slot].get());
          D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
@@ -1046,23 +1104,25 @@ class Persona5Strikers final : public Game
          if (entry.views[1])
             previous_srvs[slot] = entry.views[1].get();
       }
-      native_device_context->VSSetShaderResources(MotionVectorPatches::previous_resources_slot, MotionVectorPatches::resource_slots, previous_srvs);
-      native_device_context->VSSetShader(vertex_shader.get(), nullptr, 0);
+      if (layout.resource_slots != 0)
+      {
+         native_device_context->VSSetShaderResources(MotionVectorPatches::previous_resources_slot, MotionVectorPatches::resource_slots, previous_srvs);
+      }
       native_device_context->PSSetShader(pixel_shader.get(), nullptr, 0);
       if (motion_vector_blend_state)
          native_device_context->OMSetBlendState(motion_vector_blend_state.get(), blend_factor, sample_mask);
-      draw();
+      DrawWithVertexShader(native_device_context, vertex_shader.get(), MotionVectorPatches::jitter_slot, game_device_data.mv_jitter_buffer.get(), draw);
       if (motion_vector_blend_state)
          native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
       // Set directly, bypassing Core's state tracking: restore the game's
-      native_device_context->VSSetShader(original_vertex_shader.get(), nullptr, 0);
       native_device_context->PSSetShader(original_pixel_shader.get(), nullptr, 0);
       ID3D11Buffer* const restored_globals = original_previous_globals.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_globals_slot, 1, &restored_globals);
-      ID3D11Buffer* const restored_jitter = original_jitter.get();
-      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &restored_jitter);
-      ID3D11ShaderResourceView* const null_srvs[MotionVectorPatches::resource_slots] = {};
-      native_device_context->VSSetShaderResources(MotionVectorPatches::previous_resources_slot, MotionVectorPatches::resource_slots, null_srvs);
+      if (layout.resource_slots != 0)
+      {
+         ID3D11ShaderResourceView* const null_srvs[MotionVectorPatches::resource_slots] = {};
+         native_device_context->VSSetShaderResources(MotionVectorPatches::previous_resources_slot, MotionVectorPatches::resource_slots, null_srvs);
+      }
       native_device_context->OMSetRenderTargets(8, rtvs, dsv);
       return true;
    }
@@ -1120,11 +1180,16 @@ public:
    {
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
-      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"smaa_predication", &g_smaa_predication}, {"post_output_resolution", &g_post_output_resolution}});
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"smaa_predication", &g_smaa_predication}, {"post_output_resolution", &g_post_output_resolution}, {"mv_globals_filter", &g_mv_globals_filter}, { "mv_half_float",
+                               &g_mv_half_float }});
       Mcp::RegisterCounter("mv.tiebreak_collisions", &g_mv_tiebreak_collisions_last_frame);
       Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 200.f}});
       Mcp::RegisterInts({{"render_scale", &g_render_scale, 5, 10}, {"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"smaa_debug_view", &g_smaa_debug_view, 0, 2},
-         {"perf_test", &g_perf_test, 0, int(std::size(perf_test_modes)) - 1, [](DeviceData& device_data, double value)
+         { "perf_test",
+            &g_perf_test,
+            0,
+            int(std::size(perf_test_modes)) - 1,
+            [](DeviceData& device_data, double value)
             {
                // As the "Performance Test" combo
                if (value != 0.0 && !IsSRActive(device_data))
@@ -1137,7 +1202,7 @@ public:
                   game_device_data.perf_settle_frames = 60;
                }
                return std::string();
-            }}});
+            } }});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input_linear", smaa_linear_texture),
          MCP_GAME_TEXTURE("smaa.input", smaa_gamma_srv),
          MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
@@ -1234,23 +1299,17 @@ public:
       if (smaa && (!HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h)))
          return DrawOrDispatchOverrideType::None;
 
+      game_device_data.smaa_copies_frame = cb_luma_global_settings.FrameIndex;
+      if (smaa)
+         game_device_data.smaa_frame = cb_luma_global_settings.FrameIndex;
       D3D11_TEXTURE2D_DESC scratch_desc = {};
       if (game_device_data.smaa_linear_texture)
          game_device_data.smaa_linear_texture->GetDesc(&scratch_desc);
       if (scratch_desc.Width != canvas_desc.Width || scratch_desc.Height != canvas_desc.Height)
       {
-         game_device_data.smaa_linear_texture.reset();
-         game_device_data.smaa_linear_srv.reset();
-         game_device_data.smaa_gamma_srv.reset();
-         game_device_data.smaa_gamma_rtv.reset();
-         game_device_data.smaa_gamma_uav.reset();
+         game_device_data.ReleaseSMAACopies();
          game_device_data.smaa_predication_srv.reset();
          game_device_data.smaa_predication_uav.reset();
-         // Core's "DrawSMAA" sizes its intermediates from its first target and rebuilds them only on swapchain init (as in MEA/MELE)
-         auto& managed_resources = device_data.managed_resources;
-         managed_resources.depth_stencil_views["smaa_dsv"_h].reset();
-         managed_resources.render_target_views["smaa_edge_detection"_h].reset();
-         managed_resources.render_target_views["smaa_blending_weight_calculation"_h].reset();
          D3D11_TEXTURE2D_DESC desc = canvas_desc;
          desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
          desc.MipLevels = 1;
@@ -1268,7 +1327,12 @@ public:
             game_device_data.smaa_linear_texture.reset();
             return DrawOrDispatchOverrideType::None;
          }
-         // Without it SMAA simply runs unpredicated.
+      }
+      // Created on SMAA's first use after a resize or an idle release; without it SMAA simply runs unpredicated.
+      if (smaa && g_smaa_predication && !game_device_data.smaa_predication_uav)
+      {
+         D3D11_TEXTURE2D_DESC desc;
+         game_device_data.smaa_linear_texture->GetDesc(&desc);
          desc.Format = DXGI_FORMAT_R16_FLOAT;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
          com_ptr<ID3D11Texture2D> predication_texture;
@@ -1710,7 +1774,7 @@ public:
          const com_ptr<ID3D11Resource> source = GetViewResource(srv.get());
          const std::lock_guard lock(game_device_data.layer_mutex);
          const auto it = game_device_data.layer_frames.find(native_device_context);
-         if (!source || it == game_device_data.layer_frames.end() || std::ranges::find(it->second.targets, source.get()) == it->second.targets.end())
+         if (!source || it == game_device_data.layer_frames.end() || !Containers::Contains(it->second.targets, source.get()))
             return false;
          std::copy_n(it->second.scale, 2, scale);
          game_device_data.layer_frames.erase(it);
@@ -1734,7 +1798,7 @@ public:
          {
             uint4 depth_size;
             DXGI_FORMAT depth_format;
-            GetResourceInfo(GetViewResource(dsv.get()).get(), depth_size, depth_format);
+            GetResourceInfo(dsv.get(), depth_size, depth_format);
             if (depth_size.x != target_desc.Width || depth_size.y != target_desc.Height)
                return false;
          }
@@ -1766,9 +1830,10 @@ public:
       if (cluster_scale_offset != UINT_MAX)
       {
          native_device_context->PSGetConstantBuffers(0, 1, &original_globals);
-         std::vector<uint8_t> globals_data = original_globals ? GetGlobalsCopy(&game_device_data, original_globals.get()) : std::vector<uint8_t>{};
-         if (cluster_scale_offset + sizeof(float) <= globals_data.size())
+         const Persona5StrikersGameDeviceData::GlobalsCopy globals_copy = original_globals ? GetGlobalsCopy(&game_device_data, original_globals.get()) : nullptr;
+         if (globals_copy && cluster_scale_offset + sizeof(float) <= globals_copy->size())
          {
+            std::vector<uint8_t> globals_data = *globals_copy;
             float cluster_scale;
             std::memcpy(&cluster_scale, globals_data.data() + cluster_scale_offset, sizeof(float));
             cluster_scale *= scale[0];
@@ -1784,7 +1849,7 @@ public:
       {
          const std::lock_guard lock(game_device_data.layer_mutex);
          auto& frame = game_device_data.layer_frames[native_device_context];
-         if (std::ranges::find(frame.targets, target.get()) == frame.targets.end())
+         if (!Containers::Contains(frame.targets, target.get()))
             frame.targets.push_back(target.get());
          std::copy_n(scale, 2, frame.scale);
       }
@@ -1795,17 +1860,14 @@ public:
       native_device_context->RSGetScissorRects(&scissors, &scissor);
       if (!stretch)
       {
-         const D3D11_VIEWPORT full_viewport = {0.f, 0.f, float(target_desc.Width), float(target_desc.Height), viewport.MinDepth, viewport.MaxDepth};
-         const D3D11_RECT full_scissor = {0, 0, LONG(target_desc.Width), LONG(target_desc.Height)};
-         native_device_context->RSSetViewports(1, &full_viewport);
-         native_device_context->RSSetScissorRects(1, &full_scissor);
+         SetFullTargetViewport(native_device_context, target_desc.Width, target_desc.Height, viewport.MinDepth, viewport.MaxDepth);
       }
       if (patched_globals)
       {
          ID3D11Buffer* const buffer = patched_globals.get();
          native_device_context->PSSetConstantBuffers(0, 1, &buffer);
       }
-      DrawWithLayerVertexShader(native_device_context, quad_vertex_shader.get(), uv_scale_buffer.get(), draw);
+      DrawWithVertexShader(native_device_context, quad_vertex_shader.get(), layer_uv_scale_cb_slot, uv_scale_buffer.get(), draw);
       if (!stretch)
       {
          native_device_context->RSSetViewports(1, &viewport);
@@ -1941,16 +2003,16 @@ public:
       com_ptr<ID3D11Buffer> loop;
       native_device_context->PSGetConstantBuffers(bloom_loop_cb_slot, 1, &loop);
       // Empty on the buffer's first frame (see "OnUnmapBufferRegion")
-      const std::vector<uint8_t> constants = loop ? GetGlobalsCopy(&game_device_data, loop.get()) : std::vector<uint8_t>{};
+      const Persona5StrikersGameDeviceData::GlobalsCopy constants = loop ? GetGlobalsCopy(&game_device_data, loop.get()) : nullptr;
       const com_ptr<ID3D11Resource> resource = GetViewResource(game_source);
       auto* const target = resource ? GetPostTarget(native_device, &game_device_data, resource.get(), false) : nullptr;
-      if (constants.size() < 20 || !target)
+      if (!constants || constants->size() < 20 || !target)
          return;
       D3D11_SHADER_RESOURCE_VIEW_DESC source_desc;
       game_source->GetDesc(&source_desc);
       const UINT last_mip = source_desc.Texture2D.MostDetailedMip;
       float game_sample_scale;
-      std::memcpy(&game_sample_scale, constants.data() + 16, sizeof(game_sample_scale));
+      std::memcpy(&game_sample_scale, constants->data() + 16, sizeof(game_sample_scale));
       uint4 original_size;
       DXGI_FORMAT format;
       GetResourceInfo(resource.get(), original_size, format);
@@ -2068,6 +2130,8 @@ public:
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+      const bool can_draw = original_draw_dispatch_func && *original_draw_dispatch_func;
+      const bool sr_mesh_draw = can_draw && IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
 
       if (original_shader_hashes.Contains(ssao_depth_downsample_hash, reshade::api::shader_stage::pixel))
       {
@@ -2083,7 +2147,7 @@ public:
          }
       }
 
-      if (IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_draw_dispatch_func && *original_draw_dispatch_func)
+      if (sr_mesh_draw)
       {
 #if DEVELOPMENT
          // Includes recording the draw itself (patched or not)
@@ -2106,7 +2170,7 @@ public:
             com_ptr<ID3D11Buffer> vertex_buffer;
             // Forward draws join a started frame on the scene context; outside a frame only a depth prepass (no targets) starts one
             const bool scene_draw = game_device_data.mv_frame_ended ? !rtvs[0] : native_device_context == game_device_data.mv_scene_context;
-            if (!gbuffer && dsv && scene_draw)
+            if (!gbuffer && dsv && scene_draw && GetViewResource(dsv.get()) == game_device_data.mv_scene_depth)
             {
                com_ptr<ID3D11DepthStencilState> depth_stencil_state;
                UINT stencil_ref;
@@ -2133,12 +2197,12 @@ public:
 
       if (original_shader_hashes.Contains(layer_stretch_hash, reshade::api::shader_stage::pixel))
          game_device_data.layer_drawn = true;
-      if (IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_draw_dispatch_func && *original_draw_dispatch_func && DrawLayerAtOutputResolution(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func))
+      if (sr_mesh_draw && DrawLayerAtOutputResolution(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
       // The exposure histogram reads a layer stretch target's render resolution corner by pixel: give it the target downscaled to render
       // resolution
-      if (original_shader_hashes.Contains(exposure_histogram_hash, reshade::api::shader_stage::compute) && original_draw_dispatch_func && *original_draw_dispatch_func)
+      if (original_shader_hashes.Contains(exposure_histogram_hash, reshade::api::shader_stage::compute) && can_draw)
       {
          com_ptr<ID3D11ShaderResourceView> layer_srv;
          native_device_context->CSGetShaderResources(0, 1, &layer_srv);
@@ -2297,7 +2361,7 @@ public:
 
       // Upscaled: the post process up to the composite (which ends it) draws at the output resolution, other readers of the render
       // resolution scene get it downscaled (see "DownscalePostScene")
-      if (native_device_context == game_device_data.sr_upscaling_context && original_draw_dispatch_func && *original_draw_dispatch_func)
+      if (native_device_context == game_device_data.sr_upscaling_context && can_draw)
       {
          game_device_data.post_redirect &= !original_shader_hashes.Contains(composite_hash, reshade::api::shader_stage::pixel);
          if (game_device_data.post_redirect && (stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel && RedirectPostDraw(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, &updated_cbuffers, *original_draw_dispatch_func))
@@ -2316,12 +2380,9 @@ public:
             D3D11_TEXTURE2D_DESC desc;
             game_device_data.sr_upscaled_output->GetDesc(&desc);
             // The game scissors its passes to the render resolution
-            const D3D11_VIEWPORT viewport = {0.f, 0.f, float(desc.Width), float(desc.Height), 0.f, 1.f};
-            const D3D11_RECT scissor = {0, 0, LONG(desc.Width), LONG(desc.Height)};
             ID3D11RenderTargetView* const rtv = game_device_data.sr_upscaled_output_rtv.get();
             native_device_context->OMSetRenderTargets(1, &rtv, nullptr);
-            native_device_context->RSSetViewports(1, &viewport);
-            native_device_context->RSSetScissorRects(1, &scissor);
+            SetFullTargetViewport(native_device_context, desc.Width, desc.Height);
             (*original_draw_dispatch_func)();
             state.Restore(native_device_context);
             return DrawOrDispatchOverrideType::Replaced;
@@ -2332,7 +2393,16 @@ public:
       if (original_shader_hashes.Contains(composite_hash, reshade::api::shader_stage::pixel))
       {
          device_data.has_drawn_main_post_processing = true;
-         if (!original_draw_dispatch_func || !*original_draw_dispatch_func)
+         // Here rather than at present, as the post process (the scratch's only user) records on a deferred context
+         if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_frame > smaa_idle_release_frames)
+         {
+            game_device_data.smaa_predication_srv.reset();
+            game_device_data.smaa_predication_uav.reset();
+            ReleaseSMAA(device_data);
+         }
+         if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_copies_frame > smaa_idle_release_frames)
+            game_device_data.ReleaseSMAACopies();
+         if (!can_draw)
             return DrawOrDispatchOverrideType::None;
          // Below render scale 1 the composite draws into its own target, which the game stretches onto the swapchain
          {
@@ -2370,10 +2440,7 @@ public:
                native_device_context->RSGetScissorRects(&scissors, &scissor);
                if (layer_scale > 0.f && viewports != 0 && viewport.Width > 0.f && (viewport.Width < float(target_size.x) || (scissors != 0 && scissor.right < LONG(target_size.x))))
                {
-                  const D3D11_VIEWPORT full_viewport = {0.f, 0.f, float(target_size.x), float(target_size.y), viewport.MinDepth, viewport.MaxDepth};
-                  const D3D11_RECT full_scissor = {0, 0, LONG(target_size.x), LONG(target_size.y)};
-                  native_device_context->RSSetViewports(1, &full_viewport);
-                  native_device_context->RSSetScissorRects(1, &full_scissor);
+                  SetFullTargetViewport(native_device_context, target_size.x, target_size.y, viewport.MinDepth, viewport.MaxDepth);
                   SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
                   SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, 0.f, float(target_size.x) / viewport.Width);
                   updated_cbuffers = true;
@@ -2433,14 +2500,11 @@ public:
             state.Cache(native_device_context, device_data.uav_max_count);
             D3D11_TEXTURE2D_DESC desc;
             game_device_data.sr_upscaled_output->GetDesc(&desc); // The canvas' size
-            const D3D11_VIEWPORT viewport = {0.f, 0.f, float(desc.Width), float(desc.Height), 0.f, 1.f};
-            const D3D11_RECT scissor = {0, 0, LONG(desc.Width), LONG(desc.Height)};
             ID3D11ShaderResourceView* const scene_srv = game_device_data.sr_upscaled_output_srv.get();
             ID3D11RenderTargetView* const canvas_rtv = game_device_data.sr_upscaled_canvas_rtv.get();
             native_device_context->PSSetShaderResources(0, 1, &scene_srv);
             native_device_context->OMSetRenderTargets(1, &canvas_rtv, nullptr);
-            native_device_context->RSSetViewports(1, &viewport);
-            native_device_context->RSSetScissorRects(1, &scissor);
+            SetFullTargetViewport(native_device_context, desc.Width, desc.Height);
             if (cb_luma_global_settings.GameSettings.RCASSharpness <= 0.f || DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, false) == DrawOrDispatchOverrideType::None)
                (*original_draw_dispatch_func)();
             state.Restore(native_device_context);
@@ -2456,7 +2520,7 @@ public:
 
       // The copy of a 3D layer's alpha into its (pause screen) composite's output: its quad covers the render resolution corner (full
       // viewport, corner positions and texture coordinates). Drawn over the whole target instead, like the composite.
-      if (original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && original_shader_hashes.Contains(quad_vertex_shader_hash, reshade::api::shader_stage::vertex) && original_draw_dispatch_func && *original_draw_dispatch_func)
+      if (original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && original_shader_hashes.Contains(quad_vertex_shader_hash, reshade::api::shader_stage::vertex) && can_draw)
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
@@ -2489,7 +2553,7 @@ public:
             const D3D11_RECT whole_scissor = {0, 0, LONG(target_size.x), LONG(target_size.y)};
             native_device_context->RSSetViewports(1, &whole_viewport);
             native_device_context->RSSetScissorRects(1, &whole_scissor);
-            DrawWithLayerVertexShader(native_device_context, quad_vertex_shader.get(), uv_scale_buffer.get(), *original_draw_dispatch_func);
+            DrawWithVertexShader(native_device_context, quad_vertex_shader.get(), layer_uv_scale_cb_slot, uv_scale_buffer.get(), *original_draw_dispatch_func);
             native_device_context->RSSetViewports(1, &viewport);
             native_device_context->RSSetScissorRects(scissors, &scissor);
             return DrawOrDispatchOverrideType::Replaced;
@@ -2497,7 +2561,7 @@ public:
       }
 
       // The game's stretch of the composite target onto the swapchain (render scales below 1) is scene, not UI. Upscaled, it copies the canvas 1:1.
-      if (game_device_data.composite_target && original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && original_draw_dispatch_func && *original_draw_dispatch_func)
+      if (game_device_data.composite_target && original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && can_draw)
       {
          com_ptr<ID3D11ShaderResourceView> game_srv;
          native_device_context->PSGetShaderResources(0, 1, &game_srv);
@@ -2528,7 +2592,7 @@ public:
                return DrawOrDispatchOverrideType::Skip;
 
             // The sprite putting a 3D layer's composite on the swapchain scales up its render resolution corner: draw all of it instead
-            if (original_shader_hashes.Contains(ui_sprite_vertex_shader_hash, reshade::api::shader_stage::vertex) && original_draw_dispatch_func && *original_draw_dispatch_func)
+            if (original_shader_hashes.Contains(ui_sprite_vertex_shader_hash, reshade::api::shader_stage::vertex) && can_draw)
             {
                com_ptr<ID3D11ShaderResourceView> layer_srv;
                native_device_context->PSGetShaderResources(0, 1, &layer_srv);
@@ -2547,7 +2611,7 @@ public:
                const com_ptr<ID3D11Buffer> uv_scale_buffer = sprite_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr;
                if (uv_scale_buffer)
                {
-                  DrawWithLayerVertexShader(native_device_context, sprite_vertex_shader.get(), uv_scale_buffer.get(), *original_draw_dispatch_func);
+                  DrawWithVertexShader(native_device_context, sprite_vertex_shader.get(), layer_uv_scale_cb_slot, uv_scale_buffer.get(), *original_draw_dispatch_func);
                   return DrawOrDispatchOverrideType::Replaced;
                }
             }
@@ -2558,8 +2622,7 @@ public:
             // color subtract, only where the sprite subtracts something (a HUD subtract's quad would clip the HDR scene under it; this reads the
             // UI pixel shaders' b0 "nStageNum", t0/s0 and TEXCOORD1 and assumes a source alpha factor), else only the never displayed alpha (white). Subtracts are floored after (dialogue bubbles reached -1.5) with a black pixel shader and a MAX
             // blend; additive UI is clamped after to the display's peak (vanilla clipped at 1), likewise.
-            bool drawn = false;
-            if (original_draw_dispatch_func && *original_draw_dispatch_func)
+            if (can_draw)
             {
                com_ptr<ID3D11BlendState> blend_state;
                FLOAT blend_factor[4];
@@ -2615,13 +2678,10 @@ public:
                      }
                      native_device_context->PSSetShader(pixel_shader.get(), nullptr, 0);
                      native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
-                     drawn = true;
+                     return DrawOrDispatchOverrideType::Replaced;
                   }
                }
             }
-
-            if (drawn)
-               return DrawOrDispatchOverrideType::Replaced;
          }
       }
 
@@ -2691,25 +2751,20 @@ public:
       {
          game_device_data->render_scale_searched = true;
          game_device_data->render_scale_setting = FindRenderScaleSetting();
-         if (game_device_data->render_scale_setting)
-            game_device_data->render_scale_applied = game_device_data->render_scale_memory = *game_device_data->render_scale_setting;
       }
       int32_t* const setting = game_device_data->render_scale_setting;
       if (!setting)
          return;
-      const int32_t current = *setting;
-      // The game's menu wrote it and rebuilds its targets at it: the wanted value is forced back
-      if (current != game_device_data->render_scale_memory)
-         game_device_data->render_scale_applied = game_device_data->render_scale_memory = current;
 #if DEVELOPMENT
       const int32_t kept = g_perf_test != 0 ? perf_test_render_scales[g_perf_test] : g_render_scale;
 #else
       const int32_t kept = g_render_scale;
 #endif
       const int32_t wanted = menu ? 10 : kept;
-      if (wanted != game_device_data->render_scale_applied)
+      // The game rebuilds its targets at whatever the setting holds, also when its menu wrote it: the wanted value is forced back
+      if (*setting != wanted)
       {
-         *setting = game_device_data->render_scale_memory = game_device_data->render_scale_applied = wanted;
+         *setting = wanted;
          RECT client;
          if (game_window && GetClientRect(game_window, &client))
             PostMessageW(game_window, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right - client.left, client.bottom - client.top));
@@ -2804,7 +2859,7 @@ public:
          else if (++stats.frames >= 120)
          {
             const uint32_t samples = (std::max)(stats.samples, 1u);
-            reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms gpu game composite avg/max={:.3f}/{:.3f} ms ({} samples) cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load(), stats.scene_ms / samples, stats.scene_max_ms, stats.sr_ms / samples, stats.sr_max_ms, stats.composite_ms / (std::max)(stats.composite_samples, 1u), stats.composite_max_ms, stats.composite_samples, double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, stats.samples, stats.frames, stats.disjoint).c_str());
+            reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms gpu game composite avg/max={:.3f}/{:.3f} ms ({} samples) cpu hooks={:.3f} ms/frame globals filter={} samples={}/{} disjoint={}", perf_test_modes[g_perf_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load(), stats.scene_ms / samples, stats.scene_max_ms, stats.sr_ms / samples, stats.sr_max_ms, stats.composite_ms / (std::max)(stats.composite_samples, 1u), stats.composite_max_ms, stats.composite_samples, double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, game_device_data.mv_filtered_globals_buffer_count.load(), stats.samples, stats.frames, stats.disjoint).c_str());
             stats = {};
          }
       }
