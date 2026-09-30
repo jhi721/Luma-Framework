@@ -39,7 +39,7 @@ void main(float4 v0 : SV_Position0, float2 v1 : TEXCOORD0, float2 w1 : TEXCOORD1
       const int2 texel = pixel + offsets[i];
       const float z = 0.01 / (g_t1DepthMap.Load(int3((texel + 0.5) * depthScale, 0)) * g_vD2Z_Z2D.x + g_vD2Z_Z2D.y);
       coc[i] = (z - g_vDofInfo0.x) * g_vDofInfo0.y / z;
-      colors[i] = g_t4MainMap.Load(int3(texel, 0)).rgb;
+      colors[i] = clamp(g_t4MainMap.Load(int3(texel, 0)).rgb, 0.0, FLT11_MAX); // Luma: the scene is upgraded from R11G11B10_FLOAT (>= 0 for the Karis weight)
       weights[i] = saturate(abs(clamp(coc[i], -maxCoc, maxCoc)) / maxCoc) * P5S_KarisWeight(colors[i]);
    }
    const float weightSum = weights.x + weights.y + weights.z + weights.w;

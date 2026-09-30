@@ -1,4 +1,4 @@
-// DOF prefilter with a bokeh highlight mask (0x3D7CAD40): 0xD65ABD25 with the luminance floored before its log, the log level
+// DOF prefilter with a bokeh highlight mask (0x3D7CAD40): 0xD65ABD25 with the weighted RGB sum floored before its log, the log level
 // saturated and a fixed CoC threshold constant. See 0xE0DB2D7E.
 
 #define P5S_DOF_PREFILTER_HIGHLIGHTS 2

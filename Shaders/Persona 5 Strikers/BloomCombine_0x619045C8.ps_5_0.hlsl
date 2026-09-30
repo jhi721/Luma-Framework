@@ -45,7 +45,7 @@ void main(float4 v0 : SV_Position0, float2 v1 : TEXCOORD0, out float4 o0 : SV_Ta
    const float weightSum = 6.0;
 #endif
 
-   const float exposure = g_vCompositeInfo.z < 0.0 ? g_tExposureScaleInfo.Load(int3(1, 0, 0)).x : 1.0;
+   const float exposure = g_vCompositeInfo.z < 0.0 ? g_tExposureScaleInfo.Load(int3(1, 0, 0)).x : 1.0; // Texel 1 as in the original, unlike the composite's 0
    o0.rgb = bloom * (exposure * g_vBloomInfo.w * LumaSettings.GameSettings.BloomIntensity / weightSum);
    o0.a = 1.0;
 }

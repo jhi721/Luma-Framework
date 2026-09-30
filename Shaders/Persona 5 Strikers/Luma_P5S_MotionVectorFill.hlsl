@@ -20,6 +20,6 @@ RWTexture2D<float2> motion_vectors : register(u0);
    const float2 uv = (id.xy + 0.5) / size;
    const float4 current = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0) - jitter_ndc, depth.Load(int3(id.xy, 0)), 1.0);
    const float4 previous = mul(current, reprojection);
-   // Previous minus current, UV space, like the patched draws
-   motion_vectors[id.xy] = (previous.xy / previous.w - current.xy) * float2(0.5, -0.5);
+   // Previous minus current, UV space, like the patched draws; none for a point behind the previous camera
+   motion_vectors[id.xy] = previous.w > 0.0 ? (previous.xy / previous.w - current.xy) * float2(0.5, -0.5) : 0.0;
 }
