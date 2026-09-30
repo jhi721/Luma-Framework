@@ -561,10 +561,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::array<UINT, kMaxFilteredBuffers> mv_filtered_buffer_sizes = {};
    std::atomic<uint32_t> mv_filtered_buffer_count = 0;
    std::atomic<bool> mv_filter_overflow = false;
-   // "kCpuVc4Pool": every pooled copy, and those nobody held anymore at the last scene opening (taken by the next copies). Under
+   // "kCpuVc4Pool": every pooled copy, and those nobody held anymore at the last present (taken by the next copies). Under
    // "mv_constants_mutex".
    std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
    std::vector<uint32_t> mv_constants_pool_free;
+   size_t mv_constants_made = 0; // Copies asked for since the last present
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with a world translation and vc4. A draw takes the previous
@@ -588,6 +589,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    {
       uint32_t motion_vector_draws = 0, jitter_draws = 0, reactive_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, maps = 0, updates = 0, other_maps = 0, sr_draws = 0;
       uint32_t offset_bindings = 0;     // vc4 bound at a constant buffer offset (a ring: the per-buffer copies would be wrong)
+      uint32_t constants_pool = 0;      // At present: the pooled copies (see "NewConstantsCopy")
       uint32_t tiebreak_collisions = 0; // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
       uint32_t ended_by = 0;
       float near_plane = 0.f, far_plane = 0.f;                                                       // The upscaler's, from the camera's projection (0: none found)
@@ -1141,10 +1143,11 @@ class MassEffect final : public Game
       return desc.ByteWidth;
    }
 
-   // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the scene opening ("kCpuVc4Pool"), else a
+   // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the last present ("kCpuVc4Pool"), else a
    // new one. Under "mv_constants_mutex".
    static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MassEffectGameDeviceData& gd, const uint8_t* bytes, size_t size)
    {
+      gd.mv_constants_made++;
       if (IsCpuOptimized(kCpuVc4Pool) && !gd.mv_constants_pool_free.empty())
       {
          auto copy = gd.mv_constants_pool[gd.mv_constants_pool_free.back()];
@@ -1612,15 +1615,6 @@ class MassEffect final : public Game
             entry.second.clear();
          if (!previous_valid)
             gd.mv_previous_objects.clear();
-         {
-            const std::lock_guard lock(gd.mv_constants_mutex);
-            gd.mv_constants_pool_free.clear();
-            for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
-            {
-               if (gd.mv_constants_pool[i].use_count() == 1)
-                  gd.mv_constants_pool_free.push_back(i);
-            }
-         }
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
@@ -2397,7 +2391,7 @@ public:
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.reactive_draws", &stats.reactive_draws}, {"mv.matched", &stats.matched},
                                {"mv.camera_only", &stats.camera_only}, {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.maps", &stats.maps}, {"mv.updates", &stats.updates},
-                               {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.offset_bindings", &stats.offset_bindings}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by},
+                               {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.offset_bindings", &stats.offset_bindings}, {"mv.constants_pool", &stats.constants_pool}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by},
                                {"mv.scene_reads_after_end", &stats.scene_reads_after_end}, { "mv.scene_reader_hash",
                                   &stats.scene_reader }},
          &device_data);
@@ -3477,6 +3471,30 @@ public:
          const std::unique_lock lock(s_mutex_samplers);
          // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
          device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f;
+      }
+      {
+         // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many
+         // as the last frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their
+         // peak otherwise. Without motion vectors, none.
+         const std::lock_guard lock(gd.mv_constants_mutex);
+         size_t kept_free = gd.mv_active ? std::exchange(gd.mv_constants_made, 0) : 0;
+         std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
+            {
+               if (copy.use_count() != 1)
+                  return false;
+               if (kept_free == 0)
+                  return true;
+               kept_free--;
+               return false; });
+         gd.mv_constants_pool_free.clear();
+         for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
+         {
+            if (gd.mv_constants_pool[i].use_count() == 1)
+               gd.mv_constants_pool_free.push_back(i);
+         }
+#if DEVELOPMENT
+         gd.mv_stats.constants_pool = uint32_t(gd.mv_constants_pool.size());
+#endif
       }
 #if DEVELOPMENT
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
