@@ -1,6 +1,6 @@
 // SMAA (https://github.com/iryoku/smaa) in place of the game's compute FXAA resolve: ULTRA preset, color edge detection and depth
 // predication. The input is a snapshot of the fp16 swapchain, gamma-encoded (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white), so
-// highlights run past 1. Edge detection reads it as stored; blending reads its linear decode (Luma_BL_SMAALinearize) and re-encodes.
+// highlights run past 1. Edge detection reads it as stored; blending filters it in linear light and re-encodes.
 
 #include "../Includes/Common.hlsl"
 
@@ -30,6 +30,8 @@ cbuffer SmaaMetricsCB : register(b1)
 
 // Edge detection: tex0 = colorTexGamma (stored scene snapshot)
 // tex1 = predicationTex (plane-deviation edge mask)
-// Neighborhood blending: tex0 = colorTex (linear copy), tex1 = blendTex. Re-encode to the canvas' gamma.
+// Neighborhood blending: tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex. Re-encode to the canvas'
+// gamma.
+#define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 #include "../Includes/SMAA_Passes.hlsl"

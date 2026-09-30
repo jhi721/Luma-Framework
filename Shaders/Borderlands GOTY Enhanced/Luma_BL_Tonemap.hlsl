@@ -171,10 +171,7 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
 #endif
 
    // --- Common tail: the UI paper white pre-scale and the post-process space encode ---
-#if UI_DRAW_TYPE >= 2
-   // Pre-scale so the gamma-SDR HUD (drawn on top) lands at UIPaperWhite after composition rescales by it.
-   outColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
+   outColor = PreScaleForUIPaperWhite(outColor);
    // The extended grade and the MacLeod-Boynton hue stage can emit NaN or negatives (the scene carries small negative/WCG values):
    // none may reach the swapchain.
    outColor = (outColor == outColor) ? outColor : 0.0; // NaN -> 0 (NaN != NaN)

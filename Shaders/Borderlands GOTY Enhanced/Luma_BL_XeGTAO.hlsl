@@ -69,10 +69,7 @@ cbuffer LumaGTAO : register(b11)
 // Intel's floor: disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible)
 #define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility);
 
-// Flips the decoded normal z if the view-space handedness needs it: with DebugViewRT 2, smooth per-surface shading is correct, and
-// inverted shading wants -1.
-#define NORMAL_Z_SIGN       (1.0)
-
+// The game's HBAO+ constants as XeGTAO's
 #define VIEWPORT_PIXEL_SIZE InvFullResolution
 
 // GFSDK ProjInfo is exactly the NDC->view mul/add pair (live FOV, dialogue zoom included).
@@ -93,12 +90,11 @@ float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
 
 Texture2D tex1 : register(t1); // the game's ViewNormalTex (r11g11b10_float, captured at the coarse-AO dispatch)
 
-// Decode the game's packed view-space normals: xyz in [0,1] -> [-1,1], all three channels (see NORMAL_Z_SIGN).
+// Decode the game's packed view-space normals: xyz in [0,1] -> [-1,1], all three channels (checked with DebugViewRT 2: smooth
+// per-surface shading, no z flip needed).
 float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 {
-   float3 n = tex1.Load(int3(pixCoord, 0)).xyz * 2.0 - 1.0;
-   n.z *= NORMAL_Z_SIGN;
-   return normalize(n);
+   return normalize(tex1.Load(int3(pixCoord, 0)).xyz * 2.0 - 1.0);
 }
 
 // tex0 = the game's full-res scene depth for the prefilter (r24_g8, viewed r24_unorm_x8, captured at the deinterleave dispatch)

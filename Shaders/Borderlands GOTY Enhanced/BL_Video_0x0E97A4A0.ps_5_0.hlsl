@@ -57,10 +57,8 @@ void main(
       lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
    }
 #endif
-#if UI_DRAW_TYPE >= 2
-   // As in Luma_BL_Tonemap.hlsl: full-screen movies land at the in-game brightness after the composition's UIPaperWhite rescale.
-   lin *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
+   // Full-screen movies land at the in-game brightness after the composition's UIPaperWhite rescale
+   lin = PreScaleForUIPaperWhite(lin);
    o0.rgb = linear_to_gamma(lin); // Gamma, as the tonemap pass stores it
    return;
 }
