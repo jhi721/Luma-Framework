@@ -346,6 +346,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       com_ptr<ID3D11CommandList> remainder;  // Held so its address (the pending split's key) can't be reused
       com_ptr<ID3D11Texture2D> source_color; // Also the output at native resolution (DLAA), read by the post process
       com_ptr<ID3D11Texture2D> output_color; // Upscaling only (render scale below 1): the output, read by the post process
+      com_ptr<ID3D11Texture2D> motion_vectors;
       com_ptr<ID3D11Resource> depth;
       std::array<float, 2> jitter;
       float vertical_fov = 0.7330383f; // Radians (FSR needs it), 42 degrees as measured in dialogue until the frame's camera is known
@@ -373,9 +374,9 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    ID3D11DeviceContext* sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the scene's command lists
    std::atomic<bool> sr_active = false;
-   // A new upscaler output texture this frame (see the DLSS workaround after "Draw")
-   std::atomic<bool> sr_output_recreated = false;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
+   // Immediate context only: the upscaled output DLSS/FSR last drew into, null after a DLAA frame (see the DLSS workaround after "Draw")
+   com_ptr<ID3D11Texture2D> sr_drawn_output;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_output_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_output_srv;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_canvas_rtv;
@@ -436,8 +437,13 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::unordered_map<ID3D11Resource*, LayerOutput> layer_composed;
    com_ptr<ID3D11RenderTargetView> layer_histogram_rtv; // The stretch target downscaled to render resolution, for the exposure
    com_ptr<ID3D11ShaderResourceView> layer_histogram_srv;
-   std::atomic<uint32_t> sr_render_height = 1;
-   std::atomic<uint32_t> sr_output_height = 1;
+   // The last split's heights, for the mip bias at present
+   struct SRHeights
+   {
+      uint32_t render = 1;
+      uint32_t output = 1;
+   };
+   std::atomic<SRHeights> sr_heights = SRHeights{};
 };
 
 class Persona5Strikers final : public Game
@@ -1675,11 +1681,14 @@ public:
 
       D3D11_TEXTURE2D_DESC desc;
       split.source_color->GetDesc(&desc);
-      // The instance too: the selection is taken at present, Core may have changed it since
-      if (IsSRActive(*device_data) && game_device_data.mv_texture && device_data->GetSRInstanceData())
+      bool drawn = false;
+      // The instance too: the selection is taken at present, Core may have changed it since. NGX and FSR run on the immediate context
+      // only (the game could execute the remainder into another command list).
+      if (native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && IsSRActive(*device_data) && split.motion_vectors && device_data->GetSRInstanceData())
       {
          // Written as a UAV. Upscaling: into the split's output, read by the post process; DLAA: copied back into the scene.
          D3D11_TEXTURE2D_DESC output_desc = {};
+         bool output_recreated = split.output_color && split.output_color != game_device_data.sr_drawn_output;
          if (!split.output_color)
          {
             if (device_data->sr_output_color)
@@ -1689,7 +1698,7 @@ public:
                device_data->sr_output_color.reset();
                output_desc = {desc.Width, desc.Height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
                native_device->CreateTexture2D(&output_desc, nullptr, &device_data->sr_output_color);
-               game_device_data.sr_output_recreated = true;
+               output_recreated = true;
             }
          }
          ID3D11Texture2D* const output_color = split.output_color ? split.output_color.get() : device_data->sr_output_color.get();
@@ -1716,7 +1725,7 @@ public:
          SR::SuperResolutionImpl::DrawData draw_data;
          draw_data.source_color = split.source_color.get();
          draw_data.output_color = output_color;
-         draw_data.motion_vectors = game_device_data.mv_texture.get();
+         draw_data.motion_vectors = split.motion_vectors.get();
          draw_data.depth_buffer = split.depth.get();
          draw_data.render_width = desc.Width;
          draw_data.render_height = desc.Height;
@@ -1736,18 +1745,34 @@ public:
             // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame
             // shows the texture's stale memory until its feature is created again after a draw. Settings changed once here force that at
             // the next frame's "UpdateSettings".
-            if (game_device_data.sr_output_recreated.exchange(false) && device_data->sr_type == SR::Type::DLSS)
+            if (output_recreated && device_data->sr_type == SR::Type::DLSS)
             {
                SR::SettingsData throwaway_settings_data = settings_data;
                throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
                sr_implementations[device_data->sr_type]->UpdateSettings(sr_instance_data, native_device_context.get(), throwaway_settings_data);
             }
             device_data->has_drawn_sr = true;
+            game_device_data.sr_drawn_output = split.output_color;
+            drawn = true;
          }
          else
          {
             // Back to SMAA until the upscaler is picked again
             device_data->sr_suppressed = true;
+         }
+      }
+      // The post process reads the upscaled output: without the upscaler it gets the scene stretched, not the texture's old contents
+      if (!drawn && split.output_color)
+      {
+         D3D11_SHADER_RESOURCE_VIEW_DESC source_srv_desc = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_SRV_DIMENSION_TEXTURE2D};
+         source_srv_desc.Texture2D.MipLevels = 1;
+         com_ptr<ID3D11ShaderResourceView> source_srv;
+         com_ptr<ID3D11RenderTargetView> output_rtv;
+         if (SUCCEEDED(native_device->CreateShaderResourceView(split.source_color.get(), &source_srv_desc, &source_srv)) && SUCCEEDED(native_device->CreateRenderTargetView(split.output_color.get(), nullptr, &output_rtv)))
+         {
+            D3D11_TEXTURE2D_DESC output_desc;
+            split.output_color->GetDesc(&output_desc);
+            DrawScaled(native_device_context.get(), *device_data, source_srv.get(), output_rtv.get(), output_desc.Width, output_desc.Height);
          }
       }
 #if DEVELOPMENT
@@ -2337,10 +2362,14 @@ public:
          D3D11_TEXTURE2D_DESC scene_desc = {};
          if (scene && SUCCEEDED(scene->QueryInterface(&split.source_color)))
             split.source_color->GetDesc(&scene_desc);
+         {
+            const std::shared_lock lock(game_device_data.mv_mutex);
+            split.motion_vectors = game_device_data.mv_texture;
+         }
          uint4 mv_size = {};
          DXGI_FORMAT mv_format;
-         if (game_device_data.mv_texture)
-            GetResourceInfo(game_device_data.mv_texture.get(), mv_size, mv_format);
+         if (split.motion_vectors)
+            GetResourceInfo(split.motion_vectors.get(), mv_size, mv_format);
          split.depth = game_device_data.mv_frame_depth;
          split.jitter = game_device_data.mv_jitter;
          // "mW2P" is row major and multiplies row vectors: its column 1 (xyz) is the view's up axis times 1 / tan(fov / 2)
@@ -2374,7 +2403,6 @@ public:
                   game_device_data.sr_upscaled_output.reset();
                   game_device_data.sr_upscaled_canvas_srv.reset();
                }
-               game_device_data.sr_output_recreated = created;
 #if DEVELOPMENT
                reshade::log::message(created ? reshade::log::level::info : reshade::log::level::warning, std::format("[P5S SR] upscaling {}x{} -> {}x{}{}", scene_desc.Width, scene_desc.Height, output_size.x, output_size.y, created ? "" : " failed").c_str());
 #endif
@@ -2415,9 +2443,8 @@ public:
                   native_device->CreateRenderTargetView(split.source_color.get(), &scene_rtv_desc, &game_device_data.post_scene_rtv);
                }
             }
-            game_device_data.sr_render_height = scene_desc.Height;
+            game_device_data.sr_heights.store({.render = scene_desc.Height, .output = (split.output_color ? output_size.y : scene_desc.Height)});
             device_data.render_resolution = {float(scene_desc.Width), float(scene_desc.Height)}; // Shown by Core
-            game_device_data.sr_output_height = split.output_color ? output_size.y : scene_desc.Height;
 #if DEVELOPMENT
             {
                const std::lock_guard perf_lock(game_device_data.perf_mutex);
@@ -2874,7 +2901,8 @@ public:
       if (!custom_texture_mip_lod_bias_offset)
       {
          const std::unique_lock lock(s_mutex_samplers);
-         device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load()) : 0.f;
+         const auto heights = game_device_data.sr_heights.load();
+         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(heights.render, heights.output) : 0.f);
       }
 #if DEVELOPMENT
       // "Performance Test": the finished timestamp sets, averaged into a log line every 120 frames (the first 60 after a mode change skipped)
@@ -2930,7 +2958,7 @@ public:
          else if (++stats.frames >= 120)
          {
             const uint32_t samples = (std::max)(stats.samples, 1u);
-            reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms gpu game composite avg/max={:.3f}/{:.3f} ms ({} samples) cpu hooks={:.3f} ms/frame globals filter={} samples={}/{} disjoint={}", perf_test_modes[g_perf_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_render_height.load(), game_device_data.sr_output_height.load(), stats.scene_ms / samples, stats.scene_max_ms, stats.sr_ms / samples, stats.sr_max_ms, stats.composite_ms / (std::max)(stats.composite_samples, 1u), stats.composite_max_ms, stats.composite_samples, double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, game_device_data.mv_filtered_globals_buffer_count.load(), stats.samples, stats.frames, stats.disjoint).c_str());
+            reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms gpu game composite avg/max={:.3f}/{:.3f} ms ({} samples) cpu hooks={:.3f} ms/frame globals filter={} samples={}/{} disjoint={}", perf_test_modes[g_perf_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_heights.load().render, game_device_data.sr_heights.load().output, stats.scene_ms / samples, stats.scene_max_ms, stats.sr_ms / samples, stats.sr_max_ms, stats.composite_ms / (std::max)(stats.composite_samples, 1u), stats.composite_max_ms, stats.composite_samples, double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, game_device_data.mv_filtered_globals_buffer_count.load(), stats.samples, stats.frames, stats.disjoint).c_str());
             stats = {};
          }
       }
