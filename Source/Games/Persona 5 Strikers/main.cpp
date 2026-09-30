@@ -160,7 +160,9 @@ namespace
 struct Persona5StrikersGameDeviceData final : public GameDeviceData
 {
    // SMAA scratch, recreated on canvas resize: a linear canvas copy (SMAA can't sample the canvas it writes), its gamma encode (edge
-   // detection input; with RCAS also SMAA's output for finalize) and the predication edge-ness.
+   // detection input; with RCAS also SMAA's output for finalize) and the predication edge-ness. Guarded (with Core's SMAA intermediates):
+   // the main menu records its two composites on two deferred contexts, one of them may release it idle while the other draws.
+   std::shared_mutex smaa_mutex;
    com_ptr<ID3D11Texture2D> smaa_linear_texture;
    com_ptr<ID3D11ShaderResourceView> smaa_linear_srv;
    com_ptr<ID3D11ShaderResourceView> smaa_gamma_srv;
@@ -243,9 +245,11 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::unordered_map<uint32_t, GlobalsLayout> mv_globals_layouts;
    // The scene records on one deferred context: after its first post pass, the next scene depth draw (depth prepass, else G-buffer)
    // starts a frame and clears the target
-   bool mv_frame_ended = true;
-   com_ptr<ID3D11Resource> mv_scene_depth;          // The G-buffer's depth, which the forward redraws share
-   ID3D11DeviceContext* mv_scene_context = nullptr; // Only compared
+   // Atomics: every context's depth draws check them (shadows, other passes) before touching the scene's state
+   std::atomic<bool> mv_frame_ended = true;
+   com_ptr<ID3D11Resource> mv_scene_depth;                       // The G-buffer's depth, which the forward redraws share
+   std::atomic<ID3D11Resource*> mv_scene_depth_id = nullptr;     // "mv_scene_depth", for other contexts to compare
+   std::atomic<ID3D11DeviceContext*> mv_scene_context = nullptr; // Only compared
 
    // The $Globals buffers patched draws bind (mapped with discard before nearly every draw; some draws reuse the last contents): each
    // Map's pointer, and at Unmap a CPU snapshot of it that the draws (and the object history) share
@@ -371,7 +375,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // Upscaling: the game renders scene and post (composite included) at render scale, then stretches onto the swapchain. Instead the
    // upscaler writes the output resolution, the post process up to the composite runs at the output resolution on it (see
    // "RedirectPostDraw"), and the composite draws from it into an output sized canvas that the stretch copies 1:1.
-   ID3D11DeviceContext* sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
+   std::atomic<ID3D11DeviceContext*> sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the scene's command lists
    std::atomic<bool> sr_active = false;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
@@ -402,7 +406,10 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // The tent scale of the frame's bloom upsamples with the iterations the game skips below the output resolution ("ExtendBloom",
    // "LumaData.CustomData3"): 0 for the game's, < 0 until the first upsample
    float bloom_sample_scale = -1.f;
-   com_ptr<ID3D11Resource> composite_target; // This frame's composite target when it isn't the swapchain (render scales below 1)
+   // This frame's composite target when it isn't the swapchain (render scales below 1): reset at the scene's start, set by the composite,
+   // read by the stretch, which may record on different contexts
+   std::shared_mutex composite_target_mutex;
+   com_ptr<ID3D11Resource> composite_target;
    // The game's "RenderScale" in memory (see "FindRenderScaleSetting"), null if not found. Present thread only.
    int32_t* render_scale_setting = nullptr;
    bool render_scale_searched = false;
@@ -702,7 +709,10 @@ class Persona5Strikers final : public Game
       game_device_data.sr_split_ready = true;
       game_device_data.scene_drawn = true;
       game_device_data.sr_upscaling_context = nullptr; // Until this frame's split decides
-      game_device_data.composite_target.reset();
+      {
+         const std::unique_lock lock(game_device_data.composite_target_mutex);
+         game_device_data.composite_target.reset();
+      }
       // Last frame's camera is the previous one, unless scene-less frames (menus) came between
       game_device_data.mv_previous_view_projection = game_device_data.mv_view_projection;
       game_device_data.mv_previous_view_projection_valid = game_device_data.mv_view_projection_valid && game_device_data.mv_presents - game_device_data.mv_frame_present <= 1;
@@ -888,7 +898,7 @@ class Persona5Strikers final : public Game
       auto& game_device_data = GetGameDeviceData(device_data);
       const com_ptr<ID3D11Resource> depth = GetViewResource(dsv);
       // Into the last G-buffer's depth; only a depth prepass starts a frame, others join it
-      if (!depth || depth != game_device_data.mv_scene_depth || !game_device_data.mv_rtv || (game_device_data.mv_frame_ended ? !depth_prepass : native_device_context != game_device_data.mv_scene_context))
+      if (!depth || depth.get() != game_device_data.mv_scene_depth_id || !game_device_data.mv_rtv || (game_device_data.mv_frame_ended ? !depth_prepass : native_device_context != game_device_data.mv_scene_context))
          return false;
       const com_ptr<ID3D11VertexShader> vertex_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_vertex_shaders, original_shader_hashes.vertex_shaders[0], cmd_list_data.pipeline_state_original_vertex_shader);
       if (!vertex_shader)
@@ -921,7 +931,7 @@ class Persona5Strikers final : public Game
       auto& game_device_data = GetGameDeviceData(device_data);
       const com_ptr<ID3D11Resource> depth = GetViewResource(dsv);
       // Forward draws: into this frame's G-buffer depth, before its post
-      if (!gbuffer && (game_device_data.mv_frame_ended || native_device_context != game_device_data.mv_scene_context || !depth || depth != game_device_data.mv_scene_depth || !game_device_data.mv_rtv))
+      if (!gbuffer && (game_device_data.mv_frame_ended || native_device_context != game_device_data.mv_scene_context || !depth || depth.get() != game_device_data.mv_scene_depth_id || !game_device_data.mv_rtv))
          return false;
       com_ptr<ID3D11BlendState> blend_state;
       FLOAT blend_factor[4];
@@ -967,6 +977,7 @@ class Persona5Strikers final : public Game
             DXGI_FORMAT depth_format;
             GetResourceInfo(depth.get(), depth_size, depth_format);
             game_device_data.mv_scene_depth = depth;
+            game_device_data.mv_scene_depth_id = depth.get();
             const std::unique_lock lock(game_device_data.mv_mutex);
             D3D11_TEXTURE2D_DESC desc = {};
             if (game_device_data.mv_texture)
@@ -1374,6 +1385,7 @@ public:
       if (smaa && (!HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h)))
          return DrawOrDispatchOverrideType::None;
 
+      const std::unique_lock lock_smaa(game_device_data.smaa_mutex);
       game_device_data.smaa_copies_frame = cb_luma_global_settings.FrameIndex;
       if (smaa)
          game_device_data.smaa_frame = cb_luma_global_settings.FrameIndex;
@@ -2264,7 +2276,7 @@ public:
             com_ptr<ID3D11Buffer> vertex_buffer;
             // Forward draws join a started frame on the scene context; outside a frame only a depth prepass (no targets) starts one
             const bool scene_draw = game_device_data.mv_frame_ended ? !rtvs[0] : native_device_context == game_device_data.mv_scene_context;
-            if (!gbuffer && dsv && scene_draw && GetViewResource(dsv.get()) == game_device_data.mv_scene_depth)
+            if (!gbuffer && dsv && scene_draw && GetViewResource(dsv.get()).get() == game_device_data.mv_scene_depth_id)
             {
                com_ptr<ID3D11DepthStencilState> depth_stencil_state;
                UINT stencil_ref;
@@ -2423,7 +2435,7 @@ public:
                if (SUCCEEDED(native_device_context->Map(buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
                   native_device_context->Unmap(buffer.get(), 0);
             }
-            game_device_data.sr_upscaling_context = split.output_color ? native_device_context : nullptr;
+            game_device_data.sr_upscaling_context = (split.output_color ? native_device_context : nullptr);
             // Upscaling: the post process up to the composite runs at the output resolution (see "RedirectPostDraw")
             game_device_data.post_redirect = split.output_color && g_post_output_resolution;
             game_device_data.post_scene_current = false;
@@ -2493,14 +2505,19 @@ public:
       {
          device_data.has_drawn_main_post_processing = true;
          // Here rather than at present, as the post process (the scratch's only user) records on a deferred context
-         if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_frame > smaa_idle_release_frames)
          {
-            game_device_data.smaa_predication_srv.reset();
-            game_device_data.smaa_predication_uav.reset();
-            ReleaseSMAA(device_data);
+            const std::unique_lock lock_smaa(game_device_data.smaa_mutex);
+            if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_frame > smaa_idle_release_frames)
+            {
+               game_device_data.smaa_predication_srv.reset();
+               game_device_data.smaa_predication_uav.reset();
+               ReleaseSMAA(device_data);
+            }
+            if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_copies_frame > smaa_idle_release_frames)
+            {
+               game_device_data.ReleaseSMAACopies();
+            }
          }
-         if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_copies_frame > smaa_idle_release_frames)
-            game_device_data.ReleaseSMAACopies();
          if (!can_draw)
             return DrawOrDispatchOverrideType::None;
          // Below render scale 1 the composite draws into its own target, which the game stretches onto the swapchain
@@ -2508,10 +2525,17 @@ public:
             com_ptr<ID3D11RenderTargetView> rtv;
             native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
             const com_ptr<ID3D11Resource> target = GetViewResource(rtv.get());
-            game_device_data.composite_target.reset();
-            if (target && !IsBackBuffer(&device_data, target.get()))
+            const bool own_target = target && !IsBackBuffer(&device_data, target.get());
             {
-               game_device_data.composite_target = target;
+               const std::unique_lock lock(game_device_data.composite_target_mutex);
+               game_device_data.composite_target.reset();
+               if (own_target)
+               {
+                  game_device_data.composite_target = target;
+               }
+            }
+            if (own_target)
+            {
                uint4 target_size;
                DXGI_FORMAT target_format;
                GetResourceInfo(target.get(), target_size, target_format);
@@ -2660,11 +2684,16 @@ public:
       }
 
       // The game's stretch of the composite target onto the swapchain (render scales below 1) is scene, not UI. Upscaled, it copies the canvas 1:1.
-      if (game_device_data.composite_target && original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && can_draw)
+      if (original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && can_draw)
       {
+         com_ptr<ID3D11Resource> composite_target;
+         {
+            const std::shared_lock lock(game_device_data.composite_target_mutex);
+            composite_target = game_device_data.composite_target;
+         }
          com_ptr<ID3D11ShaderResourceView> game_srv;
          native_device_context->PSGetShaderResources(0, 1, &game_srv);
-         if (const com_ptr<ID3D11Resource> source = GetViewResource(game_srv.get()); source && source == game_device_data.composite_target)
+         if (const com_ptr<ID3D11Resource> source = GetViewResource(game_srv.get()); source && source == composite_target)
          {
             if (native_device_context != game_device_data.sr_upscaling_context)
                return DrawOrDispatchOverrideType::None;
