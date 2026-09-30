@@ -120,7 +120,9 @@ namespace
    {
       com_ptr<ID3D11Resource> resource;
       if (view)
+      {
          view->GetResource(&resource);
+      }
       return resource;
    }
 
@@ -148,8 +150,8 @@ namespace
    // Viewport and scissor over a whole target (the game scissors its passes)
    void SetFullTargetViewport(ID3D11DeviceContext* native_device_context, UINT width, UINT height, float min_depth = 0.f, float max_depth = 1.f)
    {
-      const D3D11_VIEWPORT viewport = {0.f, 0.f, float(width), float(height), min_depth, max_depth};
-      const D3D11_RECT scissor = {0, 0, LONG(width), LONG(height)};
+      const D3D11_VIEWPORT viewport = {.TopLeftX = 0.f, .TopLeftY = 0.f, .Width = float(width), .Height = float(height), .MinDepth = min_depth, .MaxDepth = max_depth};
+      const D3D11_RECT scissor = {.left = 0, .top = 0, .right = LONG(width), .bottom = LONG(height)};
       native_device_context->RSSetViewports(1, &viewport);
       native_device_context->RSSetScissorRects(1, &scissor);
    }
@@ -186,7 +188,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // Full res scene depth (SSAO depth downsample's t0) for predication, and for motion vectors when the G-buffer's is unreadable.
    // Kept across frames (the texture persists, rewritten before post): SSAO and post record on different deferred contexts, so per frame
    // resets would race.
-   std::mutex smaa_depth_mutex;
+   std::shared_mutex smaa_depth_mutex;
    com_ptr<ID3D11ShaderResourceView> smaa_depth_srv;
 
    // SMAA ran after this frame's composite, or DLSS/FSR before its post: skip the vanilla FXAA
@@ -199,7 +201,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11BlendState> ui_max_blend_states[2];
 
    // XeGTAO scratch, recreated on SSAO target resize; mutex guarded, as SSAO records on worker threads (deferred contexts)
-   std::mutex gtao_mutex;
+   std::shared_mutex gtao_mutex;
    com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5]; // R32F view space depth pyramid, 5 mips
    com_ptr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
    com_ptr<ID3D11UnorderedAccessView> gtao_working_uavs[2]; // R8G8_UNORM AO + edges ping-pong
@@ -260,7 +262,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       UINT size = 0;
       GlobalsCopy copy; // Null until the first Unmap after the buffer's registration
    };
-   std::mutex mv_globals_mutex;
+   std::shared_mutex mv_globals_mutex;
    std::unordered_map<uint64_t, GlobalsBuffer> mv_globals_buffers;
    // "mv_globals_buffers" again, for the buffer hooks to skip the game's other buffers without the lock (see "MayBeGlobalsBuffer"): an
    // open addressing set (0 = empty slot), filled under "mv_globals_mutex" up to 3/4, then a count above that lets every buffer through.
@@ -355,14 +357,14 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       std::array<float, 2> jitter;
       float vertical_fov = 0.7330383f; // Radians (FSR needs it), 42 degrees as measured in dialogue until the frame's camera is known
    };
-   std::mutex sr_mutex;
+   std::shared_mutex sr_mutex;
    bool sr_split_ready = false;                                // Scene context only: this frame's G-buffer drew, not split yet
    uint64_t sr_split_context = 0;                              // The context split last, until the game finishes its command list
    SRSplit sr_split;                                           // The last split, likewise
    std::unordered_map<uint64_t, SRSplit> sr_pending_splits;    // By the game's command list (the remainder), until executed
    std::vector<com_ptr<ID3D11Buffer>> sr_no_overwrite_buffers; // Dynamic buffers the game appends to ("D3D11_MAP_WRITE_NO_OVERWRITE")
 #if DEVELOPMENT
-   std::mutex perf_mutex;
+   std::shared_mutex perf_mutex;
    std::array<PerfQueries, 8> perf_queries;
    size_t perf_query_index = 0;
    std::array<PerfDrawQueries, 8> perf_composite_queries;
@@ -401,7 +403,12 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       std::vector<com_ptr<ID3D11RenderTargetView>> mip_rtvs;
    };
    std::unordered_map<ID3D11Resource*, PostTarget> post_targets;
-   std::unordered_map<ID3D11View*, std::pair<com_ptr<ID3D11View>, com_ptr<ID3D11View>>> post_views;
+   struct PostView
+   {
+      com_ptr<ID3D11View> original; // Held, so its address can't be reused
+      com_ptr<ID3D11View> replacement;
+   };
+   std::unordered_map<ID3D11View*, PostView> post_views;
    std::array<uint2, 2> post_sizes = {};
    // The tent scale of the frame's bloom upsamples with the iterations the game skips below the output resolution ("ExtendBloom",
    // "LumaData.CustomData3"): 0 for the game's, < 0 until the first upsample
@@ -428,7 +435,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       std::vector<ID3D11Resource*> targets; // Only compared
       float scale[2] = {1.f, 1.f};          // Render resolution / output resolution
    };
-   std::mutex layer_mutex;
+   std::shared_mutex layer_mutex;
    std::unordered_map<ID3D11DeviceContext*, LayerFrame> layer_frames;     // By context, until its stretch
    std::unordered_map<uint32_t, UINT> layer_cluster_scale_offsets;        // "fClstScl" in each pixel shader's $Globals, by original hash (UINT_MAX if none)
    std::unordered_map<UINT, com_ptr<ID3D11Buffer>> layer_globals_buffers; // The patched $Globals uploads, one dynamic buffer per size
@@ -478,11 +485,13 @@ class Persona5Strikers final : public Game
    {
       std::atomic<int64_t>& total_ns;
       const bool enabled = g_perf_test != 0;
-      const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      const std::chrono::steady_clock::time_point start = (enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{});
       ~PerfHookTimer()
       {
          if (enabled)
+         {
             total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+         }
       }
    };
 #endif
@@ -533,7 +542,9 @@ class Persona5Strikers final : public Game
       {
          const std::lock_guard lock(game_device_data.mv_globals_mutex);
          if (const auto buffer = game_device_data.mv_globals_buffers.find(resource.handle); buffer != game_device_data.mv_globals_buffers.end())
+         {
             buffer->second.mapped = *data;
+         }
       }
       // A deferred context's first map of a dynamic buffer in a command list must discard, so the split discards these (see "sr_no_overwrite_buffers")
       else if (access == reshade::api::map_access::write_only)
@@ -548,7 +559,9 @@ class Persona5Strikers final : public Game
          {
             // ponytail: cap, the game has a few (dialogue text vertices and indices); a released buffer stays referenced until the cap clears it
             if (game_device_data.sr_no_overwrite_buffers.size() >= 16)
+            {
                game_device_data.sr_no_overwrite_buffers.clear();
+            }
             game_device_data.sr_no_overwrite_buffers.emplace_back(buffer);
          }
       }
@@ -619,7 +632,7 @@ class Persona5Strikers final : public Game
          {
             const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
             const auto* code = static_cast<const uint8_t*>(desc->code);
-            patched = vertex ? MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error) : MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error);
+            patched = (vertex ? MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error) : MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error));
             com_ptr<ID3D11ShaderReflection> reflection;
             if (vertex && Shader::d3d_reflect && SUCCEEDED(Shader::d3d_reflect(code, desc->code_size, IID_PPV_ARGS(&reflection))))
             {
@@ -627,9 +640,13 @@ class Persona5Strikers final : public Game
                ID3D11ShaderReflectionConstantBuffer* const globals = reflection->GetConstantBufferByName("$Globals");
                D3D11_SHADER_VARIABLE_DESC variable;
                if (SUCCEEDED(globals->GetVariableByName("mW2P")->GetDesc(&variable)) && variable.Size == 64)
+               {
                   layout.view_projection = variable.StartOffset;
+               }
                if (SUCCEEDED(globals->GetVariableByName("mL2W")->GetDesc(&variable)) && variable.Size >= 48)
+               {
                   layout.world = variable.StartOffset;
+               }
                D3D11_SHADER_DESC shader_desc;
                if (SUCCEEDED(reflection->GetDesc(&shader_desc)))
                {
@@ -649,20 +666,28 @@ class Persona5Strikers final : public Game
       com_ptr<T> shader;
       if (!patched.empty())
       {
-         HRESULT hr;
-         if constexpr (vertex)
-            hr = native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &shader);
-         else
-            hr = native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &shader);
+         const HRESULT hr = [&]
+         {
+            if constexpr (vertex)
+               return native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &shader);
+            else
+               return native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &shader);
+         }();
          if (FAILED(hr))
+         {
             error = std::format("create 0x{:08X}", uint32_t(hr));
+         }
       }
       // Failures in every build (bug reports), every patched shader only in development
       if (DEVELOPMENT || !shader)
+      {
          reshade::log::message(shader ? reshade::log::level::info : reshade::log::level::warning, std::format("[P5S MV] {} 0x{:08X} {}", vertex ? "VS" : "PS", hash, shader ? "patched" : error).c_str());
+      }
       const std::unique_lock lock(game_device_data.mv_mutex);
       if (vertex)
+      {
          game_device_data.mv_globals_layouts.try_emplace(hash, layout);
+      }
       return shaders->try_emplace(hash, shader).first->second;
    }
 
@@ -680,7 +705,7 @@ class Persona5Strikers final : public Game
          // Skipped while the ring's next set is still unread
          if (g_perf_test != 0 && !queries.pending)
          {
-            const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
+            const D3D11_QUERY_DESC disjoint_desc = {.Query = D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {.Query = D3D11_QUERY_TIMESTAMP};
             if (!queries.disjoint)
             {
                native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
@@ -701,7 +726,7 @@ class Persona5Strikers final : public Game
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          game_device_data.mv_fill_pending = game_device_data.mv_uav && HasShaders(device_data.native_compute_shaders, "P5S Motion Vector Fill CS"_h);
       }
-      const FLOAT clear_value = game_device_data.mv_fill_pending ? 65504.f : 0.f;
+      const FLOAT clear_value = (game_device_data.mv_fill_pending ? 65504.f : 0.f);
       const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
       native_device_context->ClearRenderTargetView(game_device_data.mv_rtv.get(), clear);
       game_device_data.mv_frame_ended = false;
@@ -725,19 +750,25 @@ class Persona5Strikers final : public Game
          { return PatchedDraws::SameBytes(a.globals, b.globals); });
 #endif
       std::erase_if(game_device_data.mv_objects, [](const auto& entry)
-         { return entry.second.empty(); });
+         {
+            const auto& [key, objects] = entry;
+            return objects.empty(); });
       for (auto& [key, objects] : game_device_data.mv_objects)
          objects.clear();
       if (!game_device_data.mv_previous_view_projection_valid)
+      {
          game_device_data.mv_previous_objects.clear();
+      }
       std::erase_if(game_device_data.mv_previous_resources, [&](const auto& entry)
-         { return entry.second.frame + 1 < game_device_data.mv_frame_present; });
+         {
+            const auto& [resource, previous] = entry;
+            return previous.frame + 1 < game_device_data.mv_frame_present; });
 
       // Halton (2, 3) over the upscaler's phase count (from its last settings; more at lower render scales)
       const bool jitter = IsSRActive(device_data);
-      const SR::InstanceData* const sr_instance_data = jitter ? device_data.GetSRInstanceData() : nullptr;
-      const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
-      game_device_data.mv_jitter = jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{};
+      const SR::InstanceData* const sr_instance_data = (jitter ? device_data.GetSRInstanceData() : nullptr);
+      const int phases = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
+      game_device_data.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{});
       // Pixels to NDC (y up)
       const float ndc_jitter[4] = {game_device_data.mv_jitter[0] * 2.f / float(depth_size.x), game_device_data.mv_jitter[1] * -2.f / float(depth_size.y), 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -820,16 +851,31 @@ class Persona5Strikers final : public Game
       com_ptr<ID3D11ShaderResourceView> depth_srv;
       D3D11_TEXTURE2D_DESC depth_desc = {};
       if (com_ptr<ID3D11Texture2D> depth_texture; game_device_data.mv_scene_depth && SUCCEEDED(game_device_data.mv_scene_depth->QueryInterface(&depth_texture)))
+      {
          depth_texture->GetDesc(&depth_desc);
+      }
       if ((depth_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0)
       {
          if (GetViewResource(game_device_data.mv_scene_depth_srv.get()) != game_device_data.mv_scene_depth)
          {
             game_device_data.mv_scene_depth_srv.reset();
             // The depth formats' depth channel
-            const DXGI_FORMAT format = depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : (depth_desc.Format == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_R32_FLOAT : (depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : depth_desc.Format));
-            D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {format, D3D11_SRV_DIMENSION_TEXTURE2D};
-            view_desc.Texture2D.MipLevels = 1;
+            DXGI_FORMAT format = depth_desc.Format;
+            switch (depth_desc.Format)
+            {
+            case DXGI_FORMAT_R32G8X24_TYPELESS:
+               format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+               break;
+            case DXGI_FORMAT_R32_TYPELESS:
+               format = DXGI_FORMAT_R32_FLOAT;
+               break;
+            case DXGI_FORMAT_R24G8_TYPELESS:
+               format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+               break;
+            default:
+               break;
+            }
+            const D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {.Format = format, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D, .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1}};
             native_device->CreateShaderResourceView(game_device_data.mv_scene_depth.get(), &view_desc, &game_device_data.mv_scene_depth_srv);
          }
          depth_srv = game_device_data.mv_scene_depth_srv;
@@ -856,7 +902,9 @@ class Persona5Strikers final : public Game
             const Math::Matrix44D candidate = current.GetInverted() * previous;
             if (std::all_of(candidate.GetData(), candidate.GetData() + 16, [](double value)
                    { return std::isfinite(value); }))
+            {
                reprojection = candidate;
+            }
          }
          D3D11_TEXTURE2D_DESC mv_desc;
          game_device_data.mv_texture->GetDesc(&mv_desc);
@@ -939,7 +987,9 @@ class Persona5Strikers final : public Game
       native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
       D3D11_BLEND_DESC blend_desc = {};
       if (blend_state)
+      {
          blend_state->GetDesc(&blend_desc);
+      }
       const com_ptr<ID3D11VertexShader> vertex_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_vertex_shaders, original_shader_hashes.vertex_shaders[0], cmd_list_data.pipeline_state_original_vertex_shader);
       const com_ptr<ID3D11PixelShader> pixel_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_pixel_shaders, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader);
       // Without independent blending the MV target takes RT0's blend, which must be off; with it, a state copy writes it unblended
@@ -958,7 +1008,7 @@ class Persona5Strikers final : public Game
          {
             cached_desc = blend_desc;
             D3D11_BLEND_DESC desc = blend_desc;
-            desc.RenderTarget[MotionVectorPatches::target_slot] = {FALSE, D3D11_BLEND_ONE, D3D11_BLEND_ZERO, D3D11_BLEND_OP_ADD, D3D11_BLEND_ONE, D3D11_BLEND_ZERO, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL};
+            desc.RenderTarget[MotionVectorPatches::target_slot] = {.BlendEnable = FALSE, .SrcBlend = D3D11_BLEND_ONE, .DestBlend = D3D11_BLEND_ZERO, .BlendOp = D3D11_BLEND_OP_ADD, .SrcBlendAlpha = D3D11_BLEND_ONE, .DestBlendAlpha = D3D11_BLEND_ZERO, .BlendOpAlpha = D3D11_BLEND_OP_ADD, .RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL};
             cached_state.reset();
             native_device->CreateBlendState(&desc, &cached_state);
          }
@@ -981,9 +1031,11 @@ class Persona5Strikers final : public Game
             const std::unique_lock lock(game_device_data.mv_mutex);
             D3D11_TEXTURE2D_DESC desc = {};
             if (game_device_data.mv_texture)
+            {
                game_device_data.mv_texture->GetDesc(&desc);
-            // R16G16_FLOAT: the patched draws' motion is analytic, and float16 keeps it within 0.1 % at less bandwidth (DLSS-Best-Practices MV-1)
-            const DXGI_FORMAT mv_format = g_mv_half_float ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32G32_FLOAT;
+            }
+            // R16G16_FLOAT: the patched draws' motion is analytic, and float16 keeps it within 0.1 % at less bandwidth
+            const DXGI_FORMAT mv_format = (g_mv_half_float ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32G32_FLOAT);
             if (desc.Width != depth_size.x || desc.Height != depth_size.y || desc.Format != mv_format)
             {
                game_device_data.mv_texture.reset();
@@ -991,7 +1043,7 @@ class Persona5Strikers final : public Game
                game_device_data.mv_uav.reset();
                D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {mv_format};
                const bool typed_uav_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
-               desc = {depth_size.x, depth_size.y, 1, 1, mv_format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
+               desc = {.Width = depth_size.x, .Height = depth_size.y, .MipLevels = 1, .ArraySize = 1, .Format = mv_format, .SampleDesc = {.Count = 1, .Quality = 0}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
                if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.mv_texture)) || FAILED(native_device->CreateRenderTargetView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_rtv)))
                {
                   game_device_data.mv_texture.reset();
@@ -999,12 +1051,16 @@ class Persona5Strikers final : public Game
                   return false;
                }
                if (typed_uav_load)
+               {
                   native_device->CreateUnorderedAccessView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_uav);
+               }
                game_device_data.mv_frame_ended = true;
             }
          }
          if (game_device_data.mv_frame_ended)
+         {
             StartMotionVectorFrame(native_device, native_device_context, device_data, depth_size);
+         }
       }
 #if DEVELOPMENT
       if (g_perf_test == 2)
@@ -1073,7 +1129,7 @@ class Persona5Strikers final : public Game
          }
          // Kept as drawn for the next frame
          game_device_data.mv_objects[key].push_back({translation, globals_copy});
-         const std::vector<uint8_t>* upload_data = match ? match->globals.get() : globals_copy.get();
+         const std::vector<uint8_t>* upload_data = (match ? match->globals.get() : globals_copy.get());
          // Not found: last frame's camera, if this is the frame's view projection (others are left as is)
          if (!match && game_device_data.mv_previous_view_projection_valid && std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) == 0)
          {
@@ -1084,7 +1140,9 @@ class Persona5Strikers final : public Game
 
          com_ptr<ID3D11Buffer>& upload = game_device_data.mv_previous_globals_buffers[UINT(upload_data->size())];
          if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(upload), upload_data->data(), UINT(upload_data->size())))
+         {
             previous_globals = upload.get();
+         }
       }
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::previous_globals_slot, 1, &previous_globals);
       // Second run resources, in the slots the shader reads: the previous frame's copies, else the current ones (immutable, or no
@@ -1103,7 +1161,9 @@ class Persona5Strikers final : public Game
          const com_ptr<ID3D11Resource> resource = GetViewResource(srvs[slot].get());
          D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
          if (resource)
+         {
             resource->GetType(&dimension);
+         }
          D3D11_BUFFER_DESC buffer_desc = {};
          D3D11_TEXTURE1D_DESC texture_1d_desc = {};
          D3D11_TEXTURE2D_DESC texture_2d_desc = {};
@@ -1151,29 +1211,39 @@ class Persona5Strikers final : public Game
                switch (dimension)
                {
                case D3D11_RESOURCE_DIMENSION_BUFFER:
-                  buffer_desc = {buffer_desc.ByteWidth, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, buffer_desc.MiscFlags & (D3D11_RESOURCE_MISC_BUFFER_STRUCTURED | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS), buffer_desc.StructureByteStride};
+                  buffer_desc = {.ByteWidth = buffer_desc.ByteWidth, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE, .CPUAccessFlags = 0, .MiscFlags = buffer_desc.MiscFlags & (D3D11_RESOURCE_MISC_BUFFER_STRUCTURED | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS), .StructureByteStride = buffer_desc.StructureByteStride};
                   if (SUCCEEDED(native_device->CreateBuffer(&buffer_desc, nullptr, &buffer)))
+                  {
                      buffer->QueryInterface(&entry.copies[0]);
+                  }
                   break;
                case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
-                  texture_1d_desc = {texture_1d_desc.Width, texture_1d_desc.MipLevels, texture_1d_desc.ArraySize, texture_1d_desc.Format, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+                  texture_1d_desc = {.Width = texture_1d_desc.Width, .MipLevels = texture_1d_desc.MipLevels, .ArraySize = texture_1d_desc.ArraySize, .Format = texture_1d_desc.Format, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE};
                   if (SUCCEEDED(native_device->CreateTexture1D(&texture_1d_desc, nullptr, &texture_1d)))
+                  {
                      texture_1d->QueryInterface(&entry.copies[0]);
+                  }
                   break;
                case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
-                  texture_2d_desc = {texture_2d_desc.Width, texture_2d_desc.Height, texture_2d_desc.MipLevels, texture_2d_desc.ArraySize, texture_2d_desc.Format, texture_2d_desc.SampleDesc, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, texture_2d_desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE};
+                  texture_2d_desc = {.Width = texture_2d_desc.Width, .Height = texture_2d_desc.Height, .MipLevels = texture_2d_desc.MipLevels, .ArraySize = texture_2d_desc.ArraySize, .Format = texture_2d_desc.Format, .SampleDesc = texture_2d_desc.SampleDesc, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE, .CPUAccessFlags = 0, .MiscFlags = texture_2d_desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE};
                   if (SUCCEEDED(native_device->CreateTexture2D(&texture_2d_desc, nullptr, &texture_2d)))
+                  {
                      texture_2d->QueryInterface(&entry.copies[0]);
+                  }
                   break;
                case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
-                  texture_3d_desc = {texture_3d_desc.Width, texture_3d_desc.Height, texture_3d_desc.Depth, texture_3d_desc.MipLevels, texture_3d_desc.Format, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+                  texture_3d_desc = {.Width = texture_3d_desc.Width, .Height = texture_3d_desc.Height, .Depth = texture_3d_desc.Depth, .MipLevels = texture_3d_desc.MipLevels, .Format = texture_3d_desc.Format, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE};
                   if (SUCCEEDED(native_device->CreateTexture3D(&texture_3d_desc, nullptr, &texture_3d)))
+                  {
                      texture_3d->QueryInterface(&entry.copies[0]);
+                  }
                   break;
                }
             }
             if (entry.copies[0])
+            {
                native_device_context->CopyResource(entry.copies[0].get(), resource.get());
+            }
          }
          if (!entry.has_previous || !entry.copies[1])
             continue;
@@ -1186,7 +1256,9 @@ class Persona5Strikers final : public Game
             native_device->CreateShaderResourceView(entry.copies[1].get(), &view_desc, &entry.views[1]);
          }
          if (entry.views[1])
+         {
             previous_srvs[slot] = entry.views[1].get();
+         }
       }
       if (layout.resource_slots != 0)
       {
@@ -1194,10 +1266,14 @@ class Persona5Strikers final : public Game
       }
       native_device_context->PSSetShader(pixel_shader.get(), nullptr, 0);
       if (motion_vector_blend_state)
+      {
          native_device_context->OMSetBlendState(motion_vector_blend_state.get(), blend_factor, sample_mask);
+      }
       DrawWithVertexShader(native_device_context, vertex_shader.get(), MotionVectorPatches::jitter_slot, game_device_data.mv_jitter_buffer.get(), draw);
       if (motion_vector_blend_state)
+      {
          native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
+      }
       // Set directly, bypassing Core's state tracking: restore the game's
       native_device_context->PSSetShader(original_pixel_shader.get(), nullptr, 0);
       ID3D11Buffer* const restored_globals = original_previous_globals.get();
@@ -1220,9 +1296,9 @@ public:
       device_data.taa_detected = true;
       for (int i = 0; i < 2; i++)
       {
-         const UINT8 write_mask = i == 0 ? D3D11_COLOR_WRITE_ENABLE_ALL : D3D11_COLOR_WRITE_ENABLE_ALPHA;
+         const UINT8 write_mask = (i == 0 ? D3D11_COLOR_WRITE_ENABLE_ALL : D3D11_COLOR_WRITE_ENABLE_ALPHA);
          D3D11_BLEND_DESC blend_desc = {};
-         blend_desc.RenderTarget[0] = {TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MIN, write_mask};
+         blend_desc.RenderTarget[0] = {.BlendEnable = TRUE, .SrcBlend = D3D11_BLEND_ONE, .DestBlend = D3D11_BLEND_ONE, .BlendOp = D3D11_BLEND_OP_MIN, .SrcBlendAlpha = D3D11_BLEND_ONE, .DestBlendAlpha = D3D11_BLEND_ONE, .BlendOpAlpha = D3D11_BLEND_OP_MIN, .RenderTargetWriteMask = write_mask};
          native_device->CreateBlendState(&blend_desc, &game_device_data->ui_min_blend_states[i]);
          blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_MAX;
          blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_MAX;
@@ -1389,7 +1465,9 @@ public:
       const std::unique_lock lock_smaa(game_device_data.smaa_mutex);
       game_device_data.smaa_copies_frame = cb_luma_global_settings.FrameIndex;
       if (smaa)
+      {
          game_device_data.smaa_frame = cb_luma_global_settings.FrameIndex;
+      }
       // RCAS alone on the upscaled canvas encodes straight from the canvas's view; SMAA needs the copy, as it samples it while writing the
       // canvas, and so does RCAS on the swapchain
       ID3D11ShaderResourceView* const canvas_srv = ((!smaa && canvas_rtv == game_device_data.sr_upscaled_canvas_rtv) ? game_device_data.sr_upscaled_canvas_srv.get() : nullptr);
@@ -1457,7 +1535,9 @@ public:
          DXGI_FORMAT unused_format;
          GetResourceInfo(depth_srv.get(), depth_size, unused_format);
          if (depth_size.x != canvas_desc.Width || depth_size.y != canvas_desc.Height)
+         {
             depth_srv.reset();
+         }
       }
 
       // The replaced composite reads the Luma cbuffers, which Core binds only after this callback; they stay bound for SMAA and finalize.
@@ -1506,7 +1586,9 @@ public:
       // Without RCAS, SMAA writes (and dithers) the canvas directly, only sampling the linear copy; finalize would only decode
       const bool sharpen = cb_luma_global_settings.GameSettings.RCASSharpness > 0.f;
       if (smaa)
+      {
          DrawSMAA(native_device, native_device_context, device_data, sharpen ? game_device_data.smaa_gamma_rtv.get() : canvas_rtv.get(), game_device_data.smaa_linear_srv.get(), game_device_data.smaa_gamma_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+      }
 
       // Development builds may also draw a debug view
       if (sharpen || DEVELOPMENT)
@@ -1514,13 +1596,17 @@ public:
          DrawStateStack<DrawStateStackType::FullGraphics> finalize_state;
          finalize_state.Cache(native_device_context, device_data.uav_max_count);
          if (sharpen)
+         {
             DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("P5S SMAA Finalize PS"_h).get(), game_device_data.smaa_gamma_srv.get(), canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
+         }
 #if DEVELOPMENT
          // Calibration aid: SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red) replace the frame
          ID3D11ShaderResourceView* const edges_srv = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h].get();
-         ID3D11ShaderResourceView* const debug_srv = g_smaa_debug_view == 1 && smaa ? edges_srv : (g_smaa_debug_view == 2 && depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+         ID3D11ShaderResourceView* const debug_srv = (g_smaa_debug_view == 1 && smaa ? edges_srv : (g_smaa_debug_view == 2 && depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr));
          if (debug_srv && HasShaders(device_data.native_pixel_shaders, "Copy PS"_h))
+         {
             DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("Copy PS"_h).get(), debug_srv, canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
+         }
 #endif
          finalize_state.Restore(native_device_context);
       }
@@ -1629,9 +1715,13 @@ public:
       // $Globals may be a range of a bigger buffer; a zero count means a plain binding
       ID3D11Buffer* const cbs[] = {globals_cb.get(), game_device_data.gtao_knobs_cb.get()};
       if (globals_count != 0)
+      {
          native_device_context1->CSSetConstantBuffers1(0, 1, &cbs[0], &globals_first, &globals_count);
+      }
       else
+      {
          native_device_context->CSSetConstantBuffers(0, 1, &cbs[0]);
+      }
       native_device_context->CSSetConstantBuffers(gtao_knobs_cb_slot, 1, &cbs[1]);
       ID3D11SamplerState* const point_sampler = device_data.sampler_state_point.get();
       native_device_context->CSSetSamplers(0, 1, &point_sampler);
@@ -1655,7 +1745,9 @@ public:
       pass("P5S XeGTAO Prefilter Depths CS"_h, 5, mip_uavs, {depth_srv.get(), nullptr}, (width + 15) / 16, (height + 15) / 16);
       pass("P5S XeGTAO Main Pass CS"_h, 1, &working_uavs[0], {game_device_data.gtao_depth_mips_srv.get(), normals_srv.get()}, (width + 7) / 8, (height + 7) / 8);
       if (!temporal)
+      {
          pass("P5S XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+      }
       pass("P5S XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[temporal ? 0 : 1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
       compute_state.Restore(native_device_context);
 
@@ -1685,7 +1777,9 @@ public:
          {
             // ponytail: cap, in case the game drops a command list without executing it; a pending split per context if one ever lingers
             if (game_device_data.sr_pending_splits.size() >= 4)
+            {
                game_device_data.sr_pending_splits.clear();
+            }
             game_device_data.sr_split.remainder = finished;
             game_device_data.sr_pending_splits[reinterpret_cast<uint64_t>(finished.get())] = std::move(game_device_data.sr_split);
             game_device_data.sr_split = {};
@@ -1716,13 +1810,17 @@ public:
       // The scene's start timestamp already ran with the game's earlier command lists; the disjoint query only covers the rest
       auto* const perf_queries = split.perf_queries;
       if (perf_queries)
+      {
          native_device_context->Begin(perf_queries->disjoint.get());
+      }
 #endif
       // Always, even if the upscaler went away meanwhile: it starts the game's frame
       native_device_context->ExecuteCommandList(split.partial.get(), FALSE);
 #if DEVELOPMENT
       if (perf_queries)
+      {
          native_device_context->End(perf_queries->sr_start.get());
+      }
 #endif
 
       D3D11_TEXTURE2D_DESC desc;
@@ -1738,18 +1836,22 @@ public:
          if (!split.output_color)
          {
             if (device_data->sr_output_color)
+            {
                device_data->sr_output_color->GetDesc(&output_desc);
+            }
             if (output_desc.Width != desc.Width || output_desc.Height != desc.Height)
             {
                device_data->sr_output_color.reset();
-               output_desc = {desc.Width, desc.Height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
+               output_desc = {.Width = desc.Width, .Height = desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1, .Quality = 0}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
                native_device->CreateTexture2D(&output_desc, nullptr, &device_data->sr_output_color);
                output_recreated = true;
             }
          }
-         ID3D11Texture2D* const output_color = split.output_color ? split.output_color.get() : device_data->sr_output_color.get();
+         ID3D11Texture2D* const output_color = (split.output_color ? split.output_color.get() : device_data->sr_output_color.get());
          if (output_color)
+         {
             output_color->GetDesc(&output_desc);
+         }
 
          auto* const sr_instance_data = device_data->GetSRInstanceData();
          SR::SettingsData settings_data;
@@ -1787,7 +1889,9 @@ public:
          {
             // DLAA writes back into the scene; upscaling leaves the output to the post process (see "RedirectPostDraw")
             if (!split.output_color)
+            {
                native_device_context->CopySubresourceRegion(split.source_color.get(), 0, 0, 0, 0, output_color, 0, nullptr);
+            }
             // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame
             // shows the texture's stale memory until its feature is created again after a draw. Settings changed once here force that at
             // the next frame's "UpdateSettings".
@@ -1810,8 +1914,7 @@ public:
       // The post process reads the upscaled output: without the upscaler it gets the scene stretched, not the texture's old contents
       if (!drawn && split.output_color)
       {
-         D3D11_SHADER_RESOURCE_VIEW_DESC source_srv_desc = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_SRV_DIMENSION_TEXTURE2D};
-         source_srv_desc.Texture2D.MipLevels = 1;
+         const D3D11_SHADER_RESOURCE_VIEW_DESC source_srv_desc = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D, .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1}};
          com_ptr<ID3D11ShaderResourceView> source_srv;
          com_ptr<ID3D11RenderTargetView> output_rtv;
          if (SUCCEEDED(native_device->CreateShaderResourceView(split.source_color.get(), &source_srv_desc, &source_srv)) && SUCCEEDED(native_device->CreateRenderTargetView(split.output_color.get(), nullptr, &output_rtv)))
@@ -1854,7 +1957,9 @@ public:
             D3D11_SHADER_VARIABLE_DESC variable;
             // Missing names give dummy reflection objects whose GetDesc fails
             if (Shader::d3d_reflect && SUCCEEDED(Shader::d3d_reflect(desc->code, desc->code_size, IID_PPV_ARGS(&reflection))) && SUCCEEDED(reflection->GetResourceBindingDescByName("$Globals", &bind)) && bind.BindPoint == 0 && SUCCEEDED(reflection->GetConstantBufferByName("$Globals")->GetVariableByName("fClstScl")->GetDesc(&variable)) && variable.Size == sizeof(float))
+            {
                offset = variable.StartOffset;
+            }
          }
       }
       const std::lock_guard lock(game_device_data.layer_mutex);
@@ -1876,7 +1981,7 @@ public:
       if (!game_device_data->layer_uv_scale_buffer || game_device_data->layer_uv_scale[0] != scale[0] || game_device_data->layer_uv_scale[1] != scale[1])
       {
          const float uv_scale[4] = {1.f / scale[0], 1.f / scale[1], 0.f, 0.f};
-         const D3D11_BUFFER_DESC desc = {sizeof(uv_scale), D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER};
+         const D3D11_BUFFER_DESC desc = {.ByteWidth = sizeof(uv_scale), .Usage = D3D11_USAGE_IMMUTABLE, .BindFlags = D3D11_BIND_CONSTANT_BUFFER};
          const D3D11_SUBRESOURCE_DATA data = {uv_scale};
          game_device_data->layer_uv_scale_buffer.reset();
          if (FAILED(native_device->CreateBuffer(&desc, &data, &game_device_data->layer_uv_scale_buffer)))
@@ -1920,7 +2025,9 @@ public:
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
          if (const com_ptr<ID3D11Resource> stretch_target = GetViewResource(rtv.get()))
+         {
             game_device_data.layer_outputs[stretch_target.get()] = {scale[0], cb_luma_global_settings.FrameIndex};
+         }
       }
       else
       {
@@ -1929,7 +2036,9 @@ public:
          native_device_context->OMGetRenderTargets(1, &rtv, &dsv);
          target = GetViewResource(rtv.get());
          if (com_ptr<ID3D11Texture2D> texture; target && SUCCEEDED(target->QueryInterface(&texture)))
+         {
             texture->GetDesc(&target_desc);
+         }
          // An output sized off-screen target, with the viewport at its top left corner
          if (target_desc.Width != output_size.x || target_desc.Height != output_size.y || IsBackBuffer(&device_data, target.get()))
             return false;
@@ -1951,7 +2060,9 @@ public:
          if (!quad_vertex_shader || !HasShaders(device_data.native_vertex_shaders, "P5S Layer Sprite VS"_h, "Scale VS"_h) || !HasShaders(device_data.native_pixel_shaders, "Scale PS"_h))
             return false;
          if (!original_shader_hashes.Contains(quad_vertex_shader_hash, reshade::api::shader_stage::vertex))
+         {
             quad_vertex_shader.reset();
+         }
       }
       com_ptr<ID3D11Buffer> uv_scale_buffer;
       if (quad_vertex_shader)
@@ -1965,11 +2076,11 @@ public:
       // kept, so point lights use the wrong clusters for a frame.
       com_ptr<ID3D11Buffer> original_globals;
       com_ptr<ID3D11Buffer> patched_globals;
-      const UINT cluster_scale_offset = stretch ? UINT_MAX : GetClusterScaleOffset(device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader);
+      const UINT cluster_scale_offset = (stretch ? UINT_MAX : GetClusterScaleOffset(device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader));
       if (cluster_scale_offset != UINT_MAX)
       {
          native_device_context->PSGetConstantBuffers(0, 1, &original_globals);
-         const Persona5StrikersGameDeviceData::GlobalsCopy globals_copy = original_globals ? GetGlobalsCopy(&game_device_data, original_globals.get()) : nullptr;
+         const Persona5StrikersGameDeviceData::GlobalsCopy globals_copy = (original_globals ? GetGlobalsCopy(&game_device_data, original_globals.get()) : nullptr);
          if (globals_copy && cluster_scale_offset + sizeof(float) <= globals_copy->size())
          {
             std::vector<uint8_t> globals_data = *globals_copy;
@@ -1980,7 +2091,9 @@ public:
             const std::lock_guard lock(game_device_data.layer_mutex);
             com_ptr<ID3D11Buffer>& upload = game_device_data.layer_globals_buffers[UINT(globals_data.size())];
             if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(upload), globals_data.data(), UINT(globals_data.size())))
+            {
                patched_globals = upload;
+            }
          }
       }
 
@@ -1989,7 +2102,9 @@ public:
          const std::lock_guard lock(game_device_data.layer_mutex);
          auto& frame = game_device_data.layer_frames[native_device_context];
          if (!Containers::Contains(frame.targets, target.get()))
+         {
             frame.targets.push_back(target.get());
+         }
          std::copy_n(scale, 2, frame.scale);
       }
 
@@ -2039,7 +2154,9 @@ public:
       desc.Width = GetTextureMipSize(output.x, halvings);
       desc.Height = GetTextureMipSize(output.y, halvings);
       if (desc.MipLevels != 1)
+      {
          desc.MipLevels = 0; // The full chain: the bloom adds iterations past the game's last mip
+      }
       Persona5StrikersGameDeviceData::PostTarget target;
       target.original = resource;
       if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &target.texture)))
@@ -2054,7 +2171,7 @@ public:
    {
       constexpr bool rtv = std::is_same_v<T, ID3D11RenderTargetView>;
       if (const auto it = game_device_data->post_views.find(view); it != game_device_data->post_views.end())
-         return com_ptr<T>(static_cast<T*>(it->second.second.get()));
+         return com_ptr<T>(static_cast<T*>(it->second.replacement.get()));
       const com_ptr<ID3D11Resource> resource = GetViewResource(view);
       if (!resource)
          return nullptr;
@@ -2082,7 +2199,9 @@ public:
          native_device->CreateShaderResourceView(target->texture.get(), &desc, &replacement);
       }
       if (replacement)
-         game_device_data->post_views.emplace(view, std::make_pair(com_ptr<ID3D11View>(view), com_ptr<ID3D11View>(replacement.get())));
+      {
+         game_device_data->post_views.emplace(view, Persona5StrikersGameDeviceData::PostView{.original = com_ptr<ID3D11View>(view), .replacement = com_ptr<ID3D11View>(replacement.get())});
+      }
       return replacement;
    }
 
@@ -2116,9 +2235,13 @@ public:
       const bool compute = (stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute;
       com_ptr<ID3D11ShaderResourceView> srvs[post_srv_count];
       if (compute)
+      {
          native_device_context->CSGetShaderResources(0, post_srv_count, &srvs[0]);
+      }
       else
+      {
          native_device_context->PSGetShaderResources(0, post_srv_count, &srvs[0]);
+      }
       if (std::ranges::none_of(srvs, [&](const auto& srv)
              { return srv && GetViewResource(srv.get()) == game_device_data.post_scene; }))
          return;
@@ -2128,7 +2251,9 @@ public:
       game_device_data.post_scene_current = DrawScaled(native_device_context, device_data, game_device_data.sr_upscaled_output_srv.get(), game_device_data.post_scene_rtv.get(), size.x, size.y);
       // The runtime unbound the scene's views while it was a render target (the graphics ones are restored)
       if (compute)
+      {
          native_device_context->CSSetShaderResources(0, post_srv_count, reinterpret_cast<ID3D11ShaderResourceView* const*>(&srvs[0]));
+      }
    }
 
    // The frame's first bloom upsample (its t0 the game's deepest mip): Kino's iteration count is floor(logh), and its tent scale
@@ -2142,9 +2267,9 @@ public:
       com_ptr<ID3D11Buffer> loop;
       native_device_context->PSGetConstantBuffers(bloom_loop_cb_slot, 1, &loop);
       // Empty on the buffer's first frame (see "OnUnmapBufferRegion")
-      const Persona5StrikersGameDeviceData::GlobalsCopy constants = loop ? GetGlobalsCopy(&game_device_data, loop.get()) : nullptr;
+      const Persona5StrikersGameDeviceData::GlobalsCopy constants = (loop ? GetGlobalsCopy(&game_device_data, loop.get()) : nullptr);
       const com_ptr<ID3D11Resource> resource = GetViewResource(game_source);
-      auto* const target = resource ? GetPostTarget(native_device, &game_device_data, resource.get(), false) : nullptr;
+      auto* const target = (resource ? GetPostTarget(native_device, &game_device_data, resource.get(), false) : nullptr);
       if (!constants || constants->size() < 20 || !target)
          return;
       D3D11_SHADER_RESOURCE_VIEW_DESC source_desc;
@@ -2164,7 +2289,9 @@ public:
 #if DEVELOPMENT
       static UINT logged_iterations = 0;
       if (std::exchange(logged_iterations, iterations) != iterations)
+      {
          reshade::log::message(reshade::log::level::info, std::format("[P5S Bloom] {} iterations ({}x{} mip 0) -> {} ({}x{}), tent scale {} -> {}", last_mip + 1, original_size.x, original_size.y, iterations, desc.Width, desc.Height, game_sample_scale, game_device_data.bloom_sample_scale).c_str());
+      }
 #endif
       com_ptr<ID3D11VertexShader> vertex_shader;
       com_ptr<ID3D11PixelShader> downsample, upsample;
@@ -2229,7 +2356,7 @@ public:
       const com_ptr<ID3D11ShaderResourceView> game_source = srvs[0]; // The bloom upsample's source mip, before its redirection
       for (auto& srv : srvs)
       {
-         if (com_ptr<ID3D11ShaderResourceView> redirected_srv = srv ? RedirectView(native_device, &game_device_data, srv.get()) : nullptr)
+         if (com_ptr<ID3D11ShaderResourceView> redirected_srv = (srv ? RedirectView(native_device, &game_device_data, srv.get()) : nullptr))
          {
             srv = std::move(redirected_srv);
             redirected = true;
@@ -2240,7 +2367,9 @@ public:
       game_device_data.post_scene_current &= !writes_scene;
 
       if (game_device_data.bloom_sample_scale < 0.f && original_shader_hashes.Contains(bloom_upsample_shader_hashes))
+      {
          ExtendBloom(native_device, native_device_context, cmd_list_data, device_data, game_source.get());
+      }
       DrawStateStack<DrawStateStackType::FullGraphics> state;
       state.Cache(native_device_context, device_data.uav_max_count);
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
@@ -2278,7 +2407,9 @@ public:
          native_device_context->PSGetShaderResources(0, 1, &depth_srv);
          D3D11_SHADER_RESOURCE_VIEW_DESC depth_srv_desc;
          if (depth_srv)
+         {
             depth_srv->GetDesc(&depth_srv_desc);
+         }
          if (depth_srv && depth_srv_desc.Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS && depth_srv_desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D)
          {
             const std::lock_guard lock(game_device_data.smaa_depth_mutex);
@@ -2295,7 +2426,9 @@ public:
          if (original_shader_hashes.Contains(post_process_start_shader_hashes))
          {
             if (native_device_context == game_device_data.mv_scene_context && !game_device_data.mv_frame_ended)
+            {
                EndMotionVectorFrame(native_device, native_device_context, device_data);
+            }
          }
          else
          {
@@ -2308,14 +2441,16 @@ public:
             D3D11_DEPTH_STENCIL_DESC depth_desc = {};
             com_ptr<ID3D11Buffer> vertex_buffer;
             // Forward draws join a started frame on the scene context; outside a frame only a depth prepass (no targets) starts one
-            const bool scene_draw = game_device_data.mv_frame_ended ? !rtvs[0] : native_device_context == game_device_data.mv_scene_context;
+            const bool scene_draw = (game_device_data.mv_frame_ended ? !rtvs[0] : native_device_context == game_device_data.mv_scene_context);
             if (!gbuffer && dsv && scene_draw && GetViewResource(dsv.get()).get() == game_device_data.mv_scene_depth_id)
             {
                com_ptr<ID3D11DepthStencilState> depth_stencil_state;
                UINT stencil_ref;
                native_device_context->OMGetDepthStencilState(&depth_stencil_state, &stencil_ref);
                if (depth_stencil_state)
+               {
                   depth_stencil_state->GetDesc(&depth_desc);
+               }
                UINT stride, offset;
                native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &stride, &offset);
             }
@@ -2366,12 +2501,14 @@ public:
                uint4 histogram_size = {};
                DXGI_FORMAT histogram_format;
                if (game_device_data.layer_histogram_srv)
+               {
                   GetResourceInfo(game_device_data.layer_histogram_srv.get(), histogram_size, histogram_format);
+               }
                if (histogram_size.x != width || histogram_size.y != height)
                {
                   game_device_data.layer_histogram_rtv.reset();
                   game_device_data.layer_histogram_srv.reset();
-                  const D3D11_TEXTURE2D_DESC desc = {width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET};
+                  const D3D11_TEXTURE2D_DESC desc = {.Width = width, .Height = height, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1, .Quality = 0}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET};
                   com_ptr<ID3D11Texture2D> texture;
                   if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &texture)) || FAILED(native_device->CreateRenderTargetView(texture.get(), nullptr, &game_device_data.layer_histogram_rtv)) || FAILED(native_device->CreateShaderResourceView(texture.get(), nullptr, &game_device_data.layer_histogram_srv)))
                   {
@@ -2415,7 +2552,9 @@ public:
          Persona5StrikersGameDeviceData::SRSplit split;
          D3D11_TEXTURE2D_DESC scene_desc = {};
          if (scene && SUCCEEDED(scene->QueryInterface(&split.source_color)))
+         {
             split.source_color->GetDesc(&scene_desc);
+         }
          {
             const std::shared_lock lock(game_device_data.mv_mutex);
             split.motion_vectors = game_device_data.mv_texture;
@@ -2423,7 +2562,9 @@ public:
          uint4 mv_size = {};
          DXGI_FORMAT mv_format;
          if (split.motion_vectors)
+         {
             GetResourceInfo(split.motion_vectors.get(), mv_size, mv_format);
+         }
          split.depth = game_device_data.mv_frame_depth;
          split.jitter = game_device_data.mv_jitter;
          // "mW2P" is row major and multiplies row vectors: its column 1 (xyz) is the view's up axis times 1 / tan(fov / 2)
@@ -2438,7 +2579,9 @@ public:
          {
             D3D11_TEXTURE2D_DESC output_desc = {};
             if (game_device_data.sr_upscaled_output)
+            {
                game_device_data.sr_upscaled_output->GetDesc(&output_desc);
+            }
             if (output_desc.Width != output_size.x || output_desc.Height != output_size.y)
             {
                game_device_data.sr_upscaled_output.reset();
@@ -2446,7 +2589,7 @@ public:
                game_device_data.sr_upscaled_output_srv.reset();
                game_device_data.sr_upscaled_canvas_rtv.reset();
                game_device_data.sr_upscaled_canvas_srv.reset();
-               output_desc = {output_size.x, output_size.y, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS};
+               output_desc = {.Width = output_size.x, .Height = output_size.y, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1, .Quality = 0}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS};
                bool created = SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, &game_device_data.sr_upscaled_output)) && SUCCEEDED(native_device->CreateRenderTargetView(game_device_data.sr_upscaled_output.get(), nullptr, &game_device_data.sr_upscaled_output_rtv)) && SUCCEEDED(native_device->CreateShaderResourceView(game_device_data.sr_upscaled_output.get(), nullptr, &game_device_data.sr_upscaled_output_srv));
                output_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
                com_ptr<ID3D11Texture2D> canvas;
@@ -2462,7 +2605,9 @@ public:
 #endif
             }
             if (game_device_data.sr_upscaled_canvas_srv)
+            {
                split.output_color = game_device_data.sr_upscaled_output;
+            }
          }
          // Back at the output resolution: the output, canvas and output sized post targets go. A pending split holds its own output, and
          // their other users (post, composite, stretch) record on this context, as the scene of every frame, so they already ran.
@@ -2487,7 +2632,9 @@ public:
             {
                D3D11_MAPPED_SUBRESOURCE mapped;
                if (SUCCEEDED(native_device_context->Map(buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+               {
                   native_device_context->Unmap(buffer.get(), 0);
+               }
             }
             game_device_data.sr_upscaling_context = (split.output_color ? native_device_context : nullptr);
             // Upscaling: the post process up to the composite runs at the output resolution (see "RedirectPostDraw")
@@ -2506,7 +2653,7 @@ public:
                {
                   game_device_data.post_scene = split.source_color.get();
                   game_device_data.post_scene_rtv.reset();
-                  const D3D11_RENDER_TARGET_VIEW_DESC scene_rtv_desc = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_RTV_DIMENSION_TEXTURE2D};
+                  const D3D11_RENDER_TARGET_VIEW_DESC scene_rtv_desc = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D};
                   native_device->CreateRenderTargetView(split.source_color.get(), &scene_rtv_desc, &game_device_data.post_scene_rtv);
                }
             }
@@ -2594,7 +2741,9 @@ public:
                DXGI_FORMAT target_format;
                GetResourceInfo(target.get(), target_size, target_format);
                if (target_size.x < uint32_t(device_data.output_resolution.x + 0.5f))
+               {
                   game_device_data.render_resolution_composite = true;
+               }
 
                // A 3D layer's composite, from its stretch target: see "layer_composed"
                com_ptr<ID3D11ShaderResourceView> scene_srv;
@@ -2605,7 +2754,9 @@ public:
                   const std::lock_guard lock(game_device_data.layer_mutex);
                   layer_scale = GetRecentLayerScale(game_device_data.layer_outputs, scene.get());
                   if (layer_scale > 0.f)
+                  {
                      game_device_data.layer_composed[target.get()] = {layer_scale, cb_luma_global_settings.FrameIndex};
+                  }
                }
                // It draws the render resolution corner (for the sprite to scale up), cut by scissor or viewport: draw the whole target from the
                // whole scene instead, rescaling a corner viewport's scene coordinates by "LumaData.CustomData4" (scene samples only).
@@ -2644,7 +2795,7 @@ public:
                auto& queries = game_device_data.perf_composite_queries[game_device_data.perf_composite_query_index];
                if (!queries.pending)
                {
-                  const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
+                  const D3D11_QUERY_DESC disjoint_desc = {.Query = D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {.Query = D3D11_QUERY_TIMESTAMP};
                   if (!queries.disjoint)
                   {
                      native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
@@ -2683,7 +2834,9 @@ public:
             native_device_context->OMSetRenderTargets(1, &canvas_rtv, nullptr);
             SetFullTargetViewport(native_device_context, desc.Width, desc.Height);
             if (cb_luma_global_settings.GameSettings.RCASSharpness <= 0.f || DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, false) == DrawOrDispatchOverrideType::None)
+            {
                (*original_draw_dispatch_func)();
+            }
             state.Restore(native_device_context);
             return DrawOrDispatchOverrideType::Replaced;
          }
@@ -2714,7 +2867,7 @@ public:
             const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
             quad_vertex_shader = FindShader(device_data.native_vertex_shaders, "P5S Layer Quad VS"_h);
          }
-         const com_ptr<ID3D11Buffer> uv_scale_buffer = quad_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr;
+         const com_ptr<ID3D11Buffer> uv_scale_buffer = (quad_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr);
          D3D11_VIEWPORT viewport = {};
          UINT viewports = 1;
          native_device_context->RSGetViewports(&viewports, &viewport);
@@ -2726,8 +2879,8 @@ public:
             D3D11_RECT scissor = {};
             UINT scissors = 1;
             native_device_context->RSGetScissorRects(&scissors, &scissor);
-            const D3D11_VIEWPORT whole_viewport = {viewport.TopLeftX / scale[0], viewport.TopLeftY / scale[1], viewport.Width / scale[0], viewport.Height / scale[1], viewport.MinDepth, viewport.MaxDepth};
-            const D3D11_RECT whole_scissor = {0, 0, LONG(target_size.x), LONG(target_size.y)};
+            const D3D11_VIEWPORT whole_viewport = {.TopLeftX = viewport.TopLeftX / scale[0], .TopLeftY = viewport.TopLeftY / scale[1], .Width = viewport.Width / scale[0], .Height = viewport.Height / scale[1], .MinDepth = viewport.MinDepth, .MaxDepth = viewport.MaxDepth};
+            const D3D11_RECT whole_scissor = {.left = 0, .top = 0, .right = LONG(target_size.x), .bottom = LONG(target_size.y)};
             native_device_context->RSSetViewports(1, &whole_viewport);
             native_device_context->RSSetScissorRects(1, &whole_scissor);
             DrawWithVertexShader(native_device_context, quad_vertex_shader.get(), layer_uv_scale_cb_slot, uv_scale_buffer.get(), *original_draw_dispatch_func);
@@ -2790,7 +2943,7 @@ public:
                   const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
                   sprite_vertex_shader = FindShader(device_data.native_vertex_shaders, "P5S Layer Sprite VS"_h);
                }
-               const com_ptr<ID3D11Buffer> uv_scale_buffer = sprite_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr;
+               const com_ptr<ID3D11Buffer> uv_scale_buffer = (sprite_vertex_shader ? GetLayerUVScaleBuffer(native_device, &game_device_data, scale) : nullptr);
                if (uv_scale_buffer)
                {
                   DrawWithVertexShader(native_device_context, sprite_vertex_shader.get(), layer_uv_scale_cb_slot, uv_scale_buffer.get(), *original_draw_dispatch_func);
@@ -2812,7 +2965,9 @@ public:
                native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
                D3D11_BLEND_DESC blend_desc = {};
                if (blend_state)
+               {
                   blend_state->GetDesc(&blend_desc);
+               }
                const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend_desc.RenderTarget[0];
                const auto subtracts = [](D3D11_BLEND_OP op)
                { return op == D3D11_BLEND_OP_SUBTRACT || op == D3D11_BLEND_OP_REV_SUBTRACT; };
@@ -2836,7 +2991,7 @@ public:
                      peak_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Peak Clamp PS"_h);
                   }
                   // Index 0 all channels, 1 alpha only
-                  const int channels = subtracts_colors ? 0 : 1;
+                  const int channels = (subtracts_colors ? 0 : 1);
                   if (white_pixel_shader && coverage_pixel_shader && black_pixel_shader && peak_pixel_shader && game_device_data.ui_min_blend_states[0] && game_device_data.ui_min_blend_states[1] && game_device_data.ui_max_blend_states[channels])
                   {
                      com_ptr<ID3D11PixelShader> pixel_shader;
@@ -2848,10 +3003,14 @@ public:
                         (*original_draw_dispatch_func)();
                      };
                      if (subtracts_colors || clamp_alpha)
+                     {
                         draw(subtracts_colors ? coverage_pixel_shader.get() : white_pixel_shader.get(), game_device_data.ui_min_blend_states[channels].get());
+                     }
                      draw(pixel_shader.get(), blend_state.get());
                      if (subtracts_colors || subtracts_alpha)
+                     {
                         draw(black_pixel_shader.get(), game_device_data.ui_max_blend_states[channels].get());
+                     }
                      if (adds_colors)
                      {
                         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
@@ -2938,18 +3097,20 @@ public:
       if (!setting)
          return;
 #if DEVELOPMENT
-      const int32_t kept = g_perf_test != 0 ? perf_test_render_scales[g_perf_test] : g_render_scale;
+      const int32_t kept = (g_perf_test != 0 ? perf_test_render_scales[g_perf_test] : g_render_scale);
 #else
       const int32_t kept = g_render_scale;
 #endif
-      const int32_t wanted = menu ? 10 : kept;
+      const int32_t wanted = (menu ? 10 : kept);
       // The game rebuilds its targets at whatever the setting holds, also when its menu wrote it: the wanted value is forced back
       if (*setting != wanted)
       {
          *setting = wanted;
          RECT client;
          if (game_window && GetClientRect(game_window, &client))
+         {
             PostMessageW(game_window, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right - client.left, client.bottom - client.top));
+         }
       }
    }
 
@@ -2966,7 +3127,10 @@ public:
       {
          const std::lock_guard lock(game_device_data.layer_mutex);
          const auto stale = [](const auto& entry)
-         { return cb_luma_global_settings.FrameIndex - entry.second.frame_index > 1; };
+         {
+            const auto& [resource, output] = entry;
+            return cb_luma_global_settings.FrameIndex - output.frame_index > 1;
+         };
          std::erase_if(game_device_data.layer_outputs, stale);
          std::erase_if(game_device_data.layer_composed, stale);
       }
@@ -2975,9 +3139,13 @@ public:
          // frames are only seen with DLSS/FSR (motion vectors start them), the only time 100% matters.
          const bool render_resolution_composite = game_device_data.render_resolution_composite.exchange(false);
          if (game_device_data.scene_drawn.exchange(false) || !IsSRActive(device_data))
+         {
             game_device_data.menu_presents = 0;
+         }
          else if (render_resolution_composite && game_device_data.menu_presents < 30)
+         {
             game_device_data.menu_presents++;
+         }
          if (!game_device_data.layer_targets_created)
          {
             game_device_data.menu_presents = 30;
@@ -3069,7 +3237,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       reshade::get_config_value(nullptr, NAME, "RenderScale", g_render_scale);
       // 0 was "the game's option" before it was always forced
-      g_render_scale = g_render_scale >= 5 && g_render_scale <= 10 ? g_render_scale : 10;
+      g_render_scale = (g_render_scale >= 5 && g_render_scale <= 10 ? g_render_scale : 10);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -3082,27 +3250,39 @@ public:
          bool enabled = *value > 0.5f;
          if (ImGui::Checkbox(label, &enabled))
          {
-            *value = enabled ? 1.f : 0.f;
+            *value = (enabled ? 1.f : 0.f);
             reshade::set_config_value(nullptr, NAME, key, *value);
             device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
             ImGui::SetTooltip("%s", tooltip);
+         }
          if (DrawResetButton(*value, default_value, key))
+         {
             device_data.cb_luma_global_settings_dirty = true;
+         }
          return *value > 0.5f;
       };
       // Persisted GameSettings slider, saved once the edit ends
       const auto settings_slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
          if (ImGui::SliderFloat(label, value, 0.f, max_value))
+         {
             device_data.cb_luma_global_settings_dirty = true;
+         }
          if (ImGui::IsItemDeactivatedAfterEdit())
+         {
             reshade::set_config_value(nullptr, NAME, key, *value);
+         }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
             ImGui::SetTooltip("%s", tooltip);
+         }
          if (DrawResetButton(*value, default_value, key))
+         {
             device_data.cb_luma_global_settings_dirty = true;
+         }
       };
 
       ImGui::SeparatorText("Anti-Aliasing");
@@ -3110,9 +3290,13 @@ public:
          // The game's render scale (its option steps by 10%), forced live (see "UpdateRenderScale")
          ImGui::BeginDisabled(!GetGameDeviceData(device_data).render_scale_setting);
          if (ImGui::SliderInt("Render Scale", &g_render_scale, 5, 10, "%d0%%", ImGuiSliderFlags_AlwaysClamp))
+         {
             reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
+         }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
             ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR or stretched by the game.\nReplaces the game's own option.");
+         }
          DrawResetButton(g_render_scale, 10, "RenderScale");
          ImGui::EndDisabled();
       }
@@ -3125,7 +3309,9 @@ public:
          ImGui::Checkbox("SMAA Enable", &smaa);
          ImGui::EndDisabled();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
             ImGui::SetTooltip("%s", smaa_tooltip);
+         }
       }
       else
       {
@@ -3146,22 +3332,32 @@ public:
 
       ImGui::SeparatorText("Ambient Occlusion");
       if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
+      {
          reshade::set_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+      }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion enabled in the game's graphic settings).");
+      }
       DrawResetButton(g_gtao_enable, true, "GTAOEnable");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Primary darkness dial (higher = darker AO). Not saved.");
+      }
       ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 200.f, "%.1f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("0 = the game's SSAO radius (40 cm, capped at 108 half res pixels up close); > 0 overrides it, in centimetres, uncapped. Not saved.");
+      }
 #if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Draws diagnostics through the game's SSAO blurs into the G-buffer AO (darkens the ambient lighting only).\nDepth gradient flat or blocky = wrong input; Normals: camera-facing surfaces bright, black everywhere = NORMAL_Z_SIGN inverted;\nAO x8 = spot broad over-occlusion.");
+      }
 #endif
       ImGui::EndDisabled();
 #endif
@@ -3174,7 +3370,9 @@ public:
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Disables the in-game UI.");
+      }
    }
 
 #if DEVELOPMENT
@@ -3183,15 +3381,21 @@ public:
       ImGui::SeparatorText("SMAA");
       ImGui::Checkbox("SMAA Predication", &g_smaa_predication);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Finds edges by geometry (plane deviation of the scene depth) as well as by color, so texture detail stays sharp while silhouettes are antialiased. Not saved.");
+      }
       ImGui::Combo("SMAA Predication Debug View", &g_smaa_debug_view, "Off\0Edges\0Predication\0");
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Replaces the frame with SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red).\nToggle SMAA Predication to compare: texture detail should lose edges, silhouettes keep them.");
+      }
 
       ImGui::SeparatorText("Upscaling");
       ImGui::Checkbox("Post Process at Output Resolution", &g_post_output_resolution);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Below a 100%% render scale, runs DOF and bloom after DLSS/FSR at the output resolution (bloom with the iterations the game adds there).\nOff: the previous way, at the render resolution on the upscaled frame scaled down. Not saved.");
+      }
 
       ImGui::SeparatorText("Performance");
       ImGui::BeginDisabled(!IsSRActive(device_data));
@@ -3204,7 +3408,9 @@ public:
       }
       ImGui::EndDisabled();
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Sets the render scale for the mode and logs \"[P5S Perf]\" to ReShade.log every 120 frames: the GPU time of the scene (from its first depth draw to the split,\nthe motion vector draws included, and any GPU idle between the game's command lists) and of DLSS/FSR (timestamps, so the 60 fps cap doesn't matter), and the CPU time in the motion vector hooks.\nThe difference between DLAA and \"DLAA Without Motion Vector Draws\" is their cost (that mode's image is unjittered, with camera-only motion vectors).\nNeeds DLSS or FSR. Keep the camera still, set the GPU to maximum performance in the driver (a capped GPU downclocks). Not saved.");
+      }
    }
 #endif
 
@@ -3226,7 +3432,9 @@ public:
       ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
       static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
       if (ImGui::Button(donation_link.c_str()))
+      {
          ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+      }
       ImGui::PopStyleColor(3);
 
       ImGui::NewLine();
@@ -3239,7 +3447,9 @@ public:
       }
       static const std::string contributing_link = std::string("Contribute on Github ") + std::string(ICON_FK_FILE_CODE);
       if (ImGui::Button(contributing_link.c_str()))
+      {
          ShellExecuteA(nullptr, "open", "https://github.com/Filoppi/Luma-Framework", nullptr, nullptr, SW_SHOWNORMAL);
+      }
 
       ImGui::NewLine();
       ImGui::Text("Build Date: %s %s", __DATE__, __TIME__);

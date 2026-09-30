@@ -26,6 +26,5 @@ namespace MotionVectorPatches
 
    constexpr std::pair<uint32_t, uint32_t> previous_slots[] = {{globals_slot, previous_globals_slot}};
    // For Core's patches ("motion_vector_patch.h"): the jitter buffer is declared after $Globals
-   constexpr MotionVectorPatch::Layout layout = {globals_slot, previous_slots, jitter_slot, resource_slots, previous_resources_slot,
-      current_position_register, previous_position_register, target_slot};
+   constexpr MotionVectorPatch::Layout layout = {.object_slot = globals_slot, .previous_slots = previous_slots, .jitter_slot = jitter_slot, .resource_slots = resource_slots, .previous_resources_slot = previous_resources_slot, .current_position_register = current_position_register, .previous_position_register = previous_position_register, .target_slot = target_slot};
 } // namespace MotionVectorPatches
