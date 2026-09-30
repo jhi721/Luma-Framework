@@ -16137,6 +16137,14 @@ void Init(bool async)
 {
    has_init = true;
 
+   // ReShade can unload and register the addon again without unloading the dll (it does on boot): the games' "OnInit()" appends their
+   // defines each time, so drop the previous run's (their duplicates would override edits of the first copy)
+   static const size_t core_shader_defines_count = shader_defines_data.size();
+   while (shader_defines_data.size() > core_shader_defines_count)
+   {
+      shader_defines_data.pop_back(); // The defines can't be assigned, which "erase()" needs
+   }
+
    for (int i = 0; i < shader_defines_data.size(); i++)
    {
       shader_defines_data_index[string_view_crc32(std::string_view(shader_defines_data[i].default_data.GetName()))] = i;
