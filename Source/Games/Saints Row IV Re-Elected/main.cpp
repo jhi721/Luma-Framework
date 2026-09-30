@@ -564,16 +564,20 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    // draws in between reuse the last contents), by buffer (an entry registers it, null until its first Unmap): each Map's pointer,
    // copied at Unmap into a new snapshot the draws share
    using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
-   std::mutex mv_constants_mutex;
+   std::shared_mutex mv_constants_mutex;
    std::unordered_map<uint64_t, void*> mv_mapped_constants;
    std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
+   // Render scale: the scene draws' PS vc4 buffers, whose "IR_Pixel_Steps" (c9) is rewritten at Unmap, and the last one registered
+   // (read without the lock, cleared when that buffer is destroyed)
+   std::unordered_set<uint64_t> sub_rect_vc4_buffers;
+   std::atomic<ID3D11Buffer*> sub_rect_last_vc4 = nullptr;
    // The first registered buffers (vc2 / vc3 copies, render scale vc4) and their sizes again, for the Map hooks to skip the game's
    // other buffers without the lock and the lookups (see "MayBeRegisteredBuffer"). Written under "mv_constants_mutex"; with more
    // registered, every buffer takes the lock.
    static constexpr uint32_t max_filtered_buffers = 32;
    static constexpr uint64_t destroyed_buffer_slot = 1; // A destroyed buffer's slot, reused by the next registration (never a handle)
    std::array<std::atomic<uint64_t>, max_filtered_buffers> mv_filtered_buffers = {};
-   std::array<UINT, max_filtered_buffers> mv_filtered_buffer_sizes = {};
+   std::array<std::atomic<UINT>, max_filtered_buffers> mv_filtered_buffer_sizes = {};
    std::atomic<uint32_t> mv_filtered_buffer_count = 0; // Every registered buffer, past "max_filtered_buffers" too
    // Every copy made, and by size those nobody held anymore at the last present (the next copies take them, see "NewConstantsCopy").
    // Every copy is in the pool, so one with a use count of 2 is held by "mv_constants_copies" and the pool alone. Under
@@ -596,15 +600,12 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
 
    // Render scale (see "g_render_scale"): whether the scaled viewport and scissor are still bound (until the game binds its own, see
-   // "OnBindViewports"; a value compare can't tell them apart, the half res SSAO viewport equals the sub-rect at 0.5), the game's they
-   // replaced (put back when the scene ends), and the scene draws' PS vc4 buffers, whose "IR_Pixel_Steps" (c9) is rewritten at Unmap
-   // (under mv_constants_mutex)
+   // "OnBindViewports"; a value compare can't tell them apart, the half res SSAO viewport equals the sub-rect at 0.5) and the game's
+   // they replaced (put back when the scene ends)
    D3D11_VIEWPORT sub_rect_game_viewport = {};
    D3D11_RECT sub_rect_game_scissor = {};
    bool sub_rect_bound = false;
    bool sub_rect_scissor_bound = false;
-   ID3D11Buffer* sub_rect_last_vc4 = nullptr;
-   std::unordered_set<uint64_t> sub_rect_vc4_buffers;
    // The frame depth post reads ("mv_frame_depth": the final composite's t5, DoF, god rays) resampled over the full target after the
    // upscaler: a copy of it to read, a view to write it, and the state that writes it unconditionally
    com_ptr<ID3D11Texture2D> sub_rect_depth_copy;
@@ -760,7 +761,7 @@ class SaintsRowIV final : public Game
       {
          D3D11_BUFFER_DESC desc;
          buffer->GetDesc(&desc);
-         game_device_data->mv_filtered_buffer_sizes[slot] = desc.ByteWidth;
+         game_device_data->mv_filtered_buffer_sizes[slot].store(desc.ByteWidth, std::memory_order_relaxed);
          game_device_data->mv_filtered_buffers[slot].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_release);
       }
       // Past the list, the count still grows: every buffer then takes the lock
@@ -782,7 +783,7 @@ class SaintsRowIV final : public Game
       {
          if (game_device_data.mv_filtered_buffers[i].load(std::memory_order_acquire) == handle)
          {
-            *size = game_device_data.mv_filtered_buffer_sizes[i];
+            *size = game_device_data.mv_filtered_buffer_sizes[i].load(std::memory_order_relaxed);
             return true;
          }
       }
@@ -926,10 +927,8 @@ class SaintsRowIV final : public Game
       game_device_data.mv_mapped_constants.erase(resource.handle);
       if (!registered)
          return;
-      if (game_device_data.sub_rect_last_vc4 == reinterpret_cast<ID3D11Buffer*>(resource.handle))
-      {
-         game_device_data.sub_rect_last_vc4 = nullptr;
-      }
+      ID3D11Buffer* destroyed = reinterpret_cast<ID3D11Buffer*>(resource.handle);
+      game_device_data.sub_rect_last_vc4.compare_exchange_strong(destroyed, nullptr, std::memory_order_relaxed);
       const uint32_t count = (std::min)(game_device_data.mv_filtered_buffer_count.load(std::memory_order_relaxed), SaintsRowIVGameDeviceData::max_filtered_buffers);
       for (uint32_t i = 0; i < count; i++)
       {
@@ -1148,10 +1147,10 @@ class SaintsRowIV final : public Game
       }
       com_ptr<ID3D11Buffer> vc4;
       native_device_context->PSGetConstantBuffers(4, 1, &vc4);
-      if (vc4 && vc4.get() != game_device_data.sub_rect_last_vc4)
+      if (vc4 && vc4.get() != game_device_data.sub_rect_last_vc4.load(std::memory_order_relaxed))
       {
-         game_device_data.sub_rect_last_vc4 = vc4.get();
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
+         game_device_data.sub_rect_last_vc4.store(vc4.get(), std::memory_order_relaxed);
          if (game_device_data.sub_rect_vc4_buffers.insert(reinterpret_cast<uint64_t>(vc4.get())).second && !game_device_data.mv_constants_copies.contains(reinterpret_cast<uint64_t>(vc4.get())))
          {
             RegisterFilteredBuffer(&game_device_data, vc4.get());
@@ -2032,10 +2031,7 @@ public:
          return false;
       auto& game_device_data = GetGameDeviceData(device_data);
       const bool subtractive = blend == OutputBlend::Subtractive;
-      const uint32_t limit_pixel_shader = subtractive ? "SR4 Subtractive Limit PS"_h : "SR4 Additive Limit PS"_h;
-      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, limit_pixel_shader))
-         return false;
+      const uint32_t limit_pixel_shader = (subtractive ? "SR4 Subtractive Limit PS"_h : "SR4 Additive Limit PS"_h);
 
       D3D11_TEXTURE2D_DESC base_desc = {};
       if (game_device_data.blend_limit_base_texture)
@@ -2070,6 +2066,11 @@ public:
 
       native_device_context->CopyResource(game_device_data.blend_limit_base_texture.get(), target_resource);
       original_draw_dispatch_func();
+      // The shaders are looked up after the game's draw, which runs outside Luma's locks: without them (still compiling, a reload) the
+      // draw stays unlimited
+      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, limit_pixel_shader))
+         return true;
       DrawStateStack<DrawStateStackType::FullGraphics> limit_state;
       limit_state.Cache(native_device_context, device_data.uav_max_count);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at(limit_pixel_shader).get(), game_device_data.blend_limit_base_srv.get(), target_rtv, desc.Width, desc.Height);
@@ -2095,13 +2096,18 @@ public:
          return DrawOrDispatchOverrideType::None;
       auto& game_device_data = GetGameDeviceData(device_data);
 
-      // Held through SMAA so a shader reload cannot release them mid-use; "DrawSMAA" looks its shaders up with "at".
-      // Without "smaa" (the upscaler already antialiased the scene) only RCAS runs.
-      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      const bool sharpen = g_rcas_sharpness > 0.f && HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SR4 Sharpen PS"_h);
+      // Held through SMAA so a shader reload cannot release them mid-use ("DrawSMAA" looks its shaders up with "at"), except over the
+      // game's draw, which runs outside Luma's locks: checked again after it. Without "smaa" (the upscaler already antialiased the
+      // scene) only RCAS runs.
+      std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      const auto has_sharpen_shaders = [&]
+      { return HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "SR4 Sharpen PS"_h); };
+      const auto has_smaa_shaders = [&]
+      { return HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h) && HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h); };
+      const bool sharpen = g_rcas_sharpness > 0.f && has_sharpen_shaders();
       if (!smaa && !sharpen)
          return DrawOrDispatchOverrideType::None;
-      if (smaa && (!HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h)))
+      if (smaa && !has_smaa_shaders())
          return DrawOrDispatchOverrideType::None;
 
       // The scratch textures: canvas sized, single mip
@@ -2159,7 +2165,12 @@ public:
             depth_srv.reset();
       }
 
+      lock_shader_objects.unlock();
       original_draw_dispatch_func();
+      lock_shader_objects.lock();
+      // A shader reload during the game's draw: the composite stays as drawn this frame
+      if ((smaa && !has_smaa_shaders()) || (sharpen && !has_sharpen_shaders()) || (depth_srv && !HasShaders(device_data.native_compute_shaders, "SR4 SMAA Predication CS"_h)))
+         return DrawOrDispatchOverrideType::Replaced;
       native_device_context->CopyResource(game_device_data.smaa_gamma_texture.get(), canvas_resource.get());
       game_device_data.snapshot_frame = cb_luma_global_settings.FrameIndex;
 
