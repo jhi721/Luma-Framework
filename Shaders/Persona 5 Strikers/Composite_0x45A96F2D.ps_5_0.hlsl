@@ -1,5 +1,6 @@
 // Katana engine PostEffect3 composite: scene exposure, chromatic aberration, sun/lens flare, vignette ("limb darkening"),
-// then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) via an ARRI LogC EI1000 (no cut) shaper, an optional LDR LUT, an output power curve (g_vGammaCorrection) and fade.
+// then the HDR 3D LUT (32^3 BGRA8 asset, tonemap + grade baked offline) via an ARRI LogC EI1000 (no cut) shaper, an optional LDR
+// LUT, an output power curve (g_vGammaCorrection) and fade.
 // Writes linear colors to the swapchain through an sRGB view; UI and FXAA follow.
 // Luma: in HDR, the vanilla LUT output is scaled by E(Y) / G(Y) of the pre-LUT relative luminance Y, where G is the LUT's gray tone
 // curve and E is G continued by its tangent past the pivot where G reaches mid gray. Only luminance crosses into the output (as in

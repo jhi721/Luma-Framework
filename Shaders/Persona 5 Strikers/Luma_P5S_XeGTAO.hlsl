@@ -3,7 +3,7 @@
 // Source: https://github.com/GameTechDev/XeGTAO
 //
 // P5S specifics (from the native SSAO's disassembly and a capture of its inputs):
-// - Only the SSAO calculate (PS 0x63435B03) is replaced: these 4 dispatches run at its target size (R8_UNORM, half res) and are
+// - Only the SSAO calculate (PS 0x63435B03) is replaced: the XeGTAO dispatches run at its target size (R8_UNORM, half res) and are
 //   CopyResource'd into it. Its two depth aware blurs (0xDEBA65FD, 0x4D8EC71C, upsampling to full res) and the G-buffer merge
 //   (min into gbuf0.a) stay vanilla, so the output is VISIBILITY (1 = open), as the native one.
 // - Depth = the calculate's t0 (half res raw D32, reversed Z, sky = 0); normals = its t1 (full res R16G16B16A16_UNORM, octahedral

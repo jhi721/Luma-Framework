@@ -40,8 +40,9 @@ namespace
    // 0.299/0.587/0.114 weighted RGB sum, k a cb0 scalar) exceeds 0-1: every dumped one ending in that tail, each with one o0.xyzw write and
    // final ret (see "PatchShaderBytecodeSync")
    const std::unordered_set<uint32_t> ui_pixel_shaders = {0x90C6B12E, 0xEE9FC290, 0x07378D54, 0x4A0CB253, 0x8BA60D22, 0xD1BEFD65, 0xF0863953, 0x76C3BC5E, 0xA4DFC750, 0xBEF2C79E};
-   // A scene frame's first post pass (scene at t0): DOF (E0DB2D7E), else bloom prefilter, else composite. It ends the scene frame;
-   // DLSS/FSR run right before it. The preceding lighting varies by scene (691D080F, or 4376F855 twice).
+   // A scene frame's first post pass (scene at t0): DOF prefilter (E0DB2D7E or its two highlight mask variants), else bloom prefilter,
+   // else composite. It ends the scene frame; DLSS/FSR run right before it. The preceding lighting varies by scene (691D080F, or
+   // 4376F855 twice).
    const ShaderHashesList post_process_start_shader_hashes = {.pixel_shaders = {0xE0DB2D7E, 0xD65ABD25, 0x3D7CAD40, 0xB6289AC0, composite_hash}};
    // Bloom upsamples (3x3 tent into the next mip up, and its g_vMaxUV clamped twin): the first of a frame adds the iterations the game
    // skips below the output resolution (see "ExtendBloom")
@@ -57,7 +58,7 @@ namespace
    // stretch onto the swapchain
    constexpr uint32_t copy_hash = 0x987DC89C;
    // Fullscreen at a custom resolution (P5StrikersFix): the game draws the whole frame (composite, UI, FXAA) into its own target of that
-   // size, then this ("pow(sample, cb0[0].x)", 1) puts it on the swapchain within black bars (92F1307C). That target then is what
+   // size, then this (exp(log(color) * gamma), gamma 1) puts it on the swapchain within black bars (92F1307C). That target then is what
    // "swapchain" means in this file (see "IsGameBackBuffer").
    constexpr uint32_t letterbox_hash = 0xEC5254F6;
    // 3D layers outside the scene (main menu and pause screen characters): the quad vertex shader (texture coordinates from vertices)
@@ -398,10 +399,10 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // The upscaler drew the last presented frame: the jitter only goes where it gets resolved (a scene the split refuses, e.g. an
    // unexpected size or format, would otherwise just shake)
    std::atomic<bool> sr_drew = false;
-   // The reasons a scene frame wasn't split for the upscaler, each logged once (bits of "SplitRefusal")
+   // The reasons a scene frame wasn't split for the upscaler, each logged once (bits as in the "[P5S SR]" warning's legend)
    std::atomic<uint32_t> sr_split_refusals_logged = 0;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
-   // Immediate context only: the upscaled output DLSS/FSR last drew into, null after a DLAA frame (see the DLSS workaround after "Draw")
+   // Immediate context only: the upscaled output DLSS/FSR last drew into, null after a DLAA frame (see "output_recreated")
    com_ptr<ID3D11Texture2D> sr_drawn_output;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_output_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_output_srv;
@@ -602,7 +603,8 @@ class Persona5Strikers final : public Game
             buffer->second.mapped = *data;
          }
       }
-      // A deferred context's first map of a dynamic buffer in a command list must discard, so the split discards these (see "sr_no_overwrite_buffers")
+      // A deferred context's first map of a dynamic buffer in a command list must discard, so the split discards these (see
+      // "sr_no_overwrite_buffers")
       else if (access == reshade::api::map_access::write_only)
       {
          auto* const buffer = reinterpret_cast<ID3D11Buffer*>(resource.handle);
@@ -1493,9 +1495,9 @@ public:
    }
 
    // Draws the composite, then SMAA on its canvas (swapchain, upscaled canvas, or without DLSS/FSR below render scale 1 its own target,
-   // which the game stretches onto the swapchain) before the UI: copy, gamma encode, predication, SMAA
-   // into the gamma copy, finalize (RCAS, decode, dither) into the canvas; without RCAS, SMAA writes the canvas. With "smaa" false
-   // (DLSS/FSR antialiased) only RCAS: copy (not of the upscaled canvas), gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
+   // which the game stretches onto the swapchain) before the UI: copy, gamma encode, predication, SMAA into the gamma copy, finalize
+   // (RCAS, decode, dither) into the canvas; without RCAS, SMAA writes the canvas. With "smaa" false (DLSS/FSR antialiased) only RCAS:
+   // copy (not of the upscaled canvas), gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
    // composite is left alone and the vanilla FXAA runs (not after DLSS/FSR).
    static DrawOrDispatchOverrideType DrawCompositeWithSMAAAndRCAS(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers, const std::function<void()>& original_draw_dispatch_func, bool smaa)
    {
@@ -2733,7 +2735,7 @@ public:
          {
             const std::lock_guard lock(game_device_data.sr_mutex);
             // The game doesn't know its command list restarted: its next "D3D11_MAP_WRITE_NO_OVERWRITE" map fails without a discard first
-            // (dialogue text went missing). Data appended before the split is lost, as in other mods that split command lists.
+            // (dialogue text went missing). Data appended before the split is lost.
             for (const auto& buffer : game_device_data.sr_no_overwrite_buffers)
             {
                D3D11_MAPPED_SUBRESOURCE mapped;
@@ -3008,7 +3010,8 @@ public:
          }
       }
 
-      // The game's stretch of the composite target onto the swapchain (render scales below 1) is scene, not UI. Upscaled, it copies the canvas 1:1.
+      // The game's stretch of the composite target onto the swapchain (render scales below 1) is scene, not UI. Upscaled, it copies the
+      // canvas 1:1.
       if (original_shader_hashes.Contains(copy_hash, reshade::api::shader_stage::pixel) && can_draw)
       {
          com_ptr<ID3D11Resource> composite_target;
@@ -3069,12 +3072,13 @@ public:
                }
             }
 
-            // UI blends reading the swapchain saw it clamped to 0-1 by the vanilla UNORM target; in fp16, earlier additive UI (e.g. the menu
-            // cursor's RGB cards, alpha 1 + 1 + 1) exceeds 1: the cursor's reverse subtracted text vanished and destination alpha masks (HUD,
-            // main menu) read alphas up to 2. So clamp first with the same draw (own geometry and stencil) and a MIN blend: all channels before a
-            // color subtract, only where the sprite subtracts something (a HUD subtract's quad would clip the HDR scene under it; this reads the
-            // UI pixel shaders' b0 "nStageNum", t0/s0 and TEXCOORD1 and assumes a source alpha factor), else only the never displayed alpha (white). Subtracts are floored after (dialogue bubbles reached -1.5) with a black pixel shader and a MAX
-            // blend; additive UI is clamped after to the display's peak (vanilla clipped at 1), likewise.
+            // UI blends reading the swapchain saw it clamped to 0-1 by the vanilla UNORM target; in fp16, earlier additive UI (e.g. the
+            // menu cursor's RGB cards, alpha 1 + 1 + 1) exceeds 1: the cursor's reverse subtracted text vanished and destination alpha
+            // masks (HUD, main menu) read alphas up to 2. So the same draw (own geometry and stencil) first clamps with a MIN blend: all
+            // channels before a color subtract, only where the sprite subtracts something (a HUD subtract's quad would clip the HDR scene
+            // under it; this reads the UI pixel shaders' b0 "nStageNum", t0/s0 and TEXCOORD1 and assumes a source alpha factor), else only
+            // the never displayed alpha (white). After it, subtracts are floored at 0 (dialogue bubbles reached -1.5) with a black pixel
+            // shader and a MAX blend, and additive UI is clamped to the display's peak (vanilla clipped at 1) with a MIN blend.
             if (can_draw)
             {
                com_ptr<ID3D11BlendState> blend_state;
