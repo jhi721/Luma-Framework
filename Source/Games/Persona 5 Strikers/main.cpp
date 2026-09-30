@@ -412,7 +412,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::atomic<bool> render_resolution_composite = false;
    uint32_t menu_presents = 0;
    // The 3D layers' targets (shared by the main and pause menus) are made at the render resolution of their first use and kept through
-   // any rebuild or resize: until a layer drew, the render scale stays 100%, or they stay render sized (stretched) for the whole run
+   // any rebuild or resize: until a layer drew the game counts as in the main menu (100%), or they stay render sized (stretched) for the
+   // whole run. Then the title stays at 100% until a scene frame, as a later main menu does.
    std::atomic<bool> layer_targets_created = false;
    // Upscaling: the 3D layers outside the scene draw at the output resolution (see "DrawLayerAtOutputResolution")
    struct LayerFrame
@@ -2894,7 +2895,11 @@ public:
             game_device_data.menu_presents = 0;
          else if (render_resolution_composite && game_device_data.menu_presents < 30)
             game_device_data.menu_presents++;
-         const bool menu = game_device_data.menu_presents >= 30 || !game_device_data.layer_targets_created;
+         if (!game_device_data.layer_targets_created)
+         {
+            game_device_data.menu_presents = 30;
+         }
+         const bool menu = game_device_data.menu_presents >= 30;
          UpdateRenderScale(&game_device_data, menu);
       }
       // A mip sharper under DLSS/FSR, which resolves the detail over its jittered frames (Core applies it to anisotropic samplers)
