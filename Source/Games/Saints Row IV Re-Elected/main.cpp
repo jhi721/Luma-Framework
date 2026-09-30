@@ -1628,7 +1628,7 @@ class SaintsRowIV final : public Game
       // The motion vectors are UV deltas of the rendered area (the viewport), previous minus current
       settings_data.mvs_x_scale = float(render_width);
       settings_data.mvs_y_scale = float(render_height);
-      settings_data.auto_exposure = true;
+      settings_data.auto_exposure = (device_data.sr_type != SR::Type::FSR);
       settings_data.render_preset = dlss_render_preset;
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
@@ -1643,8 +1643,8 @@ class SaintsRowIV final : public Game
       draw_data.jitter_x = game_device_data.mv_jitter[0];
       draw_data.jitter_y = game_device_data.mv_jitter[1];
       draw_data.reset = device_data.force_reset_sr;
-      if (vert_fov > 0.0)
-         draw_data.vert_fov = float(vert_fov);
+      // FSR needs one on every frame: 60 degrees when projTM gave none (as SR3R)
+      draw_data.vert_fov = float(vert_fov > 0.0 ? vert_fov : (60.0 * M_PI / 180.0));
       if (near_plane > 0.0)
       {
          draw_data.near_plane = float(near_plane);
