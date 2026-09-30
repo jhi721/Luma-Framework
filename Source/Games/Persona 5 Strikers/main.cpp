@@ -391,6 +391,11 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::atomic<ID3D11DeviceContext*> sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the scene's command lists
    std::atomic<bool> sr_active = false;
+   // The upscaler drew the last presented frame: the jitter only goes where it gets resolved (a scene the split refuses, e.g. an
+   // unexpected size or format, would otherwise just shake)
+   std::atomic<bool> sr_drew = false;
+   // The reasons a scene frame wasn't split for the upscaler, each logged once (bits of "SplitRefusal")
+   std::atomic<uint32_t> sr_split_refusals_logged = 0;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
    // Immediate context only: the upscaled output DLSS/FSR last drew into, null after a DLAA frame (see the DLSS workaround after "Draw")
    com_ptr<ID3D11Texture2D> sr_drawn_output;
@@ -779,7 +784,7 @@ class Persona5Strikers final : public Game
             return previous.frame + 1 < game_device_data.mv_frame_present; });
 
       // Halton (2, 3) over the upscaler's phase count (from its last settings; more at lower render scales)
-      const bool jitter = IsSRActive(device_data);
+      const bool jitter = IsSRActive(device_data) && game_device_data.sr_drew;
       const SR::InstanceData* const sr_instance_data = (jitter ? device_data.GetSRInstanceData() : nullptr);
       const int phases = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
       game_device_data.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{});
@@ -2709,6 +2714,18 @@ public:
             game_device_data.sr_split_context = reinterpret_cast<uint64_t>(native_device_context);
             game_device_data.scene_antialiased = true;
          }
+         // Not split: the scene runs without the upscaler (and without the jitter, see "sr_drew"). Each reason is logged once, as it's
+         // the only trace of a setup (resolution, display mode) the upscaling doesn't expect.
+         else
+         {
+            const bool fp16_scene = scene_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || scene_desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+            const uint32_t reasons = (split.depth ? 0u : 1u) | ((native_device_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED) ? 0u : 2u) | ((scene_desc.Width == mv_size.x && scene_desc.Height == mv_size.y) ? 0u : 4u) | ((scene_desc.SampleDesc.Count == 1) ? 0u : 8u) | (fp16_scene ? 0u : 16u);
+            const uint32_t refusal = (reasons != 0 ? reasons : 32u); // 32: "FinishCommandList" failed
+            if ((game_device_data.sr_split_refusals_logged.fetch_or(refusal) & refusal) != refusal)
+            {
+               reshade::log::message(reshade::log::level::warning, std::format("[P5S SR] a scene frame runs without DLSS/FSR (reasons {:#x}: 1 no depth, 2 immediate context, 4 size, 8 multisampled, 16 not upgraded to fp16, 32 command list): scene {}x{} format {} samples {}, motion vectors {}x{}, output {}x{}", refusal, scene_desc.Width, scene_desc.Height, int(scene_desc.Format), scene_desc.SampleDesc.Count, mv_size.x, mv_size.y, output_size.x, output_size.y).c_str());
+            }
+         }
       }
 
       // Upscaled: the post process up to the composite (which ends it) draws at the output resolution, other readers of the render
@@ -3159,9 +3176,10 @@ public:
       // Set by the composite; Core copies it into "has_drawn_main_post_processing_previous" before this, but never clears it
       device_data.has_drawn_main_post_processing = false;
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
-      device_data.force_reset_sr = !device_data.has_drawn_sr;
-      device_data.has_drawn_sr = false;
       auto& game_device_data = GetGameDeviceData(device_data);
+      device_data.force_reset_sr = !device_data.has_drawn_sr;
+      game_device_data.sr_drew = device_data.has_drawn_sr.load();
+      device_data.has_drawn_sr = false;
       game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       game_device_data.mv_presents++;
       {
