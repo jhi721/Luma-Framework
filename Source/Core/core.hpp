@@ -5092,6 +5092,25 @@ namespace
                {
                   pipeline_to_bind = cached_pipeline->pipeline_clone;
                }
+               // A patch clone makes the pass custom only where it's bound: the game can keep the original by default ("OnBindPatchedShader")
+               // and swap the clone in per draw ("UseShaderVariant")
+               if (cached_pipeline->clone_origin == Shader::CloneOrigin::Patch)
+               {
+                  const bool clone_bound = game_bound_clone || swap_to_clone;
+                  if ((stages & reshade::api::pipeline_stage::compute_shader) != 0)
+                  {
+                     cmd_list_data.pipeline_state_has_custom_compute_shader = clone_bound;
+                  }
+                  if ((stages & reshade::api::pipeline_stage::vertex_shader) != 0)
+                  {
+                     cmd_list_data.pipeline_state_has_custom_vertex_shader = clone_bound;
+                  }
+                  if ((stages & reshade::api::pipeline_stage::pixel_shader) != 0)
+                  {
+                     cmd_list_data.pipeline_state_has_custom_pixel_shader = clone_bound;
+                  }
+                  cmd_list_data.pipeline_state_has_custom_graphics_shader = cmd_list_data.pipeline_state_has_custom_pixel_shader || cmd_list_data.pipeline_state_has_custom_vertex_shader;
+               }
             }
             // Device calls must not happen while holding a mutex. Pipeline destruction only happens when the original pipeline is destroyed (garbage collected), which is guaranteed to not happen here, as its being bound right now (which keeps it alive).
             if (pipeline_to_bind.handle != 0)
