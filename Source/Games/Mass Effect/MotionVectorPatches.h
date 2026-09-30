@@ -5,8 +5,8 @@
 
 #include "..\..\Core\includes\motion_vector_patch.h"
 
-// Motion vectors for a game that renders none, by patching whole DXBC containers (Core's
-// "motion_vector_patch.h"; this file holds the game's slots and registers).
+// Motion vectors for a game that renders none, by patching whole DXBC containers (Core's "motion_vector_patch.h"; this file
+// holds the game's slots and registers).
 // Vertex shaders run twice: the second run reads the previous frame's per-draw constants (vc4: view projection, world matrix, bone
 // palette) from another slot, and only its SV_Position is kept, as an extra output. The first run's SV_Position is also copied to an
 // extra output, as outputs can't be read back. Ported from Saints Row IV Re-Elected.

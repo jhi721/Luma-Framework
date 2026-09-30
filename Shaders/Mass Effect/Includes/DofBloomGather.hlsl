@@ -22,7 +22,7 @@ Texture2D<float4> SceneColorTexture : register(t0); // fp16 scene color; .w carr
 #define DoFBloomScale PsConstants[11] // .x = bloom scale
 
 // Vanilla glow gain, or zero when the Luma pyramid owns the glow. Read as a BOOLEAN (C++ bool; a weight would leave
-// half the vanilla glow) and it is that glow's ONLY switch. Hoisted out of GatherTap so it is not re-evaluated per tap.
+// half the vanilla glow) and it is that glow's ONLY switch.
 static const float LumaGatherBloomScale = (LumaSettings.GameSettings.LumaBloomEnable > 0.5) ? 0.0 : DoFBloomScale.x;
 
 // One tap: (blur * colour + bloom, blur). Vanilla bright-pass: the tap passes through when any channel is above 1.0.

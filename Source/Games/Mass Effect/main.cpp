@@ -1,6 +1,6 @@
 // Mass Effect (2007) Luma HDR mod (UE3 2007, 32-bit, DX9 -> D3D11 via dgVoodoo2), cloned from the MoH Airborne port;
-// hashes are dgVoodoo-translated, 2.87.3 and 2.81.3 keyed. No depth SRV and no motion vectors of its own: FSR's are built by
-// patched shaders (see MotionVectorPatches.h).
+// hashes are dgVoodoo-translated, 2.87.3 and 2.81.3 keyed. No depth SRV and no motion vectors of its own: the upscalers' are
+// built by patched shaders (see MotionVectorPatches.h).
 
 // No auto-debugger MessageBox: invisible under borderless and it blocks the loader (ReShade error 1114, as BL2/TW2).
 #define DISABLE_AUTO_DEBUGGER 1
@@ -29,9 +29,6 @@
 #endif
 
 #if DEVELOPMENT
-// "SR Bridge Profile": 600 upscaled frames of the SR bridge's steps (a GPU timestamp and a QPC time each, from "SR_BRIDGE_PROFILE")
-// and of the frame (present to present) into "LumaBridgeProfile\game.csv" next to the exe, the helper's own into "helper.csv"
-// ("LUMA_UPSCALER_PROFILE", set in this process only, for the restarted helper), joined by their bridge frame numbers.
 // The median of "values" (0 without any), for the sweeps
 static double Median(std::vector<double> values)
 {
@@ -41,6 +38,9 @@ static double Median(std::vector<double> values)
    return values[values.size() / 2];
 }
 
+// "SR Bridge Profile": 600 upscaled frames of the SR bridge's steps (a GPU timestamp and a QPC time each, from "SR_BRIDGE_PROFILE")
+// and of the frame (present to present) into "LumaBridgeProfile\game.csv" next to the exe, the helper's own into "helper.csv"
+// ("LUMA_UPSCALER_PROFILE", set in this process only, for the restarted helper), joined by their bridge frame numbers.
 namespace BridgeProfile
 {
    constexpr int kSteps = 6; // SRBridge.cpp's "SR_BRIDGE_PROFILE" steps
@@ -121,7 +121,7 @@ void ProfileBridgeStep(ID3D11DeviceContext* context, int step, unsigned long lon
    auto* const frame = BridgeProfile::current;
    if (!frame)
       return;
-   frame->bridge_n = bridge_frame; // The frame's own from the step after its input copies on
+   frame->bridge_n = bridge_frame; // The last step's: the bridge numbers its frame after the input copies
    frame->gpu_step[step] = BridgeProfile::Query(context, D3D11_QUERY_TIMESTAMP);
    context->End(frame->gpu_step[step].get());
    frame->cpu_step[step] = BridgeProfile::Now();
@@ -153,9 +153,9 @@ static constexpr uint32_t kDofBloomGather4Hash_v281 = 0xAA369C00;
 static constexpr uint32_t kDofBloomBlendHash_v281 = 0x63B94FF3;
 static constexpr uint32_t kBloomFilterHash_v281 = 0x464E33BB;
 
-// DLAA / FSR Native AA: the scene's first post passes, which end a motion vector frame (the upscaler runs right before). The BioSceneEffect material
-// and its Render_Style variants, else motion blur, normally come first; the others end uber-less or effect-less chains. Not the copy,
-// a generic blit.
+// DLAA / FSR Native AA: the scene's first post passes, which end a motion vector frame (the upscaler runs right before). The
+// BioSceneEffect material and its Render_Style variants, else motion blur, normally come first; the others end uber-less or
+// effect-less chains. Not the copy, a generic blit.
 static constexpr uint32_t kScenePostHashes[] = {
    0xA640835C, // BioSceneEffect material
    0x79B4213D, // ... 2.81.3
@@ -207,7 +207,7 @@ constexpr bool IsCpuOptimized(uint32_t optimization)
 #endif
 #if DEVELOPMENT
 static float g_sr_reactive_scale = 1.f;      // FSR reactive mask: the alpha blended draws' reactivity, scaled (AMD's default 1)
-static float g_sr_reactive_threshold = 0.5f; // Under it 0, over it 0.9 (AMD's 0.2; 0.5 tuned in game 2026-09-28: lower shakes static glows); 0: the scaled reactivity itself
+static float g_sr_reactive_threshold = 0.5f; // Under it 0, over it 0.9 (AMD's 0.2; 0.5 tuned in game: lower shakes static glows); 0: the scaled reactivity itself
 static bool g_mv_enable = false;
 static bool g_mv_debug_view = false;
 static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
@@ -218,7 +218,7 @@ static int g_perf_test = 0;
 struct PerfTestMode
 {
    const char* name;
-   bool set_aa = false; // Else the current settings (the fields below too)
+   bool set_aa = false; // Else the current anti-aliasing (the next three fields unused)
    SR::Type sr_type = SR::Type::None;
    bool smaa = false;
    bool reactive_mask = false;
@@ -247,7 +247,7 @@ static bool g_perf_sweep = false;
 // The hooks' CPU time for "cpu hooks": two clock reads per timed draw and buffer upload, themselves a cost (a Sweep with it off
 // shows it in the frame times)
 static bool g_perf_hook_timers = true;
-// Experiments on the game to helper handoff of the SR bridge ("in", see "SR Bridge Profile"): a flush right before the bridge's
+// Experiments on the game to helper handoff of the SR bridge (see "SR Bridge Profile"): a flush right before the bridge's
 // frame (the frame's work submitted first, the input copies and the signal on their own), and the game device's GPU thread
 // priority ("IDXGIDevice::SetGPUThreadPriority", -7 to 7). Not saved.
 static bool g_bridge_flush_before = false;
@@ -338,7 +338,7 @@ constexpr uint32_t smaa_idle_release_frames = 600;
 #if DEVELOPMENT
 static_assert(memory_sweep_settle_frames > int(smaa_idle_release_frames));
 #endif
-// RCAS on the SMAA output, opt-in (BL2/TW2): at 0 the pass never runs and its full-res intermediate is not allocated.
+// RCAS on the SMAA or upscaler output, opt-in (BL2/TW2): at 0 the pass never runs and its full-res intermediate is not allocated.
 static float g_rcas_sharpness = 0.f;
 #if DEVELOPMENT
 // Calibration aid: predication's effect is the ABSENCE of smearing, which the eye misjudges - judge the mask instead.
@@ -404,10 +404,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // The canvas the final color pass wrote, from its bound RTV. Used by Hide UI and SMAA. Released every Present.
    ComPtr<ID3D11Resource> canvas_res;
 
-   // Non-owning view onto core's DrawBloom mip 0 (core-managed, released with the swapchain). Rebuilt every frame.
+   // A reference to core's DrawBloom mip 0 (the chain is core's, see "ReleaseBloom"). Rebuilt every frame.
    ComPtr<ID3D11ShaderResourceView> srv_luma_bloom;
 
-   // Scene buffer from t0 of the hooked final pass. Its ALPHA carries linear depth, which SMAA predication reads.
+   // The scene from t0 of the uber (of the gamma pass when the engine skips the uber): the bloom source, and its ALPHA carries the
+   // linear depth SMAA predication reads.
    ComPtr<ID3D11ShaderResourceView> srv_scene;
 
    // ---- DLAA / FSR Native AA (BL GOTY's motion vector path, one per-draw buffer: dgVoodoo's vc4) ----
@@ -420,8 +421,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
    // None was picked ("CleanExtraSRResources", from the overlay): the upscaler's resources go at the next present
    std::atomic<bool> release_sr_resources = false;
-   // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
-   // blend state writes it unblended, see "OnCreateBlendState")
 #if DEVELOPMENT
    bool mv_dumping = false; // This frame's scene draws go to the log ("MV Dump Scene Draws")
    uint32_t mv_dump_index = 0;
@@ -474,8 +473,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
 #endif
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
-   // A game shader's patched version (null if refused) by its hash; a vertex shader's with the bytes of vc4 it reads
-   // ("DXBC::ConstantBufferBytes"): the previous frame's copy uploads only those
+   // A game shader's patched version (null if refused), patched on first use, by its hash; a vertex shader's with the bytes of
+   // vc4 it reads ("DXBC::ConstantBufferBytes"): the previous frame's copy uploads only those
    template <typename T>
    struct PatchedShader
    {
@@ -487,6 +486,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_pixel_shaders;
    // The alpha blended draws' pixel shaders with the mask target, by blend (see "ClassifyBoundBlend", index - 1)
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_reactive_pixel_shaders[2];
+   // The motion vector target (sized like the scene; every blend state writes it unblended, see "OnCreateBlendState")
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no upscaler)
@@ -644,7 +644,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       tex_smaa_out.reset();
    }
 
-   // Turning the feature off (or the upscaler antialiasing) gives the memory back: ~80 MB at 4K here, plus core's intermediates.
+   // Turning the feature off (or the upscaler antialiasing) gives the memory back: ~80 MB at 4K here, plus core's intermediates
+   // (~83 MB, "ReleaseSMAA").
    void ReleaseSMAAScratch()
    {
       srv_input.reset();
@@ -696,7 +697,8 @@ class MassEffect final : public Game
          DrawStateStack<DrawStateStackType::FullGraphics> bloom_state;
          bloom_state.Cache(native_device_context, device_data.uav_max_count);
 
-         // Karis average first: no TAA, so fireflies die spatially. The sigmas are in mip texels: resolution-independent.
+         // Karis average first, so fireflies die spatially (only an upscaler antialiases temporally). The sigmas are in mip
+         // texels: resolution-independent.
          ComPtr<ID3D11ShaderResourceView> srv_karis;
          DrawKarisAverage(native_device, native_device_context, device_data, srv_scene, srv_karis.put());
          if (srv_karis)
@@ -1076,8 +1078,7 @@ class MassEffect final : public Game
 #endif // ENABLE_SMAA
 #endif // DEVELOPMENT
 
-   // ---- DLAA / FSR Native AA with motion vectors and jitter from patched shaders (BL
-   // GOTY's path; vc4 = D3D9 c<N> at row N + 20) ----
+   // ---- DLAA / FSR Native AA with motion vectors and jitter from patched shaders (BL GOTY's path; vc4 row N + 20 = c<N>) ----
    static constexpr size_t kViewProjectionOffset =
       MotionVectorPatches::view_projection_row * 16; // c0-c3, row vectors
    static constexpr size_t kCameraSize = 5 * 16;     // ... and c4, the camera position
@@ -1090,10 +1091,8 @@ class MassEffect final : public Game
    // A camera ("mv_camera") comes from constants holding the translation row, so it always holds the whole camera
    static_assert(kTranslationOffset + 16 >= kViewProjectionOffset + kCameraSize);
 
-   // An upscaler is picked and hasn't failed (it then gives way to SMAA until
-   // picked again). Fixed for the whole frame (see "OnPresent"): a selection made
-   // after the motion vector state was set would otherwise run the upscaler on
-   // mixed state.
+   // An upscaler is picked and hasn't failed (it then gives way to SMAA until picked again). Fixed for the whole frame (see
+   // "OnPresent"): a selection made after the motion vector state was set would otherwise run the upscaler on mixed state.
    static bool IsSRActive(DeviceData& device_data)
    {
       return GetGameDeviceData(device_data).sr_active;
@@ -1162,8 +1161,7 @@ class MassEffect final : public Game
       return copy;
    }
 
-   // Motion vectors: a registered vc4 buffer mapped for a whole rewrite,
-   // remembered until its Unmap
+   // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device,
       reshade::api::resource resource, uint64_t offset,
       uint64_t size, reshade::api::map_access access,
@@ -1192,8 +1190,7 @@ class MassEffect final : public Game
 #endif
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has
-   // written it). Reads the mapped memory back.
+   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
    static void OnUnmapBufferRegion(reshade::api::device* device,
       reshade::api::resource resource)
    {
@@ -1219,10 +1216,8 @@ class MassEffect final : public Game
 #endif
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource
-   // (before it runs); a partial update is merged into the last copy. Needs the
-   // unsigned "full add-on support" ReShade (the signed build doesn't raise the
-   // event).
+   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs); a partial update is merged into the
+   // last copy. Needs the unsigned "full add-on support" ReShade (the signed build doesn't raise the event).
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data,
       reshade::api::resource resource,
       uint64_t offset, uint64_t size)
@@ -1265,10 +1260,9 @@ class MassEffect final : public Game
       return false;
    }
 
-   // The bound shader's motion vector version (or, "reactive" > 0, a pixel shader's
-   // reactive mask one, see "ClassifyBoundBlend"), patched from Core's bytecode copy on
-   // first use (null if it can't be, e.g. a vertex shader that doesn't place
-   // vertices with the view projection)
+   // The bound shader's motion vector version (or, "reactive" > 0, a pixel shader's reactive mask one, see "ClassifyBoundBlend"),
+   // patched from Core's bytecode copy on first use (null if it can't be, e.g. a vertex shader that doesn't place vertices with the
+   // view projection)
    template <typename T>
    static MassEffectGameDeviceData::PatchedShader<T>
    GetMotionVectorShader(ID3D11Device* native_device, DeviceData& device_data,
@@ -1324,8 +1318,7 @@ class MassEffect final : public Game
          if (FAILED(hr))
             error = std::format("create 0x{:08X}", uint32_t(hr));
       }
-      // Failures in every build (bug reports), every patched shader only in
-      // development
+      // Failures in every build (bug reports), except the expected screen space refusals; every patched shader only in development
       const bool screen_space = error.starts_with("screen space");
       if (DEVELOPMENT || (!shader && !screen_space))
          reshade::log::message(
@@ -1338,8 +1331,7 @@ class MassEffect final : public Game
       return shaders->try_emplace(hash, MassEffectGameDeviceData::PatchedShader<T>{shader, read_size, translation_offset}).first->second;
    }
 
-   // The bound vertex shader's patched version (null if refused), looked up again
-   // only when the game's changes
+   // The bound vertex shader's patched version (null if refused), looked up again only when the game's changes
    static ID3D11VertexShader*
    GetPatchedVertexShader(ID3D11Device* native_device,
       CommandListData& cmd_list_data, DeviceData& device_data,
@@ -1378,9 +1370,8 @@ class MassEffect final : public Game
       gd->mv_blend_state = blend_state.get();
    }
 
-   // Opens the scene at the frame's first mesh draw into output sized depth: takes
-   // the scene depth and picks the jitter the whole scene draws with. Once per
-   // present (the HUD and later passes never reopen it).
+   // Opens the scene at the frame's first mesh draw into output sized depth: takes the scene depth and picks the jitter the whole
+   // scene draws with. Once per present (the HUD and later passes never reopen it).
    static void OpenScene(ID3D11Device* native_device,
       ID3D11DeviceContext* native_device_context,
       CommandListData& cmd_list_data, DeviceData& device_data,
@@ -1413,8 +1404,8 @@ class MassEffect final : public Game
       gd.mv_blend_opaque = true;
       gd.mv_reactive_blend = 0;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's
-      // helper starting shows the scene as it is, antialiased with SMAA).
-      // (SR stays latched active until the next present after "None" is picked: no implementation then, nor instance data)
+      // helper starting shows the scene as it is, antialiased with SMAA). SR stays latched active until the next present after
+      // "None" is picked: no implementation then, nor instance data.
       const SR::InstanceData* sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       if (sr_instance_data && !sr_implementations[device_data.sr_type]->IsReady(sr_instance_data))
          sr_instance_data = nullptr;
@@ -1455,11 +1446,9 @@ class MassEffect final : public Game
       return native_device->CreateTexture2D(&desc, nullptr, texture);
    }
 
-   // Draws an opaque draw into the fp16 scene (the scene target alone, output
-   // sized, with the scene depth) with the patched shaders, adding the motion
-   // vector target ("target_slot", past the game's) and the previous frame's vc4
-   // ("previous_slots"). False if it can't (the draw then goes to
-   // "DrawWithJitter").
+   // Draws an opaque draw into the fp16 scene (the scene target alone, output sized, with the scene depth) with the patched shaders,
+   // adding the motion vector target ("target_slot", past the game's) and the previous frame's vc4 ("previous_slots"). False if it
+   // can't (the draw then goes to "DrawWithJitter").
    static bool DrawWithMotionVectors(
       ID3D11Device* native_device, ID3D11DeviceContext* native_device_context,
       CommandListData& cmd_list_data, DeviceData& device_data,
@@ -1470,8 +1459,7 @@ class MassEffect final : public Game
       ID3D11DepthStencilView* dsv)
    {
       auto& gd = GetGameDeviceData(device_data);
-      // The scene target alone, plus the motion vector target the last motion
-      // vector draw left bound
+      // The scene target alone, plus the motion vector and mask targets the last patched draws left bound
       for (UINT slot = 1; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; slot++)
       {
          if (rtvs[slot] &&
@@ -1521,8 +1509,7 @@ class MassEffect final : public Game
          D3D11_TEXTURE2D_DESC desc = {};
          if (gd.mv_texture)
             gd.mv_texture->GetDesc(&desc);
-         // R16G16_FLOAT: FSR keeps 16 bits internally; the error is under 0.1% of
-         // the motion (BL GOTY)
+         // R16G16_FLOAT: FSR keeps 16 bits internally; the error is under 0.1% of the motion (BL GOTY)
          constexpr DXGI_FORMAT format = DXGI_FORMAT_R16G16_FLOAT;
          if (desc.Width != size.x || desc.Height != size.y)
          {
@@ -1595,8 +1582,7 @@ class MassEffect final : public Game
             FindShader(device_data.native_compute_shaders,
                CompileTimeStringHash("ME1 Motion Vector Fill CS")) !=
                nullptr;
-         // The fill's marker: the largest float16 (a larger clear value is stored as
-         // it in R16G16_FLOAT)
+         // The fill's marker: the largest float16 (a larger clear value is stored as it in R16G16_FLOAT)
          const FLOAT clear_value = gd.mv_fill_pending ? 65504.f : 0.f;
          const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
          native_device_context->ClearRenderTargetView(gd.mv_rtv.get(), clear);
@@ -1605,16 +1591,15 @@ class MassEffect final : public Game
             const FLOAT zero[4] = {};
             native_device_context->ClearRenderTargetView(gd.mv_reactive_target_rtv.get(), zero);
          }
-         // Last frame's camera and objects are the previous ones, unless frames
-         // without a scene (menus, videos) came between
+         // Last frame's camera and objects are the previous ones, unless frames without a scene (menus, videos) came between
          const bool previous_valid =
             gd.mv_camera &&
             cb_luma_global_settings.FrameIndex - gd.mv_frame_index <= 1;
          gd.mv_previous_camera = previous_valid ? gd.mv_camera : nullptr;
          gd.mv_camera = nullptr;
          gd.mv_frame_index = cb_luma_global_settings.FrameIndex;
-         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty
-         // list matches nothing); keys drawn in neither of the last two frames go
+         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither
+         // of the last two frames go
          gd.mv_previous_objects.swap(gd.mv_objects);
 #if DEVELOPMENT
          gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_previous_objects, [](const auto& a, const auto& b)
@@ -1638,9 +1623,8 @@ class MassEffect final : public Game
          }
       }
 
-      // The game's vc4 (object, camera and bones in one). The slots added past it
-      // stay bound after the draw: no translated shader reads a constant buffer
-      // past b4.
+      // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
+      // reads a constant buffer past b4.
       com_ptr<ID3D11Buffer> current;
       native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot,
          1, &current);
@@ -1668,9 +1652,8 @@ class MassEffect final : public Game
                AddFilteredBuffer(gd, current.get());
          }
       }
-      // The previous frame's vc4: the same object's from last frame, else this
-      // draw's with last frame's camera (no object motion). None (no CPU copy yet,
-      // another camera): the current one (zero motion).
+      // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
+      // None (no CPU copy yet, another camera): the current one (zero motion).
       const std::vector<uint8_t>* upload = nullptr;
       if (constants && constants->size() >= kTranslationOffset + 16)
       {
@@ -1682,8 +1665,7 @@ class MassEffect final : public Game
                gd.mv_camera->data() + kViewProjectionOffset,
                kCameraSize) == 0;
 
-         // Draw key: same mesh, same shaders. Objects sharing it (props) are told
-         // apart by translation. No instance count.
+         // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by translation. No instance count.
          com_ptr<ID3D11Buffer> vertex_buffer;
          UINT vertex_stride = 0, vertex_offset = 0;
          native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer,
@@ -1706,16 +1688,14 @@ class MassEffect final : public Game
                uint64_t(uint32_t(draw_data.vertex_offset)),
                uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         // LocalToWorld's translation separates objects that share a key, as a
-         // tie-break only. Skinned meshes' c8 is a bone row, the same for copies of
-         // a model (holstered weapons), which matched each other's history
+         // LocalToWorld's translation separates objects that share a key, as a tie-break only. Skinned meshes' c8 is a bone row,
+         // the same for copies of a model (holstered weapons), which matched each other's history
          const size_t translation_offset = constants->size() >= gd.mv_last_vertex_translation_offset + 16 ? gd.mv_last_vertex_translation_offset : kTranslationOffset;
          std::array<float, 3> translation;
          std::memcpy(translation.data(), constants->data() + translation_offset,
             sizeof(translation));
 
-         // ponytail: linear search among the key's candidates (a handful at most); a
-         // spatial lookup if big crowds share a mesh
+         // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
          const MassEffectGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = gd.mv_previous_objects.find(key);
             previous != gd.mv_previous_objects.end())
@@ -1737,8 +1717,7 @@ class MassEffect final : public Game
          }
          if (match)
          {
-            // Last frame's list outlives the draw ("mv_previous_objects" only changes
-            // at the next frame start)
+            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
             upload = &*match->constants;
 #if DEVELOPMENT
             gd.mv_stats.matched++;
@@ -1746,9 +1725,8 @@ class MassEffect final : public Game
          }
          else if (frame_camera && gd.mv_previous_camera)
          {
-            // Not found, drawn with the frame's camera: its own constants with last
-            // frame's camera (camera motion only)
-            // Only what the shader reads (at least the camera)
+            // Not found, drawn with the frame's camera: its own constants with last frame's camera (camera motion only), only
+            // what the shader reads (at least the camera)
             const size_t copy_size = gd.mv_last_vertex_read_size != 0 ? std::clamp<size_t>(gd.mv_last_vertex_read_size, kViewProjectionOffset + kCameraSize, constants->size())
                                                                       : constants->size();
             gd.mv_camera_only_copy.assign(constants->begin(), constants->begin() + copy_size);
@@ -1783,10 +1761,8 @@ class MassEffect final : public Game
       ID3D11Buffer* const jitter = gd.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot,
          1, &jitter);
-      // Left bound after the draw (set directly, bypassing Core's state tracking):
-      // the game's next draws either bind their own targets and shaders, or are
-      // motion vector draws too. No dumped pixel shader writes past o0, so the
-      // target keeps its contents.
+      // Left bound after the draw (set directly, bypassing Core's state tracking): the game's next draws either bind their own
+      // targets and shaders, or are motion vector draws too. No dumped pixel shader writes past o0, so the target keeps its contents.
       if (rtvs[MotionVectorPatches::target_slot] != gd.mv_rtv)
       {
          ID3D11RenderTargetView* targets[MotionVectorPatches::target_slot + 1] = {
@@ -1807,11 +1783,9 @@ class MassEffect final : public Game
       return true;
    }
 
-   // Jitter for the scene's mesh draws without motion vectors (patched vertex
-   // shader, game pixel shader): depth passes, lights, decals, translucents. Every
-   // draw depth tested against the scene takes the same jitter, or jittered and
-   // unjittered depths of the same surface fail each other's test. False if it
-   // can't (the draw runs untouched).
+   // Jitter for the scene's mesh draws without motion vectors (patched vertex shader, game pixel shader): depth passes, lights,
+   // decals, translucents. Every draw depth tested against the scene takes the same jitter, or jittered and unjittered depths of
+   // the same surface fail each other's test. False if it can't (the draw runs untouched).
    static bool DrawWithJitter(
       ID3D11Device* native_device, ID3D11DeviceContext* native_device_context,
       CommandListData& cmd_list_data, DeviceData& device_data,
@@ -1825,8 +1799,7 @@ class MassEffect final : public Game
       if (!gd.mv_scene_open || gd.mv_jitter == std::array<float, 2>{} ||
           !gd.mv_jitter_buffer)
          return false;
-      // Meshes only (full screen passes have no vertex buffer or no depth test),
-      // into the scene depth (not shadows)
+      // Meshes only (full screen passes have no vertex buffer or no depth test), into the scene depth (not shadows)
       if (!dsv)
          return false;
       if (dsv != gd.jitter_dsv)
@@ -1863,9 +1836,8 @@ class MassEffect final : public Game
       if (!vertex_shader)
          return false;
 
-      // An alpha blended draw into the scene writes its mask, reactive or
-      // transparency & composition (its pixel shader patched, the mask target
-      // added past the motion vector one)
+      // An alpha blended draw into the scene writes its mask, reactive or transparency & composition (its pixel shader patched,
+      // the mask target added past the motion vector one)
       ID3D11PixelShader* reactive_shader = nullptr;
       if (g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR &&
           gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
@@ -1877,9 +1849,8 @@ class MassEffect final : public Game
                                  .shader.get();
       }
 
-      // The patched vertex shader and the jitter stay bound after the draw (see
-      // "DrawWithMotionVectors"), with the game's pixel shader (a motion vector
-      // draw's is put back) or its reactive version, and the mask target
+      // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel
+      // shader (a motion vector draw's is put back) or its reactive version, and the mask target
       PatchedDraws::BindPatchedShader(native_device_context, vertex_shader,
          &gd.mv_bound_vertex_shader);
       ID3D11Buffer* const jitter = gd.mv_jitter_buffer.get();
@@ -1911,10 +1882,8 @@ class MassEffect final : public Game
       return true;
    }
 
-   // The projection's depth row from the view projection (row vectors: clip = p *
-   // M): column 2 = A * column 3 + (0, 0, 0, B) for an affine view, so device
-   // depth = A + B / view depth (A = 1 for UE3's infinite far plane, then B =
-   // -near)
+   // The projection's depth row from the view projection (row vectors: clip = p * M): column 2 = A * column 3 + (0, 0, 0, B) for
+   // an affine view, so device depth = A + B / view depth (A = 1 for UE3's infinite far plane, then B = -near)
    static std::array<double, 2> GetDepthFromView(const float* view_projection)
    {
       double dot_23 = 0.0, dot_33 = 0.0;
@@ -1929,10 +1898,9 @@ class MassEffect final : public Game
       return {a, double(view_projection[14]) - a * view_projection[15]};
    }
 
-   // DLAA or FSR 3 Native AA on the jittered scene, its depth (from its alpha, see the fill)
-   // and the motion vectors; the result goes back into the scene's color, its
-   // alpha (the post passes' linear depth) kept. False if it didn't draw (missing
-   // input, or the upscaler failed). "reactive_mask": the fill wrote this scene's mask.
+   // DLAA or FSR 3 Native AA on the jittered scene, its depth (from its alpha, see the fill) and the motion vectors; the result goes
+   // back into the scene's color (or its copy, see "mv_scene_copy"), its alpha (the post passes' linear depth) kept. False if it
+   // didn't draw (missing input, or the upscaler failed). "reactive_mask": the fill wrote this scene's mask.
    static bool DrawUpscaler(ID3D11Device* native_device,
       ID3D11DeviceContext* native_device_context,
       DeviceData& device_data, bool reactive_mask)
@@ -1986,8 +1954,7 @@ class MassEffect final : public Game
             return false;
       }
 
-      // FSR needs the camera. vc4's view projection multiplies row vectors: column
-      // 1 is the up axis / tan(fov / 2).
+      // FSR needs the camera. vc4's view projection multiplies row vectors: column 1 is the up axis / tan(fov / 2).
       const float* const view_projection = reinterpret_cast<const float*>(
          gd.mv_camera->data() + kViewProjectionOffset);
       const double up_length =
@@ -2033,8 +2000,8 @@ class MassEffect final : public Game
       draw_data.vert_fov = gd.sr_vert_fov;
       if (near_plane > 0.0)
       {
-         // A finite far (depth 1) when the projection has one, else a large one
-         // (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE only with inverted depth)
+         // A finite far (depth 1) when the projection has one, else a large one (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE
+         // only with inverted depth)
          const double far_plane =
             depth_a > 1.0 + 1e-6 ? depth_b / (1.0 - depth_a) : near_plane * 1e6;
          draw_data.near_plane = float(near_plane);
@@ -2100,9 +2067,8 @@ class MassEffect final : public Game
       return true;
    }
 
-   // Ends the scene at its first post pass: the depth and camera motion fill (see
-   // "Luma_ME1_MotionVectorFill.hlsl"), then the upscaler, both before that pass reads the
-   // scene
+   // Ends the scene at its first post pass: the depth and camera motion fill (see "Luma_ME1_MotionVectorFill.hlsl"), then the
+   // upscaler, both before that pass reads the scene
    static void EndScene(ID3D11Device* native_device,
       ID3D11DeviceContext* native_device_context,
       DeviceData& device_data)
@@ -2162,9 +2128,8 @@ class MassEffect final : public Game
           gd.mv_scene_color &&
           (gd.mv_scene_srv || SUCCEEDED(native_device->CreateShaderResourceView(gd.mv_scene_color.get(), nullptr, &gd.mv_scene_srv))))
       {
-         // Current clip space to the previous frame's: previous * inverse(current)
-         // for column vectors (vc4 holds the row vector matrix, transposed here), in
-         // double (absolute world translation)
+         // Current clip space to the previous frame's: previous * inverse(current) for column vectors (vc4 holds the row vector
+         // matrix, transposed here), in double (absolute world translation)
          const float* const view_projection = reinterpret_cast<const float*>(
             gd.mv_camera->data() + kViewProjectionOffset);
          Math::Matrix44D current, previous;
@@ -2247,10 +2212,9 @@ class MassEffect final : public Game
 #endif
    }
 
-   // Every blend state writes the motion vector target
-   // ("MotionVectorPatches::target_slot", bound only by the motion vector draws)
-   // unblended: no per-draw copy of the game's state. ReShade turns independent
-   // blending on only when a target now differs.
+   // Every blend state writes the motion vector target ("MotionVectorPatches::target_slot", bound only by the motion vector draws)
+   // unblended, and max blends the mask target: no per-draw copy of the game's state. ReShade turns independent blending on only
+   // when a target now differs.
    static bool
    OnCreateBlendState(reshade::api::device* device,
       reshade::api::pipeline_layout layout,
@@ -2394,8 +2358,8 @@ public:
       GetShaderDefineData(GAMUT_MAPPING_TYPE_HASH).SetDefaultValue('1'); // gamut-map wild colors in composition
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');       // HUD gets its own UIPaperWhite + gamma blend
 
-      // dgVoodoo's D3D9 mirrors are b3/b4. b11 (core DrawBloom's own constants) and b12/b13 are taken as free, as in
-      // MoHA; the full slot occupancy is not measured for this game.
+      // dgVoodoo's D3D9 mirrors are b3/b4, and no translated shader reads a constant buffer past b4: b9/b10 (the motion vector
+      // draws, see "MotionVectorPatches"), b11 (core DrawBloom's own constants) and b12/b13 are free, as in MoHA.
       // luma_ui stays off: the game draws its own UI.
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
@@ -2409,12 +2373,12 @@ public:
       default_luma_global_game_settings.HighlightDechroma = 0.f; // off by default; only the mandatory DICE/gamut desaturation applies
       default_luma_global_game_settings.BloomIntensity = 1.f;
       default_luma_global_game_settings.Contrast = 1.f;
-      default_luma_global_game_settings.Dithering = 1.f; // on by default
+      default_luma_global_game_settings.Dithering = 1.f;
       default_luma_global_game_settings.LumaBloomEnable = ENABLE_BLOOM ? 1.f : 0.f;
       // 1.0 is exactly where the game's own bright-pass sits (DofBloomGather_0x56854256: any channel > 1.0).
       default_luma_global_game_settings.BloomThreshold = 1.f;
       // Light AutoHDR on the Bink pass (Video_0x1A82565B): movies bypass the scene passes. BL2's calibrated pair: at 0.5
-      // the peak is 165/80 = ~2x paper white.
+      // the peak is 165 nits, ~2x sRGB white.
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       // Until the first readback lands (~3 frames): the shipped DisplayGamma 1.6 (DefaultEngine.ini), measured 0.625.
@@ -2460,9 +2424,8 @@ public:
    }
 
 #if ENABLE_SMAA
-   // Core's DrawSMAA intermediates, ~83 MB at 4K, dropped only on swapchain init. Views hold references: release all.
-   // SMAA after the grade, before the HUD (TW2/BL2 chain): snapshot -> DrawSMAA (its blend filters the snapshot in linear light) -> [RCAS] -> canvas. Without
-   // "smaa" (the upscaler antialiased the frame, SR4's shape) only RCAS runs: snapshot -> RCAS -> canvas.
+   // SMAA after the grade, before the HUD (TW2/BL2 chain): snapshot -> DrawSMAA (its blend filters the snapshot in linear light)
+   // -> [RCAS] -> canvas. Without "smaa" (the upscaler antialiased the frame, SR4's shape) only RCAS runs: snapshot -> RCAS -> canvas.
    void RunPostFinalGradeSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, ID3D11Resource* canvas_res, ID3D11RenderTargetView* canvas_rtv, bool smaa)
    {
       uint4 cinfo{};
@@ -2837,7 +2800,6 @@ public:
          }
       }
 
-      // The devkit cannot see an indirect upgrade, so the RT bound here is the only view of the fp16 mirror.
       if (is_immediate && !gd.diag_logged_gather && IsDofBloomGather(original_shader_hashes))
       {
          gd.diag_logged_gather = true;
@@ -2846,7 +2808,7 @@ public:
          DumpConstantRows(native_device, native_device_context, "gather PS", 8, 4);
          DumpConstantRows(native_device, native_device_context, "gather VS", 20, 8, true);
       }
-      // The separable blur: 9 weights (PS rows 10..18), 4 offset pairs (VS rows 25..29), both directions of one frame.
+      // The separable blur: 9 weights (PS rows 10..18), 4 offset pairs and the centre (VS rows 25..29), both directions of one frame.
       if (is_immediate && gd.diag_filter_dumps < 2 && ContainsPixelShader(original_shader_hashes, kBloomFilterHash, kBloomFilterHash_v281))
       {
          gd.diag_filter_dumps++;
@@ -2926,7 +2888,6 @@ public:
 #if DEVELOPMENT
          if (gd.canvas_res && gd.canvas_resources_seen.insert(uint64_t(gd.canvas_res.get())).second)
             reshade::log::message(reshade::log::level::info, std::format("[ME1 Mem] new canvas 0x{:X} (#{}) at frame {}: sr={} drawn={} smaa={} uber={}", uint64_t(gd.canvas_res.get()), gd.canvas_resources_seen.size(), cb_luma_global_settings.FrameIndex, int(device_data.sr_type), device_data.has_drawn_sr.load(), g_smaa_enable, gd.uber_ran_this_frame).c_str());
-         // The devkit only sees the original r8g8b8a8 resource; the render target bound here is the only honest read.
          if (!gd.diag_logged_rt)
          {
             gd.diag_logged_rt = true;
@@ -3800,8 +3761,7 @@ public:
       ImGui::Text("Last checked target: format %u, dimension %u, %ux%u (output %.0fx%.0f)", stats.rejected_format, stats.rejected_dimension, stats.rejected_width, stats.rejected_height, double(device_data.output_resolution.x), double(device_data.output_resolution.y));
 #endif
 
-      // --- Grade (read in Luma_ME1_Tonemap.hlsl via LumaSettings.GameSettings). HDR tonemap path only except Exposure
-      // and the bloom fields, which apply on the vanilla SDR path too (bloom only when the uber or blend runs). ---
+      // --- Grade (read in Luma_ME1_Tonemap.hlsl; which fields reach the vanilla SDR path: see "LumaGameSettings") ---
       auto& gs = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
 

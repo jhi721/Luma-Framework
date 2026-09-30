@@ -2,12 +2,11 @@
 // motion for the motion vector pixels no patched draw wrote (still the marker 65504 from the frame start, the largest float16: sky,
 // unpatched draws), that depth reprojected from the current to the previous frame's camera (vc4 view projection, turned into
 // column vectors on the CPU). Depth isn't reversed. The game has no depth view to read.
-// Also FSR's masks, when enabled, from what the alpha blended draws wrote themselves (their pixel shaders patched, max blended).
-// They draw without motion vectors of their own, so FSR would keep the history of what's behind them (ghosting). The reactive
-// one from all of them (additive sparks and glows: max(r, g, b) * a with the color tonemapped x / (1 + x), the others a):
-// scaled, then 0 under the threshold and 0.9 over it (a low one shakes static glows), or without a threshold capped at 0.9 so
-// FSR still keeps a little history. The transparency & composition one from the non-additive ones (smoke, glass, water: a), as
-// is (AMD's sample passes the alpha).
+// Also FSR's masks, when enabled, from what the alpha blended draws wrote themselves (see
+// "MotionVectorPatches::PatchPixelShaderReactive", max blended). They draw without motion vectors of their own, so FSR would keep
+// the history of what's behind them (ghosting). The reactive one from all of them: scaled, then 0 under the threshold and 0.9
+// over it (a low one shakes static glows), or without a threshold capped at 0.9 so FSR still keeps a little history. The
+// transparency & composition one from the non-additive ones (smoke, glass, water), as is (AMD's sample passes the alpha).
 
 cbuffer MotionVectorFill : register(b0)
 {
