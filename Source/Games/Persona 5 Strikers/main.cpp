@@ -259,11 +259,16 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::mutex mv_globals_mutex;
    std::unordered_map<uint64_t, GlobalsBuffer> mv_globals_buffers;
    // "mv_globals_buffers" again, for the buffer hooks to skip the game's other buffers without the lock (see "MayBeGlobalsBuffer"): an
-   // open addressing set (0 = empty slot), filled under "mv_globals_mutex" up to 3/4, then a count above that lets every buffer through
+   // open addressing set (0 = empty slot), filled under "mv_globals_mutex" up to 3/4, then a count above that lets every buffer through.
+   // A destroyed buffer's slot becomes a marker that lookups step over and insertions reuse (not a pointer: those are aligned); when
+   // they fill it, it's rebuilt from the registered buffers, "mv_filtered_globals_rebuilds" odd meanwhile (a sequence lock: lookups
+   // that overlap one match anything).
    static constexpr uint32_t filtered_globals_buffer_slots = 256; // A power of two
    static constexpr uint32_t max_filtered_globals_buffers = filtered_globals_buffer_slots / 4 * 3;
+   static constexpr uint64_t destroyed_globals_buffer_slot = 1;
    std::array<std::atomic<uint64_t>, filtered_globals_buffer_slots> mv_filtered_globals_buffers = {};
-   std::atomic<uint32_t> mv_filtered_globals_buffer_count = 0;
+   std::atomic<uint32_t> mv_filtered_globals_buffer_count = 0; // Occupied slots, markers included
+   std::atomic<uint32_t> mv_filtered_globals_rebuilds = 0;
    // Scene context only: the previous frame's $Globals uploads, one dynamic buffer per size, and a draw's $Globals with last frame's
    // camera before its upload
    std::unordered_map<UINT, com_ptr<ID3D11Buffer>> mv_previous_globals_buffers;
@@ -483,7 +488,8 @@ class Persona5Strikers final : public Game
    // False if the buffer surely isn't one of "mv_globals_buffers". Lock free: the buffer hooks see every Map/Unmap of the game.
    static bool MayBeGlobalsBuffer(const Persona5StrikersGameDeviceData& game_device_data, uint64_t handle)
    {
-      if (!g_mv_globals_filter || game_device_data.mv_filtered_globals_buffer_count.load(std::memory_order_relaxed) > Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
+      const uint32_t rebuilds = game_device_data.mv_filtered_globals_rebuilds.load(std::memory_order_acquire);
+      if (!g_mv_globals_filter || (rebuilds & 1) != 0 || game_device_data.mv_filtered_globals_buffer_count.load(std::memory_order_relaxed) > Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
          return true;
       // Ends at an empty slot: the set is never more than 3/4 full
       for (uint32_t i = FilteredGlobalsBufferSlot(handle);; i = (i + 1) & (Persona5StrikersGameDeviceData::filtered_globals_buffer_slots - 1))
@@ -492,8 +498,11 @@ class Persona5Strikers final : public Game
          if (slot == handle)
             return true;
          if (slot == 0)
-            return false;
+            break;
       }
+      // Not found, unless a rebuild moved it meanwhile
+      std::atomic_thread_fence(std::memory_order_acquire);
+      return game_device_data.mv_filtered_globals_rebuilds.load(std::memory_order_relaxed) != rebuilds;
    }
 
    // Motion vectors: the mapped pointer of a $Globals buffer a patched draw binds, copied at Unmap
@@ -528,6 +537,31 @@ class Persona5Strikers final : public Game
                game_device_data.sr_no_overwrite_buffers.clear();
             game_device_data.sr_no_overwrite_buffers.emplace_back(buffer);
          }
+      }
+   }
+
+   // Motion vectors: a destroyed $Globals buffer leaves the registry, as its address can come back as another (smaller) buffer
+   static void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource)
+   {
+      DeviceData* const device_data = GetDeviceData(device);
+      if (!device_data)
+         return;
+      auto& game_device_data = GetGameDeviceData(*device_data);
+      if (!MayBeGlobalsBuffer(game_device_data, resource.handle))
+         return;
+      const std::lock_guard lock(game_device_data.mv_globals_mutex);
+      if (game_device_data.mv_globals_buffers.erase(resource.handle) == 0)
+         return;
+      for (uint32_t i = FilteredGlobalsBufferSlot(resource.handle);; i = (i + 1) & (Persona5StrikersGameDeviceData::filtered_globals_buffer_slots - 1))
+      {
+         const uint64_t slot = game_device_data.mv_filtered_globals_buffers[i].load(std::memory_order_relaxed);
+         if (slot == resource.handle)
+         {
+            game_device_data.mv_filtered_globals_buffers[i].store(Persona5StrikersGameDeviceData::destroyed_globals_buffer_slot, std::memory_order_release);
+            break;
+         }
+         if (slot == 0)
+            break;
       }
    }
 
@@ -717,15 +751,44 @@ class Persona5Strikers final : public Game
          buffer->GetDesc(&desc);
          entry->second.size = desc.ByteWidth;
          const uint32_t count = game_device_data->mv_filtered_globals_buffer_count.load(std::memory_order_relaxed);
-         if (count < Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
+         if (count <= Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
          {
             uint32_t i = FilteredGlobalsBufferSlot(handle);
-            while (game_device_data->mv_filtered_globals_buffers[i].load(std::memory_order_relaxed) != 0)
+            uint64_t slot = 0;
+            while ((slot = game_device_data->mv_filtered_globals_buffers[i].load(std::memory_order_relaxed)) != 0 && slot != Persona5StrikersGameDeviceData::destroyed_globals_buffer_slot)
                i = (i + 1) & (Persona5StrikersGameDeviceData::filtered_globals_buffer_slots - 1);
-            game_device_data->mv_filtered_globals_buffers[i].store(handle, std::memory_order_release);
+            if (slot == Persona5StrikersGameDeviceData::destroyed_globals_buffer_slot)
+            {
+               game_device_data->mv_filtered_globals_buffers[i].store(handle, std::memory_order_release);
+            }
+            else if (count < Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
+            {
+               game_device_data->mv_filtered_globals_buffers[i].store(handle, std::memory_order_release);
+               game_device_data->mv_filtered_globals_buffer_count.store(count + 1, std::memory_order_relaxed);
+            }
+            // Full: rebuilt without the markers, or past the limit every buffer goes through
+            else if (game_device_data->mv_globals_buffers.size() <= Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
+            {
+               auto& rebuilds = game_device_data->mv_filtered_globals_rebuilds;
+               rebuilds.store(rebuilds.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+               std::atomic_thread_fence(std::memory_order_release);
+               for (auto& filtered : game_device_data->mv_filtered_globals_buffers)
+                  filtered.store(0, std::memory_order_relaxed);
+               for (const auto& [registered, globals] : game_device_data->mv_globals_buffers)
+               {
+                  uint32_t j = FilteredGlobalsBufferSlot(registered);
+                  while (game_device_data->mv_filtered_globals_buffers[j].load(std::memory_order_relaxed) != 0)
+                     j = (j + 1) & (Persona5StrikersGameDeviceData::filtered_globals_buffer_slots - 1);
+                  game_device_data->mv_filtered_globals_buffers[j].store(registered, std::memory_order_relaxed);
+               }
+               game_device_data->mv_filtered_globals_buffer_count.store(uint32_t(game_device_data->mv_globals_buffers.size()), std::memory_order_relaxed);
+               rebuilds.store(rebuilds.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+            }
+            else
+            {
+               game_device_data->mv_filtered_globals_buffer_count.store(count + 1, std::memory_order_relaxed);
+            }
          }
-         if (count <= Persona5StrikersGameDeviceData::max_filtered_globals_buffers)
-            game_device_data->mv_filtered_globals_buffer_count.store(count + 1, std::memory_order_relaxed);
       }
       return entry->second.copy;
    }
@@ -1174,9 +1237,9 @@ public:
 
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
-      delete static_cast<Persona5StrikersGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members. Cleared first: those
+      // releases can fire "destroy_resource", whose hook reads it.
+      delete static_cast<Persona5StrikersGameDeviceData*>(std::exchange(device_data.game, nullptr));
    }
 
    void OnInit(bool async) override
@@ -1262,6 +1325,7 @@ public:
 
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
    }
 
@@ -1269,6 +1333,7 @@ public:
    {
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
    }
 
