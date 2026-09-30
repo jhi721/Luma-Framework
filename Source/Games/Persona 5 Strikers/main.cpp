@@ -56,6 +56,10 @@ namespace
    // Generic copy: glyphs into their atlas, a 3D layer's alpha into its composite's output, and (render scale below 1) the composite's
    // stretch onto the swapchain
    constexpr uint32_t copy_hash = 0x987DC89C;
+   // Fullscreen at a custom resolution (P5StrikersFix): the game draws the whole frame (composite, UI, FXAA) into its own target of that
+   // size, then this ("pow(sample, cb0[0].x)", 1) puts it on the swapchain within black bars (92F1307C). That target then is what
+   // "swapchain" means in this file (see "IsGameBackBuffer").
+   constexpr uint32_t letterbox_hash = 0xEC5254F6;
    // 3D layers outside the scene (main menu and pause screen characters): the quad vertex shader (texture coordinates from vertices)
    // and the stretch of a layer's render resolution corner over its target
    constexpr uint32_t quad_vertex_shader_hash = 0x2B6CA9A0;
@@ -433,6 +437,18 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // read by the stretch, which may record on different contexts
    std::shared_mutex composite_target_mutex;
    com_ptr<ID3D11Resource> composite_target;
+   // The target the game letterboxes onto the swapchain (see "letterbox_hash"): set by that draw, dropped at the first present without
+   // one. Its aspect ratio is upgraded as the swapchain's, from the rebuild it asks for.
+   struct Letterbox
+   {
+      std::shared_mutex mutex;
+      com_ptr<ID3D11Resource> target;
+      uint2 size = {};
+      bool drawn = false;
+   };
+   Letterbox letterbox;
+   // Present thread only: the next "UpdateRenderScale" rebuilds the game's targets even at the same render scale
+   bool targets_rebuild = false;
    // The game's "RenderScale" in memory (see "FindRenderScaleSetting"), null if not found. Present thread only.
    int32_t* render_scale_setting = nullptr;
    bool render_scale_searched = false;
@@ -484,10 +500,34 @@ class Persona5Strikers final : public Game
       return *static_cast<Persona5StrikersGameDeviceData*>(device_data.game);
    }
 
-   static bool IsBackBuffer(DeviceData* device_data, ID3D11Resource* resource)
+   static bool IsSwapchainBackBuffer(DeviceData* device_data, ID3D11Resource* resource)
    {
       const std::shared_lock lock(device_data->mutex);
       return device_data->back_buffers.contains(reinterpret_cast<uint64_t>(resource));
+   }
+
+   // What the game draws its frame into: the swapchain's back buffer, or the target it letterboxes onto it
+   static bool IsGameBackBuffer(DeviceData* device_data, ID3D11Resource* resource)
+   {
+      {
+         auto& letterbox = GetGameDeviceData(*device_data).letterbox;
+         const std::shared_lock lock(letterbox.mutex);
+         if (letterbox.target)
+            return letterbox.target.get() == resource;
+      }
+      return IsSwapchainBackBuffer(device_data, resource);
+   }
+
+   // The game's back buffer size: the output resolution of the upscaling, the layers and the composite
+   static uint2 GetOutputSize(DeviceData& device_data)
+   {
+      {
+         auto& letterbox = GetGameDeviceData(device_data).letterbox;
+         const std::shared_lock lock(letterbox.mutex);
+         if (letterbox.target)
+            return letterbox.size;
+      }
+      return {uint32_t(device_data.output_resolution.x + 0.5f), uint32_t(device_data.output_resolution.y + 0.5f)};
    }
 
    static bool IsSRActive(const DeviceData& device_data)
@@ -1470,7 +1510,7 @@ public:
       D3D11_TEXTURE2D_DESC canvas_desc;
       canvas_texture->GetDesc(&canvas_desc);
       // Not the main menu's second, off-screen composite (RGBA8, see the format check)
-      if (!IsBackBuffer(&device_data, canvas_resource.get()) && canvas_rtv != game_device_data.sr_upscaled_canvas_rtv && (IsSRActive(device_data) || canvas_desc.Width >= uint32_t(device_data.output_resolution.x + 0.5f)))
+      if (!IsGameBackBuffer(&device_data, canvas_resource.get()) && canvas_rtv != game_device_data.sr_upscaled_canvas_rtv && (IsSRActive(device_data) || canvas_desc.Width >= GetOutputSize(device_data).x))
          return DrawOrDispatchOverrideType::None;
       // The upgraded (linear fp16) swapchain, the SMAA copies' format
       if (canvas_desc.SampleDesc.Count != 1 || canvas_desc.ArraySize != 1 || (canvas_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && canvas_desc.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS))
@@ -2024,7 +2064,7 @@ public:
       D3D11_VIEWPORT viewport = {};
       UINT viewports = 1;
       native_device_context->RSGetViewports(&viewports, &viewport);
-      const uint2 output_size = {uint32_t(device_data.output_resolution.x + 0.5f), uint32_t(device_data.output_resolution.y + 0.5f)};
+      const uint2 output_size = GetOutputSize(device_data);
       // Most draws (the scene's included) stop here. With an output sized target this is the render scale, equal in both axes (not a panel).
       float scale[2] = {viewport.Width / float(output_size.x), viewport.Height / float(output_size.y)};
       if (!stretch && (viewports == 0 || viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f || viewport.Width >= float(output_size.x) || scale[0] <= 0.f || std::abs(scale[0] - scale[1]) > 0.01f))
@@ -2061,7 +2101,7 @@ public:
             texture->GetDesc(&target_desc);
          }
          // An output sized off-screen target, with the viewport at its top left corner
-         if (target_desc.Width != output_size.x || target_desc.Height != output_size.y || IsBackBuffer(&device_data, target.get()))
+         if (target_desc.Width != output_size.x || target_desc.Height != output_size.y || IsGameBackBuffer(&device_data, target.get()))
             return false;
          if (dsv)
          {
@@ -2422,6 +2462,27 @@ public:
       const bool can_draw = original_draw_dispatch_func && *original_draw_dispatch_func;
       const bool sr_mesh_draw = can_draw && IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
 
+      // Before the UI's swapchain checks, which from now on see the letterboxed target instead (this draw and the bars aren't UI)
+      if (original_shader_hashes.Contains(letterbox_hash, reshade::api::shader_stage::pixel))
+      {
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         com_ptr<ID3D11ShaderResourceView> srv;
+         native_device_context->PSGetShaderResources(0, 1, &srv);
+         const com_ptr<ID3D11Resource> source = GetViewResource(srv.get());
+         if (const com_ptr<ID3D11Resource> target = GetViewResource(rtv.get()); source && target && IsSwapchainBackBuffer(&device_data, target.get()))
+         {
+            uint4 source_size;
+            DXGI_FORMAT source_format;
+            GetResourceInfo(source.get(), source_size, source_format);
+            auto& letterbox = game_device_data.letterbox;
+            const std::unique_lock lock(letterbox.mutex);
+            letterbox.target = source;
+            letterbox.size = {source_size.x, source_size.y};
+            letterbox.drawn = true;
+         }
+      }
+
       if (original_shader_hashes.Contains(ssao_depth_downsample_hash, reshade::api::shader_stage::pixel))
       {
          com_ptr<ID3D11ShaderResourceView> depth_srv;
@@ -2619,7 +2680,7 @@ public:
             split.vertical_fov = 2.f * std::atan(1.f / std::sqrt(view_projection[1] * view_projection[1] + view_projection[5] * view_projection[5] + view_projection[9] * view_projection[9]));
          }
          // Upscaling when the game renders below output resolution (its render scale option): output and canvas at output resolution
-         const uint2 output_size = {uint32_t(device_data.output_resolution.x + 0.5f), uint32_t(device_data.output_resolution.y + 0.5f)};
+         const uint2 output_size = GetOutputSize(device_data);
          if (scene_desc.Width < output_size.x || scene_desc.Height < output_size.y)
          {
             D3D11_TEXTURE2D_DESC output_desc = {};
@@ -2783,7 +2844,7 @@ public:
             com_ptr<ID3D11RenderTargetView> rtv;
             native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
             const com_ptr<ID3D11Resource> target = GetViewResource(rtv.get());
-            const bool own_target = target && !IsBackBuffer(&device_data, target.get());
+            const bool own_target = target && !IsGameBackBuffer(&device_data, target.get());
             {
                const std::unique_lock lock(game_device_data.composite_target_mutex);
                game_device_data.composite_target.reset();
@@ -2797,7 +2858,7 @@ public:
                uint4 target_size;
                DXGI_FORMAT target_format;
                GetResourceInfo(target.get(), target_size, target_format);
-               if (target_size.x < uint32_t(device_data.output_resolution.x + 0.5f))
+               if (target_size.x < GetOutputSize(device_data).x)
                {
                   game_device_data.render_resolution_composite = true;
                }
@@ -2978,7 +3039,7 @@ public:
       {
          com_ptr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-         if (const com_ptr<ID3D11Resource> rtv_resource = GetViewResource(rtv.get()); rtv_resource && IsBackBuffer(&device_data, rtv_resource.get()))
+         if (const com_ptr<ID3D11Resource> rtv_resource = GetViewResource(rtv.get()); rtv_resource && IsGameBackBuffer(&device_data, rtv_resource.get()))
          {
             if (g_hide_ui && device_data.has_drawn_main_post_processing)
                return DrawOrDispatchOverrideType::Skip;
@@ -3142,7 +3203,7 @@ public:
    // rebuild its targets now (it does on any resize, e.g. alt-tab). Changing the option in the game's menu (the same setting) is undone,
    // also live. Without DLSS/FSR the game stretches its composite (SMAA runs before). With them the main menu ("menu") renders at 100%
    // (no DLSS/FSR there, so the background would be stretched), kept in the setting for the whole menu stay: P5StrikersFix rebuilds at
-   // any value written back, so the options menu shows (and saves) 100% there.
+   // any value written back, so the options menu shows (and saves) 100% there. The same WM_SIZE also rebuilds on "targets_rebuild".
    static void UpdateRenderScale(Persona5StrikersGameDeviceData* game_device_data, bool menu)
    {
       if (!game_device_data->render_scale_searched)
@@ -3150,24 +3211,26 @@ public:
          game_device_data->render_scale_searched = true;
          game_device_data->render_scale_setting = FindRenderScaleSetting();
       }
-      int32_t* const setting = game_device_data->render_scale_setting;
-      if (!setting)
-         return;
-#if DEVELOPMENT
-      const int32_t kept = (g_perf_test != 0 ? perf_test_render_scales[g_perf_test] : g_render_scale);
-#else
-      const int32_t kept = g_render_scale;
-#endif
-      const int32_t wanted = (menu ? 10 : kept);
-      // The game rebuilds its targets at whatever the setting holds, also when its menu wrote it: the wanted value is forced back
-      if (*setting != wanted)
+      bool rebuild = std::exchange(game_device_data->targets_rebuild, false);
+      if (int32_t* const setting = game_device_data->render_scale_setting)
       {
-         *setting = wanted;
-         RECT client;
-         if (game_window && GetClientRect(game_window, &client))
+#if DEVELOPMENT
+         const int32_t kept = (g_perf_test != 0 ? perf_test_render_scales[g_perf_test] : g_render_scale);
+#else
+         const int32_t kept = g_render_scale;
+#endif
+         const int32_t wanted = (menu ? 10 : kept);
+         // The game rebuilds its targets at whatever the setting holds, also when its menu wrote it: the wanted value is forced back
+         if (*setting != wanted)
          {
-            PostMessageW(game_window, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right - client.left, client.bottom - client.top));
+            *setting = wanted;
+            rebuild = true;
          }
+      }
+      RECT client;
+      if (rebuild && game_window && GetClientRect(game_window, &client))
+      {
+         PostMessageW(game_window, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right - client.left, client.bottom - client.top));
       }
    }
 
@@ -3182,6 +3245,33 @@ public:
       device_data.has_drawn_sr = false;
       game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       game_device_data.mv_presents++;
+      // A letterboxed target's aspect ratio (e.g. 2.4 at 3840x1600) isn't the swapchain's: the targets made after a rebuild are upgraded
+      // at it too (the scene, for the upscaling, and the target itself, for HDR)
+      {
+         uint2 letterbox_size = {};
+         {
+            auto& letterbox = game_device_data.letterbox;
+            const std::unique_lock lock(letterbox.mutex);
+            if (!std::exchange(letterbox.drawn, false))
+            {
+               letterbox.target.reset();
+            }
+            if (letterbox.target)
+            {
+               letterbox_size = letterbox.size;
+            }
+         }
+         if (letterbox_size.x != 0 && letterbox_size.y != 0)
+         {
+            const float aspect_ratio = float(letterbox_size.x) / float(letterbox_size.y);
+            const std::unique_lock lock(device_data.resource_upgrades.mutex);
+            if (!device_data.resource_upgrades.texture_format_upgrades_2d_custom_aspect_ratios.contains(aspect_ratio))
+            {
+               device_data.resource_upgrades.texture_format_upgrades_2d_custom_aspect_ratios = {aspect_ratio};
+               game_device_data.targets_rebuild = true;
+            }
+         }
+      }
       {
          const std::lock_guard lock(game_device_data.layer_mutex);
          const auto stale = [](const auto& entry)
@@ -3543,7 +3633,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // Every other swapchain aspect ratio BGRA8 target (e.g. G-buffer albedo) is upgraded too; upgrading only the FXAA copy would save VRAM.
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       texture_upgrade_formats = {reshade::api::format::b8g8r8a8_typeless, reshade::api::format::r11g11b10_float};
-      texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
+      // A letterboxed target's aspect ratio joins once seen (see "letterbox_hash" and "OnPresent"), none before
+      texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
+      texture_format_upgrades_2d_custom_aspect_ratios = {};
       // For the DLSS/FSR mip bias (see "OnPresent")
       enable_samplers_upgrade = true;
 
