@@ -1194,9 +1194,6 @@ class SaintsRowIV final : public Game
          return false;
       ID3D11Buffer* const sub_rect = game_device_data.mv_jitter_buffer.get();
       const uint32_t pixel_shader_hash = original_shader_hashes.pixel_shaders[0];
-      // The SSAO calculate is XeGTAO's (the draw goes on to "RunXeGTAO", which follows the sub-rect itself)
-      if (g_gtao_enable && pixel_shader_hash == ssao_singleframe_calculate_pixel_shader)
-         return false;
       if (std::ranges::contains(sub_rect_uv_pixel_shaders, pixel_shader_hash) || std::ranges::contains(sub_rect_quad_ndc_pixel_shaders, pixel_shader_hash, &std::pair<uint32_t, uint32_t>::first))
       {
          const com_ptr<ID3D11PixelShader> pixel_shader = GetMotionVectorShader<ID3D11PixelShader>(native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::ScreenUV);
@@ -2382,6 +2379,18 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
+      // XeGTAO in place of the SSAO calculate (it follows the render scale's sub-rect itself), decided on the frame's first draw so the
+      // four AO channels never mix XeGTAO and native. Without it, the native draws go on like any other scene draw ("DrawSubRect").
+      if (g_gtao_enable && pixel_shader_hash == ssao_singleframe_calculate_pixel_shader)
+      {
+         const bool first_draw = !std::exchange(game_device_data.gtao_tried_this_frame, true);
+         if (first_draw)
+         {
+            game_device_data.gtao_ran_this_frame = RunXeGTAO(native_device, native_device_context, device_data);
+         }
+         if (game_device_data.gtao_ran_this_frame)
+            return (first_draw ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::Skip);
+      }
       if (game_device_data.mv_active && !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
       {
          if (pixel_shader_hash == downsample_pixel_shader || pixel_shader_hash == god_rays_mask_pixel_shader || (game_device_data.mv_scene_copied && post_process_pixel_shaders.contains(pixel_shader_hash)))
@@ -2527,14 +2536,6 @@ public:
             CopyBoundPSConstantBuffer(native_device, native_device_context, 4, std::addressof(game_device_data.bloom_source_downsample_vc4_cb));
             return DrawOrDispatchOverrideType::None;
          }
-      }
-      if (g_gtao_enable && pixel_shader_hash == ssao_singleframe_calculate_pixel_shader)
-      {
-         // Decided on the frame's first draw, so the four AO channels never mix XeGTAO and native.
-         if (std::exchange(game_device_data.gtao_tried_this_frame, true))
-            return game_device_data.gtao_ran_this_frame ? DrawOrDispatchOverrideType::Skip : DrawOrDispatchOverrideType::None;
-         game_device_data.gtao_ran_this_frame = RunXeGTAO(native_device, native_device_context, device_data);
-         return game_device_data.gtao_ran_this_frame ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
       }
       // The distortion map's share of the target for the replacements that read it (render scale, 0 = the whole target), set at
       // each of their draws so they never read the SMAA/RCAS values left in LumaData
