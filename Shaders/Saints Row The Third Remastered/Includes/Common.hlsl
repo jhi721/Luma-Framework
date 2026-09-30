@@ -28,7 +28,8 @@ float SRTTR_Bayer(uint2 pixel)
    return kBayer4x4[((pixel.x & 3u) << 2) | (pixel.y & 3u)] * 0.125 - 1.0;
 }
 
-// UI_DRAW_TYPE 2: the scene is scaled by this before the GUI layer is blended over it, so that the final UI paper white scaling lands it at the scene paper white
+// UI_DRAW_TYPE 2: the scene is scaled by this before the GUI layer is blended over it, so that the final UI paper white
+// scaling lands it at the scene paper white
 float SRTTR_SceneToUIScale()
 {
    return LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);

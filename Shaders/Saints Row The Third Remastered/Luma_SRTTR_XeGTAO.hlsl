@@ -30,8 +30,8 @@ cbuffer AmbientParams : register(b10)
 #define FinalValuePowerRT LumaData.CustomData3 // primary darkness dial
 #define RadiusOverrideRT  LumaData.CustomData4 // > 0 overrides EFFECT_RADIUS (metres)
 
-// Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant); how it compares to the vanilla SSAO: "Normals" above. RadiusOverrideRT > 0
-// wins.
+// Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant); against the vanilla SSAO see "Normals" above.
+// RadiusOverrideRT > 0 wins.
 #define EFFECT_RADIUS 0.4
 
 // The vanilla SSAO (MiniEngine) has a screen-space radius (10 px at 1920 wide per hierarchy level), so its world radius grows with

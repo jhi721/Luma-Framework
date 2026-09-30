@@ -168,7 +168,7 @@ namespace
    thread_local CameraData last_built_camera;
 
 #if DEVELOPMENT
-   // Camera jitter trace
+   // "Log Camera Builds": traces the camera builds and counter increments
    std::atomic<int> camera_log_calls_left = 0;
    using CameraCounterIncrementFunc = void (*)(uint8_t* camera);
    CameraCounterIncrementFunc camera_counter_increment_original = nullptr;
@@ -329,8 +329,8 @@ namespace
    }
 
 #if ENABLE_SR
-   // Jitter sign conventions and the motion vectors jitter flag. The game's MVs have no jitter: with a static camera, both the TAA
-   // reprojection (cb10 matReprojection) and the object MVs are ~0 while the jitter moves the image by up to ~0.9 pixels between frames.
+   // Jitter sign conventions and the motion vectors jitter flag, tunable in development builds. The game's MVs have no jitter: with a static
+   // camera, both the TAA reprojection (cb10 matReprojection) and the object MVs are ~0 while the jitter moves the image by up to ~0.9 pixels.
 #if DEVELOPMENT
    bool sr_flip_jitter_x = false;
    bool sr_flip_jitter_y = false;
@@ -903,7 +903,7 @@ public:
       // The jitter comes from the camera built on this thread (the render thread), and SR needs the game's 8x jitter pattern to be active
       const CameraData camera = last_built_camera;
       const int32_t* jitter_mode = GetGameAddresses().jitter_mode;
-      // A frame SR doesn't draw restarts its history at the next one ("OnPresent")
+      // A skipped frame resets SR's history at the next one, see "OnPresent"
       if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed || native_device_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !camera.valid || !jitter_mode || *jitter_mode != halton_jitter_mode)
          return DrawOrDispatchOverrideType::None;
 #if DEVELOPMENT
@@ -1130,12 +1130,12 @@ public:
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
-      // Patched once the game runs, rather than at load time
+      // Patched at the first present rather than at load time, once SteamStub has unpacked the game code
       if (!game_patches_applied)
       {
          game_patches_applied = true;
 #if ENABLE_SR
-         // SR takes its jitter from the patched game code, found in the Steam, GOG and Epic builds (scanned here, once the game code is unpacked)
+         // SR takes its jitter from the patched game code (see "GetGameAddresses")
          if (!GetGameAddresses().camera_build)
          {
             sr_game_tooltip = "Unsupported game executable version: Super Resolution can't engage.\n";
@@ -1340,7 +1340,7 @@ public:
 
       ImGui::SeparatorText("Anti-Aliasing");
       bool_toggle("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");
-      // Not the canon "on top of SMAA": it sharpens the scene after any anti-aliasing (SMAA, TAA, DLAA, FSR 3), and the game's own sharpen is disabled
+      // Canon deviation (docs/UI-Toggle-Standard.md): RCAS runs after any anti-aliasing, in place of the game's disabled sharpen
       slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, defaults.RCASSharpness, 1.f, "Sharpening applied on top of anti-aliasing (0 = off). Replaces the game's Sharpen setting.");
 
       ImGui::SeparatorText("Grade");

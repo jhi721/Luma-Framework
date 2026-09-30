@@ -83,8 +83,7 @@ bool SRTTR_IsFiniteNonNegative(float3 v)
 }
 
 // The native curve F and its slope dF/dln(x) at one natural-log input, analytic per segment. Only ever evaluated
-// at the pivot, which is built from cbuffer constants, so the continuation cannot depend on the pixel (it's computed
-// once per thread group).
+// at the pivot, which is built from cbuffer constants, so the continuation cannot depend on the pixel.
 float SRTTR_CurveAndSlope(float lx, float toeMatch, float shoulderMatch, out float slope)
 {
    if (lx < toeMatch)
