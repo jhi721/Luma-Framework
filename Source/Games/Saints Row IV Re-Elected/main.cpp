@@ -2382,8 +2382,7 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
-      // The alpha test materials count as custom (Core flags their A2C patch clone), but draw with the game's shader outside of MSAA
-      if (game_device_data.mv_active && (!is_custom_pass || alpha_test_material_pixel_shaders.contains(pixel_shader_hash)) && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
+      if (game_device_data.mv_active && !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
       {
          if (pixel_shader_hash == downsample_pixel_shader || pixel_shader_hash == god_rays_mask_pixel_shader || (game_device_data.mv_scene_copied && post_process_pixel_shaders.contains(pixel_shader_hash)))
          {
@@ -2674,6 +2673,9 @@ public:
       (*original_draw_dispatch_func)();
       native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
       cmd_list_data.UseShaderVariant(native_device_context, pixel_shader_hash, reshade::api::shader_stage::pixel, Shader::ShaderVariant::Original);
+#if DEVELOPMENT
+      Mcp::Annotate(cmd_list_data, "a2c");
+#endif
       return DrawOrDispatchOverrideType::Replaced;
    }
 
