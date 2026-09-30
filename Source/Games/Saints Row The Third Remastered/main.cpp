@@ -7,6 +7,10 @@
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\reshade\deps\minhook\include\MinHook.h"
+#if DEVELOPMENT
+#include <dxgi1_4.h> // "Memory Sweep": IDXGIAdapter3::QueryVideoMemoryInfo
+#include <psapi.h>   // "Memory Sweep": GetProcessMemoryInfo
+#endif
 
 namespace
 {
@@ -236,7 +240,6 @@ namespace
    // rl_prim_2d_bink_s_01, the Bink video: fullscreen movies draw it straight into the swapchain (the frame's only draw), where its
    // replacement adds AutoHDR. Menu backgrounds draw it into the RGBA8 GUI layer, which can't hold it, so they stay vanilla.
    constexpr uint32_t video_hash = 0xE85564EB;
-   constexpr uint32_t smaa_linearize_shader_hash = CompileTimeStringHash("SRTTR SMAA Linearize CS");
    constexpr uint32_t smaa_predication_shader_hash = CompileTimeStringHash("SRTTR SMAA Predication CS");
    bool g_smaa_enable = true;
 #if DEVELOPMENT
@@ -252,9 +255,12 @@ namespace
    constexpr uint32_t ssao_chain_hashes[] = {ssao_prepare_1_hash, 0xAC38984B, 0x1DEB634A, 0xDE09F597, 0x23EF0DBA, 0x7378361E, 0x07B179C3, 0x7281BC27};
    constexpr UINT ambient_params_cb_slot = 10; // AMBIENT_PARAMS, rebound PS -> CS for XeGTAO
    bool g_gtao_enable = true;
+   // SMAA's and XeGTAO's scratch goes after this many presents without them (~5 s at 120 fps): TAA, DLAA and FSR 3 replace SMAA,
+   // the in-game SSAO can be off, and menus and loading screens run neither. Recreated on their next run.
+   constexpr uint32_t idle_release_frames = 600;
    // Calibration knobs, development builds tune them (not persisted)
 #if DEVELOPMENT
-   float g_gtao_final_value_power = 1.4f; // Matched to the vanilla SSAO with EFFECT_RADIUS 0.4 and depth normals (offline sim over 5 scenes)
+   float g_gtao_final_value_power = 1.4f; // With EFFECT_RADIUS 0.4 (see Luma_SRTTR_XeGTAO.hlsl for how it compares to the vanilla SSAO)
    float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (metres)
    int g_gtao_debug_view = 0;             // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges
 #else
@@ -553,6 +559,31 @@ namespace
    }
 
 #if ENABLE_SR
+   // "Memory Sweep": these modes in turn, each logged once settled ("[SRTTR Mem]" in ReShade.log) so the deltas between lines are each
+   // feature's cost, then the user's settings back. The in-game settings decide what can run (SMAA needs Anti-Aliasing = FXAA, DLAA and
+   // FSR 3 need TAA, XeGTAO needs Ambient Occlusion), so each line lists what is allocated; run it once per in-game Anti-Aliasing mode.
+   struct MemorySweepMode
+   {
+      const char* name;
+      SR::Type sr_type = SR::Type::None;
+      bool smaa = false;
+      bool gtao = false;
+   };
+   constexpr MemorySweepMode memory_sweep_modes[] = {
+      {.name = "None"},
+      {.name = "SMAA", .smaa = true},
+      {.name = "SMAA + XeGTAO", .smaa = true, .gtao = true},
+      {.name = "XeGTAO (SMAA off after on)", .gtao = true},
+      {.name = "DLAA + XeGTAO", .sr_type = SR::Type::DLSS, .gtao = true},
+      {.name = "FSR 3 + XeGTAO", .sr_type = SR::Type::FSR, .gtao = true},
+      {.name = "XeGTAO (SR off after on)", .gtao = true},
+      {.name = "None (after all)"},
+   };
+   constexpr int memory_sweep_settle_frames = int(idle_release_frames) + 120; // Past the idle releases
+   int memory_sweep_step = -1;                                                // -1 off
+   int memory_sweep_frames_left = 0;
+   MemorySweepMode memory_sweep_user_settings = {.name = "User"};
+
    // SR per-step timings, accumulated since the last log. CPU = submission time on the render thread. GPU = execution time, from timestamp
    // queries read back frames later without flushing; only the inputs CS and the SR draw record GPU work, the other steps only change states.
    enum SRStep : size_t
@@ -733,13 +764,12 @@ namespace
 
 struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
 {
-   // SMAA scratch at FXAA's size: the linear-light copy of its input and the predication edge-ness
-   com_ptr<ID3D11UnorderedAccessView> smaa_linear_uav;
-   com_ptr<ID3D11ShaderResourceView> smaa_linear_srv;
+   // SMAA scratch at FXAA's size: the predication edge-ness (null if its creation failed)
    com_ptr<ID3D11UnorderedAccessView> smaa_predication_uav;
    com_ptr<ID3D11ShaderResourceView> smaa_predication_srv;
    UINT smaa_width = 0;
    UINT smaa_height = 0;
+   uint32_t smaa_frame = 0; // FrameIndex of SMAA's last run, for "idle_release_frames"
    // This frame's scene depth, from the ambient pass (reset every present)
    com_ptr<ID3D11ShaderResourceView> smaa_depth_srv;
 
@@ -753,6 +783,7 @@ struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
       UINT width = 0;
       UINT height = 0;
    } gtao_scratch;
+   uint32_t gtao_frame = 0; // FrameIndex of XeGTAO's last run, for "idle_release_frames"
    // A UAV on the game's SSAO texture (it holds the resource, so its address can't be reused)
    com_ptr<ID3D11UnorderedAccessView> gtao_ssao_uav;
    bool ssao_chain_ran_this_frame = false; // the game's SSAO is on (any level but Off)
@@ -788,8 +819,7 @@ public:
          {"gtao_enable", &g_gtao_enable}});
       Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
       Mcp::RegisterInts({{"smaa_debug_view", &g_smaa_debug_view, 0, 2}, {"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input_linear", smaa_linear_srv),
-         MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
          MCP_GAME_TEXTURE("gtao.depth_mips", gtao_scratch.depth_mips_srv)});
 #if ENABLE_SR
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("sr.motion_vectors", sr_motion_vectors),
@@ -799,7 +829,6 @@ public:
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (reference)\n1 - HDR: native grade + reconstructed luminance + DICE display map", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
-         {"XE_GTAO_GENERATE_NORMALS", '1', true, false, "XeGTAO normals\n0 - G-buffer (includes normal maps: fine surface detail gets occluded too)\n1 - From depth (geometry only, like the vanilla SSAO)", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -829,7 +858,6 @@ public:
       default_luma_global_game_settings.HideGameplayUI = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
-      native_shaders_definitions.emplace(smaa_linearize_shader_hash, ShaderDefinition{"Luma_SRTTR_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(smaa_predication_shader_hash, ShaderDefinition{"Luma_SRTTR_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       // XeGTAO passes (Luma_SRTTR_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY
       native_shaders_definitions.emplace("SRTTR XeGTAO Prefilter Depths CS"_h, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
@@ -862,14 +890,12 @@ public:
 
       // Held through SMAA so a shader reload cannot release them mid-use; "DrawSMAA" looks its shaders up with "at"
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      if (!HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h) || !HasShaders(device_data.native_compute_shaders, smaa_linearize_shader_hash))
+      if (!HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h))
          return false;
 
       auto& game_device_data = GetGameDeviceData(device_data);
-      if (!game_device_data.smaa_linear_srv || game_device_data.smaa_width != size.x || game_device_data.smaa_height != size.y)
+      if (game_device_data.smaa_width != size.x || game_device_data.smaa_height != size.y)
       {
-         game_device_data.smaa_linear_uav = nullptr;
-         game_device_data.smaa_linear_srv = nullptr;
          game_device_data.smaa_predication_uav = nullptr;
          game_device_data.smaa_predication_srv = nullptr;
          D3D11_TEXTURE2D_DESC desc = {};
@@ -877,14 +903,11 @@ public:
          desc.Height = size.y;
          desc.MipLevels = 1;
          desc.ArraySize = 1;
-         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+         desc.Format = DXGI_FORMAT_R16_FLOAT;
          desc.SampleDesc.Count = 1;
          desc.Usage = D3D11_USAGE_DEFAULT;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-         if (!CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.smaa_linear_uav), std::addressof(game_device_data.smaa_linear_srv)))
-            return false;
          // Without it SMAA simply runs unpredicated
-         desc.Format = DXGI_FORMAT_R16_FLOAT;
          CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.smaa_predication_uav), std::addressof(game_device_data.smaa_predication_srv));
          game_device_data.smaa_width = size.x;
          game_device_data.smaa_height = size.y;
@@ -906,6 +929,7 @@ public:
             depth_srv = nullptr;
       }
 
+      if (depth_srv)
       {
          DrawStateStack<DrawStateStackType::Compute> compute_state;
          compute_state.Cache(native_device_context, device_data.uav_max_count);
@@ -915,21 +939,12 @@ public:
          native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
          native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
 
-         ID3D11UnorderedAccessView* const linear_uav = game_device_data.smaa_linear_uav.get();
-         ID3D11ShaderResourceView* const gamma_srv = color_srv.get();
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &linear_uav, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &gamma_srv);
-         native_device_context->CSSetShader(device_data.native_compute_shaders.at(smaa_linearize_shader_hash).get(), nullptr, 0);
+         ID3D11UnorderedAccessView* const predication_uav = game_device_data.smaa_predication_uav.get();
+         ID3D11ShaderResourceView* const raw_depth_srv = depth_srv.get();
+         native_device_context->CSSetUnorderedAccessViews(0, 1, &predication_uav, nullptr);
+         native_device_context->CSSetShaderResources(0, 1, &raw_depth_srv);
+         native_device_context->CSSetShader(device_data.native_compute_shaders.at(smaa_predication_shader_hash).get(), nullptr, 0);
          native_device_context->Dispatch((size.x + 7) / 8, (size.y + 7) / 8, 1);
-         if (depth_srv)
-         {
-            ID3D11UnorderedAccessView* const predication_uav = game_device_data.smaa_predication_uav.get();
-            ID3D11ShaderResourceView* const raw_depth_srv = depth_srv.get();
-            native_device_context->CSSetUnorderedAccessViews(0, 1, &predication_uav, nullptr);
-            native_device_context->CSSetShaderResources(0, 1, &raw_depth_srv);
-            native_device_context->CSSetShader(device_data.native_compute_shaders.at(smaa_predication_shader_hash).get(), nullptr, 0);
-            native_device_context->Dispatch((size.x + 7) / 8, (size.y + 7) / 8, 1);
-         }
 
          native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, reinterpret_cast<ID3D11RenderTargetView* const*>(&rtvs[0]), dsv.get());
          compute_state.Restore(native_device_context);
@@ -939,7 +954,9 @@ public:
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, depth_srv ? 2.f : 1.f);
       updated_cbuffers = true;
-      DrawSMAA(native_device, native_device_context, device_data, rtv.get(), game_device_data.smaa_linear_srv.get(), color_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+      // The neighborhood blend reads the gamma input too and filters it in linear light itself (SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR)
+      DrawSMAA(native_device, native_device_context, device_data, rtv.get(), color_srv.get(), color_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+      game_device_data.smaa_frame = cb_luma_global_settings.FrameIndex;
 
 #if DEVELOPMENT
       ID3D11ShaderResourceView* const edges_srv = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h].get();
@@ -1034,6 +1051,7 @@ public:
          scratch.width = width;
          scratch.height = height;
       }
+      game_device_data.gtao_frame = cb_luma_global_settings.FrameIndex; // In use, even if this run fails below
       // The vanilla final upsample writes the SSAO texture as a UAV, so it has the bind flag
       com_ptr<ID3D11Resource> uav_texture;
       if (game_device_data.gtao_ssao_uav)
@@ -1118,6 +1136,8 @@ public:
          return DrawOrDispatchOverrideType::None;
       com_ptr<ID3D11Resource> source_color;
       srvs[0]->GetResource(&source_color);
+      com_ptr<ID3D11Resource> source_depth;
+      srvs[1]->GetResource(&source_depth);
       com_ptr<ID3D11Resource> output_color_resource;
       output_uav->GetResource(&output_color_resource);
       com_ptr<ID3D11Texture2D> output_color;
@@ -1130,11 +1150,19 @@ public:
       if (!sr_instance_data || output_desc.Width < sr_instance_data->min_resolution || output_desc.Height < sr_instance_data->min_resolution)
          return DrawOrDispatchOverrideType::None;
 
-      // (Re)create the converted inputs at the TAA resolution
+      // (Re)create the converted inputs at the TAA resolution. DLSS reads the game's D24S8 depth as is; FSR has no 24 bit depth format, so it
+      // gets an R32_FLOAT copy.
       const bool sr_inputs_changed = !game_device_data.sr_motion_vectors || !AreResourcesEqual(game_device_data.sr_motion_vectors.get(), output_color.get(), false);
       if (sr_inputs_changed)
-      {
          CleanExtraSRResources(device_data);
+      const bool sr_depth_copy = device_data.sr_type == SR::Type::FSR;
+      if (!sr_depth_copy)
+      {
+         game_device_data.sr_depth = nullptr;
+         game_device_data.sr_depth_uav = nullptr;
+      }
+      if (!game_device_data.sr_motion_vectors || (sr_depth_copy && !game_device_data.sr_depth))
+      {
          D3D11_TEXTURE2D_DESC desc = {};
          desc.Width = output_desc.Width;
          desc.Height = output_desc.Height;
@@ -1143,10 +1171,11 @@ public:
          desc.SampleDesc.Count = 1;
          desc.Usage = D3D11_USAGE_DEFAULT;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-         desc.Format = DXGI_FORMAT_R32G32_FLOAT;
-         bool created = CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_motion_vectors_uav), nullptr, std::addressof(game_device_data.sr_motion_vectors));
+         // fp16 keeps the object MVs' precision (RT3 is R16G16_UNORM: 1/257 pixel steps) up to 8 pixels of motion, and is finer below
+         desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+         bool created = game_device_data.sr_motion_vectors || CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_motion_vectors_uav), nullptr, std::addressof(game_device_data.sr_motion_vectors));
          desc.Format = DXGI_FORMAT_R32_FLOAT;
-         created = created && CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_depth_uav), nullptr, std::addressof(game_device_data.sr_depth));
+         created = created && (!sr_depth_copy || game_device_data.sr_depth || CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_depth_uav), nullptr, std::addressof(game_device_data.sr_depth)));
          ASSERT_ONCE(created);
          if (!created)
          {
@@ -1176,7 +1205,7 @@ public:
       compute_state_stack.Cache(native_device_context, device_data.uav_max_count);
       SR_TIMING_MARK(SRStepStateCache);
 
-      // Convert the motion vectors and depth, the game's cb10, t1 and t3 are still bound
+      // Convert the motion vectors and depth (null without the copy: its writes are dropped), the game's cb10, t1 and t3 are still bound
       ID3D11UnorderedAccessView* const sr_inputs_uavs[] = {game_device_data.sr_motion_vectors_uav.get(), game_device_data.sr_depth_uav.get()};
       native_device_context->CSSetUnorderedAccessViews(0, ARRAYSIZE(sr_inputs_uavs), sr_inputs_uavs, nullptr);
       native_device_context->CSSetShader(device_data.native_compute_shaders.at(sr_inputs_shader_hash).get(), nullptr, 0);
@@ -1189,7 +1218,7 @@ public:
       draw_data.source_color = source_color.get();
       draw_data.output_color = output_color.get();
       draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
-      draw_data.depth_buffer = game_device_data.sr_depth.get();
+      draw_data.depth_buffer = sr_depth_copy ? game_device_data.sr_depth.get() : source_depth.get();
       draw_data.render_width = output_desc.Width;
       draw_data.render_height = output_desc.Height;
       // Projection jitter (NDC, y up) to the sample offset in pixels (y down)
@@ -1335,8 +1364,16 @@ public:
 
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.smaa_depth_srv = nullptr;
-      // Turning XeGTAO off gives its scratch back
-      if (!g_gtao_enable && game_device_data.gtao_scratch.width != 0)
+      // Scratch of a feature turned off or idle goes back, on the render thread between frames, Core's SMAA intermediates included
+      if (game_device_data.smaa_width != 0 && cb_luma_global_settings.FrameIndex - game_device_data.smaa_frame > idle_release_frames)
+      {
+         game_device_data.smaa_predication_uav = nullptr;
+         game_device_data.smaa_predication_srv = nullptr;
+         game_device_data.smaa_width = 0;
+         game_device_data.smaa_height = 0;
+         ReleaseSMAA(device_data);
+      }
+      if (game_device_data.gtao_scratch.width != 0 && (!g_gtao_enable || cb_luma_global_settings.FrameIndex - game_device_data.gtao_frame > idle_release_frames))
       {
          game_device_data.gtao_scratch = {};
          game_device_data.gtao_ssao_uav = nullptr;
@@ -1366,7 +1403,56 @@ public:
          *jitter_mode = sr_active ? halton_jitter_mode : vanilla_jitter_mode;
       }
 #endif
+#if DEVELOPMENT && ENABLE_SR
+      // "Memory Sweep": the next mode once this one settled (lazy scratch created, idle scratch released)
+      if (memory_sweep_step >= 0 && --memory_sweep_frames_left <= 0)
+      {
+         LogMemoryReport(native_device, device_data, memory_sweep_modes[memory_sweep_step].name);
+         ApplyMemorySweepMode(device_data, memory_sweep_step + 1 < int(std::size(memory_sweep_modes)) ? memory_sweep_step + 1 : -1);
+      }
+#endif
    }
+
+#if DEVELOPMENT && ENABLE_SR
+   // "step" -1 restores the user's settings. An upscaler this device can't run is replaced by None.
+   static void ApplyMemorySweepMode(DeviceData& device_data, int step)
+   {
+      if (memory_sweep_step < 0)
+         memory_sweep_user_settings = {.name = "User", .sr_type = device_data.sr_type, .smaa = g_smaa_enable, .gtao = g_gtao_enable};
+      const MemorySweepMode& mode = (step >= 0 ? memory_sweep_modes[step] : memory_sweep_user_settings);
+      SR::Type sr_type = mode.sr_type;
+      if (const auto it = device_data.sr_implementations_instances.find(sr_type); sr_type != SR::Type::None && (it == device_data.sr_implementations_instances.end() || !it->second || !sr_implementations[sr_type]->HasInit(it->second)))
+         sr_type = SR::Type::None;
+      SetSRType(device_data, sr_type);
+      g_smaa_enable = mode.smaa;
+      g_gtao_enable = mode.gtao;
+      memory_sweep_step = step;
+      memory_sweep_frames_left = memory_sweep_settle_frames;
+   }
+
+   // The process's GPU memory (local and non-local) and commit, and which of the mod's scratch is allocated
+   static void LogMemoryReport(ID3D11Device* native_device, DeviceData& device_data, const char* label)
+   {
+      DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, non_local = {};
+      com_ptr<IDXGIDevice> dxgi_device;
+      com_ptr<IDXGIAdapter> adapter;
+      com_ptr<IDXGIAdapter3> adapter3;
+      if (SUCCEEDED(native_device->QueryInterface(&dxgi_device)) && SUCCEEDED(dxgi_device->GetAdapter(&adapter)) && SUCCEEDED(adapter->QueryInterface(&adapter3)))
+      {
+         adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
+         adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non_local);
+      }
+      PROCESS_MEMORY_COUNTERS_EX pmc = {sizeof(pmc)};
+      GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+      const auto& game_device_data = GetGameDeviceData(device_data);
+      const char* const sr_name = (device_data.sr_type == SR::Type::DLSS ? "DLSS" : (device_data.sr_type == SR::Type::FSR ? "FSR 3" : "None"));
+      const bool core_smaa = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h] != nullptr;
+      constexpr double MiB = 1024.0 * 1024.0;
+      reshade::log::message(reshade::log::level::info, std::format("[SRTTR Mem] \"{}\" vram local={:.1f} non-local={:.1f} MiB private={:.1f} MiB sr={} game_taa={} smaa={}x{} core_smaa={} xegtao={}x{} sr_mvs={} sr_depth_copy={} output={}x{}",
+                                                          label, local.CurrentUsage / MiB, non_local.CurrentUsage / MiB, pmc.PrivateUsage / MiB, sr_name, device_data.taa_detected.load(), game_device_data.smaa_width, game_device_data.smaa_height, core_smaa, game_device_data.gtao_scratch.width, game_device_data.gtao_scratch.height, bool(game_device_data.sr_motion_vectors), bool(game_device_data.sr_depth), uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y))
+                                                          .c_str());
+   }
+#endif
 
 #if ENABLE_SR
    void CleanExtraSRResources(DeviceData& device_data) override
@@ -1565,6 +1651,14 @@ public:
          sr_timings_log_requested = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Writes the average, min and max time of every DLAA / FSR 3 step since the last log to ReShade.log, on the next SR frame.\nCPU = submission time on the render thread. GPU = execution time of the inputs conversion CS and the SR draw.");
+      const std::string memory_sweep_label = memory_sweep_step >= 0 ? std::format("Memory Sweep ({}/{})", memory_sweep_step + 1, std::size(memory_sweep_modes)) : std::string("Memory Sweep");
+      if (ImGui::Button(memory_sweep_label.c_str()) && memory_sweep_step < 0)
+      {
+         LogMemoryReport(device_data.native_device, device_data, "Current settings");
+         ApplyMemorySweepMode(device_data, 0);
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Runs each mode (none, SMAA, XeGTAO, DLAA, FSR 3, back to none) for %d frames and logs the process's GPU memory and commit\n([SRTTR Mem] in ReShade.log), then restores the settings. SMAA needs in-game Anti-Aliasing = FXAA, DLAA / FSR 3 need TAA:\nrun it once with each. Keep the camera still. Not saved.", memory_sweep_settle_frames);
 #endif
    }
 #endif

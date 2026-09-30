@@ -10,9 +10,8 @@
 //   vanilla chain's unoccluded output measures).
 // - Depth and NDC->view use the ambient's own formulas: viewZ = P._43 / (d - P._33),
 //   view.xy = (ndc - (P._31, P._32)) * viewZ / (P._11, P._22) (P._31/P._32 carry the TAA jitter, so it is removed).
-// - Normals: XE_GTAO_GENERATE_NORMALS 1 (default) derives them from depth, like the depth-only vanilla SSAO. The G-buffer ones
-//   carry the normal maps, so fine surface detail (gravel, slats, rivets) got occluded too: 1.6-1.7x the vanilla darkening in
-//   detailed scenes against ~1.1x in plain ones. 0 uses the G-buffer normals.
+// - Normals: the G-buffer ones (t1), normal maps included, so fine surface detail (gravel, slats, rivets) is occluded too:
+//   1.6-1.7x the vanilla (depth-only) darkening in detailed scenes against ~1.1x in plain ones.
 // - NoiseIndexRT is the frame index while a temporal AA (TAA, DLAA, FSR) accumulates, 0 (frozen pattern) otherwise.
 
 #include "Includes/Common.hlsl"
@@ -30,14 +29,10 @@ cbuffer AmbientParams : register(b10)
 #define FinalValuePowerRT LumaData.CustomData3 // primary darkness dial
 #define RadiusOverrideRT  LumaData.CustomData4 // > 0 overrides EFFECT_RADIUS (metres)
 
-// Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant). With FinalValuePowerRT 1.4 and depth normals it matches the vanilla
-// SSAO on 5 scenes (offline sim of this shader): darkening 0.99-1.10x, contacts 0.71-0.80x, coverage +1-7 pp. RadiusOverrideRT > 0
-// wins.
+// Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant). With FinalValuePowerRT 1.4, calibrated on depth normals (0.99-1.10x
+// the vanilla SSAO's darkening over 5 scenes, offline sim of this shader), the G-buffer normals darken ~1.25x in plain scenes and
+// ~1.75x in normal-mapped detail (kept deliberately). RadiusOverrideRT > 0 wins.
 #define EFFECT_RADIUS 0.4
-
-#ifndef XE_GTAO_GENERATE_NORMALS
-#define XE_GTAO_GENERATE_NORMALS 1 // Mirrors the Luma define's default
-#endif
 
 // The vanilla SSAO (MiniEngine) has a screen-space radius (10 px at 1920 wide per hierarchy level), so its world radius grows with
 // distance. A constant world radius matched it only at mid range: on the SSAO texture dumps of two scenes it was 1.9-3.2x darker at

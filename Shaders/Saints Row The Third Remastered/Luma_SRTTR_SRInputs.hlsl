@@ -13,7 +13,7 @@ Texture2D<float> Depth : register(t1);                 // D24S8, standard depth 
 Texture2D<float2> EncodedMotionVectors : register(t3); // G-buffer RT3: saturate((current - previous pixels + 127) / 255), (0, 0) = no object motion
 
 RWTexture2D<float2> OutMotionVectors : register(u0); // previous - current, in pixels, y down
-RWTexture2D<float> OutDepth : register(u1);
+RWTexture2D<float> OutDepth : register(u1);          // FSR only (no 24 bit depth format): null for DLSS, which reads Depth itself
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    if (any(id.xy >= screenSize))
