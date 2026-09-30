@@ -2153,6 +2153,27 @@ namespace Mcp
       RegisterToggles({{"core.hide_ui", &hide_ui}, {"core.force_disable_display_composition", &force_disable_display_composition}, {"core.ignore_upgraded_samplers", &ignore_upgraded_samplers},
          {"core.enable_upgraded_texture_resource_copy_redirection", &enable_upgraded_texture_resource_copy_redirection}});
       RegisterInts({{"core.frame_sleep_ms", &frame_sleep_ms, 0, 100}, {"core.frame_sleep_interval", &frame_sleep_interval, 1, 30}});
+#if ENABLE_SR
+      // As the "Super Resolution" combo, not saved to the config: 0 None, 1 Auto, 2 DLSS, 3 FSR 3
+      static_assert(sizeof(SR::UserType) == sizeof(int));
+      RegisterInts({{"core.sr_user_type", reinterpret_cast<int*>(&sr_user_type), 0, 3, [](DeviceData& device_data, double value)
+         {
+            const SR::UserType user_type = SR::UserType(int(value));
+            SR::Type type = SR::Type::None;
+            switch (user_type)
+            {
+            case SR::UserType::None: break;
+            case SR::UserType::Auto: type = GetSRAutoType(device_data); break;
+            case SR::UserType::DLSS: type = SR::Type::DLSS; break;
+            case SR::UserType::FSR_3: type = SR::Type::FSR; break;
+            }
+            if (user_type != SR::UserType::None && !device_data.sr_implementations_instances.contains(type))
+               return std::string("Not supported on this device");
+            const std::unique_lock lock_reshade(s_mutex_reshade);
+            sr_user_type = user_type;
+            SetSRType(device_data, type);
+            return std::string(); }}});
+#endif
       // "DrawSMAA" and "DrawBloom"'s intermediates, the bloom's mips through "mip"
       RegisterTextures({{"core.smaa_edges", [](DeviceData& device_data) -> ID3D11DeviceChild*
                            { return device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h].get(); }},

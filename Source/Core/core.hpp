@@ -5710,6 +5710,57 @@ namespace
    }
 #endif
 
+#if ENABLE_SR
+   // The first supported SR type (the implementations are in order of preference), what "Auto" picks
+   SR::Type GetSRAutoType(const DeviceData& device_data)
+   {
+      for (const auto& [type, instance] : device_data.sr_implementations_instances)
+      {
+         if (instance && instance->is_supported)
+            return type;
+      }
+      return SR::Type::None;
+   }
+
+   // The UI's (or the MCP's) SR selection: inits the new SR. Under "s_mutex_reshade", on the render thread.
+   // We wouldn't really need to do anything other than clearing "sr_output_color",
+   // but to avoid wasting memory allocated by SR texture and other resources, clear it up once disabled.
+   // Note that we keep these textures in memory if the user temporarily changed away from an AA method that supports SR, or if users unloaded shaders (there's no reason to, and it'd cause stutters).
+   void SetSRType(DeviceData& device_data, SR::Type sr_type)
+   {
+      if (device_data.sr_type == sr_type)
+         return;
+      auto* sr_instance_data = device_data.GetSRInstanceData();
+      if (sr_instance_data)
+      {
+         // Its own resources (e.g. DLSS's feature, the SR bridge's helper) go, the implementation stays loaded
+         sr_implementations[device_data.sr_type]->ReleaseResources(sr_instance_data);
+#if 0 // This would actually unload the previously selected SR DLL and all, making the game hitch, so it's better to just keep it in memory, especially because otherwise we need to check for compatibily again and load them again etc
+         sr_implementations[device_data.sr_type]->Deinit(sr_instance_data);
+         sr_instance_data = nullptr;
+#endif
+      }
+
+      device_data.sr_type = sr_type;
+      device_data.sr_suppressed = false;
+      sr_instance_data = device_data.GetSRInstanceData(); // Take new instance data
+
+      if (device_data.sr_type != SR::Type::None)
+      {
+         ASSERT_ONCE(sr_instance_data && sr_implementations[device_data.sr_type]->HasInit(sr_instance_data)); // Should never happen
+      }
+      else
+      {
+         device_data.sr_output_color = nullptr;
+         device_data.sr_exposure = nullptr;
+         device_data.sr_render_resolution_scale = 1.f; // Reset this to 1 when SR is toggled, even if dynamic resolution scaling is active (e.g. in Prey), we'll set it back to a low value if DRS is used again.
+         device_data.sr_scene_exposure = 1.f;
+         device_data.sr_scene_pre_exposure = 1.f;
+         game->CleanExtraSRResources(device_data);
+      }
+   }
+#endif // ENABLE_SR
+
 #if DEVELOPMENT
 #include "includes/mcp_server.inl"
 #endif // DEVELOPMENT
@@ -14243,16 +14294,7 @@ namespace
 
             SR::Type sr_type = device_data.sr_type;
 
-            SR::Type sr_auto_type = SR::Type::None;
-            // Pick the first supported one (they are in order of priority)
-            for (const auto& sr_implementation_instance : device_data.sr_implementations_instances)
-            {
-               if (sr_implementation_instance.second && sr_implementation_instance.second->is_supported)
-               {
-                  sr_auto_type = sr_implementation_instance.first;
-                  break;
-               }
-            }
+            const SR::Type sr_auto_type = GetSRAutoType(device_data);
 
             // Note: if we reached here, it's guaranteed that the selected SR type is supported
             if (ImGui::BeginCombo("Super Resolution", selected_sr_user_type))
@@ -14382,41 +14424,7 @@ namespace
                }
             }
 
-            // Init the new SR if the selection changed.
-            // We wouldn't really need to do anything other than clearing "sr_output_color",
-            // but to avoid wasting memory allocated by SR texture and other resources, clear it up once disabled.
-            // Note that we keep these textures in memory if the user temporarily changed away from an AA method that supports SR, or if users unloaded shaders (there's no reason to, and it'd cause stutters).
-            if (device_data.sr_type != sr_type)
-            {
-               auto* sr_instance_data = device_data.GetSRInstanceData();
-               if (sr_instance_data)
-               {
-                  // Its own resources (e.g. DLSS's feature, the SR bridge's helper) go, the implementation stays loaded
-                  sr_implementations[device_data.sr_type]->ReleaseResources(sr_instance_data);
-#if 0 // This would actually unload the previously selected SR DLL and all, making the game hitch, so it's better to just keep it in memory, especially because otherwise we need to check for compatibily again and load them again etc
-                  sr_implementations[device_data.sr_type]->Deinit(sr_instance_data);
-                  sr_instance_data = nullptr;
-#endif
-               }
-
-               device_data.sr_type = sr_type;
-               device_data.sr_suppressed = false;
-               sr_instance_data = device_data.GetSRInstanceData(); // Take new instance data
-
-               if (device_data.sr_type != SR::Type::None)
-               {
-                  ASSERT_ONCE(sr_instance_data && sr_implementations[device_data.sr_type]->HasInit(sr_instance_data)); // Should never happen
-               }
-               else
-               {
-                  device_data.sr_output_color = nullptr;
-                  device_data.sr_exposure = nullptr;
-                  device_data.sr_render_resolution_scale = 1.f; // Reset this to 1 when SR is toggled, even if dynamic resolution scaling is active (e.g. in Prey), we'll set it back to a low value if DRS is used again.
-                  device_data.sr_scene_exposure = 1.f;
-                  device_data.sr_scene_pre_exposure = 1.f;
-                  game->CleanExtraSRResources(device_data);
-               }
-            }
+            SetSRType(device_data, sr_type);
 #endif // ENABLE_SR
 
 #if ENABLE_REFLEX
