@@ -28,6 +28,10 @@ namespace
       bool (*taa_gate)() = nullptr;
    };
 
+   // The head of the Halton lookup that replaces the 8x jitter pattern code (see "InstallHaltonJitterPattern()"): mov eax, [rsi+0x59C];
+   // and eax, 15; lea rdx, [rip+0x10]
+   constexpr uint8_t halton_stub_prefix[] = {0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, 0x83, 0xE0, 0x0F, 0x48, 0x8D, 0x15, 0x10, 0x00, 0x00, 0x00};
+
    // All null for an unknown build; only scanned once
    const GameAddresses& GetGameAddresses()
    {
@@ -49,10 +53,12 @@ namespace
          // call taa_gate at +0x11B, cmp [rip+?], -1 (jitter_gate) at +0x128, mov ecx, [rip+?] (jitter_mode) at +0x146
          if (function[0x11B] != 0xE8 || function[0x128] != 0x83 || function[0x129] != 0x3D || function[0x12E] != 0xFF || function[0x146] != 0x8B || function[0x147] != 0x0D)
             return result;
-         // The 8x pattern block: mov eax, [rsi+0x59C]; and eax, 0x80000007 ... ja (+0x17) to the shared scaling code
+         // The 8x pattern block: mov eax, [rsi+0x59C]; and eax, 0x80000007 ... ja (+0x17) to the shared scaling code, or the Halton lookup a
+         // previous load of the addon in this process installed there
          constexpr uint8_t jitter_pattern_8x_start[] = {0x8B, 0x86, 0x9C, 0x05, 0x00, 0x00, 0x25, 0x07, 0x00, 0x00, 0x80};
          uint8_t* jitter_pattern_8x = function + 0x175;
-         if (std::memcmp(jitter_pattern_8x, jitter_pattern_8x_start, sizeof(jitter_pattern_8x_start)) != 0 || jitter_pattern_8x[0x17] != 0x0F || jitter_pattern_8x[0x18] != 0x87)
+         const bool jitter_pattern_8x_original = std::memcmp(jitter_pattern_8x, jitter_pattern_8x_start, sizeof(jitter_pattern_8x_start)) == 0 && jitter_pattern_8x[0x17] == 0x0F && jitter_pattern_8x[0x18] == 0x87;
+         if (!jitter_pattern_8x_original && std::memcmp(jitter_pattern_8x, halton_stub_prefix, sizeof(halton_stub_prefix)) != 0)
             return result;
          // The 2x and 4x mask high bytes, 0x00 if a previous load of the addon already patched them
          uint8_t* jitter_index_mask_high_bytes[] = {function + 0x2C6, function + 0x252};
@@ -91,11 +97,13 @@ namespace
    // Cheap when the bytes already match, so it can run every frame
    void SetJitterIndexFix(bool enable)
    {
-      const uint8_t mask_high_byte = enable ? 0x00 : 0x80;
+      const uint8_t mask_high_byte = (enable ? 0x00 : 0x80);
       for (uint8_t* byte : GetGameAddresses().jitter_index_mask_high_bytes)
       {
          if (byte && *byte != mask_high_byte)
+         {
             System::PatchMemory(byte, &mask_high_byte, 1);
+         }
       }
    }
 
@@ -110,7 +118,8 @@ namespace
    void InstallHaltonJitterPattern()
    {
       uint8_t* block = GetGameAddresses().jitter_pattern_8x;
-      if (!block)
+      // Already installed by a previous load of the addon in this process: the "ja" operand read below is table data by now
+      if (!block || std::memcmp(block, halton_stub_prefix, sizeof(halton_stub_prefix)) == 0)
          return;
       std::array<uint8_t, jitter_pattern_8x_size> bytes;
       std::memcpy(bytes.data(), block, jitter_pattern_8x_size); // The rest of the block stays original
@@ -124,6 +133,7 @@ namespace
          0xE9, 0x00, 0x00, 0x00, 0x00,       // jmp to the block's "ja" target (0x14089BA3B), set below
       };
       // clang-format on
+      static_assert(std::equal(std::begin(halton_stub_prefix), std::end(halton_stub_prefix), std::begin(code)));
       std::memcpy(bytes.data(), code, sizeof(code));
       const uint8_t* ja_target = block + 0x1D + *reinterpret_cast<const int32_t*>(block + 0x19);
       const int32_t jmp_offset = static_cast<int32_t>(ja_target - (block + sizeof(code)));
@@ -208,12 +218,16 @@ namespace
       if (!camera_build || MH_Initialize() != MH_OK)
          return;
       if (MH_CreateHook(camera_build, reinterpret_cast<void*>(&CameraBuildDetour), reinterpret_cast<void**>(&camera_build_original)) == MH_OK)
+      {
          MH_EnableHook(camera_build);
+      }
 #if DEVELOPMENT
       uint8_t* camera_counter_increment = GetGameAddresses().camera_counter_increment;
       constexpr uint8_t camera_counter_increment_prologue[] = {0xFF, 0x81, 0x9C, 0x05, 0x00, 0x00}; // inc dword ptr [rcx+0x59C]
       if (std::memcmp(camera_counter_increment, camera_counter_increment_prologue, sizeof(camera_counter_increment_prologue)) == 0 && MH_CreateHook(camera_counter_increment, reinterpret_cast<void*>(&CameraCounterIncrementDetour), reinterpret_cast<void**>(&camera_counter_increment_original)) == MH_OK)
+      {
          MH_EnableHook(camera_counter_increment);
+      }
 #endif
    }
 
@@ -245,7 +259,8 @@ namespace
 #if DEVELOPMENT
    bool g_smaa_predication = true;
    int g_smaa_debug_view = 0; // 0 off, 1 edges, 2 predication
-   bool g_smaa_dump = false;
+#else
+   constexpr bool g_smaa_predication = true;
 #endif
 
    // ssao_miniengine (MiniEngine SSAO), every quality level's passes: prepare 1/2, interleaved and full-res renders, and the blur-upsample perms.
@@ -254,9 +269,14 @@ namespace
    constexpr uint32_t ssao_prepare_1_hash = 0x2F4B251B;
    constexpr uint32_t ssao_chain_hashes[] = {ssao_prepare_1_hash, 0xAC38984B, 0x1DEB634A, 0xDE09F597, 0x23EF0DBA, 0x7378361E, 0x07B179C3, 0x7281BC27};
    constexpr UINT ambient_params_cb_slot = 10; // AMBIENT_PARAMS, rebound PS -> CS for XeGTAO
+   // XeGTAO passes (Luma_SRTTR_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY
+   constexpr uint32_t gtao_prefilter_shader_hash = CompileTimeStringHash("SRTTR XeGTAO Prefilter Depths CS");
+   constexpr uint32_t gtao_main_shader_hash = CompileTimeStringHash("SRTTR XeGTAO Main Pass CS");
+   constexpr uint32_t gtao_denoise_1_shader_hash = CompileTimeStringHash("SRTTR XeGTAO Denoise Pass 1 CS");
+   constexpr uint32_t gtao_denoise_2_shader_hash = CompileTimeStringHash("SRTTR XeGTAO Denoise Pass 2 CS");
    bool g_gtao_enable = true;
-   // SMAA's and XeGTAO's scratch goes after this many presents without them (~5 s at 120 fps): TAA, DLAA and FSR 3 replace SMAA,
-   // the in-game SSAO can be off, and menus and loading screens run neither. Recreated on their next run.
+   // SMAA's, XeGTAO's and the SR inputs' scratch goes after this many presents without them (~5 s at 120 fps): the in-game Anti-Aliasing runs
+   // either SMAA or SR, the in-game SSAO can be off, and menus and loading screens run none. Recreated on their next run.
    constexpr uint32_t idle_release_frames = 600;
    // Calibration knobs, development builds tune them (not persisted)
 #if DEVELOPMENT
@@ -281,6 +301,12 @@ namespace
       return (has(names) && ...);
    }
 
+   // The four XeGTAO passes are compiled. The caller holds s_mutex_shader_objects.
+   bool HasXeGTAOShaders(const DeviceData& device_data)
+   {
+      return HasShaders(device_data.native_compute_shaders, gtao_prefilter_shader_hash, gtao_main_shader_hash, gtao_denoise_1_shader_hash, gtao_denoise_2_shader_hash);
+   }
+
    // A 2D texture with a UAV and, if asked, an SRV (and the texture itself). The outputs are only written when everything was created.
    // com_ptr overloads "&" (it yields the raw out pointer), so callers pass the members with std::addressof.
    bool CreateTextureWithViews(ID3D11Device* native_device, const D3D11_TEXTURE2D_DESC& desc, com_ptr<ID3D11UnorderedAccessView>* uav, com_ptr<ID3D11ShaderResourceView>* srv = nullptr, com_ptr<ID3D11Texture2D>* texture = nullptr)
@@ -292,272 +318,34 @@ namespace
          return false;
       *uav = new_uav;
       if (srv)
+      {
          *srv = new_srv;
+      }
       if (texture)
+      {
          *texture = new_texture;
+      }
       return true;
    }
 
 #if ENABLE_SR
    // Jitter sign conventions and the motion vectors jitter flag. The game's MVs have no jitter: with a static camera, both the TAA
    // reprojection (cb10 matReprojection) and the object MVs are ~0 while the jitter moves the image by up to ~0.9 pixels between frames.
+#if DEVELOPMENT
    bool sr_flip_jitter_x = false;
    bool sr_flip_jitter_y = false;
    bool sr_mvs_jittered = false;
+#else
+   constexpr bool sr_flip_jitter_x = false;
+   constexpr bool sr_flip_jitter_y = false;
+   constexpr bool sr_mvs_jittered = false;
+#endif
 #endif
 } // namespace
 
 #if DEVELOPMENT
 namespace
 {
-   // DLAA research: logs the TAA inputs the DevKit cannot read (cbuffers, depth state) to ReShade.log
-   std::atomic<int> dlaa_log_frames_left = 0;
-   uint32_t dlaa_log_frame = 0;
-   bool dlaa_log_gbuffer_done = false;
-
-   // The game binds ranges of one large constant buffer (*SetConstantBuffers1), so only the bound range is copied.
-   // Reads up to "registers" float4s, fewer if the bound range is smaller; returns how many were read (0 on failure).
-   UINT ReadBoundConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, reshade::api::shader_stage stage, UINT slot, UINT registers, float* data)
-   {
-      com_ptr<ID3D11DeviceContext1> native_device_context1;
-      if (FAILED(native_device_context->QueryInterface(&native_device_context1)))
-         return 0;
-      com_ptr<ID3D11Buffer> cb;
-      UINT first = 0, count = 0;
-      if (stage == reshade::api::shader_stage::vertex)
-         native_device_context1->VSGetConstantBuffers1(slot, 1, &cb, &first, &count);
-      else if (stage == reshade::api::shader_stage::pixel)
-         native_device_context1->PSGetConstantBuffers1(slot, 1, &cb, &first, &count);
-      else
-         native_device_context1->CSGetConstantBuffers1(slot, 1, &cb, &first, &count);
-      if (!cb)
-         return 0;
-      D3D11_BUFFER_DESC desc = {};
-      cb->GetDesc(&desc);
-      if (count == 0 && first == 0) // Bound with the non range API
-         count = desc.ByteWidth / 16;
-      registers = (std::min)(registers, count);
-      const UINT offset = first * 16;
-      const UINT bytes = registers * 16;
-      if (registers == 0 || offset + bytes > desc.ByteWidth)
-         return 0;
-
-      D3D11_BUFFER_DESC staging_desc = {};
-      staging_desc.ByteWidth = bytes;
-      staging_desc.Usage = D3D11_USAGE_STAGING;
-      staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-      com_ptr<ID3D11Buffer> staging;
-      if (FAILED(native_device->CreateBuffer(&staging_desc, nullptr, &staging)))
-         return 0;
-      const D3D11_BOX box = {offset, 0, 0, offset + bytes, 1, 1};
-      native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, cb.get(), 0, &box);
-      D3D11_MAPPED_SUBRESOURCE mapped = {};
-      if (FAILED(native_device_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
-         return 0;
-      std::memcpy(data, mapped.pData, bytes);
-      native_device_context->Unmap(staging.get(), 0);
-      return registers;
-   }
-
-   // Raw texture dump for offline analysis (formats the DevKit cannot read back): header {width, height, dxgi_format}, then tight rows of 1 or 4 bytes
-   // per pixel. Written to %TEMP%\srttr_<file_prefix>_<name>_<frame>.bin.
-   void DumpTexture(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, ID3D11ShaderResourceView* srv, const char* file_prefix, const char* name, uint32_t frame)
-   {
-      if (!srv)
-         return;
-      com_ptr<ID3D11Resource> resource;
-      srv->GetResource(&resource);
-      com_ptr<ID3D11Texture2D> texture;
-      if (FAILED(resource->QueryInterface(&texture)))
-         return;
-      D3D11_TEXTURE2D_DESC desc = {};
-      texture->GetDesc(&desc);
-      UINT pixel_bytes = 4;
-      if (desc.Format == DXGI_FORMAT_R8_UNORM)
-         pixel_bytes = 1;
-      else if (desc.Format == DXGI_FORMAT_R16_FLOAT || desc.Format == DXGI_FORMAT_R8G8_UNORM)
-         pixel_bytes = 2;
-      else if (desc.Format != DXGI_FORMAT_R16G16_UNORM && desc.Format != DXGI_FORMAT_R24G8_TYPELESS)
-         return;
-      desc.Usage = D3D11_USAGE_STAGING;
-      desc.BindFlags = 0;
-      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-      desc.MiscFlags = 0;
-      desc.MipLevels = 1;
-      com_ptr<ID3D11Texture2D> staging;
-      if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &staging)))
-         return;
-      native_device_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, texture.get(), 0, nullptr);
-      D3D11_MAPPED_SUBRESOURCE mapped = {};
-      if (FAILED(native_device_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
-         return;
-      const auto path = std::filesystem::temp_directory_path() / (std::string("srttr_") + file_prefix + "_" + name + "_" + std::to_string(frame) + ".bin");
-      if (FILE* file = _wfopen(path.c_str(), L"wb"))
-      {
-         const uint32_t header[3] = {desc.Width, desc.Height, uint32_t(desc.Format)};
-         fwrite(header, sizeof(header), 1, file);
-         for (UINT y = 0; y < desc.Height; y++)
-            fwrite(static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, desc.Width * pixel_bytes, 1, file);
-         fclose(file);
-         reshade::log::message(reshade::log::level::info, ("[SRTTR] dump " + path.string()).c_str());
-      }
-      native_device_context->Unmap(staging.get(), 0);
-   }
-
-   // "prefix" starts the log line, e.g. "[SRTTR DLAA] frame=3"
-   void LogRegisters(const char* prefix, const char* tag, const float* data, UINT first_register, UINT last_register)
-   {
-      char line[256];
-      for (UINT i = first_register; i <= last_register; i++)
-      {
-         std::snprintf(line, sizeof(line), "%s %s c%u=%.9g,%.9g,%.9g,%.9g", prefix, tag, i, data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]);
-         reshade::log::message(reshade::log::level::info, line);
-      }
-   }
-
-   void LogTAAInputs(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, uint32_t taa_hash)
-   {
-      const std::string prefix = "[SRTTR DLAA] frame=" + std::to_string(dlaa_log_frame);
-      // TAA_PARAMS cb10: c0-c3 matReprojection, c4 screenSize (uint2) + texelSize, c5 sharpness/neighbour_threshold/impulse_reduce/key_value, c6 max_weight/min_weight/frame_id (int)
-      float taa[7 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 10, 7, taa) == 7)
-      {
-         uint32_t screen_size[2];
-         int32_t frame_id;
-         std::memcpy(screen_size, &taa[16], sizeof(screen_size));
-         std::memcpy(&frame_id, &taa[26], sizeof(frame_id));
-         const int32_t* jitter_mode = GetGameAddresses().jitter_mode;
-         char line[256];
-         // The jitter SR gets (last camera built on this thread), to compare against the pattern entry of the GPU frame_id
-         std::snprintf(line, sizeof(line), "[SRTTR DLAA] frame=%u TAA 0x%08X screenSize=%u,%u frame_id=%d jitter_mode=%d sr_camera_valid=%d sr_camera_jitter_px=%.4f,%.4f tid=%lu", dlaa_log_frame, taa_hash, screen_size[0], screen_size[1], frame_id, jitter_mode ? *jitter_mode : -1, int(last_built_camera.valid), last_built_camera.jitter_x * screen_size[0] * 0.5f, -last_built_camera.jitter_y * screen_size[1] * 0.5f, GetCurrentThreadId());
-         reshade::log::message(reshade::log::level::info, line);
-         LogRegisters(prefix.c_str(), "TAA cb10", taa, 0, 6);
-      }
-      // CB_COMMON as bound for the post chain, to compare against the G-buffer one
-      float common[42 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 1, 42, common) == 42)
-         LogRegisters(prefix.c_str(), "TAA cb1", common, 34, 41);
-      // Depth (t1) and motion vectors (t3) of the first two logged frames, to check the object MVs against the camera reprojection
-      if (dlaa_log_frame < 2)
-      {
-         com_ptr<ID3D11ShaderResourceView> srvs[3];
-         native_device_context->CSGetShaderResources(1, 3, &srvs[0]);
-         DumpTexture(native_device, native_device_context, srvs[0].get(), "dlaa", "depth", dlaa_log_frame);
-         DumpTexture(native_device, native_device_context, srvs[2].get(), "dlaa", "mv", dlaa_log_frame);
-      }
-
-      dlaa_log_frame++;
-      dlaa_log_frames_left--;
-      dlaa_log_gbuffer_done = false;
-   }
-
-   void LogGBufferInputs(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
-   {
-      // The first G-buffer draw of the frame: 4 MRTs with the motion vectors in RT3 (r16g16_unorm)
-      com_ptr<ID3D11RenderTargetView> rtvs[4];
-      com_ptr<ID3D11DepthStencilView> dsv;
-      native_device_context->OMGetRenderTargets(4, &rtvs[0], &dsv);
-      if (!rtvs[3])
-         return;
-      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-      rtvs[3]->GetDesc(&rtv_desc);
-      if (rtv_desc.Format != DXGI_FORMAT_R16G16_UNORM)
-         return;
-      dlaa_log_gbuffer_done = true;
-      const std::string prefix = "[SRTTR DLAA] frame=" + std::to_string(dlaa_log_frame);
-
-      D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
-      if (dsv)
-         dsv->GetDesc(&dsv_desc);
-      com_ptr<ID3D11DepthStencilState> depth_state;
-      UINT stencil_ref = 0;
-      native_device_context->OMGetDepthStencilState(&depth_state, &stencil_ref);
-      D3D11_DEPTH_STENCIL_DESC depth_desc = {};
-      if (depth_state)
-         depth_state->GetDesc(&depth_desc);
-      char line[256];
-      std::snprintf(line, sizeof(line), "[SRTTR DLAA] frame=%u GBuffer VS 0x%08X PS 0x%08X dsv_format=%d depth_enable=%d depth_write=%d depth_func=%d",
-         dlaa_log_frame, uint32_t(original_shader_hashes.vertex_shaders[0]), uint32_t(original_shader_hashes.pixel_shaders[0]), int(dsv_desc.Format), int(depth_desc.DepthEnable), int(depth_desc.DepthWriteMask), int(depth_desc.DepthFunc));
-      reshade::log::message(reshade::log::level::info, line);
-
-      // CB_COMMON cb1: c1 Target_dimensions, c9 Velocity_calculation_data, c34-c37 projTM, c38-c41 unknown (not the previous camera the MVs use)
-      float common[42 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::vertex, 1, 42, common) == 42)
-      {
-         LogRegisters(prefix.c_str(), "GBuffer VS cb1", common, 1, 1);
-         LogRegisters(prefix.c_str(), "GBuffer VS cb1", common, 9, 9);
-         LogRegisters(prefix.c_str(), "GBuffer VS cb1", common, 34, 41);
-      }
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::pixel, 1, 10, common) == 10)
-         LogRegisters(prefix.c_str(), "GBuffer PS cb1", common, 9, 9);
-      // CB_VERTEX cb2: c10-c13 curr_to_prev_clip (per object, static meshes only)
-      float vertex[14 * 4];
-      if (ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::vertex, 2, 14, vertex) == 14)
-         LogRegisters(prefix.c_str(), "GBuffer VS cb2", vertex, 10, 13);
-   }
-
-   // XeGTAO research: the ssao_miniengine chain (cbuffers and bindings of every pass) and the ambient pass that consumes its AO
-   std::atomic<int> xegtao_log_frames_left = 0;
-   uint32_t xegtao_log_frame = 0;
-
-   void LogViewTexture(const std::string& prefix, const std::string& slot, ID3D11View* view)
-   {
-      if (!view)
-         return;
-      com_ptr<ID3D11Resource> resource;
-      view->GetResource(&resource);
-      com_ptr<ID3D11Texture2D> texture;
-      if (FAILED(resource->QueryInterface(&texture)))
-         return;
-      D3D11_TEXTURE2D_DESC desc = {};
-      texture->GetDesc(&desc);
-      char line[256];
-      std::snprintf(line, sizeof(line), "%s %s res=%p %ux%u array=%u mips=%u format=%d", prefix.c_str(), slot.c_str(), resource.get(), desc.Width, desc.Height, desc.ArraySize, desc.MipLevels, int(desc.Format));
-      reshade::log::message(reshade::log::level::info, line);
-   }
-
-   void LogSSAOPass(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, uint32_t hash)
-   {
-      const std::string prefix = std::format("[SRTTR XeGTAO] frame={} SSAO 0x{:08X}", xegtao_log_frame, hash);
-      float params[64 * 4];
-      if (const UINT registers = ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::compute, 10, 64, params))
-         LogRegisters(prefix.c_str(), "cb10", params, 0, registers - 1);
-      com_ptr<ID3D11ShaderResourceView> srvs[4];
-      native_device_context->CSGetShaderResources(0, 4, &srvs[0]);
-      com_ptr<ID3D11UnorderedAccessView> uavs[5];
-      native_device_context->CSGetUnorderedAccessViews(0, 5, &uavs[0]);
-      for (UINT i = 0; i < 4; i++)
-         LogViewTexture(prefix, "t" + std::to_string(i), srvs[i].get());
-      for (UINT i = 0; i < 5; i++)
-         LogViewTexture(prefix, "u" + std::to_string(i), uavs[i].get());
-   }
-
-   void LogAmbientInputs(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context)
-   {
-      const std::string prefix = std::format("[SRTTR XeGTAO] frame={} ambient", xegtao_log_frame);
-      // AMBIENT_PARAMS cb10 (52 registers): c0-c3 Projection, c4-c7 ViewInverse, c8-c11 ShadowMatrix, c12 RenderOffset, c13 LightDir,
-      // c14/c15 AmbientLevelHigh/Low, c16-c22 ZonePos, c23 AmountInv/Normals/Power/Intensity, c24 _unused0/IntensityDiffuse/MaxIterations/NumberOfInteriors
-      float params[52 * 4];
-      if (const UINT registers = ReadBoundConstants(native_device, native_device_context, reshade::api::shader_stage::pixel, 10, 52, params))
-         LogRegisters(prefix.c_str(), "cb10", params, 0, (std::min)(registers, 25u) - 1);
-      char line[256];
-      std::snprintf(line, sizeof(line), "%s camera valid=%d projection_y_scale=%.9g near=%.9g far=%.9g jitter=%.9g,%.9g", prefix.c_str(), int(last_built_camera.valid), last_built_camera.projection_y_scale, last_built_camera.near_plane, last_built_camera.far_plane, last_built_camera.jitter_x, last_built_camera.jitter_y);
-      reshade::log::message(reshade::log::level::info, line);
-      // t0 depth, t1 view space normals, t2 SSAO
-      com_ptr<ID3D11ShaderResourceView> srvs[3];
-      native_device_context->PSGetShaderResources(0, 3, &srvs[0]);
-      for (UINT i = 0; i < 3; i++)
-         LogViewTexture(prefix, "t" + std::to_string(i), srvs[i].get());
-      if (xegtao_log_frames_left == 2) // The first frame of each button press; the frame number keeps the files apart
-      {
-         DumpTexture(native_device, native_device_context, srvs[0].get(), "xegtao", "depth", xegtao_log_frame);
-         DumpTexture(native_device, native_device_context, srvs[1].get(), "xegtao", "normals", xegtao_log_frame);
-         DumpTexture(native_device, native_device_context, srvs[2].get(), "xegtao", "ao", xegtao_log_frame);
-      }
-      xegtao_log_frame++;
-      xegtao_log_frames_left--;
-   }
-
 #if ENABLE_SR
    // "Memory Sweep": these modes in turn, each logged once settled ("[SRTTR Mem]" in ReShade.log) so the deltas between lines are each
    // feature's cost, then the user's settings back. The in-game settings decide what can run (SMAA needs Anti-Aliasing = FXAA, DLAA and
@@ -637,13 +425,13 @@ namespace
       using Clock = std::chrono::steady_clock;
 
    public:
-      SRTimingScope(SRTimings& timings, ID3D11Device* native_device, ID3D11DeviceContext* native_device_context)
+      SRTimingScope(SRTimings* timings, ID3D11Device* native_device, ID3D11DeviceContext* native_device_context)
           : timings(timings), native_device(native_device), native_device_context(native_device_context)
       {
          marks[0] = Clock::now();
          if (native_device_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
             return;
-         for (auto& queries : timings.queries)
+         for (auto& queries : timings->queries)
          {
             if (!queries.pending)
                continue;
@@ -651,20 +439,24 @@ namespace
             UINT64 ticks[sr_gpu_step_count + 1] = {};
             HRESULT hr = native_device_context->GetData(queries.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
             for (size_t i = 0; i < ARRAYSIZE(ticks) && hr == S_OK; i++)
+            {
                hr = native_device_context->GetData(queries.timestamps[i].get(), &ticks[i], sizeof(ticks[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            }
             if (hr == S_FALSE)
                continue;
             queries.pending = false;
             if (FAILED(hr) || disjoint.Disjoint || disjoint.Frequency == 0 || !std::is_sorted(std::begin(ticks), std::end(ticks)))
             {
-               timings.gpu_invalid++;
+               timings->gpu_invalid++;
                continue;
             }
             const double ms_per_tick = 1000.0 / double(disjoint.Frequency);
             for (size_t i = 0; i < sr_gpu_step_count; i++)
-               timings.gpu[i].Add(double(ticks[i + 1] - ticks[i]) * ms_per_tick);
-            timings.gpu[sr_gpu_step_count].Add(double(ticks[sr_gpu_step_count] - ticks[0]) * ms_per_tick);
-            timings.gpu_samples++;
+            {
+               timings->gpu[i].Add(double(ticks[i + 1] - ticks[i]) * ms_per_tick);
+            }
+            timings->gpu[sr_gpu_step_count].Add(double(ticks[sr_gpu_step_count] - ticks[0]) * ms_per_tick);
+            timings->gpu_samples++;
          }
          if (sr_timings_log_requested.exchange(false))
          {
@@ -672,20 +464,28 @@ namespace
             {
                for (size_t i = 0; i < count; i++)
                {
-                  const size_t name = i + 1 == count ? SRStepCount : first_name + i; // The last is the total
+                  const size_t name = (i + 1 == count ? SRStepCount : (first_name + i)); // The last is the total
                   reshade::log::message(reshade::log::level::info, std::format("{} {:<14} avg {:.3f} min {:.3f} max {:.3f} ms", prefix, sr_step_names[name], stats[i].sum / samples, stats[i].min, stats[i].max).c_str());
                }
             };
-            reshade::log::message(reshade::log::level::info, std::format("[SRTTR SR] timings since the last log: CPU submission over {} frames, GPU execution over {} frames ({} dropped, {} invalid)", timings.cpu_samples, timings.gpu_samples, timings.gpu_dropped, timings.gpu_invalid).c_str());
-            if (timings.cpu_samples)
-               log_stats("[SRTTR SR] CPU", timings.cpu, 0, SRStepCount + 1, timings.cpu_samples);
-            if (timings.gpu_samples)
-               log_stats("[SRTTR SR] GPU", timings.gpu, SRStepInputsCS, sr_gpu_step_count + 1, timings.gpu_samples);
-            for (auto& stat : timings.cpu)
+            reshade::log::message(reshade::log::level::info, std::format("[SRTTR SR] timings since the last log: CPU submission over {} frames, GPU execution over {} frames ({} dropped, {} invalid)", timings->cpu_samples, timings->gpu_samples, timings->gpu_dropped, timings->gpu_invalid).c_str());
+            if (timings->cpu_samples)
+            {
+               log_stats("[SRTTR SR] CPU", timings->cpu, 0, SRStepCount + 1, timings->cpu_samples);
+            }
+            if (timings->gpu_samples)
+            {
+               log_stats("[SRTTR SR] GPU", timings->gpu, SRStepInputsCS, sr_gpu_step_count + 1, timings->gpu_samples);
+            }
+            for (auto& stat : timings->cpu)
+            {
                stat = {};
-            for (auto& stat : timings.gpu)
+            }
+            for (auto& stat : timings->gpu)
+            {
                stat = {};
-            timings.cpu_samples = timings.gpu_samples = timings.gpu_dropped = timings.gpu_invalid = 0;
+            }
+            timings->cpu_samples = timings->gpu_samples = timings->gpu_dropped = timings->gpu_invalid = 0;
          }
       }
       SRTimingScope(const SRTimingScope&) = delete;
@@ -698,12 +498,16 @@ namespace
          if (step < SRStepStateCache || step > SRStepDraw)
             return;
          if (step == SRStepStateCache)
+         {
             queries = BeginQueries();
+         }
          if (!queries)
             return;
          native_device_context->End(queries->timestamps[step - SRStepStateCache].get());
          if (step == SRStepDraw)
+         {
             native_device_context->End(queries->disjoint.get());
+         }
       }
 
       ~SRTimingScope()
@@ -713,17 +517,19 @@ namespace
          const auto ms = [](Clock::duration duration)
          { return std::chrono::duration<double, std::milli>(duration).count(); };
          for (size_t i = 0; i < SRStepCount; i++)
-            timings.cpu[i].Add(ms(marks[i + 1] - marks[i]));
-         timings.cpu[SRStepCount].Add(ms(marks[SRStepCount] - marks[0]));
-         timings.cpu_samples++;
+         {
+            timings->cpu[i].Add(ms(marks[i + 1] - marks[i]));
+         }
+         timings->cpu[SRStepCount].Add(ms(marks[SRStepCount] - marks[0]));
+         timings->cpu_samples++;
       }
 
    private:
       SRTimings::Queries* BeginQueries()
       {
-         if (timings.queries_failed)
+         if (timings->queries_failed)
             return nullptr;
-         for (auto& free_queries : timings.queries)
+         for (auto& free_queries : timings->queries)
          {
             if (free_queries.pending)
                continue;
@@ -733,10 +539,12 @@ namespace
                bool created = SUCCEEDED(native_device->CreateQuery(&desc, &free_queries.disjoint));
                desc.Query = D3D11_QUERY_TIMESTAMP;
                for (auto& timestamp : free_queries.timestamps)
+               {
                   created = created && SUCCEEDED(native_device->CreateQuery(&desc, &timestamp));
+               }
                if (!created)
                {
-                  timings.queries_failed = true;
+                  timings->queries_failed = true;
                   return nullptr;
                }
             }
@@ -744,11 +552,11 @@ namespace
             native_device_context->Begin(free_queries.disjoint.get());
             return &free_queries;
          }
-         timings.gpu_dropped++;
+         timings->gpu_dropped++;
          return nullptr;
       }
 
-      SRTimings& timings;
+      SRTimings* timings;
       ID3D11Device* native_device;
       ID3D11DeviceContext* native_device_context;
       SRTimings::Queries* queries = nullptr;
@@ -765,11 +573,14 @@ namespace
 struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
 {
    // SMAA scratch at FXAA's size: the predication edge-ness (null if its creation failed)
-   com_ptr<ID3D11UnorderedAccessView> smaa_predication_uav;
-   com_ptr<ID3D11ShaderResourceView> smaa_predication_srv;
-   UINT smaa_width = 0;
-   UINT smaa_height = 0;
-   uint32_t smaa_frame = 0; // FrameIndex of SMAA's last run, for "idle_release_frames"
+   struct SMAAScratch
+   {
+      com_ptr<ID3D11UnorderedAccessView> predication_uav;
+      com_ptr<ID3D11ShaderResourceView> predication_srv;
+      UINT width = 0;
+      UINT height = 0;
+      uint32_t last_frame = 0; // FrameIndex of SMAA's last run, for "idle_release_frames"
+   } smaa_scratch;
    // This frame's scene depth, from the ambient pass (reset every present)
    com_ptr<ID3D11ShaderResourceView> smaa_depth_srv;
 
@@ -782,8 +593,8 @@ struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
       com_ptr<ID3D11ShaderResourceView> working_srvs[2];
       UINT width = 0;
       UINT height = 0;
+      uint32_t last_frame = 0; // FrameIndex of XeGTAO's last run, for "idle_release_frames"
    } gtao_scratch;
-   uint32_t gtao_frame = 0; // FrameIndex of XeGTAO's last run, for "idle_release_frames"
    // A UAV on the game's SSAO texture (it holds the resource, so its address can't be reused)
    com_ptr<ID3D11UnorderedAccessView> gtao_ssao_uav;
    bool ssao_chain_ran_this_frame = false; // the game's SSAO is on (any level but Off)
@@ -797,6 +608,9 @@ struct SaintsRowTheThirdRemasteredGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11UnorderedAccessView> sr_motion_vectors_uav;
    com_ptr<ID3D11Texture2D> sr_depth;
    com_ptr<ID3D11UnorderedAccessView> sr_depth_uav;
+   uint32_t sr_inputs_last_frame = 0; // FrameIndex of the inputs' last use, for "idle_release_frames"
+   // The last two TAA outputs SR drew into (so a game alternating two isn't "new" every frame), see OUT-4 in "DrawSRInPlaceOfTAA"
+   com_ptr<ID3D11Resource> sr_outputs[2];
 #if DEVELOPMENT
    SRTimings sr_timings;
 #endif
@@ -815,11 +629,10 @@ public:
    {
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
-      Mcp::RegisterToggles({{"fix_native_taa_jitter", &g_fix_native_taa_jitter}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_dump", &g_smaa_dump},
-         {"gtao_enable", &g_gtao_enable}});
+      Mcp::RegisterToggles({{"fix_native_taa_jitter", &g_fix_native_taa_jitter}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"gtao_enable", &g_gtao_enable}});
       Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
       Mcp::RegisterInts({{"smaa_debug_view", &g_smaa_debug_view, 0, 2}, {"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.pred_mask", smaa_scratch.predication_srv),
          MCP_GAME_TEXTURE("gtao.depth_mips", gtao_scratch.depth_mips_srv)});
 #if ENABLE_SR
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("sr.motion_vectors", sr_motion_vectors),
@@ -859,11 +672,10 @@ public:
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
       native_shaders_definitions.emplace(smaa_predication_shader_hash, ShaderDefinition{"Luma_SRTTR_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
-      // XeGTAO passes (Luma_SRTTR_XeGTAO.hlsl); the two denoisers differ only by XE_GTAO_FINAL_APPLY
-      native_shaders_definitions.emplace("SRTTR XeGTAO Prefilter Depths CS"_h, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
-      native_shaders_definitions.emplace("SRTTR XeGTAO Main Pass CS"_h, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
-      native_shaders_definitions.emplace("SRTTR XeGTAO Denoise Pass 1 CS"_h, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
-      native_shaders_definitions.emplace("SRTTR XeGTAO Denoise Pass 2 CS"_h, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
+      native_shaders_definitions.emplace(gtao_prefilter_shader_hash, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
+      native_shaders_definitions.emplace(gtao_main_shader_hash, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
+      native_shaders_definitions.emplace(gtao_denoise_1_shader_hash, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
+      native_shaders_definitions.emplace(gtao_denoise_2_shader_hash, ShaderDefinition{"Luma_SRTTR_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
 #if ENABLE_SR
       native_shaders_definitions.emplace(sr_inputs_shader_hash, ShaderDefinition{"Luma_SRTTR_SRInputs", reshade::api::pipeline_subobject_type::compute_shader});
       sr_game_tooltip = "Requires \"Anti-Aliasing\" set to \"TAA\" in the game's display settings.\n";
@@ -872,7 +684,7 @@ public:
 
    // SMAA in place of the FXAA draw: it reads FXAA's input (t0) and writes FXAA's render target. Returns false, and FXAA draws, when an input,
    // a shader or the scratch is missing.
-   bool DrawSMAAInPlaceOfFXAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool& updated_cbuffers)
+   bool DrawSMAAInPlaceOfFXAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers)
    {
       com_ptr<ID3D11RenderTargetView> rtv;
       native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
@@ -880,12 +692,10 @@ public:
       native_device_context->PSGetShaderResources(0, 1, &color_srv);
       if (!rtv || !color_srv)
          return false;
-      uint4 size;
-      uint4 target_size;
-      DXGI_FORMAT format;
-      GetResourceInfo(color_srv.get(), size, format);
-      GetResourceInfo(rtv.get(), target_size, format);
-      if (size.x != target_size.x || size.y != target_size.y || size.x == 0 || size.y == 0)
+      // SMAA's metrics are the swapchain's (the Luma settings), so its input and target must match it
+      const uint2 size = GetViewTextureSize(color_srv.get());
+      const uint2 swapchain_size = {uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
+      if (size != GetViewTextureSize(rtv.get()) || size != swapchain_size || size.x == 0 || size.y == 0)
          return false;
 
       // Held through SMAA so a shader reload cannot release them mid-use; "DrawSMAA" looks its shaders up with "at"
@@ -894,40 +704,30 @@ public:
          return false;
 
       auto& game_device_data = GetGameDeviceData(device_data);
-      if (game_device_data.smaa_width != size.x || game_device_data.smaa_height != size.y)
+      auto& scratch = game_device_data.smaa_scratch;
+      if (scratch.width != size.x || scratch.height != size.y)
       {
-         game_device_data.smaa_predication_uav = nullptr;
-         game_device_data.smaa_predication_srv = nullptr;
-         D3D11_TEXTURE2D_DESC desc = {};
-         desc.Width = size.x;
-         desc.Height = size.y;
-         desc.MipLevels = 1;
-         desc.ArraySize = 1;
-         desc.Format = DXGI_FORMAT_R16_FLOAT;
-         desc.SampleDesc.Count = 1;
-         desc.Usage = D3D11_USAGE_DEFAULT;
-         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+         scratch = {};
+         const D3D11_TEXTURE2D_DESC desc = {.Width = size.x, .Height = size.y, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16_FLOAT, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
          // Without it SMAA simply runs unpredicated
-         CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.smaa_predication_uav), std::addressof(game_device_data.smaa_predication_srv));
-         game_device_data.smaa_width = size.x;
-         game_device_data.smaa_height = size.y;
+         CreateTextureWithViews(native_device, desc, std::addressof(scratch.predication_uav), std::addressof(scratch.predication_srv));
+         scratch.width = size.x;
+         scratch.height = size.y;
       }
 
       // Predication depth: the ambient pass' R24 scene depth at FXAA's size. Anything else falls back to plain ULTRA.
-      bool predication_available = game_device_data.smaa_predication_uav && HasShaders(device_data.native_compute_shaders, smaa_predication_shader_hash);
-#if DEVELOPMENT
-      predication_available = predication_available && g_smaa_predication;
-#endif
-      com_ptr<ID3D11ShaderResourceView> depth_srv = predication_available ? game_device_data.smaa_depth_srv : nullptr;
+      const bool predication_available = g_smaa_predication && scratch.predication_uav && HasShaders(device_data.native_compute_shaders, smaa_predication_shader_hash);
+      com_ptr<ID3D11ShaderResourceView> depth_srv = (predication_available ? game_device_data.smaa_depth_srv : nullptr);
       if (depth_srv)
       {
          D3D11_SHADER_RESOURCE_VIEW_DESC depth_srv_desc;
          depth_srv->GetDesc(&depth_srv_desc);
-         uint4 depth_size;
-         GetResourceInfo(depth_srv.get(), depth_size, format);
-         if (depth_srv_desc.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS || depth_srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || depth_size.x != size.x || depth_size.y != size.y)
+         if (depth_srv_desc.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS || depth_srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || GetViewTextureSize(depth_srv.get()) != size)
+         {
             depth_srv = nullptr;
+         }
       }
+      ID3D11ShaderResourceView* const predication_srv = (depth_srv ? scratch.predication_srv.get() : nullptr);
 
       if (depth_srv)
       {
@@ -939,7 +739,7 @@ public:
          native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
          native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
 
-         ID3D11UnorderedAccessView* const predication_uav = game_device_data.smaa_predication_uav.get();
+         ID3D11UnorderedAccessView* const predication_uav = scratch.predication_uav.get();
          ID3D11ShaderResourceView* const raw_depth_srv = depth_srv.get();
          native_device_context->CSSetUnorderedAccessViews(0, 1, &predication_uav, nullptr);
          native_device_context->CSSetShaderResources(0, 1, &raw_depth_srv);
@@ -952,24 +752,16 @@ public:
 
       // The SMAA shaders read the target size from the Luma settings and the predication scale from the Luma data, in both stages
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, depth_srv ? 2.f : 1.f);
-      updated_cbuffers = true;
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, 0, 0, (depth_srv ? 2.f : 1.f));
+      *updated_cbuffers = true;
       // The neighborhood blend reads the gamma input too and filters it in linear light itself (SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR)
-      DrawSMAA(native_device, native_device_context, device_data, rtv.get(), color_srv.get(), color_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
-      game_device_data.smaa_frame = cb_luma_global_settings.FrameIndex;
+      DrawSMAA(native_device, native_device_context, device_data, rtv.get(), color_srv.get(), color_srv.get(), predication_srv);
+      scratch.last_frame = cb_luma_global_settings.FrameIndex;
 
 #if DEVELOPMENT
       ID3D11ShaderResourceView* const edges_srv = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h].get();
-      if (g_smaa_dump)
-      {
-         g_smaa_dump = false;
-         const uint32_t frame = cb_luma_global_settings.FrameIndex;
-         DumpTexture(native_device, native_device_context, depth_srv.get(), "smaa", "depth", frame);
-         DumpTexture(native_device, native_device_context, depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr, "smaa", "predication", frame);
-         DumpTexture(native_device, native_device_context, edges_srv, "smaa", "edges", frame);
-      }
       // Calibration aid: SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red) replace the frame
-      ID3D11ShaderResourceView* const debug_srv = g_smaa_debug_view == 1 ? edges_srv : (g_smaa_debug_view == 2 && depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+      ID3D11ShaderResourceView* const debug_srv = (g_smaa_debug_view == 1 ? edges_srv : (g_smaa_debug_view == 2 ? predication_srv : nullptr));
       if (debug_srv && HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) && HasShaders(device_data.native_pixel_shaders, "Copy PS"_h))
       {
          DrawStateStack<DrawStateStackType::FullGraphics> debug_state;
@@ -984,12 +776,12 @@ public:
    // XeGTAO right before the ambient draw, on its inputs (t0 depth, t1 view space normals, cb10 AMBIENT_PARAMS for this frame's projection):
    // prefilter, main pass and two denoisers, the last one writing the ambient's t2 (the game's SSAO texture) through a UAV. Returns false,
    // and the SSAO keeps its previous content, when an input, a shader or the scratch is missing.
-   bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool& updated_cbuffers)
+   bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers)
    {
       // Held through the dispatches so a shader reload cannot release them mid-use
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       const auto& shaders = device_data.native_compute_shaders;
-      if (!HasShaders(shaders, "SRTTR XeGTAO Prefilter Depths CS"_h, "SRTTR XeGTAO Main Pass CS"_h, "SRTTR XeGTAO Denoise Pass 1 CS"_h, "SRTTR XeGTAO Denoise Pass 2 CS"_h))
+      if (!HasXeGTAOShaders(device_data))
          return false;
 
       com_ptr<ID3D11DeviceContext1> native_device_context1;
@@ -1006,14 +798,12 @@ public:
       srvs[0]->GetDesc(&depth_srv_desc);
       com_ptr<ID3D11Resource> ssao_texture;
       srvs[2]->GetResource(&ssao_texture);
-      uint4 depth_size, normals_size, ssao_size;
-      DXGI_FORMAT unused_format;
-      GetResourceInfo(srvs[0].get(), depth_size, unused_format);
-      GetResourceInfo(srvs[1].get(), normals_size, unused_format);
-      GetResourceInfo(ssao_texture.get(), ssao_size, unused_format);
+      const uint2 depth_size = GetViewTextureSize(srvs[0].get());
+      const uint2 normals_size = GetViewTextureSize(srvs[1].get());
+      const uint2 ssao_size = GetViewTextureSize(srvs[2].get());
       const UINT width = ssao_size.x;
       const UINT height = ssao_size.y;
-      if (depth_srv_desc.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS || width == 0 || height == 0 || depth_size.x != width || depth_size.y != height || normals_size.x != width || normals_size.y != height)
+      if (depth_srv_desc.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS || width == 0 || height == 0 || depth_size != ssao_size || normals_size != ssao_size)
          return false;
 
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1021,14 +811,8 @@ public:
       if (scratch.width != width || scratch.height != height)
       {
          scratch = {};
-         D3D11_TEXTURE2D_DESC desc = {};
-         desc.Width = width;
-         desc.Height = height;
-         desc.MipLevels = ARRAYSIZE(scratch.depth_mip_uavs); // XE_GTAO_DEPTH_MIP_LEVELS
-         desc.ArraySize = 1;
-         desc.Format = DXGI_FORMAT_R32_FLOAT;
-         desc.SampleDesc.Count = 1;
-         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+         // MipLevels = XE_GTAO_DEPTH_MIP_LEVELS
+         D3D11_TEXTURE2D_DESC desc = {.Width = width, .Height = height, .MipLevels = UINT(ARRAYSIZE(scratch.depth_mip_uavs)), .ArraySize = 1, .Format = DXGI_FORMAT_R32_FLOAT, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
          com_ptr<ID3D11Texture2D> depth_mips_texture;
          bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(depth_mips_texture.get(), nullptr, &scratch.depth_mips_srv));
          D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
@@ -1042,7 +826,9 @@ public:
          desc.MipLevels = 1;
          desc.Format = DXGI_FORMAT_R8G8_UNORM;
          for (int i = 0; ok && i < 2; i++)
+         {
             ok = CreateTextureWithViews(native_device, desc, std::addressof(scratch.working_uavs[i]), std::addressof(scratch.working_srvs[i]));
+         }
          if (!ok)
          {
             scratch = {};
@@ -1051,11 +837,13 @@ public:
          scratch.width = width;
          scratch.height = height;
       }
-      game_device_data.gtao_frame = cb_luma_global_settings.FrameIndex; // In use, even if this run fails below
+      scratch.last_frame = cb_luma_global_settings.FrameIndex; // In use, even if this run fails below
       // The vanilla final upsample writes the SSAO texture as a UAV, so it has the bind flag
       com_ptr<ID3D11Resource> uav_texture;
       if (game_device_data.gtao_ssao_uav)
+      {
          game_device_data.gtao_ssao_uav->GetResource(&uav_texture);
+      }
       if (uav_texture != ssao_texture)
       {
          game_device_data.gtao_ssao_uav = nullptr;
@@ -1072,9 +860,9 @@ public:
          ID3D11Buffer* const ambient_params_cb = ambient_params.get();
          native_device_context1->CSSetConstantBuffers1(ambient_params_cb_slot, 1, &ambient_params_cb, &ambient_params_first, &ambient_params_count);
          // The noise pattern cycles only when a temporal AA accumulated last frame (the ambient runs before this frame's TAA), otherwise it would boil
-         const uint32_t noise_index = device_data.taa_detected ? cb_luma_global_settings.FrameIndex % 64 : 0;
+         const uint32_t noise_index = (device_data.taa_detected ? (cb_luma_global_settings.FrameIndex % 64) : 0);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaData, noise_index, uint32_t(g_gtao_debug_view), g_gtao_final_value_power, g_gtao_radius_override);
-         updated_cbuffers = true;
+         *updated_cbuffers = true;
          ID3D11SamplerState* const point_sampler = device_data.sampler_state_point.get();
          native_device_context->CSSetSamplers(0, 1, &point_sampler);
 
@@ -1093,10 +881,10 @@ public:
          ID3D11UnorderedAccessView* const mip_uavs[] = {scratch.depth_mip_uavs[0].get(), scratch.depth_mip_uavs[1].get(), scratch.depth_mip_uavs[2].get(), scratch.depth_mip_uavs[3].get(), scratch.depth_mip_uavs[4].get()};
          ID3D11UnorderedAccessView* const working_uavs[] = {scratch.working_uavs[0].get(), scratch.working_uavs[1].get()};
          ID3D11UnorderedAccessView* const ssao_uav = game_device_data.gtao_ssao_uav.get();
-         pass("SRTTR XeGTAO Prefilter Depths CS"_h, ARRAYSIZE(mip_uavs), mip_uavs, {srvs[0].get(), nullptr}, (width + 15) / 16, (height + 15) / 16);
-         pass("SRTTR XeGTAO Main Pass CS"_h, 1, &working_uavs[0], {scratch.depth_mips_srv.get(), srvs[1].get()}, (width + 7) / 8, (height + 7) / 8);
-         pass("SRTTR XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {scratch.working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
-         pass("SRTTR XeGTAO Denoise Pass 2 CS"_h, 1, &ssao_uav, {scratch.working_srvs[1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+         pass(gtao_prefilter_shader_hash, ARRAYSIZE(mip_uavs), mip_uavs, {srvs[0].get(), nullptr}, (width + 15) / 16, (height + 15) / 16);
+         pass(gtao_main_shader_hash, 1, &working_uavs[0], {scratch.depth_mips_srv.get(), srvs[1].get()}, (width + 7) / 8, (height + 7) / 8);
+         pass(gtao_denoise_1_shader_hash, 1, &working_uavs[1], {scratch.working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+         pass(gtao_denoise_2_shader_hash, 1, &ssao_uav, {scratch.working_srvs[1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
          compute_state.Restore(native_device_context);
       }
 
@@ -1112,17 +900,15 @@ public:
    DrawOrDispatchOverrideType DrawSRInPlaceOfTAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
-#if DEVELOPMENT
-      SRTimingScope sr_timing(game_device_data.sr_timings, native_device, native_device_context);
-#endif
       // The jitter comes from the camera built on this thread (the render thread), and SR needs the game's 8x jitter pattern to be active
       const CameraData camera = last_built_camera;
       const int32_t* jitter_mode = GetGameAddresses().jitter_mode;
+      // A frame SR doesn't draw restarts its history at the next one ("OnPresent")
       if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed || native_device_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !camera.valid || !jitter_mode || *jitter_mode != halton_jitter_mode)
-      {
-         device_data.force_reset_sr = true;
          return DrawOrDispatchOverrideType::None;
-      }
+#if DEVELOPMENT
+      SRTimingScope sr_timing(&game_device_data.sr_timings, native_device, native_device_context);
+#endif
       // Held through the dispatch so a shader reload cannot release it mid-use
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       if (!HasShaders(device_data.native_compute_shaders, sr_inputs_shader_hash))
@@ -1138,59 +924,58 @@ public:
       srvs[0]->GetResource(&source_color);
       com_ptr<ID3D11Resource> source_depth;
       srvs[1]->GetResource(&source_depth);
-      com_ptr<ID3D11Resource> output_color_resource;
-      output_uav->GetResource(&output_color_resource);
-      com_ptr<ID3D11Texture2D> output_color;
-      if (FAILED(output_color_resource->QueryInterface(&output_color)))
-         return DrawOrDispatchOverrideType::None;
-      D3D11_TEXTURE2D_DESC output_desc;
-      output_color->GetDesc(&output_desc);
+      com_ptr<ID3D11Resource> output_color;
+      output_uav->GetResource(&output_color);
+      const uint2 output_size = GetViewTextureSize(output_uav.get()); // 0x0 unless a 2D texture
 
       auto* sr_instance_data = device_data.GetSRInstanceData();
-      if (!sr_instance_data || output_desc.Width < sr_instance_data->min_resolution || output_desc.Height < sr_instance_data->min_resolution)
+      if (!sr_instance_data || output_size.x == 0 || output_size.y == 0 || output_size.x < sr_instance_data->min_resolution || output_size.y < sr_instance_data->min_resolution)
          return DrawOrDispatchOverrideType::None;
 
       // (Re)create the converted inputs at the TAA resolution. DLSS reads the game's D24S8 depth as is; FSR has no 24 bit depth format, so it
       // gets an R32_FLOAT copy.
       const bool sr_inputs_changed = !game_device_data.sr_motion_vectors || !AreResourcesEqual(game_device_data.sr_motion_vectors.get(), output_color.get(), false);
       if (sr_inputs_changed)
+      {
          CleanExtraSRResources(device_data);
+      }
       const bool sr_depth_copy = device_data.sr_type == SR::Type::FSR;
       if (!sr_depth_copy)
       {
          game_device_data.sr_depth = nullptr;
          game_device_data.sr_depth_uav = nullptr;
       }
-      if (!game_device_data.sr_motion_vectors || (sr_depth_copy && !game_device_data.sr_depth))
+      const auto create_input = [&](DXGI_FORMAT format, com_ptr<ID3D11UnorderedAccessView>* uav, com_ptr<ID3D11Texture2D>* texture)
       {
-         D3D11_TEXTURE2D_DESC desc = {};
-         desc.Width = output_desc.Width;
-         desc.Height = output_desc.Height;
-         desc.MipLevels = 1;
-         desc.ArraySize = 1;
-         desc.SampleDesc.Count = 1;
-         desc.Usage = D3D11_USAGE_DEFAULT;
-         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+         const D3D11_TEXTURE2D_DESC desc = {.Width = output_size.x, .Height = output_size.y, .MipLevels = 1, .ArraySize = 1, .Format = format, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
+         return CreateTextureWithViews(native_device, desc, uav, nullptr, texture);
+      };
+      bool created = true;
+      if (!game_device_data.sr_motion_vectors)
+      {
          // fp16 keeps the object MVs' precision (RT3 is R16G16_UNORM: 1/257 pixel steps) up to 8 pixels of motion, and is finer below
-         desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-         bool created = game_device_data.sr_motion_vectors || CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_motion_vectors_uav), nullptr, std::addressof(game_device_data.sr_motion_vectors));
-         desc.Format = DXGI_FORMAT_R32_FLOAT;
-         created = created && (!sr_depth_copy || game_device_data.sr_depth || CreateTextureWithViews(native_device, desc, std::addressof(game_device_data.sr_depth_uav), nullptr, std::addressof(game_device_data.sr_depth)));
-         ASSERT_ONCE(created);
-         if (!created)
-         {
-            CleanExtraSRResources(device_data);
-            return DrawOrDispatchOverrideType::None;
-         }
+         created = create_input(DXGI_FORMAT_R16G16_FLOAT, std::addressof(game_device_data.sr_motion_vectors_uav), std::addressof(game_device_data.sr_motion_vectors));
       }
+      if (created && sr_depth_copy && !game_device_data.sr_depth)
+      {
+         created = create_input(DXGI_FORMAT_R32_FLOAT, std::addressof(game_device_data.sr_depth_uav), std::addressof(game_device_data.sr_depth));
+      }
+      ASSERT_ONCE(created);
+      if (!created)
+      {
+         CleanExtraSRResources(device_data);
+         return DrawOrDispatchOverrideType::None;
+      }
+      game_device_data.sr_inputs_last_frame = cb_luma_global_settings.FrameIndex;
+      const bool new_output = output_color != game_device_data.sr_outputs[0] && output_color != game_device_data.sr_outputs[1];
 
       SR_TIMING_MARK(SRStepPrepare);
 
       SR::SettingsData settings_data;
-      settings_data.output_width = output_desc.Width;
-      settings_data.output_height = output_desc.Height;
-      settings_data.render_width = output_desc.Width;
-      settings_data.render_height = output_desc.Height;
+      settings_data.output_width = output_size.x;
+      settings_data.output_height = output_size.y;
+      settings_data.render_width = output_size.x;
+      settings_data.render_height = output_size.y;
       settings_data.hdr = true; // TAA runs on the scene linear HDR color, before tonemapping
       settings_data.mvs_jittered = sr_mvs_jittered;
       // FSR's auto exposure clips highlights
@@ -1209,7 +994,7 @@ public:
       ID3D11UnorderedAccessView* const sr_inputs_uavs[] = {game_device_data.sr_motion_vectors_uav.get(), game_device_data.sr_depth_uav.get()};
       native_device_context->CSSetUnorderedAccessViews(0, ARRAYSIZE(sr_inputs_uavs), sr_inputs_uavs, nullptr);
       native_device_context->CSSetShader(device_data.native_compute_shaders.at(sr_inputs_shader_hash).get(), nullptr, 0);
-      native_device_context->Dispatch((output_desc.Width + 7) / 8, (output_desc.Height + 7) / 8, 1);
+      native_device_context->Dispatch((output_size.x + 7) / 8, (output_size.y + 7) / 8, 1);
       ID3D11UnorderedAccessView* const null_uavs[ARRAYSIZE(sr_inputs_uavs)] = {};
       native_device_context->CSSetUnorderedAccessViews(0, ARRAYSIZE(null_uavs), null_uavs, nullptr);
       SR_TIMING_MARK(SRStepInputsCS);
@@ -1218,13 +1003,13 @@ public:
       draw_data.source_color = source_color.get();
       draw_data.output_color = output_color.get();
       draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
-      draw_data.depth_buffer = sr_depth_copy ? game_device_data.sr_depth.get() : source_depth.get();
-      draw_data.render_width = output_desc.Width;
-      draw_data.render_height = output_desc.Height;
+      draw_data.depth_buffer = (sr_depth_copy ? game_device_data.sr_depth.get() : source_depth.get());
+      draw_data.render_width = output_size.x;
+      draw_data.render_height = output_size.y;
       // Projection jitter (NDC, y up) to the sample offset in pixels (y down)
-      draw_data.jitter_x = camera.jitter_x * output_desc.Width * (sr_flip_jitter_x ? 0.5f : -0.5f);
-      draw_data.jitter_y = camera.jitter_y * output_desc.Height * (sr_flip_jitter_y ? -0.5f : 0.5f);
-      draw_data.vert_fov = camera.projection_y_scale > 0.f ? 2.f * std::atan(1.f / camera.projection_y_scale) : (60.f * float(M_PI) / 180.f); // FSR fails without it
+      draw_data.jitter_x = camera.jitter_x * output_size.x * (sr_flip_jitter_x ? 0.5f : -0.5f);
+      draw_data.jitter_y = camera.jitter_y * output_size.y * (sr_flip_jitter_y ? -0.5f : 0.5f);
+      draw_data.vert_fov = (camera.projection_y_scale > 0.f ? (2.f * std::atan(1.f / camera.projection_y_scale)) : (60.f * float(M_PI) / 180.f)); // FSR fails without it
       if (camera.near_plane > 0.f && camera.far_plane > camera.near_plane)
       {
          draw_data.near_plane = camera.near_plane;
@@ -1239,9 +1024,18 @@ public:
       compute_state_stack.Restore(native_device_context);
       SR_TIMING_MARK(SRStepStateRestore);
       if (!sr_succeeded)
-      {
-         device_data.force_reset_sr = true;
          return DrawOrDispatchOverrideType::None;
+      // OUT-4: DLSS draws nothing into a new output until its feature is created again after a draw; a settings change forces that at the next
+      // "UpdateSettings" (as in SR4)
+      if (new_output)
+      {
+         game_device_data.sr_outputs[1] = std::exchange(game_device_data.sr_outputs[0], output_color);
+         if (device_data.sr_type == SR::Type::DLSS)
+         {
+            SR::SettingsData throwaway_settings_data = settings_data;
+            throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
+            sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
+         }
       }
       device_data.has_drawn_sr = true;
       return DrawOrDispatchOverrideType::Replaced; // The game's TAA history isn't updated, it's only read again if SR is turned off
@@ -1267,21 +1061,18 @@ public:
       {
          const auto is_pixel_shader = [&](uint32_t hash)
          { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); };
-#if DEVELOPMENT
-         if (dlaa_log_frames_left > 0 && !dlaa_log_gbuffer_done)
-            LogGBufferInputs(native_device, native_device_context, original_shader_hashes);
-#endif
          if (is_pixel_shader(ambient_hash))
          {
             // Once per frame, and only when the game's SSAO is on
             if (g_gtao_enable && game_device_data.ssao_chain_ran_this_frame && !std::exchange(game_device_data.gtao_tried_this_frame, true))
-               game_device_data.gtao_succeeded = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && RunXeGTAO(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers);
-#if DEVELOPMENT
-            if (xegtao_log_frames_left > 0)
-               LogAmbientInputs(native_device, native_device_context);
-#endif
+            {
+               game_device_data.gtao_succeeded = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && RunXeGTAO(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers);
+            }
             game_device_data.smaa_depth_srv = nullptr;
-            native_device_context->PSGetShaderResources(0, 1, &game_device_data.smaa_depth_srv);
+            if (g_smaa_enable)
+            {
+               native_device_context->PSGetShaderResources(0, 1, &game_device_data.smaa_depth_srv);
+            }
          }
          else if (is_pixel_shader(video_hash))
          {
@@ -1289,14 +1080,16 @@ public:
             native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
             D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
             if (rtv)
+            {
                rtv->GetDesc(&rtv_desc);
+            }
             // Core only binds the Luma settings itself when the game leaves both cbuffers to it. The flag tells the shader its target
             // (the swapchain) keeps AutoHDR highlights above 1.
             SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, (rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0));
             updated_cbuffers = true;
          }
-         else if (g_smaa_enable && is_pixel_shader(fxaa_pixel_shader_hash) && DrawSMAAInPlaceOfFXAA(native_device, native_device_context, cmd_list_data, device_data, updated_cbuffers))
+         else if (g_smaa_enable && is_pixel_shader(fxaa_pixel_shader_hash) && DrawSMAAInPlaceOfFXAA(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers))
          {
             return DrawOrDispatchOverrideType::Replaced;
          }
@@ -1305,21 +1098,16 @@ public:
 
       const auto is_compute_shader = [&](uint32_t hash)
       { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::compute); };
-#if DEVELOPMENT
-      if (xegtao_log_frames_left > 0)
-      {
-         if (const auto ssao_hash = std::find_if(std::begin(ssao_chain_hashes), std::end(ssao_chain_hashes), is_compute_shader); ssao_hash != std::end(ssao_chain_hashes))
-            LogSSAOPass(native_device, native_device_context, *ssao_hash);
-      }
-#endif
       // XeGTAO writes the chain's only output at the ambient draw. While it works, the chain is skipped.
       if (is_compute_shader(ssao_prepare_1_hash))
+      {
          game_device_data.ssao_chain_ran_this_frame = true;
+      }
       if (g_gtao_enable && game_device_data.gtao_succeeded && std::any_of(std::begin(ssao_chain_hashes), std::end(ssao_chain_hashes), is_compute_shader))
       {
          // Only while XeGTAO can still run at the ambient: a shader reload would otherwise leave the previous frame's AO
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-         if (HasShaders(device_data.native_compute_shaders, "SRTTR XeGTAO Prefilter Depths CS"_h, "SRTTR XeGTAO Main Pass CS"_h, "SRTTR XeGTAO Denoise Pass 1 CS"_h, "SRTTR XeGTAO Denoise Pass 2 CS"_h))
+         if (HasXeGTAOShaders(device_data))
             return DrawOrDispatchOverrideType::Skip;
       }
       // The tonemap runs in every frame with a scene, whatever the anti-aliasing setting
@@ -1328,14 +1116,8 @@ public:
          device_data.has_drawn_main_post_processing = true;
          return DrawOrDispatchOverrideType::None;
       }
-      const auto taa_hash = std::find_if(std::begin(taa_hashes), std::end(taa_hashes), is_compute_shader);
-      if (taa_hash == std::end(taa_hashes))
+      if (std::none_of(std::begin(taa_hashes), std::end(taa_hashes), is_compute_shader))
          return DrawOrDispatchOverrideType::None;
-
-#if DEVELOPMENT
-      if (dlaa_log_frames_left > 0)
-         LogTAAInputs(native_device, native_device_context, *taa_hash);
-#endif
 
       game_device_data.temporal_aa_this_frame = true; // OnPresent turns it into device_data.taa_detected
 
@@ -1355,7 +1137,9 @@ public:
 #if ENABLE_SR
          // SR takes its jitter from the patched game code, found in the Steam, GOG and Epic builds (scanned here, once the game code is unpacked)
          if (!GetGameAddresses().camera_build)
+         {
             sr_game_tooltip = "Unsupported game executable version: Super Resolution can't engage.\n";
+         }
          InstallHaltonJitterPattern();
 #endif
          InstallCameraHooks();
@@ -1365,15 +1149,12 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.smaa_depth_srv = nullptr;
       // Scratch of a feature turned off or idle goes back, on the render thread between frames, Core's SMAA intermediates included
-      if (game_device_data.smaa_width != 0 && cb_luma_global_settings.FrameIndex - game_device_data.smaa_frame > idle_release_frames)
+      if (game_device_data.smaa_scratch.width != 0 && cb_luma_global_settings.FrameIndex - game_device_data.smaa_scratch.last_frame > idle_release_frames)
       {
-         game_device_data.smaa_predication_uav = nullptr;
-         game_device_data.smaa_predication_srv = nullptr;
-         game_device_data.smaa_width = 0;
-         game_device_data.smaa_height = 0;
+         game_device_data.smaa_scratch = {};
          ReleaseSMAA(device_data);
       }
-      if (game_device_data.gtao_scratch.width != 0 && (!g_gtao_enable || cb_luma_global_settings.FrameIndex - game_device_data.gtao_frame > idle_release_frames))
+      if (game_device_data.gtao_scratch.width != 0 && (!g_gtao_enable || cb_luma_global_settings.FrameIndex - game_device_data.gtao_scratch.last_frame > idle_release_frames))
       {
          game_device_data.gtao_scratch = {};
          game_device_data.gtao_ssao_uav = nullptr;
@@ -1387,20 +1168,26 @@ public:
       // The offset is added to the game's own sampler bias, which is unknown, so the game's TAA keeps it unchanged.
       if (enable_samplers_upgrade && !custom_texture_mip_lod_bias_offset)
       {
-         const float mip_lod_bias_offset = device_data.has_drawn_sr ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f;
+         const float mip_lod_bias_offset = (device_data.has_drawn_sr ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f);
          if (mip_lod_bias_offset != device_data.texture_mip_lod_bias_offset)
          {
             std::unique_lock lock_samplers(s_mutex_samplers); // The offset is a key of the samplers map, read by other threads
             device_data.texture_mip_lod_bias_offset = mip_lod_bias_offset;
          }
       }
+      // Any frame SR didn't draw (off, skipped, failed, no TAA dispatch) restarts its history at the next one
+      device_data.force_reset_sr = !device_data.has_drawn_sr;
       device_data.has_drawn_sr = false;
+      if (game_device_data.sr_motion_vectors && cb_luma_global_settings.FrameIndex - game_device_data.sr_inputs_last_frame > idle_release_frames)
+      {
+         CleanExtraSRResources(device_data);
+      }
       // Only switched on changes, so the development combo stays usable
       const bool sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       if (int32_t* jitter_mode = GetGameAddresses().jitter_mode; jitter_mode && sr_active != halton_jitter_mode_applied)
       {
          halton_jitter_mode_applied = sr_active;
-         *jitter_mode = sr_active ? halton_jitter_mode : vanilla_jitter_mode;
+         *jitter_mode = (sr_active ? halton_jitter_mode : vanilla_jitter_mode);
       }
 #endif
 #if DEVELOPMENT && ENABLE_SR
@@ -1408,7 +1195,7 @@ public:
       if (memory_sweep_step >= 0 && --memory_sweep_frames_left <= 0)
       {
          LogMemoryReport(native_device, device_data, memory_sweep_modes[memory_sweep_step].name);
-         ApplyMemorySweepMode(device_data, memory_sweep_step + 1 < int(std::size(memory_sweep_modes)) ? memory_sweep_step + 1 : -1);
+         ApplyMemorySweepMode(device_data, ((memory_sweep_step + 1 < int(std::size(memory_sweep_modes))) ? (memory_sweep_step + 1) : -1));
       }
 #endif
    }
@@ -1418,11 +1205,15 @@ public:
    static void ApplyMemorySweepMode(DeviceData& device_data, int step)
    {
       if (memory_sweep_step < 0)
+      {
          memory_sweep_user_settings = {.name = "User", .sr_type = device_data.sr_type, .smaa = g_smaa_enable, .gtao = g_gtao_enable};
+      }
       const MemorySweepMode& mode = (step >= 0 ? memory_sweep_modes[step] : memory_sweep_user_settings);
       SR::Type sr_type = mode.sr_type;
       if (const auto it = device_data.sr_implementations_instances.find(sr_type); sr_type != SR::Type::None && (it == device_data.sr_implementations_instances.end() || !it->second || !sr_implementations[sr_type]->HasInit(it->second)))
+      {
          sr_type = SR::Type::None;
+      }
       SetSRType(device_data, sr_type);
       g_smaa_enable = mode.smaa;
       g_gtao_enable = mode.gtao;
@@ -1449,7 +1240,7 @@ public:
       const bool core_smaa = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h] != nullptr;
       constexpr double MiB = 1024.0 * 1024.0;
       reshade::log::message(reshade::log::level::info, std::format("[SRTTR Mem] \"{}\" vram local={:.1f} non-local={:.1f} MiB private={:.1f} MiB sr={} game_taa={} smaa={}x{} core_smaa={} xegtao={}x{} sr_mvs={} sr_depth_copy={} output={}x{}",
-                                                          label, local.CurrentUsage / MiB, non_local.CurrentUsage / MiB, pmc.PrivateUsage / MiB, sr_name, device_data.taa_detected.load(), game_device_data.smaa_width, game_device_data.smaa_height, core_smaa, game_device_data.gtao_scratch.width, game_device_data.gtao_scratch.height, bool(game_device_data.sr_motion_vectors), bool(game_device_data.sr_depth), uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y))
+                                                          label, local.CurrentUsage / MiB, non_local.CurrentUsage / MiB, pmc.PrivateUsage / MiB, sr_name, device_data.taa_detected.load(), game_device_data.smaa_scratch.width, game_device_data.smaa_scratch.height, core_smaa, game_device_data.gtao_scratch.width, game_device_data.gtao_scratch.height, bool(game_device_data.sr_motion_vectors), bool(game_device_data.sr_depth), uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y))
                                                           .c_str());
    }
 #endif
@@ -1462,6 +1253,10 @@ public:
       game_device_data.sr_motion_vectors_uav = nullptr;
       game_device_data.sr_depth = nullptr;
       game_device_data.sr_depth_uav = nullptr;
+      for (auto& output : game_device_data.sr_outputs)
+      {
+         output = nullptr;
+      }
    }
 #endif
 
@@ -1491,21 +1286,60 @@ public:
       const auto slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
          if (ImGui::SliderFloat(label, value, 0.f, max_value))
+         {
             device_data.cb_luma_global_settings_dirty = true;
+         }
          if (ImGui::IsItemDeactivatedAfterEdit())
+         {
             reshade::set_config_value(nullptr, NAME, key, *value);
+         }
          if (ImGui::IsItemHovered())
+         {
             ImGui::SetTooltip("%s", tooltip);
+         }
          if (DrawResetButton(*value, default_value, key))
+         {
             device_data.cb_luma_global_settings_dirty = true;
+         }
+      };
+
+      // A float setting shown as a checkbox; returns whether it's on
+      const auto toggle = [&](const char* label, const char* key, float* value, float default_value, const char* tooltip)
+      {
+         bool enabled = *value > 0.5f;
+         if (ImGui::Checkbox(label, &enabled))
+         {
+            *value = (enabled ? 1.f : 0.f);
+            device_data.cb_luma_global_settings_dirty = true;
+            reshade::set_config_value(nullptr, NAME, key, *value);
+         }
+         if (ImGui::IsItemHovered())
+         {
+            ImGui::SetTooltip("%s", tooltip);
+         }
+         if (DrawResetButton(*value, default_value, key))
+         {
+            device_data.cb_luma_global_settings_dirty = true;
+         }
+         return *value > 0.5f;
+      };
+
+      // A bool setting's checkbox, saved on change
+      const auto bool_toggle = [&](const char* label, const char* key, bool* value, bool default_value, const char* tooltip)
+      {
+         if (ImGui::Checkbox(label, value))
+         {
+            reshade::set_config_value(nullptr, NAME, key, *value);
+         }
+         if (ImGui::IsItemHovered())
+         {
+            ImGui::SetTooltip("%s", tooltip);
+         }
+         DrawResetButton(*value, default_value, key);
       };
 
       ImGui::SeparatorText("Anti-Aliasing");
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
-         reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");
-      DrawResetButton(g_smaa_enable, true, "SMAAEnable");
+      bool_toggle("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");
       // Not the canon "on top of SMAA": it sharpens the scene after any anti-aliasing (SMAA, TAA, DLAA, FSR 3), and the game's own sharpen is disabled
       slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, defaults.RCASSharpness, 1.f, "Sharpening applied on top of anti-aliasing (0 = off). Replaces the game's Sharpen setting.");
 
@@ -1517,51 +1351,28 @@ public:
       slider("Color Grading Intensity", "ColorGradingIntensity", &settings.ColorGradingIntensity, defaults.ColorGradingIntensity, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
-         reshade::set_config_value(nullptr, NAME, "XeGTAOEnable", g_gtao_enable);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion enabled in the game's display settings).");
-      DrawResetButton(g_gtao_enable, true, "XeGTAOEnable");
+      bool_toggle("XeGTAO Enable", "XeGTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion enabled in the game's display settings).");
 
       ImGui::SeparatorText("Effects");
       slider("Vignette Intensity", "VignetteIntensity", &settings.VignetteIntensity, defaults.VignetteIntensity, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
       slider("Film Grain Intensity", "FilmGrainIntensity", &settings.FilmGrainIntensity, defaults.FilmGrainIntensity, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
-      bool video_auto_hdr = settings.VideoAutoHDREnable > 0.5f;
-      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
-      {
-         settings.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
-         reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", settings.VideoAutoHDREnable);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
-      if (DrawResetButton(settings.VideoAutoHDREnable, defaults.VideoAutoHDREnable, "VideoAutoHDREnable"))
-         device_data.cb_luma_global_settings_dirty = true;
-      ImGui::BeginDisabled(!video_auto_hdr);
+      ImGui::BeginDisabled(!toggle("Video AutoHDR", "VideoAutoHDREnable", &settings.VideoAutoHDREnable, defaults.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only)."));
       slider("Video HDR Boost", "VideoAutoHDRBoost", &settings.VideoAutoHDRBoost, defaults.VideoAutoHDRBoost, 1.f, "Video highlight strength (0 = off).");
       ImGui::EndDisabled();
-      bool dithering = settings.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
-      {
-         settings.Dithering = dithering ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
-         reshade::set_config_value(nullptr, NAME, "Dithering", settings.Dithering);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Reduces gradient banding.");
-      if (DrawResetButton(settings.Dithering, defaults.Dithering, "Dithering"))
-         device_data.cb_luma_global_settings_dirty = true;
+      toggle("Dithering", "Dithering", &settings.Dithering, defaults.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       // Session only, so a restart never comes back without a HUD
       bool hide_gameplay_ui = settings.HideGameplayUI > 0.5f;
       if (ImGui::Checkbox("Hide Gameplay UI", &hide_gameplay_ui))
       {
-         settings.HideGameplayUI = hide_gameplay_ui ? 1.f : 0.f;
+         settings.HideGameplayUI = (hide_gameplay_ui ? 1.f : 0.f);
          device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Disables the in-game UI.");
+      }
 
       ImGui::SeparatorText("Fixes");
 #if ENABLE_SR
@@ -1573,12 +1384,18 @@ public:
       ImGui::BeginDisabled(sr_active);
       bool fix_native_taa_jitter = g_fix_native_taa_jitter || sr_active;
       if (ImGui::Checkbox("Fix Native TAA Jitter", &fix_native_taa_jitter))
+      {
          reshade::set_config_value(nullptr, NAME, "FixNativeTAAJitter", fix_native_taa_jitter);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("The game's TAA jitter only ever uses one of its two sample offsets, every other frame. This makes both alternate, for a sharper, more stable TAA.\nDLAA / FSR 3 always use a fixed jitter of their own.");
+      {
+         ImGui::SetTooltip("The game's TAA only uses half of the detail it was designed to gather over frames. This fixes it, for a sharper, steadier image.\nDLAA / FSR 3 always use their own fix.");
+      }
       DrawResetButton(fix_native_taa_jitter, true, "FixNativeTAAJitter"); // Hidden while forced on
       if (!sr_active)
+      {
          g_fix_native_taa_jitter = fix_native_taa_jitter;
+      }
       ImGui::EndDisabled();
    }
 
@@ -1593,7 +1410,9 @@ public:
                                                          "4x\0"
                                                          "8x Halton (SR)\0");
          if (ImGui::IsItemHovered())
+         {
             ImGui::SetTooltip("Game TAA jitter: D3D MSAA sample patterns, with 8x replaced by Halton. SR requires 8x. Reset when SR changes. Not saved.");
+         }
       }
       else
       {
@@ -1605,60 +1424,71 @@ public:
       ImGui::SameLine();
       ImGui::Checkbox("Flip Jitter Y", &sr_flip_jitter_y);
       if (ImGui::Checkbox("MVs Jittered", &sr_mvs_jittered))
+      {
          device_data.force_reset_sr = true;
-      ImGui::TextDisabled("Camera: jitter %.6f %.6f NDC, fov %.2f deg, near %.3f, far %.1f", last_built_camera.jitter_x, last_built_camera.jitter_y, last_built_camera.projection_y_scale > 0.f ? 2.f * std::atan(1.f / last_built_camera.projection_y_scale) * 180.f / float(M_PI) : 0.f, last_built_camera.near_plane, last_built_camera.far_plane);
+      }
+      ImGui::TextDisabled("Camera: jitter %.6f %.6f NDC, fov %.2f deg, near %.3f, far %.1f", last_built_camera.jitter_x, last_built_camera.jitter_y, (last_built_camera.projection_y_scale > 0.f ? (2.f * std::atan(1.f / last_built_camera.projection_y_scale) * 180.f / float(M_PI)) : 0.f), last_built_camera.near_plane, last_built_camera.far_plane);
 #endif
 
       ImGui::SeparatorText("SMAA");
       ImGui::Checkbox("SMAA Predication", &g_smaa_predication);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Finds edges by geometry (plane deviation of the scene depth) as well as by colour, so texture detail stays sharp while silhouettes are antialiased. Not saved.");
+      }
       ImGui::Combo("SMAA Predication Debug View", &g_smaa_debug_view, "Off\0Edges\0Predication\0");
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Replaces the frame with SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red).\nToggle SMAA Predication to compare: texture detail should lose edges, silhouettes keep them.");
+      }
 
       ImGui::SeparatorText("XeGTAO");
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Midtone darkness of the occlusion (1.4 = vanilla match, 2.2 = Intel default). Not saved.");
+      {
+         ImGui::SetTooltip("Midtone darkness of the occlusion (1.4 = default, calibrated to the vanilla SSAO on depth normals: darker with the G-buffer ones; 2.2 = Intel default). Not saved.");
+      }
       ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Radius in metres at 8 m view depth, scaled with depth (0 = the shader's EFFECT_RADIUS). Not saved.");
+      }
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Written to the game's SSAO texture, so it shows through the ambient light. Not saved.");
+      }
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Diagnostics");
-      if (ImGui::Button("Log DLAA Inputs"))
+      if (ImGui::Button("Log Camera Builds"))
       {
-         dlaa_log_frames_left = 16;
          camera_log_calls_left = 200;
       }
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Writes TAA cbuffers, camera matrices and depth state of the next 16 frames, and the next 200 camera projection builds, to ReShade.log.");
-      if (ImGui::Button("Dump SMAA Inputs"))
-         g_smaa_dump = true;
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Dumps the next SMAA frame's depth, predication and edges to %%TEMP%%\\srttr_smaa_*_<frame>.bin (in-game Anti-Aliasing = FXAA).");
-      if (ImGui::Button("Log XeGTAO Inputs"))
-         xegtao_log_frames_left = 2;
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Writes the cbuffers and bindings of every SSAO pass and of the ambient pass, and the camera, of the next 2 frames to ReShade.log. The first frame also dumps the ambient depth, normals and AO to %%TEMP%%\\srttr_xegtao_*.bin.");
+      {
+         ImGui::SetTooltip("Writes the next 200 camera projection builds (counter, TAA gates, jitter row) and counter increments to ReShade.log.\nThe passes' cbuffers and textures: the Luma MCP (luma_read_cbuffer, luma_read_resource, luma_trace_*).");
+      }
 #if ENABLE_SR
       if (ImGui::Button("Log SR Timings"))
+      {
          sr_timings_log_requested = true;
+      }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Writes the average, min and max time of every DLAA / FSR 3 step since the last log to ReShade.log, on the next SR frame.\nCPU = submission time on the render thread. GPU = execution time of the inputs conversion CS and the SR draw.");
-      const std::string memory_sweep_label = memory_sweep_step >= 0 ? std::format("Memory Sweep ({}/{})", memory_sweep_step + 1, std::size(memory_sweep_modes)) : std::string("Memory Sweep");
+      }
+      const std::string memory_sweep_label = (memory_sweep_step >= 0 ? std::format("Memory Sweep ({}/{})", memory_sweep_step + 1, std::size(memory_sweep_modes)) : std::string("Memory Sweep"));
       if (ImGui::Button(memory_sweep_label.c_str()) && memory_sweep_step < 0)
       {
          LogMemoryReport(device_data.native_device, device_data, "Current settings");
          ApplyMemorySweepMode(device_data, 0);
       }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Runs each mode (none, SMAA, XeGTAO, DLAA, FSR 3, back to none) for %d frames and logs the process's GPU memory and commit\n([SRTTR Mem] in ReShade.log), then restores the settings. SMAA needs in-game Anti-Aliasing = FXAA, DLAA / FSR 3 need TAA:\nrun it once with each. Keep the camera still. Not saved.", memory_sweep_settle_frames);
+      }
 #endif
    }
 #endif
@@ -1681,7 +1511,9 @@ public:
       ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
       static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
       if (ImGui::Button(donation_link.c_str()))
+      {
          ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+      }
       ImGui::PopStyleColor(3);
 
       ImGui::NewLine();
@@ -1694,7 +1526,9 @@ public:
       }
       static const std::string contributing_link = std::string("Contribute on Github ") + std::string(ICON_FK_FILE_CODE);
       if (ImGui::Button(contributing_link.c_str()))
+      {
          ShellExecuteA(nullptr, "open", "https://github.com/Filoppi/Luma-Framework", nullptr, nullptr, SW_SHOWNORMAL);
+      }
 
       ImGui::NewLine();
       ImGui::Text("Build Date: %s %s", __DATE__, __TIME__);
@@ -1735,15 +1569,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       samplers_upgrade_mode = 4;
 
       for (const uint32_t hash : compose_hashes)
+      {
          redirected_shader_hashes["Compose"].insert(std::format("{:08X}", hash));
+      }
       for (const uint32_t hash : compose_gui_hashes)
+      {
          redirected_shader_hashes["ComposeGUI"].insert(std::format("{:08X}", hash));
+      }
 
       game = new SaintsRowTheThirdRemastered();
    }
-   // The camera hook detour lives in this module: remove it before it unloads
+   // The camera hook detour lives in this module: remove it before it unloads. On an unload (not the process exit) the game's jitter goes back
+   // to vanilla too, as a later load starts from the 2x pattern (the Halton code stays, it's only reached in mode 3).
    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
    {
+      if (lpReserved == nullptr && game_patches_applied)
+      {
+         if (int32_t* jitter_mode = GetGameAddresses().jitter_mode)
+         {
+            *jitter_mode = vanilla_jitter_mode;
+         }
+         SetJitterIndexFix(false);
+      }
       MH_DisableHook(MH_ALL_HOOKS);
       MH_Uninitialize();
    }

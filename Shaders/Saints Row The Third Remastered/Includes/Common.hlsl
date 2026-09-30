@@ -11,8 +11,10 @@
 
 // Whether the scene takes the Luma HDR path. TONEMAP_TYPE 0 keeps the vanilla SDR output (dither and clips included) on HDR displays too.
 #define SRTTR_HDR_SCENE (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
-// Whether the vanilla SDR 4x4 Bayer dither runs at all: TONEMAP_TYPE 0 always keeps it, otherwise the Luma output dither replaces it when enabled.
-#define SRTTR_VANILLA_BAYER (!SRTTR_HDR_SCENE && (TONEMAP_TYPE == 0 || LumaSettings.GameSettings.Dithering <= 0.5))
+// Whether the Luma output dither runs (SRTTR_DitherOutput). TONEMAP_TYPE 0 is the vanilla reference: its Bayer dither stays and nothing is added.
+#define SRTTR_LUMA_DITHER (TONEMAP_TYPE >= 1 && LumaSettings.GameSettings.Dithering > 0.5)
+// Whether the vanilla SDR 4x4 Bayer dither runs at all: the Luma output dither replaces it.
+#define SRTTR_VANILLA_BAYER (!SRTTR_HDR_SCENE && !SRTTR_LUMA_DITHER)
 // Whether the tonemap writes that dither into the scene. Not when compose sharpens the scene (RCAS would amplify the
 // pattern): compose applies it after sharpening instead, on the graded colour rather than before the LUT.
 #define SRTTR_BAYER_IN_SCENE (SRTTR_VANILLA_BAYER && LumaSettings.GameSettings.RCASSharpness <= 0.0)
@@ -36,8 +38,7 @@ float SRTTR_SceneToUIScale()
 // PQ in HDR and SDR on HDR (as the other Luma mods). The input is gamma code with 1 = UI paper white (UI_DRAW_TYPE 2).
 void SRTTR_DitherOutput(inout float3 color, float2 uv)
 {
-   // TONEMAP_TYPE 0 is the vanilla reference: its Bayer dither stays and nothing is added
-   if (TONEMAP_TYPE == 0 || LumaSettings.GameSettings.Dithering <= 0.5)
+   if (!SRTTR_LUMA_DITHER)
    {
       return;
    }

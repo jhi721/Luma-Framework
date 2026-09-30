@@ -2,7 +2,7 @@
 // Forked from Luma_SR3_XeGTAO.hlsl (Saints Row: The Third 2011).
 // Source: https://github.com/GameTechDev/XeGTAO
 //
-// SRTTR specifics (ambient PS 0xFD45DCA7 disassembly and the DEV "Log XeGTAO Inputs" dumps):
+// SRTTR specifics (ambient PS 0xFD45DCA7 disassembly and the 2026-09-24 input dumps, NOTES_LOG.md):
 // - Runs right before the ambient draw, on its own inputs: t0 full-res D24 hardware depth (standard Z), t1 full-res
 //   r16g16_unorm Lambert azimuthal view-space normals, and its cb10 AMBIENT_PARAMS (rebound PS -> CS b10).
 // - The final denoise writes the ambient's t2 (the game's full-res r8_unorm SSAO texture) in place of the vanilla
@@ -10,8 +10,9 @@
 //   vanilla chain's unoccluded output measures).
 // - Depth and NDC->view use the ambient's own formulas: viewZ = P._43 / (d - P._33),
 //   view.xy = (ndc - (P._31, P._32)) * viewZ / (P._11, P._22) (P._31/P._32 carry the TAA jitter, so it is removed).
-// - Normals: the G-buffer ones (t1), normal maps included, so fine surface detail (gravel, slats, rivets) is occluded too:
-//   1.6-1.7x the vanilla (depth-only) darkening in detailed scenes against ~1.1x in plain ones.
+// - Normals: the G-buffer ones (t1), normal maps included, so fine surface detail (gravel, slats, rivets) is occluded too. At the
+//   defaults (EFFECT_RADIUS 0.4, FinalValuePowerRT 1.4, calibrated on depth normals to 0.99-1.10x the vanilla darkening) the offline
+//   sim of this shader over 5 scenes puts them at ~1.2-1.35x the vanilla (depth-only) SSAO in plain scenes and ~1.65-1.75x in detailed ones.
 // - NoiseIndexRT is the frame index while a temporal AA (TAA, DLAA, FSR) accumulates, 0 (frozen pattern) otherwise.
 
 #include "Includes/Common.hlsl"
@@ -29,9 +30,8 @@ cbuffer AmbientParams : register(b10)
 #define FinalValuePowerRT LumaData.CustomData3 // primary darkness dial
 #define RadiusOverrideRT  LumaData.CustomData4 // > 0 overrides EFFECT_RADIUS (metres)
 
-// Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant). With FinalValuePowerRT 1.4, calibrated on depth normals (0.99-1.10x
-// the vanilla SSAO's darkening over 5 scenes, offline sim of this shader), the G-buffer normals darken ~1.25x in plain scenes and
-// ~1.75x in normal-mapped detail (kept deliberately). RadiusOverrideRT > 0 wins.
+// Metres at RADIUS_REFERENCE_DEPTH (Intel default 0.5, constant); how it compares to the vanilla SSAO: "Normals" above. RadiusOverrideRT > 0
+// wins.
 #define EFFECT_RADIUS 0.4
 
 // The vanilla SSAO (MiniEngine) has a screen-space radius (10 px at 1920 wide per hierarchy level), so its world radius grows with

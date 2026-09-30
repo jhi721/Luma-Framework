@@ -61,8 +61,8 @@ SamplerState Sampler_Linear_CC : register(s2);
 // ungraded; the HDR working value goes through here too, so it stays consistent with the reference.
 float3 SRTTR_Grade(float3 code)
 {
-   const float grey = dot(float3(0.3, 0.59, 0.11), code);
-   float3 graded = TintColor.w * (code - grey) + grey;
+   const float luma = dot(float3(0.3, 0.59, 0.11), code);
+   float3 graded = TintColor.w * (code - luma) + luma;
 #if SRTTR_TM_HAS_LUT
    graded = ColorGradingLUT.SampleLevel(Sampler_Linear_CC, graded, 0).rgb;
 #endif
@@ -273,7 +273,7 @@ groupshared float3 gContinuation;
       // The GUI layer is blended over this in gamma space by compose; the composition rescales by UI paper white.
       hdr *= SRTTR_SceneToUIScale();
 #endif
-      hdr = (hdr == hdr) ? max(0.0, hdr) : 0.0;
+      hdr = IsNaN_Strict(hdr) ? 0.0 : max(0.0, hdr);
       outputCode = linear_to_gamma(hdr, GCT_NONE);
    }
    else
