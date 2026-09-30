@@ -79,6 +79,17 @@ namespace
    int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges
    // See "PatchedDraws::CountTieBreakCollisions"
    uint32_t g_mv_tiebreak_collisions_last_frame = 0;
+   // Per scene frame (published at the next one's start): the depth tested draws into the scene depth beside the G-buffer that got the
+   // jitter, or didn't for lack of a vertex buffer or of a motion vector patch (no camera in $Globals, patch failed). Each skipped pixel
+   // shader is logged once, with its reason.
+   std::atomic<uint32_t> g_jitter_draws = 0;
+   std::atomic<uint32_t> g_jitter_skipped_no_vb = 0;
+   std::atomic<uint32_t> g_jitter_skipped_unpatched = 0;
+   uint32_t g_jitter_draws_last_frame = 0;
+   uint32_t g_jitter_skipped_no_vb_last_frame = 0;
+   uint32_t g_jitter_skipped_unpatched_last_frame = 0;
+   std::shared_mutex g_jitter_skipped_mutex;
+   std::unordered_set<uint64_t> g_jitter_skipped_logged;
    bool g_smaa_predication = true;
    int g_smaa_debug_view = 0; // 0 off, 1 edges, 2 predication
    // Upscaling A/B: the post process at the output resolution (see "RedirectPostDraw"), else the previous way (see
@@ -697,6 +708,9 @@ class Persona5Strikers final : public Game
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 #if DEVELOPMENT
+      g_jitter_draws_last_frame = g_jitter_draws.exchange(0);
+      g_jitter_skipped_no_vb_last_frame = g_jitter_skipped_no_vb.exchange(0);
+      g_jitter_skipped_unpatched_last_frame = g_jitter_skipped_unpatched.exchange(0);
       // "Performance Test": the scene's GPU time starts here, a timestamp recorded into the game's command list
       {
          const std::lock_guard lock(game_device_data.perf_mutex);
@@ -1343,6 +1357,8 @@ public:
       Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"smaa_predication", &g_smaa_predication}, {"post_output_resolution", &g_post_output_resolution}, {"mv_globals_filter", &g_mv_globals_filter}, { "mv_half_float",
                                &g_mv_half_float }});
       Mcp::RegisterCounter("mv.tiebreak_collisions", &g_mv_tiebreak_collisions_last_frame);
+      Mcp::RegisterCounters({{"jitter.draws", &g_jitter_draws_last_frame}, {"jitter.skipped_no_vb", &g_jitter_skipped_no_vb_last_frame}, { "jitter.skipped_unpatched",
+                                &g_jitter_skipped_unpatched_last_frame }});
       Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 200.f}});
       Mcp::RegisterInts({{"render_scale", &g_render_scale, 5, 10}, {"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"smaa_debug_view", &g_smaa_debug_view, 0, 2},
          { "perf_test",
@@ -2460,12 +2476,36 @@ public:
             {
                ID3D11RenderTargetView* const bound_rtvs[8] = {rtvs[0].get(), rtvs[1].get(), rtvs[2].get(), rtvs[3].get(), rtvs[4].get(), rtvs[5].get(), rtvs[6].get(), rtvs[7].get()};
                if (DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, bound_rtvs, dsv.get(), gbuffer, *original_draw_dispatch_func))
+               {
+#if DEVELOPMENT
+                  g_jitter_draws += !gbuffer;
+#endif
                   return DrawOrDispatchOverrideType::Replaced;
+               }
             }
             // Any other mesh depth tested against the scene: the depth prepass (no targets), or depth test only geometry
             const bool depth_prepass = !rtvs[0] && depth_write;
             if (!gbuffer && depth_desc.DepthEnable && vertex_buffer && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, dsv.get(), depth_prepass, *original_draw_dispatch_func))
+            {
+#if DEVELOPMENT
+               g_jitter_draws++;
+#endif
                return DrawOrDispatchOverrideType::Replaced;
+            }
+#if DEVELOPMENT
+            // Only scene depth draws fill "depth_desc"
+            if (!gbuffer && depth_desc.DepthEnable)
+            {
+               auto& skipped = (vertex_buffer ? g_jitter_skipped_unpatched : g_jitter_skipped_no_vb);
+               skipped++;
+               const uint64_t key = (uint64_t(original_shader_hashes.pixel_shaders.empty() ? 0 : original_shader_hashes.pixel_shaders[0]) << 1) | (vertex_buffer ? 1 : 0);
+               const std::unique_lock lock(g_jitter_skipped_mutex);
+               if (g_jitter_skipped_logged.insert(key).second)
+               {
+                  reshade::log::message(reshade::log::level::info, std::format("[P5S Jitter] not jittered: PS {:#010x} VS {:#010x} ({}, depth {})", original_shader_hashes.pixel_shaders.empty() ? 0u : original_shader_hashes.pixel_shaders[0], original_shader_hashes.vertex_shaders.empty() ? 0u : original_shader_hashes.vertex_shaders[0], vertex_buffer ? "unpatched" : "no vertex buffer", depth_write ? "written" : "tested").c_str());
+               }
+            }
+#endif
          }
       }
 
