@@ -20,7 +20,7 @@ struct LumaGameSettings
    float Saturation;            // 1 = vanilla. HDR path only.
    float ColorGradingIntensity; // 1 = vanilla LUT, 0 = its identity (the plain shoulder).
    float Contrast;              // 1 = vanilla. Multiplicative contrast around 18% mid-gray before the display map. HDR path only.
-   float HighlightDechroma;     // 0 = off. DICE highlight desaturation: sources above a third of peak fade toward white. HDR path only.
+   float HighlightDechroma;     // 0 = off. DICE highlight desaturation: past a third of peak (max channel), toward their luminance's gray. HDR path only.
    float VignetteIntensity;     // 1 = vanilla, 0 = none. Scales the finals' vignette darkening.
    float FilmGrainIntensity;    // 1 = vanilla, 0 = off. Scales both film grain layers of the finals.
 };

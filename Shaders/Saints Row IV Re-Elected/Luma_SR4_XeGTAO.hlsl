@@ -4,7 +4,7 @@
 // Game specifics (Saints Row: The Third DevKit SSAO snapshots and DEV vc0 readout; Saints Row IV ships the same calculate,
 // blur and apply shaders byte-for-byte):
 // - Only rl_ssao_singleframe_calculate (PS 0x624BF56D, SSAO_Level 2/3) is replaced: the first of its 4 draws (one RGBA
-//   channel each) runs the passes below at the half-res target size, CopyResource'd into the game's target
+//   channel each) runs the passes below into a scratch of the half-res target's size, CopyResource'd into the game's target
 //   (r8g8b8a8_unorm, r16g16b16a16_float once Luma upgrades it), and the other 3 are skipped. Its blur (level 3) and
 //   apply (max(1 - avg(rgba), 0.05), multiplied into lighting) stay vanilla, so the output is AO AMOUNT (0 = open) in
 //   all four channels.
@@ -32,10 +32,10 @@ cbuffer GameVC0 : register(b0)
 cbuffer LumaGTAO : register(b9)
 {
    float FinalValuePowerRT;          // primary darkness dial
-   float DepthInputScaleRT;          // full-res depth/normals pixels per AO target pixel (2 = half res)
+   float DepthInputScaleRT;          // full-res depth/normals pixels per working pixel (2 at half res, 1 in full resolution mode)
    float RadiusOverrideRT;           // > 0 overrides EFFECT_RADIUS (metres)
    float DebugViewRT;                // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
-   float2 ViewportPixelSizeRT;       // 1 / AO target resolution
+   float2 ViewportPixelSizeRT;       // 1 / working resolution (the target's, or the depth's in full resolution mode)
    float NoiseIndexRT;               // frame % 64 with DLSS/FSR, 0 otherwise (see the header)
    float DownsampleScaleRT;          // full resolution mode: working pixels per target pixel, averaged by downsample_cs (see the header)
    float2 SubRectScaleRT;            // Render scale: the scene's share of the target (1 = the whole target), see main.cpp "g_render_scale"

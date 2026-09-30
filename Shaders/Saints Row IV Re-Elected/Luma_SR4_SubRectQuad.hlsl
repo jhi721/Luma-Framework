@@ -1,8 +1,10 @@
 // Render scale: the scene's screen space quads drawn into the render sub-rect (see "g_render_scale" in main.cpp), in place of
 // the game's VS: deferred lights (0x0FFC4B94, 0x086E02B3), the full screen quad (0x58DBDDA3: rl_restore_depth, the particle depth
-// downsample, the SSAO calculate and blur) and the SSAO apply (0x9669662B), in output and half output sized targets. Their UVs (0..1 over the full
-// target) are scaled to the sub-rect; positions stay NDC from the vertex buffer. Same signatures as the game's VS, so its input
-// layouts and pixel shaders still fit. Also the scene depth and colour resampled over the full target for post.
+// downsample, the SSAO blur) and the SSAO apply (0x9669662B), in output and half output sized targets. Their UVs (0..1 over the
+// full target) are scaled to the sub-rect; positions stay NDC from the vertex buffer. Same signatures as the game's VS, so its
+// input layouts and pixel shaders still fit. The quads whose pixel shader rebuilds NDC from the UV (the SSAO calculates,
+// rl_rao_calculate) keep the game's VS and get that shader patched instead (main.cpp "sub_rect_quad_ndc_pixel_shaders").
+// Also the scene depth and colour resampled over the full target for post.
 
 cbuffer SubRect : register(b9) // The motion vector jitter buffer ("MotionVectorPatches::jitter_slot")
 {
@@ -46,8 +48,8 @@ void light_vs(float3 position : POSITION0, float2 uv : TEXCOORD0, out float4 o_p
 #endif
 }
 
-// The scene's depth (the G-buffer's, in the sub-rect) over the full target, nearest: post (DoF, the final composite) reads it at UVs over
-// the full target once the upscaler has filled it
+// The scene's depth (the G-buffer's, in the sub-rect) over the full target, nearest: post (the final composite's DoF weight, t5) reads
+// it at UVs over the full target, with or without the upscaler (main.cpp "ResolveScene")
 Texture2D<float> scene_depth : register(t0);
 
 float depth_upscale_ps(float4 position : SV_Position) : SV_Depth

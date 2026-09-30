@@ -47,7 +47,7 @@ float3 SampleColor(float2 uv, float2 offset)
    const float3 inner = SampleColor(uv, float2(-0.5, -0.5)) * 4.0 + SampleColor(uv, float2(1.0, -0.5)) * 2.0 + SampleColor(uv, float2(-0.5, 1.0)) * 2.0 + SampleColor(uv, float2(1.0, 1.0));
    const float3 all = inner + 2.0 * (SampleColor(uv, float2(-2.0, 1.5)) + SampleColor(uv, float2(-2.0, -0.5)) + SampleColor(uv, float2(-1.5, -2.0)) + SampleColor(uv, float2(0.5, -2.0)) + SampleColor(uv, float2(2.0, -1.5)) + SampleColor(uv, float2(2.0, 0.5)) + SampleColor(uv, float2(-0.5, 2.0)) + SampleColor(uv, float2(1.5, 2.0)));
    const float3 weights = float3(0.21, 0.72, 0.07);
-   // Zero (not a skip) past the focus limit, as the original: a negative threshold still spawns black sprites there
+   // Zero (not a skip) in focus (coc <= 1.5), as the original: a negative threshold still spawns black sprites there
    const bool blurred = coc > 1.5;
    const float contrast = blurred ? dot(inner, weights / 9.0) - dot(all, weights) * 0.04 : 0.0;
 

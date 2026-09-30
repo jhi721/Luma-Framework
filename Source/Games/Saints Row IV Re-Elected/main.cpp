@@ -268,7 +268,7 @@ namespace
    constexpr std::pair<uint32_t, uint32_t> sub_rect_quad_vertex_shaders[] = {
       {0x0FFC4B94, CompileTimeStringHash("SR4 Sub Rect Light Unit Z VS")}, // Deferred lights
       {0x086E02B3, CompileTimeStringHash("SR4 Sub Rect Light VS")},
-      {0x58DBDDA3, CompileTimeStringHash("SR4 Sub Rect Quad VS")}, // Full screen: rl_restore_depth, the particle depth downsample, the AO term and blur (also post)
+      {0x58DBDDA3, CompileTimeStringHash("SR4 Sub Rect Quad VS")}, // Full screen: rl_restore_depth, the particle depth downsample, the SSAO blur (also post)
       {0x9669662B, CompileTimeStringHash("SR4 Sub Rect SSAO VS")}, // SSAO apply
    };
    // The scene's pixel shaders that make their screen UV from NDC themselves (the sun shadow term family, reading Depth_map), patched to
@@ -284,27 +284,27 @@ namespace
    // screen space decals and blood pools, ice, water. Patched to scale those reads. From a census of every PS in the packfile.
    constexpr uint32_t sub_rect_gbuffer_pixel_shaders[] = {0x0A0667FF, 0x0C8CA3C7, 0x361EB62F, 0x3F7B8610, 0x5D07F0FA, 0x940CFE19, 0x969065BB, 0x984B90D0, 0xB6D774D4, 0xBF6D0B8A, 0xD4FBFD7A, 0xD8A1A3C4, 0xF6B4D96E};
    constexpr uint32_t gbuffer_texture_slots = (1u << 13) | (1u << 14);
-   // The full screen quads' pixel shaders that also rebuild NDC from the quad UV (the native SSAO calculate, rl_rao_calculate_box /
-   // _ellipsoid): drawn with the game's VS (UV over the viewport), their screen texture reads scaled instead, by slot (the multiframe
-   // SSAO also reads its previous result, t0)
+   // The full screen quads' pixel shaders that also rebuild NDC from the quad UV (the native SSAO calculates, singleframe and multiframe,
+   // and the AO volumes rl_rao_calculate_box / _ellipsoid): drawn with the game's VS (UV over the viewport), their screen texture reads
+   // scaled instead, by slot (the multiframe SSAO also reads its previous result, t0)
    constexpr std::pair<uint32_t, uint32_t> sub_rect_quad_ndc_pixel_shaders[] = {{0x624BF56D, gbuffer_texture_slots}, {0x1D8BB773, gbuffer_texture_slots | 1u}, {0xDA63305D, gbuffer_texture_slots}, {0x30983822, gbuffer_texture_slots}};
    // The post passes Luma doesn't replace that read the distortion map (drawn into the sub-rect with the scene) at the screen UV, with
    // its slot: rl_distortion_02, and the rl_hdr finals outside "tonemap_pixel_shaders" (those and rl_distortion_01 scale it in
    // "SR4_SampleDistortionMap")
    constexpr std::pair<uint32_t, uint32_t> sub_rect_distortion_pixel_shaders[] = {{0x8957630A, 1}, {0x7DCC8A34, 4}, {0x7FC325C0, 4}, {0x8D1F6BBB, 4}, {0xD501C191, 4}, {0xE9664111, 4}, {0xFEE7D6DC, 4}};
-   // The native SSAO passes drawing into its half res targets under the sub-rect: the calculates (multiframe, and singleframe with XeGTAO
-   // off) and the singleframe blurs. Past the share's edge the next pass reads (the apply's bilinear, the blur's taps, the multiframe
-   // history), so the edge is repeated there after each (see "DrawSubRect").
+   // The native SSAO passes drawing into its half res targets under the sub-rect: the calculates (multiframe, and singleframe when
+   // XeGTAO doesn't run) and the singleframe blurs. Past the share's edge the next pass reads (the apply's bilinear, the blur's taps,
+   // the multiframe history), so the edge is repeated there after each (see "DrawSubRect").
    constexpr uint32_t sub_rect_ssao_pixel_shaders[] = {0x1D8BB773, 0x624BF56D, 0x8D425B02, 0x77A123E3};
    constexpr uint32_t sub_rect_ssao_guard_texels = 8;
 
    // XeGTAO over rl_ssao_singleframe_calculate (SSAO_Level 2/3). Its 4 draws (one AO channel each, into a half-res target:
-   // r8g8b8a8_unorm, r16g16b16a16_float once Luma's format upgrade reaches it) become one XeGTAO run at the target's size (see
-   // "RunXeGTAO"), copied into the target (created without UAV bind); the native blur and apply stay. Level 1 (multiframe)
-   // stays native.
+   // r8g8b8a8_unorm, r16g16b16a16_float once Luma's format upgrade reaches it) become one XeGTAO run at the first draw (at the
+   // target's size, the depth's with DLSS/FSR, see "RunXeGTAO"), copied into the target (created without UAV bind); the native
+   // blur and apply stay. Level 1 (multiframe) stays native.
    constexpr uint32_t ssao_singleframe_calculate_pixel_shader = 0x624BF56D;
    constexpr UINT gtao_knobs_cb_slot = 9;     // "register(b9)" in Luma_SR4_XeGTAO.hlsl; b11 is core DrawBloom's
-   constexpr UINT gtao_depth_mip_count = 5;   // XE_GTAO_DEPTH_MIP_LEVELS in Luma_SR4_XeGTAO.hlsl
+   constexpr UINT gtao_depth_mip_count = 5;   // XE_GTAO_DEPTH_MIP_LEVELS in Includes/XeGTAO.hlsl
    float g_gtao_final_value_power = 2.2f;     // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;        // > 0 overrides the shader's EFFECT_RADIUS (metres)
    float g_gtao_thin_occluder_override = 0.f; // > 0 overrides the shader's THIN_OCCLUDER_COMPENSATION
@@ -428,7 +428,7 @@ namespace
    enum class PixelShaderPatch : uint8_t
    {
       MotionVectors,
-      ScreenUV,              // Render scale, see "sub_rect_uv_pixel_shaders"
+      ScreenUV,              // Render scale (and the sun shadow terms' jitter), see the "sub_rect_*_pixel_shaders"
       MotionVectorsScreenUV, // The same on top of the motion vector patch
    };
 } // namespace
@@ -462,7 +462,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    bool msaa_scene = false;
    // "DrawUpscaler" made a new upscaler output texture (see there)
    bool sr_output_recreated = false;
-   // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the draws
+   // "IsSRActive", taken at present (see there)
    bool sr_active = false;
    // None was picked ("CleanExtraSRResources", from the overlay): the motion vector and render scale resources go at the next present
    std::atomic<bool> release_sr_resources = false;
@@ -477,7 +477,7 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    bool bloom_source_downsampled = false;
 
    // XeGTAO scratch.
-   bool gtao_tried_this_frame = false;               // the frame's first calculate draw has run
+   bool gtao_tried_this_frame = false;               // the frame's first calculate draw decided XeGTAO or native
    bool gtao_ran_this_frame = false;                 // ... and XeGTAO wrote all four channels, skip the other three
    com_ptr<ID3D11Texture2D> gtao_depth_mips_texture; // R32F view-space depth pyramid, 5 mips
    com_ptr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[gtao_depth_mip_count];
@@ -843,7 +843,8 @@ class SaintsRowIV final : public Game
       }
    }
 
-   // Motion vectors: the CPU copy of a vc2 / vc3 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
+   // Before a registered buffer's Unmap (the game has written it): the render scale's vc4 rewrite, and the motion vectors' CPU copy
+   // of a vc2 / vc3 buffer, read back from the mapped memory.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
@@ -1216,8 +1217,8 @@ class SaintsRowIV final : public Game
          native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &sub_rect);
       }
       draw();
-      // A native SSAO pass: its share's last column and row repeated into a band past it (the texture's clamp at full scale), for the
-      // next pass's reads past the edge; the share ends at the scaled viewport's last covered pixel
+      // A native SSAO pass (see "sub_rect_ssao_pixel_shaders"): its share's last column and row repeated into a band past it (the
+      // texture's clamp at full scale); the share ends at the scaled viewport's last covered pixel
       if (GetSubRectScale(device_data) < 1.f && std::ranges::contains(sub_rect_ssao_pixel_shaders, pixel_shader_hash))
       {
          com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -1828,9 +1829,9 @@ class SaintsRowIV final : public Game
       graphics_state.Restore(native_device_context);
    }
 
-   // Jitter for the scene's mesh draws without motion vectors (patched vertex shader, game pixel shader): the G-buffer, light volumes,
-   // depth only and forward draws. Every draw depth tested against the scene takes the same jitter, or jittered and unjittered depths
-   // of the same surface fail each other's test. False if it can't (the draw runs untouched).
+   // Jitter for the scene's mesh draws without motion vectors (patched vertex shader): the G-buffer, light volumes, depth only and
+   // forward draws. Every draw depth tested against the scene takes the same jitter, or jittered and unjittered depths of the same
+   // surface fail each other's test. False if it can't (the draw runs untouched).
    static bool DrawWithJitter(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, ID3D11DepthStencilView* dsv)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -2019,7 +2020,7 @@ public:
    // An additive or subtractive draw onto the gamma-encoded HDR output (the vint UI's additive / subtractive render modes, the
    // bokeh sprites). Vanilla's UNORM swapchain clipped its result to [0,1]; here it went past the peak over highlights, or negative.
    // The game's draw, then "SR4 Additive Limit PS" / "SR4 Subtractive Limit PS" with blend op MIN / MAX from a copy of the target
-   // taken before it (see "Luma_SR4_BlendLimit.hlsl"). False (the game's draw runs alone) when something is missing.
+   // taken before it (see "Luma_SR4_BlendLimit.hlsl"). False (the game's draw runs alone) when the target or the copy is unusable.
    bool DrawBlendLimited(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, const std::function<void()>& original_draw_dispatch_func, ID3D11RenderTargetView* target_rtv, ID3D11Resource* target_resource, OutputBlend blend)
    {
       com_ptr<ID3D11Texture2D> target_texture;
@@ -2078,8 +2079,8 @@ public:
       return true;
    }
 
-   // Draws the final composite, then SMAA on the canvas it wrote (the swapchain), before DoF and the UI read it.
-   // Anything missing (shaders still compiling, an unexpected target) leaves the composite alone and skips SMAA.
+   // Draws the final composite, then SMAA and/or RCAS on the canvas it wrote (the swapchain), before DoF and the UI read it.
+   // Anything missing (shaders still compiling, an unexpected target) leaves the composite as the game draws it.
    DrawOrDispatchOverrideType DrawTonemapWithSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, const std::function<void()>& original_draw_dispatch_func, bool smaa)
    {
       com_ptr<ID3D11RenderTargetView> canvas_rtv;
@@ -2391,7 +2392,7 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
       // XeGTAO in place of the SSAO calculate (it follows the render scale's sub-rect itself), decided on the frame's first draw so the
-      // four AO channels never mix XeGTAO and native. Without it, the native draws go on like any other scene draw ("DrawSubRect").
+      // four AO channels never mix XeGTAO and native. Off or failed, the native draws go on like any other scene draw ("DrawSubRect").
       if (g_gtao_enable && pixel_shader_hash == ssao_singleframe_calculate_pixel_shader)
       {
          const bool first_draw = !std::exchange(game_device_data.gtao_tried_this_frame, true);
@@ -2406,7 +2407,7 @@ public:
       {
          if (pixel_shader_hash == downsample_pixel_shader || pixel_shader_hash == god_rays_mask_pixel_shader || (game_device_data.mv_scene_copied && post_process_pixel_shaders.contains(pixel_shader_hash)))
          {
-            // The first downsample reads the finished scene, a copy of the material target
+            // The first downsample reads a copy of the material target; its source is kept (see "mv_scene_color")
             if (pixel_shader_hash == downsample_pixel_shader && std::exchange(game_device_data.mv_scene_color_wanted, false))
             {
                com_ptr<ID3D11ShaderResourceView> scene_srv;
@@ -2443,7 +2444,7 @@ public:
                constants[18] = float(game_device_data.mv_render_size[0]);
                constants[19] = float(game_device_data.mv_render_size[1]);
                const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-               // ponytail: a shader reload between the frame start and here (DEV) leaves the FLT_MAX marker for a frame
+               // ponytail: a shader reload between the frame start and here (DEV) leaves the fill's marker for a frame
                if (HasShaders(device_data.native_compute_shaders, "SR4 Motion Vector Fill CS"_h) && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
                {
                   DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
@@ -2641,9 +2642,9 @@ public:
          return DrawOrDispatchOverrideType::None;
       }
 
-      // Alpha-tested material draws into the MSAA scene get alpha to coverage, with the sharpened alpha above. Only opaque ones
-      // (blending off or One/Zero, as foliage): the same shaders also draw alpha-blended decals and windows, whose alpha is their
-      // opacity. The game's blend state and shader are handed back after the draw.
+      // Alpha-tested material draws into the MSAA scene get alpha to coverage, with the sharpened alpha (see "PatchShaderBytecodeSync").
+      // Only opaque ones (blending off or One/Zero, as foliage): the same shaders also draw alpha-blended decals and windows, whose
+      // alpha is their opacity. The game's blend state and shader are handed back after the draw.
       if (!g_luma_msaa_enable || is_custom_pass || original_draw_dispatch_func == nullptr || (stages & reshade::api::shader_stage::pixel) == 0 || !alpha_test_material_pixel_shaders.contains(pixel_shader_hash))
          return DrawOrDispatchOverrideType::None;
       // Without the sharpened-alpha clone (patch rejected or unloaded), coverage from the raw alpha would thin foliage out.
@@ -3161,8 +3162,7 @@ public:
       if (!g_gtao_enable && game_device_data.gtao_width != 0)
          game_device_data.ReleaseGTAOScratch();
 #if DEVELOPMENT
-      // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, the first 60
-      // after a change of mode or AA settings skipped), opens the next frame's
+      // "Performance Test" (see its tooltip): closes this frame's timestamp set, reads back the finished ones, opens the next frame's
       if (auto* const queries = std::exchange(game_device_data.perf_frame_queries, nullptr))
       {
          native_device_context->End(queries->frame_end.get());

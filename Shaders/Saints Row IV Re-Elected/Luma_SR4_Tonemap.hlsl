@@ -107,7 +107,7 @@ float3 SR4_DisplayMap(float3 hdrLinear, float2 uv)
    const float paperWhite = GamePaperWhiteNits / sRGB_WhiteLevelNits;
    const float peakWhite = PeakWhiteNits / sRGB_WhiteLevelNits;
    // User contrast before the display map, so DICE contains whatever it pushes up. Multiplicative around mid-gray (TW2's
-   // form); the floored log2 keeps black at 0 for Contrast 0 instead of pow(0, 0) = NaN. Gated so 1 stays bit-exact.
+   // form); the floored log2 keeps Contrast 0 finite on black instead of pow(0, 0) = NaN. Gated so 1 stays bit-exact.
    [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
    {
       hdrLinear = exp2(LumaSettings.GameSettings.Contrast * log2(max(hdrLinear / MidGray, 1e-30))) * MidGray;
@@ -235,7 +235,7 @@ float4 SR4_TonemapFinal(float2 texcoord0, float4 texcoord1, bool diffracted, boo
    }
    else
    {
-      // The gamma 2.2 decode exactly inverts the vanilla pow(1/2.2), so the linear reference is the graded shoulder itself.
+      // The gamma 2.2 decode exactly inverts the vanilla pow(1/2.2), so the linear reference is the shoulder's output itself.
       vanilla = curved;
    }
    return SR4_Output(vanilla, SR4_RecoveryGain(u), texcoord1.xy, scene.a);
