@@ -219,21 +219,21 @@ namespace
       int gtao_full_res = -1;      // >= 0: "GTAO Full Resolution" while it runs, else the current one
    };
    constexpr PerfTestMode perf_test_modes[] = {
-      {"Off"},
-      {"Current Settings"},
-      {"DLSS K", true, SR::Type::DLSS, 11},
-      {"DLSS K 100%", true, SR::Type::DLSS, 11, false, 2, 1.f, 0},
-      {"DLSS K 67%", true, SR::Type::DLSS, 11, false, 2, 0.67f, 0},
-      {"DLSS K 50%", true, SR::Type::DLSS, 11, false, 2, 0.5f, 0},
-      {"DLSS K 100% GTAO Half Res", true, SR::Type::DLSS, 11, false, 2, 1.f, 1},
-      {"DLSS K 100% Jitter Only", true, SR::Type::DLSS, 11, false, 1, 1.f, 0},
-      {"DLSS K 100% Without Motion Vector Draws", true, SR::Type::DLSS, 11, false, 0, 1.f, 0},
-      {"DLSS L", true, SR::Type::DLSS, 12},
-      {"DLSS M", true, SR::Type::DLSS, 13},
-      {"DLSS E (CNN)", true, SR::Type::DLSS, 5},
-      {"FSR 3", true, SR::Type::FSR},
-      {"SMAA", true, SR::Type::None, 0, true},
-      {"No AA", true, SR::Type::None, 0, false},
+      {.name = "Off"},
+      {.name = "Current Settings"},
+      {.name = "DLSS K", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 11},
+      {.name = "DLSS K 100%", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 11, .render_scale = 1.f, .gtao_full_res = 0},
+      {.name = "DLSS K 67%", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 11, .render_scale = 0.67f, .gtao_full_res = 0},
+      {.name = "DLSS K 50%", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 11, .render_scale = 0.5f, .gtao_full_res = 0},
+      {.name = "DLSS K 100% GTAO Half Res", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 11, .render_scale = 1.f, .gtao_full_res = 1},
+      {.name = "DLSS K 100% Jitter Only", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 11, .motion_vector_draws = 1, .render_scale = 1.f, .gtao_full_res = 0},
+      {.name = "DLSS K 100% Without Motion Vector Draws", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 11, .motion_vector_draws = 0, .render_scale = 1.f, .gtao_full_res = 0},
+      {.name = "DLSS L", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 12},
+      {.name = "DLSS M", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 13},
+      {.name = "DLSS E (CNN)", .set_aa = true, .sr_type = SR::Type::DLSS, .dlss_preset = 5},
+      {.name = "FSR 3", .set_aa = true, .sr_type = SR::Type::FSR},
+      {.name = "SMAA", .set_aa = true, .smaa = true},
+      {.name = "No AA", .set_aa = true},
    };
    // "Sweep": these modes in turn, a few log windows each, over several rounds (interleaved, so the scene's drift averages out), then
    // a median per mode
@@ -692,7 +692,7 @@ class SaintsRowIV final : public Game
    {
       std::atomic<int64_t>& total_ns;
       const bool enabled = g_perf_test != 0 && g_perf_hook_timers;
-      const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      const std::chrono::steady_clock::time_point start = (enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{});
       ~PerfHookTimer()
       {
          if (enabled)
@@ -726,10 +726,10 @@ class SaintsRowIV final : public Game
       {
          SetSRType(device_data, mode.set_aa ? mode.sr_type : game_device_data.perf_user_sr_type);
          device_data.sr_suppressed = false;
-         dlss_render_preset = mode.set_aa && mode.sr_type == SR::Type::DLSS ? mode.dlss_preset : game_device_data.perf_user_dlss_preset;
-         g_smaa_enable = mode.set_aa ? mode.smaa : game_device_data.perf_user_smaa;
-         g_render_scale = mode.render_scale > 0.f ? mode.render_scale : game_device_data.perf_user_render_scale;
-         g_gtao_full_res = mode.gtao_full_res >= 0 ? mode.gtao_full_res : game_device_data.perf_user_gtao_full_res;
+         dlss_render_preset = ((mode.set_aa && mode.sr_type == SR::Type::DLSS) ? mode.dlss_preset : game_device_data.perf_user_dlss_preset);
+         g_smaa_enable = (mode.set_aa ? mode.smaa : game_device_data.perf_user_smaa);
+         g_render_scale = (mode.render_scale > 0.f ? mode.render_scale : game_device_data.perf_user_render_scale);
+         g_gtao_full_res = (mode.gtao_full_res >= 0 ? mode.gtao_full_res : game_device_data.perf_user_gtao_full_res);
       }
       g_perf_test = mode_index;
    }
@@ -1058,7 +1058,7 @@ class SaintsRowIV final : public Game
       }
       if (!patched.empty())
       {
-         HRESULT hr;
+         HRESULT hr = E_FAIL;
          if constexpr (vertex)
             hr = native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &shader);
          else
@@ -1240,10 +1240,10 @@ class SaintsRowIV final : public Game
                // A copy into a resource bound for output is a hazard the runtime does not resolve: unbound around the copies
                native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
                const UINT band_x = (std::min)(desc.Width - 1 - last_x, sub_rect_ssao_guard_texels), band_y = (std::min)(desc.Height - 1 - last_y, sub_rect_ssao_guard_texels);
-               const D3D11_BOX column = {last_x, 0, 0, last_x + 1, last_y + 1, 1};
+               const D3D11_BOX column = {.left = last_x, .top = 0, .front = 0, .right = last_x + 1, .bottom = last_y + 1, .back = 1};
                for (UINT i = 1; i <= band_x; i++)
                   native_device_context->CopySubresourceRegion(texture.get(), 0, last_x + i, 0, 0, texture.get(), 0, &column);
-               const D3D11_BOX row = {0, last_y, 0, last_x + 1 + band_x, last_y + 1, 1};
+               const D3D11_BOX row = {.left = 0, .top = last_y, .front = 0, .right = last_x + 1 + band_x, .bottom = last_y + 1, .back = 1};
                for (UINT i = 1; i <= band_y; i++)
                   native_device_context->CopySubresourceRegion(texture.get(), 0, 0, last_y + i, 0, texture.get(), 0, &row);
                ID3D11RenderTargetView* targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -1291,10 +1291,10 @@ class SaintsRowIV final : public Game
                game_device_data.mv_blend_state = nullptr;
                game_device_data.mv_blend_opaque = true;
                // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
-               const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
-               const int phases = sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
+               const SR::InstanceData* const sr_instance_data = (IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr);
+               const int phases = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
                const unsigned int phase = cb_luma_global_settings.FrameIndex % phases;
-               game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+               game_device_data.mv_jitter = (((sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
                // The render size: the render scale's sub-rect (see "ScaleSceneViewport"), else the scene's
                const float scale = GetSubRectScale(device_data);
                const float render_width = std::round(float(gbuffer_depth_size.x) * scale), render_height = std::round(float(gbuffer_depth_size.y) * scale);
@@ -1358,7 +1358,7 @@ class SaintsRowIV final : public Game
             // The fill reads the target back through its UAV
             D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {mv_format};
             const bool typed_uav_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
-            desc = {size.x, size.y, 1, 1, mv_format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
+            desc = {.Width = size.x, .Height = size.y, .MipLevels = 1, .ArraySize = 1, .Format = mv_format, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
             if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.mv_texture)) || FAILED(native_device->CreateRenderTargetView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_rtv)))
             {
                game_device_data.mv_texture.reset();
@@ -1450,7 +1450,7 @@ class SaintsRowIV final : public Game
       const bool skinned = game_device_data.mv_last_vertex_shader_skinned;
       const bool resourceless = game_device_data.mv_last_vertex_shader_resourceless;
       const SaintsRowIVGameDeviceData::ConstantsCopy object = GetConstantsCopy(&game_device_data, game_cbs[0].get());
-      const SaintsRowIVGameDeviceData::ConstantsCopy bones = skinned ? GetConstantsCopy(&game_device_data, game_cbs[1].get()) : nullptr;
+      const SaintsRowIVGameDeviceData::ConstantsCopy bones = (skinned ? GetConstantsCopy(&game_device_data, game_cbs[1].get()) : nullptr);
       const auto copy_size = [](const SaintsRowIVGameDeviceData::ConstantsCopy& copy)
       { return copy ? copy->size() : size_t(0); };
       // The previous frame's vc2 / vc3: the same object's from last frame, else this draw's with last frame's camera (no object motion).
@@ -1588,7 +1588,7 @@ class SaintsRowIV final : public Game
       if (output_desc.Width != scene_desc.Width || output_desc.Height != scene_desc.Height)
       {
          device_data.sr_output_color.reset();
-         output_desc = {scene_desc.Width, scene_desc.Height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
+         output_desc = {.Width = scene_desc.Width, .Height = scene_desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
          native_device->CreateTexture2D(&output_desc, nullptr, &device_data.sr_output_color);
          game_device_data.sr_output_recreated = true;
       }
@@ -1607,13 +1607,13 @@ class SaintsRowIV final : public Game
       const auto length3 = [](const std::array<double, 4>& v)
       { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
       const std::array<double, 4> up = row(1), z = row(2), w = row(3);
-      const double a = length3(w) > 0.0 ? length3(z) / length3(w) : 0.0;
+      const double a = (length3(w) > 0.0 ? (length3(z) / length3(w)) : 0.0);
       const double b = z[3] - a * w[3];
-      const double near_plane = a > 0.0 ? -b / a : 0.0;
+      const double near_plane = (a > 0.0 ? (-b / a) : 0.0);
       // far = B / (1 - A), finite for A > 1 (A ~= 1.00001 at near 0.15: ~15 km). ponytail: 100 km for A <= 1 (infinite); Core's FSR
       // sets FFX_FSR3_ENABLE_DEPTH_INFINITE only with inverted depth, a separate infinite far flag in SR::SettingsData would drop it
-      const double far_plane = (a > 1.0 && b / (1.0 - a) > near_plane) ? b / (1.0 - a) : 100000.0;
-      const double vert_fov = length3(up) > 0.0 ? 2.0 * std::atan(1.0 / length3(up)) : 0.0;
+      const double far_plane = ((a > 1.0 && b / (1.0 - a) > near_plane) ? (b / (1.0 - a)) : 100000.0);
+      const double vert_fov = (length3(up) > 0.0 ? (2.0 * std::atan(1.0 / length3(up))) : 0.0);
 
       SR::SettingsData settings_data;
       settings_data.output_width = scene_desc.Width;
@@ -1714,7 +1714,7 @@ class SaintsRowIV final : public Game
       if ((render_width != scene_desc.Width || render_height != scene_desc.Height) && game_device_data.mv_jitter_buffer && HasShaders(device_data.native_vertex_shaders, "Copy VS"_h))
       {
          ID3D11Buffer* const sub_rect = game_device_data.mv_jitter_buffer.get();
-         const D3D11_VIEWPORT viewport = {0.f, 0.f, float(scene_desc.Width), float(scene_desc.Height), 0.f, 1.f};
+         const D3D11_VIEWPORT viewport = {.TopLeftX = 0.f, .TopLeftY = 0.f, .Width = float(scene_desc.Width), .Height = float(scene_desc.Height), .MinDepth = 0.f, .MaxDepth = 1.f};
          // No upscaled scene: the sub-rect stretched (bilinear) over the target from a copy of it, so post never shows it in the corner
          if (!upscaled && HasShaders(device_data.native_pixel_shaders, "SR4 Sub Rect Color Upscale PS"_h))
          {
@@ -1725,7 +1725,7 @@ class SaintsRowIV final : public Game
             {
                game_device_data.sub_rect_color_copy.reset();
                game_device_data.sub_rect_color_copy_srv.reset();
-               copy_desc = {scene_desc.Width, scene_desc.Height, 1, 1, scene_desc.Format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+               copy_desc = {.Width = scene_desc.Width, .Height = scene_desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = scene_desc.Format, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE};
                const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R16G16B16A16_FLOAT);
                if (FAILED(native_device->CreateTexture2D(&copy_desc, nullptr, &game_device_data.sub_rect_color_copy)) || FAILED(native_device->CreateShaderResourceView(game_device_data.sub_rect_color_copy.get(), &srv_desc, &game_device_data.sub_rect_color_copy_srv)))
                   game_device_data.sub_rect_color_copy.reset();
@@ -1763,7 +1763,7 @@ class SaintsRowIV final : public Game
             {
                game_device_data.sub_rect_depth_copy.reset();
                game_device_data.sub_rect_depth_copy_srv.reset();
-               copy_desc = {depth_desc.Width, depth_desc.Height, 1, 1, DXGI_FORMAT_R24G8_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+               copy_desc = {.Width = depth_desc.Width, .Height = depth_desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R24G8_TYPELESS, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE};
                const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
                if (FAILED(native_device->CreateTexture2D(&copy_desc, nullptr, &game_device_data.sub_rect_depth_copy)) || FAILED(native_device->CreateShaderResourceView(game_device_data.sub_rect_depth_copy.get(), &srv_desc, &game_device_data.sub_rect_depth_copy_srv)))
                   game_device_data.sub_rect_depth_copy.reset();
@@ -2058,7 +2058,7 @@ public:
          auto& rt = blend_desc.RenderTarget[0];
          rt.BlendEnable = TRUE;
          rt.SrcBlend = rt.DestBlend = rt.SrcBlendAlpha = rt.DestBlendAlpha = D3D11_BLEND_ONE;
-         rt.BlendOp = rt.BlendOpAlpha = subtractive ? D3D11_BLEND_OP_MAX : D3D11_BLEND_OP_MIN;
+         rt.BlendOp = rt.BlendOpAlpha = (subtractive ? D3D11_BLEND_OP_MAX : D3D11_BLEND_OP_MIN);
          rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
          if (FAILED(native_device->CreateBlendState(&blend_desc, &blend_state)))
             return false;
@@ -2270,13 +2270,13 @@ public:
       // ground: the AO boils.
       const bool temporal = IsSRActive(device_data);
 #if DEVELOPMENT
-      const bool full_res = g_gtao_full_res ? g_gtao_full_res == 2 : temporal;
-      const bool noise_per_frame = g_gtao_noise_per_frame ? g_gtao_noise_per_frame == 2 : temporal;
-      const bool single_denoise = g_gtao_single_denoise ? g_gtao_single_denoise == 2 : temporal;
+      const bool full_res = (g_gtao_full_res ? (g_gtao_full_res == 2) : temporal);
+      const bool noise_per_frame = (g_gtao_noise_per_frame ? (g_gtao_noise_per_frame == 2) : temporal);
+      const bool single_denoise = (g_gtao_single_denoise ? (g_gtao_single_denoise == 2) : temporal);
 #else
       const bool full_res = temporal, noise_per_frame = temporal, single_denoise = temporal;
 #endif
-      const uint32_t work_width = full_res ? depth_size.x : width, work_height = full_res ? depth_size.y : height;
+      const uint32_t work_width = (full_res ? depth_size.x : width), work_height = (full_res ? depth_size.y : height);
 
       if (game_device_data.gtao_width != work_width || game_device_data.gtao_height != work_height || game_device_data.gtao_format != target_rtv_desc.Format)
       {
@@ -2326,9 +2326,9 @@ public:
       // Render scale: the scene fills the target's top-left share (see "g_render_scale"): the shader's ndc follow it, the main
       // pass and the denoise run over it only (the depth prefilter covers the whole target, so samples past the edge read cleared depth)
       const bool sub_rect = GetSubRectScale(device_data) < 1.f;
-      const float sub_rect_scale[2] = {sub_rect ? float(game_device_data.mv_render_size[0]) / device_data.output_resolution.x : 1.f, sub_rect ? float(game_device_data.mv_render_size[1]) / device_data.output_resolution.y : 1.f};
+      const float sub_rect_scale[2] = {(sub_rect ? (float(game_device_data.mv_render_size[0]) / device_data.output_resolution.x) : 1.f), (sub_rect ? (float(game_device_data.mv_render_size[1]) / device_data.output_resolution.y) : 1.f)};
       const UINT ao_width = (std::min)(work_width, UINT(std::ceil(float(work_width) * sub_rect_scale[0]))), ao_height = (std::min)(work_height, UINT(std::ceil(float(work_height) * sub_rect_scale[1])));
-      const float knobs[12] = {g_gtao_final_value_power, full_res ? 1.f : float(input_scale), g_gtao_radius_override, debug_view, 1.f / float(work_width), 1.f / float(work_height), noise_per_frame ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, float(input_scale), sub_rect_scale[0], sub_rect_scale[1], g_gtao_thin_occluder_override, 0.f};
+      const float knobs[12] = {g_gtao_final_value_power, (full_res ? 1.f : float(input_scale)), g_gtao_radius_override, debug_view, 1.f / float(work_width), 1.f / float(work_height), (noise_per_frame ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f), float(input_scale), sub_rect_scale[0], sub_rect_scale[1], g_gtao_thin_occluder_override, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.gtao_knobs_cb), knobs, sizeof(knobs)))
          return false;
 
@@ -2928,7 +2928,7 @@ public:
          bool enabled = *value > 0.5f;
          if (ImGui::Checkbox(label, &enabled))
          {
-            *value = enabled ? 1.f : 0.f;
+            *value = (enabled ? 1.f : 0.f);
             reshade::set_config_value(nullptr, NAME, key, *value);
             device_data.cb_luma_global_settings_dirty = true;
          }
@@ -3155,7 +3155,7 @@ public:
       {
          const std::unique_lock lock(s_mutex_samplers);
          // -1 at native resolution, lower below it (the render scale)
-         device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(std::round(device_data.output_resolution.y * GetSubRectScale(device_data)), device_data.output_resolution.y) : 0.f;
+         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(std::round(device_data.output_resolution.y * GetSubRectScale(device_data)), device_data.output_resolution.y) : 0.f);
       }
       // Turning XeGTAO off gives its scratch back; it is rebuilt on demand.
       if (!g_gtao_enable && game_device_data.gtao_width != 0)
@@ -3200,7 +3200,7 @@ public:
                *max_ms = (std::max)(*max_ms, ms);
                ++*samples;
             };
-            UINT64 frame_start, frame_end, scene_start, scene_end, sr_end;
+            UINT64 frame_start = 0, frame_end = 0, scene_start = 0, scene_end = 0, sr_end = 0;
             if (!read(queries.frame_start, &frame_start) || !read(queries.frame_end, &frame_end))
                continue;
             add(frame_start, frame_end, &stats.frame_ms, &stats.frame_max_ms, &stats.samples);
@@ -3224,9 +3224,9 @@ public:
             {
                const auto average = [](double total, uint32_t samples)
                { return samples != 0 ? total / samples : 0.0; };
-               std::string aa = g_smaa_enable ? "SMAA" : "None";
+               std::string aa = (g_smaa_enable ? "SMAA" : "None");
                if (IsSRActive(device_data))
-                  aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
+                  aa = (device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default"));
                const std::array<double, 4> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.sr_ms, stats.sr_samples), double(game_device_data.perf_hook_ns.exchange(0)) / 1e6 / stats.frames};
                reshade::log::message(reshade::log::level::info, std::format("[SR4 Perf] mode=\"{}\" aa={} hook_timers={} msaa={} gtao={} gtao_full_res={} render_scale={:.2f} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}", perf_test_modes[g_perf_test].name, aa, g_perf_hook_timers, game_device_data.msaa_scene, g_gtao_enable, g_gtao_full_res, GetSubRectScale(device_data), g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), window[0], stats.frame_max_ms, window[1], stats.scene_max_ms, stats.scene_samples, window[2], stats.sr_max_ms, stats.sr_samples, stats.cpu_frame_ms / stats.frames, window[3], stats.samples, stats.frames, stats.disjoint).c_str());
                stats = {};
