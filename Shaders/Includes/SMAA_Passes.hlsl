@@ -3,6 +3,8 @@
 // SMAAGather) and includes this instead of SMAA.hlsl.
 // Optional hook: SMAA_NEIGHBORHOOD_OUTPUT(color, position), a statement run on the blended float4 color before it is returned (e.g.
 // to re-encode a linear colorTex to the canvas' gamma).
+// Optional: SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR 1 lets the neighborhood blend read the gamma-encoded canvas (the edge detection's input)
+// and filter it in linear light, without a linear copy (needs "gamma_to_linear" included first; re-encode with the output hook).
 
 #ifndef SMAA_CUSTOM_SL
 #define SMAA_CUSTOM_SL
@@ -20,6 +22,40 @@ SamplerState PointSampler : register(s1);
 #define SMAA_BRANCH                                   [branch]
 #define SMAATexture2DMS2(tex)                         Texture2DMS<float4, 2> tex
 #define SMAALoad(tex, pos, sample)                    tex.Load(pos, sample)
+#endif
+
+#if SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR
+// The blend averages the pixel with a neighbor through a bilinear fetch, which must happen in linear light: the fetch is done by
+// hand, the footprint's texels decoded before weighting (clamped as the linear sampler). The same as the hardware bilinear of a
+// linear copy, without the copy. An axis within the hardware's 8 bit filter weights of a texel center is on it: the interpolated
+// coordinate's float error would otherwise weight in the neighbor a little, visibly so for an HDR one next to a dark pixel. On a
+// texel center on both (every pixel that doesn't blend) the fetch is that texel.
+float4 SampleGammaInLinear(Texture2D tex, float2 coord)
+{
+   const float2 nearest = round(coord * SMAA_RT_METRICS.zw - 0.5);
+   const float2 texel = abs(coord * SMAA_RT_METRICS.zw - 0.5 - nearest) < 1.0 / 512.0 ? nearest : coord * SMAA_RT_METRICS.zw - 0.5;
+   const int2 last = int2(SMAA_RT_METRICS.zw) - 1;
+   float4 color;
+   [branch] if (all(texel == nearest))
+   {
+      color = tex.Load(int3(clamp(int2(nearest), 0, last), 0));
+      color.rgb = gamma_to_linear(color.rgb, GCT_MIRROR);
+   }
+   else
+   {
+      const float2 base = floor(texel);
+      const float2 f = texel - base;
+      float4 c[4];
+      [unroll] for (uint i = 0; i < 4; i++)
+      {
+         c[i] = tex.Load(int3(clamp(int2(base) + int2(i & 1, i >> 1), 0, last), 0));
+         c[i].rgb = gamma_to_linear(c[i].rgb, GCT_MIRROR);
+      }
+      color = lerp(lerp(c[0], c[1], f.x), lerp(c[2], c[3], f.x), f.y);
+   }
+   return color;
+}
+#define SMAA_NEIGHBORHOOD_SAMPLE(tex, coord) SampleGammaInLinear(tex, coord)
 #endif
 
 #include "SMAA.hlsl"
