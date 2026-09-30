@@ -94,12 +94,15 @@ float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
    const uint scale = uint(DownsampleScaleRT);
    uint2 size;
    tex0.GetDimensions(size.x, size.y);
+   // Render scale: the AO covers the scene's share only (main.cpp "ao_width"); past it, its edge, as the texture's clamp at full scale
+   // (the game's bilinear apply and its blur read past the share's edge)
+   const uint2 last = min(size, uint2(ceil(float2(size) * SubRectScaleRT))) - 1;
    float sum = 0.0;
    for (uint y = 0; y < scale; y++)
    {
       for (uint x = 0; x < scale; x++)
       {
-         const float v = tex0.Load(int3(min(dtid * scale + uint2(x, y), size - 1), 0)).x;
+         const float v = tex0.Load(int3(min(dtid * scale + uint2(x, y), last), 0)).x;
 #if DEVELOPMENT
          if (DebugViewRT > 0.5)
          {

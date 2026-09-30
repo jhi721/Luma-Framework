@@ -1,8 +1,8 @@
 // SMAA implementation for Saints Row IV. Reference: https://github.com/iryoku/smaa
 // ULTRA preset + color edge detection, run right after the rl_hdr final composite on the gamma canvas (the swapchain), before the
 // PostProcess 2 diffusion DoF and the UI. It adds to the game's MSAA rather than replacing an AA pass; DLSS/FSR replace it.
-// The canvas holds gamma-encoded, display-mapped HDR, so values above 1 occur; edge detection runs on it, neighborhood blending in
-// linear light (Luma_SR4_SMAALinearize), then re-encodes.
+// The canvas holds gamma-encoded, display-mapped HDR, so values above 1 occur; edge detection runs on it, neighborhood blending
+// filters it in linear light, then re-encodes.
 // Predication uses plane-deviation edge-ness in [0,1] of the game's R24 scene depth (Luma_SR4_SMAAPredication); main.cpp passes a
 // null texture and scale 1 (plain ULTRA) without it. No SMAAGather: SMAA point-samples the three neighbours.
 
@@ -17,6 +17,8 @@
 #define SMAA_PREDICATION_STRENGTH  0.5
 
 // Edge detection: tex0 = colorTexGamma (gamma canvas snapshot), tex1 = predication edge-ness (may be null)
-// Neighborhood blending: tex0 = colorTex (linear copy), tex1 = blendTex. Re-encode to the canvas' gamma.
+// Neighborhood blending: tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex. Re-encode to the canvas'
+// gamma.
+#define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 #include "../Includes/SMAA_Passes.hlsl"

@@ -18,7 +18,8 @@ namespace MotionVectorPatches
    constexpr uint32_t object_slot = 2;
    constexpr std::pair<uint32_t, uint32_t> previous_slots[] = {{object_slot, 10}, {3, 11}};
    // The jitter buffer. c0.xy: the upscaler's projection jitter in NDC, added to SV_Position after its unjittered copy, so motion
-   // vectors never contain it; c0.zw: the render sub-rect's share of the target (see "PatchScreenUVPixelShader").
+   // vectors never contain it; c0.zw: the render sub-rect's share of the target; c1.xy: the UV of the share's last full res texel
+   // center (see "PatchScreenUVPixelShader").
    constexpr uint32_t jitter_slot = 9;
    // The second run reads t0-t15 at t64-t79, bound to the current resources (no motion vector VS reads one that changes per frame)
    constexpr uint32_t resource_slots = 16;
@@ -39,9 +40,11 @@ namespace MotionVectorPatches
    // Render scale (sub-rect rendering): a pixel shader whose screen texture reads address the full target gets them scaled to
    // the sub-rect by the jitter buffer's share (cb9[0].zw, see "Luma_SR4_SubRectQuad.hlsl"):
    // - one that makes its screen UV from NDC itself, "mad rX.xy, rY.xyxx, l(0.5, -0.5, ..), l(0.5, 0.5, ..)", gets
-   //   "mul rX.xy, rX.xyxx, cb9[0].zwzz" after it;
+   //   "mul rX.xy, rX.xyxx, cb9[0].zwzz" after it, and when rY != rX (the NDC goes on to rebuild the position) the jitter out of rY,
+   //   "mad rY.xy, cb9[0].xyxx, l(-1, ..), rY.xyxx" (applies at every render scale);
    // - every read of the "texture_slots" (a bit per t slot, none: no_texture) at a register coordinate reads at
-   //   "mul rNew.xy, coordinate, cb9[0].zwzz";
+   //   "mul rNew.xy, coordinate, cb9[0].zwzz", "min rNew.xy, rNew.xyxx, cb9[1].xyxx": past the share the texture holds no scene
+   //   (stale or cleared), its edge is read there instead, as the texture's clamp at full scale (SSAO samples near the edge);
    // - the stipple DSF (material pass, "IR_Stipple_Pattern_Offset"): "mad rB.xyzw, cb4[9].xyxy, l(0.9, ..), rA.xzxz" makes the
    //   viewport UV plus 0.9 texel, the next instruction the texel from rB ("IR_Pixel_Steps.zw", the render size under the sub-rect).
    //   rB is then only compared with the samples' UVs over the full texture as distance weights, all zero from sub-rect UVs (black),
@@ -111,6 +114,7 @@ namespace MotionVectorPatches
       { return ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(x, y, z, w) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32); };
       const uint32_t cb9_zw = cb9_swizzle(2, 3, 2, 2);
       constexpr uint32_t mul = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8);
+      constexpr uint32_t min = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MIN) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8);
       uint32_t scaled;
       std::vector<uint32_t> patched = CopyDeclarations(tokens, instructions, first_body, texture_slots == no_texture ? 0 : 1, &scaled, [&](size_t i)
          {
@@ -121,7 +125,7 @@ namespace MotionVectorPatches
                added.assign(tokens.begin() + instruction.begin, tokens.begin() + instruction.begin + instruction.length);
                added[0] &= ~D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN_MASK;
                added[2] = jitter_slot;
-               added[3] = 1;
+               added[3] = 2;
             }
             return added; });
       bool found = false;
@@ -130,7 +134,8 @@ namespace MotionVectorPatches
          const Instruction& instruction = instructions[i];
          if (const size_t coordinate = screen_texture_coordinate(instruction))
          {
-            patched.insert(patched.end(), {mul, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), scaled, tokens[coordinate], tokens[coordinate + 1], cb9_zw, jitter_slot, 0});
+            patched.insert(patched.end(), {mul, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), scaled, tokens[coordinate], tokens[coordinate + 1], cb9_zw, jitter_slot, 0,
+                                             min, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), scaled, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0), scaled, cb9_swizzle(0, 1, 0, 0), jitter_slot, 1});
             const size_t position = patched.size() + (coordinate - instruction.begin);
             patched.insert(patched.end(), tokens.begin() + instruction.begin, tokens.begin() + instruction.begin + instruction.length);
             patched[position] = Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0);
@@ -158,8 +163,15 @@ namespace MotionVectorPatches
          }
          if (!is_ndc_to_uv(instruction))
             continue;
-         const uint32_t uv = tokens[instruction.begin + 2];
+         const uint32_t uv = tokens[instruction.begin + 2], ndc = tokens[instruction.begin + 4];
          patched.insert(patched.end(), {mul, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), uv, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0), uv, cb9_zw, jitter_slot, 0});
+         // The NDC also rebuilds the position when it outlives the UV (the sun shadow terms that reproject the G-buffer depth): the
+         // depth was drawn jittered, so the point it holds sits at the pixel's NDC minus the jitter (cb9[0].xy)
+         if (ndc != uv)
+         {
+            constexpr uint32_t minus_one = std::bit_cast<uint32_t>(-1.f);
+            patched.insert(patched.end(), {mad, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), ndc, cb9_swizzle(0, 1, 0, 0), jitter_slot, 0, immediate, minus_one, minus_one, minus_one, minus_one, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0), ndc});
+         }
          found = true;
       }
       if (!found)
