@@ -113,12 +113,13 @@ float3 Sanitize(float3 c)
 // behind it, as in the repo. Takes and returns LINEAR light, 1.0 = paper white, NO engine fade (the caller re-applies
 // it: contrast pivots on mid-gray, so a fade before it would never reach black). `color` is the pass's own grade with
 // its upper saturate()s as max(0), decoded to display-linear: vanilla-exact below the clip and its own analytic
-// continuation above it, so range, luminance and chroma all come from the game's math.
+// continuation above it, so range, luminance and chromaticity all come from the game's math.
 float3 FinishME1HDR(float3 color)
 {
    // 3. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
-   // escape the peak it just established, and nothing downstream re-contains it. Multiplicative around mid-gray, the
-   // repo's form (RenoDX_Contrast); 0.18 is mid-gray here too, display-referred with 1.0 = paper white (code ~0.46).
+   // escape the peak it just established, and nothing downstream re-contains it. A power around mid-gray, the repo's
+   // form (RenoDX_Contrast in the Call of Duty includes); 0.18 is mid-gray here too, display-referred with 1.0 = paper
+   // white (code ~0.46).
    // [branch] on a cbuffer uniform: at the 1.0 default this must be a BIT-EXACT no-op. The max() cannot go either -
    // PowUE3 floors with abs(), which would MIRROR a small negative rather than crush it.
    [branch] if (LumaSettings.GameSettings.Contrast != 1.0)

@@ -207,7 +207,7 @@ constexpr bool IsCpuOptimized(uint32_t optimization)
 #endif
 #if DEVELOPMENT
 static float g_sr_reactive_scale = 1.f;      // FSR reactive mask: the alpha blended draws' reactivity, scaled (AMD's default 1)
-static float g_sr_reactive_threshold = 0.5f; // Under it 0, over it 0.9 (AMD's 0.2; 0.5 tuned in game: lower shakes static glows); 0: the scaled reactivity itself
+static float g_sr_reactive_threshold = 0.5f; // Under it 0, over it 0.9 (AMD's 0.2; 0.5 tuned in game: lower shakes static glows); 0: the scaled reactivity, capped at 0.9
 static bool g_mv_enable = false;
 static bool g_mv_debug_view = false;
 static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
@@ -338,7 +338,7 @@ constexpr uint32_t smaa_idle_release_frames = 600;
 #if DEVELOPMENT
 static_assert(memory_sweep_settle_frames > int(smaa_idle_release_frames));
 #endif
-// RCAS on the SMAA or upscaler output, opt-in (BL2/TW2): at 0 the pass never runs and its full-res intermediate is not allocated.
+// RCAS on the SMAA or upscaler output, opt-in (BL2/TW2); 0 = off (see "tex_smaa_out").
 static float g_rcas_sharpness = 0.f;
 #if DEVELOPMENT
 // Calibration aid: predication's effect is the ABSENCE of smearing, which the eye misjudges - judge the mask instead.
@@ -632,7 +632,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       tex_pred.reset();
    }
 
-   // RCAS. The intermediate exists ONLY while sharpening is on: at 0 the last SMAA pass writes the canvas directly.
+   // RCAS. The intermediate exists ONLY while sharpening is on: at 0 the pass never runs and the last SMAA pass writes the
+   // canvas directly, saving a write-back.
    ComPtr<ID3D11Buffer> cb_sharpen;
    float sharpen_amount = -1.f;
    ComPtr<ID3D11Texture2D> tex_smaa_out;
@@ -1080,13 +1081,13 @@ class MassEffect final : public Game
 #endif // ENABLE_SMAA
 #endif // DEVELOPMENT
 
-   // ---- DLAA / FSR Native AA with motion vectors and jitter from patched shaders (BL GOTY's path; vc4 row N + 20 = c<N>) ----
-   static constexpr size_t kViewProjectionOffset =
-      MotionVectorPatches::view_projection_row * 16; // c0-c3, row vectors
-   static constexpr size_t kCameraSize = 5 * 16;     // ... and c4, the camera position
-   static constexpr size_t kTranslationOffset =
-      (MotionVectorPatches::view_projection_row + 8) *
-      16; // c8: LocalToWorld's translation row
+   // ---- DLAA / FSR Native AA with motion vectors and jitter from patched shaders (BL GOTY's path; vc4 layout in "MotionVectorPatches") ----
+   // c0-c3, row vectors
+   static constexpr size_t kViewProjectionOffset = MotionVectorPatches::view_projection_row * 16;
+   // ... and c4, the camera position
+   static constexpr size_t kCameraSize = 5 * 16;
+   // c8: LocalToWorld's translation row
+   static constexpr size_t kTranslationOffset = (MotionVectorPatches::view_projection_row + 8) * 16;
    // Skinned vertex shaders (bones from c5) hold LocalToWorld at c230-c233
    static constexpr size_t kSkinnedTranslationOffset =
       (MotionVectorPatches::view_projection_row + 233) * 16;
@@ -1188,8 +1189,7 @@ class MassEffect final : public Game
          gd.mv_mapped_constants[resource.handle] = *data;
 #if DEVELOPMENT
       else
-         gd.mv_stats
-            .other_maps++; // A partial or appending write: the copies would miss it
+         gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
 #endif
    }
 
@@ -1659,7 +1659,7 @@ class MassEffect final : public Game
                gd.mv_camera->data() + kViewProjectionOffset,
                kCameraSize) == 0;
 
-         // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by translation. No instance count.
+         // Draw key: same mesh, same shaders, no instance count
          com_ptr<ID3D11Buffer> vertex_buffer;
          UINT vertex_stride = 0, vertex_offset = 0;
          native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer,
@@ -1682,7 +1682,7 @@ class MassEffect final : public Game
                uint64_t(uint32_t(draw_data.vertex_offset)),
                uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         // LocalToWorld's translation separates objects that share a key, as a tie-break only. Skinned meshes' c8 is a bone row,
+         // LocalToWorld's translation separates objects that share a key (props), as a tie-break only. Skinned meshes' c8 is a bone row,
          // the same for copies of a model (holstered weapons), which matched each other's history
          const size_t translation_offset = constants->size() >= gd.mv_last_vertex_translation_offset + 16 ? gd.mv_last_vertex_translation_offset : kTranslationOffset;
          std::array<float, 3> translation;
@@ -2440,7 +2440,7 @@ public:
          gd.smaa_h = h;
       }
 
-      // RCAS decides the chain's SHAPE: with sharpening off the last SMAA pass writes the canvas, saving a write-back.
+      // RCAS decides the chain's SHAPE (see "tex_smaa_out").
       auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("ME1 Sharpen PS"));
       bool do_sharpen = g_rcas_sharpness > 0.f && copy_vs != nullptr && sharpen_ps != nullptr;
@@ -2636,8 +2636,7 @@ public:
 
 #if DEVELOPMENT
       // Whether anything reads the upscaled scene itself after its end, while the post passes read a copy of it (the upscaler's
-      // output could then go to the copy only)
-      // (off while a "Performance Test" runs: every draw after the scene reads all its views here)
+      // output could then go to the copy only). Off while a "Performance Test" runs: every draw after the scene reads all its views here.
       if (g_perf_test == 0 && gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
       {
          com_ptr<ID3D11ShaderResourceView> srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];

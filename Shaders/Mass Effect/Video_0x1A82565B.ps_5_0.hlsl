@@ -1,4 +1,4 @@
-// Mass Effect (2007) - Bink movie pass (YUV->RGB) straight onto the canvas, never through the scene passes. Restores
+// Mass Effect (2007) - Bink movie pass (Y'CbCr -> R'G'B') straight onto the canvas, never through the scene passes. Restores
 // the vanilla clamp, then a LIGHT PumboAutoHDR.
 
 // clang-format off
@@ -15,9 +15,10 @@
 #define VIDEO_AUTO_HDR_PEAK_NITS 250.0
 #endif
 
-Texture2D<float4> t0 : register(t0); // Y plane
-Texture2D<float4> t1 : register(t1); // U plane
-Texture2D<float4> t2 : register(t2); // V plane
+// Y' and the two chroma planes; which one is Cb or Cr is up to the cb4 matrix.
+Texture2D<float4> t0 : register(t0);
+Texture2D<float4> t1 : register(t1);
+Texture2D<float4> t2 : register(t2);
 
 SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
@@ -47,14 +48,14 @@ void main(
     float4 v12 : TEXCOORD7,
     out float4 o0 : SV_TARGET0)
 {
-   // YUV plane fetch + dgVoodoo mask (verbatim; all three planes share v5.xy).
+   // Plane fetch + dgVoodoo mask (verbatim; all three planes share v5.xy).
    float4 yuv1;
    yuv1.x = ApplyDgvMask(t0.Sample(s0_s, v5.xy), DgvMaskT0, DgvFillT0).x;
    yuv1.y = ApplyDgvMask(t1.Sample(s1_s, v5.xy), DgvMaskT1, DgvFillT1).x;
    yuv1.z = ApplyDgvMask(t2.Sample(s2_s, v5.xy), DgvMaskT2, DgvFillT2).x;
    yuv1.w = BinkConstant.x;
 
-   // YUV -> RGB, matrix from the constants (verbatim dp4 rows).
+   // Y'CbCr -> R'G'B', matrix from the constants (verbatim dp4 rows).
    float3 rgb;
    rgb.r = dot(BinkRowR, yuv1);
    rgb.g = dot(BinkRowG, yuv1);
