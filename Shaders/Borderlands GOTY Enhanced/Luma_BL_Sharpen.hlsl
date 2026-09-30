@@ -1,6 +1,6 @@
-// RCAS on the gamma canvas after SMAA or the upscaler, into the swapchain target (or a temp main.cpp copies into it). It runs on the gamma
-// values as they are (paperWhite 1) with FidelityFX's SDR-tuned RCAS_LIMIT lobe bound, so highlights above 1 may sharpen less
-// uniformly.
+// RCAS on the gamma canvas after SMAA or the upscaler, into the swapchain target (or a temp main.cpp copies into it). It runs on
+// the gamma values as they are (paperWhite 1) with FidelityFX's SDR-tuned RCAS_LIMIT lobe bound, so highlights above 1 may sharpen
+// less uniformly.
 
 #include "../Includes/RCAS.hlsl"
 

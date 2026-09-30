@@ -35,8 +35,8 @@
 //   0x43A10668 = the indirect dispatch arguments from the queue counts.
 //   0x78019A89 = resolve of one queue: blends each queued pixel's colors and writes Color (u0, the swapchain) in place.
 //   0x08891303 = resolve of the other queue, the same: WorkQueue + Luma + InColor(t2) -> Color(u0, swapchain in-place).
-// All four are skipped when SMAA or DLSS / FSR own the resolve (see "fxaa_replaced"): the last one is where SMAA / RCAS run. Before
-// 2026-09-30 the first three kept running, so the first resolve's half of FXAA reached SMAA's input and the upscaled image.
+// All four are skipped when SMAA or DLSS / FSR own the resolve (see "fxaa_replaced"): the last one is where SMAA / RCAS run. Left
+// running, the first resolve's half of FXAA would reach SMAA's input and the upscaled image.
 static constexpr uint32_t kFXAAEdgeHash = 0x81CDE53D;
 static constexpr uint32_t kFXAAArgumentsHash = 0x43A10668;
 static constexpr uint32_t kFXAAFirstResolveHash = 0x78019A89;
@@ -139,7 +139,7 @@ static bool g_smaa_pred_debug = false;   // show the predication mask instead of
 static bool g_smaa_pred_measure = false; // one-shot: read the mask back and log its distribution (UI button)
 #endif
 
-// Ambient Occlusion: XeGTAO replaces the native HBAO+ (default ON = supersede it). Persisted as "XeGTAOEnable".
+// Ambient Occlusion: XeGTAO replaces the native HBAO+, on by default. Persisted as "XeGTAOEnable".
 static bool g_gtao_enable = true;
 // Runtime XeGTAO knobs (LumaGTAO cb b11); their sliders are DEVELOPMENT/TEST only. FinalValuePower = primary darkness dial
 // (calibrate to the vanilla HBAO+ histogram — its PowExponent does not transfer numerically). DepthScale =
@@ -156,12 +156,11 @@ static constexpr int g_gtao_temporal = 0;
 static constexpr int g_gtao_debug_view = 0; // The shader's DebugViewRT is DEV only
 #endif
 
-// Loading-movie memory-leak fix (toggle "Fix Movie Memory Leak" under Fixes).
-// The game's Bink movies create D3D11 YUV decode buffers and never release them -> linear RAM
-// growth -> OOM. The leak is the GAME, not Luma. We drop the game's leaked COM refs on OLD movie
-// generations (orphaned: a movie's buffers are sampled only during its own playback). Tagged by
-// creation call-stack RVAs in BorderlandsGOTY.exe (frozen remaster; non-matching build tags nothing
-// = safe no-op). Movies keep playing. Diagnosed and validated with a resource tracker addon (live bytes by creation stack).
+// Loading-movie memory-leak fix ("Fix Movie Memory Leak" under Fixes). The game's Bink movies create D3D11 Y'CbCr decode buffers
+// and never release them -> linear RAM growth -> OOM; the leak is the game's, not Luma's. We drop the game's leaked COM refs on OLD
+// movie generations (orphaned: a movie's buffers are sampled only during its own playback), tagged by creation call-stack RVAs in
+// BorderlandsGOTY.exe (frozen remaster; a non-matching build tags nothing = safe no-op). Movies keep playing. Diagnosed and
+// validated with a resource tracker addon (live bytes by creation stack).
 static bool g_fix_movie_leak = true; // default ON; persisted as "FixMovieLeak"
 
 namespace BLMovieLeakFix
@@ -700,8 +699,7 @@ class BorderlandsGoty final : public Game
       return true;
    }
 
-   // Create a DEFAULT-usage 2D texture (1 mip, 1 sample) of w×h with the given bind flags, fp16 unless another
-   // format is asked for. Resets `out`.
+   // A DEFAULT usage 2D texture (1 mip, 1 sample), fp16 unless "format" says otherwise. Resets "out".
    static bool CreateDefaultTex(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, ComPtr<ID3D11Texture2D>* out, DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT)
    {
       out->reset();
@@ -718,12 +716,10 @@ class BorderlandsGoty final : public Game
    }
 
 #if DEVELOPMENT
-   // One-shot readback of the predication mask, so g_smaa_pred_tolerance is calibrated from numbers rather than
-   // from screenshots. A mean would be useless here: on a well-tuned frame the mask is 0 nearly everywhere and any
-   // average drowns in that, so this reports COVERAGE at the level SMAA actually compares against (0.5) plus the
-   // shape either side of it. Every texel is read, not a stride - a 1px silhouette is precisely the signal a
-   // subsample would step over. Copies on the frame the button is pressed and maps on a later one (non-blocking),
-   // so the press never stalls the render thread.
+   // One-shot readback of the predication mask, to calibrate g_smaa_pred_tolerance from numbers rather than screenshots. It reports
+   // COVERAGE at the level SMAA compares against (0.5) and the shape either side, not a mean: on a well-tuned frame the mask is 0
+   // nearly everywhere. Every texel is read, as a 1px silhouette is exactly what a stride would step over. Copies on the press frame
+   // and maps on a later one without waiting, so the press never stalls the render thread.
    static void LogPredicationStats(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, BorderlandsGotyGameDeviceData& gd)
    {
       auto& capture = gd.pred_measure;
@@ -1008,8 +1004,8 @@ class BorderlandsGoty final : public Game
    }
    bool OverrideCopyTextureRegion(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const D3D11_BOX* dst_box, uint64_t& src_resource, uint32_t src_subresource, const D3D11_BOX* src_box) override
    {
-      // UE3 copies the scene and its depth with CopySubresourceRegion too (10 a gameplay frame, DEV count 2026-09-30). Only a whole
-      // texture copy is one of them (the upscaler reads it, and the post passes read it in full), as MELE.
+      // UE3 copies the scene and its depth with CopySubresourceRegion too (10 a gameplay frame, see "refused_region_copies"). Only a
+      // whole texture copy is one of them (the upscaler reads it, and the post passes read it in full), as MELE.
       auto& game_device_data = GetGameDeviceData(device_data);
       const bool scene_or_depth = src_resource == uint64_t(game_device_data.mv_scene_color.get()) || src_resource == uint64_t(game_device_data.mv_depth.get());
       bool whole = dst_subresource == 0 && src_subresource == 0 && (!dst_box || (dst_box->left == 0 && dst_box->top == 0 && dst_box->front == 0));
@@ -1825,7 +1821,7 @@ public:
       // "UI Paper White" slider on UI_DRAW_TYPE >= 1 && !use_os_reference_white_level. Default 203 nits (BT.2408).
       use_os_reference_white_level = false;
 
-      // User grade controls (read in Luma_BL_Tonemap.hlsl via LumaSettings.GameSettings). All vanilla by default.
+      // User controls (LumaSettings.GameSettings, see GameCBuffers.hlsl); the grade is vanilla by default.
       default_luma_global_game_settings.Exposure = 1.f; // multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;
       default_luma_global_game_settings.HighlightDechroma = 0.f; // Off: only the DICE and gamut mapping desaturation applies
@@ -1833,7 +1829,7 @@ public:
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;          // subtle anti-banding on by default
       default_luma_global_game_settings.FlareOut = 1.f;           // additive lens-flare/glare scale (1 = vanilla)
-      default_luma_global_game_settings.VideoAutoHDREnable = 1.f; // light AutoHDR on Bink movies, HDR only (on by default)
+      default_luma_global_game_settings.VideoAutoHDREnable = 1.f; // light AutoHDR on Bink movies, HDR only
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f; // highlight-expansion strength (peak ~165 nits at 0.5)
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
@@ -2011,9 +2007,8 @@ public:
          }
       }
 
-      // Hide HUD: cancel the game's UI draws (for clean screenshots). A UI draw = one targeting a swapchain back
-      // buffer — the same detection the core UI handling uses (RTV resource in device_data.back_buffers; see
-      // core.hpp). Compute/offscreen draws have no swapchain RTV so they're untouched.
+      // Hide HUD: cancel the game's UI draws, those into a swapchain back buffer ("device_data.back_buffers", as Core's UI detection).
+      // Compute and offscreen draws have no swapchain RTV, so they're untouched.
       if (g_hide_ui && !is_custom_pass)
       {
          ComPtr<ID3D11RenderTargetView> rtv;
@@ -2296,7 +2291,7 @@ public:
          }
          const float pred_scale = pred_ok ? 2.f : 1.f;
 
-         // Shader-readiness gate (async loader / dev live-reload). If anything is missing, fall through to native FXAA.
+         // Shader-readiness gate (async loader / dev live-reload): anything missing takes "fallback".
          if (smaa && (!AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) ||
                         !AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")})))
             return fallback;
@@ -2330,8 +2325,8 @@ public:
          if (smaa)
          {
             gd.smaa_frame = cb_luma_global_settings.FrameIndex;
-            // The predication extract: hardware d24 -> plane-deviation edge-ness in R16F. Core's Compute state stack restores the game's
-            // CS state and unbinds our UAV before DrawSMAA reads it as an SRV (an SRV of a resource still bound as a UAV reads as null).
+            // The predication extract ("BL Depth Extract CS"). Core's Compute state stack restores the game's CS state and unbinds our
+            // UAV before DrawSMAA reads it as an SRV (an SRV of a resource still bound as a UAV reads as null).
             if (pred_ok)
             {
                DrawStateStack<DrawStateStackType::Compute> compute_state;
@@ -2863,7 +2858,7 @@ public:
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f);                 // midtone-shadow contrast dial
       ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 1.f, 200.f);                             // UE3 units -> ~meters; the anti-over-occlusion dial
       ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f);                       // 0 = use EFFECT_RADIUS
-#if DEVELOPMENT                                                                                            // shader DebugViewRT blocks are #if DEVELOPMENT — don't draw a dead combo in TEST
+#if DEVELOPMENT                                                                                            // Both knobs are constexpr outside it (the shader's DebugViewRT is DEVELOPMENT only)
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0"); // diagnostics through the AO apply
       ImGui::Combo("GTAO Temporal Noise", &g_gtao_temporal, "Auto (DLSS/FSR)\0Off (frozen, 2 denoise passes)\0On (frame % 64, 1 denoise pass)\0");
 #endif
@@ -3053,7 +3048,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       // Safety minimum: the remaster already renders its post chain in fp16. r10g10b10a2 covers any 10-bit target at
       // swapchain size (the backbuffer itself is r8g8b8a8); r11g11b10_float includes the HBAO+ view normals XeGTAO
-      // reads. r8/b8 formats are left alone deliberately - nothing downstream needs them, and _srgb -> fp16 risks a
+      // reads. r8g8b8a8 / b8g8r8a8 are left alone deliberately - nothing downstream needs them, and _srgb -> fp16 risks a
       // sampling shift.
       texture_upgrade_formats = {
          reshade::api::format::r10g10b10a2_unorm,
@@ -3061,7 +3056,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          reshade::api::format::r11g11b10_float,
       };
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio;
-      force_disable_display_composition = false; // core composition does the scRGB encode + paper white
+      force_disable_display_composition = false;
 
       // AF16x: mode 4 upgrades the game's AF samplers to MaxAnisotropy=16 (clarity on oblique surfaces).
       // LOD bias offset 0 without DLSS/FSR (no TAA: a negative bias would shimmer), set per frame with them (see OnPresent).

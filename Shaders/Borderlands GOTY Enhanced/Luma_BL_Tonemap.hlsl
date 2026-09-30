@@ -19,9 +19,8 @@
 // the HUD lands at its own paper white. The Display Composition decodes, applies paper white, encodes scRGB and gamut maps at present.
 
 // clang-format off
-// The order is load-bearing, do not sort: the game-local "Includes/Common.hlsl" must come first, defining LUMA_GAME_CB_STRUCTS (via
-// GameCBuffers.hlsl) before any shared header pulls Settings.hlsl, so LumaSettings.GameSettings is the real grade struct. Sorted
-// below the shared "../Includes/*" block, Settings.hlsl's empty dummy wins -> "invalid subscript 'BloomIntensity'".
+// Do not sort: the game-local "Includes/Common.hlsl" must come first (see there). Sorted below the shared "../Includes/*" block,
+// Settings.hlsl's empty dummy wins -> "invalid subscript 'BloomIntensity'".
 #include "Includes/Common.hlsl"             // LumaGameSettings (the grade sliders)
 #include "../Includes/Color.hlsl"
 #include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
@@ -132,11 +131,10 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // gamut-correct handling of highly saturated highlights, not a display-gamut expansion.
    float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
 
-   // 4. Soft hue reference: ReinhardPiecewise(x, 5, 1.5) per channel in BT.2020, where the RenoDX BL1 port builds
-   // it (common.hlsli, ApplyCustomGrading). Linear below 1.5 and rolling toward 5 above, it compresses a saturated
-   // highlight's strong channel before its weak ones, so the hue leans the way the vanilla clip leaned it — without
-   // the clip's whitening. Reinhard.hlsl's ReinhardPiecewise is the RenoDX formula (identical at the x_min = 0 it
-   // fixes). BL1 policy: this donor, and nothing else, supplies the hue.
+   // 4. Soft hue reference, per channel in BT.2020 where the RenoDX BL1 port builds it (common.hlsli, ApplyCustomGrading). Linear
+   // below 1.5 and rolling toward 5 above, it compresses a saturated highlight's strong channel before its weak ones (see the
+   // header). Reinhard.hlsl's ReinhardPiecewise is the RenoDX formula (identical at the x_min = 0 it fixes). BL1 policy: this donor,
+   // and nothing else, supplies the hue.
    float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
 
    // 5. MacLeod–Boynton hue emulation (the RenoDX BL1 colour stage): the reference's hue direction rebuilt on the

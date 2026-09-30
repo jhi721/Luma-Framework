@@ -28,10 +28,8 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)
 
-// Edge detection: tex0 = colorTexGamma (stored scene snapshot)
-// tex1 = predicationTex (plane-deviation edge mask)
-// Neighborhood blending: tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex. Re-encode to the canvas'
-// gamma.
+// Edge detection: tex0 = colorTexGamma (the stored snapshot), tex1 = predicationTex (plane-deviation edge mask). Neighborhood
+// blending: tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex, re-encoded to the canvas' gamma.
 #define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 #include "../Includes/SMAA_Passes.hlsl"
