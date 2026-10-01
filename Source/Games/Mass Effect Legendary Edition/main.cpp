@@ -64,8 +64,9 @@ static const char* GameName(MEGame game)
 
 // SMAA replaces the shared MiniEngine FXAA resolve on the fp16 gamma post buffer. The prepass and indirect-
 // argument dispatches touch only work queues: skipped with the resolves when SMAA or DLSS / FSR own them.
-// Prepass: t0 the post buffer, work queues u0/u1.
+// Prepass: t0 the post buffer, work queues u0/u1. ME3 LE's reads a precomputed R16F luma at t1 (seen 2026-10-01).
 static constexpr uint32_t kFXAAPrepassHash = 0xDB7428D0;
+static constexpr uint32_t kFXAAPrepassLumaHash = 0xEB56A2F1;
 static constexpr uint32_t kFXAAArgumentsHash = 0xF46EB801; // The resolves' indirect arguments.
 static constexpr uint32_t kFXAAResolveHHash = 0xB53BB634;  // Horizontal resolve: replaced with SMAA.
 static constexpr uint32_t kFXAAResolveVHash = 0xF43DBFFD;  // Vertical in-place refine: skipped after SMAA.
@@ -2188,7 +2189,7 @@ public:
       // After DLSS / FSR (which already antialiased the scene, FXAA would blur it) only RCAS runs, or nothing
       const bool smaa = !device_data.has_drawn_sr;
       // Decided at the prepass, whose t0 is the post buffer: fp16 only, as the resolve's guard below
-      if (original_shader_hashes.Contains(kFXAAPrepassHash, reshade::api::shader_stage::compute))
+      if (original_shader_hashes.Contains(kFXAAPrepassHash, reshade::api::shader_stage::compute) || original_shader_hashes.Contains(kFXAAPrepassLumaHash, reshade::api::shader_stage::compute))
       {
          gd.fxaa_replaced = false;
          if ((g_smaa_enable || !smaa) && !is_custom_pass)
