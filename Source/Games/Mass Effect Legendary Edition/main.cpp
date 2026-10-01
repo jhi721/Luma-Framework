@@ -63,9 +63,12 @@ static const char* GameName(MEGame game)
 }
 
 // SMAA replaces the shared MiniEngine FXAA resolve on the fp16 gamma post buffer. The prepass and indirect-
-// argument dispatches touch only work queues and remain native.
-static constexpr uint32_t kFXAAResolveHHash = 0xB53BB634; // Horizontal resolve: replaced with SMAA.
-static constexpr uint32_t kFXAAResolveVHash = 0xF43DBFFD; // Vertical in-place refine: skipped after SMAA.
+// argument dispatches touch only work queues: skipped with the resolves when SMAA or DLSS / FSR own them.
+// Prepass: t0 the post buffer, work queues u0/u1.
+static constexpr uint32_t kFXAAPrepassHash = 0xDB7428D0;
+static constexpr uint32_t kFXAAArgumentsHash = 0xF46EB801; // The resolves' indirect arguments.
+static constexpr uint32_t kFXAAResolveHHash = 0xB53BB634;  // Horizontal resolve: replaced with SMAA.
+static constexpr uint32_t kFXAAResolveVHash = 0xF43DBFFD;  // Vertical in-place refine: skipped after SMAA.
 
 // Stage-1 tonemap permutations (MB = motion blur). Slots are stored per permutation because MB binds depth at t0
 // and pushes everything up one, and ME3LE additionally binds velocity at t2. They mirror the scene and bloom
@@ -130,6 +133,8 @@ static constexpr uint32_t kBloomBrightPassHash = 0xF8942FF1;
 // User-facing AA settings persisted through ReShade.
 static bool g_smaa_enable = true;
 static float g_rcas_sharpness = 0.f; // RCAS on the SMAA or DLSS / FSR output (0 = off)
+// SMAA's and RCAS's resources go after this many presents without them (menus still run SMAA under an upscaler)
+static constexpr uint32_t smaa_idle_release_frames = 600;
 
 // SMAA predication, uploaded as SmaaPredication.xyz. Not exposed: tuned to this engine's non-reverse hyperbolic
 // R24 depth, whose small far-silhouette deltas need 0.001 rather than SMAA's generic 0.01.
@@ -196,10 +201,17 @@ static bool g_mv_force_jitter = false;   // The projection jitter without an ups
 static bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
 static bool g_mv_skip_fill = false;      // No camera fill (the debug view then shows the patched draws alone)
 static bool g_mv_dump = false;           // One shot: the motion vectors, depth and cameras to "Luma_MV_Dump" (see "DumpMotionVectors")
+// A/B of the constant copies' CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy", "mv_read_sizes")
+static bool g_mv_buffer_filter = true;
+static bool g_mv_constants_pool = true;
+static bool g_mv_read_sizes = true;
 #else
 static constexpr bool g_mv_enable = false;
 static constexpr bool g_mv_force_jitter = false;
 static constexpr bool g_mv_disable_jitter = false;
+static constexpr bool g_mv_buffer_filter = true;
+static constexpr bool g_mv_constants_pool = true;
+static constexpr bool g_mv_read_sizes = true;
 #endif
 
 #if DEVELOPMENT
@@ -249,7 +261,7 @@ struct RGBA16FTarget
    uint32_t w = 0, h = 0;
 };
 
-// Per-device resources and per-frame state. SMAA detects edges on a gamma snapshot and blends a linear decode of it.
+// Per-device resources and per-frame state. SMAA detects edges on a gamma snapshot and blends it filtered in linear light.
 struct MassEffectGameDeviceData final : public GameDeviceData
 {
    // Handles already processed by SMAA this frame; later in-place FXAA resolves must be skipped.
@@ -261,20 +273,21 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // SMAA b1: target metrics followed by predication scale, threshold, and strength.
    com_ptr<ID3D11Buffer> cb_smaa_metrics;
 
-   // Size DrawSMAA built its core-managed intermediates at (rebuild on resolution change).
-   uint32_t smaa_core_w = 0, smaa_core_h = 0;
-
-   // SRV-readable snapshot of the in-place gamma post buffer.
+   // SRV-readable snapshot of the in-place gamma post buffer: SMAA's edge and blend input, else RCAS's.
    RGBA16FTarget smaa_input;
-   // Its linear-light decode, for the neighborhood blend.
-   RGBA16FTarget smaa_input_linear;
-
-   // fp16 SMAA output, copied back directly or through RCAS.
+   // fp16 SMAA output when RCAS follows it or the post buffer has no RTV (else SMAA writes the buffer itself).
    RGBA16FTarget smaa_out;
 
    // RCAS b0 = (width, height, sharpness, 0).
    com_ptr<ID3D11Buffer> cb_sharpen;
+   // RCAS output when the post buffer has no RTV.
    RGBA16FTarget rcas_out;
+   // Luma frame index of the last SMAA, "smaa_out" and snapshot use (see "smaa_idle_release_frames")
+   uint32_t smaa_frame = 0;
+   uint32_t smaa_out_frame = 0;
+   uint32_t snapshot_frame = 0;
+   // SMAA or the upscaler owns this frame's FXAA resolve: every FXAA dispatch is skipped (decided at the prepass)
+   bool fxaa_replaced = false;
 
    // XeGTAO inputs at half-res AO size: R24 depth from deinterleave t0, packed R8G8 view normals from horizon t0.
    ComPtr<ID3D11ShaderResourceView> srv_gtao_depth;
@@ -325,6 +338,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
    // blend state writes it unblended, see "OnCreateBlendState")
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
+   // None was picked ("CleanExtraSRResources", from the overlay): our upscaler resources go at the next present
+   std::atomic<bool> release_sr_resources = false;
    std::shared_mutex mv_mutex;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> mv_vertex_shaders;
    std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_pixel_shaders;
@@ -332,6 +347,10 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // for world space geometry, matched by draw key alone), by original hash
    std::unordered_set<uint32_t> mv_bone_vertex_shaders;
    std::unordered_map<uint32_t, uint32_t> mv_translation_offsets;
+   // The bytes of b0 / b1 / b3 each patched vertex shader reads ("DXBC::ConstantBufferBytes": the previous frame's copies upload only
+   // those), by original hash
+   using ReadSizes = std::array<UINT, std::size(MotionVectorPatches::previous_slots)>;
+   std::unordered_map<uint32_t, ReadSizes> mv_read_sizes;
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no fill)
@@ -375,6 +394,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ID3D11VertexShader* mv_last_vertex_shader = nullptr;
    bool mv_last_vertex_shader_skinned = false;
    uint32_t mv_last_vertex_shader_translation = UINT_MAX;
+   ReadSizes mv_last_vertex_shader_read_sizes = {};
    uint32_t mv_last_pixel_shader_hash = 0;
    ID3D11PixelShader* mv_last_pixel_shader = nullptr;
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
@@ -384,8 +404,21 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // update): the engine uploads every one with UpdateSubresource (whole buffer, only when a constant changed), so a draw's constants
    // are its buffer's latest copy
    using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
-   std::mutex mv_constants_mutex;
+   std::shared_mutex mv_constants_mutex;
    std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
+   // The first registered buffers and their sizes again, for the hook to skip the game's other buffers without the lock and the lookup
+   // (see "MayBeRegisteredBuffer"). Written under "mv_constants_mutex"; with more registered, every buffer takes the lock.
+   static constexpr uint32_t max_filtered_buffers = 32;
+   static constexpr uint64_t destroyed_buffer_slot = 1; // A destroyed buffer's slot, reused by the next registration (never a handle)
+   std::array<std::atomic<uint64_t>, max_filtered_buffers> mv_filtered_buffers = {};
+   std::array<UINT, max_filtered_buffers> mv_filtered_buffer_sizes = {};
+   std::atomic<uint32_t> mv_filtered_buffer_count = 0; // Every registered buffer, past "max_filtered_buffers" too
+   // Every copy made, and by size those nobody held anymore at the last present (the next copies take them, see "NewConstantsCopy").
+   // Every copy is in the pool, so one with a use count of 2 is held by "mv_constants_copies" and the pool alone. Under
+   // "mv_constants_mutex".
+   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
+   std::unordered_map<size_t, std::vector<uint32_t>> mv_constants_pool_free;
+   size_t mv_constants_made = 0; // Copies asked for since the last present
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld (its translation in world space) and b0 / b1 /
@@ -422,12 +455,16 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       uint32_t mirrored = 0;            // Draws of mirrored views (planar reflections), left untouched
       uint32_t view_restarts = 0;       // Scene reopened for a later view (see "IsNewView")
       uint32_t tiebreak_collisions = 0; // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
+      uint32_t registered_buffers = 0;  // At present: the b0 / b1 / b3 buffers with CPU copies (see "MayBeRegisteredBuffer")
+      uint32_t constants_pool = 0;      // At present: the pooled copies (see "NewConstantsCopy")
+      uint32_t fxaa_skipped = 0;        // FXAA dispatches skipped before the replaced resolve (see "fxaa_replaced")
       uint32_t ended_by = 0;
       uint32_t rejected[8] = {};                                                                     // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
-   int mv_draw_reject = -1; // The current draw's "MV_REJECT" reason (-1 for none), for the MCP trace note
+   uint32_t mv_destroyed_buffers = 0; // Registered buffers the game destroyed, in the session (see "OnDestroyResource")
+   int mv_draw_reject = -1;           // The current draw's "MV_REJECT" reason (-1 for none), for the MCP trace note
    // The views that opened the scene this frame (and the last frame's): near plane, determinant and PreViewTranslation z of their b1,
    // viewport, scene draws and motion vector draws
    struct ViewInfo
@@ -551,7 +588,6 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameSMAABlendPS = CompileTimeStringHash("SMAA Neighborhood Blending PS");
    static constexpr uint32_t kNameCopyVS = CompileTimeStringHash("Copy VS");
    static constexpr uint32_t kNameSharpenPS = CompileTimeStringHash("MELE Sharpen PS");
-   static constexpr uint32_t kNameSMAALinearizeCS = CompileTimeStringHash("MELE SMAA Linearize CS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
 
    // operator[] default-inserts on a miss, which would mutate a map the render thread otherwise only reads.
@@ -697,16 +733,80 @@ class MassEffectLE final : public Game
       return translation;
    }
 
-   // A b0 / b1 / b3 buffer's CPU copy (null until its first update); registers it for a copy at every update. Under "mv_constants_mutex".
+   // A b0 / b1 / b3 buffer's CPU copy (null until its first update); registers it for a copy at every update, and for the lock free
+   // filter ("MayBeRegisteredBuffer") with its size. Under "mv_constants_mutex".
    static MassEffectGameDeviceData::ConstantsCopy GetConstantsCopy(MassEffectGameDeviceData* game_device_data, ID3D11Buffer* buffer)
    {
-      return buffer ? game_device_data->mv_constants_copies[reinterpret_cast<uint64_t>(buffer)] : nullptr;
+      if (!buffer)
+         return nullptr;
+      const auto [entry, registered] = game_device_data->mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(buffer));
+      if (registered)
+      {
+         // A destroyed buffer's slot, else the next one (the size before the handle, which the hook reads first)
+         const uint32_t count = game_device_data->mv_filtered_buffer_count.load(std::memory_order_relaxed);
+         uint32_t slot = 0;
+         while (slot < (std::min)(count, MassEffectGameDeviceData::max_filtered_buffers) && game_device_data->mv_filtered_buffers[slot].load(std::memory_order_relaxed) != MassEffectGameDeviceData::destroyed_buffer_slot)
+            slot++;
+         if (slot < MassEffectGameDeviceData::max_filtered_buffers)
+         {
+            D3D11_BUFFER_DESC desc;
+            buffer->GetDesc(&desc);
+            game_device_data->mv_filtered_buffer_sizes[slot] = desc.ByteWidth;
+            game_device_data->mv_filtered_buffers[slot].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_release);
+         }
+         // Past the list, the count still grows: every buffer then takes the lock
+         if (slot >= count)
+            game_device_data->mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
+      }
+      return entry->second;
+   }
+
+   // False if the buffer surely isn't a registered b0 / b1 / b3 one; "size" its size if known (else 0). Lock free: the hook sees every
+   // UpdateSubresource of the game (a few thousand a frame, most into other buffers).
+   static bool MayBeRegisteredBuffer(const MassEffectGameDeviceData& game_device_data, uint64_t handle, UINT* size)
+   {
+      *size = 0;
+      const uint32_t count = game_device_data.mv_filtered_buffer_count.load(std::memory_order_acquire);
+      if (!g_mv_buffer_filter || count > MassEffectGameDeviceData::max_filtered_buffers)
+         return true;
+      for (uint32_t i = 0; i < count; i++)
+      {
+         if (game_device_data.mv_filtered_buffers[i].load(std::memory_order_acquire) == handle)
+         {
+            *size = game_device_data.mv_filtered_buffer_sizes[i];
+            return true;
+         }
+      }
+      return false;
+   }
+
+   // A b0 / b1 / b3 copy of "size" bytes from "bytes" (null: zeroed): one of that size nobody held anymore at the last present, else a
+   // new one. Under "mv_constants_mutex".
+   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MassEffectGameDeviceData* game_device_data, const uint8_t* bytes, size_t size)
+   {
+      game_device_data->mv_constants_made++;
+      if (g_mv_constants_pool)
+      {
+         if (const auto free_copies = game_device_data->mv_constants_pool_free.find(size); free_copies != game_device_data->mv_constants_pool_free.end() && !free_copies->second.empty())
+         {
+            auto copy = game_device_data->mv_constants_pool[free_copies->second.back()];
+            free_copies->second.pop_back();
+            if (bytes)
+               std::memcpy(copy->data(), bytes, size);
+            else
+               std::fill(copy->begin(), copy->end(), uint8_t(0));
+            return copy;
+         }
+      }
+      auto copy = (bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size));
+      // Pooled even without "g_mv_constants_pool", which only gates the reuse: the in-place rewrite relies on it (see "mv_constants_pool")
+      game_device_data->mv_constants_pool.push_back(copy);
+      return copy;
    }
 
    // Motion vectors: the CPU copy of a registered b0 / b1 / b3 buffer, from the game's UpdateSubresource (before it runs). UE3 uploads
    // whole buffers (no box: "size" is UINT64_MAX); a partial update is merged into the last copy. Needs the ReShade build with full
    // add-on support (the signed one raises no event for UpdateSubresource).
-   // ponytail: one allocation per update (a few thousand a frame); pool the copies if the hook shows in a profile
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource resource, uint64_t offset, uint64_t size)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
@@ -718,30 +818,74 @@ class MassEffectLE final : public Game
 #if DEVELOPMENT
       const PerfHookTimer timer{game_device_data.perf_hook_ns};
 #endif
+      UINT buffer_size = 0;
+      if (!MayBeRegisteredBuffer(game_device_data, resource.handle, &buffer_size))
+         return false;
       const std::lock_guard lock(game_device_data.mv_constants_mutex);
-      const auto copy = game_device_data.mv_constants_copies.find(resource.handle);
-      if (copy == game_device_data.mv_constants_copies.end())
+      const auto entry = game_device_data.mv_constants_copies.find(resource.handle);
+      if (entry == game_device_data.mv_constants_copies.end())
          return false;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
-      if (offset >= desc.ByteWidth)
-         return false;
-      const size_t updated_size = size_t((std::min)(size, uint64_t(desc.ByteWidth) - offset));
-      const auto* const bytes = static_cast<const uint8_t*>(data);
-      if (updated_size == desc.ByteWidth)
+      if (buffer_size == 0)
       {
-         copy->second = std::make_shared<std::vector<uint8_t>>(bytes, bytes + updated_size);
+         D3D11_BUFFER_DESC desc;
+         reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
+         buffer_size = desc.ByteWidth;
+      }
+      if (offset >= buffer_size)
+         return false;
+      const size_t updated_size = size_t((std::min)(size, uint64_t(buffer_size) - offset));
+      const auto* const bytes = static_cast<const uint8_t*>(data);
+      // The buffer's last copy, rewritten in place when no draw or object holds it (only the map and the pool do, see
+      // "mv_constants_pool"): most of the updates go to buffers no motion vector draw read since. Made non-const ("NewConstantsCopy"), so
+      // writing it is defined.
+      auto& copy = entry->second;
+      if (g_mv_constants_pool && copy && copy.use_count() == 2 && copy->size() == buffer_size)
+      {
+         std::memcpy(const_cast<uint8_t*>(copy->data()) + offset, bytes, updated_size);
+      }
+      else if (updated_size == buffer_size)
+      {
+         copy = NewConstantsCopy(&game_device_data, bytes, updated_size);
       }
       else
       {
-         auto updated = copy->second && copy->second->size() == desc.ByteWidth ? std::make_shared<std::vector<uint8_t>>(*copy->second) : std::make_shared<std::vector<uint8_t>>(desc.ByteWidth);
+         const bool whole = copy && copy->size() == buffer_size;
+         auto updated = NewConstantsCopy(&game_device_data, whole ? copy->data() : nullptr, buffer_size);
          std::memcpy(updated->data() + offset, bytes, updated_size);
-         copy->second = std::move(updated);
+         copy = std::move(updated);
       }
 #if DEVELOPMENT
       game_device_data.mv_stats.updates++;
 #endif
       return false;
+   }
+
+   // Motion vectors: a destroyed b0 / b1 / b3 buffer leaves the registry and the filter (its address can come back as another buffer,
+   // of another size)
+   static void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource)
+   {
+      DeviceData* const device_data = device->get_private_data<DeviceData>();
+      if (!device_data || !device_data->game)
+         return;
+      auto& game_device_data = GetGameDeviceData(*device_data);
+      UINT unused_size = 0;
+      if (!MayBeRegisteredBuffer(game_device_data, resource.handle, &unused_size))
+         return;
+      const std::lock_guard lock(game_device_data.mv_constants_mutex);
+      if (game_device_data.mv_constants_copies.erase(resource.handle) == 0)
+         return;
+      const uint32_t count = (std::min)(game_device_data.mv_filtered_buffer_count.load(std::memory_order_relaxed), MassEffectGameDeviceData::max_filtered_buffers);
+      for (uint32_t i = 0; i < count; i++)
+      {
+         if (game_device_data.mv_filtered_buffers[i].load(std::memory_order_relaxed) == resource.handle)
+         {
+            game_device_data.mv_filtered_buffers[i].store(MassEffectGameDeviceData::destroyed_buffer_slot, std::memory_order_release);
+            break;
+         }
+      }
+#if DEVELOPMENT
+      game_device_data.mv_destroyed_buffers++;
+#endif
    }
 
    // The bound shader's motion vector version, patched from Core's bytecode copy on first use (null if it can't be). Vertex shaders
@@ -785,7 +929,11 @@ class MassEffectLE final : public Game
                   const bool skinned = SUCCEEDED(reflection->GetResourceBindingDescByName("VSBoneConstants", &bind_desc)) && bind_desc.BindPoint == MotionVectorPatches::previous_slots[2].first;
                   // The object's translation, LocalToWorld's 4th row (row vectors)
                   const bool translated = SUCCEEDED(reflection->GetConstantBufferByName("$Globals")->GetVariableByName("LocalToWorld")->GetDesc(&variable_desc)) && (variable_desc.uFlags & D3D_SVF_USED) != 0;
+                  MassEffectGameDeviceData::ReadSizes read_sizes;
+                  for (size_t i = 0; i < read_sizes.size(); i++)
+                     read_sizes[i] = DXBC::ConstantBufferBytes(code, desc->code_size, MotionVectorPatches::previous_slots[i].first);
                   const std::unique_lock lock(game_device_data.mv_mutex);
+                  game_device_data.mv_read_sizes[hash] = read_sizes;
                   if (skinned)
                      game_device_data.mv_bone_vertex_shaders.insert(hash);
                   if (translated)
@@ -823,6 +971,8 @@ class MassEffectLE final : public Game
          game_device_data.mv_last_vertex_shader_skinned = game_device_data.mv_bone_vertex_shaders.contains(hash);
          const auto translation = game_device_data.mv_translation_offsets.find(hash);
          game_device_data.mv_last_vertex_shader_translation = translation != game_device_data.mv_translation_offsets.end() ? translation->second : UINT_MAX;
+         const auto read_sizes = game_device_data.mv_read_sizes.find(hash);
+         game_device_data.mv_last_vertex_shader_read_sizes = read_sizes != game_device_data.mv_read_sizes.end() ? read_sizes->second : MassEffectGameDeviceData::ReadSizes{};
          game_device_data.mv_last_vertex_shader_hash = hash;
       }
       return game_device_data.mv_last_vertex_shader;
@@ -1244,7 +1394,8 @@ class MassEffectLE final : public Game
          game_device_data.mv_stats.uncopied++;
       }
 #endif
-      game_device_data.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, uploads, current, "MELE");
+      const std::span<const UINT> read_sizes = (g_mv_read_sizes ? std::span<const UINT>(game_device_data.mv_last_vertex_shader_read_sizes) : std::span<const UINT>());
+      game_device_data.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, uploads, current, "MELE", read_sizes);
       ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
       // Left bound after the draw (set directly, bypassing Core's state tracking): the game's next draws either bind their own
@@ -1599,7 +1750,7 @@ public:
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
       Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter},
-         {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}});
+         {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}});
       Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, {"perf_hook_timers", &g_perf_hook_timers}});
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
@@ -1616,7 +1767,6 @@ public:
                return std::string();
             }}});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", smaa_input.tex),
-         MCP_GAME_TEXTURE("smaa.input_linear", smaa_input_linear.tex),
          MCP_GAME_TEXTURE("smaa.output", smaa_out.tex),
          MCP_GAME_TEXTURE("rcas.output", rcas_out.tex),
          MCP_GAME_TEXTURE("gtao.depth_mips", tex_gtao_depth_mips),
@@ -1649,10 +1799,8 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
-      // Core registers SMAA through ENABLE_SMAA; its neighborhood blend reads a linear decode of the gamma post buffer.
+      // Core registers SMAA through ENABLE_SMAA; its neighborhood blend filters the gamma post buffer in linear light.
       // RCAS runs afterwards through Copy VS and DrawCustomPixelShader.
-      native_shaders_definitions.emplace(kNameSMAALinearizeCS,
-         ShaderDefinition("Luma_MELE_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(kNameSharpenPS,
          ShaderDefinition{"Luma_MELE_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 
@@ -1671,6 +1819,7 @@ public:
       native_shaders_definitions.emplace(kNameMVFillCS,
          ShaderDefinition("Luma_MELE_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
 
       // Very High slice count for spatial stability (no TAA without DLSS/FSR).
@@ -1704,7 +1853,9 @@ public:
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.matched", &stats.matched}, {"mv.camera_only", &stats.camera_only},
          {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.updates", &stats.updates}, {"mv.sr_draws", &stats.sr_draws}, {"mv.matched_same_camera", &stats.matched_same_camera},
-         {"mv.mirrored", &stats.mirrored}, {"mv.view_restarts", &stats.view_restarts}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by}}, &device_data);
+         {"mv.mirrored", &stats.mirrored}, {"mv.view_restarts", &stats.view_restarts}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by},
+         {"mv.registered_buffers", &stats.registered_buffers}, {"mv.constants_pool", &stats.constants_pool}, {"mv.destroyed_buffers", &GetGameDeviceData(device_data).mv_destroyed_buffers},
+         {"fxaa.skipped", &stats.fxaa_skipped}}, &device_data);
       constexpr const char* reject_names[] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
       for (size_t i = 0; i < std::size(reject_names); i++)
          Mcp::RegisterCounter(std::string("mv.rejected.") + reject_names[i], &stats.rejected[i], &device_data);
@@ -2029,166 +2180,187 @@ public:
       return {};
    }
 
-   // Replaces the in-place FXAA resolve (color at u0) with SMAA, or with RCAS alone after DLSS / FSR. Disabled SMAA leaves FXAA
-   // native only without an upscaler.
+   // Replaces the in-place FXAA resolve (color at u0) with SMAA, or with RCAS alone after DLSS / FSR, the last pass writing the post
+   // buffer itself. Disabled SMAA leaves FXAA native only without an upscaler. When SMAA or the upscaler owns the resolve, FXAA's
+   // earlier passes are skipped too, and the resolves never fall back to the game's (its queue would be stale).
    DrawOrDispatchOverrideType RunSMAAResolve(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass)
    {
-      const bool is_resolve_h = original_shader_hashes.Contains(kFXAAResolveHHash, reshade::api::shader_stage::compute);
-      const bool is_resolve_v = original_shader_hashes.Contains(kFXAAResolveVHash, reshade::api::shader_stage::compute);
-      // The resolve is the final scene-post step and arms HUD suppression for subsequent draws, with or without SMAA.
-      if (is_resolve_h || is_resolve_v)
-         gd.scene_post_done_this_frame = true;
       // After DLSS / FSR (which already antialiased the scene, FXAA would blur it) only RCAS runs, or nothing
       const bool smaa = !device_data.has_drawn_sr;
-      if (!g_smaa_enable && smaa)
-         return DrawOrDispatchOverrideType::None;
-      if (!is_custom_pass && (is_resolve_h || is_resolve_v))
+      // Decided at the prepass, whose t0 is the post buffer: fp16 only, as the resolve's guard below
+      if (original_shader_hashes.Contains(kFXAAPrepassHash, reshade::api::shader_stage::compute))
       {
-         ComPtr<ID3D11UnorderedAccessView> uav_color;
-         native_device_context->CSGetUnorderedAccessViews(0, 1, uav_color.put());
-         if (!uav_color)
-            return DrawOrDispatchOverrideType::None;
-         ComPtr<ID3D11Resource> color_res;
-         uav_color->GetResource(color_res.put());
-         if (!color_res)
-            return DrawOrDispatchOverrideType::None;
-         const uint64_t color_handle = reinterpret_cast<uint64_t>(color_res.get());
-
-         // Skip later resolves for an already processed resource; rerunning in-place FXAA would corrupt SMAA.
-         if (gd.smaa_applied_handles.count(color_handle) != 0)
-            return DrawOrDispatchOverrideType::Replaced;
-         // Only horizontal resolve triggers SMAA; an unexpected vertical-only resolve remains native (skipped after DLSS / FSR).
-         if (!is_resolve_h)
-            return smaa ? DrawOrDispatchOverrideType::None : DrawOrDispatchOverrideType::Replaced;
-         if (!smaa && g_rcas_sharpness <= 0.f)
+         gd.fxaa_replaced = false;
+         if ((g_smaa_enable || !smaa) && !is_custom_pass)
          {
-            gd.smaa_applied_handles.insert(color_handle);
-            return DrawOrDispatchOverrideType::Replaced;
+            com_ptr<ID3D11ShaderResourceView> color;
+            native_device_context->CSGetShaderResources(0, 1, &color);
+            uint4 unused_size;
+            DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+            if (color)
+               GetResourceInfo(color.get(), unused_size, format);
+            gd.fxaa_replaced = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
          }
-
-         uint4 cinfo{};
-         DXGI_FORMAT cfmt = DXGI_FORMAT_UNKNOWN;
-         GetResourceInfo(color_res.get(), cinfo, cfmt);
-         const uint32_t w = cinfo.x, h = cinfo.y;
-         if (w == 0 || h == 0)
+         if (!gd.fxaa_replaced)
             return DrawOrDispatchOverrideType::None;
-         // SMAA temporaries are RGBA16F; CopyResource silently fails across formats, so fall back to FXAA on mismatch.
-         if (cfmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
-            return DrawOrDispatchOverrideType::None;
+#if DEVELOPMENT
+         gd.mv_stats.fxaa_skipped++;
+#endif
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+      if (gd.fxaa_replaced && original_shader_hashes.Contains(kFXAAArgumentsHash, reshade::api::shader_stage::compute))
+      {
+#if DEVELOPMENT
+         gd.mv_stats.fxaa_skipped++;
+#endif
+         return DrawOrDispatchOverrideType::Replaced;
+      }
 
-         // Predication requires current, same-sized depth; otherwise a null texture and scale 1 select plain ULTRA.
-         bool depth_ok = false;
-         if (smaa && gd.srv_depth)
-         {
-            uint4 dinfo{};
-            DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
-            GetResourceInfo(gd.srv_depth.get(), dinfo, dfmt);
-            depth_ok = (dinfo.x == w && dinfo.y == h);
-         }
-         // Threshold and strength are inert without the depth-edge term.
-         const float pred_scale = depth_ok ? kPredScale : 1.f;
+      const bool is_resolve_h = original_shader_hashes.Contains(kFXAAResolveHHash, reshade::api::shader_stage::compute);
+      const bool is_resolve_v = original_shader_hashes.Contains(kFXAAResolveVHash, reshade::api::shader_stage::compute);
+      if ((!is_resolve_h && !is_resolve_v) || is_custom_pass)
+         return DrawOrDispatchOverrideType::None;
+      // The resolve is the final scene-post step and arms HUD suppression for subsequent draws, with or without SMAA.
+      gd.scene_post_done_this_frame = true;
+      // Anything that can't run here: the game's resolve, unless its earlier passes were skipped or an upscaler antialiased the frame
+      const DrawOrDispatchOverrideType fallback = ((gd.fxaa_replaced || !smaa) ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None);
+      if (!g_smaa_enable && smaa)
+         return fallback;
 
-         // Async loading and live reload may temporarily require native FXAA fallback.
-         auto* linearize_cs = FindShader(device_data.native_compute_shaders, kNameSMAALinearizeCS);
-         const bool smaa_ready = linearize_cs != nullptr &&
-                                 AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
-                                 AllShadersReady(device_data.native_vertex_shaders, {kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS});
-         if (smaa && !smaa_ready)
-            return DrawOrDispatchOverrideType::None;
+      ComPtr<ID3D11UnorderedAccessView> uav_color;
+      native_device_context->CSGetUnorderedAccessViews(0, 1, uav_color.put());
+      if (!uav_color)
+         return fallback;
+      ComPtr<ID3D11Resource> color_res;
+      uav_color->GetResource(color_res.put());
+      if (!color_res)
+         return fallback;
+      const uint64_t color_handle = reinterpret_cast<uint64_t>(color_res.get());
 
-         // DrawSMAA rebuilds managed views only on swapchain init; drop them explicitly on resolution changes.
-         if (smaa && (gd.smaa_core_w != w || gd.smaa_core_h != h))
-         {
-            auto& mr = device_data.managed_resources;
-            mr.depth_stencil_views[CompileTimeStringHash("smaa_dsv")].reset();
-            mr.render_target_views[CompileTimeStringHash("smaa_edge_detection")].reset();
-            mr.render_target_views[CompileTimeStringHash("smaa_blending_weight_calculation")].reset();
-            gd.smaa_core_w = w;
-            gd.smaa_core_h = h;
-         }
+      // Skip later resolves for an already processed resource; rerunning in-place FXAA would corrupt SMAA.
+      if (gd.smaa_applied_handles.count(color_handle) != 0)
+         return DrawOrDispatchOverrideType::Replaced;
+      // Only horizontal resolve triggers SMAA; an unexpected vertical-only resolve remains native (skipped after DLSS / FSR, or with
+      // FXAA's earlier passes skipped).
+      if (!is_resolve_h)
+         return fallback;
 
-         const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, kPredThreshold, kPredStrength, 0.f};
-         if (smaa && !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_smaa_metrics), metrics, sizeof(metrics)))
-            return DrawOrDispatchOverrideType::None;
+      uint4 cinfo{};
+      DXGI_FORMAT cfmt = DXGI_FORMAT_UNKNOWN;
+      GetResourceInfo(color_res.get(), cinfo, cfmt);
+      const uint32_t w = cinfo.x, h = cinfo.y;
+      // SMAA temporaries are RGBA16F; CopyResource silently fails across formats, so fall back on mismatch.
+      if (w == 0 || h == 0 || cfmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
+         return fallback;
 
-         // The fp16 SMAA output is both a render target and an SRV for the optional sharpen pass (after DLSS / FSR: RCAS's input copy).
+      auto* const sharpen_vs = FindShader(device_data.native_vertex_shaders, kNameCopyVS);
+      auto* const sharpen_ps = FindShader(device_data.native_pixel_shaders, kNameSharpenPS);
+      const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
+      const bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs && sharpen_ps && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_sharpen), sp, sizeof(sp));
+      // After DLSS / FSR without RCAS: the upscaled image stays as it is
+      if (!smaa && !do_sharpen)
+      {
+         gd.smaa_applied_handles.insert(color_handle);
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+
+      // Predication requires current, same-sized depth; otherwise a null texture and scale 1 select plain ULTRA.
+      bool depth_ok = false;
+      if (smaa && gd.srv_depth)
+      {
+         uint4 dinfo{};
+         DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
+         GetResourceInfo(gd.srv_depth.get(), dinfo, dfmt);
+         depth_ok = (dinfo.x == w && dinfo.y == h);
+      }
+      // Threshold and strength are inert without the depth-edge term.
+      const float pred_scale = depth_ok ? kPredScale : 1.f;
+
+      // Async loading and live reload may temporarily require the fallback.
+      const bool smaa_ready = AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
+                              AllShadersReady(device_data.native_vertex_shaders, {kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS});
+      if (smaa && !smaa_ready)
+         return fallback;
+
+      const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, kPredThreshold, kPredStrength, 0.f};
+      if (smaa && !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_smaa_metrics), metrics, sizeof(metrics)))
+         return fallback;
+
+      // The snapshot SMAA (edges and blend) or RCAS reads; the post buffer is written in place
+      if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, &gd.smaa_input))
+         return fallback;
+      // The last pass writes the post buffer itself, through a view made for this dispatch (a kept one would hold the buffer through a
+      // resize). Without one (a buffer without RTV binding), a temp copied into it.
+      ComPtr<ID3D11RenderTargetView> color_rtv;
+      native_device->CreateRenderTargetView(color_res.get(), nullptr, color_rtv.put());
+      // SMAA's output goes to a temp when RCAS reads it, or when the buffer has no RTV
+      const bool smaa_into_temp = smaa && (do_sharpen || !color_rtv);
+      if (smaa_into_temp)
+      {
          if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &gd.smaa_out))
-            return smaa ? DrawOrDispatchOverrideType::None : DrawOrDispatchOverrideType::Replaced;
+            return fallback;
+         gd.smaa_out_frame = cb_luma_global_settings.FrameIndex;
+      }
+      ID3D11RenderTargetView* sharpen_target = color_rtv.get();
+      if (do_sharpen && !sharpen_target && EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET, &gd.rcas_out))
+         sharpen_target = gd.rcas_out.rtv.get();
+      if (!smaa && !sharpen_target)
+         return fallback;
 
-         // The gamma snapshot is only ever read; its linear-light decode feeds the neighborhood blend.
-         if (smaa && (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, &gd.smaa_input) ||
-                        !EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &gd.smaa_input_linear)))
-            return DrawOrDispatchOverrideType::None;
+      native_device_context->CopyResource(gd.smaa_input.tex.get(), color_res.get());
+      gd.snapshot_frame = cb_luma_global_settings.FrameIndex;
+      // The buffer is the resolve's CS UAV: D3D11 unbinds it there once it's bound as a render target, put back after
+      DrawStateStack<DrawStateStackType::Compute> resolve_compute_state;
+      resolve_compute_state.Cache(native_device_context, device_data.uav_max_count);
 
-         native_device_context->CopyResource(smaa ? gd.smaa_input.tex.get() : gd.smaa_out.tex.get(), color_res.get());
-         if (smaa)
-         {
-            DrawStateStack<DrawStateStackType::Compute> linearize_state;
-            linearize_state.Cache(native_device_context, device_data.uav_max_count);
-            ID3D11ShaderResourceView* lin_srv = gd.smaa_input.srv.get();
-            ID3D11UnorderedAccessView* lin_uav = gd.smaa_input_linear.uav.get();
-            native_device_context->CSSetUnorderedAccessViews(0, 1, &lin_uav, nullptr);
-            native_device_context->CSSetShaderResources(0, 1, &lin_srv);
-            native_device_context->CSSetShader(linearize_cs, nullptr, 0);
-            native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-            linearize_state.Restore(native_device_context);
-         }
-
+      if (smaa)
+      {
+         gd.smaa_frame = cb_luma_global_settings.FrameIndex;
          // DrawSMAA restores shaders, resources, and targets, but not cbuffer slots; save VS/PS b1 explicitly.
          ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
          native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
          native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-         if (smaa)
-         {
-            ID3D11Buffer* mcb = gd.cb_smaa_metrics.get();
-            native_device_context->VSSetConstantBuffers(1, 1, &mcb);
-            native_device_context->PSSetConstantBuffers(1, 1, &mcb);
+         ID3D11Buffer* mcb = gd.cb_smaa_metrics.get();
+         native_device_context->VSSetConstantBuffers(1, 1, &mcb);
+         native_device_context->PSSetConstantBuffers(1, 1, &mcb);
 
-            DrawSMAA(native_device, native_device_context, device_data,
-               gd.smaa_out.rtv.get(), gd.smaa_input_linear.srv.get() /*blend color (linear)*/, gd.smaa_input.srv.get() /*edge color (gamma)*/,
-               depth_ok ? gd.srv_depth.get() : nullptr /*predication*/);
-         }
+         // The snapshot for both the edge detection (gamma) and the blend (filtered in linear light, Luma_SMAA_impl.hlsl)
+         DrawSMAA(native_device, native_device_context, device_data,
+            smaa_into_temp ? gd.smaa_out.rtv.get() : color_rtv.get(), gd.smaa_input.srv.get(), gd.smaa_input.srv.get(),
+            depth_ok ? gd.srv_depth.get() : nullptr /*predication*/);
 
-         // Apply optional RCAS, otherwise copy SMAA directly so the cancelled resolve always produces output.
-         auto* const sharpen_vs = FindShader(device_data.native_vertex_shaders, kNameCopyVS);
-         auto* const sharpen_ps = FindShader(device_data.native_pixel_shaders, kNameSharpenPS);
-         const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-         // The RCAS output is written by the sharpen pass and then copied out, so it needs no SRV.
-         const bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs && sharpen_ps && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_sharpen), sp, sizeof(sp)) &&
-                                 EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET, &gd.rcas_out);
-
-         if (do_sharpen)
-         {
-            // DrawCustomPixelShader does not restore state; FullGraphics also prevents RCAS b0 leaking into HUD draws.
-            DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
-            sharpen_state.Cache(native_device_context, device_data.uav_max_count);
-
-            ID3D11Buffer* scb = gd.cb_sharpen.get();
-            native_device_context->PSSetConstantBuffers(0, 1, &scb);
-            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-               sharpen_vs, sharpen_ps, gd.smaa_out.srv.get(), gd.rcas_out.rtv.get(), w, h, false);
-
-            sharpen_state.Restore(native_device_context);
-
-            native_device_context->CopyResource(color_res.get(), gd.rcas_out.tex.get());
-         }
-         else
-         {
-            native_device_context->CopyResource(color_res.get(), gd.smaa_out.tex.get());
-         }
-
-         // Restore native VS/PS b1; the linearize dispatch already restored its compute state.
          ID3D11Buffer* vcb = vs_cb1_orig.get();
          ID3D11Buffer* pcb = ps_cb1_orig.get();
          native_device_context->VSSetConstantBuffers(1, 1, &vcb);
          native_device_context->PSSetConstantBuffers(1, 1, &pcb);
-
-         gd.smaa_applied_handles.insert(color_handle);
-         device_data.has_drawn_main_post_processing = true;
-         return DrawOrDispatchOverrideType::Replaced;
       }
 
-      return DrawOrDispatchOverrideType::None;
+      // Optional RCAS on the SMAA (or upscaled) output, into the post buffer (or a temp copied into it)
+      if (do_sharpen && sharpen_target)
+      {
+         // DrawCustomPixelShader does not restore state; FullGraphics also prevents RCAS b0 leaking into HUD draws.
+         DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
+         sharpen_state.Cache(native_device_context, device_data.uav_max_count);
+
+         ID3D11Buffer* scb = gd.cb_sharpen.get();
+         native_device_context->PSSetConstantBuffers(0, 1, &scb);
+         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
+            sharpen_vs, sharpen_ps, smaa ? gd.smaa_out.srv.get() : gd.smaa_input.srv.get(), sharpen_target, w, h, false);
+
+         sharpen_state.Restore(native_device_context);
+         if (!color_rtv)
+            native_device_context->CopyResource(color_res.get(), gd.rcas_out.tex.get());
+      }
+      else if (smaa_into_temp)
+      {
+         // SMAA went into its temp and no RCAS followed
+         native_device_context->CopyResource(color_res.get(), gd.smaa_out.tex.get());
+      }
+
+      resolve_compute_state.Restore(native_device_context);
+      gd.smaa_applied_handles.insert(color_handle);
+      device_data.has_drawn_main_post_processing = true;
+      return DrawOrDispatchOverrideType::Replaced;
    }
 
    // Runs the DLSS / FSR motion vector and jitter draws, captures inputs for SMAA, bloom, XeGTAO and Bink, replaces the FXAA and
@@ -2344,6 +2516,11 @@ public:
       data.GameData.SwapchainGammaEncoded = gd.stage2_seen_this_frame ? 0.f : 1.f;
    }
 
+   void CleanExtraSRResources(DeviceData& device_data) override
+   {
+      GetGameDeviceData(device_data).release_sr_resources = true;
+   }
+
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -2353,7 +2530,42 @@ public:
       device_data.force_reset_sr = !device_data.has_drawn_sr;
       device_data.has_drawn_sr = false;
       gd.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
-      gd.mv_active = IsSRActive(device_data) || g_mv_enable;
+      const bool mv_was_active = gd.mv_active.exchange(IsSRActive(device_data) || g_mv_enable);
+      if (mv_was_active && !gd.mv_active)
+      {
+         // The copies stop following the uploads: a draw after the upscaler comes back must find none ("uncopied", zero motion) until its
+         // buffer is uploaded again, not a stale one
+         {
+            const std::lock_guard lock(gd.mv_constants_mutex);
+            for (auto& [buffer, copy] : gd.mv_constants_copies)
+               copy.reset();
+         }
+         gd.mv_objects.clear();
+         gd.mv_previous_objects.clear();
+         gd.mv_camera.reset();
+         gd.mv_previous_camera.reset();
+         gd.view_camera.reset();
+         gd.scene_view_camera.reset();
+      }
+      // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again)
+      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false) && !g_mv_enable)
+      {
+         gd.sr_output_srv.reset();
+         {
+            const std::unique_lock lock(gd.mv_mutex);
+            gd.mv_texture.reset();
+            gd.mv_rtv.reset();
+            gd.mv_uav.reset();
+         }
+         gd.mv_depth_srv.reset();
+         gd.mv_depth.reset();
+         gd.mv_depth_copy = 0;
+         gd.mv_scene_color.reset();
+         gd.mv_scene_color_copy = 0;
+         gd.mv_fill_buffer.reset();
+         gd.mv_jitter_buffer.reset();
+         gd.mv_previous_constants = {};
+      }
       gd.sr_input = nullptr;
       gd.sr_rebind_done = false;
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before the prepass
@@ -2363,6 +2575,48 @@ public:
       gd.mv_view_restarted = false;
       gd.mv_fill_pending = false;
       gd.view_dsv = nullptr;
+      gd.fxaa_replaced = false;
+      // SMAA's resources go once it stopped running (the upscaler antialiases, or the game's AA is off), the snapshot and RCAS's temp
+      // once RCAS stopped as well; on the render thread, between frames
+      if (cb_luma_global_settings.FrameIndex - gd.smaa_frame > smaa_idle_release_frames)
+         ReleaseSMAA(device_data);
+      if (gd.smaa_out.tex && cb_luma_global_settings.FrameIndex - gd.smaa_out_frame > smaa_idle_release_frames)
+         gd.smaa_out = {};
+      if (gd.smaa_input.tex && cb_luma_global_settings.FrameIndex - gd.snapshot_frame > smaa_idle_release_frames)
+      {
+         gd.smaa_input = {};
+         gd.rcas_out = {};
+      }
+      // Luma bloom off: DrawBloom's mip chains go (rebuilt at its next draw)
+      if (!g_bloom_enable)
+         ReleaseBloom();
+      // The pooled constant copies only the pool holds (superseded, no object keeps them) are free for the next ones, as many as the
+      // last frame asked for: a burst between two presents (loading screens) would keep its peak otherwise. Without motion vectors, none.
+      {
+         const std::lock_guard lock(gd.mv_constants_mutex);
+         size_t kept_free = std::exchange(gd.mv_constants_made, 0);
+         if (!gd.mv_active)
+            kept_free = 0;
+         std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
+            {
+               if (copy.use_count() != 1)
+                  return false;
+               if (kept_free == 0)
+                  return true;
+               kept_free--;
+               return false; });
+         for (auto& [size, free_copies] : gd.mv_constants_pool_free)
+            free_copies.clear();
+         for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
+         {
+            if (gd.mv_constants_pool[i].use_count() == 1)
+               gd.mv_constants_pool_free[gd.mv_constants_pool[i]->size()].push_back(i);
+         }
+#if DEVELOPMENT
+         gd.mv_stats.registered_buffers = gd.mv_filtered_buffer_count.load(std::memory_order_relaxed);
+         gd.mv_stats.constants_pool = uint32_t(gd.mv_constants_pool.size());
+#endif
+      }
       if (!custom_texture_mip_lod_bias_offset)
       {
          const std::unique_lock lock(s_mutex_samplers);
@@ -2831,6 +3085,7 @@ public:
       ImGui::Text("Constant updates copied: %u, upscaler draws: %u, scene ended by 0x%08X, matched with an identical camera: %u", stats.updates, stats.sr_draws, stats.ended_by, stats.matched_same_camera);
       ImGui::Text("Refused: %u extra target, %u no scene, %u other depth/color, %u format, %u size, %u create, %u blend, %u shaders", stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]);
       ImGui::Text("Last checked target: format %u, dimension %u, %ux%u (output %.0fx%.0f)", stats.rejected_format, stats.rejected_dimension, stats.rejected_width, stats.rejected_height, double(device_data.output_resolution.x), double(device_data.output_resolution.y));
+      ImGui::Text("Constant copies: %u registered buffers, %u pooled, %u destroyed; FXAA dispatches skipped: %u", stats.registered_buffers, stats.constants_pool, GetGameDeviceData(device_data).mv_destroyed_buffers, stats.fxaa_skipped);
 
       ImGui::SeparatorText("Performance");
       auto& game_device_data = GetGameDeviceData(device_data);
