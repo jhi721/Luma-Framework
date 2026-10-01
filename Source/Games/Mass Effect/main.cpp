@@ -568,11 +568,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    size_t mv_constants_made = 0; // Copies asked for since the last present
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
-   // Motion vector draws by draw key (shaders, buffers, arguments), with a world translation and vc4. A draw takes the previous
-   // frame's vc4 of its key's nearest draw (same object, a frame earlier), its camera included.
+   // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld and vc4. A draw takes the previous frame's vc4
+   // of its key's nearest draw (same object, a frame earlier), its camera included.
    struct MotionVectorObject
    {
-      std::array<float, 3> translation;
+      PatchedDraws::ObjectTransform transform;
       ConstantsCopy constants;
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
@@ -1682,12 +1682,10 @@ class MassEffect final : public Game
                uint64_t(uint32_t(draw_data.vertex_offset)),
                uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         // LocalToWorld's translation separates objects that share a key (props), as a tie-break only. Skinned meshes' c8 is a bone row,
-         // the same for copies of a model (holstered weapons), which matched each other's history
+         // LocalToWorld (c5-c8) separates objects that share a key (props), as a tie-break only (see "PatchedDraws::ObjectTransform").
+         // Skinned meshes' c8 is a bone row, the same for copies of a model (holstered weapons), which matched each other's history.
          const size_t translation_offset = constants->size() >= gd.mv_last_vertex_translation_offset + 16 ? gd.mv_last_vertex_translation_offset : kTranslationOffset;
-         std::array<float, 3> translation;
-         std::memcpy(translation.data(), constants->data() + translation_offset,
-            sizeof(translation));
+         const PatchedDraws::ObjectTransform transform = PatchedDraws::ReadRowVectorTransform(constants->data() + translation_offset - 3 * 16);
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
          const MassEffectGameDeviceData::MotionVectorObject* match = nullptr;
@@ -1697,10 +1695,7 @@ class MassEffect final : public Game
             float nearest = FLT_MAX;
             for (const auto& candidate : previous->second)
             {
-               const float dx = candidate.translation[0] - translation[0],
-                           dy = candidate.translation[1] - translation[1],
-                           dz = candidate.translation[2] - translation[2];
-               const float distance = dx * dx + dy * dy + dz * dz;
+               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
                if (candidate.constants->size() == constants->size() &&
                    distance < nearest)
                {
@@ -1739,7 +1734,7 @@ class MassEffect final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         gd.mv_objects[key].push_back({translation, constants});
+         gd.mv_objects[key].push_back({transform, constants});
       }
 #if DEVELOPMENT
       else

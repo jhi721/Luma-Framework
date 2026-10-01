@@ -588,11 +588,11 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    std::vector<uint8_t> mv_camera_upload; // Scratch: an unmatched draw's vc2 with last frame's camera
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
-   // Motion vector draws by draw key (shaders, buffers, arguments), with the objTM translation and vc2 / vc3. A draw takes the
+   // Motion vector draws by draw key (shaders, buffers, arguments), with objTM and vc2 / vc3. A draw takes the
    // previous frame's constants of its key's nearest draw (same object, a frame earlier).
    struct MotionVectorObject
    {
-      std::array<float, 3> translation;
+      PatchedDraws::ObjectTransform transform;
       ConstantsCopy object; // vc2
       ConstantsCopy bones;  // vc3, skinned draws only
    };
@@ -1473,7 +1473,7 @@ class SaintsRowIV final : public Game
             return false;
 #endif
 
-         // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by translation. No instance count: frustum culling
+         // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by objTM. No instance count: frustum culling
          // changes it for the instanced statics as the camera turns.
          com_ptr<ID3D11Buffer> vertex_buffer;
          UINT vertex_stride = 0, vertex_offset = 0;
@@ -1486,8 +1486,9 @@ class SaintsRowIV final : public Game
          uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         const float* const values = reinterpret_cast<const float*>(object->data());
-         const std::array<float, 3> translation = {values[16 * 4 + 3], values[17 * 4 + 3], values[18 * 4 + 3]};
+         // objTM: vc2 rows 16-18 (3x4, column vectors)
+         PatchedDraws::ObjectTransform transform;
+         std::memcpy(transform.data(), object->data() + 16 * 16, sizeof(transform));
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
          const SaintsRowIVGameDeviceData::MotionVectorObject* match = nullptr;
@@ -1496,8 +1497,7 @@ class SaintsRowIV final : public Game
             float nearest = FLT_MAX;
             for (const auto& candidate : previous->second)
             {
-               const float dx = candidate.translation[0] - translation[0], dy = candidate.translation[1] - translation[1], dz = candidate.translation[2] - translation[2];
-               const float distance = dx * dx + dy * dy + dz * dz;
+               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
                if (copy_size(candidate.object) == object->size() && copy_size(candidate.bones) == copy_size(bones) && distance < nearest)
                {
                   nearest = distance;
@@ -1512,7 +1512,7 @@ class SaintsRowIV final : public Game
             if (skinned)
                uploads[1] = match->bones.get();
             // Kept as drawn for the next frame
-            game_device_data.mv_objects[key].push_back({translation, object, bones});
+            game_device_data.mv_objects[key].push_back({transform, object, bones});
          }
          // Draws with another projTM than the frame's camera (sky, windows at infinity) are left as is and not tracked
          else if (std::memcmp(object->data(), game_device_data.mv_camera.data(), camera_size) == 0)
@@ -1525,7 +1525,7 @@ class SaintsRowIV final : public Game
                std::memcpy(upload.data(), game_device_data.mv_previous_camera.data(), camera_size);
                uploads[0] = &upload;
             }
-            game_device_data.mv_objects[key].push_back({translation, object, bones});
+            game_device_data.mv_objects[key].push_back({transform, object, bones});
          }
       }
       ID3D11Buffer* const current[] = {game_cbs[0].get(), game_cbs[1].get()};

@@ -515,18 +515,18 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    size_t mv_constants_made = 0; // Copies asked for since the last present
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
-   // Motion vector draws by draw key (shaders, buffers, arguments), with the LocalToWorld translation and b0 / b1 / b3. A draw takes
+   // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld and b0 / b1 / b3. A draw takes
    // the previous frame's constants of its key's nearest draw (same object, a frame earlier), its camera included: the first person
    // weapon draws with a camera of its own.
    struct MotionVectorObject
    {
-      std::array<float, 3> translation;
+      PatchedDraws::ObjectTransform transform;
       ConstantsCopy object; // b0
       ConstantsCopy camera; // b1
       ConstantsCopy bones;  // b3, skinned draws only
 #if DEVELOPMENT
       uint32_t vertex_shader_hash = 0, pixel_shader_hash = 0, index_count = 0; // For the "mv_log_tiebreak" log
-      // Its vertex shader reads LocalToWorld (else matched by draw key alone, its translation 0)
+      // Its vertex shader reads LocalToWorld (else matched by draw key alone, its transform 0)
       bool translated = false;
 #endif
    };
@@ -1322,9 +1322,9 @@ class BorderlandsGoty final : public Game
                   {
                      const auto& a = objects[i];
                      const auto& b = objects[j];
-                     if (!a.translated || a.translation != b.translation || (PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones)))
+                     if (!a.translated || a.transform != b.transform || (PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones)))
                         continue;
-                     reshade::log::message(reshade::log::level::info, std::format("[BL MV] tie-break collision: VS 0x{:08X} PS 0x{:08X}, {} indices, objects {} and {} of {} at ({}, {}, {}); b0 of {} bytes first differs at {}, b3 at {}", a.vertex_shader_hash, a.pixel_shader_hash, a.index_count, i, j, objects.size(), a.translation[0], a.translation[1], a.translation[2], a.object ? a.object->size() : 0, first_difference(a.object, b.object), first_difference(a.bones, b.bones)).c_str());
+                     reshade::log::message(reshade::log::level::info, std::format("[BL MV] tie-break collision: VS 0x{:08X} PS 0x{:08X}, {} indices, objects {} and {} of {} at ({}, {}, {}); b0 of {} bytes first differs at {}, b3 at {}", a.vertex_shader_hash, a.pixel_shader_hash, a.index_count, i, j, objects.size(), a.transform[9], a.transform[10], a.transform[11], a.object ? a.object->size() : 0, first_difference(a.object, b.object), first_difference(a.bones, b.bones)).c_str());
                   }
                }
             }
@@ -1385,10 +1385,10 @@ class BorderlandsGoty final : public Game
          uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         std::array<float, 3> translation = {};
-         if (const uint32_t offset = game_device_data.mv_last_vertex_shader->translation_offset; offset != UINT_MAX && offset + sizeof(translation) <= object->size())
+         PatchedDraws::ObjectTransform transform = {};
+         if (const uint32_t offset = game_device_data.mv_last_vertex_shader->translation_offset; offset != UINT_MAX && offset + 3 * sizeof(float) <= object->size())
          {
-            std::memcpy(translation.data(), object->data() + offset, sizeof(translation));
+            transform = PatchedDraws::ReadRowVectorTransform(object->data() + offset - 3 * 16);
          }
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
@@ -1398,8 +1398,7 @@ class BorderlandsGoty final : public Game
             float nearest = FLT_MAX;
             for (const auto& candidate : previous->second)
             {
-               const float dx = candidate.translation[0] - translation[0], dy = candidate.translation[1] - translation[1], dz = candidate.translation[2] - translation[2];
-               const float distance = dx * dx + dy * dy + dz * dz;
+               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
                if (copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones) && distance < nearest)
                {
                   nearest = distance;
@@ -1434,7 +1433,7 @@ class BorderlandsGoty final : public Game
 #endif
          // Kept as drawn for the next frame
          auto& drawn_objects = game_device_data.mv_objects[key];
-         drawn_objects.push_back({translation, object, camera, bones});
+         drawn_objects.push_back({transform, object, camera, bones});
 #if DEVELOPMENT
          drawn_objects.back().vertex_shader_hash = original_shader_hashes.vertex_shaders[0];
          drawn_objects.back().pixel_shader_hash = original_shader_hashes.pixel_shaders[0];

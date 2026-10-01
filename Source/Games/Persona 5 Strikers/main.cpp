@@ -308,11 +308,11 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       bool has_previous = false;
    };
    std::unordered_map<ID3D11Resource*, PreviousResource> mv_previous_resources;
-   // Patched draws by draw key (shaders, buffers, arguments), with translation and $Globals. A draw takes the previous frame's
+   // Patched draws by draw key (shaders, buffers, arguments), with the world matrix and $Globals. A draw takes the previous frame's
    // $Globals of its key's nearest draw (same object, a frame earlier).
    struct MotionVectorObject
    {
-      std::array<float, 3> translation;
+      PatchedDraws::ObjectTransform transform;
       GlobalsCopy globals; // Never null
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
@@ -1153,7 +1153,7 @@ class Persona5Strikers final : public Game
             game_device_data.mv_view_projection_valid = true;
          }
 
-         // Draw key: same mesh, same shaders. Objects sharing it (e.g. props) are told apart by translation.
+         // Draw key: same mesh, same shaders. Objects sharing it (e.g. props) are told apart by their world matrix.
          com_ptr<ID3D11Buffer> vertex_buffer;
          UINT vertex_stride = 0, vertex_offset = 0;
          native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vertex_offset);
@@ -1165,11 +1165,10 @@ class Persona5Strikers final : public Game
          uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         std::array<float, 3> translation = {};
-         if (layout.world != UINT_MAX && layout.world + 48 <= globals_copy->size())
+         PatchedDraws::ObjectTransform transform = {};
+         if (layout.world != UINT_MAX && layout.world + sizeof(transform) <= globals_copy->size())
          {
-            const float* const world = reinterpret_cast<const float*>(globals_copy->data() + layout.world);
-            translation = {world[3], world[7], world[11]};
+            std::memcpy(transform.data(), globals_copy->data() + layout.world, sizeof(transform));
          }
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
@@ -1179,8 +1178,7 @@ class Persona5Strikers final : public Game
             float nearest = FLT_MAX;
             for (const auto& object : previous->second)
             {
-               const float dx = object.translation[0] - translation[0], dy = object.translation[1] - translation[1], dz = object.translation[2] - translation[2];
-               const float distance = dx * dx + dy * dy + dz * dz;
+               const float distance = PatchedDraws::TransformDistance(object.transform, transform);
                if (object.globals->size() == globals_copy->size() && distance < nearest)
                {
                   nearest = distance;
@@ -1189,7 +1187,7 @@ class Persona5Strikers final : public Game
             }
          }
          // Kept as drawn for the next frame
-         game_device_data.mv_objects[key].push_back({translation, globals_copy});
+         game_device_data.mv_objects[key].push_back({transform, globals_copy});
          const std::vector<uint8_t>* upload_data = (match ? match->globals.get() : globals_copy.get());
          // Not found: last frame's camera, if this is the frame's view projection (others are left as is)
          if (!match && game_device_data.mv_previous_view_projection_valid && std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) == 0)

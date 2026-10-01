@@ -388,11 +388,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
-   // Motion vector draws by draw key (shaders, buffers, arguments), with the LocalToWorld translation (in world space) and b0 / b1 /
+   // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld (its translation in world space) and b0 / b1 /
    // b3. A draw takes the previous frame's constants of its key's nearest draw (same object, a frame earlier), its camera included.
    struct MotionVectorObject
    {
-      std::array<float, 3> translation;
+      PatchedDraws::ObjectTransform transform;
       ConstantsCopy object; // b0
       ConstantsCopy camera; // b1
       ConstantsCopy bones;  // b3, skinned draws only
@@ -1170,16 +1170,16 @@ class MassEffectLE final : public Game
          uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
             HashCombine(key, value);
-         // The translation in world space: LocalToWorld includes the camera's PreViewTranslation
+         // LocalToWorld, its translation in world space (it includes the camera's PreViewTranslation)
          const std::array<float, 3> view_translation = GetPreViewTranslation(*camera);
          const uint32_t translation_offset = game_device_data.mv_last_vertex_shader_translation;
          const bool translated = translation_offset != UINT_MAX && translation_offset + sizeof(float) * 3 <= object->size();
-         std::array<float, 3> translation = {};
+         PatchedDraws::ObjectTransform transform = {};
          if (translated)
          {
-            std::memcpy(translation.data(), object->data() + translation_offset, sizeof(translation));
-            for (size_t i = 0; i < translation.size(); i++)
-               translation[i] -= view_translation[i];
+            transform = PatchedDraws::ReadRowVectorTransform(object->data() + translation_offset - 3 * 16);
+            for (size_t i = 0; i < view_translation.size(); i++)
+               transform[9 + i] -= view_translation[i];
          }
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
@@ -1189,8 +1189,7 @@ class MassEffectLE final : public Game
             float nearest = FLT_MAX;
             for (const auto& candidate : previous->second)
             {
-               const float dx = candidate.translation[0] - translation[0], dy = candidate.translation[1] - translation[1], dz = candidate.translation[2] - translation[2];
-               const float distance = dx * dx + dy * dy + dz * dz;
+               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
                if (copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones) && distance < nearest)
                {
                   nearest = distance;
@@ -1237,7 +1236,7 @@ class MassEffectLE final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         game_device_data.mv_objects[key].push_back({translation, object, camera, bones});
+         game_device_data.mv_objects[key].push_back({transform, object, camera, bones});
       }
 #if DEVELOPMENT
       else

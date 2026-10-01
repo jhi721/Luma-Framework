@@ -3,6 +3,7 @@
 #include <d3d11_1.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <format>
@@ -183,9 +184,32 @@ namespace PatchedDraws
       }
    };
 
-   // A development check of a frame's motion vector objects by draw key: those with another object's "translation" but other
-   // constants. Their previous frame match is arbitrary (a tie-break translation that isn't per object, e.g. a bone row); 0 when
-   // the tie-break works.
+   // An object's world transform, the tie-break between the motion vector draws sharing a draw key (props): its axes and translation
+   // (3x4). The translation alone ties for modular pieces that share a pivot and differ only by rotation (BL2's arches, measured
+   // 2026-10-01).
+   using ObjectTransform = std::array<float, 12>;
+
+   // A row vector matrix's (UE3's LocalToWorld) first three rows' xyz and its translation row's, from its first row
+   inline ObjectTransform ReadRowVectorTransform(const uint8_t* first_row)
+   {
+      ObjectTransform transform;
+      for (size_t row = 0; row < 4; row++)
+         std::memcpy(transform.data() + row * 3, first_row + row * 16, 3 * sizeof(float));
+      return transform;
+   }
+
+   // Squared distance between two objects' transforms: the nearest is the same object a frame earlier
+   inline float TransformDistance(const ObjectTransform& a, const ObjectTransform& b)
+   {
+      float distance = 0.f;
+      for (size_t i = 0; i < a.size(); i++)
+         distance += (a[i] - b[i]) * (a[i] - b[i]);
+      return distance;
+   }
+
+   // A development check of a frame's motion vector objects by draw key: those with another object's "transform" but other
+   // constants. Their previous frame match is arbitrary (a tie-break transform that isn't per object, e.g. bone rows); 0 when the
+   // tie-break works.
    template <typename Object, typename SameConstants>
    uint32_t CountTieBreakCollisions(const std::unordered_map<uint64_t, std::vector<Object>>& objects_by_key, SameConstants same_constants)
    {
@@ -196,7 +220,7 @@ namespace PatchedDraws
          {
             for (size_t j = 0; j < objects.size(); j++)
             {
-               if (i != j && objects[i].translation == objects[j].translation && !same_constants(objects[i], objects[j]))
+               if (i != j && objects[i].transform == objects[j].transform && !same_constants(objects[i], objects[j]))
                {
                   collisions++;
                   break;
