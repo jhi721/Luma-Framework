@@ -65,11 +65,15 @@ static constexpr uint32_t kScaleformDigitGlyphHash2873 = 0x79CDF7BA;
 // DLAA / FSR Native AA: the scene's first post passes after its translucency, which end a motion vector frame (the upscaler runs
 // right before the first one; measured 2026-10-01, BL2 4K: light shafts, FXAA, the depth of field's low resolution copy, bloom,
 // tonemap). Not the depth of field's CoC (0x003AD65E): it runs before the translucent draws, which then draw into the scene again.
-// The ones without a constant are dgVoodoo 2.87.3 only (no 2.81.3 equivalents known).
+// BL2's 2.81.3 twins are from _tools/dgv_hashgen over GlobalShaderCache-PC-D3D-SM3.bin (TDownsampleLightShaftsPixelShader<LS_Point>,
+// TFilterPixelShader, TDOFGatherPixelShader0; 2026-10-01, the bright pass's known twin reproduced as the control). TPS: not checked.
 static constexpr uint32_t kScenePostHashes[] = {
    0xEB2678CD, // light shafts downsample
+   0x13098E07, // light shafts downsample, dgVoodoo 2.81.3
    0x070EAE70, // depth of field low resolution scene
+   0x6DF81571, // depth of field low resolution scene, dgVoodoo 2.81.3
    0xC710CF7C, // bloom downsample
+   0x77A6E651, // bloom downsample, dgVoodoo 2.81.3
    kBloomBrightPassHash,
    kBloomBrightPassHash_v281,
    kFXAAResolveHash,
