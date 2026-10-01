@@ -1,7 +1,7 @@
 // DLSS/FSR inputs from the scene's alpha, the encoded view depth (see "Includes/SceneDepth.hlsl"): the device depth, and the camera
 // motion for the motion vector pixels no patched draw wrote (still the marker 65504 from the frame start, the largest float16: sky, unpatched
 // draws), that depth reprojected from the current to the previous frame's camera (vc4 view projection, turned into column vectors
-// on the CPU, PreViewTranslation change included). Depth isn't reversed. The game has no depth view to read (ME1's fill).
+// on the CPU, PreViewTranslation change included). Depth isn't reversed. As in ME1's fill, the game has no depth view to read.
 // Also FSR's masks, when enabled, from what the alpha blended draws wrote themselves (Mass Effect 2007's, see
 // "MotionVectorPatch::PatchPixelShaderReactive", max blended). They draw without motion vectors of their own, so FSR would keep the
 // history of what's behind them (ghosting). The reactive one from all of them: scaled, then 0 under the threshold and 0.9 over it

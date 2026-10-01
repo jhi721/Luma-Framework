@@ -356,7 +356,8 @@ float4 RunTonemap(float4 v5, float4 v6)
    }
    else
    {
-      // Vanilla bloom (screen-blend gated by a (0.3, 0.59, 0.11) weighted sum of the linear scene, t1), never scaled: Bloom Intensity belongs to the Luma pyramid.
+      // Vanilla bloom (t1, screen-blend gated by a (0.3, 0.59, 0.11) weighted sum of the linear scene), never scaled: Bloom
+      // Intensity belongs to the Luma pyramid.
       r0.w = dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999));
       r0.w = r0.w * -3;
       r0.w = exp2(r0.w);
@@ -485,7 +486,7 @@ float4 RunTonemap(float4 v5, float4 v6)
       // Highlight dechroma handed to DICE rather than run as our own pass afterwards: it runs INSIDE the containment in
       // the processing primaries, and only above ShoulderStart * PeakWhite (1/3 of peak for this type), so mid-tones
       // cannot be touched. Its ramp follows the max channel, but DICE enters it on its AVERAGE luminance, so a saturated
-      // highlight switches on with a visible step (DICE.hlsl notes it; shared code, left as is). 0 = off for the OUTPUT
+      // highlight switches on with a visible step (a limitation of the shared DICE.hlsl). 0 = off for the OUTPUT
       // but not the cost: DICE's guard carries no [branch], so fxc flattens it for every pixel above the shoulder.
       settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
       float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, settings) / paperWhite;

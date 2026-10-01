@@ -1,6 +1,6 @@
 // Borderlands 2 / The Pre-Sequel — Bink video (Y'CbCr->R'G'B') pass. SDR clamp + light AutoHDR for HDR.
-// Movies decode to 3 Y'CbCr planes (Y'=t0, the color difference planes t1 and t2) and a fullscreen quad converts them straight onto the swapchain,
-// bypassing the tonemap; on the fp16 scRGB swapchain that SDR output sits flat at paper white. Body verbatim from the
+// Movies decode to 3 Y'CbCr planes (Y' = t0, the color difference planes t1 and t2) and a fullscreen quad converts them
+// straight onto the swapchain, bypassing the tonemap; on the fp16 scRGB swapchain that SDR output sits flat at paper white. Body verbatim from the
 // dgVoodoo ps_5_0 disasm (DX9 0x33244F80: tor/tog/tob/consts c0..c3 -> cb4[8..11]); the cb3 and/or pairs are
 // dgVoodoo's texture-format bit emulation, kept via asuint/asfloat. dgVoodoo dropped the SM3 saturate(o) (the UNORM
 // backbuffer clamped for free), so it is re-added before the AutoHDR - kills the matrix's overshoot and negatives.

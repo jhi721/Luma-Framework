@@ -651,7 +651,7 @@ class Borderlands2 final : public Game
 
 #if ENABLE_SMAA
    // Post-tonemap SMAA on the gamma LDR: AFTER the tonemap, so it cannot perturb the DoF composited inside it.
-   // Snapshot LDR -> linearize (+ predication extract) CS -> DrawSMAA -> optional RCAS; the last pass writes the LDR RTV.
+   // Snapshot LDR -> predication extract CS -> DrawSMAA -> optional RCAS; the last pass writes the LDR RTV.
    // Without "smaa" (the upscaler antialiased the frame, ME1's shape) only RCAS runs: snapshot -> RCAS -> LDR.
    void RunPostTonemapSMAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, Borderlands2GameDeviceData* gd, ID3D11RenderTargetView* ldr_rtv, bool smaa)
    {
@@ -2178,9 +2178,7 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 
-      // User settings mirrored into LumaSettings.GameSettings. The grade sliders default to a vanilla no-op;
-      // Exposure/Bloom/Vignette act on both SDR+HDR, Saturation/Dechroma/Contrast HDR-only; those three and Dithering
-      // need TONEMAP_TYPE 1.
+      // User settings mirrored into LumaSettings.GameSettings; GameCBuffers.hlsl says which act in SDR too.
       default_luma_global_game_settings.Exposure = 1.f;           // scene multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;         // BT.709-luminance lerp (Color.hlsl Saturation)
       default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only mandatory DICE/gamut desat applies
@@ -3635,8 +3633,8 @@ public:
       }
 #endif
 
-      // Grade sliders, read in Luma_BL2TPS_Tonemap.hlsl; every default is a vanilla no-op, and OnInit says which
-      // of them act in SDR as well.
+      // Grade sliders, read in Luma_BL2TPS_Tonemap.hlsl; every default is a vanilla no-op, and GameCBuffers.hlsl says
+      // which of them act in SDR as well.
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& default_game_settings = default_luma_global_game_settings;
@@ -3821,7 +3819,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_format_upgrades_2d_size_filters |= (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomAspectRatio;
       texture_format_upgrades_2d_custom_aspect_ratios = {float(screen_width) / float(screen_height), 16.f / 9.f};
 
-      // AF16x: mode 4 upgrades the game's AF samplers to MaxAnisotropy=16 (clarity on oblique surfaces). The LOD bias offset is negative only under DLSS/FSR (see "OnPresent"): without a temporal resolve it would shimmer.
+      // AF16x: mode 4 upgrades the game's AF samplers to MaxAnisotropy=16 (clarity on oblique surfaces). The LOD bias offset is
+      // negative only under DLSS/FSR (see "OnPresent"): without a temporal resolve it would shimmer.
       enable_samplers_upgrade = true; // boot-time only (can't change after device creation)
       samplers_upgrade_mode = 4;
 

@@ -4,7 +4,7 @@
 //
 // The knee mirrors the native bright pass (main.cpp "kBloomBrightPassHash"):
 // saturate((max3(source * BloomScale) - BloomThreshold) * 0.5), BloomScale a constant 4 that only undoes the pass's
-// pre-divided-by-4 source - applying it here as well opened the knee 4x too low and put ~10x the native energy in.
+// pre-divided-by-4 source; applying it here too opens the knee 4x too low (~10x the native energy).
 // C++ keeps GameSettings.BloomThreshold live off that pass (measured 0.50 to 1.32) and binds LumaSettings here.
 // Karis firefly weighting runs before this (DrawKarisAverage); no TAA to hide sparkle.
 
