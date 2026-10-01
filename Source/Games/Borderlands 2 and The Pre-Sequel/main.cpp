@@ -362,6 +362,7 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    // upscaler's output goes into both: post passes draw onto the scene and resolve it again (light shafts, measured 2026-10-01), so
    // ME1's copy only write would be overwritten with the jittered scene.
    com_ptr<ID3D11Resource> mv_scene_copy;
+   com_ptr<ID3D11RenderTargetView> mv_scene_copy_rtv; // The upscaler's output goes into both in one pass ("BL2TPS Copy Back PS")
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    // The projection jitter (pixels, +y down), chosen when the scene opens; its NDC offset is at VS "MotionVectorPatches::jitter_slot"
    // of every mesh draw depth tested against the scene
@@ -1623,9 +1624,33 @@ class Borderlands2 final : public Game
       if (perf_end_parts)
          native_device_context->End(perf_queries->upscaler_end.get());
 #endif
-      // The RGB write mask keeps the scene's encoded depth; the copy is the game's resolve of the same scene
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), gd.sr_rgb_blend_state.get(), nullptr, copy_vs, copy_ps,
-         gd.sr_output_srv.get(), gd.mv_scene_rtv.get(), scene_desc.Width, scene_desc.Height);
+      // The RGB write mask keeps the scene's encoded depth; the copy is the game's resolve of the same scene, written in the same pass
+      // (with a view like the scene's: dgVoodoo's are single slice arrays), else copied whole after it
+      ID3D11RenderTargetView* copy_rtv = nullptr;
+      auto* const copy_back_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS Copy Back PS"));
+      if (gd.mv_scene_copy && copy_back_ps)
+      {
+         com_ptr<ID3D11Resource> copy_rtv_resource;
+         if (gd.mv_scene_copy_rtv)
+            gd.mv_scene_copy_rtv->GetResource(&copy_rtv_resource);
+         if (copy_rtv_resource != gd.mv_scene_copy)
+         {
+            gd.mv_scene_copy_rtv.reset();
+            com_ptr<ID3D11Texture2D> copy;
+            if (SUCCEEDED(gd.mv_scene_copy->QueryInterface(&copy)))
+            {
+               D3D11_TEXTURE2D_DESC copy_desc;
+               copy->GetDesc(&copy_desc);
+               D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+               gd.mv_scene_rtv->GetDesc(&rtv_desc);
+               if (copy_desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+                  native_device->CreateRenderTargetView(copy.get(), &rtv_desc, &gd.mv_scene_copy_rtv);
+            }
+         }
+         copy_rtv = gd.mv_scene_copy_rtv.get();
+      }
+      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), gd.sr_rgb_blend_state.get(), nullptr, copy_vs, copy_rtv ? copy_back_ps : copy_ps,
+         gd.sr_output_srv.get(), gd.mv_scene_rtv.get(), scene_desc.Width, scene_desc.Height, true, copy_rtv);
 #if DEVELOPMENT
       if (perf_end_parts)
       {
@@ -1633,7 +1658,7 @@ class Borderlands2 final : public Game
          perf_queries->end_parts = true;
       }
 #endif
-      if (gd.mv_scene_copy)
+      if (gd.mv_scene_copy && !copy_rtv)
          native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
       // Not while the bridge's helper starts (the color copied as it is): SMAA stays on and the next frame resets
       device_data.has_drawn_sr = sr_implementations[device_data.sr_type]->IsReady(sr_instance_data);
@@ -1836,6 +1861,8 @@ public:
       sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Motion Vector Fill CS"),
          ShaderDefinition("Luma_BL2TPS_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Copy Back PS"),
+         ShaderDefinition("Luma_BL2TPS_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
@@ -2949,6 +2976,7 @@ public:
             gd.mv_scene_rtv.reset();
             gd.mv_scene_srv.reset();
             gd.mv_scene_copy.reset();
+            gd.mv_scene_copy_rtv.reset();
             gd.mv_objects.clear();
             gd.mv_previous_objects.clear();
             gd.mv_camera.reset();

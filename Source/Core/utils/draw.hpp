@@ -885,8 +885,9 @@ void AddCustomTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls
 }
 #endif
 
-// Fullscreen (full render target) pass
-void DrawCustomPixelShader(ID3D11DeviceContext* device_context, ID3D11DepthStencilState* depth_stencil_state, ID3D11BlendState* blend_state, ID3D11SamplerState* sampler_state, ID3D11VertexShader* vs, ID3D11PixelShader* ps, ID3D11ShaderResourceView* source_resource_texture_view, ID3D11RenderTargetView* target_resource_texture_view, UINT width, UINT height, bool alpha = true)
+// Fullscreen (full render target) pass. "second_target_resource_texture_view" (optional): a second target of the same size, for a pixel
+// shader writing SV_Target1 too.
+void DrawCustomPixelShader(ID3D11DeviceContext* device_context, ID3D11DepthStencilState* depth_stencil_state, ID3D11BlendState* blend_state, ID3D11SamplerState* sampler_state, ID3D11VertexShader* vs, ID3D11PixelShader* ps, ID3D11ShaderResourceView* source_resource_texture_view, ID3D11RenderTargetView* target_resource_texture_view, UINT width, UINT height, bool alpha = true, ID3D11RenderTargetView* second_target_resource_texture_view = nullptr)
 {
    // Set the new resources/states:
    constexpr FLOAT blend_factor_alpha[4] = { 1.f, 1.f, 1.f, 1.f };
@@ -910,7 +911,8 @@ void DrawCustomPixelShader(ID3D11DeviceContext* device_context, ID3D11DepthStenc
    {
       device_context->PSSetSamplers(0, 1, &sampler_state);
    }
-   device_context->OMSetRenderTargets(1, &target_resource_texture_view, nullptr);
+   ID3D11RenderTargetView* const target_resource_texture_views[] = { target_resource_texture_view, second_target_resource_texture_view };
+   device_context->OMSetRenderTargets(second_target_resource_texture_view ? 2 : 1, target_resource_texture_views, nullptr);
    device_context->VSSetShader(vs, nullptr, 0);
    device_context->PSSetShader(ps, nullptr, 0);
    device_context->IASetInputLayout(nullptr);
