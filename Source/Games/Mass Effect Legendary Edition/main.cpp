@@ -391,6 +391,10 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    int mv_refused_reason = 0;
    ID3D11BlendState* mv_blend_state = nullptr;
    bool mv_blend_opaque = true;
+   bool mv_blend_depth_only = false; // RT0 writes no color (a depth-only pass, or an occlusion query box)
+   // The last depth stencil state of a depth-only draw, and whether it writes depth (see "DrawWithMotionVectors")
+   ID3D11DepthStencilState* mv_depth_stencil_state = nullptr;
+   bool mv_depth_write = false;
    uint32_t mv_last_vertex_shader_hash = 0;
    ID3D11VertexShader* mv_last_vertex_shader = nullptr;
    bool mv_last_vertex_shader_skinned = false;
@@ -1092,6 +1096,9 @@ class MassEffectLE final : public Game
       game_device_data.mv_refused_dsv = nullptr;
       game_device_data.mv_blend_state = nullptr;
       game_device_data.mv_blend_opaque = true;
+      game_device_data.mv_blend_depth_only = false;
+      game_device_data.mv_depth_stencil_state = nullptr;
+      game_device_data.mv_depth_write = false;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
       const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
@@ -1204,13 +1211,29 @@ class MassEffectLE final : public Game
          D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
          if (blend_state)
             blend_state->GetDesc(&blend_desc);
-         // Additive lights, decals and translucents keep the motion vectors of what's behind them, and so do draws that write no color
-         // (occlusion query bounding boxes: every blend state writes the motion vector target, see "OnCreateBlendState")
+         // Additive lights, decals and translucents keep the motion vectors of what's behind them (every blend state writes the motion
+         // vector target, see "OnCreateBlendState")
          const D3D11_RENDER_TARGET_BLEND_DESC& rt0_blend = blend_desc.RenderTarget[0];
          game_device_data.mv_blend_opaque = rt0_blend.RenderTargetWriteMask != 0 && (!rt0_blend.BlendEnable || (rt0_blend.SrcBlend == D3D11_BLEND_ONE && rt0_blend.DestBlend == D3D11_BLEND_ZERO && rt0_blend.BlendOp == D3D11_BLEND_OP_ADD));
+         game_device_data.mv_blend_depth_only = rt0_blend.RenderTargetWriteMask == 0;
          game_device_data.mv_blend_state = blend_state.get();
       }
-      if (!game_device_data.mv_blend_opaque)
+      // A draw that writes no color owns its pixels only if it writes depth: the alpha tested depth pass of long hair (ME3 LE
+      // 0x89BD83EE, its color drawn blended afterwards), not occlusion query bounding boxes (depth tested, not written)
+      if (!game_device_data.mv_blend_opaque && game_device_data.mv_blend_depth_only)
+      {
+         com_ptr<ID3D11DepthStencilState> depth_stencil_state;
+         native_device_context->OMGetDepthStencilState(&depth_stencil_state, nullptr);
+         if (depth_stencil_state.get() != game_device_data.mv_depth_stencil_state)
+         {
+            D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
+            if (depth_stencil_state)
+               depth_stencil_state->GetDesc(&depth_desc);
+            game_device_data.mv_depth_write = depth_desc.DepthEnable && depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
+            game_device_data.mv_depth_stencil_state = depth_stencil_state.get();
+         }
+      }
+      if (!game_device_data.mv_blend_opaque && !(game_device_data.mv_blend_depth_only && game_device_data.mv_depth_write))
          return MV_REJECT(6);
 
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
