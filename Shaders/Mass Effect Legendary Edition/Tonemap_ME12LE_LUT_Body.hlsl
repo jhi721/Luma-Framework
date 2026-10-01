@@ -23,14 +23,8 @@
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
 
-#ifndef TM_HAS_MOTIONBLUR
-#define TM_HAS_MOTIONBLUR 1
-#endif
-#ifndef TM_HAS_GRAIN
-#define TM_HAS_GRAIN 1
-#endif
-#ifndef TM_HAS_FILMIC
-#define TM_HAS_FILMIC 0
+#if !defined(TM_HAS_MOTIONBLUR) || !defined(TM_HAS_GRAIN) || !defined(TM_HAS_FILMIC)
+#error "The entry point defines TM_HAS_MOTIONBLUR, TM_HAS_GRAIN and TM_HAS_FILMIC"
 #endif
 
 // Decompiler artifact kept so the verbatim transcription compiles unchanged.

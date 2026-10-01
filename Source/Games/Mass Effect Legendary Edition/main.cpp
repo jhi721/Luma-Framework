@@ -76,7 +76,8 @@ static constexpr uint32_t kFXAAResolveVHash = 0xF43DBFFD;  // Vertical in-place 
 // Stage-1 tonemap permutations (MB = motion blur). Slots are stored per permutation because MB binds depth at t0
 // and pushes everything up one, and ME3LE additionally binds velocity at t2. They mirror the scene and bloom
 // registers of the matching HLSL body with no compile-time cross-check, so a re-captured permutation must move both
-// sides. Unlisted permutations stay vanilla; this table drives bloom, SMAA depth capture and the DEVELOPMENT readout.
+// sides. Unlisted permutations stay vanilla; this table drives bloom, SMAA depth capture, the DLSS / FSR scene end and the
+// DEVELOPMENT readout.
 struct TonemapPermDesc
 {
    uint32_t hash;
@@ -111,25 +112,6 @@ static constexpr TonemapPermDesc kTonemapPermsME3LE[] = {
 // Selected once in DllMain.
 static std::span<const TonemapPermDesc> g_tonemap_perms = kTonemapPermsME1LE;
 
-// Everything that differs between the three games. ME2LE/ME3LE share the native HBAO+ radius of 48 uu against ME1LE's
-// 30 uu; GTAO visibility power is 1 everywhere, so it stays at its global default instead of living here.
-struct MEGameProfile
-{
-   std::span<const TonemapPermDesc> tonemap_perms;
-   float gtao_radius_override; // Native radius (uu) / DepthScale; 0 keeps the shader's own radius.
-};
-static constexpr MEGameProfile ProfileFor(MEGame game)
-{
-   switch (game)
-   {
-   case MEGame::ME2LE:
-      return {kTonemapPermsME2LE, 0.96f};
-   case MEGame::ME3LE:
-      return {kTonemapPermsME3LE, 0.96f};
-   default:
-      return {kTonemapPermsME1LE, 0.f};
-   }
-}
 // Quarter-resolution bloom bright-pass; cb0.xy = (BloomScale, Threshold).
 static constexpr uint32_t kBloomBrightPassHash = 0xF8942FF1;
 
@@ -204,7 +186,8 @@ static bool g_mv_force_jitter = false;   // The projection jitter without an ups
 static bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
 static bool g_mv_skip_fill = false;      // No camera fill (the debug view then shows the patched draws alone)
 static bool g_mv_dump = false;           // One shot: the motion vectors, depth and cameras to "Luma_MV_Dump" (see "DumpMotionVectors")
-// A/B of the constant copies' CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy", "mv_read_sizes")
+static bool g_mv_probe = false;          // The scene's readers to ReShade.log (see "OnDrawOrDispatch"): reads every draw's bindings
+// A/B of the constant copies' CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy", "PatchedShader::read_sizes")
 static bool g_mv_buffer_filter = true;
 static bool g_mv_constants_pool = true;
 static bool g_mv_read_sizes = true;
@@ -273,7 +256,6 @@ struct RGBA16FTarget
    ComPtr<ID3D11Texture2D> tex;
    ComPtr<ID3D11RenderTargetView> rtv;
    ComPtr<ID3D11ShaderResourceView> srv;
-   ComPtr<ID3D11UnorderedAccessView> uav;
    uint32_t w = 0, h = 0;
 };
 
@@ -334,7 +316,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    float bloom_scale_live = -1.f;                // Negative until the first successful readback.
    float bloom_threshold_live = -1.f;            // Negative selects the 1.2 fallback.
 #if DEVELOPMENT
-   int bloom_bright_pass_hits = 0; // Bright-pass captures this frame.
    // Which stage-1 permutation the game last drew, and how many stage-1 draws the frame contained. A count of two
    // can mean a mid-frame permutation switch, and so two HDR families in one frame.
    const TonemapPermDesc* stage1_perm = nullptr;
@@ -357,16 +338,19 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // None was picked ("CleanExtraSRResources", from the overlay): our upscaler resources go at the next present
    std::atomic<bool> release_sr_resources = false;
    std::shared_mutex mv_mutex;
-   std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> mv_vertex_shaders;
-   std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_pixel_shaders;
-   // The patched vertex shaders that read b3 (skinned), and the byte offset of each one's LocalToWorld translation row in b0 (none
-   // for world space geometry, matched by draw key alone), by original hash
-   std::unordered_set<uint32_t> mv_bone_vertex_shaders;
-   std::unordered_map<uint32_t, uint32_t> mv_translation_offsets;
-   // The bytes of b0 / b1 / b3 each patched vertex shader reads ("DXBC::ConstantBufferBytes": the previous frame's copies upload only
-   // those), by original hash
-   using ReadSizes = std::array<UINT, std::size(MotionVectorPatches::previous_slots)>;
-   std::unordered_map<uint32_t, ReadSizes> mv_read_sizes;
+   // A patched shader (null if refused) with, for a vertex shader, whether it reads b3 (skinned), the byte offset of its LocalToWorld
+   // translation row in b0 (none for world space geometry, matched by draw key alone), and the bytes of b0 / b1 / b3 it reads
+   // ("DXBC::ConstantBufferBytes": the previous frame's copies upload only those)
+   template <typename T>
+   struct PatchedShader
+   {
+      com_ptr<T> shader;
+      bool skinned = false;
+      uint32_t translation_offset = UINT_MAX;
+      std::array<UINT, std::size(MotionVectorPatches::previous_slots)> read_sizes = {};
+   };
+   std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
+   std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_pixel_shaders;
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no fill)
@@ -391,14 +375,15 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::array<float, 2> mv_jitter_ndc = {}; // The same offset in NDC (y up), as the jitter buffer holds it
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
    // Per-draw lookups kept for the next draw (reset when the scene opens, views and states can be recreated between scenes): the
-   // jitter path's last depth view and whether it's the scene depth, its last depth stencil state's depth test, the motion vector
-   // path's last accepted and last refused targets (with the refusal's "MV_REJECT" reason) and the last blend state's opacity (null =
-   // the default state, opaque), the last vertex and pixel shader's patched versions (owned by "mv_vertex_shaders" /
-   // "mv_pixel_shaders", never erased) and the vertex shader's facts.
+   // jitter path's last depth view and whether it's the scene depth, the last depth stencil state's depth test and write (null = the
+   // default state, both on; see "CacheDepthStencilState"), the motion vector path's last accepted and last refused targets (with the
+   // refusal's "MV_REJECT" reason) and the last blend state's opacity (null = the default state, opaque), the last vertex and pixel
+   // shader's patched entries (owned by "mv_vertex_shaders" / "mv_pixel_shaders", never erased).
    ID3D11DepthStencilView* jitter_dsv = nullptr;
    bool jitter_dsv_scene = false;
-   ID3D11DepthStencilState* jitter_depth_stencil_state = nullptr;
-   bool jitter_depth_test = true;
+   ID3D11DepthStencilState* depth_stencil_state = nullptr;
+   bool depth_test = true;
+   bool depth_write = true;
    ID3D11RenderTargetView* mv_accepted_rtv = nullptr;
    ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
    ID3D11RenderTargetView* mv_refused_rtv = nullptr;
@@ -407,14 +392,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ID3D11BlendState* mv_blend_state = nullptr;
    bool mv_blend_opaque = true;
    bool mv_blend_depth_only = false; // RT0 writes no color (a depth-only pass, or an occlusion query box)
-   // The last depth stencil state of a depth-only draw, and whether it writes depth (see "DrawWithMotionVectors")
-   ID3D11DepthStencilState* mv_depth_stencil_state = nullptr;
-   bool mv_depth_write = false;
    uint32_t mv_last_vertex_shader_hash = 0;
-   ID3D11VertexShader* mv_last_vertex_shader = nullptr;
-   bool mv_last_vertex_shader_skinned = false;
-   uint32_t mv_last_vertex_shader_translation = UINT_MAX;
-   ReadSizes mv_last_vertex_shader_read_sizes = {};
+   const PatchedShader<ID3D11VertexShader>* mv_last_vertex_shader = nullptr;
    uint32_t mv_last_pixel_shader_hash = 0;
    ID3D11PixelShader* mv_last_pixel_shader = nullptr;
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
@@ -441,6 +420,9 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    size_t mv_constants_made = 0; // Copies asked for since the last present
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
+   // An unmatched draw's b0 with LocalToWorld moved to last frame's PreViewTranslation (see "DrawWithMotionVectors"), kept for its
+   // capacity
+   std::vector<uint8_t> mv_object_previous_view;
    // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld (its translation in world space) and b0 / b1 /
    // b3. A draw takes the previous frame's constants of its key's nearest draw (same object, a frame earlier), its camera included.
    struct MotionVectorObject
@@ -593,41 +575,25 @@ class MassEffectLE final : public Game
       return true;
    }
 
-   static bool CreateDefaultRGBA16FTex(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, ComPtr<ID3D11Texture2D>& out)
-   {
-      out.reset();
-      D3D11_TEXTURE2D_DESC td = {};
-      td.Width = w;
-      td.Height = h;
-      td.MipLevels = 1;
-      td.ArraySize = 1;
-      td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-      td.SampleDesc.Count = 1;
-      td.Usage = D3D11_USAGE_DEFAULT;
-      td.BindFlags = bind_flags;
-      return SUCCEEDED(device->CreateTexture2D(&td, nullptr, out.put()));
-   }
-
-   // (Re)create an fp16 scratch target on resolution change, with one view per requested bind flag. Returns false if
-   // the texture or any requested view is missing.
+   // (Re)create an fp16 scratch target on resolution change, with a view per requested bind flag (render target, shader resource).
+   // Returns false if the texture or any requested view is missing.
    static bool EnsureRGBA16FTarget(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, RGBA16FTarget* target)
    {
       if (!target->tex || target->w != w || target->h != h)
       {
          *target = {};
-         if (CreateDefaultRGBA16FTex(device, w, h, bind_flags, target->tex))
+         const D3D11_TEXTURE2D_DESC desc = {.Width = w, .Height = h, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = bind_flags};
+         if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, target->tex.put())))
          {
             if (bind_flags & D3D11_BIND_RENDER_TARGET)
                device->CreateRenderTargetView(target->tex.get(), nullptr, target->rtv.put());
             if (bind_flags & D3D11_BIND_SHADER_RESOURCE)
                device->CreateShaderResourceView(target->tex.get(), nullptr, target->srv.put());
-            if (bind_flags & D3D11_BIND_UNORDERED_ACCESS)
-               device->CreateUnorderedAccessView(target->tex.get(), nullptr, target->uav.put());
             target->w = w;
             target->h = h;
          }
       }
-      return target->tex && (!(bind_flags & D3D11_BIND_RENDER_TARGET) || target->rtv) && (!(bind_flags & D3D11_BIND_SHADER_RESOURCE) || target->srv) && (!(bind_flags & D3D11_BIND_UNORDERED_ACCESS) || target->uav);
+      return target->tex && (!(bind_flags & D3D11_BIND_RENDER_TARGET) || target->rtv) && (!(bind_flags & D3D11_BIND_SHADER_RESOURCE) || target->srv);
    }
 
    static void ReleaseGTAOScratch(MassEffectGameDeviceData& gd)
@@ -658,7 +624,7 @@ class MassEffectLE final : public Game
             game_device_data.mv_depth_copy = dst_resource;
       }
 #if DEVELOPMENT
-      else if (game_device_data.mv_scene_done && (src_resource == uint64_t(game_device_data.mv_scene_color.get()) || src_resource == game_device_data.mv_scene_color_copy))
+      else if (g_mv_probe && game_device_data.mv_scene_done && (src_resource == uint64_t(game_device_data.mv_scene_color.get()) || src_resource == game_device_data.mv_scene_color_copy))
       {
          const std::string line = std::format("[MELE Probe] copy of the scene after its end -> 0x{:X}", dst_resource);
          if (game_device_data.probe_logged.insert(line).second)
@@ -873,10 +839,11 @@ class MassEffectLE final : public Game
 #endif
    }
 
-   // The bound shader's motion vector version, patched from Core's bytecode copy on first use (null if it can't be). Vertex shaders
-   // that don't place vertices with b1's ViewProjectionMatrix are refused: jittered, they would shift against their own UVs.
+   // The bound shader's motion vector version, patched from Core's bytecode copy on first use (a null shader if it can't be); the entry
+   // is never erased. Vertex shaders that don't place vertices with b1's ViewProjectionMatrix are refused: jittered, they would shift
+   // against their own UVs.
    template <typename T>
-   static com_ptr<T> GetMotionVectorShader(ID3D11Device* native_device, DeviceData& device_data, std::unordered_map<uint32_t, com_ptr<T>>* shaders, uint32_t hash, reshade::api::pipeline pipeline)
+   static const MassEffectGameDeviceData::PatchedShader<T>& GetMotionVectorShader(ID3D11Device* native_device, DeviceData& device_data, std::unordered_map<uint32_t, MassEffectGameDeviceData::PatchedShader<T>>* shaders, uint32_t hash, reshade::api::pipeline pipeline)
    {
       constexpr bool vertex = std::is_same_v<T, ID3D11VertexShader>;
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -888,6 +855,7 @@ class MassEffectLE final : public Game
       std::vector<uint8_t> patched;
       std::string error = "no bytecode";
       bool screen_space = false;
+      MassEffectGameDeviceData::PatchedShader<T> entry;
       {
          const std::shared_lock lock(s_mutex_generic);
          if (const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second->subobjects_cache)
@@ -911,56 +879,60 @@ class MassEffectLE final : public Game
                else
                {
                   D3D11_SHADER_INPUT_BIND_DESC bind_desc;
-                  const bool skinned = SUCCEEDED(reflection->GetResourceBindingDescByName("VSBoneConstants", &bind_desc)) && bind_desc.BindPoint == MotionVectorPatches::previous_slots[2].first;
+                  entry.skinned = SUCCEEDED(reflection->GetResourceBindingDescByName("VSBoneConstants", &bind_desc)) && bind_desc.BindPoint == MotionVectorPatches::previous_slots[2].first;
                   // The object's translation, LocalToWorld's 4th row (row vectors)
-                  const bool translated = SUCCEEDED(reflection->GetConstantBufferByName("$Globals")->GetVariableByName("LocalToWorld")->GetDesc(&variable_desc)) && (variable_desc.uFlags & D3D_SVF_USED) != 0;
-                  MassEffectGameDeviceData::ReadSizes read_sizes;
-                  for (size_t i = 0; i < read_sizes.size(); i++)
-                     read_sizes[i] = DXBC::ConstantBufferBytes(code, desc->code_size, MotionVectorPatches::previous_slots[i].first);
-                  const std::unique_lock lock(game_device_data.mv_mutex);
-                  game_device_data.mv_read_sizes[hash] = read_sizes;
-                  if (skinned)
-                     game_device_data.mv_bone_vertex_shaders.insert(hash);
-                  if (translated)
-                     game_device_data.mv_translation_offsets[hash] = variable_desc.StartOffset + 3 * 16;
+                  if (SUCCEEDED(reflection->GetConstantBufferByName("$Globals")->GetVariableByName("LocalToWorld")->GetDesc(&variable_desc)) && (variable_desc.uFlags & D3D_SVF_USED) != 0)
+                  {
+                     entry.translation_offset = variable_desc.StartOffset + 3 * 16;
+                  }
+                  for (size_t i = 0; i < entry.read_sizes.size(); i++)
+                     entry.read_sizes[i] = DXBC::ConstantBufferBytes(code, desc->code_size, MotionVectorPatches::previous_slots[i].first);
                }
             }
          }
       }
-      com_ptr<T> shader;
       if (!patched.empty())
       {
          HRESULT hr;
          if constexpr (vertex)
-            hr = native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &shader);
+            hr = native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &entry.shader);
          else
-            hr = native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &shader);
+            hr = native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.shader);
          if (FAILED(hr))
             error = std::format("create 0x{:08X}", uint32_t(hr));
       }
       // Failures in every build (bug reports), every patched shader only in development
-      if (DEVELOPMENT || !shader)
-         reshade::log::message((shader || screen_space) ? reshade::log::level::info : reshade::log::level::warning, std::format("[MELE MV] {} 0x{:08X} {}", vertex ? "VS" : "PS", hash, shader ? "patched" : error).c_str());
+      if (DEVELOPMENT || !entry.shader)
+         reshade::log::message((entry.shader || screen_space) ? reshade::log::level::info : reshade::log::level::warning, std::format("[MELE MV] {} 0x{:08X} {}", vertex ? "VS" : "PS", hash, entry.shader ? "patched" : error).c_str());
       const std::unique_lock lock(game_device_data.mv_mutex);
-      return shaders->try_emplace(hash, shader).first->second;
+      return shaders->try_emplace(hash, std::move(entry)).first->second;
    }
 
    // The bound vertex shader's patched version (null if refused), looked up again only when the game's changes
    static ID3D11VertexShader* GetPatchedVertexShader(ID3D11Device* native_device, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t hash)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
-      if (hash != game_device_data.mv_last_vertex_shader_hash)
+      if (hash != game_device_data.mv_last_vertex_shader_hash || !game_device_data.mv_last_vertex_shader)
       {
-         game_device_data.mv_last_vertex_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_vertex_shaders, hash, cmd_list_data.pipeline_state_original_vertex_shader).get();
-         const std::shared_lock lock(game_device_data.mv_mutex);
-         game_device_data.mv_last_vertex_shader_skinned = game_device_data.mv_bone_vertex_shaders.contains(hash);
-         const auto translation = game_device_data.mv_translation_offsets.find(hash);
-         game_device_data.mv_last_vertex_shader_translation = translation != game_device_data.mv_translation_offsets.end() ? translation->second : UINT_MAX;
-         const auto read_sizes = game_device_data.mv_read_sizes.find(hash);
-         game_device_data.mv_last_vertex_shader_read_sizes = read_sizes != game_device_data.mv_read_sizes.end() ? read_sizes->second : MassEffectGameDeviceData::ReadSizes{};
+         game_device_data.mv_last_vertex_shader = &GetMotionVectorShader(native_device, device_data, &game_device_data.mv_vertex_shaders, hash, cmd_list_data.pipeline_state_original_vertex_shader);
          game_device_data.mv_last_vertex_shader_hash = hash;
       }
-      return game_device_data.mv_last_vertex_shader;
+      return game_device_data.mv_last_vertex_shader->shader.get();
+   }
+
+   // The bound depth stencil state's depth test and write, looked up again only when it changes (both draw paths)
+   static void CacheDepthStencilState(ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData* game_device_data)
+   {
+      com_ptr<ID3D11DepthStencilState> depth_stencil_state;
+      native_device_context->OMGetDepthStencilState(&depth_stencil_state, nullptr);
+      if (depth_stencil_state.get() == game_device_data->depth_stencil_state)
+         return;
+      D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
+      if (depth_stencil_state)
+         depth_stencil_state->GetDesc(&depth_desc);
+      game_device_data->depth_test = depth_desc.DepthEnable;
+      game_device_data->depth_write = depth_desc.DepthEnable && depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
+      game_device_data->depth_stencil_state = depth_stencil_state.get();
    }
 
    // A b1 copy's ViewProjectionMatrix (row vectors) as clip z = A * clip w + B, w the view depth: A from the z and w columns, B at the
@@ -1070,8 +1042,9 @@ class MassEffectLE final : public Game
       game_device_data.mv_scene_color.reset();
       game_device_data.mv_scene_color_copy = 0;
       game_device_data.jitter_dsv = nullptr;
-      game_device_data.jitter_depth_stencil_state = nullptr;
-      game_device_data.jitter_depth_test = true;
+      game_device_data.depth_stencil_state = nullptr;
+      game_device_data.depth_test = true;
+      game_device_data.depth_write = true;
       game_device_data.mv_accepted_rtv = nullptr;
       game_device_data.mv_accepted_dsv = nullptr;
       game_device_data.mv_refused_rtv = nullptr;
@@ -1079,8 +1052,6 @@ class MassEffectLE final : public Game
       game_device_data.mv_blend_state = nullptr;
       game_device_data.mv_blend_opaque = true;
       game_device_data.mv_blend_depth_only = false;
-      game_device_data.mv_depth_stencil_state = nullptr;
-      game_device_data.mv_depth_write = false;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
       const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
@@ -1202,26 +1173,15 @@ class MassEffectLE final : public Game
       }
       // A draw that writes no color owns its pixels only if it writes depth: the alpha tested depth pass of long hair (ME3 LE
       // 0x89BD83EE, its color drawn blended afterwards), not occlusion query bounding boxes (depth tested, not written)
-      if (!game_device_data.mv_blend_opaque && game_device_data.mv_blend_depth_only)
-      {
-         com_ptr<ID3D11DepthStencilState> depth_stencil_state;
-         native_device_context->OMGetDepthStencilState(&depth_stencil_state, nullptr);
-         if (depth_stencil_state.get() != game_device_data.mv_depth_stencil_state)
-         {
-            D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
-            if (depth_stencil_state)
-               depth_stencil_state->GetDesc(&depth_desc);
-            game_device_data.mv_depth_write = depth_desc.DepthEnable && depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
-            game_device_data.mv_depth_stencil_state = depth_stencil_state.get();
-         }
-      }
-      if (!game_device_data.mv_blend_opaque && !(game_device_data.mv_blend_depth_only && game_device_data.mv_depth_write))
+      if (game_device_data.mv_blend_depth_only)
+         CacheDepthStencilState(native_device_context, &game_device_data);
+      if (!game_device_data.mv_blend_opaque && !(game_device_data.mv_blend_depth_only && game_device_data.depth_write))
          return MV_REJECT(6);
 
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
       if (const uint32_t pixel_shader_hash = original_shader_hashes.pixel_shaders[0]; pixel_shader_hash != game_device_data.mv_last_pixel_shader_hash)
       {
-         game_device_data.mv_last_pixel_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_pixel_shaders, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader).get();
+         game_device_data.mv_last_pixel_shader = GetMotionVectorShader(native_device, device_data, &game_device_data.mv_pixel_shaders, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader).shader.get();
          game_device_data.mv_last_pixel_shader_hash = pixel_shader_hash;
       }
       ID3D11PixelShader* const pixel_shader = game_device_data.mv_last_pixel_shader;
@@ -1283,7 +1243,7 @@ class MassEffectLE final : public Game
       com_ptr<ID3D11Buffer> game_cbs[4];
       native_device_context->VSGetConstantBuffers(0, UINT(std::size(game_cbs)), &game_cbs[0]);
       ID3D11Buffer* const current[std::size(MotionVectorPatches::previous_slots)] = {game_cbs[MotionVectorPatches::previous_slots[0].first].get(), game_cbs[MotionVectorPatches::previous_slots[1].first].get(), game_cbs[MotionVectorPatches::previous_slots[2].first].get()};
-      const bool skinned = game_device_data.mv_last_vertex_shader_skinned;
+      const bool skinned = game_device_data.mv_last_vertex_shader->skinned;
       // b1's copy was taken for this draw by "IsMirroredView" (every draw with a depth target)
       MassEffectGameDeviceData::ConstantsCopy object, camera = game_device_data.view_camera, bones;
       {
@@ -1307,7 +1267,6 @@ class MassEffectLE final : public Game
       // The previous frame's b0 / b1 / b3: the same object's from last frame, else this draw's with last frame's world camera (no object
       // motion). None (no CPU copy yet, or an unmatched draw with another camera): the current ones (zero motion).
       const std::vector<uint8_t>* uploads[std::size(MotionVectorPatches::previous_slots)] = {};
-      std::vector<uint8_t> object_previous_view; // Outlives "mv_previous_constants.Bind"
       if (object && camera && (!skinned || bones))
       {
          // The world camera: the frame's first motion vector draw's
@@ -1328,7 +1287,7 @@ class MassEffectLE final : public Game
             HashCombine(key, value);
          // LocalToWorld, its translation in world space (it includes the camera's PreViewTranslation)
          const std::array<float, 3> view_translation = GetPreViewTranslation(*camera);
-         const uint32_t translation_offset = game_device_data.mv_last_vertex_shader_translation;
+         const uint32_t translation_offset = game_device_data.mv_last_vertex_shader->translation_offset;
          const bool translated = translation_offset != UINT_MAX && translation_offset + sizeof(float) * 3 <= object->size();
          PatchedDraws::ObjectTransform transform = {};
          if (translated)
@@ -1373,7 +1332,8 @@ class MassEffectLE final : public Game
             if (translated)
             {
                const std::array<float, 3> previous_view_translation = GetPreViewTranslation(*game_device_data.mv_previous_camera);
-               object_previous_view = *object;
+               auto& object_previous_view = game_device_data.mv_object_previous_view;
+               object_previous_view.assign(object->begin(), object->end());
                float row[3];
                std::memcpy(row, object_previous_view.data() + translation_offset, sizeof(row));
                for (size_t i = 0; i < std::size(row); i++)
@@ -1392,7 +1352,7 @@ class MassEffectLE final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         game_device_data.mv_objects[key].push_back({transform, object, camera, bones});
+         game_device_data.mv_objects[key].push_back({transform, std::move(object), std::move(camera), std::move(bones)});
       }
 #if DEVELOPMENT
       else
@@ -1400,7 +1360,7 @@ class MassEffectLE final : public Game
          game_device_data.mv_stats.uncopied++;
       }
 #endif
-      const std::span<const UINT> read_sizes = (g_mv_read_sizes ? std::span<const UINT>(game_device_data.mv_last_vertex_shader_read_sizes) : std::span<const UINT>());
+      const std::span<const UINT> read_sizes = (g_mv_read_sizes ? std::span<const UINT>(game_device_data.mv_last_vertex_shader->read_sizes) : std::span<const UINT>());
       game_device_data.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, uploads, current, "MELE", read_sizes);
       ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
@@ -1452,17 +1412,8 @@ class MassEffectLE final : public Game
       }
       if (!game_device_data.jitter_dsv_scene)
          return false;
-      com_ptr<ID3D11DepthStencilState> depth_stencil_state;
-      native_device_context->OMGetDepthStencilState(&depth_stencil_state, nullptr);
-      if (depth_stencil_state.get() != game_device_data.jitter_depth_stencil_state)
-      {
-         D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
-         if (depth_stencil_state)
-            depth_stencil_state->GetDesc(&depth_desc);
-         game_device_data.jitter_depth_test = depth_desc.DepthEnable;
-         game_device_data.jitter_depth_stencil_state = depth_stencil_state.get();
-      }
-      if (!game_device_data.jitter_depth_test)
+      CacheDepthStencilState(native_device_context, &game_device_data);
+      if (!game_device_data.depth_test)
          return false;
       com_ptr<ID3D11Buffer> vertex_buffer;
       UINT vertex_stride, vertex_offset;
@@ -1756,7 +1707,7 @@ public:
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
       Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter},
-         {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}});
+         {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}});
       Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, {"perf_hook_timers", &Perf::g_hook_timers}});
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
@@ -1886,94 +1837,83 @@ public:
    // never stalls. OnPresent turns the live artist-authored BloomScale into the effective intensity.
    void CaptureBloomScale(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData& gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
    {
-      if (g_bloom_enable && original_shader_hashes.Contains(kBloomBrightPassHash, reshade::api::shader_stage::pixel) && !gd.bloom_scale_captured_this_frame)
+      if (!g_bloom_enable || gd.bloom_scale_captured_this_frame || !original_shader_hashes.Contains(kBloomBrightPassHash, reshade::api::shader_stage::pixel))
+         return;
+      gd.bloom_scale_captured_this_frame = true; // Do not advance the ring twice in one frame.
+      ComPtr<ID3D11Buffer> cb0;
+      native_device_context->PSGetConstantBuffers(0, 1, cb0.put());
+      if (!cb0)
+         return;
+      // Empty or full: a failed allocation releases the whole ring, retried next frame
+      if (!gd.bloom_scale_ring[2])
       {
-         gd.bloom_scale_captured_this_frame = true; // Do not advance the ring twice in one frame.
-#if DEVELOPMENT
-         gd.bloom_bright_pass_hits++;
-#endif
-         ComPtr<ID3D11Buffer> cb0;
-         native_device_context->PSGetConstantBuffers(0, 1, cb0.put());
-         if (cb0)
+         D3D11_BUFFER_DESC bd{};
+         cb0->GetDesc(&bd);
+         bd.Usage = D3D11_USAGE_STAGING;
+         bd.BindFlags = 0;
+         bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+         bd.MiscFlags = 0;
+         for (auto& b : gd.bloom_scale_ring)
          {
-            if (!gd.bloom_scale_ring[2]) // Gate on the last slot so partial allocation retries next frame.
+            if (FAILED(native_device->CreateBuffer(&bd, nullptr, b.put())))
             {
-               D3D11_BUFFER_DESC bd{};
-               cb0->GetDesc(&bd);
-               bd.Usage = D3D11_USAGE_STAGING;
-               bd.BindFlags = 0;
-               bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-               bd.MiscFlags = 0;
-               for (auto& b : gd.bloom_scale_ring)
-                  b = nullptr; // com_ptr::put() requires null and this discards prior partial allocation.
-               for (auto& b : gd.bloom_scale_ring)
-               {
-                  if (FAILED(native_device->CreateBuffer(&bd, nullptr, b.put())))
-                  {
-                     for (auto& r : gd.bloom_scale_ring)
-                        r = nullptr;
-                     break;
-                  }
-               }
-            }
-            if (gd.bloom_scale_ring[2])
-            {
-               native_device_context->CopyResource(gd.bloom_scale_ring[gd.bloom_scale_ring_wr].get(), cb0.get());
-               if (gd.bloom_scale_ring_filled < 3)
-                  gd.bloom_scale_ring_filled++;
-               if (gd.bloom_scale_ring_filled >= 3)
-               {
-                  const int oldest = (gd.bloom_scale_ring_wr + 1) % 3; // Written two frames ago and expected idle.
-                  D3D11_MAPPED_SUBRESOURCE ms{};
-                  if (SUCCEEDED(native_device_context->Map(gd.bloom_scale_ring[oldest].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &ms)))
-                  {
-                     const float* f = reinterpret_cast<const float*>(ms.pData);
-                     const float bscale = f[0];     // BloomScaleAndThreshold.x.
-                     const float bthreshold = f[1]; // BloomScaleAndThreshold.y, per-scene artist dial.
-                     native_device_context->Unmap(gd.bloom_scale_ring[oldest].get(), 0);
-                     if (bscale >= 0.f && bscale < 100.f) // Reject implausible readback data.
-                     {
-                        gd.bloom_scale_live = bscale;
-                     }
-                     if (bthreshold > 0.f && bthreshold < 100.f)
-                     {
-                        gd.bloom_threshold_live = bthreshold;
-                     }
-                  }
-               }
-               gd.bloom_scale_ring_wr = (gd.bloom_scale_ring_wr + 1) % 3; // Map failure skips only this update.
+               for (auto& r : gd.bloom_scale_ring)
+                  r = nullptr;
+               return;
             }
          }
       }
+      native_device_context->CopyResource(gd.bloom_scale_ring[gd.bloom_scale_ring_wr].get(), cb0.get());
+      if (gd.bloom_scale_ring_filled < 3)
+         gd.bloom_scale_ring_filled++;
+      if (gd.bloom_scale_ring_filled >= 3)
+      {
+         const int oldest = (gd.bloom_scale_ring_wr + 1) % 3; // Written two frames ago and expected idle.
+         D3D11_MAPPED_SUBRESOURCE ms{};
+         if (SUCCEEDED(native_device_context->Map(gd.bloom_scale_ring[oldest].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &ms)))
+         {
+            const float* f = reinterpret_cast<const float*>(ms.pData);
+            const float bscale = f[0];     // BloomScaleAndThreshold.x.
+            const float bthreshold = f[1]; // BloomScaleAndThreshold.y, per-scene artist dial.
+            native_device_context->Unmap(gd.bloom_scale_ring[oldest].get(), 0);
+            if (bscale >= 0.f && bscale < 100.f) // Reject implausible readback data.
+            {
+               gd.bloom_scale_live = bscale;
+            }
+            if (bthreshold > 0.f && bthreshold < 100.f)
+            {
+               gd.bloom_threshold_live = bthreshold;
+            }
+         }
+      }
+      gd.bloom_scale_ring_wr = (gd.bloom_scale_ring_wr + 1) % 3; // Map failure skips only this update.
    }
 
    // Core uploads a dirty settings cbuffer before the replaced pass runs, so the flag applies to the same draw.
    void TagVideoTarget(ID3D11DeviceContext* native_device_context, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
    {
-      if (original_shader_hashes.Contains(kVideoBinkHash, reshade::api::shader_stage::pixel))
+      if (!original_shader_hashes.Contains(kVideoBinkHash, reshade::api::shader_stage::pixel))
+         return;
+      ComPtr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+      if (!rtv)
+         return;
+      ComPtr<ID3D11Resource> rt_res;
+      rtv->GetResource(rt_res.put());
+      if (!rt_res)
+         return;
+      bool on_swapchain;
       {
-         ComPtr<ID3D11RenderTargetView> rtv;
-         native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-         ComPtr<ID3D11Resource> rt_res;
-         if (rtv)
-            rtv->GetResource(rt_res.put());
-         if (rt_res)
-         {
-            const uint64_t rt_handle = reinterpret_cast<uint64_t>(rt_res.get());
-            bool on_swapchain;
-            {
-               // Swapchain recreation mutates back_buffers under unique_lock; draw hooks must take a shared lock.
-               std::shared_lock lock(device_data.mutex);
-               on_swapchain = device_data.back_buffers.contains(rt_handle);
-            }
-            auto& gs = cb_luma_global_settings.GameSettings;
-            const float flag = on_swapchain ? 1.f : 0.f;
-            if (gs.VideoOnSwapchain != flag)
-            {
-               gs.VideoOnSwapchain = flag;
-               device_data.cb_luma_global_settings_dirty = true;
-            }
-         }
+         // Swapchain recreation mutates back_buffers under unique_lock; draw hooks must take a shared lock.
+         std::shared_lock lock(device_data.mutex);
+         on_swapchain = device_data.back_buffers.contains(reinterpret_cast<uint64_t>(rt_res.get()));
+      }
+      auto& gs = cb_luma_global_settings.GameSettings;
+      const float flag = on_swapchain ? 1.f : 0.f;
+      if (gs.VideoOnSwapchain != flag)
+      {
+         gs.VideoOnSwapchain = flag;
+         device_data.cb_luma_global_settings_dirty = true;
       }
    }
 
@@ -2005,10 +1945,8 @@ public:
       }
 
       // Build fp16 bloom from the tonemap's linear scene and rebind its native bloom slot.
-      const bool bloom_ready =
-         AllShadersReady(device_data.native_vertex_shaders, {kNameBloomVS}) &&
-         AllShadersReady(device_data.native_pixel_shaders, {kNameBloomPrefilterPS, kNameBloomDownsamplePS, kNameBloomUpsamplePS});
-      if (g_bloom_enable && bloom_ready)
+      if (g_bloom_enable && AllShadersReady(device_data.native_vertex_shaders, {kNameBloomVS}) &&
+          AllShadersReady(device_data.native_pixel_shaders, {kNameBloomPrefilterPS, kNameBloomDownsamplePS, kNameBloomUpsamplePS}))
       {
          ComPtr<ID3D11ShaderResourceView> srv_scene;
          native_device_context->PSGetShaderResources(perm->scene_slot, 1, srv_scene.put());
@@ -2041,9 +1979,7 @@ public:
          // Deinterleave: capture half-resolution R24 depth, prepare all scratch resources, then skip native work.
          if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
          {
-            const bool gtao_shaders_ready =
-               AllShadersReady(device_data.native_compute_shaders, {kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS});
-            if (!gtao_shaders_ready)
+            if (!AllShadersReady(device_data.native_compute_shaders, {kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS}))
                return DrawOrDispatchOverrideType::None;
 
             ComPtr<ID3D11ShaderResourceView> srv_d;
@@ -2287,9 +2223,8 @@ public:
       const float pred_scale = depth_ok ? kPredScale : 1.f;
 
       // Async loading and live reload may temporarily require the fallback.
-      const bool smaa_ready = AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
-                              AllShadersReady(device_data.native_vertex_shaders, {kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS});
-      if (smaa && !smaa_ready)
+      if (smaa && !(AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
+                     AllShadersReady(device_data.native_vertex_shaders, {kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS})))
          return fallback;
 
       const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, kPredThreshold, kPredStrength, 0.f};
@@ -2379,10 +2314,10 @@ public:
    {
       auto& gd = GetGameDeviceData(device_data);
 
-      const bool is_immediate = cmd_list_data.is_primary; // Cached by Core; avoids a per-draw virtual query.
-      // Do not reject custom passes globally: the hash-replaced stage-1 tonemap still supplies SMAA depth and the
-      // bloom slot. Individual native-only branches apply !is_custom_pass where required.
-      if (!is_immediate)
+      // Immediate context only ("is_primary" is cached by Core: no per-draw virtual query). Do not reject custom passes globally: the
+      // hash-replaced stage-1 tonemap still supplies SMAA depth and the bloom slot. Individual native-only branches apply
+      // !is_custom_pass where required.
+      if (!cmd_list_data.is_primary)
          return DrawOrDispatchOverrideType::None;
 
       const bool compute = (stages & reshade::api::shader_stage::compute) != 0;
@@ -2392,7 +2327,7 @@ public:
       // Scene probe: the passes that read the scene after its first motion vector draw, before its end ("open") and after it
       // ("done"), logged once per shader, phase and slot (the evidence for the post passes that end the scene, and that the upscaled
       // scene reaches every reader). Stale bindings show up too.
-      if (gd.mv_active && gd.mv_scene_color && (gd.mv_scene_open || gd.mv_scene_done))
+      if (g_mv_probe && gd.mv_active && gd.mv_scene_color && (gd.mv_scene_open || gd.mv_scene_done))
       {
          const uint32_t hash = compute ? uint32_t(original_shader_hashes.compute_shaders[0]) : uint32_t(original_shader_hashes.pixel_shaders[0]);
          com_ptr<ID3D11ShaderResourceView> srvs[16];
@@ -2575,6 +2510,7 @@ public:
          gd.mv_fill_buffer.reset();
          gd.mv_jitter_buffer.reset();
          gd.mv_previous_constants = {};
+         gd.mv_object_previous_view = {};
       }
       gd.sr_input = nullptr;
       gd.sr_rebind_done = false;
@@ -2678,16 +2614,27 @@ public:
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       gd.last_views.swap(gd.views);
       gd.views.clear();
+      // The views, the DEV panel's counts and the world camera in ReShade.log every 300 frames while motion vectors run
       if (gd.mv_active && cb_luma_global_settings.FrameIndex % 300 == 0)
       {
          std::string line = std::format("[MELE MV] frame {} views:", cb_luma_global_settings.FrameIndex);
          for (const auto& view : gd.last_views)
             line += std::format(" [near {:.2f} det {:.4f} pvt.z {:.1f} viewport {:.0f}x{:.0f} draws {} mv {}]", view.near_plane, view.determinant, view.view_translation_z, view.viewport_width, view.viewport_height, view.draws, view.motion_vector_draws);
          reshade::log::message(reshade::log::level::info, line.c_str());
-      }
-      // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run
-      if (const auto& stats = gd.mv_last_stats; gd.mv_active && cb_luma_global_settings.FrameIndex % 300 == 0)
+         const auto& stats = gd.mv_last_stats;
          reshade::log::message(reshade::log::level::info, std::format("[MELE MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter, {} mirrored, {} view restarts, {} updates, sr {} ({}), ended by 0x{:08X}, refused {}/{}/{}/{}/{}/{}/{}/{}", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.mirrored, stats.view_restarts, stats.updates, stats.sr_draws, int(device_data.sr_type), stats.ended_by, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]).c_str());
+         // The world camera against last frame's: the PreViewTranslations and the largest ViewProjectionMatrix change
+         if (gd.mv_camera && gd.mv_previous_camera && gd.mv_camera->size() == gd.mv_previous_camera->size() && gd.mv_camera->size() >= kPreViewTranslationOffset + 12)
+         {
+            const float* const current = reinterpret_cast<const float*>(gd.mv_camera->data());
+            const float* const previous = reinterpret_cast<const float*>(gd.mv_previous_camera->data());
+            float change = 0.f;
+            for (int i = 0; i < 16; i++)
+               change = (std::max)(change, std::abs(current[i] - previous[i]));
+            const auto current_translation = GetPreViewTranslation(*gd.mv_camera), previous_translation = GetPreViewTranslation(*gd.mv_previous_camera);
+            reshade::log::message(reshade::log::level::info, std::format("[MELE MV] camera: PVT ({:.3f}, {:.3f}, {:.3f}) previous ({:.3f}, {:.3f}, {:.3f}), max VP change {:.6f}, VP row 3 ({:.4f}, {:.4f}, {:.4f}, {:.4f}), b1 {} bytes, determinant {:.4f}, {} matched with an identical camera", current_translation[0], current_translation[1], current_translation[2], previous_translation[0], previous_translation[1], previous_translation[2], change, current[12], current[13], current[14], current[15], gd.mv_camera->size(), ViewDeterminant(*gd.mv_camera), gd.mv_last_stats.matched_same_camera).c_str());
+         }
+      }
       // "MV Dump": raw rows of the staging copies (motion vectors R16G16_FLOAT, depth R24G8) and the two b1 copies, beside the executable
       if (gd.dump_textures[0] && gd.dump_textures[1])
       {
@@ -2722,17 +2669,6 @@ public:
          gd.dump_textures[1].reset();
          reshade::log::message(reshade::log::level::info, "[MELE MV] dump written to Luma_MV_Dump");
       }
-      // The world camera against last frame's: the PreViewTranslations and the largest ViewProjectionMatrix change
-      if (gd.mv_active && cb_luma_global_settings.FrameIndex % 300 == 0 && gd.mv_camera && gd.mv_previous_camera && gd.mv_camera->size() == gd.mv_previous_camera->size() && gd.mv_camera->size() >= kPreViewTranslationOffset + 12)
-      {
-         const float* const current = reinterpret_cast<const float*>(gd.mv_camera->data());
-         const float* const previous = reinterpret_cast<const float*>(gd.mv_previous_camera->data());
-         float change = 0.f;
-         for (int i = 0; i < 16; i++)
-            change = (std::max)(change, std::abs(current[i] - previous[i]));
-         const auto current_translation = GetPreViewTranslation(*gd.mv_camera), previous_translation = GetPreViewTranslation(*gd.mv_previous_camera);
-         reshade::log::message(reshade::log::level::info, std::format("[MELE MV] camera: PVT ({:.3f}, {:.3f}, {:.3f}) previous ({:.3f}, {:.3f}, {:.3f}), max VP change {:.6f}, VP row 3 ({:.4f}, {:.4f}, {:.4f}, {:.4f}), b1 {} bytes, determinant {:.4f}, {} matched with an identical camera", current_translation[0], current_translation[1], current_translation[2], previous_translation[0], previous_translation[1], previous_translation[2], change, current[12], current[13], current[14], current[15], gd.mv_camera->size(), ViewDeterminant(*gd.mv_camera), gd.mv_last_stats.matched_same_camera).c_str());
-      }
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels
       {
          const std::shared_lock lock(gd.mv_mutex);
@@ -2764,7 +2700,6 @@ public:
       gd.bloom_scale_captured_this_frame = false; // Re-arm BloomScale capture.
       gd.scene_post_done_this_frame = false;      // Re-armed by the FXAA resolve.
 #if DEVELOPMENT
-      gd.bloom_bright_pass_hits = 0;
       gd.stage1_draws = 0; // stage1_perm deliberately survives: a paused or menu frame keeps the last answer.
 #endif
 
@@ -2950,8 +2885,6 @@ public:
 #if DEVELOPMENT
       {
          auto& gd = GetGameDeviceData(device_data);
-         const char* gname = GameName(g_me_game);
-         const float eff_thr = gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : default_luma_global_game_settings.BloomThreshold;
          ImGui::SeparatorText("Stage 1 DEV readout");
          if (gd.stage1_perm == nullptr)
          {
@@ -2965,9 +2898,9 @@ public:
          }
 
          ImGui::SeparatorText("Bloom DEV readout");
-         ImGui::Text("game=%s  bright-pass hits/frame=%d  (0 = capture hook never fired)", gname, gd.bloom_bright_pass_hits);
+         ImGui::Text("game=%s  bright pass captured this frame=%d  (0 = capture hook never fired)", GameName(g_me_game), int(gd.bloom_scale_captured_this_frame));
          ImGui::Text("threshold_live=%.4f  scale_live=%.4f  (-1 = not captured yet)", gd.bloom_threshold_live, gd.bloom_scale_live);
-         ImGui::Text("eff threshold=%.4f  eff intensity=%.4f", eff_thr, cb_luma_global_settings.GameSettings.BloomIntensity);
+         ImGui::Text("eff threshold=%.4f  eff intensity=%.4f", cb_luma_global_settings.GameSettings.BloomThreshold, cb_luma_global_settings.GameSettings.BloomIntensity);
       }
 #endif
    }
@@ -2975,7 +2908,8 @@ public:
 #if DEVELOPMENT
    void DrawImGuiDevSettings(DeviceData& device_data) override
    {
-      const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
+      const auto& gd = GetGameDeviceData(device_data);
+      const auto& stats = gd.mv_last_stats;
       ImGui::SeparatorText("Motion vector research");
       ImGui::BeginDisabled(perf_test_modes[Perf::g_test].set_aa); // The "Performance Test" mode owns it
       ImGui::Checkbox("MV Enable", &g_mv_enable);
@@ -2991,6 +2925,9 @@ public:
       ImGui::Checkbox("MV Skip Fill", &g_mv_skip_fill);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("No camera motion fill: pixels no patched draw wrote stay at zero, so the debug view shows the object draws alone. Not saved.");
+      ImGui::Checkbox("MV Probe", &g_mv_probe);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Logs \"[MELE Probe]\" lines to ReShade.log: every pass that reads the scene after its first motion vector draw, once per\nshader, phase and slot. Reads every draw's bindings (slower). Not saved.");
       if (ImGui::Button("MV Dump"))
          g_mv_dump = true;
       if (ImGui::IsItemHovered())
@@ -3002,7 +2939,7 @@ public:
       ImGui::Text("Constant updates copied: %u, upscaler draws: %u, scene ended by 0x%08X, matched with an identical camera: %u", stats.updates, stats.sr_draws, stats.ended_by, stats.matched_same_camera);
       ImGui::Text("Refused: %u extra target, %u no scene, %u other depth/color, %u format, %u size, %u create, %u blend, %u shaders", stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]);
       ImGui::Text("Last checked target: format %u, dimension %u, %ux%u (output %.0fx%.0f)", stats.rejected_format, stats.rejected_dimension, stats.rejected_width, stats.rejected_height, double(device_data.output_resolution.x), double(device_data.output_resolution.y));
-      ImGui::Text("Constant copies: %u registered buffers, %u pooled, %u destroyed; FXAA dispatches skipped: %u", stats.registered_buffers, stats.constants_pool, GetGameDeviceData(device_data).mv_destroyed_buffers, stats.fxaa_skipped);
+      ImGui::Text("Constant copies: %u registered buffers, %u pooled, %u destroyed; FXAA dispatches skipped: %u", stats.registered_buffers, stats.constants_pool, gd.mv_destroyed_buffers, stats.fxaa_skipped);
 
       ImGui::SeparatorText("Performance");
       Perf::DrawCombo(perf_test_modes, &g_perf_sweep, [&](int mode_index)
@@ -3074,10 +3011,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
       g_me_game = DetectMEGame();
-      // Per-game defaults; LoadConfigs may override the persisted ones afterwards.
-      const MEGameProfile profile = ProfileFor(g_me_game);
-      g_tonemap_perms = profile.tonemap_perms;
-      g_gtao_radius_override = profile.gtao_radius_override;
+      // Per-game defaults (ME1LE's are the globals' own); LoadConfigs may override the persisted ones afterwards. ME2LE/ME3LE's native
+      // HBAO+ radius is 48 uu against ME1LE's 30 uu: their GTAO radius override (native radius / DepthScale) is 0.96, ME1LE's 0 keeps
+      // the shader's own radius.
+      switch (g_me_game)
+      {
+      case MEGame::ME2LE:
+         g_tonemap_perms = kTonemapPermsME2LE;
+         g_gtao_radius_override = 0.96f;
+         break;
+      case MEGame::ME3LE:
+         g_tonemap_perms = kTonemapPermsME3LE;
+         g_gtao_radius_override = 0.96f;
+         break;
+      default:
+         break;
+      }
 
       Globals::SetGlobals(PROJECT_NAME, "Mass Effect Legendary Edition Luma mod", "", 3);
 
