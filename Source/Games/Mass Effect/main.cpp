@@ -1285,8 +1285,8 @@ class MassEffect final : public Game
                   translation_offset = kSkinnedTranslationOffset;
             }
             else if (reactive != 0)
-               patched = MotionVectorPatches::PatchPixelShaderReactive(code,
-                  desc->code_size, reactive == 2, &error);
+               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout,
+                  MotionVectorPatches::reactive_slot, reactive == 2, &error);
             else
                patched = MotionVectorPatches::PatchPixelShader(code, desc->code_size,
                   &error);
