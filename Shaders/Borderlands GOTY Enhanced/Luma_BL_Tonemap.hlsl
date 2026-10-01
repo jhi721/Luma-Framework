@@ -106,8 +106,8 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    // of the SDR reference below.
    float3 postMidtones = GradeUE3_PostMidtones(untonemapped, true);
 
-   // FXAA luma, read by the game's edge CS at SV_Target1: the original's log2 of the BT.709-weighted sum of the post-midtones color,
-   // a graded intermediate before the gamma exponent (see GradeUE3_PostMidtones).
+   // FXAA luma, read by the game's edge CS at SV_Target1: the original's log2 curve of the BT.709-weighted sum of the post-midtones
+   // color, a graded intermediate before the gamma exponent (see GradeUE3_PostMidtones).
    outLuma = 0.25 * log2(dot(postMidtones, float3(0.212670997, 0.715160012, 0.0721689984)) * 15.0 + 1.0);
 
 #if TONEMAP_TYPE >= 1

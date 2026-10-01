@@ -3,7 +3,7 @@
 //   as an extended HDR function, takes its hue from a soft ReinhardPiecewise reference through MacLeod-Boynton
 //   emulation, then DICE-maps to the display. The video (0x0E97A4A0) and lens-flare (0x010371F2) passes are
 //   replaced too. Core Display Composition does the paper-white scale + encode.
-//   One HDR mod owns the swapchain -> any other HDR mod must be removed from the game folder.
+//   Only one HDR mod can own the swapchain: any other must be removed from the game folder.
 // - AA: compute FXAA (3.11 work-queue) -> SMAA (ULTRA + color edge + depth predication) + optional RCAS. Edge
 //   detection reads the scene as stored, in GAMMA space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white); the blend
 //   filters it in linear light. The last pass writes the swapchain.
@@ -37,25 +37,24 @@
 //   0x81CDE53D = edge detection: a work queue per edge orientation, each pixel with its two colors packed as float16 (t0 = Color).
 //   0x43A10668 = the indirect dispatch arguments from the queue counts.
 //   0x78019A89 = resolve of one queue: blends each queued pixel's colors and writes Color (u0, the swapchain) in place.
-//   0x08891303 = resolve of the other queue, the same: WorkQueue + Luma + InColor(t2) -> Color(u0, swapchain in-place).
+//   0x08891303 = resolve of the other queue, the same way (InColor t2 aliases Color u0, the swapchain).
 // All four are skipped when SMAA or DLSS / FSR own the resolve (see "fxaa_replaced"): the last one is where SMAA / RCAS run. Left
 // running, the first resolve's half of FXAA would reach SMAA's input and the upscaled image.
 static constexpr uint32_t kFXAAEdgeHash = 0x81CDE53D;
 static constexpr uint32_t kFXAAArgumentsHash = 0x43A10668;
 static constexpr uint32_t kFXAAFirstResolveHash = 0x78019A89;
 static constexpr uint32_t kFXAAResolveHash = 0x08891303; // Replaced with SMAA (RCAS only after DLSS / FSR)
-static constexpr uint32_t kCelShadingHash = 0x08DC66D1;  // cel-shading edge PS — binds scene depth at t0 (predication source)
+static constexpr uint32_t kCelShadingHash = 0x08DC66D1;  // Cel-shading edge PS: binds the scene depth at t0 (the predication source)
 
-// AO: XeGTAO replaces the game's native NVIDIA HBAO+ (GFSDK_SSAO). Full-res 4K chain:
-// deinterleave 0xFFE232A6 -> normals 0xB2B47225 (left running) -> coarse horizon 0xF534EB09 -> bilateral
-// blur 0x4E1BEE34 -> apply-multiply PS 0x44764BF6. We capture scene depth at the deinterleave and the
-// packed view normals at the coarse pass (skipping both), then at the blur dispatch run the 4 XeGTAO passes
-// into ITS u0 (the game's FINAL r16g16_float AO; apply reads .x) so the apply blit composites our AO
-// unchanged. XeGTAO reads the game's own cb0 ($Globals: ProjInfo) + cb2 (MinZ_MaxZRatioCS), still bound at
-// the injection point. Noise frozen and denoise x2 without an upscaler, per frame and x1 with DLSS/FSR (see "IsGTAOTemporal").
-static constexpr uint32_t kAODeinterleaveHash = 0xFFE232A6; // scene depth -> quarter-res array — skipped (we build our own mip pyramid)
-static constexpr uint32_t kAOCoarseHash = 0xF534EB09;       // HBAO+ horizon march (x2), binds view normals at t0 — skipped (capture normals)
-static constexpr uint32_t kAOBlurHash = 0x4E1BEE34;         // bilateral blur -> FINAL r16g16_float u0 — replaced with XeGTAO
+// AO: XeGTAO replaces the game's native NVIDIA HBAO+ (GFSDK_SSAO). Full-res chain: deinterleave 0xFFE232A6 -> normals
+// 0xB2B47225 (left running) -> coarse horizon 0xF534EB09 -> bilateral blur 0x4E1BEE34 -> apply-multiply PS 0x44764BF6. The scene
+// depth is captured at the deinterleave and the packed view normals at the coarse pass (both skipped); at the blur dispatch the 4
+// XeGTAO passes write its u0 (the game's final r16g16_float AO, the apply reads .x), so the apply blit composites it unchanged.
+// XeGTAO reads the game's own cb0 ($Globals: ProjInfo) and cb2 (MinZ_MaxZRatioCS), still bound there. Noise and denoise count: see
+// "IsGTAOTemporal".
+static constexpr uint32_t kAODeinterleaveHash = 0xFFE232A6; // Scene depth -> quarter-res array: skipped (XeGTAO builds its own mip pyramid)
+static constexpr uint32_t kAOCoarseHash = 0xF534EB09;       // HBAO+ horizon march (x2), binds the view normals at t0: skipped (normals captured)
+static constexpr uint32_t kAOBlurHash = 0x4E1BEE34;         // Bilateral blur -> the final r16g16_float AO at u0: replaced with XeGTAO
 
 // DLSS / FSR: the scene's first post passes, which end a motion vector frame (the upscaler runs right before): the DOF/Bloom
 // gather CS (reads the scene copy and the depth copy), else the uber post (DOF and Bloom off in the game's settings).
@@ -145,7 +144,7 @@ static constexpr uint32_t smaa_idle_release_frames = 600;
 // User settings, persisted in the [Luma] config section (LoadConfigs) unless noted otherwise.
 static bool g_smaa_enable = true;
 static float g_rcas_sharpness = 0.f; // RCAS on the SMAA or DLSS / FSR output; off by default: the ink outlines are clean and sharpening haloes them
-static bool g_hide_ui = false;       // hide the game's HUD (skips swapchain-targeting UI draws) — for clean screenshots
+static bool g_hide_ui = false;       // Hides the game's HUD (skips its draws into the swapchain), for clean screenshots
 // SMAA predication on geometry. The signal is plane-deviation edge-ness built from the scene depth, not the depth
 // itself (see Luma_BL_DepthExtract.hlsl); the tolerance is the only free parameter and is a fraction of view
 // depth, so MoH Airborne's calibrated 0.02 carries over unchanged.
@@ -160,10 +159,10 @@ static bool g_smaa_pred_measure = false; // one-shot: read the mask back and log
 
 // Ambient Occlusion: XeGTAO replaces the native HBAO+, on by default. Persisted as "XeGTAOEnable".
 static bool g_gtao_enable = true;
-// Runtime XeGTAO knobs (LumaGTAO cb b11); their sliders are DEVELOPMENT/TEST only. FinalValuePower = primary darkness dial
-// (calibrate to the vanilla HBAO+ histogram — its PowExponent does not transfer numerically). DepthScale =
-// viewZ divisor (UE3 units, near plane ~10 -> ~meters) so Intel's tuned radius/falloff apply; the dial
-// against broad over-occlusion. RadiusOverride > 0 overrides EFFECT_RADIUS (in scaled units).
+// Runtime XeGTAO knobs (LumaGTAO cb b11); their sliders are DEVELOPMENT/TEST only. FinalValuePower: the primary darkness dial,
+// calibrated to the vanilla HBAO+ histogram (its PowExponent does not transfer numerically). DepthScale: the view z divisor (UE3
+// units, near plane ~10, to ~meters) so Intel's tuned radius and falloff apply; the dial against broad over-occlusion.
+// RadiusOverride > 0 overrides EFFECT_RADIUS (in scaled units).
 static float g_gtao_final_value_power = 1.0f;
 static float g_gtao_depth_scale = 50.f;
 static float g_gtao_radius_override = 0.f;
@@ -175,12 +174,12 @@ static constexpr int g_gtao_temporal = 0;
 static constexpr int g_gtao_debug_view = 0; // The shader's DebugViewRT is DEV only
 #endif
 
-// Loading-movie memory-leak fix ("Fix Movie Memory Leak" under Fixes). The game's Bink movies create D3D11 Y'CbCr decode buffers
-// and never release them -> linear RAM growth -> OOM; the leak is the game's, not Luma's. We drop the game's leaked COM refs on OLD
-// movie generations (orphaned: a movie's buffers are sampled only during its own playback), tagged by creation call-stack RVAs in
-// BorderlandsGOTY.exe (frozen remaster; a non-matching build tags nothing = safe no-op). Movies keep playing. Diagnosed and
-// validated with a resource tracker addon (live bytes by creation stack).
-static bool g_fix_movie_leak = true; // default ON; persisted as "FixMovieLeak"
+// "Fix Movie Memory Leak": the game's Bink movies create D3D11 Y'CbCr decode buffers and never release them, so RAM grows linearly
+// until OOM (the leak is the game's, not Luma's). The game's leaked COM references are dropped on old movie generations (orphaned:
+// a movie's buffers are sampled only during its own playback), tagged by creation call stack RVAs in BorderlandsGOTY.exe (a frozen
+// remaster; a non-matching build tags nothing, a safe no-op). Movies keep playing. Diagnosed and validated with a resource tracker
+// addon (live bytes by creation stack).
+static bool g_fix_movie_leak = true; // Persisted as "FixMovieLeak"
 
 namespace BLMovieLeakFix
 {
@@ -235,7 +234,7 @@ namespace BLMovieLeakFix
       return has_create && has_stream;
    }
 
-   // Tag movie YUV decode buffers at creation (stack walk only for >= 2MB buffers).
+   // Tags the movies' Y'CbCr decode buffers at creation (the stack is walked only from "STACKWALK_MIN_BYTES")
    void OnInitResource(reshade::api::device*, const reshade::api::resource_desc& desc, const reshade::api::subresource_data*, reshade::api::resource_usage, reshade::api::resource handle)
    {
       // Decode targets are BUFFERS (measured); gating on type excludes the textures that share the
@@ -1757,9 +1756,9 @@ public:
       };
       shader_defines_data.append_range(game_shader_defines_data);
 
-      // Post-process buffers in GAMMA space (UE3 engine, gamma-2.2 SDR): the gamma-SDR HUD blends on top in
-      // gamma to look vanilla (linear space washes it out). Tonemap pre-scales by GamePaperWhite/UIPaperWhite
-      // (UI_DRAW_TYPE 2); the core composition decodes gamma + applies paper white + scRGB encode.
+      // Post-process buffers stay gamma-encoded, as the game's gamma 2.2 SDR: the gamma SDR HUD then blends as in vanilla (a linear
+      // buffer washes it out). The tonemap pre-scales by GamePaperWhite / UIPaperWhite (UI_DRAW_TYPE 2); the composition decodes,
+      // applies paper white and encodes scRGB.
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0');
       GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('1'); // game shipped gamma-2.2 SDR
@@ -1803,8 +1802,8 @@ public:
       luma_data_cbuffer_index = 12;
       luma_ui_cbuffer_index = -1;
 
-      // Manual Scene + UI Paper White sliders instead of the OS HDR reference level. Core gates the separate
-      // "UI Paper White" slider on UI_DRAW_TYPE >= 1 && !use_os_reference_white_level. Default 203 nits (BT.2408).
+      // Scene and UI Paper White sliders by default, not the OS reference white level: Core shows the separate "UI Paper White" only
+      // with UI_DRAW_TYPE >= 1 and !use_os_reference_white_level. Default 203 nits (BT.2408).
       use_os_reference_white_level = false;
 
       // User controls (LumaSettings.GameSettings, see GameCBuffers.hlsl); the grade is vanilla by default.
@@ -2020,11 +2019,11 @@ public:
 
       // XeGTAO over the native HBAO+ (see the AO hash block above; deinterleave x2 -> normals -> coarse x2 -> blur -> apply blit).
       // The chain is taken over only when everything is ready at the first dispatch; a failure there leaves the whole native chain
-      // untouched, like the SMAA fp16 guard. The normals pass 0xB2B47225 isn't hooked: our main pass reads its ViewNormalTex output.
+      // untouched, like the SMAA fp16 guard. The normals pass 0xB2B47225 isn't hooked: the XeGTAO main pass reads its ViewNormalTex.
       if (g_gtao_enable)
       {
-         // (a) Deinterleave: capture the full-res r24 scene depth (t0) + build/validate ALL scratch, then skip
-         // the native dispatch. Both dispatches of the pair hit this branch (second is a cheap re-capture).
+         // (a) Deinterleave: captures the full-res r24 scene depth (t0) and builds every scratch resource, then skips the native
+         // dispatch. Both dispatches of the pair come here (the second is a cheap re-capture).
          if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
          {
             if (!AllShadersReady(device_data.native_compute_shaders, {CompileTimeStringHash("BL XeGTAO Prefilter Depths CS"), CompileTimeStringHash("BL XeGTAO Main Pass CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS")}))
@@ -2042,7 +2041,6 @@ public:
                return DrawOrDispatchOverrideType::None;
             const uint32_t w = depth_size.x, h = depth_size.y;
 
-            // (Re)create the scratch at the game's AO full-res (cached; NOT per-frame).
             if (gd.gtao_w != w || gd.gtao_h != h)
             {
                gd.ReleaseGTAOScratch();
@@ -2085,8 +2083,8 @@ public:
             return DrawOrDispatchOverrideType::Replaced; // skip the native deinterleave
          }
 
-         // (b) Coarse horizon march: capture the packed view normals (t0), skip the native dispatch. Only when
-         // we own the chain this frame — otherwise the native pipeline is left fully intact.
+         // (b) Coarse horizon march: captures the packed view normals (t0) and skips the native dispatch, only when the chain was taken
+         // over this frame (else the native chain runs whole).
          if (original_shader_hashes.Contains(kAOCoarseHash, reshade::api::shader_stage::compute))
          {
             if (!gd.srv_gtao_depth)
@@ -2098,8 +2096,8 @@ public:
             return DrawOrDispatchOverrideType::Replaced; // skip the native coarse march
          }
 
-         // (c) Bilateral blur: ITS u0 is the game's FINAL r16g16_float AO — run the 4 XeGTAO passes into it and
-         // cancel the native dispatch. The game's apply blit (untouched) then multiplies it into the scene.
+         // (c) Bilateral blur: its u0 is the game's final r16g16_float AO. The 4 XeGTAO passes write it in place of the native dispatch;
+         // the game's apply blit (untouched) then multiplies it into the scene.
          if (original_shader_hashes.Contains(kAOBlurHash, reshade::api::shader_stage::compute))
          {
             if (!gd.srv_gtao_depth)
@@ -2148,7 +2146,7 @@ public:
                native_device_context->Dispatch(groups_x, groups_y, 1);
                native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uav_nulls.data(), nullptr);
             };
-            // 1) Prefilter: game full-res depth -> our R32F mip pyramid (each thread does 2x2 -> 16x16 per group).
+            // 1) Prefilter: the game's full-res depth -> the R32F mip pyramid (2x2 per thread, 16x16 per group).
             dispatch(cs_prefilter, {gd.srv_gtao_depth.get()}, {gd.gtao_depth_mip_uavs[0].get(), gd.gtao_depth_mip_uavs[1].get(), gd.gtao_depth_mip_uavs[2].get(), gd.gtao_depth_mip_uavs[3].get(), gd.gtao_depth_mip_uavs[4].get()}, (w + 15) / 16, (h + 15) / 16);
             // 2) Main pass: pyramid + game view normals -> AO+edges (working0).
             dispatch(cs_main, {gd.srv_gtao_depth_mips.get(), gd.srv_gtao_normals.get()}, {gd.uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
@@ -2199,17 +2197,17 @@ public:
          return DrawOrDispatchOverrideType::Replaced;
       }
 
-      // Replace the compute FXAA resolve with SMAA. Replace EVERY occurrence in the frame (the game can run the
-      // resolve more than once — e.g. menu/transition frames have two), each with its own InColor/Color target.
-      // After DLSS / FSR (which already antialiased the scene, FXAA would blur it) only RCAS runs, or nothing.
+      // The compute FXAA resolve, replaced with SMAA at every occurrence in the frame (menu and transition frames run two), each with
+      // its own InColor / Color target. After DLSS / FSR (which already antialiased the scene, FXAA would blur it) only RCAS runs, or
+      // nothing.
       if ((g_smaa_enable || device_data.has_drawn_sr) && !is_custom_pass &&
           original_shader_hashes.Contains(kFXAAResolveHash, reshade::api::shader_stage::compute))
       {
          // Without this chain's earlier passes the game's resolve would read a stale queue: anything that can't run here skips it
          const DrawOrDispatchOverrideType fallback = (gd.fxaa_replaced ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None);
-         // FXAA resolve is IN-PLACE: InColor (t2) aliases Color (u0 = swapchain), so D3D auto-unbinds the SRV at
-         // dispatch (t2 reads null). We therefore source the scene color from the UAV's resource (it holds the
-         // tonemapped pre-FXAA color, since we're replacing FXAA) by copying it into an SRV-capable temp.
+         // The resolve is in place: InColor (t2) aliases Color (u0, the swapchain), so D3D11 unbinds the SRV at dispatch (t2 reads
+         // null). The scene color (tonemapped, pre-FXAA, the earlier FXAA passes being skipped) is taken from the UAV's resource
+         // instead, copied into an SRV-capable snapshot.
          ComPtr<ID3D11UnorderedAccessView> uav_color;
          native_device_context->CSGetUnorderedAccessViews(0, 1, uav_color.put());
          if (!uav_color)
@@ -2226,9 +2224,9 @@ public:
          const uint32_t w = cinfo.x, h = cinfo.y;
          if (w == 0 || h == 0)
             return fallback;
-         // fp16 guard: the SMAA path forces R16G16B16A16_FLOAT temps; CopyResource silently no-ops on a format
-         // mismatch, so a non-fp16 swapchain (HDR upgrade absent) would feed SMAA uninitialized memory and copy
-         // garbage back. Bail to the game's native FXAA instead of shipping a corrupt frame.
+         // fp16 guard: the SMAA path uses R16G16B16A16_FLOAT temps and CopyResource silently no-ops on a format mismatch, so a
+         // non-fp16 swapchain (HDR upgrade absent) would feed SMAA uninitialized memory and copy garbage back. The game's FXAA runs
+         // instead.
          if (cfmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
          {
 #if DEVELOPMENT || TEST
@@ -2255,9 +2253,9 @@ public:
             gd.smaa_h = h;
          }
 
-         // Predication depth is valid only if captured this frame AND it matches the color dimensions (a resolution
-         // change can leave a different-size depth). When invalid we pass a null predication texture and a scale of
-         // 1.0 so SMAA uses the plain ULTRA threshold rather than the doubled predicated baseline.
+         // Predication depth is valid only if captured this frame and sized like the color (a resolution change can leave a
+         // different-size depth). When invalid, a null predication texture and a scale of 1.0 give SMAA the plain ULTRA threshold
+         // rather than the doubled predicated baseline.
          auto* pred_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL Depth Extract CS"));
          bool pred_ok = smaa && g_smaa_predication && gd.srv_depth && gd.cb_game_offsets && pred_cs != nullptr;
          if (pred_ok)
@@ -2355,8 +2353,8 @@ public:
             auto* debug_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
             if (copy_vs != nullptr && debug_ps != nullptr && create_smaa_out())
             {
-               // The mask is single-channel, so the core copy lands it in RED - unmistakably a debug view. It
-               // REPLACES the antialiased frame, reusing the same temp-then-copy route the fallback path takes.
+               // The single-channel mask lands in red through Core's copy, in place of the antialiased frame, through SMAA's output
+               // temp copied into the target.
                DrawStateStack<DrawStateStackType::FullGraphics> debug_state;
                debug_state.Cache(native_device_context, device_data.uav_max_count);
                DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
@@ -2384,7 +2382,7 @@ public:
             if (smaa_into_temp && !create_smaa_out())
                return fallback;
 
-            // Bind metrics at VS+PS b1 (DrawSMAA restores VS/PS/SRVs/RTs but NOT cbuffer slots).
+            // The metrics at VS and PS b1, put back after (DrawSMAA restores shaders, SRVs and targets, not constant buffers)
             ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
             native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
             native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
@@ -2417,7 +2415,7 @@ public:
          }
          if (do_sharpen && sharpen_target)
          {
-            // DrawCustomPixelShader does NOT restore state -> wrap in core's DrawStateStack<FullGraphics>.
+            // DrawCustomPixelShader doesn't restore state
             DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
             sharpen_state.Cache(native_device_context, device_data.uav_max_count);
 
@@ -2645,8 +2643,8 @@ public:
                "[BL-Leak] no movie buffers detected after warmup -- game build may differ from the one this leak fix targets; the fix is inactive (RAM-growth crash not mitigated).");
       }
 
-      // Predication inputs are captured per-frame at the cel pass; drop them every present so a frame without that
-      // pass (menu/transition/reorder) uses NO predication, not last frame's (possibly wrong-size) depth.
+      // Predication inputs are captured per frame at the cel pass and dropped every present, so a frame without that pass (menus,
+      // transitions) uses no predication rather than last frame's (possibly wrong-size) depth.
       gd.srv_depth.reset();
       gd.cb_game_offsets.reset();
 
@@ -2911,14 +2909,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       uint32_t mod_version = 3; // a bump resets stale shader-define slots and cached settings/shaders
       Globals::SetGlobals(cleared_project_name, "Borderlands GOTY Enhanced Luma HDR + SMAA mod", "", mod_version);
 
-      // Native HDR: swapchain -> scRGB fp16; core Display Composition does the paper-white scale + scRGB encode +
-      // gamut map at present. Replaced tonemap PS writes gamma-encoded HDR (1.0 = paper white) into the (now fp16) post chain.
+      // scRGB fp16 swapchain; the replaced tonemap writes gamma-encoded HDR (1.0 = paper white) into the fp16 post chain, and the
+      // Display Composition scales paper white, encodes and gamut maps at present.
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // r8g8b8a8_unorm backbuffer -> r16g16b16a16_float
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       // Safety minimum: the remaster already renders its post chain in fp16. r10g10b10a2 covers any 10-bit target at
       // swapchain size (the backbuffer itself is r8g8b8a8); r11g11b10_float includes the HBAO+ view normals XeGTAO
-      // reads. r8g8b8a8 / b8g8r8a8 are left alone deliberately - nothing downstream needs them, and _srgb -> fp16 risks a
+      // reads. r8g8b8a8 / b8g8r8a8 are left alone deliberately: nothing downstream needs them, and _srgb -> fp16 risks a
       // sampling shift.
       texture_upgrade_formats = {
          reshade::api::format::r10g10b10a2_unorm,
