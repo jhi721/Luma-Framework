@@ -33,6 +33,14 @@ namespace MotionVectorPatches
    constexpr uint32_t target_slot = 4;
 
    // For Core's patches ("motion_vector_patch.h")
-   constexpr MotionVectorPatch::Layout layout = {object_slot, previous_slots, jitter_slot, resource_slots, previous_resources_slot,
-      current_position_register, previous_position_register, target_slot};
+   constexpr MotionVectorPatch::Layout layout = {
+      .object_slot = object_slot,
+      .previous_slots = previous_slots,
+      .jitter_slot = jitter_slot,
+      .resource_slots = resource_slots,
+      .previous_resources_slot = previous_resources_slot,
+      .current_position_register = current_position_register,
+      .previous_position_register = previous_position_register,
+      .target_slot = target_slot,
+   };
 } // namespace MotionVectorPatches

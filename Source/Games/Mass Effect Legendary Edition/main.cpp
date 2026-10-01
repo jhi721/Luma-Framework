@@ -51,7 +51,9 @@ static MEGame DetectMEGame()
 {
    std::string exe = System::GetProcessExecutableName();
    for (auto& c : exe)
+   {
       c = (char)tolower((unsigned char)c);
+   }
    if (exe.find("masseffect3") != std::string::npos)
       return MEGame::ME3LE;
    if (exe.find("masseffect2") != std::string::npos)
@@ -59,10 +61,20 @@ static MEGame DetectMEGame()
    return MEGame::ME1LE; // Also an unknown executable
 }
 
+#if DEVELOPMENT // Only the DEV readouts and logs name the game
 static const char* GameName(MEGame game)
 {
-   return game == MEGame::ME3LE ? "ME3LE" : (game == MEGame::ME2LE ? "ME2LE" : "ME1LE");
+   switch (game)
+   {
+   case MEGame::ME3LE:
+      return "ME3LE";
+   case MEGame::ME2LE:
+      return "ME2LE";
+   default:
+      return "ME1LE";
+   }
 }
+#endif
 
 // SMAA replaces the shared MiniEngine FXAA resolve on the fp16 gamma post buffer. The prepass and indirect-
 // argument dispatches touch only work queues: skipped with the resolves when SMAA or DLSS / FSR own them.
@@ -256,6 +268,22 @@ struct RGBA16FTarget
    uint32_t w = 0, h = 0;
 };
 
+// Why "DrawWithMotionVectors" refused a draw: the DEV counters, the MCP trace note, and the names they are logged and registered
+// under
+enum MotionVectorReject : int
+{
+   REJECT_EXTRA_TARGET,
+   REJECT_NO_SCENE,
+   REJECT_OTHER_DEPTH_COLOR,
+   REJECT_FORMAT,
+   REJECT_SIZE,
+   REJECT_CREATE,
+   REJECT_BLEND,
+   REJECT_SHADERS,
+   REJECT_COUNT
+};
+static constexpr const char* kMotionVectorRejectNames[REJECT_COUNT] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
+
 // Per-device resources and per-frame state. SMAA detects edges on a gamma snapshot and blends it filtered in linear light.
 struct MassEffectGameDeviceData final : public GameDeviceData
 {
@@ -358,13 +386,13 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // The frame's scene depth (the depth view's resource), its last copy, and a view of the one the camera fill and the upscaler
    // read (the depth itself if it can be read, else the copy)
    com_ptr<ID3D11Resource> mv_depth;
-   uint64_t mv_depth_copy = 0;
+   com_ptr<ID3D11Resource> mv_depth_copy;
    com_ptr<ID3D11ShaderResourceView> mv_depth_srv;
    bool mv_fill_pending = false;
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    // The fp16 scene the motion vector draws write, and its last copy (UE3's resolve into "SceneColorTexture": the post passes read it)
    com_ptr<ID3D11Resource> mv_scene_color;
-   uint64_t mv_scene_color_copy = 0;
+   com_ptr<ID3D11Resource> mv_scene_color_copy;
    // The projection jitter (pixels, +y down), chosen when the scene opens; its NDC offset is at VS "MotionVectorPatches::jitter_slot"
    // of every mesh draw depth tested against the scene
    std::array<float, 2> mv_jitter = {};
@@ -384,7 +412,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
    ID3D11RenderTargetView* mv_refused_rtv = nullptr;
    ID3D11DepthStencilView* mv_refused_dsv = nullptr;
-   int mv_refused_reason = 0;
+   MotionVectorReject mv_refused_reason = REJECT_EXTRA_TARGET;
    ID3D11BlendState* mv_blend_state = nullptr;
    bool mv_blend_opaque = true;
    bool mv_blend_depth_only = false; // RT0 writes no color (a depth-only pass, or an occlusion query box)
@@ -457,7 +485,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       uint32_t constants_pool = 0;      // At present: the pooled copies (see "NewConstantsCopy")
       uint32_t fxaa_skipped = 0;        // FXAA dispatches skipped before the replaced resolve (see "fxaa_replaced")
       uint32_t ended_by = 0;
-      uint32_t rejected[8] = {};                                                                     // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
+      uint32_t rejected[REJECT_COUNT] = {};                                                          // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
       uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
@@ -499,6 +527,10 @@ class MassEffectLE final : public Game
    static MassEffectGameDeviceData& GetGameDeviceData(DeviceData& device_data)
    {
       return *static_cast<MassEffectGameDeviceData*>(device_data.game);
+   }
+   static const MassEffectGameDeviceData& GetGameDeviceData(const DeviceData& device_data)
+   {
+      return *static_cast<const MassEffectGameDeviceData*>(device_data.game);
    }
 
 #if DEVELOPMENT
@@ -582,9 +614,13 @@ class MassEffectLE final : public Game
          if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, target->tex.put())))
          {
             if (bind_flags & D3D11_BIND_RENDER_TARGET)
+            {
                device->CreateRenderTargetView(target->tex.get(), nullptr, target->rtv.put());
+            }
             if (bind_flags & D3D11_BIND_SHADER_RESOURCE)
+            {
                device->CreateShaderResourceView(target->tex.get(), nullptr, target->srv.put());
+            }
             target->w = w;
             target->h = h;
          }
@@ -592,19 +628,21 @@ class MassEffectLE final : public Game
       return target->tex && (!(bind_flags & D3D11_BIND_RENDER_TARGET) || target->rtv) && (!(bind_flags & D3D11_BIND_SHADER_RESOURCE) || target->srv);
    }
 
-   static void ReleaseGTAOScratch(MassEffectGameDeviceData& gd)
+   static void ReleaseGTAOScratch(MassEffectGameDeviceData* gd)
    {
-      gd.tex_gtao_depth_mips.reset();
-      for (auto& uav : gd.gtao_depth_mip_uavs)
+      gd->tex_gtao_depth_mips.reset();
+      for (auto& uav : gd->gtao_depth_mip_uavs)
+      {
          uav.reset();
-      gd.srv_gtao_depth_mips.reset();
+      }
+      gd->srv_gtao_depth_mips.reset();
       for (int i = 0; i < 2; i++)
       {
-         gd.tex_gtao_working[i].reset();
-         gd.uav_gtao_working[i].reset();
-         gd.srv_gtao_working[i].reset();
+         gd->tex_gtao_working[i].reset();
+         gd->uav_gtao_working[i].reset();
+         gd->srv_gtao_working[i].reset();
       }
-      gd.gtao_w = gd.gtao_h = 0;
+      gd->gtao_w = gd->gtao_h = 0;
    }
 
    // Motion vectors: the copies of the scene and of its depth while it's open (the last ones before the first post pass are what
@@ -615,16 +653,22 @@ class MassEffectLE final : public Game
       if (game_device_data.mv_scene_open)
       {
          if (src_resource == uint64_t(game_device_data.mv_scene_color.get()))
-            game_device_data.mv_scene_color_copy = dst_resource;
+         {
+            game_device_data.mv_scene_color_copy.reset(reinterpret_cast<ID3D11Resource*>(dst_resource));
+         }
          else if (src_resource == uint64_t(game_device_data.mv_depth.get()))
-            game_device_data.mv_depth_copy = dst_resource;
+         {
+            game_device_data.mv_depth_copy.reset(reinterpret_cast<ID3D11Resource*>(dst_resource));
+         }
       }
 #if DEVELOPMENT
-      else if (g_mv_probe && game_device_data.mv_scene_done && (src_resource == uint64_t(game_device_data.mv_scene_color.get()) || src_resource == game_device_data.mv_scene_color_copy))
+      else if (g_mv_probe && game_device_data.mv_scene_done && (src_resource == uint64_t(game_device_data.mv_scene_color.get()) || src_resource == uint64_t(game_device_data.mv_scene_color_copy.get())))
       {
          const std::string line = std::format("[MELE Probe] copy of the scene after its end -> 0x{:X}", dst_resource);
          if (game_device_data.probe_logged.insert(line).second)
+         {
             reshade::log::message(reshade::log::level::info, line.c_str());
+         }
       }
 #endif
       return false;
@@ -659,14 +703,14 @@ class MassEffectLE final : public Game
 
    // An upscaler is picked and hasn't failed (it then gives way to SMAA until picked again). Fixed for the whole frame (see
    // "OnPresent"): a selection made after the motion vector state was set would otherwise run the upscaler on mixed state.
-   static bool IsSRActive(DeviceData& device_data)
+   static bool IsSRActive(const DeviceData& device_data)
    {
       return GetGameDeviceData(device_data).sr_active;
    }
 
    // XeGTAO noise per frame and one denoise pass (Intel's XeGTAO.h with TAA) while DLSS / FSR accumulate the lit scene the AO multiplies
    // into; without them a moving pattern would boil, so it stays frozen and denoises twice
-   static bool IsGTAOTemporal(DeviceData& device_data)
+   static bool IsGTAOTemporal(const DeviceData& device_data)
    {
       return g_gtao_temporal ? g_gtao_temporal == 2 : IsSRActive(device_data);
    }
@@ -676,7 +720,9 @@ class MassEffectLE final : public Game
    {
       std::array<float, 3> translation = {};
       if (camera.size() >= kPreViewTranslationOffset + sizeof(translation))
+      {
          std::memcpy(translation.data(), camera.data() + kPreViewTranslationOffset, sizeof(translation));
+      }
       return translation;
    }
 
@@ -693,7 +739,9 @@ class MassEffectLE final : public Game
          const uint32_t count = game_device_data->mv_filtered_buffer_count.load(std::memory_order_relaxed);
          uint32_t slot = 0;
          while (slot < (std::min)(count, MassEffectGameDeviceData::max_filtered_buffers) && game_device_data->mv_filtered_buffers[slot].load(std::memory_order_relaxed) != MassEffectGameDeviceData::destroyed_buffer_slot)
+         {
             slot++;
+         }
          if (slot < MassEffectGameDeviceData::max_filtered_buffers)
          {
             D3D11_BUFFER_DESC desc;
@@ -703,7 +751,9 @@ class MassEffectLE final : public Game
          }
          // Past the list, the count still grows: every buffer then takes the lock
          if (slot >= count)
+         {
             game_device_data->mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
+         }
       }
       return entry->second;
    }
@@ -739,9 +789,13 @@ class MassEffectLE final : public Game
             auto copy = game_device_data->mv_constants_pool[free_copies->second.back()];
             free_copies->second.pop_back();
             if (bytes)
+            {
                std::memcpy(copy->data(), bytes, size);
+            }
             else
+            {
                std::fill(copy->begin(), copy->end(), uint8_t(0));
+            }
             return copy;
          }
       }
@@ -859,9 +913,13 @@ class MassEffectLE final : public Game
             const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
             const auto* code = static_cast<const uint8_t*>(desc->code);
             if constexpr (vertex)
+            {
                patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error);
+            }
             else
+            {
                patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error);
+            }
             com_ptr<ID3D11ShaderReflection> reflection;
             if (vertex && !patched.empty() && Shader::d3d_reflect && SUCCEEDED(Shader::d3d_reflect(code, desc->code_size, IID_PPV_ARGS(&reflection))))
             {
@@ -882,24 +940,34 @@ class MassEffectLE final : public Game
                      entry.translation_offset = variable_desc.StartOffset + 3 * 16;
                   }
                   for (size_t i = 0; i < entry.read_sizes.size(); i++)
+                  {
                      entry.read_sizes[i] = DXBC::ConstantBufferBytes(code, desc->code_size, MotionVectorPatches::previous_slots[i].first);
+                  }
                }
             }
          }
       }
       if (!patched.empty())
       {
-         HRESULT hr;
+         HRESULT hr = E_FAIL;
          if constexpr (vertex)
+         {
             hr = native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &entry.shader);
+         }
          else
+         {
             hr = native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.shader);
+         }
          if (FAILED(hr))
+         {
             error = std::format("create 0x{:08X}", uint32_t(hr));
+         }
       }
       // Failures in every build (bug reports), every patched shader only in development
       if (DEVELOPMENT || !entry.shader)
+      {
          reshade::log::message((entry.shader || screen_space) ? reshade::log::level::info : reshade::log::level::warning, std::format("[MELE MV] {} 0x{:08X} {}", vertex ? "VS" : "PS", hash, entry.shader ? "patched" : error).c_str());
+      }
       const std::unique_lock lock(game_device_data.mv_mutex);
       return shaders->try_emplace(hash, std::move(entry)).first->second;
    }
@@ -925,7 +993,9 @@ class MassEffectLE final : public Game
          return;
       D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
       if (depth_stencil_state)
+      {
          depth_stencil_state->GetDesc(&depth_desc);
+      }
       game_device_data->depth_test = depth_desc.DepthEnable;
       game_device_data->depth_write = depth_desc.DepthEnable && depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
       game_device_data->depth_stencil_state = depth_stencil_state.get();
@@ -939,7 +1009,7 @@ class MassEffectLE final : public Game
          return {};
       const float* const vp = reinterpret_cast<const float*>(camera.data());
       const double w_axis = double(vp[3]) * vp[3] + double(vp[7]) * vp[7] + double(vp[11]) * vp[11];
-      const double a = w_axis > 0.0 ? (double(vp[2]) * vp[3] + double(vp[6]) * vp[7] + double(vp[10]) * vp[11]) / w_axis : 0.0;
+      const double a = (w_axis > 0.0 ? (double(vp[2]) * vp[3] + double(vp[6]) * vp[7] + double(vp[10]) * vp[11]) / w_axis : 0.0);
       return {a, double(vp[14]) - a * vp[15]};
    }
 
@@ -981,7 +1051,7 @@ class MassEffectLE final : public Game
 
    // Whether a depth view is output sized (the scene's, not a shadow's or a capture's own), cached for the last view checked (reset at
    // present: views can be recreated)
-   static bool IsOutputSizedDepth(DeviceData& device_data, MassEffectGameDeviceData* game_device_data, ID3D11DepthStencilView* dsv)
+   static bool IsOutputSizedDepth(const DeviceData& device_data, MassEffectGameDeviceData* game_device_data, ID3D11DepthStencilView* dsv)
    {
       if (dsv != game_device_data->view_dsv)
       {
@@ -997,7 +1067,7 @@ class MassEffectLE final : public Game
    // A later view into output sized depth than the one that opened the scene: a scene capture (not mirrored: another camera, a far near
    // plane) draws into the scene's targets before the main view, every other frame. The main view is the last one before post, so the
    // scene reopens for it. Needs "IsMirroredView" first (it reads the draw's b1).
-   static bool IsNewView(DeviceData& device_data, MassEffectGameDeviceData* game_device_data, ID3D11DepthStencilView* dsv)
+   static bool IsNewView(const DeviceData& device_data, MassEffectGameDeviceData* game_device_data, ID3D11DepthStencilView* dsv)
    {
       if (!game_device_data->view_camera || game_device_data->view_camera == game_device_data->scene_view_camera || !IsOutputSizedDepth(device_data, game_device_data, dsv))
          return false;
@@ -1010,10 +1080,14 @@ class MassEffectLE final : public Game
       const std::array<float, 3> scene_translation = GetPreViewTranslation(*scene_camera), translation = GetPreViewTranslation(*camera);
       const double scene_near = ViewNearPlane(*scene_camera), near_plane = ViewNearPlane(*camera);
       const double scene_determinant = ViewDeterminant(*scene_camera), determinant = ViewDeterminant(*camera);
-      const bool same_view = std::abs(scene_translation[0] - translation[0]) <= 1.f && std::abs(scene_translation[1] - translation[1]) <= 1.f && std::abs(scene_translation[2] - translation[2]) <= 1.f &&
-                             std::abs(scene_near - near_plane) <= 0.01 * std::abs(scene_near) && std::abs(scene_determinant - determinant) <= 0.01 * std::abs(scene_determinant);
+      const bool same_position = std::abs(scene_translation[0] - translation[0]) <= 1.f && std::abs(scene_translation[1] - translation[1]) <= 1.f && std::abs(scene_translation[2] - translation[2]) <= 1.f;
+      const bool same_near_plane = std::abs(scene_near - near_plane) <= 0.01 * std::abs(scene_near);
+      const bool same_determinant = std::abs(scene_determinant - determinant) <= 0.01 * std::abs(scene_determinant);
+      const bool same_view = same_position && same_near_plane && same_determinant;
       if (same_view)
+      {
          game_device_data->scene_view_camera = camera;
+      }
       return !same_view;
    }
 
@@ -1034,9 +1108,9 @@ class MassEffectLE final : public Game
       game_device_data.scene_view_camera = game_device_data.view_camera;
       game_device_data.mv_depth.reset();
       dsv->GetResource(&game_device_data.mv_depth);
-      game_device_data.mv_depth_copy = 0;
+      game_device_data.mv_depth_copy.reset();
       game_device_data.mv_scene_color.reset();
-      game_device_data.mv_scene_color_copy = 0;
+      game_device_data.mv_scene_color_copy.reset();
       game_device_data.jitter_dsv = nullptr;
       game_device_data.depth_stencil_state = nullptr;
       game_device_data.depth_test = true;
@@ -1049,13 +1123,14 @@ class MassEffectLE final : public Game
       game_device_data.mv_blend_opaque = true;
       game_device_data.mv_blend_depth_only = false;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
-      const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
+      const SR::InstanceData* const sr_instance_data = (IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr);
+      const unsigned int phase_count = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
+      const unsigned int phase = cb_luma_global_settings.FrameIndex % phase_count;
       bool jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter;
 #if DEVELOPMENT
       jitter &= perf_test_modes[Perf::g_test].motion_vector_draws >= 1; // "Performance Test" without jitter draws
 #endif
-      game_device_data.mv_jitter = jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+      game_device_data.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
       game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / device_data.output_resolution.x, game_device_data.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -1068,6 +1143,17 @@ class MassEffectLE final : public Game
    }
 
 #if DEVELOPMENT
+   // " <count> <reason>" for every refusal reason, for the DEV panel and the periodic log
+   static std::string FormatRejects(const MassEffectGameDeviceData::MotionVectorStats& stats)
+   {
+      std::string text;
+      for (int reject = 0; reject < REJECT_COUNT; reject++)
+      {
+         text += std::format(" {} {}", stats.rejected[reject], kMotionVectorRejectNames[reject]);
+      }
+      return text;
+   }
+
 #define MV_REJECT(reason) ([&](auto& gd) { gd.mv_stats.rejected[reason]++; gd.mv_draw_reject = int(reason); return false; }(GetGameDeviceData(device_data)))
 #else
 #define MV_REJECT(reason) false
@@ -1083,17 +1169,17 @@ class MassEffectLE final : public Game
       for (UINT slot = MotionVectorPatches::target_slot; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; slot++)
       {
          if (rtvs[slot] && (slot != MotionVectorPatches::target_slot || rtvs[slot] != game_device_data.mv_rtv))
-            return MV_REJECT(0);
+            return MV_REJECT(REJECT_EXTRA_TARGET);
       }
       if (!rtvs[0] || !dsv || !game_device_data.mv_scene_open)
-         return MV_REJECT(1);
+         return MV_REJECT(REJECT_NO_SCENE);
       // Known targets: checked, and the motion vector target built for them
       if (rtvs[0].get() != game_device_data.mv_accepted_rtv || dsv != game_device_data.mv_accepted_dsv)
       {
          // Refused targets stay refused until the scene reopens (the scene depth and color only change there)
          if (rtvs[0].get() == game_device_data.mv_refused_rtv && dsv == game_device_data.mv_refused_dsv)
             return MV_REJECT(game_device_data.mv_refused_reason);
-         const auto refuse = [&](int reason)
+         const auto refuse = [&](MotionVectorReject reason)
          {
             game_device_data.mv_refused_rtv = rtvs[0].get();
             game_device_data.mv_refused_dsv = dsv;
@@ -1105,14 +1191,16 @@ class MassEffectLE final : public Game
          com_ptr<ID3D11Resource> color;
          rtvs[0]->GetResource(&color);
          if (depth != game_device_data.mv_depth || !color || (game_device_data.mv_scene_color && color != game_device_data.mv_scene_color))
-            return refuse(2);
+            return refuse(REJECT_OTHER_DEPTH_COLOR);
          // UE3 may view its single sample targets as multisampled (TEXTURE2DMS)
          D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
          rtvs[0]->GetDesc(&rtv_desc);
          com_ptr<ID3D11Texture2D> color_texture;
          D3D11_TEXTURE2D_DESC color_desc = {};
          if (SUCCEEDED(color->QueryInterface(&color_texture)))
+         {
             color_texture->GetDesc(&color_desc);
+         }
 #if DEVELOPMENT
          game_device_data.mv_stats.rejected_format = rtv_desc.Format;
          game_device_data.mv_stats.rejected_dimension = rtv_desc.ViewDimension;
@@ -1120,15 +1208,17 @@ class MassEffectLE final : public Game
          game_device_data.mv_stats.rejected_height = color_desc.Height;
 #endif
          if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || (rtv_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D && rtv_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2DMS) || color_desc.SampleDesc.Count != 1)
-            return refuse(3);
+            return refuse(REJECT_FORMAT);
          const uint2 size = {color_desc.Width, color_desc.Height};
          if (size.x != device_data.output_resolution.x || size.y != device_data.output_resolution.y)
-            return refuse(4);
+            return refuse(REJECT_SIZE);
          game_device_data.mv_scene_color = color;
          const std::unique_lock lock(game_device_data.mv_mutex);
          D3D11_TEXTURE2D_DESC desc = {};
          if (game_device_data.mv_texture)
+         {
             game_device_data.mv_texture->GetDesc(&desc);
+         }
          // R16G16_FLOAT: DLSS takes it, FSR keeps 16 bits internally; the error is under 0.1% of the motion (Borderlands GOTY Enhanced)
          constexpr DXGI_FORMAT format = DXGI_FORMAT_R16G16_FLOAT;
          if (desc.Width != size.x || desc.Height != size.y)
@@ -1139,15 +1229,17 @@ class MassEffectLE final : public Game
             // The fill reads the target back through its UAV
             D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {format};
             const bool typed_uav_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
-            desc = {size.x, size.y, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
+            desc = {.Width = size.x, .Height = size.y, .MipLevels = 1, .ArraySize = 1, .Format = format, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
             if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.mv_texture)) || FAILED(native_device->CreateRenderTargetView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_rtv)))
             {
                game_device_data.mv_texture.reset();
                game_device_data.mv_rtv.reset();
-               return MV_REJECT(5);
+               return MV_REJECT(REJECT_CREATE);
             }
             if (typed_uav_load)
+            {
                native_device->CreateUnorderedAccessView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_uav);
+            }
             game_device_data.mv_frame_ended = true;
          }
          game_device_data.mv_accepted_rtv = rtvs[0].get();
@@ -1159,7 +1251,9 @@ class MassEffectLE final : public Game
       {
          D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
          if (blend_state)
+         {
             blend_state->GetDesc(&blend_desc);
+         }
          // Additive lights, decals and translucents keep the motion vectors of what's behind them (every blend state writes the motion
          // vector target, see "OnCreateBlendState")
          const D3D11_RENDER_TARGET_BLEND_DESC& rt0_blend = blend_desc.RenderTarget[0];
@@ -1170,9 +1264,11 @@ class MassEffectLE final : public Game
       // A draw that writes no color owns its pixels only if it writes depth: the alpha tested depth pass of long hair (ME3 LE
       // 0x89BD83EE, its color drawn blended afterwards), not occlusion query bounding boxes (depth tested, not written)
       if (game_device_data.mv_blend_depth_only)
+      {
          CacheDepthStencilState(native_device_context, &game_device_data);
+      }
       if (!game_device_data.mv_blend_opaque && !(game_device_data.mv_blend_depth_only && game_device_data.depth_write))
-         return MV_REJECT(6);
+         return MV_REJECT(REJECT_BLEND);
 
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
       if (const uint32_t pixel_shader_hash = original_shader_hashes.pixel_shaders[0]; pixel_shader_hash != game_device_data.mv_last_pixel_shader_hash)
@@ -1182,7 +1278,7 @@ class MassEffectLE final : public Game
       }
       ID3D11PixelShader* const pixel_shader = game_device_data.mv_last_pixel_shader;
       if (!vertex_shader || !pixel_shader || !game_device_data.mv_jitter_buffer)
-         return MV_REJECT(7);
+         return MV_REJECT(REJECT_SHADERS);
       const bool frame_start = std::exchange(game_device_data.mv_frame_ended, false);
       if (frame_start || std::exchange(game_device_data.mv_view_restarted, false))
       {
@@ -1192,23 +1288,27 @@ class MassEffectLE final : public Game
          com_ptr<ID3D11Texture2D> depth_texture;
          D3D11_TEXTURE2D_DESC depth_desc = {};
          if (depth && SUCCEEDED(depth->QueryInterface(&depth_texture)))
+         {
             depth_texture->GetDesc(&depth_desc);
+         }
          if ((depth_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 && game_device_data.mv_depth_copy)
          {
             depth_texture.reset();
             depth_desc = {};
-            if (SUCCEEDED(reinterpret_cast<ID3D11Resource*>(game_device_data.mv_depth_copy)->QueryInterface(&depth_texture)))
+            if (SUCCEEDED(game_device_data.mv_depth_copy->QueryInterface(&depth_texture)))
+            {
                depth_texture->GetDesc(&depth_desc);
+            }
          }
          if ((depth_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 && (depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS || depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || depth_desc.Format == DXGI_FORMAT_R32_TYPELESS) && depth_desc.SampleDesc.Count == 1)
          {
-            const DXGI_FORMAT srv_format = depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : (depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT);
+            const DXGI_FORMAT srv_format = (depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : (depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT));
             const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, srv_format, 0, 1);
             native_device->CreateShaderResourceView(depth_texture.get(), &srv_desc, &game_device_data.mv_depth_srv);
          }
          game_device_data.mv_fill_pending = game_device_data.mv_depth_srv && game_device_data.mv_uav && FindShader(device_data.native_compute_shaders, kNameMVFillCS) != nullptr;
          // The fill's marker: the largest float16 (a larger clear value is stored as it in R16G16_FLOAT)
-         const FLOAT clear_value = game_device_data.mv_fill_pending ? 65504.f : 0.f;
+         const FLOAT clear_value = (game_device_data.mv_fill_pending ? 65504.f : 0.f);
          const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
          native_device_context->ClearRenderTargetView(game_device_data.mv_rtv.get(), clear);
       }
@@ -1216,7 +1316,7 @@ class MassEffectLE final : public Game
       {
          // Last frame's camera and objects are the previous ones, unless frames without a scene (menus, videos) came between
          const bool previous_valid = game_device_data.mv_camera && cb_luma_global_settings.FrameIndex - game_device_data.mv_frame_index <= 1;
-         game_device_data.mv_previous_camera = previous_valid ? game_device_data.mv_camera : nullptr;
+         game_device_data.mv_previous_camera = (previous_valid ? game_device_data.mv_camera : nullptr);
          game_device_data.mv_camera = nullptr;
          game_device_data.mv_frame_index = cb_luma_global_settings.FrameIndex;
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
@@ -1229,9 +1329,13 @@ class MassEffectLE final : public Game
          std::erase_if(game_device_data.mv_objects, [](const auto& entry)
             { return entry.second.empty(); });
          for (auto& entry : game_device_data.mv_objects)
+         {
             entry.second.clear();
+         }
          if (!previous_valid)
+         {
             game_device_data.mv_previous_objects.clear();
+         }
       }
 
       // The game's b0 / b1 / b3. The slots added past them stay bound after the draw: no game vertex shader reads a constant buffer
@@ -1246,7 +1350,9 @@ class MassEffectLE final : public Game
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
          object = GetConstantsCopy(&game_device_data, current[0]);
          if (skinned)
+         {
             bones = GetConstantsCopy(&game_device_data, current[2]);
+         }
       }
       const auto copy_size = [](const MassEffectGameDeviceData::ConstantsCopy& copy)
       { return copy ? copy->size() : size_t(0); };
@@ -1256,7 +1362,9 @@ class MassEffectLE final : public Game
       if (perf_test_modes[Perf::g_test].motion_vector_draws < 2)
       {
          if (object && camera && !game_device_data.mv_camera)
+         {
             game_device_data.mv_camera = camera;
+         }
          return false;
       }
 #endif
@@ -1267,7 +1375,9 @@ class MassEffectLE final : public Game
       {
          // The world camera: the frame's first motion vector draw's
          if (!game_device_data.mv_camera)
+         {
             game_device_data.mv_camera = camera;
+         }
 
          // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by translation. No instance count.
          com_ptr<ID3D11Buffer> vertex_buffer;
@@ -1280,7 +1390,9 @@ class MassEffectLE final : public Game
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
          uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
+         {
             HashCombine(key, value);
+         }
          // LocalToWorld, its translation in world space (it includes the camera's PreViewTranslation)
          const std::array<float, 3> view_translation = GetPreViewTranslation(*camera);
          const uint32_t translation_offset = game_device_data.mv_last_vertex_shader->translation_offset;
@@ -1290,7 +1402,9 @@ class MassEffectLE final : public Game
          {
             transform = PatchedDraws::ReadRowVectorTransform(object->data() + translation_offset - 3 * 16);
             for (size_t i = 0; i < view_translation.size(); i++)
+            {
                transform[9 + i] -= view_translation[i];
+            }
          }
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
@@ -1314,7 +1428,9 @@ class MassEffectLE final : public Game
             uploads[0] = match->object.get();
             uploads[1] = match->camera.get();
             if (skinned)
+            {
                uploads[2] = match->bones.get();
+            }
 #if DEVELOPMENT
             game_device_data.mv_stats.matched++;
             game_device_data.mv_stats.matched_same_camera += match->camera->size() == camera->size() && std::memcmp(match->camera->data(), camera->data(), camera->size()) == 0;
@@ -1333,7 +1449,9 @@ class MassEffectLE final : public Game
                float row[3];
                std::memcpy(row, object_previous_view.data() + translation_offset, sizeof(row));
                for (size_t i = 0; i < std::size(row); i++)
+               {
                   row[i] += previous_view_translation[i] - view_translation[i];
+               }
                std::memcpy(object_previous_view.data() + translation_offset, row, sizeof(row));
                uploads[0] = &object_previous_view;
             }
@@ -1348,7 +1466,7 @@ class MassEffectLE final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         game_device_data.mv_objects[key].push_back({transform, std::move(object), std::move(camera), std::move(bones)});
+         game_device_data.mv_objects[key].push_back({.transform = transform, .object = std::move(object), .camera = std::move(camera), .bones = std::move(bones)});
       }
 #if DEVELOPMENT
       else
@@ -1367,7 +1485,9 @@ class MassEffectLE final : public Game
       {
          ID3D11RenderTargetView* targets[MotionVectorPatches::target_slot + 1] = {};
          for (UINT slot = 0; slot < MotionVectorPatches::target_slot; slot++)
+         {
             targets[slot] = rtvs[slot].get();
+         }
          targets[MotionVectorPatches::target_slot] = game_device_data.mv_rtv.get();
          native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
       }
@@ -1378,7 +1498,9 @@ class MassEffectLE final : public Game
 #if DEVELOPMENT
       game_device_data.mv_stats.motion_vector_draws++;
       if (!game_device_data.views.empty())
+      {
          game_device_data.views.back().motion_vector_draws++;
+      }
 #endif
       return true;
    }
@@ -1441,7 +1563,7 @@ class MassEffectLE final : public Game
       auto& game_device_data = GetGameDeviceData(device_data);
       if (!game_device_data.mv_texture || !game_device_data.mv_camera || game_device_data.mv_camera->size() < 16 * sizeof(float) || !game_device_data.mv_depth_srv || !game_device_data.mv_scene_color)
          return false;
-      ID3D11Resource* const scene_resource = game_device_data.mv_scene_color_copy ? reinterpret_cast<ID3D11Resource*>(game_device_data.mv_scene_color_copy) : game_device_data.mv_scene_color.get();
+      ID3D11Resource* const scene_resource = (game_device_data.mv_scene_color_copy ? game_device_data.mv_scene_color_copy.get() : game_device_data.mv_scene_color.get());
       com_ptr<ID3D11Texture2D> scene;
       if (FAILED(scene_resource->QueryInterface(&scene)))
          return false;
@@ -1459,14 +1581,18 @@ class MassEffectLE final : public Game
 
       D3D11_TEXTURE2D_DESC output_desc = {};
       if (device_data.sr_output_color)
+      {
          device_data.sr_output_color->GetDesc(&output_desc);
+      }
       if (output_desc.Width != scene_desc.Width || output_desc.Height != scene_desc.Height)
       {
          device_data.sr_output_color.reset();
-         output_desc = {scene_desc.Width, scene_desc.Height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
+         output_desc = {.Width = scene_desc.Width, .Height = scene_desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
          game_device_data.sr_output_srv.reset();
          if (SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, &device_data.sr_output_color)) && FAILED(native_device->CreateShaderResourceView(device_data.sr_output_color.get(), nullptr, &game_device_data.sr_output_srv)))
+         {
             device_data.sr_output_color.reset();
+         }
          game_device_data.sr_output_recreated = true;
       }
       if (!device_data.sr_output_color)
@@ -1481,27 +1607,30 @@ class MassEffectLE final : public Game
       const float* const vp = reinterpret_cast<const float*>(game_device_data.mv_camera->data());
       const double up_length = std::sqrt(double(vp[1]) * vp[1] + double(vp[5]) * vp[5] + double(vp[9]) * vp[9]);
       // The last valid field of view is kept (FSR asserts on 0)
-      if (const double vert_fov = up_length > 0.0 ? 2.0 * std::atan(1.0 / up_length) : 0.0; vert_fov > 0.0 && vert_fov <= 3.14159265358979)
+      if (const double vert_fov = (up_length > 0.0 ? 2.0 * std::atan(1.0 / up_length) : 0.0); vert_fov > 0.0 && vert_fov <= 3.14159265358979)
+      {
          game_device_data.sr_vert_fov = float(vert_fov);
+      }
       const auto [a, b] = ViewDepthTerms(*game_device_data.mv_camera);
       const double near_plane = ViewNearPlane(*game_device_data.mv_camera);
 
-      SR::SettingsData settings_data;
-      settings_data.output_width = scene_desc.Width;
-      settings_data.output_height = scene_desc.Height;
-      settings_data.render_width = scene_desc.Width;
-      settings_data.render_height = scene_desc.Height;
-      settings_data.dynamic_resolution = false;
-      settings_data.hdr = true;
-      settings_data.inverted_depth = false;
-      settings_data.mvs_jittered = false;
-      // The motion vectors are UV deltas, previous minus current
-      settings_data.mvs_x_scale = float(scene_desc.Width);
-      settings_data.mvs_y_scale = float(scene_desc.Height);
-      settings_data.auto_exposure = device_data.sr_type != SR::Type::FSR; // FSR's clips highlights (Luma canon)
-      // DLAA on scene-referred HDR input takes preset J or K, never L or M (DLSS best practices PRE-4: L crushes saturated highlights):
-      // "Default" picks K (11); an explicit choice is kept
-      settings_data.render_preset = (dlss_render_preset != 0 ? dlss_render_preset : 11u);
+      const SR::SettingsData settings_data = {
+         .output_width = scene_desc.Width,
+         .output_height = scene_desc.Height,
+         .render_width = scene_desc.Width,
+         .render_height = scene_desc.Height,
+         .dynamic_resolution = false,
+         .hdr = true,
+         .inverted_depth = false,
+         .mvs_jittered = false,
+         // The motion vectors are UV deltas, previous minus current
+         .mvs_x_scale = float(scene_desc.Width),
+         .mvs_y_scale = float(scene_desc.Height),
+         .auto_exposure = device_data.sr_type != SR::Type::FSR, // FSR's clips highlights (Luma canon)
+         // DLAA on scene-referred HDR input takes preset J or K, never L or M (DLSS best practices PRE-4: L crushes saturated
+         // highlights): "Default" picks K (11); an explicit choice is kept
+         .render_preset = (dlss_render_preset != 0 ? dlss_render_preset : 11u),
+      };
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
       SR::SuperResolutionImpl::DrawData draw_data;
@@ -1558,7 +1687,9 @@ class MassEffectLE final : public Game
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, kNameMVFillCS);
 #if DEVELOPMENT
       if (g_mv_skip_fill)
+      {
          game_device_data.mv_fill_pending = false;
+      }
       if (auto* const perf_queries = game_device_data.perf_timestamps.frame; perf_queries && perf_queries->Marked(PERF_SCENE_START))
       {
          perf_queries->Mark(native_device_context, PERF_FILL_START);
@@ -1587,7 +1718,9 @@ class MassEffectLE final : public Game
          const Math::Matrix44D reprojection = previous * view_translation * current;
          float constants[20] = {}; // A multiple of 16 bytes
          for (int i = 0; i < 16; i++)
+         {
             constants[i] = float(reprojection.GetData()[i]);
+         }
          constants[16] = game_device_data.mv_jitter_ndc[0];
          constants[17] = game_device_data.mv_jitter_ndc[1];
          if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
@@ -1631,10 +1764,12 @@ class MassEffectLE final : public Game
             desc.MiscFlags = 0;
             game_device_data.dump_textures[i].reset();
             if (SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.dump_textures[i])))
+            {
                native_device_context->CopyResource(game_device_data.dump_textures[i].get(), texture.get());
+            }
          }
          game_device_data.dump_cameras[0] = *game_device_data.mv_camera;
-         game_device_data.dump_cameras[1] = game_device_data.mv_previous_camera ? *game_device_data.mv_previous_camera : *game_device_data.mv_camera;
+         game_device_data.dump_cameras[1] = (game_device_data.mv_previous_camera ? *game_device_data.mv_previous_camera : *game_device_data.mv_camera);
          game_device_data.dump_jitter = game_device_data.mv_jitter;
       }
 #endif
@@ -1663,9 +1798,13 @@ class MassEffectLE final : public Game
    {
       com_ptr<ID3D11ShaderResourceView> srvs[16]; // t0-t15
       if (compute)
+      {
          native_device_context->CSGetShaderResources(0, UINT(std::size(srvs)), &srvs[0]);
+      }
       else
+      {
          native_device_context->PSGetShaderResources(0, UINT(std::size(srvs)), &srvs[0]);
+      }
       ID3D11ShaderResourceView* const upscaled = gd.sr_output_srv.get();
       for (UINT slot = 0; slot < std::size(srvs); slot++)
       {
@@ -1677,9 +1816,13 @@ class MassEffectLE final : public Game
          if (resource.get() != gd.sr_input && resource.get() != gd.mv_scene_color.get())
             continue;
          if (compute)
+         {
             native_device_context->CSSetShaderResources(slot, 1, &upscaled);
+         }
          else
+         {
             native_device_context->PSSetShaderResources(slot, 1, &upscaled);
+         }
       }
    }
 
@@ -1705,8 +1848,10 @@ public:
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
       Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter},
-         {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}});
-      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, {"perf_hook_timers", &Perf::g_hook_timers}});
+         {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, { "mv_read_sizes",
+            &g_mv_read_sizes }});
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, { "perf_hook_timers",
+                               &Perf::g_hook_timers }});
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
          {"gtao_depth_scale", &g_gtao_depth_scale, 10.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 3.f}});
@@ -1724,7 +1869,7 @@ public:
                g_perf_sweep.Stop();
                ApplyPerfTestMode(device_data, int(value));
                return std::string();
-            }}});
+            } }});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", smaa_input.tex),
          MCP_GAME_TEXTURE("smaa.output", smaa_out.tex),
          MCP_GAME_TEXTURE("rcas.output", rcas_out.tex),
@@ -1737,7 +1882,7 @@ public:
       // window because no swapchain exists yet (Display falls back to the primary monitor).
       bool hdr_supported = false, hdr_enabled = false;
       Display::IsHDRSupportedAndEnabled(0, hdr_supported, hdr_enabled);
-      const char native_hdr = hdr_enabled ? '1' : '0';
+      const char native_hdr = (hdr_enabled ? '1' : '0');
 
       auto& post_process_space = GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH);
       post_process_space.SetDefaultValue(native_hdr);
@@ -1812,13 +1957,16 @@ public:
       // For the MCP "luma_dev_values" tool: the last complete frame's counts
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.matched", &stats.matched}, {"mv.camera_only", &stats.camera_only},
-         {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.updates", &stats.updates}, {"mv.sr_draws", &stats.sr_draws}, {"mv.matched_same_camera", &stats.matched_same_camera},
-         {"mv.mirrored", &stats.mirrored}, {"mv.view_restarts", &stats.view_restarts}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by},
-         {"mv.registered_buffers", &stats.registered_buffers}, {"mv.constants_pool", &stats.constants_pool}, {"mv.destroyed_buffers", &GetGameDeviceData(device_data).mv_destroyed_buffers},
-         {"fxaa.skipped", &stats.fxaa_skipped}}, &device_data);
-      constexpr const char* reject_names[] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
-      for (size_t i = 0; i < std::size(reject_names); i++)
-         Mcp::RegisterCounter(std::string("mv.rejected.") + reject_names[i], &stats.rejected[i], &device_data);
+                               {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.updates", &stats.updates}, {"mv.sr_draws", &stats.sr_draws}, {"mv.matched_same_camera", &stats.matched_same_camera},
+                               {"mv.mirrored", &stats.mirrored}, {"mv.view_restarts", &stats.view_restarts}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by},
+                               {"mv.registered_buffers", &stats.registered_buffers}, {"mv.constants_pool", &stats.constants_pool}, {"mv.destroyed_buffers", &GetGameDeviceData(device_data).mv_destroyed_buffers},
+                               { "fxaa.skipped",
+                                  &stats.fxaa_skipped }},
+         &device_data);
+      for (int reject = 0; reject < REJECT_COUNT; reject++)
+      {
+         Mcp::RegisterCounter(std::string("mv.rejected.") + kMotionVectorRejectNames[reject], &stats.rejected[reject], &device_data);
+      }
 #endif
    }
 
@@ -1834,58 +1982,62 @@ public:
 
    // Capture bright-pass cb0 into a staging ring and map the oldest entry with DO_NOT_WAIT, so the readback
    // never stalls. OnPresent turns the live artist-authored BloomScale into the effective intensity.
-   void CaptureBloomScale(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData& gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
+   void CaptureBloomScale(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
    {
-      if (!g_bloom_enable || gd.bloom_scale_captured_this_frame || !original_shader_hashes.Contains(kBloomBrightPassHash, reshade::api::shader_stage::pixel))
+      if (!g_bloom_enable || gd->bloom_scale_captured_this_frame || !original_shader_hashes.Contains(kBloomBrightPassHash, reshade::api::shader_stage::pixel))
          return;
-      gd.bloom_scale_captured_this_frame = true; // Do not advance the ring twice in one frame.
+      gd->bloom_scale_captured_this_frame = true; // Do not advance the ring twice in one frame.
       ComPtr<ID3D11Buffer> cb0;
       native_device_context->PSGetConstantBuffers(0, 1, cb0.put());
       if (!cb0)
          return;
       // Empty or full: a failed allocation releases the whole ring, retried next frame
-      if (!gd.bloom_scale_ring[2])
+      if (!gd->bloom_scale_ring[2])
       {
-         D3D11_BUFFER_DESC bd{};
-         cb0->GetDesc(&bd);
-         bd.Usage = D3D11_USAGE_STAGING;
-         bd.BindFlags = 0;
-         bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-         bd.MiscFlags = 0;
-         for (auto& b : gd.bloom_scale_ring)
+         D3D11_BUFFER_DESC staging_desc{};
+         cb0->GetDesc(&staging_desc);
+         staging_desc.Usage = D3D11_USAGE_STAGING;
+         staging_desc.BindFlags = 0;
+         staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+         staging_desc.MiscFlags = 0;
+         for (auto& staging_buffer : gd->bloom_scale_ring)
          {
-            if (FAILED(native_device->CreateBuffer(&bd, nullptr, b.put())))
+            if (FAILED(native_device->CreateBuffer(&staging_desc, nullptr, staging_buffer.put())))
             {
-               for (auto& r : gd.bloom_scale_ring)
-                  r = nullptr;
+               for (auto& ring_buffer : gd->bloom_scale_ring)
+               {
+                  ring_buffer = nullptr;
+               }
                return;
             }
          }
       }
-      native_device_context->CopyResource(gd.bloom_scale_ring[gd.bloom_scale_ring_wr].get(), cb0.get());
-      if (gd.bloom_scale_ring_filled < 3)
-         gd.bloom_scale_ring_filled++;
-      if (gd.bloom_scale_ring_filled >= 3)
+      native_device_context->CopyResource(gd->bloom_scale_ring[gd->bloom_scale_ring_wr].get(), cb0.get());
+      if (gd->bloom_scale_ring_filled < 3)
       {
-         const int oldest = (gd.bloom_scale_ring_wr + 1) % 3; // Written two frames ago and expected idle.
-         D3D11_MAPPED_SUBRESOURCE ms{};
-         if (SUCCEEDED(native_device_context->Map(gd.bloom_scale_ring[oldest].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &ms)))
+         gd->bloom_scale_ring_filled++;
+      }
+      if (gd->bloom_scale_ring_filled >= 3)
+      {
+         const int oldest = (gd->bloom_scale_ring_wr + 1) % 3; // Written two frames ago and expected idle.
+         D3D11_MAPPED_SUBRESOURCE mapped{};
+         if (SUCCEEDED(native_device_context->Map(gd->bloom_scale_ring[oldest].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)))
          {
-            const float* f = reinterpret_cast<const float*>(ms.pData);
-            const float bscale = f[0];     // BloomScaleAndThreshold.x.
-            const float bthreshold = f[1]; // BloomScaleAndThreshold.y, per-scene artist dial.
-            native_device_context->Unmap(gd.bloom_scale_ring[oldest].get(), 0);
-            if (bscale >= 0.f && bscale < 100.f) // Reject implausible readback data.
+            const float* cb0_values = reinterpret_cast<const float*>(mapped.pData);
+            const float bloom_scale = cb0_values[0];     // BloomScaleAndThreshold.x.
+            const float bloom_threshold = cb0_values[1]; // BloomScaleAndThreshold.y, per-scene artist dial.
+            native_device_context->Unmap(gd->bloom_scale_ring[oldest].get(), 0);
+            if (bloom_scale >= 0.f && bloom_scale < 100.f) // Reject implausible readback data.
             {
-               gd.bloom_scale_live = bscale;
+               gd->bloom_scale_live = bloom_scale;
             }
-            if (bthreshold > 0.f && bthreshold < 100.f)
+            if (bloom_threshold > 0.f && bloom_threshold < 100.f)
             {
-               gd.bloom_threshold_live = bthreshold;
+               gd->bloom_threshold_live = bloom_threshold;
             }
          }
       }
-      gd.bloom_scale_ring_wr = (gd.bloom_scale_ring_wr + 1) % 3; // Map failure skips only this update.
+      gd->bloom_scale_ring_wr = (gd->bloom_scale_ring_wr + 1) % 3; // Map failure skips only this update.
    }
 
    // Core uploads a dirty settings cbuffer before the replaced pass runs, so the flag applies to the same draw.
@@ -1901,14 +2053,14 @@ public:
       rtv->GetResource(rt_res.put());
       if (!rt_res)
          return;
-      bool on_swapchain;
+      bool on_swapchain = false;
       {
          // Swapchain recreation mutates back_buffers under unique_lock; draw hooks must take a shared lock.
          std::shared_lock lock(device_data.mutex);
          on_swapchain = device_data.back_buffers.contains(reinterpret_cast<uint64_t>(rt_res.get()));
       }
       auto& gs = cb_luma_global_settings.GameSettings;
-      const float flag = on_swapchain ? 1.f : 0.f;
+      const float flag = (on_swapchain ? 1.f : 0.f);
       if (gs.VideoOnSwapchain != flag)
       {
          gs.VideoOnSwapchain = flag;
@@ -1917,14 +2069,14 @@ public:
    }
 
    // Stage 1 supplies motion-blur depth for SMAA and the scene/bloom slots for fp16 bloom injection.
-   void InjectBloomAndDepth(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, const TonemapPermDesc* perm)
+   void InjectBloomAndDepth(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const TonemapPermDesc* perm)
    {
       if (perm == nullptr)
          return;
 
 #if DEVELOPMENT
-      gd.stage1_perm = perm; // Recorded before the SMAA and bloom gates, so the readout reflects every stage-1 draw.
-      ++gd.stage1_draws;
+      gd->stage1_perm = perm; // Recorded before the SMAA and bloom gates, so the readout reflects every stage-1 draw.
+      ++gd->stage1_draws;
 #endif
 
       if (g_smaa_enable)
@@ -1932,14 +2084,16 @@ public:
          if (perm->scene_slot != 0)
          {
             // Only motion-blur permutations bind depth at t0; non-MB t0 is scene color.
-            ComPtr<ID3D11ShaderResourceView> srv_d;
-            native_device_context->PSGetShaderResources(0, 1, srv_d.put());
-            if (srv_d)
-               gd.srv_depth = srv_d;
+            ComPtr<ID3D11ShaderResourceView> depth_srv;
+            native_device_context->PSGetShaderResources(0, 1, depth_srv.put());
+            if (depth_srv)
+            {
+               gd->srv_depth = depth_srv;
+            }
          }
          else
          {
-            gd.srv_depth.reset(); // Disable predication instead of reusing stale depth.
+            gd->srv_depth.reset(); // Disable predication instead of reusing stale depth.
          }
       }
 
@@ -1961,8 +2115,8 @@ public:
             DrawBloom(native_device, native_device_context, device_data, srv_scene.get(), (int)kBloomSigmas.size(), kBloomSigmas.data(), srv_bloom.put());
             if (srv_bloom)
             {
-               ID3D11ShaderResourceView* p = srv_bloom.get();
-               native_device_context->PSSetShaderResources(perm->bloom_slot, 1, &p);
+               ID3D11ShaderResourceView* bloom_srv = srv_bloom.get();
+               native_device_context->PSSetShaderResources(perm->bloom_slot, 1, &bloom_srv);
             }
          }
       }
@@ -1971,7 +2125,7 @@ public:
    // Take over HBAO+ only when every XeGTAO shader and resource is ready at the first dispatch, otherwise the
    // whole native deinterleave -> horizon -> blur -> apply chain stays active. A returned value is terminal for
    // the callback; nullopt means XeGTAO is off or no AO hash matched, and the caller continues.
-   std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
+   std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
    {
       if (g_gtao_enable)
       {
@@ -1981,57 +2135,56 @@ public:
             if (!AllShadersReady(device_data.native_compute_shaders, {kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS}))
                return DrawOrDispatchOverrideType::None;
 
-            ComPtr<ID3D11ShaderResourceView> srv_d;
-            native_device_context->CSGetShaderResources(0, 1, srv_d.put());
-            if (!srv_d)
+            ComPtr<ID3D11ShaderResourceView> depth_srv;
+            native_device_context->CSGetShaderResources(0, 1, depth_srv.put());
+            if (!depth_srv)
                return DrawOrDispatchOverrideType::None;
-            uint4 dinfo{};
-            DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
-            GetResourceInfo(srv_d.get(), dinfo, dfmt);
-            if (dinfo.x == 0 || dinfo.y == 0)
+            uint4 depth_size{};
+            DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
+            GetResourceInfo(depth_srv.get(), depth_size, depth_format);
+            if (depth_size.x == 0 || depth_size.y == 0)
                return DrawOrDispatchOverrideType::None;
             // Native cb0 stays content-dimensioned, so pixel/UV mapping holds even when the allocation is larger.
-            uint32_t w = dinfo.x, h = dinfo.y;
+            uint32_t w = depth_size.x, h = depth_size.y;
 
-            if (gd.gtao_w != w || gd.gtao_h != h || !gd.tex_gtao_depth_mips || !gd.tex_gtao_working[1])
+            if (gd->gtao_w != w || gd->gtao_h != h || !gd->tex_gtao_depth_mips || !gd->tex_gtao_working[1])
             {
                ReleaseGTAOScratch(gd);
 
-               D3D11_TEXTURE2D_DESC td = {};
-               td.Width = w;
-               td.Height = h;
-               td.MipLevels = 5; // XE_GTAO_DEPTH_MIP_LEVELS.
-               td.ArraySize = 1;
-               td.Format = DXGI_FORMAT_R32_FLOAT;
-               td.SampleDesc.Count = 1;
-               td.Usage = D3D11_USAGE_DEFAULT;
-               td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-               bool ok = SUCCEEDED(native_device->CreateTexture2D(&td, nullptr, gd.tex_gtao_depth_mips.put()));
-               D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-               ud.Format = td.Format;
-               ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+               D3D11_TEXTURE2D_DESC texture_desc = {
+                  .Width = w,
+                  .Height = h,
+                  .MipLevels = 5, // XE_GTAO_DEPTH_MIP_LEVELS.
+                  .ArraySize = 1,
+                  .Format = DXGI_FORMAT_R32_FLOAT,
+                  .SampleDesc = {.Count = 1},
+                  .Usage = D3D11_USAGE_DEFAULT,
+                  .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+               };
+               bool ok = SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_depth_mips.put()));
+               D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {.Format = texture_desc.Format, .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D};
                for (int i = 0; ok && i < 5; i++)
                {
-                  ud.Texture2D.MipSlice = i;
-                  ok = SUCCEEDED(native_device->CreateUnorderedAccessView(gd.tex_gtao_depth_mips.get(), &ud, gd.gtao_depth_mip_uavs[i].put()));
+                  uav_desc.Texture2D.MipSlice = i;
+                  ok = SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_depth_mips.get(), &uav_desc, gd->gtao_depth_mip_uavs[i].put()));
                }
-               ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd.tex_gtao_depth_mips.get(), nullptr, gd.srv_gtao_depth_mips.put()));
+               ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_depth_mips.get(), nullptr, gd->srv_gtao_depth_mips.put()));
 
-               td.MipLevels = 1;
-               td.Format = DXGI_FORMAT_R8G8_UNORM;
+               texture_desc.MipLevels = 1;
+               texture_desc.Format = DXGI_FORMAT_R8G8_UNORM;
                for (int i = 0; ok && i < 2; i++)
                {
-                  ok = ok && SUCCEEDED(native_device->CreateTexture2D(&td, nullptr, gd.tex_gtao_working[i].put()));
-                  ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.tex_gtao_working[i].get(), nullptr, gd.uav_gtao_working[i].put()));
-                  ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd.tex_gtao_working[i].get(), nullptr, gd.srv_gtao_working[i].put()));
+                  ok = ok && SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_working[i].put()));
+                  ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_working[i].get(), nullptr, gd->uav_gtao_working[i].put()));
+                  ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_working[i].get(), nullptr, gd->srv_gtao_working[i].put()));
                }
                if (!ok)
                {
                   ReleaseGTAOScratch(gd);                  // All or nothing; retry clean next frame.
                   return DrawOrDispatchOverrideType::None; // Leaves the native chain active.
                }
-               gd.gtao_w = w;
-               gd.gtao_h = h;
+               gd->gtao_w = w;
+               gd->gtao_h = h;
             }
 
 #if DEVELOPMENT || TEST
@@ -2041,23 +2194,25 @@ public:
 #endif
             // The last is the noise index (see "IsGTAOTemporal")
             const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f};
-            if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_gtao), knobs, sizeof(knobs)))
+            if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), knobs, sizeof(knobs)))
                return DrawOrDispatchOverrideType::None;
 
-            gd.srv_gtao_depth = srv_d;
-            gd.gtao_active_this_frame = true;
+            gd->srv_gtao_depth = depth_srv;
+            gd->gtao_active_this_frame = true;
             return DrawOrDispatchOverrideType::Replaced;
          }
 
          // Horizon march: capture packed view normals and skip native work only after a successful takeover.
          if (original_shader_hashes.Contains(kAOHorizonHash, reshade::api::shader_stage::compute))
          {
-            if (!gd.gtao_active_this_frame)
+            if (!gd->gtao_active_this_frame)
                return DrawOrDispatchOverrideType::None;
-            ComPtr<ID3D11ShaderResourceView> srv_n;
-            native_device_context->CSGetShaderResources(0, 1, srv_n.put());
-            if (srv_n)
-               gd.srv_gtao_normals = srv_n;
+            ComPtr<ID3D11ShaderResourceView> normals_srv;
+            native_device_context->CSGetShaderResources(0, 1, normals_srv.put());
+            if (normals_srv)
+            {
+               gd->srv_gtao_normals = normals_srv;
+            }
 
             return DrawOrDispatchOverrideType::Replaced;
          }
@@ -2065,14 +2220,14 @@ public:
          // Blur: run all XeGTAO passes and write the game's final R8_UNORM u0; native apply performs composition.
          if (original_shader_hashes.Contains(kAOBlurHash, reshade::api::shader_stage::compute))
          {
-            if (!gd.gtao_active_this_frame)
+            if (!gd->gtao_active_this_frame)
                return DrawOrDispatchOverrideType::None;
 
             ComPtr<ID3D11UnorderedAccessView> uav_final;
             native_device_context->CSGetUnorderedAccessViews(0, 1, uav_final.put());
             if (!uav_final)
                return DrawOrDispatchOverrideType::Replaced; // Earlier native stages were already skipped.
-            if (!gd.srv_gtao_depth || !gd.srv_gtao_normals)
+            if (!gd->srv_gtao_depth || !gd->srv_gtao_normals)
             {
                // Missing fixed-order inputs: write neutral AO instead of applying stale data.
                const FLOAT ones[4] = {1.f, 1.f, 1.f, 1.f};
@@ -2082,14 +2237,14 @@ public:
 
             // Dispatch dimensions follow the captured depth allocation, not the DynamicScale content size; native
             // apply ignores the region outside the content.
-            const uint32_t w = gd.gtao_w, h = gd.gtao_h;
-            DrawStateStack<DrawStateStackType::Compute> st;
-            st.Cache(native_device_context, device_data.uav_max_count);
+            const uint32_t w = gd->gtao_w, h = gd->gtao_h;
+            DrawStateStack<DrawStateStackType::Compute> compute_state;
+            compute_state.Cache(native_device_context, device_data.uav_max_count);
 
-            ID3D11Buffer* kcb = gd.cb_gtao.get();
-            native_device_context->CSSetConstantBuffers(11, 1, &kcb);
-            ID3D11SamplerState* smp = device_data.sampler_state_point.get();
-            native_device_context->CSSetSamplers(0, 1, &smp);
+            ID3D11Buffer* gtao_cb = gd->cb_gtao.get();
+            native_device_context->CSSetConstantBuffers(11, 1, &gtao_cb);
+            ID3D11SamplerState* point_sampler = device_data.sampler_state_point.get();
+            native_device_context->CSSetSamplers(0, 1, &point_sampler);
             // XeGTAO deliberately inherits native b0 ($Globals/ProjInfo) and b2 (MinZ_MaxZRatioCS): the immediate
             // context runs a fixed contiguous AO chain with no ClearState, so the horizon-pass bindings persist.
 
@@ -2107,17 +2262,19 @@ public:
                native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uav_nulls.data(), nullptr);
             };
             // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
-            dispatch(kNameGTAOPrefilterCS, {gd.srv_gtao_depth.get()}, {gd.gtao_depth_mip_uavs[0].get(), gd.gtao_depth_mip_uavs[1].get(), gd.gtao_depth_mip_uavs[2].get(), gd.gtao_depth_mip_uavs[3].get(), gd.gtao_depth_mip_uavs[4].get()}, (w + 15) / 16, (h + 15) / 16);
+            dispatch(kNameGTAOPrefilterCS, {gd->srv_gtao_depth.get()}, {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(), gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()}, (w + 15) / 16, (h + 15) / 16);
             // Main pass writes AO and edges to working0.
-            dispatch(kNameGTAOMainPassCS, {gd.srv_gtao_depth_mips.get(), gd.srv_gtao_normals.get()}, {gd.uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
+            dispatch(kNameGTAOMainPassCS, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get()}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
             // First denoiser writes working1, two horizontal pixels per thread. Skipped when temporal: the final one reads working0.
             const bool single_denoise = IsGTAOTemporal(device_data);
             if (!single_denoise)
-               dispatch(kNameGTAODenoise1CS, {gd.srv_gtao_working[0].get()}, {gd.uav_gtao_working[1].get()}, (w + 15) / 16, (h + 7) / 8);
+            {
+               dispatch(kNameGTAODenoise1CS, {gd->srv_gtao_working[0].get()}, {gd->uav_gtao_working[1].get()}, (w + 15) / 16, (h + 7) / 8);
+            }
             // Final denoiser writes the game's R8_UNORM AO target.
-            dispatch(kNameGTAODenoise2CS, {gd.srv_gtao_working[single_denoise ? 0 : 1].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
+            dispatch(kNameGTAODenoise2CS, {gd->srv_gtao_working[single_denoise ? 0 : 1].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
 
-            st.Restore(native_device_context);
+            compute_state.Restore(native_device_context);
             return DrawOrDispatchOverrideType::Replaced;
          }
       }
@@ -2128,14 +2285,14 @@ public:
    // Replaces the in-place FXAA resolve (color at u0) with SMAA, or with RCAS alone after DLSS / FSR, the last pass writing the post
    // buffer itself. Disabled SMAA leaves FXAA native only without an upscaler. When SMAA or the upscaler owns the resolve, FXAA's
    // earlier passes are skipped too, and the resolves never fall back to the game's (its queue would be stale).
-   DrawOrDispatchOverrideType RunSMAAResolve(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData& gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass)
+   DrawOrDispatchOverrideType RunSMAAResolve(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass)
    {
       // After DLSS / FSR (which already antialiased the scene, FXAA would blur it) only RCAS runs, or nothing
       const bool smaa = !device_data.has_drawn_sr;
       // Decided at the prepass, whose t0 is the post buffer: fp16 only, as the resolve's guard below
       if (original_shader_hashes.Contains(kFXAAPrepassHash, reshade::api::shader_stage::compute) || original_shader_hashes.Contains(kFXAAPrepassLumaHash, reshade::api::shader_stage::compute))
       {
-         gd.fxaa_replaced = false;
+         gd->fxaa_replaced = false;
          if ((g_smaa_enable || !smaa) && !is_custom_pass)
          {
             com_ptr<ID3D11ShaderResourceView> color;
@@ -2143,20 +2300,22 @@ public:
             uint4 unused_size;
             DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
             if (color)
+            {
                GetResourceInfo(color.get(), unused_size, format);
-            gd.fxaa_replaced = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            }
+            gd->fxaa_replaced = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
          }
-         if (!gd.fxaa_replaced)
+         if (!gd->fxaa_replaced)
             return DrawOrDispatchOverrideType::None;
 #if DEVELOPMENT
-         gd.mv_stats.fxaa_skipped++;
+         gd->mv_stats.fxaa_skipped++;
 #endif
          return DrawOrDispatchOverrideType::Replaced;
       }
-      if (gd.fxaa_replaced && original_shader_hashes.Contains(kFXAAArgumentsHash, reshade::api::shader_stage::compute))
+      if (gd->fxaa_replaced && original_shader_hashes.Contains(kFXAAArgumentsHash, reshade::api::shader_stage::compute))
       {
 #if DEVELOPMENT
-         gd.mv_stats.fxaa_skipped++;
+         gd->mv_stats.fxaa_skipped++;
 #endif
          return DrawOrDispatchOverrideType::Replaced;
       }
@@ -2166,9 +2325,9 @@ public:
       if ((!is_resolve_h && !is_resolve_v) || is_custom_pass)
          return DrawOrDispatchOverrideType::None;
       // The resolve is the final scene-post step and arms HUD suppression for subsequent draws, with or without SMAA.
-      gd.scene_post_done_this_frame = true;
+      gd->scene_post_done_this_frame = true;
       // Anything that can't run here: the game's resolve, unless its earlier passes were skipped or an upscaler antialiased the frame
-      const DrawOrDispatchOverrideType fallback = ((gd.fxaa_replaced || !smaa) ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None);
+      const DrawOrDispatchOverrideType fallback = ((gd->fxaa_replaced || !smaa) ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None);
       if (!g_smaa_enable && smaa)
          return fallback;
 
@@ -2183,43 +2342,43 @@ public:
       const uint64_t color_handle = reinterpret_cast<uint64_t>(color_res.get());
 
       // Skip later resolves for an already processed resource; rerunning in-place FXAA would corrupt SMAA.
-      if (gd.smaa_applied_handles.count(color_handle) != 0)
+      if (gd->smaa_applied_handles.count(color_handle) != 0)
          return DrawOrDispatchOverrideType::Replaced;
       // Only horizontal resolve triggers SMAA; an unexpected vertical-only resolve remains native (skipped after DLSS / FSR, or with
       // FXAA's earlier passes skipped).
       if (!is_resolve_h)
          return fallback;
 
-      uint4 cinfo{};
-      DXGI_FORMAT cfmt = DXGI_FORMAT_UNKNOWN;
-      GetResourceInfo(color_res.get(), cinfo, cfmt);
-      const uint32_t w = cinfo.x, h = cinfo.y;
+      uint4 color_size{};
+      DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
+      GetResourceInfo(color_res.get(), color_size, color_format);
+      const uint32_t w = color_size.x, h = color_size.y;
       // SMAA temporaries are RGBA16F; CopyResource silently fails across formats, so fall back on mismatch.
-      if (w == 0 || h == 0 || cfmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
+      if (w == 0 || h == 0 || color_format != DXGI_FORMAT_R16G16B16A16_FLOAT)
          return fallback;
 
       auto* const sharpen_vs = FindShader(device_data.native_vertex_shaders, kNameCopyVS);
       auto* const sharpen_ps = FindShader(device_data.native_pixel_shaders, kNameSharpenPS);
-      const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-      const bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs && sharpen_ps && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_sharpen), sp, sizeof(sp));
+      const float sharpen_constants[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
+      const bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs && sharpen_ps && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_sharpen), sharpen_constants, sizeof(sharpen_constants));
       // After DLSS / FSR without RCAS: the upscaled image stays as it is
       if (!smaa && !do_sharpen)
       {
-         gd.smaa_applied_handles.insert(color_handle);
+         gd->smaa_applied_handles.insert(color_handle);
          return DrawOrDispatchOverrideType::Replaced;
       }
 
       // Predication requires current, same-sized depth; otherwise a null texture and scale 1 select plain ULTRA.
       bool depth_ok = false;
-      if (smaa && gd.srv_depth)
+      if (smaa && gd->srv_depth)
       {
-         uint4 dinfo{};
-         DXGI_FORMAT dfmt = DXGI_FORMAT_UNKNOWN;
-         GetResourceInfo(gd.srv_depth.get(), dinfo, dfmt);
-         depth_ok = (dinfo.x == w && dinfo.y == h);
+         uint4 depth_size{};
+         DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
+         GetResourceInfo(gd->srv_depth.get(), depth_size, depth_format);
+         depth_ok = (depth_size.x == w && depth_size.y == h);
       }
       // Threshold and strength are inert without the depth-edge term.
-      const float pred_scale = depth_ok ? kPredScale : 1.f;
+      const float pred_scale = (depth_ok ? kPredScale : 1.f);
 
       // Async loading and live reload may temporarily require the fallback.
       if (smaa && !(AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
@@ -2227,11 +2386,11 @@ public:
          return fallback;
 
       const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, kPredThreshold, kPredStrength, 0.f};
-      if (smaa && !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_smaa_metrics), metrics, sizeof(metrics)))
+      if (smaa && !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_smaa_metrics), metrics, sizeof(metrics)))
          return fallback;
 
       // The snapshot SMAA (edges and blend) or RCAS reads; the post buffer is written in place
-      if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, &gd.smaa_input))
+      if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, &gd->smaa_input))
          return fallback;
       // The last pass writes the post buffer itself, through a view made for this dispatch (a kept one would hold the buffer through a
       // resize). Without one (a buffer without RTV binding), a temp copied into it.
@@ -2241,42 +2400,44 @@ public:
       const bool smaa_into_temp = smaa && (do_sharpen || !color_rtv);
       if (smaa_into_temp)
       {
-         if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &gd.smaa_out))
+         if (!EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &gd->smaa_out))
             return fallback;
-         gd.smaa_out_frame = cb_luma_global_settings.FrameIndex;
+         gd->smaa_out_frame = cb_luma_global_settings.FrameIndex;
       }
       ID3D11RenderTargetView* sharpen_target = color_rtv.get();
-      if (do_sharpen && !sharpen_target && EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET, &gd.rcas_out))
-         sharpen_target = gd.rcas_out.rtv.get();
+      if (do_sharpen && !sharpen_target && EnsureRGBA16FTarget(native_device, w, h, D3D11_BIND_RENDER_TARGET, &gd->rcas_out))
+      {
+         sharpen_target = gd->rcas_out.rtv.get();
+      }
       if (!smaa && !sharpen_target)
          return fallback;
 
-      native_device_context->CopyResource(gd.smaa_input.tex.get(), color_res.get());
-      gd.snapshot_frame = cb_luma_global_settings.FrameIndex;
+      native_device_context->CopyResource(gd->smaa_input.tex.get(), color_res.get());
+      gd->snapshot_frame = cb_luma_global_settings.FrameIndex;
       // The buffer is the resolve's CS UAV: D3D11 unbinds it there once it's bound as a render target, put back after
       DrawStateStack<DrawStateStackType::Compute> resolve_compute_state;
       resolve_compute_state.Cache(native_device_context, device_data.uav_max_count);
 
       if (smaa)
       {
-         gd.smaa_frame = cb_luma_global_settings.FrameIndex;
+         gd->smaa_frame = cb_luma_global_settings.FrameIndex;
          // DrawSMAA restores shaders, resources, and targets, but not cbuffer slots; save VS/PS b1 explicitly.
          ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
          native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
          native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-         ID3D11Buffer* mcb = gd.cb_smaa_metrics.get();
-         native_device_context->VSSetConstantBuffers(1, 1, &mcb);
-         native_device_context->PSSetConstantBuffers(1, 1, &mcb);
+         ID3D11Buffer* metrics_cb = gd->cb_smaa_metrics.get();
+         native_device_context->VSSetConstantBuffers(1, 1, &metrics_cb);
+         native_device_context->PSSetConstantBuffers(1, 1, &metrics_cb);
 
          // The snapshot for both the edge detection (gamma) and the blend (filtered in linear light, Luma_SMAA_impl.hlsl)
          DrawSMAA(native_device, native_device_context, device_data,
-            smaa_into_temp ? gd.smaa_out.rtv.get() : color_rtv.get(), gd.smaa_input.srv.get(), gd.smaa_input.srv.get(),
-            depth_ok ? gd.srv_depth.get() : nullptr /*predication*/);
+            smaa_into_temp ? gd->smaa_out.rtv.get() : color_rtv.get(), gd->smaa_input.srv.get(), gd->smaa_input.srv.get(),
+            depth_ok ? gd->srv_depth.get() : nullptr /*predication*/);
 
-         ID3D11Buffer* vcb = vs_cb1_orig.get();
-         ID3D11Buffer* pcb = ps_cb1_orig.get();
-         native_device_context->VSSetConstantBuffers(1, 1, &vcb);
-         native_device_context->PSSetConstantBuffers(1, 1, &pcb);
+         ID3D11Buffer* vs_cb1 = vs_cb1_orig.get();
+         ID3D11Buffer* ps_cb1 = ps_cb1_orig.get();
+         native_device_context->VSSetConstantBuffers(1, 1, &vs_cb1);
+         native_device_context->PSSetConstantBuffers(1, 1, &ps_cb1);
       }
 
       // Optional RCAS on the SMAA (or upscaled) output, into the post buffer (or a temp copied into it)
@@ -2286,23 +2447,25 @@ public:
          DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
          sharpen_state.Cache(native_device_context, device_data.uav_max_count);
 
-         ID3D11Buffer* scb = gd.cb_sharpen.get();
-         native_device_context->PSSetConstantBuffers(0, 1, &scb);
+         ID3D11Buffer* sharpen_cb = gd->cb_sharpen.get();
+         native_device_context->PSSetConstantBuffers(0, 1, &sharpen_cb);
          DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-            sharpen_vs, sharpen_ps, smaa ? gd.smaa_out.srv.get() : gd.smaa_input.srv.get(), sharpen_target, w, h, false);
+            sharpen_vs, sharpen_ps, smaa ? gd->smaa_out.srv.get() : gd->smaa_input.srv.get(), sharpen_target, w, h, false);
 
          sharpen_state.Restore(native_device_context);
          if (!color_rtv)
-            native_device_context->CopyResource(color_res.get(), gd.rcas_out.tex.get());
+         {
+            native_device_context->CopyResource(color_res.get(), gd->rcas_out.tex.get());
+         }
       }
       else if (smaa_into_temp)
       {
          // SMAA went into its temp and no RCAS followed
-         native_device_context->CopyResource(color_res.get(), gd.smaa_out.tex.get());
+         native_device_context->CopyResource(color_res.get(), gd->smaa_out.tex.get());
       }
 
       resolve_compute_state.Restore(native_device_context);
-      gd.smaa_applied_handles.insert(color_handle);
+      gd->smaa_applied_handles.insert(color_handle);
       device_data.has_drawn_main_post_processing = true;
       return DrawOrDispatchOverrideType::Replaced;
    }
@@ -2320,7 +2483,7 @@ public:
          return DrawOrDispatchOverrideType::None;
 
       const bool compute = (stages & reshade::api::shader_stage::compute) != 0;
-      const TonemapPermDesc* const stage1_perm = compute ? nullptr : FindTonemapPerm(original_shader_hashes);
+      const TonemapPermDesc* const stage1_perm = (compute ? nullptr : FindTonemapPerm(original_shader_hashes));
       const bool stage1 = stage1_perm != nullptr;
 #if DEVELOPMENT
       // Scene probe: the passes that read the scene after its first motion vector draw, before its end ("open") and after it
@@ -2328,24 +2491,32 @@ public:
       // scene reaches every reader). Stale bindings show up too.
       if (g_mv_probe && gd.mv_active && gd.mv_scene_color && (gd.mv_scene_open || gd.mv_scene_done))
       {
-         const uint32_t hash = compute ? uint32_t(original_shader_hashes.compute_shaders[0]) : uint32_t(original_shader_hashes.pixel_shaders[0]);
+         const uint32_t hash = (compute ? uint32_t(original_shader_hashes.compute_shaders[0]) : uint32_t(original_shader_hashes.pixel_shaders[0]));
          com_ptr<ID3D11ShaderResourceView> srvs[16];
          if (compute)
+         {
             native_device_context->CSGetShaderResources(0, UINT(std::size(srvs)), &srvs[0]);
+         }
          else
+         {
             native_device_context->PSGetShaderResources(0, UINT(std::size(srvs)), &srvs[0]);
+         }
          for (UINT slot = 0; slot < std::size(srvs); slot++)
          {
             com_ptr<ID3D11Resource> resource;
             if (srvs[slot])
+            {
                srvs[slot]->GetResource(&resource);
-            const bool scene = resource && (resource == gd.mv_scene_color || uint64_t(resource.get()) == gd.mv_scene_color_copy);
+            }
+            const bool scene = resource && (resource == gd.mv_scene_color || resource == gd.mv_scene_color_copy);
             const bool upscaled = resource && device_data.sr_output_color && resource.get() == static_cast<ID3D11Resource*>(device_data.sr_output_color.get());
             if (!scene && !upscaled)
                continue;
             std::string line = std::format("[MELE Probe] {} {} 0x{:08X} reads the {} at t{}", gd.mv_scene_open ? "open" : "done", compute ? "CS" : "PS", hash, scene ? "scene" : "upscaled scene", slot);
             if (gd.probe_logged.insert(line).second)
+            {
                reshade::log::message(reshade::log::level::info, (line + std::format(" (frame {})", cb_luma_global_settings.FrameIndex)).c_str());
+            }
          }
       }
 #endif
@@ -2386,7 +2557,9 @@ public:
                {
                   gd.mv_camera = nullptr;
                   for (auto& entry : gd.mv_objects)
+                  {
                      entry.second.clear();
+                  }
                }
 #if DEVELOPMENT
                gd.mv_stats.view_restarts++;
@@ -2401,20 +2574,24 @@ public:
                   D3D11_VIEWPORT viewport = {};
                   UINT viewport_count = 1;
                   native_device_context->RSGetViewports(&viewport_count, &viewport);
-                  gd.views.push_back({float(ViewNearPlane(*gd.view_camera)), float(ViewDeterminant(*gd.view_camera)), GetPreViewTranslation(*gd.view_camera)[2], viewport.Width, viewport.Height});
+                  gd.views.push_back({.near_plane = float(ViewNearPlane(*gd.view_camera)), .determinant = float(ViewDeterminant(*gd.view_camera)), .view_translation_z = GetPreViewTranslation(*gd.view_camera)[2], .viewport_width = viewport.Width, .viewport_height = viewport.Height});
                }
 #endif
             }
 #if DEVELOPMENT
             if (gd.mv_scene_open && !mirrored && !gd.views.empty())
+            {
                gd.views.back().draws++;
+            }
 #endif
             const bool motion_vectors = !mirrored && DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
             const bool jitter = !mirrored && !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv.get());
 #if DEVELOPMENT
             Mcp::Annotate(cmd_list_data, mirrored ? "mirrored" : (motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched")));
             if (const int reject = std::exchange(gd.mv_draw_reject, -1); reject >= 0)
+            {
                Mcp::Annotate(cmd_list_data, "mv_reject", reject);
+            }
 #endif
             if (motion_vectors || jitter)
                return DrawOrDispatchOverrideType::Replaced;
@@ -2436,16 +2613,16 @@ public:
       if (g_hide_ui && !is_custom_pass && gd.scene_post_done_this_frame)
          return DrawOrDispatchOverrideType::Replaced;
 
-      CaptureBloomScale(native_device, native_device_context, gd, original_shader_hashes);
+      CaptureBloomScale(native_device, native_device_context, &gd, original_shader_hashes);
 
       TagVideoTarget(native_device_context, device_data, original_shader_hashes);
 
-      InjectBloomAndDepth(native_device, native_device_context, device_data, gd, stage1_perm);
+      InjectBloomAndDepth(native_device, native_device_context, device_data, &gd, stage1_perm);
 
-      if (const auto gtao_result = RunXeGTAO(native_device, native_device_context, device_data, gd, original_shader_hashes))
+      if (const auto gtao_result = RunXeGTAO(native_device, native_device_context, device_data, &gd, original_shader_hashes))
          return *gtao_result;
 
-      return RunSMAAResolve(native_device, native_device_context, device_data, gd, original_shader_hashes, is_custom_pass);
+      return RunSMAAResolve(native_device, native_device_context, device_data, &gd, original_shader_hashes, is_custom_pass);
    }
 
    void CleanExtraSRResources(DeviceData& device_data) override
@@ -2470,7 +2647,9 @@ public:
          {
             const std::lock_guard lock(gd.mv_constants_mutex);
             for (auto& [buffer, copy] : gd.mv_constants_copies)
+            {
                copy.reset();
+            }
          }
          gd.mv_objects.clear();
          gd.mv_previous_objects.clear();
@@ -2505,9 +2684,9 @@ public:
          }
          gd.mv_depth_srv.reset();
          gd.mv_depth.reset();
-         gd.mv_depth_copy = 0;
+         gd.mv_depth_copy.reset();
          gd.mv_scene_color.reset();
-         gd.mv_scene_color_copy = 0;
+         gd.mv_scene_color_copy.reset();
          gd.mv_fill_buffer.reset();
          gd.mv_jitter_buffer.reset();
          gd.mv_previous_constants = {};
@@ -2526,9 +2705,13 @@ public:
       // SMAA's resources go once it stopped running (the upscaler antialiases, or the game's AA is off), the snapshot and RCAS's temp
       // once RCAS stopped as well; on the render thread, between frames
       if (cb_luma_global_settings.FrameIndex - gd.smaa_frame > smaa_idle_release_frames)
+      {
          ReleaseSMAA(device_data);
+      }
       if (gd.smaa_out.tex && cb_luma_global_settings.FrameIndex - gd.smaa_out_frame > smaa_idle_release_frames)
+      {
          gd.smaa_out = {};
+      }
       if (gd.smaa_input.tex && cb_luma_global_settings.FrameIndex - gd.snapshot_frame > smaa_idle_release_frames)
       {
          gd.smaa_input = {};
@@ -2536,14 +2719,18 @@ public:
       }
       // Luma bloom off: DrawBloom's mip chains go (rebuilt at its next draw)
       if (!g_bloom_enable)
+      {
          ReleaseBloom();
+      }
       // The pooled constant copies only the pool holds (superseded, no object keeps them) are free for the next ones, as many as the
       // last frame asked for: a burst between two presents (loading screens) would keep its peak otherwise. Without motion vectors, none.
       {
          const std::lock_guard lock(gd.mv_constants_mutex);
          size_t kept_free = std::exchange(gd.mv_constants_made, 0);
          if (!gd.mv_active)
+         {
             kept_free = 0;
+         }
          std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
             {
                if (copy.use_count() != 1)
@@ -2553,11 +2740,15 @@ public:
                kept_free--;
                return false; });
          for (auto& [size, free_copies] : gd.mv_constants_pool_free)
+         {
             free_copies.clear();
+         }
          for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
          {
             if (gd.mv_constants_pool[i].use_count() == 1)
+            {
                gd.mv_constants_pool_free[gd.mv_constants_pool[i]->size()].push_back(i);
+            }
          }
 #if DEVELOPMENT
          gd.mv_stats.registered_buffers = gd.mv_filtered_buffer_count.load(std::memory_order_relaxed);
@@ -2568,7 +2759,7 @@ public:
       {
          const std::unique_lock lock(s_mutex_samplers);
          // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
-         device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f;
+         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
       }
 #if DEVELOPMENT
       // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, the first 60
@@ -2620,10 +2811,12 @@ public:
       {
          std::string line = std::format("[MELE MV] frame {} views:", cb_luma_global_settings.FrameIndex);
          for (const auto& view : gd.last_views)
+         {
             line += std::format(" [near {:.2f} det {:.4f} pvt.z {:.1f} viewport {:.0f}x{:.0f} draws {} mv {}]", view.near_plane, view.determinant, view.view_translation_z, view.viewport_width, view.viewport_height, view.draws, view.motion_vector_draws);
+         }
          reshade::log::message(reshade::log::level::info, line.c_str());
          const auto& stats = gd.mv_last_stats;
-         reshade::log::message(reshade::log::level::info, std::format("[MELE MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter, {} mirrored, {} view restarts, {} updates, sr {} ({}), ended by 0x{:08X}, refused {}/{}/{}/{}/{}/{}/{}/{}", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.mirrored, stats.view_restarts, stats.updates, stats.sr_draws, int(device_data.sr_type), stats.ended_by, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]).c_str());
+         reshade::log::message(reshade::log::level::info, std::format("[MELE MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter, {} mirrored, {} view restarts, {} updates, sr {} ({}), ended by 0x{:08X}, refused{}", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.mirrored, stats.view_restarts, stats.updates, stats.sr_draws, int(device_data.sr_type), stats.ended_by, FormatRejects(stats)).c_str());
          // The world camera against last frame's: the PreViewTranslations and the largest ViewProjectionMatrix change
          if (gd.mv_camera && gd.mv_previous_camera && gd.mv_camera->size() == gd.mv_previous_camera->size() && gd.mv_camera->size() >= kPreViewTranslationOffset + 12)
          {
@@ -2631,7 +2824,9 @@ public:
             const float* const previous = reinterpret_cast<const float*>(gd.mv_previous_camera->data());
             float change = 0.f;
             for (int i = 0; i < 16; i++)
+            {
                change = (std::max)(change, std::abs(current[i] - previous[i]));
+            }
             const auto current_translation = GetPreViewTranslation(*gd.mv_camera), previous_translation = GetPreViewTranslation(*gd.mv_previous_camera);
             reshade::log::message(reshade::log::level::info, std::format("[MELE MV] camera: PVT ({:.3f}, {:.3f}, {:.3f}) previous ({:.3f}, {:.3f}, {:.3f}), max VP change {:.6f}, VP row 3 ({:.4f}, {:.4f}, {:.4f}, {:.4f}), b1 {} bytes, determinant {:.4f}, {} matched with an identical camera", current_translation[0], current_translation[1], current_translation[2], previous_translation[0], previous_translation[1], previous_translation[2], change, current[12], current[13], current[14], current[15], gd.mv_camera->size(), ViewDeterminant(*gd.mv_camera), gd.mv_last_stats.matched_same_camera).c_str());
          }
@@ -2653,7 +2848,9 @@ public:
             const UINT row_size = desc.Width * 4; // Both formats are 4 bytes per texel
             std::ofstream file(i == 0 ? "Luma_MV_Dump/mv.bin" : "Luma_MV_Dump/depth.bin", std::ios::binary);
             for (UINT y = 0; y < desc.Height; y++)
+            {
                file.write(static_cast<const char*>(mapped.pData) + size_t(y) * mapped.RowPitch, row_size);
+            }
             context->Unmap(gd.dump_textures[i].get(), 0);
             info << (i == 0 ? "mv " : "depth ") << desc.Width << " " << desc.Height << " " << int(desc.Format) << "\n";
          }
@@ -2662,7 +2859,9 @@ public:
             info << (i == 0 ? "camera" : "previous_camera");
             const float* const values = reinterpret_cast<const float*>(gd.dump_cameras[i].data());
             for (size_t j = 0; j < gd.dump_cameras[i].size() / sizeof(float); j++)
+            {
                info << " " << std::format("{:.9g}", values[j]);
+            }
             info << "\n";
          }
          info << "jitter " << gd.dump_jitter[0] << " " << gd.dump_jitter[1] << "\n";
@@ -2708,14 +2907,14 @@ public:
       {
          auto& gs = cb_luma_global_settings.GameSettings;
          const float scale = (gd.bloom_scale_live >= 0.f ? std::clamp(gd.bloom_scale_live, 0.f, 4.f) : 1.f);
-         float eff = 1.f;
+         float effective_intensity = 1.f;
          if (g_bloom_enable)
          {
-            eff = g_bloom_intensity * scale;
+            effective_intensity = g_bloom_intensity * scale;
          }
-         if (fabsf(gs.BloomIntensity - eff) > 1e-4f)
+         if (fabsf(gs.BloomIntensity - effective_intensity) > 1e-4f)
          {
-            gs.BloomIntensity = eff;
+            gs.BloomIntensity = effective_intensity;
             device_data.cb_luma_global_settings_dirty = true;
          }
          // The prefilter's cap follows the native scale alone, so the slider still scales capped sources (Luma_Bloom_impl.hlsl)
@@ -2726,10 +2925,10 @@ public:
          }
 
          // Follow native per-scene cb0.y; the default until the first readback.
-         const float thr = gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : default_luma_global_game_settings.BloomThreshold;
-         if (fabsf(gs.BloomThreshold - thr) > 1e-4f)
+         const float effective_threshold = (gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : default_luma_global_game_settings.BloomThreshold);
+         if (fabsf(gs.BloomThreshold - effective_threshold) > 1e-4f)
          {
-            gs.BloomThreshold = thr;
+            gs.BloomThreshold = effective_threshold;
             device_data.cb_luma_global_settings_dirty = true;
          }
       }
@@ -2750,7 +2949,7 @@ public:
       reshade::get_config_value(nullptr, PROJECT_NAME, "BloomIntensity", g_bloom_intensity);
       reshade::get_config_value(nullptr, PROJECT_NAME, "Dithering", gs.Dithering);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VideoAutoHDREnable", g_video_auto_hdr_enable);
-      gs.VideoAutoHDREnable = g_video_auto_hdr_enable ? 1.f : 0.f;
+      gs.VideoAutoHDREnable = (g_video_auto_hdr_enable ? 1.f : 0.f);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       reshade::get_config_value(nullptr, PROJECT_NAME, "GTAOEnable", g_gtao_enable);
       reshade::get_config_value(nullptr, PROJECT_NAME, "GTAOFinalValuePower", g_gtao_final_value_power);
@@ -2766,30 +2965,44 @@ public:
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
       if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      {
          reshade::set_config_value(nullptr, PROJECT_NAME, "SMAAEnable", g_smaa_enable);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR).");
+      }
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
       ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
+      {
          reshade::set_config_value(nullptr, PROJECT_NAME, "RCASSharpness", g_rcas_sharpness);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Sharpening applied on top of SMAA or DLSS/FSR (0 = off; requires AA enabled in the game's video settings).");
+      }
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
-      auto& gd_def = default_luma_global_game_settings;
+      auto& default_game_settings = default_luma_global_game_settings;
       // A [0, max] float setting: slider, saved on edit, reset button (saved too: LoadConfigs reads PROJECT_NAME, not [Luma])
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
          if (ImGui::SliderFloat(label, value, 0.f, max))
+         {
             device_data.cb_luma_global_settings_dirty = true;
+         }
          if (ImGui::IsItemDeactivatedAfterEdit())
+         {
             reshade::set_config_value(nullptr, PROJECT_NAME, key, *value);
+         }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
             ImGui::SetTooltip("%s", tooltip);
+         }
          if (DrawResetButton<float, false>(*value, default_value, key))
          {
             device_data.cb_luma_global_settings_dirty = true;
@@ -2797,15 +3010,15 @@ public:
          }
       };
 
-      slider("Exposure", &gs.Exposure, gd_def.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
+      slider("Exposure", &gs.Exposure, default_game_settings.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         slider("Contrast", &gs.Contrast, gd_def.Contrast, "Contrast", 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+         slider("Contrast", &gs.Contrast, default_game_settings.Contrast, "Contrast", 2.f, "Overall image contrast, HDR only (1 = vanilla).");
 
-         slider("Saturation", &gs.Saturation, gd_def.Saturation, "Saturation", 2.f, "Color saturation, HDR only (1 = vanilla).");
+         slider("Saturation", &gs.Saturation, default_game_settings.Saturation, "Saturation", 2.f, "Color saturation, HDR only (1 = vanilla).");
 
-         slider("Highlights Desaturation", &gs.HighlightDechroma, gd_def.HighlightDechroma, "HighlightDechroma", 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+         slider("Highlights Desaturation", &gs.HighlightDechroma, default_game_settings.HighlightDechroma, "HighlightDechroma", 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       }
 
       ImGui::SeparatorText("Bloom");
@@ -2815,92 +3028,122 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
+      }
       ImGui::BeginDisabled(!g_bloom_enable);
-      slider("Bloom Intensity", &g_bloom_intensity, gd_def.BloomIntensity, "BloomIntensity", 2.f, "Bloom strength (1 = vanilla, 0 = none).");
+      slider("Bloom Intensity", &g_bloom_intensity, default_game_settings.BloomIntensity, "BloomIntensity", 2.f, "Bloom strength (1 = vanilla, 0 = none).");
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Ambient Occlusion");
       if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
+      {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAOEnable", g_gtao_enable);
+      }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
+      }
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemDeactivatedAfterEdit())
+      {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAOFinalValuePower", g_gtao_final_value_power);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Primary darkness dial (higher = darker AO). Calibrate to match vanilla's overall darkening.");
+      }
       ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 10.f, 200.f, "%.0f", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemDeactivatedAfterEdit())
+      {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAODepthScale", g_gtao_depth_scale);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("viewZ divisor (UE3 units -> ~meters). FIRST dial if AO shows broad depth-correlated over-occlusion.");
+      }
       ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 3.f, "%.3f");
       if (ImGui::IsItemDeactivatedAfterEdit())
+      {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAORadiusOverride", g_gtao_radius_override);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("0 = shader EFFECT_RADIUS define; > 0 overrides it to match the vanilla HBAO+ radius (uu / DepthScale).");
+      }
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Draws diagnostics through the game's AO apply (multiplied into the scene). Depth gradient dead/flat or normals blocky = wrong input; AO x8 = spot broad over-occlusion.");
+      }
 #if DEVELOPMENT
       ImGui::Combo("GTAO Temporal Noise", &g_gtao_temporal, "Auto (DLSS/FSR)\0Off (frozen, 2 denoise passes)\0On (frame % 64, 1 denoise pass)\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("A/B of the XeGTAO noise: per frame with one denoise pass (DLSS/FSR accumulate it), or frozen with two. Not saved.");
+      }
 #endif
       ImGui::EndDisabled();
 #endif
 
       ImGui::SeparatorText("Effects");
-      slider("Vignette Intensity", &gs.VignetteIntensity, gd_def.VignetteIntensity, "VignetteIntensity", 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
+      slider("Vignette Intensity", &gs.VignetteIntensity, default_game_settings.VignetteIntensity, "VignetteIntensity", 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
 
-      slider("Film Grain Intensity", &gs.FilmGrainIntensity, gd_def.FilmGrainIntensity, "FilmGrainIntensity", 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
+      slider("Film Grain Intensity", &gs.FilmGrainIntensity, default_game_settings.FilmGrainIntensity, "FilmGrainIntensity", 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
          if (ImGui::Checkbox("Video AutoHDR", &g_video_auto_hdr_enable))
          {
             reshade::set_config_value(nullptr, PROJECT_NAME, "VideoAutoHDREnable", g_video_auto_hdr_enable);
-            gs.VideoAutoHDREnable = g_video_auto_hdr_enable ? 1.f : 0.f;
+            gs.VideoAutoHDREnable = (g_video_auto_hdr_enable ? 1.f : 0.f);
             device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered())
+         {
             ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
+         }
          ImGui::BeginDisabled(!g_video_auto_hdr_enable);
-         slider("Video HDR Boost", &gs.VideoAutoHDRBoost, gd_def.VideoAutoHDRBoost, "VideoAutoHDRBoost", 1.f, "Video highlight strength (0 = off).");
+         slider("Video HDR Boost", &gs.VideoAutoHDRBoost, default_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost", 1.f, "Video highlight strength (0 = off).");
          ImGui::EndDisabled();
       }
 
       bool dithering = gs.Dithering > 0.5f;
       if (ImGui::Checkbox("Dithering", &dithering))
       {
-         gs.Dithering = dithering ? 1.f : 0.f;
+         gs.Dithering = (dithering ? 1.f : 0.f);
          device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, PROJECT_NAME, "Dithering", gs.Dithering);
       }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Reduces gradient banding.");
+      }
 
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Disables the in-game UI.");
+      }
 
 #if DEVELOPMENT
       {
          auto& gd = GetGameDeviceData(device_data);
          ImGui::SeparatorText("Stage 1 DEV readout");
-         if (gd.stage1_perm == nullptr)
-         {
-            ImGui::Text("no stage-1 tonemap draw seen yet");
-         }
-         else
+         if (gd.stage1_perm)
          {
             ImGui::Text("perm 0x%08X  (draws this frame: %d)", gd.stage1_perm->hash, gd.stage1_draws);
             if (ImGui::IsItemHovered())
+            {
                ImGui::SetTooltip("The stage-1 permutation the game drew last; its description and HDR family are in the matching Tonemap_0x<hash> shader. A frame reporting two draws switched permutation mid-frame and may be using two families.");
+            }
+         }
+         else
+         {
+            ImGui::Text("no stage-1 tonemap draw seen yet");
          }
 
          ImGui::SeparatorText("Bloom DEV readout");
@@ -2921,29 +3164,45 @@ public:
       ImGui::Checkbox("MV Enable", &g_mv_enable);
       ImGui::EndDisabled();
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Draws the scene with the motion vector shaders without DLSS/FSR: camera and object motion (each draw finds its own\nprevious frame b0/b1/b3). The image must not change; the debug view is black with a static camera and lights up only\nwhat moves. ReShade.log: patched/refused shaders. Not saved; greyed while a Performance Test mode sets the anti-aliasing.");
+      }
       ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without an upscaler, with MV Enable. The image shakes by a subpixel; nothing\nmay flicker or lose pixels, and the debug view stays black with a static camera. Not saved.");
+      }
       ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("No projection jitter under DLSS/FSR (the upscaler gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
+      }
       ImGui::Checkbox("MV Skip Fill", &g_mv_skip_fill);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("No camera motion fill: pixels no patched draw wrote stay at zero, so the debug view shows the object draws alone. Not saved.");
+      }
       ImGui::Checkbox("MV Probe", &g_mv_probe);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Logs \"[MELE Probe]\" lines to ReShade.log: every pass that reads the scene after its first motion vector draw, once per\nshader, phase and slot. Reads every draw's bindings (slower). Not saved.");
+      }
       if (ImGui::Button("MV Dump"))
+      {
          g_mv_dump = true;
+      }
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Writes this frame's motion vectors, depth and cameras to \"Luma_MV_Dump\" beside the executable (offline analysis).");
+      }
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");
+      }
       ImGui::Text("Last frame: %u motion vector draws (%u matched, %u camera only, %u other camera, %u uncopied), %u jitter draws, %u mirrored, %u view restarts", stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.mirrored, stats.view_restarts);
       ImGui::Text("Constant updates copied: %u, upscaler draws: %u, scene ended by 0x%08X, matched with an identical camera: %u", stats.updates, stats.sr_draws, stats.ended_by, stats.matched_same_camera);
-      ImGui::Text("Refused: %u extra target, %u no scene, %u other depth/color, %u format, %u size, %u create, %u blend, %u shaders", stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7]);
+      ImGui::Text("Refused:%s", FormatRejects(stats).c_str());
       ImGui::Text("Last checked target: format %u, dimension %u, %ux%u (output %.0fx%.0f)", stats.rejected_format, stats.rejected_dimension, stats.rejected_width, stats.rejected_height, double(device_data.output_resolution.x), double(device_data.output_resolution.y));
       ImGui::Text("Constant copies: %u registered buffers, %u pooled, %u destroyed; FXAA dispatches skipped: %u", stats.registered_buffers, stats.constants_pool, gd.mv_destroyed_buffers, stats.fxaa_skipped);
 
@@ -2978,7 +3237,9 @@ public:
       ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
       static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
       if (ImGui::Button(donation_link.c_str()))
+      {
          ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+      }
       ImGui::PopStyleColor(3);
 
       ImGui::NewLine();
@@ -2991,7 +3252,9 @@ public:
       }
       static const std::string contributing_link = std::string("Contribute on Github ") + std::string(ICON_FK_FILE_CODE);
       if (ImGui::Button(contributing_link.c_str()))
+      {
          ShellExecuteA(nullptr, "open", "https://github.com/Filoppi/Luma-Framework", nullptr, nullptr, SW_SHOWNORMAL);
+      }
 
       ImGui::NewLine();
       ImGui::Text("Build Date: %s %s", __DATE__, __TIME__);
