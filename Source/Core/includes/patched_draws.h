@@ -185,8 +185,7 @@ namespace PatchedDraws
    };
 
    // An object's world transform, the tie-break between the motion vector draws sharing a draw key (props): its axes and translation
-   // (3x4). The translation alone ties for modular pieces that share a pivot and differ only by rotation (BL2's arches, measured
-   // 2026-10-01).
+   // (3x4). The translation alone ties for modular pieces that share a pivot and differ only by rotation (BL2's arches).
    using ObjectTransform = std::array<float, 12>;
 
    // A row vector matrix's (UE3's LocalToWorld) first three rows' xyz and its translation row's, from its first row

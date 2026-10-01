@@ -333,9 +333,9 @@ namespace MotionVectorPatch
       return WriteChunks(chunks);
    }
 
-   // A pixel shader's container, signatures and program, checked for the patches below: game targets only, below the layout's
-   // "target_slot"
-   // (depth writers, dgVoodoo's depth restores, refuse: a target declared after oDepth), inputs below the added ones, one final ret
+   // A pixel shader's container, signatures and program, checked for "PatchPixelShaderReactive" (games also use it as a pre-check):
+   // only game targets, below the layout's "target_slot" (depth writers such as dgVoodoo's depth restores are refused, as a target
+   // declared after oDepth), inputs below the added ones, one final ret
    struct PixelShader
    {
       std::vector<Chunk> chunks;
@@ -434,9 +434,9 @@ namespace MotionVectorPatch
       std::vector<uint32_t> reactive = {mov, Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL), target.reg, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3), color};
       if (additive)
       {
-         // o5.y = 0
+         // reactive.y = 0
          reactive.insert(reactive.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y), reactive_slot, immediate, 0, 0, 0, 0});
-         // scratch.x = max(r, g, b, 0), scratch.y = scratch.x + 1, o5.x = saturate(scratch.x / scratch.y * a)
+         // scratch.x = max(r, g, b, 0), scratch.y = scratch.x + 1, reactive.x = saturate(scratch.x / scratch.y * a)
          reactive.insert(reactive.end(), {
                                             max,
                                             Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_x),

@@ -17,7 +17,8 @@
 #include <format>
 #include <string>
 
-// Offline profiling of a frame's steps ("_tools/sr_bridge_perf" defines it before including this file)
+// Profiling of a frame's steps: defined by Mass Effect's Development builds (force included "BridgeProfile.h") and by
+// "_tools/sr_bridge_perf" (before including this file)
 #ifndef SR_BRIDGE_PROFILE
 #define SR_BRIDGE_PROFILE(command_list, step)
 #endif
