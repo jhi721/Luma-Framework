@@ -66,9 +66,7 @@ bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3
 
    const float scale = Reinhard::ReinhardRange(m.xxx, k).x / m;
    const float3 compressed = adapted * scale;
-   // The shoulder is asymptotic to 1, so the tolerance covers roundoff in it and nothing else. A
-   // compressed value genuinely above 1 means the shoulder did not do its job, which is a failure
-   // rather than something to clamp quietly.
+   // See MELE_HDR_BRIDGE_PROXY_EPS: a compressed value genuinely above 1 is a shoulder failure, never clamped.
    if (!(scale > 0.0 && scale <= 1.0) || !MELE_IsFiniteNonNegative(compressed) || max3(compressed) > 1.0 + MELE_HDR_BRIDGE_PROXY_EPS)
    {
       return false;
@@ -99,8 +97,6 @@ bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 // on both sides, so on a finite positive reference the reference's channel ratios survive exactly - the
 // per-channel shift and the whitening the native chain produced are kept, not undone. A coloured
 // reference stays coloured, equal channels stay equal, and a channel the grade zeroed is not refilled.
-//
-// Of the working value only Y is used; its own RGB ratios are deliberately discarded.
 //
 // The guarantee ends here, before the shared output tail. The vignette, DICE, the user controls, grain
 // and dither all run after it.

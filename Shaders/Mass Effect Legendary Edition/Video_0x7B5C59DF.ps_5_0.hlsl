@@ -1,5 +1,5 @@
-// Trilogy-wide Bink Y'CbCr-to-RGB pass with optional HDR highlight expansion. The matrix is transcribed from
-// 0x7B5C59DF; the native 8-bit clamp is restored before decoding because fp16 targets do not clamp Y'CbCr overshoot.
+// Trilogy-wide Bink Y'CbCr-to-R'G'B' pass with optional HDR highlight expansion, matrix transcribed from 0x7B5C59DF.
+// The native 8-bit clamp is restored before decoding: fp16 targets do not clamp the out-of-range R'G'B' it produces.
 //
 // Intermediate draws stay gamma for stage 2. Direct swapchain draws follow the topology fixed in OnInit: linear scRGB
 // on native HDR (POST_PROCESS_SPACE_TYPE 1, whose fp16 swapchain is linear and has no composition decode after it),
@@ -33,7 +33,7 @@ cbuffer _Globals : register(b0)
    float4 crc;    // Cr coefficients
    float4 cbc;    // Cb coefficients
    float4 adj;    // chroma re-centering offset
-   float4 yscale; // Y (luma) scale
+   float4 yscale; // Y' (luma) scale
    float4 consts; // .w = alpha
 }
 

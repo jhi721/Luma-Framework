@@ -1,6 +1,6 @@
-// Camera motion for motion vector pixels no patched draw wrote (still the marker 65504 from the frame start, the largest float16:
-// sky, unpatched draws): the scene depth reprojected from the current to the previous frame's world camera (b1 ViewProjectionMatrix and
-// the PreViewTranslation change, turned into column vectors on the CPU). Depth isn't reversed.
+// Camera motion for the motion vector pixels no patched draw wrote (sky, unpatched draws), which still hold the frame-start
+// marker 65504, the largest float16: scene depth reprojected from the current to the previous frame's world camera (b1
+// ViewProjectionMatrix and the PreViewTranslation change, transposed for column vectors on the CPU). Depth isn't reversed.
 
 cbuffer MotionVectorFill : register(b0)
 {

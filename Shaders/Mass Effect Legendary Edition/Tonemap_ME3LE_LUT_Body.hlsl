@@ -15,7 +15,7 @@
 #include "Includes/Common.hlsl"      // Defines game settings; keep first.
 #include "../Includes/Color.hlsl"    // Transfer and color helpers.
 #include "../Includes/DICE.hlsl"     // Display-peak tonemap.
-#include "../Includes/Reinhard.hlsl" // Reversible compression, used by the grade proxy.
+#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
 #include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
 // clang-format on
@@ -288,8 +288,7 @@ void main(
       }
    }
 
-   // Use one native grade function for both the working value and SDR reference. The white blowout the native result
-   // already contains is kept as it is; it is not given back its lost chroma.
+   // The white blowout already in the native result is kept; its lost chroma is not given back.
    float3 sdrGamma = MELE_ME3LE_GradeChain(r0.xyz);
    float3 gradedHDR = MELE_NativeColorGradedHDR(sdrGamma, workHDR, workValid);
 

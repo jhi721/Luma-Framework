@@ -1,9 +1,9 @@
 // Mass Effect Legendary Edition trilogy Luma mod (Unreal Engine 3, native DX11, x64). One addon, three games:
 // stage-1 hashes, bloom slots and the GTAO radius are per game, the FXAA/HBAO+/DoF/bloom/present chains are shared.
 //
-// Stage 1 replaces the SDR-clamping uber-post tonemap with an HDR reconstruction and DICE rolloff; stage 2
-// (0x0765601C) decodes the gamma intermediate and applies Game Paper White. SMAA replaces compute FXAA, fp16
-// pyramidal bloom replaces the UNORM bloom, XeGTAO writes the native AO target; native fp16 DoF is unchanged.
+// Stage 1 replaces the SDR-clamping uber-post tonemap with an HDR reconstruction and DICE rolloff; on the native HDR
+// topology stage 2 (0x0765601C) decodes the gamma intermediate and applies Game Paper White. SMAA replaces compute
+// FXAA, fp16 pyramidal bloom replaces the UNORM bloom, XeGTAO writes the native AO target; native fp16 DoF is unchanged.
 //
 // Sub-native borderless is best-effort: the game allocates desktop-sized targets but renders a top-left
 // sub-rectangle through cb2 DynamicScale, so injected in-place passes process the full allocation.
@@ -78,11 +78,11 @@ static const char* GameName(MEGame game)
 
 // SMAA replaces the shared MiniEngine FXAA resolve on the fp16 gamma post buffer. The prepass and indirect-
 // argument dispatches touch only work queues: skipped with the resolves when SMAA or DLSS / FSR own them.
-// Prepass: t0 the post buffer, work queues u0/u1. ME3 LE's reads a precomputed R16F luma at t1 (seen 2026-10-01).
+// Prepass: t0 the post buffer, work queues u0/u1. ME3LE's also reads a precomputed R16F luma at t1.
 static constexpr uint32_t kFXAAPrepassHash = 0xDB7428D0;
 static constexpr uint32_t kFXAAPrepassLumaHash = 0xEB56A2F1;
 static constexpr uint32_t kFXAAArgumentsHash = 0xF46EB801; // The resolves' indirect arguments.
-static constexpr uint32_t kFXAAResolveHHash = 0xB53BB634;  // Horizontal resolve: replaced with SMAA.
+static constexpr uint32_t kFXAAResolveHHash = 0xB53BB634;  // Horizontal resolve: replaced with SMAA (RCAS only after DLSS / FSR).
 static constexpr uint32_t kFXAAResolveVHash = 0xF43DBFFD;  // Vertical in-place refine: skipped after SMAA.
 
 // Stage-1 tonemap permutations (MB = motion blur). Slots are stored per permutation because MB binds depth at t0
@@ -194,7 +194,7 @@ static bool g_mv_debug_view = false;
 static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
 static bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
 static bool g_mv_skip_fill = false;      // No camera fill (the debug view then shows the patched draws alone)
-static bool g_mv_dump = false;           // One shot: the motion vectors, depth and cameras to "Luma_MV_Dump" (see "DumpMotionVectors")
+static bool g_mv_dump = false;           // One shot: the motion vectors, depth and cameras to "Luma_MV_Dump", written at present
 static bool g_mv_probe = false;          // The scene's readers to ReShade.log (see "OnDrawOrDispatch"): reads every draw's bindings
 // A/B of the constant copies' CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy", "PatchedShader::read_sizes")
 static bool g_mv_buffer_filter = true;
@@ -268,8 +268,7 @@ struct RGBA16FTarget
    uint32_t w = 0, h = 0;
 };
 
-// Why "DrawWithMotionVectors" refused a draw: the DEV counters, the MCP trace note, and the names they are logged and registered
-// under
+// Why "DrawWithMotionVectors" refused a draw (DEV counters, MCP trace note), and the names they are logged and registered under
 enum MotionVectorReject : int
 {
    REJECT_EXTRA_TARGET,
@@ -287,7 +286,8 @@ static constexpr const char* kMotionVectorRejectNames[REJECT_COUNT] = {"extra_ta
 // Per-device resources and per-frame state. SMAA detects edges on a gamma snapshot and blends it filtered in linear light.
 struct MassEffectGameDeviceData final : public GameDeviceData
 {
-   // Handles already processed by SMAA this frame; later in-place FXAA resolves must be skipped.
+   // Post buffers whose FXAA resolve was already replaced this frame (SMAA, RCAS or the upscaled image); later in-place resolves
+   // are skipped.
    std::unordered_set<uint64_t> smaa_applied_handles;
 
    // R24 scene depth captured from motion-blur tonemap permutations for SMAA predication.
@@ -1091,8 +1091,9 @@ class MassEffectLE final : public Game
       return !same_view;
    }
 
-   // Opens the scene at the frame's first mesh draw into output sized depth (the depth prepass): takes the scene depth and picks the
-   // jitter the whole scene draws with. Once per present (the HUD and later passes never reopen it).
+   // Opens the scene at the frame's first mesh draw into output sized depth (the depth prepass), and again for a later view (see
+   // "IsNewView"): takes the scene depth and picks the jitter the whole scene draws with. Never after the scene's end (the HUD and
+   // later passes).
    static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash, ID3D11DepthStencilView* dsv)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1173,7 +1174,7 @@ class MassEffectLE final : public Game
       }
       if (!rtvs[0] || !dsv || !game_device_data.mv_scene_open)
          return MV_REJECT(REJECT_NO_SCENE);
-      // Known targets: checked, and the motion vector target built for them
+      // Targets other than the last accepted ones: checked, and the motion vector target sized for them
       if (rtvs[0].get() != game_device_data.mv_accepted_rtv || dsv != game_device_data.mv_accepted_dsv)
       {
          // Refused targets stay refused until the scene reopens (the scene depth and color only change there)
@@ -1393,7 +1394,7 @@ class MassEffectLE final : public Game
          {
             HashCombine(key, value);
          }
-         // LocalToWorld, its translation in world space (it includes the camera's PreViewTranslation)
+         // LocalToWorld, the camera's PreViewTranslation taken out of its translation (world space)
          const std::array<float, 3> view_translation = GetPreViewTranslation(*camera);
          const uint32_t translation_offset = game_device_data.mv_last_vertex_shader->translation_offset;
          const bool translated = translation_offset != UINT_MAX && translation_offset + sizeof(float) * 3 <= object->size();
@@ -2192,7 +2193,7 @@ public:
 #else
             const float dbg = 0.f;
 #endif
-            // The last is the noise index (see "IsGTAOTemporal")
+            // knobs[4] is the noise index (see "IsGTAOTemporal")
             const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f};
             if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), knobs, sizeof(knobs)))
                return DrawOrDispatchOverrideType::None;
@@ -2476,9 +2477,8 @@ public:
    {
       auto& gd = GetGameDeviceData(device_data);
 
-      // Immediate context only ("is_primary" is cached by Core: no per-draw virtual query). Do not reject custom passes globally: the
-      // hash-replaced stage-1 tonemap still supplies SMAA depth and the bloom slot. Individual native-only branches apply
-      // !is_custom_pass where required.
+      // Immediate context only ("is_primary" is cached by Core, no per-draw query). Custom passes aren't rejected here: the replaced
+      // stage-1 tonemap still supplies SMAA depth and the bloom slot; native-only branches check !is_custom_pass themselves.
       if (!cmd_list_data.is_primary)
          return DrawOrDispatchOverrideType::None;
 
@@ -2486,9 +2486,9 @@ public:
       const TonemapPermDesc* const stage1_perm = (compute ? nullptr : FindTonemapPerm(original_shader_hashes));
       const bool stage1 = stage1_perm != nullptr;
 #if DEVELOPMENT
-      // Scene probe: the passes that read the scene after its first motion vector draw, before its end ("open") and after it
-      // ("done"), logged once per shader, phase and slot (the evidence for the post passes that end the scene, and that the upscaled
-      // scene reaches every reader). Stale bindings show up too.
+      // "MV Probe": each pass that reads the scene or the upscaled scene after the first motion vector draw, before the scene's end
+      // ("open") or after it ("done"), logged once per shader, phase and slot. Evidence for the post passes that end the scene and that
+      // every reader gets the upscaled scene; stale bindings show up too.
       if (g_mv_probe && gd.mv_active && gd.mv_scene_color && (gd.mv_scene_open || gd.mv_scene_done))
       {
          const uint32_t hash = (compute ? uint32_t(original_shader_hashes.compute_shaders[0]) : uint32_t(original_shader_hashes.pixel_shaders[0]));
@@ -2604,12 +2604,12 @@ public:
          RebindUpscaledScene(native_device_context, gd, compute);
          gd.sr_rebind_done = stage1;
       }
-      // Every draw without a patched shader: the game's own, if the last patched draw's are still bound
+      // A draw without patched shaders gets the game's own back while the last patched draw's are still bound
       PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
       PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
 
-      // HUD draws occur after the FXAA resolve. Suppress only plain game draws in that window so stage 1, stage 2,
-      // movies without a scene resolve, and pre-scene menus remain intact.
+      // "Hide Gameplay UI": the HUD draws after the FXAA resolve. Only plain game draws after it are skipped, so stage 1, stage 2,
+      // movies without a scene resolve and pre-scene menus stay.
       if (g_hide_ui && !is_custom_pass && gd.scene_post_done_this_frame)
          return DrawOrDispatchOverrideType::Replaced;
 
@@ -2762,8 +2762,8 @@ public:
          device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
       }
 #if DEVELOPMENT
-      // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, the first 60
-      // after a change of mode or AA settings skipped), opens the next frame's
+      // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, after 60
+      // settle frames whenever the settings it keys on change) and opens the next frame's
       com_ptr<ID3D11DeviceContext> native_device_context;
       native_device->GetImmediateContext(&native_device_context);
       gd.perf_timestamps.Close(native_device_context.get());
@@ -2795,7 +2795,7 @@ public:
                const Perf::Sweep<PERF_COLUMN_COUNT>::Row row = {stats.frame.Average(), stats.scene.Average(), stats.sr.Average(), window.HookMs(), stats.fill.Average()};
                const char* const game_name = GameName(g_me_game);
                reshade::log::message(reshade::log::level::info, std::format("[MELE Perf] game={} mode=\"{}\" aa={} hook_timers={} mv_enable={} gtao={} gtao_temporal={} bloom={} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame fill={:.3f} ms ({}) samples={}/{} disjoint={}", game_name, perf_test_modes[Perf::g_test].name, aa, Perf::g_hook_timers, g_mv_enable, g_gtao_enable, g_gtao_temporal, g_bloom_enable, g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), row[PERF_COLUMN_FRAME], stats.frame.max_ms, row[PERF_COLUMN_SCENE], stats.scene.max_ms, stats.scene.samples, row[PERF_COLUMN_SR], stats.sr.max_ms, stats.sr.samples, window.CpuFrameMs(), row[PERF_COLUMN_HOOKS], row[PERF_COLUMN_FILL], stats.fill.samples, stats.frame.samples, window.frames, window.disjoint).c_str());
-               // Per mode: the median window (and the frame's range), and the frame against the last mode's (SMAA Off)
+               // Per sweep mode: the medians, the frame's range and the frame against the baseline (the last mode, SMAA Off)
                g_perf_sweep.OnWindow(Perf::g_test, row, [&](int mode_index)
                   { ApplyPerfTestMode(device_data, mode_index); }, [&](int mode, int baseline_mode, double baseline)
                   {
@@ -2831,7 +2831,8 @@ public:
             reshade::log::message(reshade::log::level::info, std::format("[MELE MV] camera: PVT ({:.3f}, {:.3f}, {:.3f}) previous ({:.3f}, {:.3f}, {:.3f}), max VP change {:.6f}, VP row 3 ({:.4f}, {:.4f}, {:.4f}, {:.4f}), b1 {} bytes, determinant {:.4f}, {} matched with an identical camera", current_translation[0], current_translation[1], current_translation[2], previous_translation[0], previous_translation[1], previous_translation[2], change, current[12], current[13], current[14], current[15], gd.mv_camera->size(), ViewDeterminant(*gd.mv_camera), gd.mv_last_stats.matched_same_camera).c_str());
          }
       }
-      // "MV Dump": raw rows of the staging copies (motion vectors R16G16_FLOAT, depth R24G8) and the two b1 copies, beside the executable
+      // "MV Dump": raw rows of the staging copies (motion vectors R16G16_FLOAT, depth R24G8), the two b1 copies and the jitter, beside
+      // the executable
       if (gd.dump_textures[0] && gd.dump_textures[1])
       {
          com_ptr<ID3D11DeviceContext> context;
@@ -2896,14 +2897,14 @@ public:
       gd.srv_gtao_depth.reset();
       gd.srv_gtao_normals.reset();
       gd.gtao_active_this_frame = false;
-      gd.bloom_scale_captured_this_frame = false; // Re-arm BloomScale capture.
-      gd.scene_post_done_this_frame = false;      // Re-armed by the FXAA resolve.
+      gd.bloom_scale_captured_this_frame = false; // Re-arms the bright pass capture.
+      gd.scene_post_done_this_frame = false;      // Set again by the FXAA resolve.
 #if DEVELOPMENT
       gd.stage1_draws = 0; // stage1_perm deliberately survives: a paused or menu frame keeps the last answer.
 #endif
 
-      // This is the sole writer of effective BloomIntensity. UI code edits only the raw slider and enable state,
-      // preventing raw/derived values from oscillating while dragging. Native bloom keeps multiplier 1.
+      // The only runtime writer of the effective bloom values: the UI edits only the raw slider and enable, so raw and derived values
+      // can't oscillate while dragging. Native bloom keeps intensity 1.
       {
          auto& gs = cb_luma_global_settings.GameSettings;
          const float scale = (gd.bloom_scale_live >= 0.f ? std::clamp(gd.bloom_scale_live, 0.f, 4.f) : 1.f);
@@ -2988,7 +2989,8 @@ public:
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& default_game_settings = default_luma_global_game_settings;
-      // A [0, max] float setting: slider, saved on edit, reset button (saved too: LoadConfigs reads PROJECT_NAME, not [Luma])
+      // A [0, max] float setting: slider saved on edit, and a reset button saved here (DrawResetButton's own save writes NAME, but
+      // LoadConfigs reads PROJECT_NAME)
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
          if (ImGui::SliderFloat(label, value, 0.f, max))
@@ -3280,9 +3282,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
       g_me_game = DetectMEGame();
-      // Per-game defaults (ME1LE's are the globals' own); LoadConfigs may override the persisted ones afterwards. ME2LE/ME3LE's native
-      // HBAO+ radius is 48 uu against ME1LE's 30 uu: their GTAO radius override (native radius / DepthScale) is 0.96, ME1LE's 0 keeps
-      // the shader's own radius.
+      // Per-game defaults (ME1LE's are the globals' own), before LoadConfigs reads the saved values. ME2LE/ME3LE's native HBAO+ radius
+      // is 48 uu against ME1LE's 30 uu: their GTAO radius override (native radius / DepthScale) is 0.96; ME1LE's 0 keeps the shader's.
       switch (g_me_game)
       {
       case MEGame::ME2LE:

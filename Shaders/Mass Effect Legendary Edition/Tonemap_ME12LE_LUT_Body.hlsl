@@ -372,7 +372,6 @@ void main(
       }
    }
 
-   // Use one native grade function for both the working value and SDR reference. Filmic feeds r1; non-filmic r0.
 #if TM_HAS_FILMIC
    float3 sdrGamma = MELE_ME12LE_GradeChain(r1.xyz);
 #else

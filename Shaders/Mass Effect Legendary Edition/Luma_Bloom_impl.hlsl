@@ -13,7 +13,7 @@
 // user's Bloom Intensity multiplies after the clip, as on top of vanilla, and so still scales a capped source.
 static const float kMELE_BloomCap = 4.0;
 
-// Native max-channel soft knee; the tonemap applies BloomTint downstream.
+// Native max-channel soft knee.
 float3 MELE_BloomThreshold(float3 color)
 {
    // Restores the floor half of that [0,1] bound: negative values would blur in and be subtracted by the

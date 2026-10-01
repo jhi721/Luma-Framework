@@ -3,7 +3,7 @@
 // tail decodes it again on purpose: consuming that decode reschedules the vanilla curve on 0x2754F750 and 0x69F03340
 // in Publishing, turning r0*w + (1 - e) into (r0*w - e) + 1 at the same instruction count. Float32 addition is not
 // associative and that line is native transcription, so the duplicate decode stays (measured). fxc still picks either
-// form per permutation from unrelated code (the exposure metering moved some ME1LE/ME2LE ones, 2026-10-01): at most
+// form per permutation from unrelated code (the exposure metering moved some ME1LE/ME2LE ones): at most
 // 1 ULP, and only a `precise` on the curve would pin it, which spreads to the whole expression.
 // Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (0 none, 1 radial power, 3 ME3LE smoothstep), TM_HAS_GRAIN,
 // TM_ALPHA_LUMA (native ME3LE output luma to alpha).
@@ -30,7 +30,7 @@ float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 // exactly the vanilla multiply in the encoded domain. Grain and dither stay in gamma below, where hoisting would
 // amplify shadow noise.
 float3 vigLinear = 1.0;
-float3 vigGamma = 1.0; // The native multiplier, kept for the exposure metering below
+float3 vigGamma = 1.0; // The native gamma-domain multiplier, for the exposure metering below.
 #if TM_VIGNETTE_TYPE == 1
 // The slider scales only radial darkening, so zero intensity does not alter the native white point tint.
 {

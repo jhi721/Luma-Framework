@@ -11,7 +11,7 @@
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
 #include "../Includes/DICE.hlsl"
-#include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
+#include "../Includes/Reinhard.hlsl" // ReinhardRange for HDRBridge's grade proxy, which family 02 never calls.
 #include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_ExpExtended.hlsli" // Continued scene curve and its validated work input.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Native-colour projection; needs Reinhard above.
@@ -227,8 +227,7 @@ void main(
       workValid = sourceValid && MELE_TryAnalyticGradeChainHDR(workNative, workHDR);
    }
 
-   // The native grade runs only on the SDR reference; the working value took its uncapped twin above. RGB ratios
-   // come from this bounded grade, never from the twin or the scene; only the relative luminance is the twin's.
+   // The native grade runs only on the SDR reference; the uncapped twin above supplies only relative luminance.
    float3 sdrGamma = MELE_Analytic_GradeChain(r0.xyz);
    float3 gradedHDR = MELE_NativeColorGradedHDR(sdrGamma, workHDR, workValid);
 

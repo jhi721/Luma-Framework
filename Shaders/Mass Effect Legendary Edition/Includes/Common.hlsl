@@ -82,7 +82,7 @@ bool MELE_IsFiniteNonNegative(float3 v)
 {
    return all(v >= 0.0) && all(v <= FLT_MAX);
 }
-// A divisor or exponent that must be finite and strictly positive (zero rejected too). A macro, not a function: fxc
+// A divisor or exponent that must be finite and strictly positive. A macro, not a function: fxc
 // reassociates unrelated math around an inlined call (0x8C8E8CA2's exponential curve moved), never around the bare
 // comparison, so the listings stay identical.
 #define MELE_IS_FINITE_POSITIVE(x) ((x) > 0.0 && (x) <= FLT_MAX)
