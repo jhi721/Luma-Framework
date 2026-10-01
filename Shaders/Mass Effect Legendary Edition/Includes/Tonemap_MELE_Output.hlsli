@@ -95,6 +95,8 @@ else // SDR still uses the scRGB swapchain; sdrLinear is the exact native grade.
 }
 
 postProcessedColor = IsNaN_Strict(postProcessedColor) ? 0.0 : postProcessedColor;
+// Stage 1 owns the non-negative floor: no negative RGB may reach the gamma HUD or the swapchain, so wide-gamut
+// (negative BT.709) components the hue transfer kept end here.
 postProcessedColor = max(0.0, postProcessedColor);
 
 // Encode gamma(scene / R), R = UI Paper White / Game Paper White. The native gamma HUD blends before stage 2

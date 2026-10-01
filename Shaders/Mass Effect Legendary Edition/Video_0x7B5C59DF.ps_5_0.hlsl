@@ -1,9 +1,10 @@
 // Trilogy-wide Bink Y'CbCr-to-RGB pass with optional HDR highlight expansion. The matrix is transcribed from
 // 0x7B5C59DF; the native 8-bit clamp is restored before decoding because fp16 targets do not clamp Y'CbCr overshoot.
 //
-// Intermediate draws stay gamma for stage 2. Direct swapchain draws emit linear scRGB once stage 2 has
-// established a linear frame, and otherwise stay gamma for the final composition decode; C++ supplies both
-// states. Bypassing stage 2 makes the linear path the other pass that applies Game Paper White itself.
+// Intermediate draws stay gamma for stage 2. Direct swapchain draws follow the topology fixed in OnInit: linear scRGB
+// on native HDR (POST_PROCESS_SPACE_TYPE 1, whose fp16 swapchain is linear and has no composition decode after it),
+// gamma on native SDR (Core's composition decodes the whole frame). Bypassing stage 2 makes the linear path the other
+// pass that applies Game Paper White itself. C++ reports per draw whether the target is a back buffer.
 
 // clang-format off
 #include "Includes/Common.hlsl"   // Defines game settings; keep first.
@@ -48,12 +49,11 @@ void main(
 
    const bool hdr = LumaSettings.DisplayMode == 1;
    const bool onSwapchain = LumaSettings.GameSettings.VideoOnSwapchain > 0.5;
-   const bool swapchain_gamma_encoded = LumaData.GameData.SwapchainGammaEncoded > 0.5;
 
    // The native 8-bit clamp, restored in every mode (see the header).
    const float3 clamped = saturate(rgb);
 
-   const bool emitLinear = onSwapchain && !swapchain_gamma_encoded;
+   const bool emitLinear = onSwapchain && POST_PROCESS_SPACE_TYPE == 1;
 #if ENABLE_VIDEO_AUTO_HDR
    const bool autoHDR = hdr && LumaSettings.GameSettings.VideoAutoHDREnable > 0.5; // Exact HDR mode only.
 #else

@@ -138,9 +138,6 @@ static float g_bloom_intensity = 1.0f;
 // Bink targets the intermediate gamma buffer or the swapchain directly; GameSettings.VideoOnSwapchain reports
 // which, so the UI/Game ratio and Game Paper White are applied exactly once on either path.
 static constexpr uint32_t kVideoBinkHash = 0x7B5C59DF;
-// Shared stage 2 decodes the gamma scene/HUD composite into linear scRGB and applies the UI/Game ratio and Game
-// Paper White. Native SDR omits it.
-static constexpr uint32_t kOutputStage2Hash = 0x0765601C;
 
 // XeGTAO replaces the half-resolution GFSDK HBAO+ chain, writing the game's R8_UNORM AO target at the blur
 // dispatch; the native apply blit still composites. Noise and denoise pass count follow "IsGTAOTemporal".
@@ -312,7 +309,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    int bloom_scale_ring_filled = 0;              // Do not map until every slot contains real data.
    bool bloom_scale_captured_this_frame = false; // Once-per-frame capture gate.
    bool scene_post_done_this_frame = false;      // Arms HUD suppression after the FXAA resolve.
-   bool stage2_seen_this_frame = false;          // False means final composition must decode the gamma swapchain.
    float bloom_scale_live = -1.f;                // Negative until the first successful readback.
    float bloom_threshold_live = -1.f;            // Negative selects the 1.2 fallback.
 #if DEVELOPMENT
@@ -2432,11 +2428,6 @@ public:
       PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
       PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
 
-      // Core uploads LumaData after this callback for replaced shaders, so stage 2 and any later direct Bink draw
-      // receive the updated encoding state in the same frame.
-      if (original_shader_hashes.Contains(kOutputStage2Hash, reshade::api::shader_stage::pixel))
-         gd.stage2_seen_this_frame = true;
-
       // HUD draws occur after the FXAA resolve. Suppress only plain game draws in that window so stage 1, stage 2,
       // movies without a scene resolve, and pre-scene menus remain intact.
       if (g_hide_ui && !is_custom_pass && gd.scene_post_done_this_frame)
@@ -2452,13 +2443,6 @@ public:
          return *gtao_result;
 
       return RunSMAAResolve(native_device, native_device_context, device_data, gd, original_shader_hashes, is_custom_pass);
-   }
-
-   void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData&, DeviceData& device_data) override
-   {
-      // Read by the Bink replacement to decide whether a direct swapchain draw may emit linear scRGB.
-      const auto& gd = GetGameDeviceData(device_data);
-      data.GameData.SwapchainGammaEncoded = gd.stage2_seen_this_frame ? 0.f : 1.f;
    }
 
    void CleanExtraSRResources(DeviceData& device_data) override
@@ -2492,10 +2476,24 @@ public:
          gd.view_camera.reset();
          gd.scene_view_camera.reset();
       }
-      // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again)
-      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false) && !g_mv_enable)
+      // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again). The DEV
+      // "MV Enable" still draws motion vectors without an upscaler: their resources stay then.
+      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
+      }
+      if (device_data.sr_type == SR::Type::None && !gd.mv_active && (gd.mv_jitter_buffer || gd.mv_texture))
+      {
+         // The previous constants ring and the jitter buffer stay bound at VS b8 to b11 after the last motion vector draw (no game
+         // shader binds those slots), and the binding alone keeps them alive
+         com_ptr<ID3D11DeviceContext> native_device_context;
+         native_device->GetImmediateContext(&native_device_context);
+         ID3D11Buffer* const no_buffer = nullptr;
+         for (const auto& [current_slot, previous_slot] : MotionVectorPatches::previous_slots)
+         {
+            native_device_context->VSSetConstantBuffers(previous_slot, 1, &no_buffer);
+         }
+         native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &no_buffer);
          {
             const std::unique_lock lock(gd.mv_mutex);
             gd.mv_texture.reset();
@@ -2689,7 +2687,6 @@ public:
       }
 #endif
 
-      gd.stage2_seen_this_frame = false;
       // Clear per-frame SMAA state so menus and transitions cannot reuse stale predication depth.
       gd.smaa_applied_handles.clear();
       gd.srv_depth.reset();

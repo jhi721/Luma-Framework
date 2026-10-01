@@ -29,8 +29,7 @@ struct LumaGameSettings
 // Game-specific per-pass cbuffer data.
 struct LumaGameData
 {
-   // 1 until stage 2 draws this frame (it writes linear scRGB to the swapchain); always 1 on the native-SDR topology.
-   float SwapchainGammaEncoded;
+   float Dummy; // hlsl doesn't support empty structs
 };
 } // namespace CB
 
