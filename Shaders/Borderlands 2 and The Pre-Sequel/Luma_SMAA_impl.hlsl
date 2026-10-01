@@ -2,7 +2,7 @@
 // ULTRA preset + color edge detection, run POST-tonemap on the gamma LDR (main.cpp RunPostTonemapSMAA) so it cannot
 // perturb the DoF composited inside the tonemap; the native FXAA is cancelled while SMAA is on (main.cpp's FXAA
 // override). Edge detection reads the ENCODED post-tonemap signal, the domain its thresholds are
-// tuned in; neighborhood blending reads the LINEAR-light decode of that same signal (Luma_BL2TPS_SMAALinearize) and
+// tuned in; neighborhood blending filters that same snapshot in linear light (SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR) and
 // this file re-encodes the blended result, so what goes back downstream is still the game's gamma 2.2 LDR. The PS
 // appends no HDR tail (Display Composition does paper-white + scRGB). Predication = plane-deviation edge-ness
 // built from the scene-color .a depth (Luma_BL2TPS_DepthExtract), null texture + scale 1.0 as the fallback.
@@ -29,15 +29,16 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PREDICATION_STRENGTH  0.5
 #define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)
-// Color.hlsl only for the re-encode helper. Neither it (it includes only Math.hlsl) nor the self-contained SMAA.hlsl
+// Color.hlsl only for the decode and re-encode helpers. Neither it (it includes only Math.hlsl) nor the self-contained SMAA.hlsl
 // has a DEVELOPMENT/TEST conditional, so every entry point stays byte-identical across the two define sets.
 #include "../Includes/Color.hlsl"
 
 // Edge detection: tex0 = colorTexGamma (the gamma-encoded LDR snapshot)
 // tex1 = predicationTex (plane-deviation edge-ness; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
-// Neighborhood blending: tex0 = colorTex, the LINEAR decode of the LDR (Luma_BL2TPS_SMAALinearize says why); tex1 = blendTex. Re-encode
-// with the tonemap's own linear_to_gamma, so both sides move together if DefaultGamma ever does; GCT_MIRROR brings the dither's
-// negative half at black back out unclamped. One encode only: the RTV is never an SRGB view. Alpha is left as the blend produced it
-// (the tonemap writes o0.w = 0). No HDR tail.
+// Neighborhood blending: tex0 = colorTex, the same snapshot, decoded before its bilinear weights (the blend averages, which must
+// happen in linear light); tex1 = blendTex. Re-encode with the tonemap's own linear_to_gamma, so both sides move together if
+// DefaultGamma ever does; GCT_MIRROR brings the dither's negative half at black back out unclamped. One encode only: the RTV is
+// never an SRGB view. Alpha is left as the blend produced it (the tonemap writes o0.w = 0). No HDR tail.
+#define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 #include "../Includes/SMAA_Passes.hlsl"
