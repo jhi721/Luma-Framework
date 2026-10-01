@@ -8,9 +8,9 @@
 // clang-format on
 
 // Borderlands 2 + The Pre-Sequel — uber post-process / tonemap SHARED IMPLEMENTATION (UE3, via dgVoodoo D3D9->11).
-// Holds the grade body as RunTonemap(); the per-hash wrapper files (Tonemap_0x<HASH>.ps_5_0.hlsl, one per game ×
-// dgVoodoo version) declare the full UE3 interpolator set + main() and forward to it. No hash in this filename ->
-// not matched/replaced directly; it is #included by the wrappers.
+// Holds the grade body as RunTonemap() and the main() over the full UE3 interpolator set; the per-hash wrapper files
+// (Tonemap_0x<HASH>.ps_5_0.hlsl, one per game × dgVoodoo version) set the slot map and include it. No hash in this
+// filename -> not matched/replaced directly.
 //
 // Vanilla body (DOF + screen-blend bloom + vignette + ImageAdjustments + 16-slice ColorGradingLUT) transcribed
 // VERBATIM (register-level) from the readable DX9 BL2 tonemap (tonemap_0x54ED86A0.ps_3_0),
@@ -25,7 +25,7 @@
 // and Vignette controls, and Luma's pyramidal bloom is on by default).
 //
 // This is NOT inverse tonemapping, NOT hue restoration from the raw scene, and NOT MELE family 05's hard-clip
-// treatment: no path anywhere takes chroma from the working value.
+// treatment: no path anywhere takes the working value's channel ratios.
 // The per-channel ImageAdjustments curve below MUST keep the original's swizzles (r0.zzxy / r3.z,w,xy) — a
 // "cleaner" rewrite swaps channels and casts the whole image green.
 
@@ -273,8 +273,8 @@ bool BL2TPS_TryBuildWorkingLuminance(float3 curveInput, out float targetLuminanc
 // linear BT.709 luminance on both sides, so on a finite positive reference the reference's channel
 // ratios survive exactly: the per-channel shift, the LUT tint and the whitening the native chain
 // produced are kept, not undone. A coloured reference stays coloured, equal channels stay equal, and
-// a channel the grade zeroed is not refilled. Of the working value only Y is used; its own hue and
-// chroma are deliberately discarded.
+// a channel the grade zeroed is not refilled. Of the working value only Y is used; its own channel
+// ratios (hue, colorfulness) are deliberately discarded.
 //
 // Guard contract, deliberately not one blanket fallback:
 //   the WHOLE reference triple is validated, not only its luminance: a dot product returns a finite
@@ -349,14 +349,14 @@ float4 RunTonemap(float4 v5, float4 v6)
       // Luma pyramidal bloom (t5, built by the mod from the fp16 scene; the game's is UNORM-clamped). Composited like
       // the vanilla branch below - the artists' per-area tint and the x4 - so BloomIntensity 1 is vanilla strength
       // (it arrives pre-scaled by the pyramid-to-native energy ratio, main.cpp). The vanilla screen-blend gate
-      // (saturate(exp2(-3*luma) * .w)) is deliberately skipped: an 8-bit approximation that cancels the glow of the
+      // (saturate(exp2(-3 * weighted RGB) * .w)) is deliberately skipped: an 8-bit approximation that cancels the glow of the
       // brightest sources, the one thing this bloom exists to fix.
       float3 lumaBloom = t5.SampleLevel(s1_s, v6.xy, 0).rgb;
       hdrColor += lumaBloom * (BloomTintAndScreenBlendThreshold.xyz * (4.0 * LumaSettings.GameSettings.BloomIntensity));
    }
    else
    {
-      // Vanilla bloom (screen-blend gated by luminance, t1), never scaled: Bloom Intensity belongs to the Luma pyramid.
+      // Vanilla bloom (screen-blend gated by a (0.3, 0.59, 0.11) weighted sum of the linear scene, t1), never scaled: Bloom Intensity belongs to the Luma pyramid.
       r0.w = dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999));
       r0.w = r0.w * -3;
       r0.w = exp2(r0.w);
@@ -368,7 +368,7 @@ float4 RunTonemap(float4 v5, float4 v6)
    }
 
 #if TM_HAS_LIGHTSHAFT
-   // Light shafts / god rays (TPS only), verbatim from tps_tonemap_0xF8997849: an inverse-luminance gate (adds only
+   // Light shafts / god rays (TPS only), verbatim from tps_tonemap_0xF8997849: the same inverse weighted RGB gate (adds only
    // into darker pixels), additive x4 colour, and a per-pixel attenuation in .a where shafts occlude.
    {
       float lsGate = saturate(exp2(dot(hdrColor, float3(0.300000012, 0.589999974, 0.109999999)) * -3.0));
@@ -509,10 +509,10 @@ float4 RunTonemap(float4 v5, float4 v6)
 #endif
 
    // Sanitize (signed LUT excursions, the user grade and DICE can emit NaN/negatives -> garbage on the swapchain).
-   postProcessedColor = (postProcessedColor == postProcessedColor) ? postProcessedColor : 0.0; // NaN -> 0
+   // max returns the non-NaN operand, so NaN -> 0 too.
    postProcessedColor = max(0.0, postProcessedColor);
 
-   // GCT_NONE, not GCT_MIRROR: the two lines above already forced this non-negative, so the mirror's
+   // GCT_NONE, not GCT_MIRROR: the line above already forced this non-negative, so the mirror's
    // sign round trip would be dead weight. The SDR decode further up keeps its mirror - the native
    // trilinear read really can hand it a signed excursion.
    postProcessedColor = linear_to_gamma(postProcessedColor, GCT_NONE);
@@ -534,4 +534,23 @@ float4 RunTonemap(float4 v5, float4 v6)
 #endif
 
    return float4(postProcessedColor, 0.0); // vanilla wrote o0.w = 0
+}
+
+void main(
+    float4 v0 : SV_POSITION0,
+    float4 v1 : TEXCOORD8,
+    float4 v2 : COLOR0,
+    float4 v3 : COLOR1,
+    float4 v4 : TEXCOORD9,
+    float4 v5 : TEXCOORD0,
+    float4 v6 : TEXCOORD1,
+    float4 v7 : TEXCOORD2,
+    float4 v8 : TEXCOORD3,
+    float4 v9 : TEXCOORD4,
+    float4 v10 : TEXCOORD5,
+    float4 v11 : TEXCOORD6,
+    float4 v12 : TEXCOORD7,
+    out float4 o0 : SV_TARGET0)
+{
+   o0 = RunTonemap(v5, v6);
 }

@@ -2,7 +2,7 @@
 // auto-registers them at ENABLE_BLOOM=1. Replaces the game's quarter-res UNORM-clamped glow with a multi-mip fp16
 // one off the linear HDR scene. Only the WEIGHT comes from the game; magnitude belongs to the tonemap's composite.
 //
-// The knee mirrors the native bright pass (0x997ACB8E under dgVoodoo 2.87.3, 0x5605F6C2 under 2.81.3):
+// The knee mirrors the native bright pass (main.cpp "kBloomBrightPassHash"):
 // saturate((max3(source * BloomScale) - BloomThreshold) * 0.5), BloomScale a constant 4 that only undoes the pass's
 // pre-divided-by-4 source - applying it here as well opened the knee 4x too low and put ~10x the native energy in.
 // C++ keeps GameSettings.BloomThreshold live off that pass (measured 0.50 to 1.32) and binds LumaSettings here.

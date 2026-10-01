@@ -1,6 +1,8 @@
 // Borderlands 2 / The Pre-Sequel — SMAA predication signal, ported from Medal of Honor: Airborne (which took it
-// from The Witcher 2). No depth buffer under dgVoodoo, but UE3 packs LINEAR view-space depth in the ALPHA of the fp16
-// scene colour, captured in main.cpp at the tonemap draw. Rescaling that depth cannot work: SMAA's predication is a
+// from The Witcher 2). No depth buffer under dgVoodoo, but the base pass encodes the view depth W in the ALPHA of the fp16
+// scene colour (Gearbox EncodeFloatW, see Includes/SceneDepth.hlsl), captured in main.cpp at the tonemap draw. Each tap is
+// decoded back to linear W first: the encoding is quadratic, so on it a plane is not a plane and the 4096 units switch
+// would read as sky. Rescaling linear depth cannot work either: SMAA's predication is a
 // plain first difference between adjacent pixels, and on linear depth a plane's own per-pixel change grows as z^2, so
 // a distant floor seen edge-on moves more than a near silhouette and no remap or threshold fixes that ratio.
 //
@@ -11,10 +13,12 @@
 // centreZ makes it a unitless edge-ness in [0,1], so SMAA_PREDICATION_THRESHOLD is simply 0.5 whatever the scale, FOV
 // or resolution - tune P.x, not it.
 //
-// DIFFERENCE FROM MoH: the sign. Geometry carries NEGATIVE view z here and sky/invalid is a >= 0 (the +65472 far
-// sentinel, measured), so each tap goes through DepthFromAlpha, which also pins sky far away.
+// DIFFERENCE FROM MoH: the encoding, decoded per tap. The sky (encoded 65503) decodes to about 2 million units, far
+// past any geometry, so a silhouette against it always clears the tolerance.
 
-Texture2D<float4> scene : register(t0); // fp16 scene colour; .a = view-space Z (negative for geometry)
+#include "Includes/SceneDepth.hlsl"
+
+Texture2D<float4> scene : register(t0); // fp16 scene colour; .a = EncodeFloatW(view depth)
 RWTexture2D<float> uav : register(u0);  // R16_FLOAT predication signal (0 = on the local plane, 1 = edge)
 
 cbuffer PredCB : register(b0)
@@ -22,22 +26,15 @@ cbuffer PredCB : register(b0)
    float4 P; // P.x = relative tolerance: plane deviation counted as a full edge, as a fraction of view depth
 }
 
-// Sky / invalid (a >= 0, e.g. the +65472 sentinel) is pushed to the fp16 ceiling rather than to a finite scene
-// distance, so a silhouette against the sky always clears the tolerance.
-float DepthFromAlpha(float a)
-{
-   return (a < 0.0) ? -a : 65504.0;
-}
-
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    const int3 p = int3(id.xy, 0);
-   const float centerZ = DepthFromAlpha(scene.Load(p).a);
+   const float centerZ = DecodeFloatW(scene.Load(p).a);
    // Out-of-bounds Loads return 0 (D3D11-defined); mirroring the centre there keeps the border flat instead of
    // reporting a false edge along the screen edges.
-   const float leftZ = (id.x > 0) ? DepthFromAlpha(scene.Load(p - int3(1, 0, 0)).a) : centerZ;
-   const float rightZ = DepthFromAlpha(scene.Load(p + int3(1, 0, 0)).a);
-   const float topZ = (id.y > 0) ? DepthFromAlpha(scene.Load(p - int3(0, 1, 0)).a) : centerZ;
-   const float bottomZ = DepthFromAlpha(scene.Load(p + int3(0, 1, 0)).a);
+   const float leftZ = (id.x > 0) ? DecodeFloatW(scene.Load(p - int3(1, 0, 0)).a) : centerZ;
+   const float rightZ = DecodeFloatW(scene.Load(p + int3(1, 0, 0)).a);
+   const float topZ = (id.y > 0) ? DecodeFloatW(scene.Load(p - int3(0, 1, 0)).a) : centerZ;
+   const float bottomZ = DecodeFloatW(scene.Load(p + int3(0, 1, 0)).a);
 
    // Deviation from the local plane: compare each one-sided delta against the slope implied by the opposite
    // neighbour and keep the smaller. On a plane (any orientation) the two agree and this cancels to ~0; at a depth

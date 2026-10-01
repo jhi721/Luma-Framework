@@ -30,6 +30,9 @@ namespace MotionVectorPatches
    constexpr uint32_t previous_position_register = 15;
    // Past D3D9's 4 simultaneous targets, within SM4's 8
    constexpr uint32_t target_slot = 4;
+   // FSR's masks (x reactive, y transparency & composition), written by the scene's alpha blended draws (their pixel shaders
+   // patched with Core's "PatchPixelShaderReactive")
+   constexpr uint32_t reactive_slot = 5;
 
    constexpr MotionVectorPatch::Layout layout = {object_slot, previous_slots, jitter_slot, resource_slots, previous_resources_slot,
       current_position_register, previous_position_register, target_slot, view_projection_row};

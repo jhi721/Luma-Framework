@@ -1,9 +1,9 @@
-// Borderlands 2 / The Pre-Sequel — Bink video (YUV->RGB) pass. SDR clamp + light AutoHDR for HDR.
-// Movies decode to 3 YUV planes (Y=t0, U=t1, V=t2) and a fullscreen quad converts them straight onto the swapchain,
+// Borderlands 2 / The Pre-Sequel — Bink video (Y'CbCr->R'G'B') pass. SDR clamp + light AutoHDR for HDR.
+// Movies decode to 3 Y'CbCr planes (Y'=t0, the color difference planes t1 and t2) and a fullscreen quad converts them straight onto the swapchain,
 // bypassing the tonemap; on the fp16 scRGB swapchain that SDR output sits flat at paper white. Body verbatim from the
 // dgVoodoo ps_5_0 disasm (DX9 0x33244F80: tor/tog/tob/consts c0..c3 -> cb4[8..11]); the cb3 and/or pairs are
 // dgVoodoo's texture-format bit emulation, kept via asuint/asfloat. dgVoodoo dropped the SM3 saturate(o) (the UNORM
-// backbuffer clamped for free), so it is re-added before the AutoHDR - kills YUV overshoot and negatives.
+// backbuffer clamped for free), so it is re-added before the AutoHDR - kills the matrix's overshoot and negatives.
 
 #include "Includes/Common.hlsl" // game-local: pulls GameCBuffers (LumaGameSettings VideoAutoHDR* fields) + shared Common
 
@@ -16,9 +16,9 @@
 #define VIDEO_AUTO_HDR_PEAK_NITS 250.0
 #endif
 
-Texture2D<float4> t0 : register(t0); // Y plane
-Texture2D<float4> t1 : register(t1); // U plane
-Texture2D<float4> t2 : register(t2); // V plane
+Texture2D<float4> t0 : register(t0); // Y' plane
+Texture2D<float4> t1 : register(t1); // Color difference plane
+Texture2D<float4> t2 : register(t2); // Color difference plane
 
 SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
@@ -51,7 +51,7 @@ void main(
 {
    float4 r0, r1;
 
-   // --- YUV plane fetch + dgVoodoo format-emulation mask (verbatim) ---
+   // --- Y'CbCr plane fetch + dgVoodoo format-emulation mask (verbatim) ---
    r0 = t0.Sample(s0_s, v5.xy);
    r0 = asfloat((asuint(r0) & asuint(cb3[44])) | asuint(cb3[45]));
    r1 = t1.Sample(s1_s, v5.xy);
@@ -62,7 +62,7 @@ void main(
    r0.z = r1.x;
    r0.w = cb4[11].x;
 
-   // --- YUV -> RGB matrix (verbatim: c0/c1/c2 = tor/tog/tob -> cb4[8..10], consts -> cb4[11]) ---
+   // --- Y'CbCr -> R'G'B' matrix (verbatim: c0/c1/c2 = tor/tog/tob -> cb4[8..10], consts -> cb4[11]) ---
    o0.x = dot(cb4[8], r0);
    o0.y = dot(cb4[9], r0);
    o0.z = dot(cb4[10], r0);
