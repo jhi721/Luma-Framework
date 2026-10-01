@@ -4,12 +4,9 @@
 
 #include "..\..\Core\includes\motion_vector_patch.h"
 
-// Motion vectors for a game that renders none, by patching whole DXBC containers (Core's "motion_vector_patch.h"; this file
-// holds the game's slots and registers).
-// Vertex shaders run twice: the second run reads the previous frame's per-draw constants (vc4: view projection, world matrix, bone
-// palette) from another slot, and only its SV_Position is kept, as an extra output. The first run's SV_Position is also copied to an
-// extra output, as outputs can't be read back. Ported from Saints Row IV Re-Elected.
-// Pixel shaders write the UV space delta from the current to the previous position to an extra target.
+// The game's slots and registers for Core's DXBC motion vector patch (described in "motion_vector_patch.h"), ported from
+// Saints Row IV Re-Elected. The second vertex shader run reads the previous frame's per-draw constants (vc4: view projection,
+// world matrix, bone palette) from another slot.
 namespace MotionVectorPatches
 {
    // dgVoodoo mirrors every D3D9 vertex shader constant into vc4 (c<N> at cb4[N + 20]): view projection c0-c3, camera position c4,
@@ -20,8 +17,7 @@ namespace MotionVectorPatches
    // The first vc4 row of the view projection (c0). Vertex shaders that never read it (shadow and LocalToView projections, the 29 of
    // 420 in the shader cache that don't place vertices with it) are refused: they don't draw the scene's camera view.
    constexpr uint32_t view_projection_row = 20;
-   // The jitter buffer. c0.xy: the upscaler's projection jitter in NDC, added to SV_Position after its unjittered copy, so motion
-   // vectors never contain it.
+   // The jitter buffer (see "MotionVectorPatch::Layout")
    constexpr uint32_t jitter_slot = 9;
    // The second run reads t0-t15 at t64-t79 (no translated vertex shader declares a resource)
    constexpr uint32_t resource_slots = 16;

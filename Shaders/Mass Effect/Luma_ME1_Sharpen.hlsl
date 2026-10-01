@@ -1,5 +1,5 @@
 // RCAS on the SMAA output, or on upscaled frames a snapshot of the canvas (BL2/TPS/TW2 shape): on the gamma canvas, written
-// back before the HUD and the composition. paperWhite 1.0; RCAS_LIMIT bounds the lobe (bloom no longer clamps at 1.0).
+// back before the HUD and the composition. paperWhite 1.0; RCAS_LIMIT bounds the lobe (the HDR canvas exceeds 1.0).
 
 #include "../Includes/RCAS.hlsl"
 

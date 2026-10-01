@@ -330,7 +330,7 @@ static constexpr uint32_t kLumaBloomSlot = 6;
 // One sigma per mip, count taken FROM the array so the two cannot drift (MELE). Blended 0.5/0.5 = energy-preserving.
 static constexpr float g_bloom_sigmas[] = {1.5f, 2.f, 2.f, 2.f, 1.f, 0.5f};
 
-static bool g_hide_ui = false; // session-only, never persisted
+static bool g_hide_ui = false; // Session-only, never persisted: a stuck "on" would look like a broken HUD
 #if DEVELOPMENT
 // ReShade's runtime for "Take Screenshot" (the settings callback isn't given it)
 static reshade::api::effect_runtime* g_effect_runtime = nullptr;
@@ -1461,7 +1461,7 @@ class MassEffect final : public Game
       ClassifyBoundBlend(native_device_context, &gd);
       if (!gd.mv_blend_opaque)
          return MV_REJECT(6);
-      // Known targets: checked, and the motion vector target built for them
+      // Targets other than the last accepted ones: checked, and the motion vector target sized for them
       if (rtvs[0] != gd.mv_scene_rtv || dsv != gd.mv_accepted_dsv)
       {
          com_ptr<ID3D11Resource> depth;
@@ -3752,7 +3752,7 @@ public:
          ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
-      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only: a stuck "on" would look like a broken HUD.
+      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
 #if DEVELOPMENT
