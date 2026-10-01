@@ -121,8 +121,9 @@ bool MELE_TryAnalyticGradeChainHDR(float3 c, out float3 workHDR)
    const float invGamma = GammaColorScaleAndInverse.w;
    const float gammaExponent = 1.0 / invGamma;
    // Raw cbuffer reads take the bit tests, not MELE_IsFinite, whose comparisons fxc deletes on them (see
-   // Includes/Common.hlsl). The exponent is computed, so its comparison survives.
-   if (IsAnyNaN_Strict(SceneMidTones.xyz) || any(IsInfinite_Strict(SceneMidTones.xyz)) || IsNaN_Strict(invGamma) || IsInfinite_Strict(invGamma) || !(invGamma > 0.0 && gammaExponent <= FLT_MAX))
+   // Includes/Common.hlsl). The exponent is computed, so its comparison survives; past the bit tests it is positive
+   // exactly when invGamma is.
+   if (IsAnyNaN_Strict(SceneMidTones.xyz) || any(IsInfinite_Strict(SceneMidTones.xyz)) || IsNaN_Strict(invGamma) || IsInfinite_Strict(invGamma) || !MELE_IS_FINITE_POSITIVE(gammaExponent))
    {
       workHDR = float3(0.0, 0.0, 0.0);
       return false;

@@ -18,7 +18,7 @@
 // A unit conversion, not an application of Game Paper White: the HDR branch below multiplies into
 // absolute-nit ratios for DICE and divides straight back out. The two passes that actually apply this
 // scale to an outgoing frame are Output_0x0765601C and Video_0x7B5C59DF, and this is not a third.
-const float paperWhite = MELE_GetGamePaperWhiteScale();
+const float gamePaperWhiteScale = MELE_GetGamePaperWhiteScale();
 const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
 
 float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
@@ -83,7 +83,7 @@ if (LumaSettings.DisplayMode == 1) // HDR
    // average crosses; that gate is shared DICE.hlsl code. 0 is off for the OUTPUT but not the cost: DICE's guard
    // carries no [branch], so fxc flattens it for every pixel above the shoulder.
    settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   postProcessedColor = DICETonemap(vignettedHDR * paperWhite, peakWhite, settings) / paperWhite; // Game-Paper-White-relative.
+   postProcessedColor = DICETonemap(vignettedHDR * gamePaperWhiteScale, peakWhite, settings) / gamePaperWhiteScale; // Game-Paper-White-relative.
 
    // User saturation LAST, after the display map, in Game-Paper-White-relative linear RGB; 1.0 is a no-op.
    postProcessedColor = Saturation(postProcessedColor, LumaSettings.GameSettings.Saturation);

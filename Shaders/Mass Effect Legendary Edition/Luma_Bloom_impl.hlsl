@@ -13,23 +13,23 @@
 static const float kMELE_BloomCap = 4.0;
 
 // Native max-channel soft knee; the tonemap applies BloomTint downstream.
-float3 mele_bloom_threshold(float3 color)
+float3 MELE_BloomThreshold(float3 color)
 {
    // Restores the floor half of that [0,1] bound: negative values would blur in and be subtracted by the
    // composite, reading as a hue shift rather than as darkening. Non-finite ones poison a whole Gaussian kernel.
    color = MELE_IsFinite(color) ? max(color, 0.0) : 0.0; // A computed sum: the ordered test survives fxc
 
-   float w = saturate((max(color.r, max(color.g, color.b)) - LumaSettings.GameSettings.BloomThreshold) * 0.5);
+   float w = saturate((max3(color) - LumaSettings.GameSettings.BloomThreshold) * 0.5);
    color *= w;
 
    // Ceiling half, limited on the max channel so hue is preserved. It bounds the prefiltered sum (see the header);
    // a native-style per-tap bound would have to live in Shaders/Includes.
-   const float mch = max(color.r, max(color.g, color.b));
+   const float mch = max3(color);
    const float ceiling = kMELE_BloomCap / max(LumaSettings.GameSettings.BloomIntensity, 1e-3);
    return color * (min(mch, ceiling) / max(mch, 1e-6));
 }
 
-#define LUMA_BLOOM_THRESHOLD_FUNCTION(color) mele_bloom_threshold(color)
+#define LUMA_BLOOM_THRESHOLD_FUNCTION(color) MELE_BloomThreshold(color)
 #define LUMA_BLOOM_SCALE                     0.25                  // 4 bilinear taps * 0.0625 = 0.25 of their mean.
 #define LUMA_BLOOM_TINT                      float3(1.0, 1.0, 1.0) // Tonemap applies BloomTint downstream.
 

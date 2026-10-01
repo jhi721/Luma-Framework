@@ -36,6 +36,10 @@
 // failing case pass would hide the condition the check exists to report.
 #define MELE_HDR_BRIDGE_PROXY_EPS 1e-4
 
+// The relative luminance below which MELE_NativeColorAtLuminance declines (returns its reference unscaled): deep
+// fades put white under it (see that function).
+#define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
+
 // Minimum accepted slope for each filmic family's fit. The two are in DIFFERENT domains and the
 // numbers are not interchangeable: family 04 fits in scene-x, family 03 in the LUT's own input z, and
 // the two are related by F' ~= 0.95 at the pivot and by the probe window widths.

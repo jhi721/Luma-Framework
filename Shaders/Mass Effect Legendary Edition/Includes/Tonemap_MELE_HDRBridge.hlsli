@@ -43,7 +43,7 @@ bool MELE_TryBuildGradeProxy(float3 workNative, float r, out float q, out float3
    q = 1.0;
    proxyNative = workNative;
 
-   if (!MELE_IsFiniteNonNegative(workNative) || !(r > 0.0 && r <= FLT_MAX))
+   if (!MELE_IsFiniteNonNegative(workNative) || !MELE_IS_FINITE_POSITIVE(r))
    {
       return false;
    }
@@ -122,7 +122,6 @@ bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 // +4 instructions on sixteen of the eighteen family 01-04 permutations and +3 on the two analytic ones
 // (0x225A8330 takes its colour from the hue donor, never calls this, and did not move). Do not
 // re-attempt it without re-measuring.
-#define MELE_NATIVE_COLOR_MIN_LUMINANCE 1e-6
 
 float3 MELE_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetLuminance)
 {

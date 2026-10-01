@@ -1,5 +1,5 @@
 // Trilogy-wide Bink Y'CbCr-to-RGB pass with optional HDR highlight expansion. The matrix is transcribed from
-// 0x7B5C59DF; the native 8-bit clamp is restored before decoding because fp16 targets do not clamp YUV overshoot.
+// 0x7B5C59DF; the native 8-bit clamp is restored before decoding because fp16 targets do not clamp Y'CbCr overshoot.
 //
 // Intermediate draws stay gamma for stage 2. Direct swapchain draws emit linear scRGB once stage 2 has
 // established a linear frame, and otherwise stay gamma for the final composition decode; C++ supplies both
@@ -47,22 +47,22 @@ void main(
    o0.w = consts.w; // Preserve alpha for in-world video surfaces.
 
    const bool hdr = LumaSettings.DisplayMode == 1;
-   const bool on_swapchain = LumaSettings.GameSettings.VideoOnSwapchain > 0.5;
+   const bool onSwapchain = LumaSettings.GameSettings.VideoOnSwapchain > 0.5;
    const bool swapchain_gamma_encoded = LumaData.GameData.SwapchainGammaEncoded > 0.5;
 
    // The native 8-bit clamp, restored in every mode (see the header).
    const float3 clamped = saturate(rgb);
 
-   const bool emit_linear = on_swapchain && !swapchain_gamma_encoded;
+   const bool emitLinear = onSwapchain && !swapchain_gamma_encoded;
 #if ENABLE_VIDEO_AUTO_HDR
-   const bool auto_hdr = hdr && LumaSettings.GameSettings.VideoAutoHDREnable > 0.5; // Exact HDR mode only.
+   const bool autoHDR = hdr && LumaSettings.GameSettings.VideoAutoHDREnable > 0.5; // Exact HDR mode only.
 #else
-   const bool auto_hdr = false;
+   const bool autoHDR = false;
 #endif
 
    // Both selectors are cbuffer-uniform, so this branch is free. On a gamma target, skipping the decode/re-encode
    // round trip keeps the output exact, without its transcendental error.
-   [branch] if (!auto_hdr && !emit_linear)
+   [branch] if (!autoHDR && !emitLinear)
    {
       o0.xyz = clamped;
    }
@@ -71,7 +71,7 @@ void main(
       float3 lin = gamma_to_linear(clamped, GCT_MIRROR);
 
 #if ENABLE_VIDEO_AUTO_HDR
-      [branch] if (auto_hdr)
+      [branch] if (autoHDR)
       {
          // Linear 1 lands at UI Paper White once the transport ratio and Game Paper White are applied.
          const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
@@ -81,6 +81,6 @@ void main(
 
       // Linear output carries the transport ratio and Game Paper White like stage 2, so video white lands at UI Paper White.
       const float directScale = MELE_GetUIPaperWhiteRelativeToGame() * MELE_GetGamePaperWhiteScale();
-      o0.xyz = emit_linear ? (lin * directScale) : linear_to_gamma(lin, GCT_MIRROR);
+      o0.xyz = emitLinear ? (lin * directScale) : linear_to_gamma(lin, GCT_MIRROR);
    }
 }

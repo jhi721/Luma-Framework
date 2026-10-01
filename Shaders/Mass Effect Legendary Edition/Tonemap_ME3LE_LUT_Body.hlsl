@@ -289,7 +289,7 @@ void main(
    }
 
    // Use one native grade function for both the working value and SDR reference. The white blowout the native result
-   // already contains is kept as it is; it is not given back its lost saturation.
+   // already contains is kept as it is; it is not given back its lost chroma.
    float3 sdrGamma = MELE_ME3LE_GradeChain(r0.xyz);
    float3 gradedHDR = MELE_NativeColorGradedHDR(sdrGamma, workHDR, workValid);
 
