@@ -21,6 +21,9 @@
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
 #include "..\..\Core\includes\patched_draws.h"
+#if DEVELOPMENT
+#include "..\..\Core\includes\perf_test.h"
+#endif
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 #include <unordered_set>
 #if DEVELOPMENT
@@ -29,15 +32,6 @@
 #endif
 
 #if DEVELOPMENT
-// The median of "values" (0 without any), for the sweeps
-static double Median(std::vector<double> values)
-{
-   if (values.empty())
-      return 0.0;
-   std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
-   return values[values.size() / 2];
-}
-
 // "SR Bridge Profile": 600 upscaled frames of the SR bridge's steps (a GPU timestamp and a QPC time each, from "SR_BRIDGE_PROFILE")
 // and of the frame (present to present) into "LumaBridgeProfile\game.csv" next to the exe, the helper's own into "helper.csv"
 // ("LUMA_UPSCALER_PROFILE", set in this process only, for the restarted helper), joined by their bridge frame numbers.
@@ -213,8 +207,7 @@ static bool g_mv_debug_view = false;
 static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
 static bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
 // "Performance Test" (see "OnPresent"): GPU timestamps and hook CPU time to ReShade.log ("[ME1 Perf]"). A mode sets the
-// anti-aliasing while it runs (the user's is restored on "Off" or "Current Settings", and never saved)
-static int g_perf_test = 0;
+// anti-aliasing while it runs (the user's is restored on "Off" or "Current Settings", and never saved). The mode is "Perf::g_test".
 struct PerfTestMode
 {
    const char* name;
@@ -241,35 +234,49 @@ constexpr PerfTestMode perf_test_modes[] = {
    {"FSR 3 Without Blend Memo", true, SR::Type::FSR, false, false, 2, kCpuBlendMemo},
    {"No AA No CPU Optimizations", true, SR::Type::None, false, false, 2, kCpuAll},
 };
-// "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a
-// median per mode against the last one ("No AA")
-static bool g_perf_sweep = false;
-// The hooks' CPU time for "cpu hooks": two clock reads per timed draw and buffer upload, themselves a cost (a Sweep with it off
-// shows it in the frame times)
-static bool g_perf_hook_timers = true;
 // Experiments on the game to helper handoff of the SR bridge (see "SR Bridge Profile"): a flush right before the bridge's
 // frame (the frame's work submitted first, the input copies and the signal on their own), and the game device's GPU thread
 // priority ("IDXGIDevice::SetGPUThreadPriority", -7 to 7). Not saved.
 static bool g_bridge_flush_before = false;
 static int g_gpu_thread_priority = 0;
+// "Sweep": these modes in turn, a log window each, over several rounds, then a median per mode against the last one ("No AA")
 constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7, 8};
 // "CPU Sweep": the CPU optimizations each off in turn, with and without an upscaler
 constexpr int perf_cpu_sweep_modes[] = {4, 9, 10, 11, 12, 13, 8};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
 static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[std::size(perf_cpu_sweep_modes) - 1]].name) == "No AA");
-struct PerfSweep
+constexpr Perf::SweepDef perf_sweeps[] = {{"Sweep", perf_sweep_modes}, {"CPU Sweep", perf_cpu_sweep_modes}};
+// Per mode, each window's GPU frame, scene, end, hook and CPU frame times, and the end's parts. A log window (120 frames) per mode and
+// round.
+enum PerfColumn : size_t
 {
-   const char* name;
-   std::span<const int> modes;
+   PERF_COLUMN_FRAME,
+   PERF_COLUMN_SCENE,
+   PERF_COLUMN_TAIL,
+   PERF_COLUMN_HOOKS,
+   PERF_COLUMN_CPU_FRAME,
+   PERF_COLUMN_FILL,
+   PERF_COLUMN_UPSCALER,
+   PERF_COLUMN_COPY_BACK,
+   PERF_COLUMN_SCENE_COPY,
+   PERF_COLUMN_COUNT
 };
-constexpr PerfSweep perf_sweeps[] = {{"Sweep", perf_sweep_modes}, {"CPU Sweep", perf_cpu_sweep_modes}};
-static const PerfSweep* g_perf_sweep_running = &perf_sweeps[0];
-constexpr int perf_sweep_rounds = 3;
-constexpr int perf_sweep_windows = 1;  // Per mode and round (120 frames)
+static Perf::Sweep<PERF_COLUMN_COUNT> g_perf_sweep = {.defs = perf_sweeps, .rounds = 3, .windows = 1};
 constexpr int perf_settle_frames = 30; // Skipped after a settings change (history reset, targets rebuilt) and the upscaler being ready
+// The scene's tail, from its end: after the fill (with the reactive mask), the upscaler and its copy back, and the tail's end
+enum PerfStamp : size_t
+{
+   PERF_SCENE_START = Perf::FIRST_GAME_STAMP,
+   PERF_SCENE_END,
+   PERF_FILL_END,
+   PERF_UPSCALER_END,
+   PERF_COPY_END,
+   PERF_SCENE_TAIL_END,
+   PERF_STAMP_COUNT
+};
 static int GetPerfMotionVectorDraws()
 {
-   return perf_test_modes[g_perf_test].motion_vector_draws;
+   return perf_test_modes[Perf::g_test].motion_vector_draws;
 }
 // "Memory Sweep": these modes in order, one "[ME1 Mem]" log line each once settled (the upscaler ready, then a fixed frame count),
 // so the deltas between lines are each feature's cost. The user's settings are restored at the end.
@@ -425,41 +432,18 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    bool mv_dumping = false; // This frame's scene draws go to the log ("MV Dump Scene Draws")
    uint32_t mv_dump_index = 0;
    // "Performance Test": GPU timestamps per frame (present to present, the scene from its opening to its first post pass, the end
-   // of the scene: fill (with the reactive mask), the upscaler and copies), all on the immediate context, in a ring read back a few frames later
-   // without waiting (SR4's, see docs/GPU-Perf-Measurement-Immediate-Deferred.md); and the CPU time in the scene hooks
-   struct PerfQueries
-   {
-      com_ptr<ID3D11Query> disjoint, frame_start, scene_start, scene_end, end_end, frame_end;
-      com_ptr<ID3D11Query> fill_end, upscaler_end, copy_end; // Inside the end of the scene: after the fill, the upscaler and its copy back
-      bool scene_started = false;                            // scene_start issued
-      bool scene = false;                                    // ... and scene_end
-      bool end = false;                                      // ... and end_end
-      bool end_parts = false;                                // ... fill_end, upscaler_end and copy_end (the upscaler drew)
-      bool pending = false;
-   };
+   // of the scene: fill (with the reactive mask), the upscaler and copies, see "PerfStamp"); and the CPU time in the scene hooks
    struct PerfStats
    {
-      double frame_ms = 0.0, frame_max_ms = 0.0, scene_ms = 0.0, scene_max_ms = 0.0, end_ms = 0.0, end_max_ms = 0.0, cpu_frame_ms = 0.0;
-      double end_parts_ms[4] = {}; // The end of the scene: fill, upscaler, copy back, scene copy (the rest)
-      uint32_t samples = 0, scene_samples = 0, end_samples = 0, end_parts_samples = 0, disjoint = 0, frames = 0;
+      Perf::Stat frame, scene, end;
+      Perf::Stat end_parts[4]; // The end of the scene: fill, upscaler, copy back, scene copy (the rest)
    };
-   std::array<PerfQueries, 8> perf_queries;
-   size_t perf_query_index = 0;
-   PerfQueries* perf_frame_queries = nullptr; // This frame's, from present to present
-   PerfStats perf_stats;                      // This log window's
-   int perf_settle_frames = 0;                // Frames skipped after a change (history reset, targets rebuilt)
-   std::string perf_settings;                 // The measured settings, to restart the settle on a change
-   std::chrono::steady_clock::time_point perf_last_present;
-   std::atomic<int64_t> perf_hook_ns = 0; // This log window's
+   Perf::TimestampRing<PERF_STAMP_COUNT> perf_timestamps;
+   Perf::Window<PerfStats> perf_window;
    // The user's anti-aliasing while a mode that sets its own runs
    SR::Type perf_user_sr_type = SR::Type::None;
    bool perf_user_smaa = false;
    bool perf_user_reactive_mask = true;
-   // "Sweep": the step over all rounds, the log windows done in it, and per mode each window's GPU frame, scene, end, hook and CPU
-   // frame times
-   int perf_sweep_step = 0;
-   int perf_sweep_windows_done = 0;
-   std::vector<std::array<double, 9>> perf_sweep_results[std::size(perf_test_modes)];
    // "Memory Sweep": frames left before the current mode's log line, frames waited for the upscaler, and the user's settings to restore
    int memory_sweep_settle_frames = 0;
    int memory_sweep_wait_frames = 0;
@@ -1177,7 +1161,7 @@ class MassEffect final : public Game
          return;
       auto& gd = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
-      const PerfHookTimer perf_timer{gd.perf_hook_ns};
+      const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT buffer_size;
       if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
@@ -1203,7 +1187,7 @@ class MassEffect final : public Game
          return;
       auto& gd = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
-      const PerfHookTimer perf_timer{gd.perf_hook_ns};
+      const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT buffer_size;
       if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
@@ -1231,7 +1215,7 @@ class MassEffect final : public Game
          return false;
       auto& gd = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
-      const PerfHookTimer perf_timer{gd.perf_hook_ns};
+      const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT known_size;
       if (!MayBeRegisteredBuffer(gd, resource.handle, &known_size))
@@ -1392,8 +1376,10 @@ class MassEffect final : public Game
          return;
       gd.mv_scene_open = true;
 #if DEVELOPMENT
-      if (auto* const perf_queries = gd.perf_frame_queries; perf_queries && !std::exchange(perf_queries->scene_started, true))
-         native_device_context->End(perf_queries->scene_start.get());
+      if (auto* const perf_queries = gd.perf_timestamps.frame)
+      {
+         perf_queries->Mark(native_device_context, PERF_SCENE_START);
+      }
 #endif
       gd.mv_depth.reset();
       dsv->GetResource(&gd.mv_depth);
@@ -1624,7 +1610,7 @@ class MassEffect final : public Game
          1, &current);
 #if DEVELOPMENT
       // Diagnostics, off while a "Performance Test" runs (they cost CPU on every draw that Publishing doesn't pay)
-      if (g_perf_test == 0 && gd.mv_previous_constants.ring_context)
+      if (Perf::g_test == 0 && gd.mv_previous_constants.ring_context)
       {
          com_ptr<ID3D11Buffer> bound;
          UINT first_constant = 0, constant_count = 0;
@@ -2009,10 +1995,12 @@ class MassEffect final : public Game
          return false;
       }
 #if DEVELOPMENT
-      auto* const perf_queries = gd.perf_frame_queries;
-      const bool perf_end_parts = perf_queries && perf_queries->scene && !perf_queries->end;
+      auto* const perf_queries = gd.perf_timestamps.frame;
+      const bool perf_end_parts = perf_queries && perf_queries->Marked(PERF_SCENE_END) && !perf_queries->Marked(PERF_SCENE_TAIL_END);
       if (perf_end_parts)
-         native_device_context->End(perf_queries->upscaler_end.get());
+      {
+         perf_queries->Mark(native_device_context, PERF_UPSCALER_END);
+      }
 #endif
       // The copy's alpha is the game's resolve of the same scene (the RGB write mask keeps its linear depth)
       bool copy_only = false;
@@ -2045,8 +2033,7 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       if (perf_end_parts)
       {
-         native_device_context->End(perf_queries->copy_end.get());
-         perf_queries->end_parts = true;
+         perf_queries->Mark(native_device_context, PERF_COPY_END);
       }
 #endif
       if (gd.mv_scene_copy && !copy_only)
@@ -2064,11 +2051,10 @@ class MassEffect final : public Game
    {
       auto& gd = GetGameDeviceData(device_data);
 #if DEVELOPMENT
-      auto* const perf_queries = gd.perf_frame_queries;
-      if (perf_queries && perf_queries->scene_started && !perf_queries->scene)
+      auto* const perf_queries = gd.perf_timestamps.frame;
+      if (perf_queries && perf_queries->Marked(PERF_SCENE_START))
       {
-         native_device_context->End(perf_queries->scene_end.get());
-         perf_queries->scene = true;
+         perf_queries->Mark(native_device_context, PERF_SCENE_END);
       }
 #endif
       gd.mv_scene_open = false;
@@ -2168,8 +2154,10 @@ class MassEffect final : public Game
             native_device_context->CSSetShaderResources(0, 2, null_srvs);
             filled = true;
 #if DEVELOPMENT
-            if (perf_queries && perf_queries->scene && !perf_queries->end)
-               native_device_context->End(perf_queries->fill_end.get());
+            if (perf_queries && perf_queries->Marked(PERF_SCENE_END) && !perf_queries->Marked(PERF_SCENE_TAIL_END))
+            {
+               perf_queries->Mark(native_device_context, PERF_FILL_END);
+            }
 #endif
 #if DEVELOPMENT
             if (write_reactive && g_sr_reactive_zero_test)
@@ -2193,10 +2181,9 @@ class MassEffect final : public Game
       compute_state.Restore(native_device_context);
       graphics_state.Restore(native_device_context);
 #if DEVELOPMENT
-      if (perf_queries && perf_queries->scene && !perf_queries->end)
+      if (perf_queries && perf_queries->Marked(PERF_SCENE_END))
       {
-         native_device_context->End(perf_queries->end_end.get());
-         perf_queries->end = true;
+         perf_queries->Mark(native_device_context, PERF_SCENE_TAIL_END);
       }
 #endif
    }
@@ -2269,12 +2256,12 @@ public:
       Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, { "dump_pass_cb",
                                &g_dump_pass_cb }});
       Mcp::RegisterInts({{ "perf_test",
-         &g_perf_test,
+         &Perf::g_test,
          0,
          int(std::size(perf_test_modes)) - 1,
          [](DeviceData& device_data, double value)
          {
-            g_perf_sweep = false; // As the "Performance Test" combo
+            g_perf_sweep.Stop(); // As the "Performance Test" combo
             ApplyPerfTestMode(device_data, int(value));
             return std::string();
          } }});
@@ -2632,7 +2619,7 @@ public:
 #if DEVELOPMENT
       // Whether anything reads the upscaled scene itself after its end, while the post passes read a copy of it (the upscaler's
       // output could then go to the copy only). Off while a "Performance Test" runs: every draw after the scene reads all its views here.
-      if (g_perf_test == 0 && gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
+      if (Perf::g_test == 0 && gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
       {
          com_ptr<ID3D11ShaderResourceView> srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
          if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
@@ -2661,7 +2648,7 @@ public:
       if (gd.mv_active && is_immediate)
       {
 #if DEVELOPMENT
-         const PerfHookTimer perf_timer{gd.perf_hook_ns}; // The draws' own submission included
+         const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns}; // The draws' own submission included
 #endif
          if (!gd.mv_scene_done && std::ranges::any_of(kScenePostHashes, [&](uint32_t hash)
                                      { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); }))
@@ -2912,24 +2899,11 @@ public:
    }
 
 #if DEVELOPMENT
-   // "Performance Test": adds the scope's CPU time to the motion vector hooks' total, while the test runs with "Hook Timers"
-   struct PerfHookTimer
-   {
-      std::atomic<int64_t>& total_ns;
-      const bool enabled = g_perf_test != 0 && g_perf_hook_timers;
-      const std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      ~PerfHookTimer()
-      {
-         if (enabled)
-            total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-      }
-   };
-
    static void ApplyPerfTestMode(DeviceData& device_data, int mode_index)
    {
       auto& gd = GetGameDeviceData(device_data);
       const PerfTestMode& mode = perf_test_modes[mode_index];
-      const PerfTestMode& previous_mode = perf_test_modes[g_perf_test];
+      const PerfTestMode& previous_mode = perf_test_modes[Perf::g_test];
       if (!previous_mode.set_aa && mode.set_aa)
       {
          gd.perf_user_sr_type = device_data.sr_type;
@@ -2938,13 +2912,13 @@ public:
       }
       if (mode.set_aa || previous_mode.set_aa)
       {
-         device_data.sr_type = mode.set_aa ? mode.sr_type : gd.perf_user_sr_type;
+         SetSRType(device_data, (mode.set_aa ? mode.sr_type : gd.perf_user_sr_type));
          device_data.sr_suppressed = false;
          g_smaa_enable = mode.set_aa ? mode.smaa : gd.perf_user_smaa;
          g_sr_reactive_enable = mode.set_aa ? mode.reactive_mask : gd.perf_user_reactive_mask;
       }
       g_perf_cpu_optimizations_off = mode.cpu_optimizations_off;
-      g_perf_test = mode_index;
+      Perf::g_test = mode_index;
    }
 
    // A sweep picks the upscaler as Core's selection change does: the previous one's resources go ("ReleaseResources"), and on None
@@ -3279,9 +3253,9 @@ public:
             if (sweep_step >= 0)
             {
                auto& results = sweep_results[sweep_step % std::size(kSweepModes)];
-               results[0].push_back(Median(frame_gpu_ms));
-               results[1].push_back(Median(bridge_gpu_ms));
-               results[2].push_back(Median(draw_cpu_ms));
+               results[0].push_back(Perf::Median(frame_gpu_ms));
+               results[1].push_back(Perf::Median(bridge_gpu_ms));
+               results[2].push_back(Perf::Median(draw_cpu_ms));
                if (!AdvanceBridgeProfileSweep(device_data))
                {
                   std::string summary;
@@ -3290,7 +3264,7 @@ public:
                      if (sweep_results[i][0].empty())
                         continue;
                      const std::string line = std::format("[ME1 Bridge] sweep mode=\"{}\" runs={} frame GPU median={:.3f} ms bridge GPU median={:.3f} ms bridge CPU in Draw median={:.3f} ms",
-                        kSweepModes[i].name, sweep_results[i][0].size(), Median(sweep_results[i][0]), Median(sweep_results[i][1]), Median(sweep_results[i][2]));
+                        kSweepModes[i].name, sweep_results[i][0].size(), Perf::Median(sweep_results[i][0]), Perf::Median(sweep_results[i][1]), Perf::Median(sweep_results[i][2]));
                      reshade::log::message(reshade::log::level::info, line.c_str());
                      summary += line + "\n";
                   }
@@ -3319,140 +3293,44 @@ public:
       // after a settings change or a pause skipped), opens the next frame's
       com_ptr<ID3D11DeviceContext> perf_context;
       native_device->GetImmediateContext(&perf_context);
-      if (auto* const queries = std::exchange(gd.perf_frame_queries, nullptr))
+      gd.perf_timestamps.Close(perf_context.get());
+      if (Perf::g_test != 0)
       {
-         perf_context->End(queries->frame_end.get());
-         perf_context->End(queries->disjoint.get());
-         queries->pending = true;
-      }
-      if (g_perf_test != 0)
-      {
-         const auto now = std::chrono::steady_clock::now();
+         auto& window = gd.perf_window;
          const std::string aa = IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : "none");
-         const std::string settings = std::format("mode=\"{}\" hook_timers={} cpu_optimizations=0x{:02X} aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[g_perf_test].name, g_perf_hook_timers, g_cpu_optimizations & ~g_perf_cpu_optimizations_off, aa, IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
+         const std::string settings = std::format("mode=\"{}\" hook_timers={} cpu_optimizations=0x{:02X} aa={} mask={} scale={:.2f} threshold={:.2f} tc={} output={}x{}", perf_test_modes[Perf::g_test].name, Perf::g_hook_timers, g_cpu_optimizations & ~g_perf_cpu_optimizations_off, aa, IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable, g_sr_reactive_scale, g_sr_reactive_threshold, g_sr_tc_from_mask, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
          // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile)
-         if (std::exchange(gd.perf_settings, settings) != settings || now - gd.perf_last_present > std::chrono::milliseconds(250) ||
-             (IsSRActive(device_data) && !sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData())))
-            gd.perf_settle_frames = perf_settle_frames;
-         const bool measuring = gd.perf_settle_frames <= 0;
-         auto& stats = gd.perf_stats;
-         for (auto& queries : gd.perf_queries)
-         {
-            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
-            if (!queries.pending || perf_context->GetData(queries.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
-               continue;
-            queries.pending = false;
-            if (!measuring)
-               continue;
-            if (disjoint.Disjoint || disjoint.Frequency == 0)
+         const bool measuring = window.Present(settings, perf_settle_frames, IsSRActive(device_data) && !sr_implementations[device_data.sr_type]->IsReady(device_data.GetSRInstanceData()));
+         auto& stats = window.stats;
+         window.disjoint += gd.perf_timestamps.Collect(perf_context.get(), measuring, [&](const auto& frame)
             {
-               stats.disjoint++;
-               continue;
-            }
-            const auto read = [&](const com_ptr<ID3D11Query>& query, UINT64* ticks)
-            { return perf_context->GetData(query.get(), ticks, sizeof(*ticks), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK; };
-            const auto add = [&](UINT64 start, UINT64 end, double* total, double* max_ms, uint32_t* samples)
-            {
-               const double ms = 1000.0 * double(end - start) / double(disjoint.Frequency);
-               *total += ms;
-               *max_ms = (std::max)(*max_ms, ms);
-               ++*samples;
-            };
-            UINT64 frame_start, frame_end, scene_start, scene_end, end_end, fill_end, upscaler_end, copy_end;
-            if (!read(queries.frame_start, &frame_start) || !read(queries.frame_end, &frame_end))
-               continue;
-            add(frame_start, frame_end, &stats.frame_ms, &stats.frame_max_ms, &stats.samples);
-            if (queries.scene && read(queries.scene_start, &scene_start) && read(queries.scene_end, &scene_end))
-            {
-               add(scene_start, scene_end, &stats.scene_ms, &stats.scene_max_ms, &stats.scene_samples);
-               if (queries.end && read(queries.end_end, &end_end))
+               stats.frame.Add(frame.Ms(Perf::FRAME_START, Perf::FRAME_END));
+               if (!frame.Has(PERF_SCENE_START) || !frame.Has(PERF_SCENE_END))
+                  return;
+               stats.scene.Add(frame.Ms(PERF_SCENE_START, PERF_SCENE_END));
+               if (!frame.Has(PERF_SCENE_TAIL_END))
+                  return;
+               stats.end.Add(frame.Ms(PERF_SCENE_END, PERF_SCENE_TAIL_END));
+               if (frame.Has(PERF_FILL_END) && frame.Has(PERF_UPSCALER_END) && frame.Has(PERF_COPY_END))
                {
-                  add(scene_end, end_end, &stats.end_ms, &stats.end_max_ms, &stats.end_samples);
-                  if (queries.end_parts && read(queries.fill_end, &fill_end) && read(queries.upscaler_end, &upscaler_end) && read(queries.copy_end, &copy_end))
-                  {
-                     const UINT64 bounds[5] = {scene_end, fill_end, upscaler_end, copy_end, end_end};
-                     for (int part = 0; part < 4; part++)
-                        stats.end_parts_ms[part] += 1000.0 * double(bounds[part + 1] - bounds[part]) / double(disjoint.Frequency);
-                     stats.end_parts_samples++;
-                  }
-               }
-            }
-         }
-         if (!measuring)
-         {
-            gd.perf_settle_frames--;
-            stats = {};
-            gd.perf_hook_ns = 0;
-         }
-         else
-         {
-            stats.cpu_frame_ms += std::chrono::duration<double, std::milli>(now - gd.perf_last_present).count();
-            if (++stats.frames >= 120)
+                  const size_t bounds[5] = {PERF_SCENE_END, PERF_FILL_END, PERF_UPSCALER_END, PERF_COPY_END, PERF_SCENE_TAIL_END};
+                  for (int part = 0; part < 4; part++)
+                     stats.end_parts[part].Add(frame.Ms(bounds[part], bounds[part + 1]));
+               } });
+         window.Finish(measuring, [&]
             {
-               const auto average = [](double total, uint32_t samples)
-               { return samples != 0 ? total / samples : 0.0; };
-               const double fill = average(stats.end_parts_ms[0], stats.end_parts_samples), upscaler = average(stats.end_parts_ms[1], stats.end_parts_samples),
-                            copy_back = average(stats.end_parts_ms[2], stats.end_parts_samples), scene_copy = average(stats.end_parts_ms[3], stats.end_parts_samples);
-               reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] {} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) end avg/max={:.3f}/{:.3f} ms ({}) = fill {:.3f} + upscaler {:.3f} + copy back {:.3f} + scene copy {:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}",
-                                                                   settings, average(stats.frame_ms, stats.samples), stats.frame_max_ms, average(stats.scene_ms, stats.scene_samples), stats.scene_max_ms, stats.scene_samples, average(stats.end_ms, stats.end_samples), stats.end_max_ms, stats.end_samples, fill, upscaler, copy_back, scene_copy, stats.end_parts_samples, stats.cpu_frame_ms / stats.frames, double(gd.perf_hook_ns) / 1e6 / stats.frames, stats.samples, stats.frames, stats.disjoint)
-                                                                   .c_str());
-               const std::array<double, 9> window = {average(stats.frame_ms, stats.samples), average(stats.scene_ms, stats.scene_samples), average(stats.end_ms, stats.end_samples), double(gd.perf_hook_ns.exchange(0)) / 1e6 / stats.frames, stats.cpu_frame_ms / stats.frames, fill, upscaler, copy_back, scene_copy};
-               stats = {};
-               if (g_perf_sweep)
+            const double fill = stats.end_parts[0].Average(), upscaler = stats.end_parts[1].Average(), copy_back = stats.end_parts[2].Average(), scene_copy = stats.end_parts[3].Average();
+            const double hooks = window.HookMs();
+            reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] {} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) end avg/max={:.3f}/{:.3f} ms ({}) = fill {:.3f} + upscaler {:.3f} + copy back {:.3f} + scene copy {:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}",
+                                                                settings, stats.frame.Average(), stats.frame.max_ms, stats.scene.Average(), stats.scene.max_ms, stats.scene.samples, stats.end.Average(), stats.end.max_ms, stats.end.samples, fill, upscaler, copy_back, scene_copy, stats.end_parts[0].samples, window.CpuFrameMs(), hooks, stats.frame.samples, window.frames, window.disjoint)
+                                                                .c_str());
+            // The row in "PerfColumn" order
+            g_perf_sweep.OnWindow(Perf::g_test, {stats.frame.Average(), stats.scene.Average(), stats.end.Average(), hooks, window.CpuFrameMs(), fill, upscaler, copy_back, scene_copy}, [&](int mode_index)
+               { ApplyPerfTestMode(device_data, mode_index); }, [&](int mode, int baseline_mode, double baseline)
                {
-                  gd.perf_sweep_results[g_perf_test].push_back(window);
-                  if (++gd.perf_sweep_windows_done >= perf_sweep_windows)
-                  {
-                     gd.perf_sweep_windows_done = 0;
-                     const int step = ++gd.perf_sweep_step;
-                     if (step < perf_sweep_rounds * int(g_perf_sweep_running->modes.size()))
-                     {
-                        ApplyPerfTestMode(device_data, g_perf_sweep_running->modes[step % g_perf_sweep_running->modes.size()]);
-                     }
-                     else
-                     {
-                        const auto median = [&](int mode, size_t column)
-                        {
-                           std::vector<double> values;
-                           for (const auto& result : gd.perf_sweep_results[mode])
-                              values.push_back(result[column]);
-                           return Median(std::move(values));
-                        };
-                        const int baseline_mode = g_perf_sweep_running->modes.back();
-                        const double baseline = median(baseline_mode, 0);
-                        for (const int mode : g_perf_sweep_running->modes)
-                        {
-                           const double cpu_frame = median(mode, 4);
-                           reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" hook_timers={} windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, g_perf_hook_timers, gd.perf_sweep_results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, median(mode, 0), median(mode, 0) - baseline, perf_test_modes[baseline_mode].name, median(mode, 1), median(mode, 2), median(mode, 5), median(mode, 6), median(mode, 7), median(mode, 8), median(mode, 3)).c_str());
-                        }
-                        g_perf_sweep = false;
-                        ApplyPerfTestMode(device_data, 0);
-                     }
-                  }
-               }
-            }
-         }
-         gd.perf_last_present = now;
-
-         auto& queries = gd.perf_queries[gd.perf_query_index];
-         if (!queries.pending)
-         {
-            if (!queries.disjoint)
-            {
-               const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT}, timestamp_desc = {D3D11_QUERY_TIMESTAMP};
-               native_device->CreateQuery(&disjoint_desc, &queries.disjoint);
-               for (auto* const query : {&queries.frame_start, &queries.scene_start, &queries.scene_end, &queries.end_end, &queries.frame_end, &queries.fill_end, &queries.upscaler_end, &queries.copy_end})
-                  native_device->CreateQuery(&timestamp_desc, &*query);
-            }
-            if (queries.disjoint && queries.frame_start && queries.scene_start && queries.scene_end && queries.end_end && queries.frame_end && queries.fill_end && queries.upscaler_end && queries.copy_end)
-            {
-               perf_context->Begin(queries.disjoint.get());
-               perf_context->End(queries.frame_start.get());
-               queries.scene_started = queries.scene = queries.end = queries.end_parts = false;
-               gd.perf_frame_queries = &queries;
-               gd.perf_query_index = (gd.perf_query_index + 1) % gd.perf_queries.size();
-            }
-         }
+                     const double cpu_frame = g_perf_sweep.Median(mode, PERF_COLUMN_CPU_FRAME);
+                     reshade::log::message(reshade::log::level::info, std::format("[ME1 Perf] sweep mode=\"{}\" hook_timers={} windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, Perf::g_hook_timers, g_perf_sweep.results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, g_perf_sweep.Median(mode, PERF_COLUMN_FRAME), g_perf_sweep.Median(mode, PERF_COLUMN_FRAME) - baseline, perf_test_modes[baseline_mode].name, g_perf_sweep.Median(mode, PERF_COLUMN_SCENE), g_perf_sweep.Median(mode, PERF_COLUMN_TAIL), g_perf_sweep.Median(mode, PERF_COLUMN_FILL), g_perf_sweep.Median(mode, PERF_COLUMN_UPSCALER), g_perf_sweep.Median(mode, PERF_COLUMN_COPY_BACK), g_perf_sweep.Median(mode, PERF_COLUMN_SCENE_COPY), g_perf_sweep.Median(mode, PERF_COLUMN_HOOKS)).c_str()); }); });
+         gd.perf_timestamps.Open(native_device, perf_context.get());
       }
 #endif
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before its first mesh
@@ -3668,33 +3546,8 @@ public:
       ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("No projection jitter under the upscaler (it gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
-      const std::string sweep_label = std::format("{} ({}/{})", g_perf_sweep_running->name, GetGameDeviceData(device_data).perf_sweep_step + 1, perf_sweep_rounds * g_perf_sweep_running->modes.size());
-      if (ImGui::BeginCombo("Performance Test", g_perf_sweep ? sweep_label.c_str() : perf_test_modes[g_perf_test].name))
-      {
-         for (int i = 0; i < int(std::size(perf_test_modes)); i++)
-         {
-            if (ImGui::Selectable(perf_test_modes[i].name, !g_perf_sweep && g_perf_test == i) && (g_perf_sweep || g_perf_test != i))
-            {
-               g_perf_sweep = false;
-               ApplyPerfTestMode(device_data, i);
-            }
-         }
-         for (const PerfSweep& sweep : perf_sweeps)
-         {
-            if (ImGui::Selectable(sweep.name, g_perf_sweep && g_perf_sweep_running == &sweep) && !g_perf_sweep)
-            {
-               auto& gd = GetGameDeviceData(device_data);
-               gd.perf_sweep_step = 0;
-               gd.perf_sweep_windows_done = 0;
-               for (auto& results : gd.perf_sweep_results)
-                  results.clear();
-               g_perf_sweep_running = &sweep;
-               ApplyPerfTestMode(device_data, sweep.modes[0]);
-               g_perf_sweep = true;
-            }
-         }
-         ImGui::EndCombo();
-      }
+      Perf::DrawCombo(perf_test_modes, &g_perf_sweep, [&](int mode_index)
+         { ApplyPerfTestMode(device_data, mode_index); });
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([ME1 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill with the reactive mask, the upscaler, copies) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still; compare by toggling FSR and the mask. \"Sweep\" runs every mode, 3 rounds, then logs medians;\n\"CPU Sweep\" the CPU optimizations each off in turn (FSR 3, then no AA), the same way. Not saved.");
       if (ImGui::TreeNode("CPU Optimizations"))
@@ -3706,11 +3559,11 @@ public:
             ImGui::SetTooltip("The hooks' CPU optimizations (always on in Publishing); a \"Performance Test\" mode can turn some off on top. Not saved.");
          ImGui::TreePop();
       }
-      ImGui::Checkbox("Hook Timers", &g_perf_hook_timers);
+      ImGui::Checkbox("Hook Timers", &Perf::g_hook_timers);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. The test also turns off the per draw diagnostics.");
       const std::string memory_sweep_label = g_memory_sweep_step >= 0 ? std::format("Memory Sweep ({}/{})", g_memory_sweep_step + 1, std::size(memory_sweep_modes)) : std::string("Memory Sweep");
-      if (ImGui::Button(memory_sweep_label.c_str()) && g_memory_sweep_step < 0 && g_perf_test == 0)
+      if (ImGui::Button(memory_sweep_label.c_str()) && g_memory_sweep_step < 0 && Perf::g_test == 0)
       {
          LogMemoryReport(device_data.native_device, device_data, "Current Settings");
          ApplyMemorySweepMode(device_data, 0);
