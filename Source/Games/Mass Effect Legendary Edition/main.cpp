@@ -1499,7 +1499,9 @@ class MassEffectLE final : public Game
       settings_data.mvs_x_scale = float(scene_desc.Width);
       settings_data.mvs_y_scale = float(scene_desc.Height);
       settings_data.auto_exposure = device_data.sr_type != SR::Type::FSR; // FSR's clips highlights (Luma canon)
-      settings_data.render_preset = dlss_render_preset;
+      // DLAA on scene-referred HDR input takes preset J or K, never L or M (DLSS best practices PRE-4: L crushes saturated highlights):
+      // "Default" picks K (11); an explicit choice is kept
+      settings_data.render_preset = (dlss_render_preset != 0 ? dlss_render_preset : 11u);
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
       SR::SuperResolutionImpl::DrawData draw_data;
@@ -1798,6 +1800,7 @@ public:
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;           // Off preserves vanilla SDR video.
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;           // 0=1x, 0.5=2.0625x, 1=3.125x UI white.
       default_luma_global_game_settings.VideoOnSwapchain = 0.f;             // Set per Bink draw.
+      default_luma_global_game_settings.BloomScale = 1.f;                   // The live per-scene cb0.x once read back.
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
    }
 
@@ -2704,15 +2707,21 @@ public:
       // preventing raw/derived values from oscillating while dragging. Native bloom keeps multiplier 1.
       {
          auto& gs = cb_luma_global_settings.GameSettings;
+         const float scale = (gd.bloom_scale_live >= 0.f ? std::clamp(gd.bloom_scale_live, 0.f, 4.f) : 1.f);
          float eff = 1.f;
          if (g_bloom_enable)
          {
-            const float scale = gd.bloom_scale_live >= 0.f ? std::clamp(gd.bloom_scale_live, 0.f, 4.f) : 1.f;
             eff = g_bloom_intensity * scale;
          }
          if (fabsf(gs.BloomIntensity - eff) > 1e-4f)
          {
             gs.BloomIntensity = eff;
+            device_data.cb_luma_global_settings_dirty = true;
+         }
+         // The prefilter's cap follows the native scale alone, so the slider still scales capped sources (Luma_Bloom_impl.hlsl)
+         if (fabsf(gs.BloomScale - scale) > 1e-4f)
+         {
+            gs.BloomScale = scale;
             device_data.cb_luma_global_settings_dirty = true;
          }
 

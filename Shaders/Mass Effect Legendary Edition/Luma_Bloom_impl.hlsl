@@ -8,8 +8,9 @@
 #include "Includes/Common.hlsl"
 
 // Vanilla bloom was bounded to [0,1] by its R16G16B16A16_UNORM target alone; the bright pass clamps nothing.
-// Vanilla clips after multiplying by BloomScale and this runs before the composite applies BloomIntensity, so
-// dividing by that factor keeps the cap scene independent: 4 * LUMA_BLOOM_SCALE lands on vanilla's 1.0.
+// Vanilla clips after multiplying by the native BloomScale; the composite applies it later (inside BloomIntensity),
+// so dividing by that scale alone keeps the cap scene independent: 4 * LUMA_BLOOM_SCALE lands on vanilla's 1.0. The
+// user's Bloom Intensity multiplies after the clip, as on top of vanilla, and so still scales a capped source.
 static const float kMELE_BloomCap = 4.0;
 
 // Native max-channel soft knee; the tonemap applies BloomTint downstream.
@@ -25,7 +26,7 @@ float3 MELE_BloomThreshold(float3 color)
    // Ceiling half, limited on the max channel so hue is preserved. It bounds the prefiltered sum (see the header);
    // a native-style per-tap bound would have to live in Shaders/Includes.
    const float mch = max3(color);
-   const float ceiling = kMELE_BloomCap / max(LumaSettings.GameSettings.BloomIntensity, 1e-3);
+   const float ceiling = kMELE_BloomCap / max(LumaSettings.GameSettings.BloomScale, 1e-3);
    return color * (min(mch, ceiling) / max(mch, 1e-6));
 }
 

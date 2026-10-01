@@ -2,7 +2,9 @@
 // The bodies already decode sdrGamma for gradedHDR (MELE_NativeColorGradedHDR, or 0x225A8330's hue donor), but this
 // tail decodes it again on purpose: consuming that decode reschedules the vanilla curve on 0x2754F750 and 0x69F03340
 // in Publishing, turning r0*w + (1 - e) into (r0*w - e) + 1 at the same instruction count. Float32 addition is not
-// associative and that line is native transcription, so the duplicate decode stays (measured).
+// associative and that line is native transcription, so the duplicate decode stays (measured). fxc still picks either
+// form per permutation from unrelated code (the exposure metering moved some ME1LE/ME2LE ones, 2026-10-01): at most
+// 1 ULP, and only a `precise` on the curve would pin it, which spreads to the whole expression.
 // Includer macros, all defaulting to off: TM_VIGNETTE_TYPE (0 none, 1 radial power, 3 ME3LE smoothstep), TM_HAS_GRAIN,
 // TM_ALPHA_LUMA (native ME3LE output luma to alpha).
 #ifndef TM_VIGNETTE_TYPE
@@ -28,6 +30,7 @@ float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 // exactly the vanilla multiply in the encoded domain. Grain and dither stay in gamma below, where hoisting would
 // amplify shadow noise.
 float3 vigLinear = 1.0;
+float3 vigGamma = 1.0; // The native multiplier, kept for the exposure metering below
 #if TM_VIGNETTE_TYPE == 1
 // The slider scales only radial darkening, so zero intensity does not alter the native white point tint.
 {
@@ -40,6 +43,7 @@ float3 vigLinear = 1.0;
    const float3 whitePoint = TM_VIG_FLOOR + 1.0; // Floor plus center value.
    float3 vig = TM_VIG_FLOOR + vd;
    vig = whitePoint * lerp(1.0, vig / whitePoint, LumaSettings.GameSettings.VignetteIntensity);
+   vigGamma = vig;
    vigLinear = gamma_to_linear(vig, GCT_MIRROR);
 }
 #elif TM_VIGNETTE_TYPE == 3
@@ -53,6 +57,7 @@ float3 vigLinear = 1.0;
    float vs = (3.0 - 2.0 * vd) * vd * vd; // smoothstep(0, 1, vd).
    const float3 whitePoint = float3(1.01036298, 1.00000572, 1.16309249);
    float3 vig = whitePoint - vs * LumaSettings.GameSettings.VignetteIntensity;
+   vigGamma = vig;
    vigLinear = gamma_to_linear(vig, GCT_MIRROR);
 }
 #endif
@@ -104,26 +109,28 @@ postProcessedColor = max(0.0, postProcessedColor);
 const float uiPaperWhiteRelativeToGame = MELE_GetUIPaperWhiteRelativeToGame();
 o0.xyz = linear_to_gamma(postProcessedColor / max(uiPaperWhiteRelativeToGame, 1e-4), GCT_MIRROR);
 
+float grain = 0.0;
 #if TM_HAS_GRAIN
 // Native film grain stays in gamma after encoding, as vanilla did, scaled by the user control.
 {
    float2 nuv = v0.zw * NoiseTextureOffset.xy + NoiseTextureOffset.zw;
    float n = NoiseTexture.Sample(NoiseTextureSampler_s, nuv).x;
-   n = (n - 0.5) * FilmGrain_Scale * LumaSettings.GameSettings.FilmGrainIntensity;
-   o0.xyz = o0.xyz + n;
+   grain = (n - 0.5) * FilmGrain_Scale * LumaSettings.GameSettings.FilmGrainIntensity;
+   o0.xyz = o0.xyz + grain;
 }
 #endif
 
 o0.xyz = max(0.0, o0.xyz); // Grain may make shadows negative; retain HDR headroom above 1.
 
 // linear_to_gamma is a pure pow, so dividing by R in linear equals dividing by gamma(R) in the encoded domain.
-// Used by the metering below and by the native SDR clamp at the end of this tail.
+// Used by the native SDR clamp at the end of this tail.
 const float rEncoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
 
-// Native eye adaptation meters the final gamma scene after vignette, grain, and SDR clamp, HUD not yet present.
-// Cancelling transport with gamma(x / R) * gamma(R) = gamma(x) keeps both Paper White controls out of exposure.
+// Native eye adaptation meters the vanilla final gamma scene: the native SDR grade times the gamma vignette, plus
+// grain, clamped as vanilla's mov_sat did, HUD not yet present. Built from the native result, not from o0, so the HDR
+// reconstruction, DICE and both Paper White controls stay out of exposure in every Display Mode.
 {
-   float3 metered = saturate(o0.xyz * rEncoded);
+   float3 metered = saturate(sdrGamma * vigGamma + grain);
    float adaptLuma = dot(metered, float3(0.212670997, 0.715160012, 0.0721689984));
    o1 = 0.25 * log2(adaptLuma * 15 + 1);
 }

@@ -24,6 +24,7 @@ struct LumaGameSettings
    float VideoAutoHDREnable; // 0/1 toggle. 1 = expand Bink movie highlights into HDR, 0 = vanilla SDR videos (no expansion).
    float VideoAutoHDRBoost;  // 0..1. Bink highlight range relative to UI white: 0 = 1x/no-op, 1 = up to 3.125x. Default 0.5.
    float VideoOnSwapchain;   // Set by C++ per Bink draw: 1 = it targets a swapchain back buffer, 0 = any other target.
+   float BloomScale;         // Written by C++: live native BloomScale (bright-pass cb0.x, clamped to [0, 4]), 1 until first readback.
 };
 
 // Game-specific per-pass cbuffer data.
