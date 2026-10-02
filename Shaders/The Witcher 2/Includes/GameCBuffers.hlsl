@@ -41,9 +41,10 @@ struct MotionVectorFillConstants
    float reactive_scale;
    float reactive_threshold;
    float reactive_enabled;
-   float exposure_enabled; // The upscaler's exposure from the adaptation texel (render scale, see main.cpp), else 1
+   float exposure_enabled; // The upscaler's exposure from the exposure pass's levels (linear scene, see main.cpp), else 1
    float2 render_size;     // The scene's top-left render area (pixels): the output size, or smaller under the render scale
-   float2 padding;
+   float user_exposure;    // Luma's Exposure, the tonemap's scene multiplier (1 in the vanilla SDR tonemap)
+   float exposure_static;  // The static exposure perms: the gain is the pass's c49 levels, not an adaptation texel
 };
 
 // XeGTAO's runtime knobs (Luma_TW2_XeGTAO.hlsl, b9), written by "RunXeGTAO"
@@ -55,11 +56,13 @@ struct GTAOKnobs
    float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
    float2 viewport_pixel_size; // 1 / AO target resolution (half render res)
    float2 area_scale;          // The scene's share of the AO target under the render scale (main.cpp "RenderArea"), else 1
+   float noise_index;          // XeGTAO's temporal noise: frame % 64 while DLSS/FSR accumulates the AO, else 0
+   float3 padding;
 };
 } // namespace CB
 
 #ifdef __cplusplus
-static_assert(sizeof(CB::MotionVectorFillConstants) == 112 && sizeof(CB::GTAOKnobs) == 32); // The HLSL cbuffers' sizes
+static_assert(sizeof(CB::MotionVectorFillConstants) == 112 && sizeof(CB::GTAOKnobs) == 48); // The HLSL cbuffers' sizes
 #endif
 
 #endif // LUMA_GAME_CB_STRUCTS

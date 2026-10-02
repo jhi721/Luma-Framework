@@ -12,8 +12,8 @@
 //   convention as the native HBAO, so the space stays self-consistent.
 // - NDC->view from the game's cb4 (copied PS->CS by main.cpp):
 //   viewRay.xy = (uv.x*2-1, 1-2*uv.y) * cb4[9].zw; viewPos = viewRay * depth, viewPos.z = +depth
-// - No TAA and no motion vectors here: NoiseIndex is FROZEN at 0 (a frame index would make the pattern
-//   boil) and denoise runs twice; all stability is spatial.
+// - Temporal noise only while DLSS/FSR accumulates the scene (NoiseIndex = frame % 64, SR3R's pattern); without an upscaler
+//   it is frozen at 0 (nothing accumulates, a moving pattern would boil). Denoise runs twice either way.
 // - Viewport size comes through the Luma knobs CB at b9, not from game constants.
 
 // --- Game constant buffer (bound by the game at the hooked draw; main.cpp copies PS b4 -> CS b4) ---
@@ -55,7 +55,7 @@ cbuffer LumaGTAO : register(b9)
 #define NATIVE_KERNEL_PIXELS                        (cb4[16].y * gtao_knobs.area_scale.x)
 #define XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ) min(XeGTAO_EffectRadius(), NATIVE_KERNEL_PIXELS * viewspaceZ * NDC_TO_VIEW_MUL_X_PIXEL_SIZE.x)
 
-#define NoiseIndexRT                                0
+#define NoiseIndexRT                                gtao_knobs.noise_index
 
 #define VIEWPORT_PIXEL_SIZE                         ViewportPixelSizeRT
 

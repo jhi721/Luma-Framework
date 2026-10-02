@@ -198,31 +198,52 @@ static constexpr int GetPerfMotionVectorDraws()
 // into an area shrunk to the scale; at the post chain's entry the area goes back to the window size for every post pass, the grade,
 // the UI and the present blit, and the upscaler turns the shrunk scene into the whole surface there, before any post pass (light
 // shafts, motion blur, DoF, the bright-pass copy, flares, luminance) reads it ("ResolveRenderArea"). DLAA / FSR Native AA runs there
-// too (DLSS-Best-Practices PLC-1: none of the post chain baked into the history). Steam exe only (addresses): other builds upscale at
-// the exposure, after the post chain's first passes, and have no render scale.
+// too (DLSS-Best-Practices PLC-1: none of the post chain baked into the history). Steam and GOG exes (addresses): other builds upscale
+// at the exposure, after the post chain's first passes, and have no render scale.
 static float g_render_scale = 1.f;
 constexpr float MIN_RENDER_SCALE = 0.5f;
 namespace RenderArea
 {
-   constexpr DWORD STEAM_TIME_DATE_STAMP = 0x518B881C;
-   // The two functions' prologue (MSVC's aligned stack frame)
-   constexpr uint8_t PROLOGUE[] = {0x53, 0x8B, 0xDC, 0x51, 0x51, 0x83, 0xE4, 0xF0};
-   uint8_t* const* const renderer_global = reinterpret_cast<uint8_t* const*>(0x160C6EC);
-   const uint8_t* const* const render_settings_global = reinterpret_cast<const uint8_t* const*>(0x2580E28);
+   // A supported executable: its link time and the addresses the hooks use, as virtual addresses at the preferred base (the GOG exe
+   // has ASLR). Steam's come from a memory dump (SteamStub); GOG's were matched to them by code (NOTES.md "GOG build").
+   struct Executable
+   {
+      DWORD time_date_stamp;
+      uint32_t renderer_global;        // The renderer (its viewports at +4, their count at +8)
+      uint32_t render_settings_global; // The render settings ("UberSampling" at +0x4c)
+      // A 3D frame's scene (__stdcall(int, frame info*), the frame info's first field is the CRenderFrame); the frame driver runs the
+      // post chain after it
+      uint32_t frame_scene;
+      // The post chain (__stdcall, 6 arguments): reads the viewport's area (argument 5) and the frame info's (argument 3, +0x2a8) at
+      // its entry, and keeps them for every pass. Its input is the scene color surface (slot 0) the scene render last drew into.
+      uint32_t post_chain;
+      // The engine's current D3DVIEWPORT9's Width and Height (Steam: 0x237e988 + 8, applied by FUN_0052f030): post passes (motion blur
+      // "004ab9ce", radial blur "004a8efb", "004a7f37", "004a4d2d") derive their VS UV scale (c180) and sample clamp (motion blur c56)
+      // from it at their start, before they set their own viewport. The scene leaves its area there.
+      uint32_t current_viewport_size;
+      std::array<uint8_t, 8> frame_scene_prologue;
+      std::array<uint8_t, 8> post_chain_prologue;
+   };
+   constexpr uint32_t PREFERRED_BASE = 0x400000;
+   // MSVC's aligned stack frame (push ebx; mov ebx, esp; ...)
+   constexpr std::array<uint8_t, 8> ALIGNED_FRAME = {0x53, 0x8B, 0xDC, 0x51, 0x51, 0x83, 0xE4, 0xF0};
+   constexpr Executable EXECUTABLES[] = {
+      // Steam (2013)
+      {.time_date_stamp = 0x518B881C, .renderer_global = 0x160C6EC, .render_settings_global = 0x2580E28, .frame_scene = 0xB14859, .post_chain = 0x9D7B67, .current_viewport_size = 0x237E990, .frame_scene_prologue = ALIGNED_FRAME, .post_chain_prologue = ALIGNED_FRAME},
+      // GOG (2023 rebuild: the post chain's frame is ebp based, same arguments and "ret 0x18")
+      {.time_date_stamp = 0x644689F9, .renderer_global = 0x167D4DC, .render_settings_global = 0x25EAEB8, .frame_scene = 0xB4DD26, .post_chain = 0xA28F79, .current_viewport_size = 0x23E8A20, .frame_scene_prologue = ALIGNED_FRAME, .post_chain_prologue = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x81, 0xEC}},
+   };
    constexpr size_t UBER_SAMPLING_OFFSET = 0x4C; // Render settings: "UberSampling", the scene rendered N x N times when > 1
-   // A 3D frame's scene (__stdcall(int, frame info*), the frame info's first field is the CRenderFrame); the frame driver runs the
-   // post chain after it
-   uint8_t* const frame_scene = reinterpret_cast<uint8_t*>(0xB14859);
-   // The post chain (__stdcall, 6 arguments): reads the viewport's area (argument 5) and the frame info's (argument 3, +0x2a8) at its
-   // entry, and keeps them for every pass. Its input is the scene color surface (slot 0) the scene render last drew into.
-   uint8_t* const post_chain = reinterpret_cast<uint8_t*>(0x9D7B67);
-   constexpr size_t VIEWPORT_AREA_OFFSET = 0xC; // CRenderViewport: the area's width and height, then the window's at +0x1c/+0x20
-   constexpr size_t FRAME_AREA_OFFSET = 0x2B8;  // CRenderFrame: its passes' area (the frame info's +0x2a8)
+   constexpr size_t VIEWPORT_AREA_OFFSET = 0xC;  // CRenderViewport: the area's width and height, then the window's at +0x1c/+0x20
+   constexpr size_t FRAME_AREA_OFFSET = 0x2B8;   // CRenderFrame: its passes' area (the frame info's +0x2a8)
    constexpr size_t FRAME_INFO_AREA_OFFSET = 0x2A8;
-   // The engine's current D3DVIEWPORT9 (0x237e988, applied by FUN_0052f030), its Width and Height: post passes (motion blur
-   // "004ab9ce", radial blur "004a8efb", "004a7f37", "004a4d2d") derive their VS UV scale (c180) and sample clamp (motion blur c56)
-   // from it at their start, before they set their own viewport. The scene leaves its area there.
-   uint32_t* const current_viewport_size = reinterpret_cast<uint32_t*>(0x237E990);
+
+   // The running executable's ("Install")
+   uint8_t* const* renderer_global = nullptr;
+   const uint8_t* const* render_settings_global = nullptr;
+   uint8_t* frame_scene = nullptr;
+   uint8_t* post_chain = nullptr;
+   uint32_t* current_viewport_size = nullptr;
 
    bool installed = false;       // The post chain hook
    bool scale_installed = false; // The render scale's frame hook
@@ -285,12 +306,24 @@ namespace RenderArea
 
    void Install()
    {
-      const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(GetModuleHandleW(nullptr));
-      const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(dos) + dos->e_lfanew);
-      if (nt->FileHeader.TimeDateStamp != STEAM_TIME_DATE_STAMP || std::memcmp(post_chain, PROLOGUE, sizeof(PROLOGUE)) != 0 || MH_Initialize() != MH_OK)
+      uint8_t* const image = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+      const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+      const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + dos->e_lfanew);
+      const auto executable = std::find_if(std::begin(EXECUTABLES), std::end(EXECUTABLES), [nt](const Executable& candidate)
+         { return candidate.time_date_stamp == nt->FileHeader.TimeDateStamp; });
+      if (executable == std::end(EXECUTABLES))
+         return;
+      const auto at = [image](uint32_t address)
+      { return image + (address - PREFERRED_BASE); };
+      renderer_global = reinterpret_cast<uint8_t* const*>(at(executable->renderer_global));
+      render_settings_global = reinterpret_cast<const uint8_t* const*>(at(executable->render_settings_global));
+      frame_scene = at(executable->frame_scene);
+      post_chain = at(executable->post_chain);
+      current_viewport_size = reinterpret_cast<uint32_t*>(at(executable->current_viewport_size));
+      if (std::memcmp(post_chain, executable->post_chain_prologue.data(), executable->post_chain_prologue.size()) != 0 || MH_Initialize() != MH_OK)
          return;
       installed = MH_CreateHook(post_chain, reinterpret_cast<void*>(&PostChainDetour), reinterpret_cast<void**>(&post_chain_original)) == MH_OK;
-      scale_installed = installed && std::memcmp(frame_scene, PROLOGUE, sizeof(PROLOGUE)) == 0 &&
+      scale_installed = installed && std::memcmp(frame_scene, executable->frame_scene_prologue.data(), executable->frame_scene_prologue.size()) == 0 &&
                         MH_CreateHook(frame_scene, reinterpret_cast<void*>(&FrameSceneDetour), reinterpret_cast<void**>(&frame_scene_original)) == MH_OK;
       installed = installed && MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
       if (!installed)
@@ -414,12 +447,14 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // last one the upscaler drew (a change restarts its history)
    std::array<uint32_t, 2> mv_render_size = {};
    std::array<uint32_t, 2> sr_render_size = {};
-   // Render scale: the upscaler runs before the post chain, on the linear scene: the scene draws' last target (the scene color). Its
-   // exposure (1x1, written by the fill) from the exposure pass's last adaptation texture (t1, the gain at .z); the linear depth's
-   // copy and view for its stretch over the surface
+   // The upscaler runs before the post chain, on the linear scene: the scene draws' last target (the scene color). Its exposure (1x1,
+   // written by the fill) from the last exposure pass's adaptation texture (t1, the gain at .z) and constants; under the render scale
+   // the linear depth's copy and view for its stretch over the surface
    com_ptr<ID3D11RenderTargetView> mv_scene_color_rtv;
    ID3D11RenderTargetView* mv_seen_rtv = nullptr; // The last scene draw's first target, checked once per change
    com_ptr<ID3D11ShaderResourceView> sr_adaptation_srv;
+   com_ptr<ID3D11Buffer> sr_exposure_constants; // A copy of the last exposure pass's vc4 (its cap, post-scale and static levels)
+   bool sr_exposure_static = false;             // The last exposure pass was a static perm (no adaptation texture)
    com_ptr<ID3D11Texture2D> sr_exposure;
    com_ptr<ID3D11UnorderedAccessView> sr_exposure_uav;
    com_ptr<ID3D11Texture2D> render_area_depth_copy;
@@ -591,8 +626,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // clears it.
    uint32_t gtao_w = 0, gtao_h = 0;
    DXGI_FORMAT gtao_final_fmt = DXGI_FORMAT_UNKNOWN; // actual (possibly Luma-upgraded) AO RT format
-   ComPtr<ID3D11Buffer> cb_gtao;                     // knobs + viewport (GTAO_KNOBS_CB_SLOT), immutable, recreated on change and with the set
-   CB::GTAOKnobs gtao_cb_data = {};                  // what cb_gtao was built with; meaningful only while cb_gtao exists
+   com_ptr<ID3D11Buffer> cb_gtao;                    // knobs + viewport (GTAO_KNOBS_CB_SLOT), dynamic: the noise index changes every frame
 
 #if DEVELOPMENT
    // ---- Vanilla constant logger (see LogVanillaGrade / LogVanillaTonemap) ----
@@ -1247,15 +1281,18 @@ class TheWitcher2Game final : public Game
       gd->mv_blend_state = blend_state.get();
    }
 
-   // The upscaler's mip bias reaches only the scene's draws (Core swaps the game's samplers for biased ones as they're bound): the shadow
-   // maps before the scene, whose alpha tested foliage it thinned (smaller, flickering shadows, also at DLAA), and the post chain and
-   // the UI after it keep the game's mips
-   static void SetMipBias(DeviceData& device_data, float bias)
+   // The upscaler's mip bias reaches only the scene's draws (Core swaps the game's samplers for biased ones): the shadow maps before the
+   // scene, whose alpha tested foliage it thinned (smaller, flickering shadows, also at DLAA), and the post chain and the UI after it keep
+   // the game's mips. The bound samplers are swapped right away: the scene opens inside its first draw, after Core's own check.
+   static void SetMipBias(ID3D11DeviceContext* native_device_context, DeviceData& device_data, float bias)
    {
       if (custom_texture_mip_lod_bias_offset)
          return;
       const std::unique_lock lock(s_mutex_samplers);
+      if (device_data.texture_mip_lod_bias_offset == bias)
+         return;
       device_data.texture_mip_lod_bias_offset = bias;
+      RebindUpgradedSamplers(native_device_context, device_data);
    }
 
    // Opens the scene at the frame's first mesh draw into output sized depth: takes the scene depth and picks the jitter the whole
@@ -1273,7 +1310,7 @@ class TheWitcher2Game final : public Game
       if (!GetPatchedVertexShader(native_device, cmd_list_data, device_data, vertex_shader_hash))
          return false;
       gd.mv_scene_open = true;
-      SetMipBias(device_data, gd.scene_mip_bias);
+      SetMipBias(native_device_context, device_data, gd.scene_mip_bias);
 #if DEVELOPMENT
       if (auto* const perf_queries = gd.perf_timestamps.frame)
       {
@@ -1917,8 +1954,9 @@ class TheWitcher2Game final : public Game
          // The motion vectors are UV deltas of the render area, previous minus current
          .mvs_x_scale = float(render_width),
          .mvs_y_scale = float(render_height),
-         // FSR's clips highlights (FSR-Best-Practices FIN-3): the scene is already exposed, or the exposure texture comes with it
-         .auto_exposure = false,
+         // DLSS's own (DLSS-Best-Practices EXP-4 canon; presets L and M ignore the texture anyway); FSR's clips highlights
+         // (FSR-Best-Practices FIN-3), it takes the tonemap's exposure (FIN-4)
+         .auto_exposure = device_data.sr_type != SR::Type::FSR,
          .render_preset = dlss_render_preset,
       };
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
@@ -1990,7 +2028,7 @@ class TheWitcher2Game final : public Game
       auto& gd = GetGameDeviceData(device_data);
       gd.mv_scene_open = false;
       gd.mv_scene_done = true;
-      SetMipBias(device_data, 0.f);
+      SetMipBias(native_device_context, device_data, 0.f);
 #if DEVELOPMENT
       auto* const perf_queries = gd.perf_timestamps.frame;
       if (perf_queries && perf_queries->Marked(PERF_SCENE_START))
@@ -2049,7 +2087,7 @@ class TheWitcher2Game final : public Game
             native_device->CreateUnorderedAccessView(gd.sr_exposure.get(), nullptr, &gd.sr_exposure_uav);
          }
       }
-      const bool adapted_exposure = !exposed && gd.sr_adaptation_srv;
+      const bool game_exposure = !exposed && gd.sr_exposure_constants && (gd.sr_exposure_static || gd.sr_adaptation_srv);
       if (write_reactive)
       {
          gd.sr_reactive_frame = cb_luma_global_settings.FrameIndex;
@@ -2077,8 +2115,10 @@ class TheWitcher2Game final : public Game
             .reactive_scale = g_sr_reactive_scale,
             .reactive_threshold = g_sr_reactive_threshold,
             .reactive_enabled = (write_reactive ? 1.f : 0.f),
-            .exposure_enabled = (adapted_exposure ? 1.f : 0.f),
+            .exposure_enabled = (game_exposure ? 1.f : 0.f),
             .render_size = {float(gd.mv_render_size[0]), float(gd.mv_render_size[1])},
+            .user_exposure = (GetShaderDefineCompiledNumericalValue(char_ptr_crc32("TONEMAP_TYPE")) >= 1 ? cb_luma_global_settings.GameSettings.Exposure : 1.f),
+            .exposure_static = (gd.sr_exposure_static ? 1.f : 0.f),
          };
          for (int i = 0; i < 16; i++)
          {
@@ -2088,11 +2128,11 @@ class TheWitcher2Game final : public Game
          {
             // The G-buffer, the motion vectors and the scene may be bound as render targets
             native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-            ID3D11Buffer* const buffer = gd.mv_fill_buffer.get();
-            ID3D11ShaderResourceView* const srvs[3] = {gd.mv_linear_depth_srv.get(), write_reactive ? gd.mv_reactive_target_srv.get() : nullptr, adapted_exposure ? gd.sr_adaptation_srv.get() : nullptr};
+            ID3D11Buffer* const buffers[2] = {gd.mv_fill_buffer.get(), game_exposure ? gd.sr_exposure_constants.get() : nullptr};
+            ID3D11ShaderResourceView* const srvs[3] = {gd.mv_linear_depth_srv.get(), write_reactive ? gd.mv_reactive_target_srv.get() : nullptr, game_exposure ? gd.sr_adaptation_srv.get() : nullptr};
             ID3D11UnorderedAccessView* const uavs[5] = {gd.mv_uav.get(), gd.mv_device_depth_uav.get(), write_reactive ? gd.mv_reactive_uav.get() : nullptr, write_reactive ? gd.mv_transparency_uav.get() : nullptr,
                gd.sr_exposure_uav.get()};
-            native_device_context->CSSetConstantBuffers(0, 1, &buffer);
+            native_device_context->CSSetConstantBuffers(0, UINT(std::size(buffers)), buffers);
             native_device_context->CSSetShaderResources(0, UINT(std::size(srvs)), srvs);
             native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(uavs)), uavs, nullptr);
             native_device_context->CSSetShader(fill_shader, nullptr, 0);
@@ -2568,22 +2608,17 @@ class TheWitcher2Game final : public Game
          .viewport_pixel_size = {1.f / float(w), 1.f / float(h)},
          .area_scale = {(RenderArea::render_size[0] != 0 ? float(RenderArea::render_size[0]) / device_data.output_resolution.x : 1.f),
             (RenderArea::render_size[1] != 0 ? float(RenderArea::render_size[1]) / device_data.output_resolution.y : 1.f)},
+         .noise_index = (IsSRActive(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f),
       };
-      if (!gd->cb_gtao || std::memcmp(&gd->gtao_cb_data, &knobs, sizeof(knobs)) != 0)
-      {
-         if (CreateImmutableCB(native_device, &knobs, sizeof(knobs), std::addressof(gd->cb_gtao)))
-         {
-            gd->gtao_cb_data = knobs;
-         }
-      }
-      if (!gd->cb_gtao)
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), &knobs, sizeof(knobs)))
          return DrawOrDispatchOverrideType::None;
 
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       compute_state.Cache(native_device_context, device_data.uav_max_count);
 
       native_device_context->CSSetConstantBuffers(4, 1, game_cb4.get_addressof());
-      native_device_context->CSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, gd->cb_gtao.get_addressof());
+      ID3D11Buffer* const knobs_cb = gd->cb_gtao.get();
+      native_device_context->CSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &knobs_cb);
       ID3D11SamplerState* point_sampler = device_data.sampler_state_point.get();
       native_device_context->CSSetSamplers(0, 1, &point_sampler);
 
@@ -2971,11 +3006,37 @@ public:
 #endif
       }
       const bool is_exposure = is_immediate && (ContainsPixelShader(original_shader_hashes, TONEMAP_EXPOSURE) || ContainsPixelShader(original_shader_hashes, TONEMAP_EXPOSURE_STATIC));
-      // Render scale: the upscaler's exposure comes from the adaptation the exposure last read (its t1; the static perms have none)
-      if (is_exposure && game_device_data.mv_active && ContainsPixelShader(original_shader_hashes, TONEMAP_EXPOSURE))
+      // The upscaler's exposure on the linear scene comes from the exposure pass's inputs: the adaptation it read (its t1; the static
+      // perms have none) and its vc4, copied whole (dgVoodoo binds it at offset 0 and rewrites it for the next pass)
+      if (is_exposure && game_device_data.mv_active)
       {
+         game_device_data.sr_exposure_static = !ContainsPixelShader(original_shader_hashes, TONEMAP_EXPOSURE);
          game_device_data.sr_adaptation_srv.reset();
-         native_device_context->PSGetShaderResources(1, 1, &game_device_data.sr_adaptation_srv);
+         if (!game_device_data.sr_exposure_static)
+         {
+            native_device_context->PSGetShaderResources(1, 1, &game_device_data.sr_adaptation_srv);
+         }
+         com_ptr<ID3D11Buffer> constants;
+         native_device_context->PSGetConstantBuffers(4, 1, &constants);
+         if (constants)
+         {
+            D3D11_BUFFER_DESC desc, copy_desc = {};
+            constants->GetDesc(&desc);
+            if (game_device_data.sr_exposure_constants)
+            {
+               game_device_data.sr_exposure_constants->GetDesc(&copy_desc);
+            }
+            if (copy_desc.ByteWidth != desc.ByteWidth)
+            {
+               game_device_data.sr_exposure_constants.reset();
+               const CD3D11_BUFFER_DESC new_desc(desc.ByteWidth, D3D11_BIND_CONSTANT_BUFFER);
+               native_device->CreateBuffer(&new_desc, nullptr, &game_device_data.sr_exposure_constants);
+            }
+            if (game_device_data.sr_exposure_constants)
+            {
+               native_device_context->CopyResource(game_device_data.sr_exposure_constants.get(), constants.get());
+            }
+         }
       }
       // DLSS/FSR without the post chain hook (not the Steam exe) or with UberSampling: the exposed scene is the upscaler's input,
       // upscaled in place right after the exposure (adaptive or static) wrote it, before the glow, DoF and the grade read it (the
@@ -3050,6 +3111,7 @@ public:
       {
          game_device_data.sr_output_srv.reset();
          game_device_data.sr_adaptation_srv.reset();
+         game_device_data.sr_exposure_constants.reset();
          game_device_data.sr_exposure.reset();
          game_device_data.sr_exposure_uav.reset();
          game_device_data.mv_scene_color_rtv.reset();
@@ -3154,7 +3216,11 @@ public:
       game_device_data.mv_fill_pending = false;
       // Core biases the anisotropic samplers (all of the game's with the AF16x upgrade): -1 at native resolution, -1.58 at 67%, -2 at 50%
       game_device_data.scene_mip_bias = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y * RenderArea::next_scale, device_data.output_resolution.y) : 0.f);
-      SetMipBias(device_data, 0.f);
+      {
+         com_ptr<ID3D11DeviceContext> native_device_context;
+         native_device->GetImmediateContext(&native_device_context);
+         SetMipBias(native_device_context.get(), device_data, 0.f);
+      }
       {
          // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many as
          // the last frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their peak
