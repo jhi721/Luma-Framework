@@ -532,11 +532,14 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
 #if DEVELOPMENT
    uint32_t mv_logged_untransformed_frame = 0;
    uint32_t mv_logged_terrain_frame = 0;
-   // Matches whose nearest candidate wasn't exact, by vertex shader: count and largest transform distance (logged every 300 frames)
+   // Matches whose nearest candidate wasn't exact, by vertex shader: count, largest transform distance and that match's translation
+   // distance (both squared; the rows' w), and the tie-break's rows (logged every 300 frames)
    struct InexactMatches
    {
       uint32_t count = 0;
       float max_distance = 0.f;
+      float max_translation = 0.f;
+      char transform = '?';
    };
    std::unordered_map<uint32_t, InexactMatches> mv_inexact_by_vs;
    uint32_t mv_logged_inexact_frame = 0;
@@ -1692,7 +1695,13 @@ class TheWitcher2Game final : public Game
             {
                auto& inexact = gd.mv_inexact_by_vs[uint32_t(original_shader_hashes.vertex_shaders[0])];
                inexact.count++;
-               inexact.max_distance = (std::max)(inexact.max_distance, nearest);
+               if (nearest > inexact.max_distance)
+               {
+                  inexact.max_distance = nearest;
+                  // 3x4 column vector matrices: the translation is the rows' w
+                  inexact.max_translation = PatchedDraws::TransformDistance({match->transform[3], match->transform[7], match->transform[11]}, {transform[3], transform[7], transform[11]});
+               }
+               inexact.transform = (gd.mv_last_vertex.transform_offset == LOCAL_TO_WORLD_OFFSET ? 'W' : 'B');
             }
             if (cb_luma_global_settings.FrameIndex - gd.mv_logged_inexact_frame >= 300)
             {
@@ -1700,10 +1709,10 @@ class TheWitcher2Game final : public Game
                std::vector<std::pair<uint32_t, TheWitcher2GameDeviceData::InexactMatches>> sorted(gd.mv_inexact_by_vs.begin(), gd.mv_inexact_by_vs.end());
                std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b)
                   { return a.second.count > b.second.count; });
-               std::string line = std::format("[TW2 MV] frame {}: inexact matches over 300 frames (VS count max_distance):", cb_luma_global_settings.FrameIndex);
+               std::string line = std::format("[TW2 MV] frame {}: inexact matches over 300 frames (VS transform count max_distance max_translation, squared; W LocalToWorld, B bone 0):", cb_luma_global_settings.FrameIndex);
                for (size_t i = 0; i < (std::min<size_t>)(sorted.size(), 16); i++)
                {
-                  line += std::format(" 0x{:08X} {} {:.3g};", sorted[i].first, sorted[i].second.count, sorted[i].second.max_distance);
+                  line += std::format(" 0x{:08X} {} {} {:.3g} {:.3g};", sorted[i].first, sorted[i].second.transform, sorted[i].second.count, sorted[i].second.max_distance, sorted[i].second.max_translation);
                }
                reshade::log::message(reshade::log::level::info, line.c_str());
                gd.mv_inexact_by_vs.clear();
