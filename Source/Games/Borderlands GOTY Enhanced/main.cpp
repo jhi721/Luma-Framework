@@ -553,7 +553,15 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    // The frame's world camera (b1 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
-   uint32_t mv_frame_index = 0; // The Luma frame index of the last motion vector frame
+   // b1's ViewProjectionMatrix is translated (the camera at the origin, CameraPosition 0): the camera's translation comes with each
+   // object's LocalToWorld (b0, whose previous copy carries the previous one). Geometry without LocalToWorld (instanced foliage, VS
+   // 0x9B0EA126 / 0xB4A05DE8: instance matrices in vertex inputs, rebuilt every frame) gets it from "CameraMove()" instead, through its
+   // previous camera. Per frame: the matched world camera objects' previous minus current translation, and their cached median.
+   std::vector<std::array<float, 3>> mv_camera_moves;
+   size_t mv_camera_move_samples = 0;
+   std::array<float, 3> mv_camera_move = {};
+   std::vector<uint8_t> mv_moved_camera; // A previous camera moved by it, uploaded by one draw
+   uint32_t mv_frame_index = 0;          // The Luma frame index of the last motion vector frame
 
 #if DEVELOPMENT
    // Per frame counts for the DEV panel (the last complete frame's shown)
@@ -1146,6 +1154,33 @@ class BorderlandsGoty final : public Game
 #define MV_REJECT(reason) false
 #endif
 
+   // The camera's translation since the previous frame (see "mv_camera_moves"): the median of this frame's matched world camera objects
+   // so far, as moving objects are few. Zero before the first one.
+   static const std::array<float, 3>& CameraMove(BorderlandsGotyGameDeviceData* game_device_data)
+   {
+      auto& moves = game_device_data->mv_camera_moves;
+      if (game_device_data->mv_camera_move_samples != moves.size())
+      {
+         game_device_data->mv_camera_move_samples = moves.size();
+         for (size_t axis = 0; axis < 3; axis++)
+         {
+            const auto middle = moves.begin() + moves.size() / 2;
+            std::nth_element(moves.begin(), middle, moves.end(), [axis](const auto& a, const auto& b)
+               { return a[axis] < b[axis]; });
+            game_device_data->mv_camera_move[axis] = (*middle)[axis];
+         }
+      }
+      return game_device_data->mv_camera_move;
+   }
+
+   // A row vector view projection (b1's first 4 rows) for points translated by "move": row 3 += move * rows 0-2
+   template <typename T>
+   static void MoveViewProjection(T* view_projection, const std::array<float, 3>& move)
+   {
+      for (size_t column = 0; column < 4; column++)
+         view_projection[12 + column] += move[0] * view_projection[column] + move[1] * view_projection[4 + column] + move[2] * view_projection[8 + column];
+   }
+
    // Draws an opaque draw into the fp16 scene (the world and weapon base passes: the scene target alone, output sized, with the scene
    // depth) with the patched shaders, adding the motion vector target ("target_slot", past the game's) and the previous frame's
    // b0 / b1 / b3 ("previous_slots"). False if it can't (the draw then goes to "DrawWithJitter").
@@ -1280,6 +1315,9 @@ class BorderlandsGoty final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
          // two frames go
          game_device_data.mv_previous_objects.swap(game_device_data.mv_objects);
+         game_device_data.mv_camera_moves.clear();
+         game_device_data.mv_camera_move_samples = 0;
+         game_device_data.mv_camera_move = {};
 #if DEVELOPMENT
          // Objects without a translation (world space and instanced geometry, placed by their vertex inputs and b1) all share one by design:
          // whichever of them matches gives the same previous position (VS 0x9B0EA126, 0xB4A05DE8: instance matrix in v4-v7)
@@ -1388,6 +1426,8 @@ class BorderlandsGoty final : public Game
                }
             }
          }
+         const bool world_camera = camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0);
+         const bool translated = game_device_data.mv_last_vertex_shader->translation_offset != UINT_MAX;
          if (match)
          {
             // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
@@ -1395,11 +1435,15 @@ class BorderlandsGoty final : public Game
             uploads[1] = match->camera.get();
             if (skinned)
                uploads[2] = match->bones.get();
+            if (translated && world_camera)
+            {
+               game_device_data.mv_camera_moves.push_back({match->transform[9] - transform[9], match->transform[10] - transform[10], match->transform[11] - transform[11]});
+            }
 #if DEVELOPMENT
             game_device_data.mv_stats.matched++;
 #endif
          }
-         else if (game_device_data.mv_previous_camera && copy_size(game_device_data.mv_previous_camera) == camera->size() && (camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0)))
+         else if (game_device_data.mv_previous_camera && copy_size(game_device_data.mv_previous_camera) == camera->size() && world_camera)
          {
             // Not found, drawn with the world camera: its own constants with last frame's world camera (camera motion only)
             uploads[1] = game_device_data.mv_previous_camera.get();
@@ -1413,6 +1457,13 @@ class BorderlandsGoty final : public Game
             game_device_data.mv_stats.other_camera++;
          }
 #endif
+         // Without LocalToWorld the vertices are already translated by this frame's camera: the previous camera moves back by its translation
+         if (!translated && world_camera && uploads[1] && uploads[1]->size() >= 16 * sizeof(float))
+         {
+            game_device_data.mv_moved_camera.assign(uploads[1]->begin(), uploads[1]->end());
+            MoveViewProjection(reinterpret_cast<float*>(game_device_data.mv_moved_camera.data()), CameraMove(&game_device_data));
+            uploads[1] = &game_device_data.mv_moved_camera;
+         }
          // Kept as drawn for the next frame
          auto& drawn_objects = game_device_data.mv_objects[key];
          drawn_objects.push_back({transform, object, camera, bones});
@@ -1555,7 +1606,7 @@ class BorderlandsGoty final : public Game
          return false;
       }
 
-      // FSR needs the camera (DLSS ignores it). b1's ViewProjectionMatrix multiplies row vectors with absolute world translation: column
+      // FSR needs the camera (DLSS ignores it). b1's ViewProjectionMatrix multiplies row vectors in translated world space: column
       // 1 is the up axis / tan(fov / 2); UE3's projection has an infinite far plane with clip w - clip z = the near plane (element 3,3
       // minus 3,2).
       const float* const view_projection = reinterpret_cast<const float*>(game_device_data.mv_camera->data());
@@ -1642,7 +1693,7 @@ class BorderlandsGoty final : public Game
       if (std::exchange(game_device_data.mv_fill_pending, false) && fill_shader)
       {
          // Current clip space to the previous frame's: previous * inverse(current) for column vectors (b1 holds the row vector
-         // matrix, transposed here), in double (absolute world translation)
+         // matrix, transposed here), in double
          Math::Matrix44D current, previous;
          current.SetIdentity();
          previous.SetIdentity();
@@ -1650,6 +1701,8 @@ class BorderlandsGoty final : public Game
          {
             std::copy_n(reinterpret_cast<const float*>(game_device_data.mv_camera->data()), 16, current.GetData());
             std::copy_n(reinterpret_cast<const float*>(game_device_data.mv_previous_camera->data()), 16, previous.GetData());
+            // Depth unprojects to this frame's translated world (see "mv_camera_moves")
+            MoveViewProjection(previous.GetData(), CameraMove(&game_device_data));
             current.Transpose();
             previous.Transpose();
             current.Invert();
