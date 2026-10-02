@@ -6337,6 +6337,212 @@ namespace
 
    //TODOFT3: merge all the shader permutations that use the same code in Prey (and then move shader binaries to bin folder? Add shader files to VS project?)
 
+   // Expects "s_mutex_samplers" to already be locked
+   com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
+   {
+      D3D11_SAMPLER_DESC desc = original_desc;
+#if !DEVELOPMENT
+      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
+      {
+         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
+         {
+            desc.Filter = D3D11_FILTER_ANISOTROPIC;
+         }
+
+         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+
+         if (samplers_upgrade_mode >= 5) // Bruteforce the offset
+         {
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
+         }
+         else if (samplers_upgrade_mode == 4)
+         {
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
+         }
+         else if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero
+         {
+             desc.MipLODBias = (desc.MipLODBias == 0.0f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias;
+             desc.MipLODBias = std::clamp(desc.MipLODBias, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
+         }
+
+         float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
+         desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
+
+         // TODO: Clean up the code. Other "samplers_upgrade_mode" values aren't supported outside of development (because they aren't even needed, until proven otherwise)
+      }
+      else
+      {
+         return nullptr;
+      }
+#else
+      // Prey's CryEngine (and most games) only uses:
+      // D3D11_FILTER_ANISOTROPIC
+      // D3D11_FILTER_COMPARISON_ANISOTROPIC
+      // D3D11_FILTER_MIN_MAG_MIP_POINT
+      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT
+      // D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT
+      // D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT
+      // D3D11_FILTER_MIN_MAG_MIP_LINEAR
+      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR
+
+      // This could theoretically make some textures that have moire patters, or were purposely blurry, "worse", but the positives of upgrading still outweight the negatives.
+      // Note that this might not fix all cases because there's still "ID3D11DeviceContext::SetResourceMinLOD()" and textures that are blurry for other reasons
+      // because they use other types of samplers (unfortunately it seems like some decals use "D3D11_FILTER_MIN_MAG_MIP_LINEAR").
+      // Note that the AF on different textures in the game seems is possibly linked with other graphics settings than just AF (maybe textures or objects quality).
+      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
+      {
+         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
+         {
+            desc.Filter = D3D11_FILTER_ANISOTROPIC;
+         }
+
+         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+
+         // Note: this is the main ingredient in making textures less blurry
+         if (samplers_upgrade_mode == 4)
+         {
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+         }
+         else if (samplers_upgrade_mode >= 5)
+         {
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+         }
+         // Note: this never seems to affect anything in Prey, probably also doesn't in most games
+         if (samplers_upgrade_mode >= 6)
+         {
+            desc.MinLOD = min(desc.MinLOD, 0.f);
+         }
+      }
+      else if ((desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 1) // This is the most common (main/only) format being used other than AF
+         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2)
+         || (desc.Filter == D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3)
+         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4)
+         || (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5)
+         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
+      {
+         //TODOFT: research. Force this on to see how it behaves. Doesn't work, it doesn't really help any further with (e.g.) blurry decal textures
+         // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
+         if (samplers_upgrade_mode >= 7)
+         {
+            desc.Filter == (desc.ComparisonFunc != D3D11_COMPARISON_NEVER && samplers_upgrade_mode == 7) ? D3D11_FILTER_COMPARISON_ANISOTROPIC : D3D11_FILTER_ANISOTROPIC;
+            desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+         }
+         // Note: changing the lod bias of non anisotropic filters makes reflections (cubemap samples?) a lot more specular (shiny) in Prey (and probably does in other games too), so it's best avoided (it can look better is some screenshots, but it's likely not intended).
+         // Even if we only fix up textures that didn't have a positive bias, we run into the same problem.
+         if (samplers_upgrade_mode == 4 && desc.MipLODBias <= 0.f)
+         {
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+         }
+         else if (samplers_upgrade_mode >= 5)
+         {
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+         }
+         if (samplers_upgrade_mode >= 6)
+         {
+            desc.MinLOD = 0.f;
+         }
+         else
+         {
+            float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
+            desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
+         }
+      }
+#endif // !DEVELOPMENT
+
+#if DEVELOPMENT && !defined(NDEBUG) && 0 // Make sure that the device we are using to create samples is the "native" one (the final one), not the proxy created by ReShade // TODO: delete if ReShade doesn't take my PR for this
+      ID3D11Device* parent_device = nullptr;
+      // Special ID used by ReShade (and possibly other applications) that returns the parent object of a proxy
+      constexpr GUID ID_IDeviceChildParent = { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+      struct __declspec(uuid("7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42")) IDeviceChildParent : IUnknown { };
+      device->QueryInterface(__uuidof(IDeviceChildParent), (void**)&parent_device);
+      if (parent_device)
+      {
+         ASSERT_ONCE_MSG(false, "We are possibly creating a sampler through the ReShade proxy device, which means ReShade will see it and call the init function on it, which we don't want"); // Note that if other applications implemented "ID_IDeviceChildParent", this could result in false positives
+         parent_device->Release();
+      }
+#endif
+
+      // Nothing to upgrade. Creating it anyway would return the original sampler itself (DX11 shares identical state objects),
+      // making the map hold a strong ref to its own key, which certainly won't help with ref counting.
+      if (std::memcmp(&desc, &original_desc, sizeof(D3D11_SAMPLER_DESC)) == 0)
+      {
+         return nullptr;
+      }
+
+      com_ptr<ID3D11SamplerState> sampler;
+      device->CreateSamplerState(&desc, &sampler); // Note: in DX11 all state objects are shared, so if we create one with the same desc as an existing one, it will return the ptr to that one instead.
+      ASSERT_ONCE(sampler != nullptr);
+      return sampler;
+   }
+
+   // Core swaps the game's samplers for upgraded ones only as they're bound (the descriptor push of "sampler" type below), so after a
+   // change of "texture_mip_lod_bias_offset" a sampler that stayed bound keeps the previous bias until the game rebinds it, which a game
+   // or wrapper skipping redundant binds may never do (The Witcher 2 under dgVoodoo: the scene kept the shadow pass's unbiased samplers).
+   // Swaps every stage's bound samplers for the current bias's variants. Expects "s_mutex_samplers" to be locked exclusively.
+   void RebindUpgradedSamplers(ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   {
+      using GetSamplers = void (STDMETHODCALLTYPE ID3D11DeviceContext::*)(UINT, UINT, ID3D11SamplerState**);
+      using SetSamplers = void (STDMETHODCALLTYPE ID3D11DeviceContext::*)(UINT, UINT, ID3D11SamplerState* const*);
+      constexpr std::pair<GetSamplers, SetSamplers> stages[] = {
+         {&ID3D11DeviceContext::VSGetSamplers, &ID3D11DeviceContext::VSSetSamplers},
+         {&ID3D11DeviceContext::HSGetSamplers, &ID3D11DeviceContext::HSSetSamplers},
+         {&ID3D11DeviceContext::DSGetSamplers, &ID3D11DeviceContext::DSSetSamplers},
+         {&ID3D11DeviceContext::GSGetSamplers, &ID3D11DeviceContext::GSSetSamplers},
+         {&ID3D11DeviceContext::PSGetSamplers, &ID3D11DeviceContext::PSSetSamplers},
+         {&ID3D11DeviceContext::CSGetSamplers, &ID3D11DeviceContext::CSSetSamplers},
+      };
+      const float bias = device_data.texture_mip_lod_bias_offset;
+      for (const auto& [get_samplers, set_samplers] : stages)
+      {
+         ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+         (native_device_context->*get_samplers)(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, samplers);
+         bool swapped = false;
+         for (ID3D11SamplerState*& sampler : samplers)
+         {
+            if (!sampler)
+               continue;
+            // The game's sampler: the bound one, or the one whose variant is bound
+            auto original = device_data.custom_sampler_by_original_sampler.find(reinterpret_cast<uint64_t>(sampler));
+            if (original == device_data.custom_sampler_by_original_sampler.end())
+            {
+               original = std::find_if(device_data.custom_sampler_by_original_sampler.begin(), device_data.custom_sampler_by_original_sampler.end(), [sampler](const auto& entry)
+                  { return std::any_of(entry.second.begin(), entry.second.end(), [sampler](const auto& variant)
+                       { return variant.second.get() == sampler; }); });
+               if (original == device_data.custom_sampler_by_original_sampler.end())
+                  continue;
+            }
+            auto& [original_handle, variants] = *original;
+            auto variant = variants.find(bias);
+            if (variant == variants.end())
+            {
+               D3D11_SAMPLER_DESC desc;
+               reinterpret_cast<ID3D11SamplerState*>(original_handle)->GetDesc(&desc);
+               variant = variants.emplace(bias, CreateCustomSampler(device_data, device_data.native_device, desc)).first;
+            }
+            // No variant: a sampler Core doesn't upgrade, the game's own
+            ID3D11SamplerState* const replacement = (variant->second ? variant->second.get() : reinterpret_cast<ID3D11SamplerState*>(original_handle));
+            if (replacement != sampler)
+            {
+               sampler->Release();
+               sampler = replacement;
+               sampler->AddRef();
+               swapped = true;
+            }
+         }
+         if (swapped)
+         {
+            (native_device_context->*set_samplers)(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, samplers);
+         }
+         for (ID3D11SamplerState* sampler : samplers)
+         {
+            if (sampler)
+            {
+               sampler->Release();
+            }
+         }
+      }
+   }
+
    // Return false to prevent the original draw call from running (e.g. if you replaced it or just want to skip it)
    // Most games (e.g. Prey, Dishonored 2) always draw in direct mode (as opposed to indirect), but uses different command lists on different threads (e.g. on Prey, that's almost only used for the shadow projection maps, in Dishonored 2, for almost every separate pass).
    // Usually there's a few compute shaders but most passes are "classic" pixel shaders.
@@ -6354,6 +6560,14 @@ namespace
       bool is_custom_pass = false;
 
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+
+      // A mip bias changed since this context's last draw: its bound samplers still have the previous one (see "RebindUpgradedSamplers")
+      if (enable_samplers_upgrade && !ignore_upgraded_samplers && cmd_list_data.applied_texture_mip_lod_bias_offset != device_data.texture_mip_lod_bias_offset)
+      {
+         const std::unique_lock lock(s_mutex_samplers);
+         RebindUpgradedSamplers(native_device_context, device_data);
+         cmd_list_data.applied_texture_mip_lod_bias_offset = device_data.texture_mip_lod_bias_offset;
+      }
 
       const auto& original_shader_hashes = is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader_hashes : cmd_list_data.pipeline_state_original_graphics_shader_hashes;
 
@@ -8096,144 +8310,6 @@ namespace
 #endif
 
       return cancelled_or_replaced;
-   }
-
-   // Expects "s_mutex_samplers" to already be locked
-   com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
-   {
-      D3D11_SAMPLER_DESC desc = original_desc;
-#if !DEVELOPMENT
-      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
-      {
-         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
-         {
-            desc.Filter = D3D11_FILTER_ANISOTROPIC;
-         }
-
-         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
-
-         if (samplers_upgrade_mode >= 5) // Bruteforce the offset
-         {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
-         }
-         else if (samplers_upgrade_mode == 4)
-         {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
-         }
-         else if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero
-         {
-             desc.MipLODBias = (desc.MipLODBias == 0.0f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias;
-             desc.MipLODBias = std::clamp(desc.MipLODBias, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
-         }
-
-         float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
-         desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
-
-         // TODO: Clean up the code. Other "samplers_upgrade_mode" values aren't supported outside of development (because they aren't even needed, until proven otherwise)
-      }
-      else
-      {
-         return nullptr;
-      }
-#else
-      // Prey's CryEngine (and most games) only uses:
-      // D3D11_FILTER_ANISOTROPIC
-      // D3D11_FILTER_COMPARISON_ANISOTROPIC
-      // D3D11_FILTER_MIN_MAG_MIP_POINT
-      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT
-      // D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT
-      // D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT
-      // D3D11_FILTER_MIN_MAG_MIP_LINEAR
-      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR
-
-      // This could theoretically make some textures that have moire patters, or were purposely blurry, "worse", but the positives of upgrading still outweight the negatives.
-      // Note that this might not fix all cases because there's still "ID3D11DeviceContext::SetResourceMinLOD()" and textures that are blurry for other reasons
-      // because they use other types of samplers (unfortunately it seems like some decals use "D3D11_FILTER_MIN_MAG_MIP_LINEAR").
-      // Note that the AF on different textures in the game seems is possibly linked with other graphics settings than just AF (maybe textures or objects quality).
-      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
-      {
-         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
-         {
-            desc.Filter = D3D11_FILTER_ANISOTROPIC;
-         }
-
-         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
-
-         // Note: this is the main ingredient in making textures less blurry
-         if (samplers_upgrade_mode == 4)
-         {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         else if (samplers_upgrade_mode >= 5)
-         {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         // Note: this never seems to affect anything in Prey, probably also doesn't in most games
-         if (samplers_upgrade_mode >= 6)
-         {
-            desc.MinLOD = min(desc.MinLOD, 0.f);
-         }
-      }
-      else if ((desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 1) // This is the most common (main/only) format being used other than AF
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2)
-         || (desc.Filter == D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3)
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4)
-         || (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5)
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
-      {
-         //TODOFT: research. Force this on to see how it behaves. Doesn't work, it doesn't really help any further with (e.g.) blurry decal textures
-         // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
-         if (samplers_upgrade_mode >= 7)
-         {
-            desc.Filter == (desc.ComparisonFunc != D3D11_COMPARISON_NEVER && samplers_upgrade_mode == 7) ? D3D11_FILTER_COMPARISON_ANISOTROPIC : D3D11_FILTER_ANISOTROPIC;
-            desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
-         }
-         // Note: changing the lod bias of non anisotropic filters makes reflections (cubemap samples?) a lot more specular (shiny) in Prey (and probably does in other games too), so it's best avoided (it can look better is some screenshots, but it's likely not intended).
-         // Even if we only fix up textures that didn't have a positive bias, we run into the same problem.
-         if (samplers_upgrade_mode == 4 && desc.MipLODBias <= 0.f)
-         {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         else if (samplers_upgrade_mode >= 5)
-         {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         if (samplers_upgrade_mode >= 6)
-         {
-            desc.MinLOD = 0.f;
-         }
-         else
-         {
-            float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
-            desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
-         }
-      }
-#endif // !DEVELOPMENT
-
-#if DEVELOPMENT && !defined(NDEBUG) && 0 // Make sure that the device we are using to create samples is the "native" one (the final one), not the proxy created by ReShade // TODO: delete if ReShade doesn't take my PR for this
-      ID3D11Device* parent_device = nullptr;
-      // Special ID used by ReShade (and possibly other applications) that returns the parent object of a proxy
-      constexpr GUID ID_IDeviceChildParent = { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
-      struct __declspec(uuid("7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42")) IDeviceChildParent : IUnknown { };
-      device->QueryInterface(__uuidof(IDeviceChildParent), (void**)&parent_device);
-      if (parent_device)
-      {
-         ASSERT_ONCE_MSG(false, "We are possibly creating a sampler through the ReShade proxy device, which means ReShade will see it and call the init function on it, which we don't want"); // Note that if other applications implemented "ID_IDeviceChildParent", this could result in false positives
-         parent_device->Release();
-      }
-#endif
-
-      // Nothing to upgrade. Creating it anyway would return the original sampler itself (DX11 shares identical state objects),
-      // making the map hold a strong ref to its own key, which certainly won't help with ref counting.
-      if (std::memcmp(&desc, &original_desc, sizeof(D3D11_SAMPLER_DESC)) == 0)
-      {
-         return nullptr;
-      }
-
-      com_ptr<ID3D11SamplerState> sampler;
-      device->CreateSamplerState(&desc, &sampler); // Note: in DX11 all state objects are shared, so if we create one with the same desc as an existing one, it will return the ptr to that one instead.
-      ASSERT_ONCE(sampler != nullptr);
-      return sampler;
    }
 
    void OnInitSampler(reshade::api::device* device, const reshade::api::sampler_desc& desc, reshade::api::sampler sampler)

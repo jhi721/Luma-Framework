@@ -281,6 +281,8 @@ struct TraceDrawCallData
 struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 {
    bool is_primary = false; // Immediate/Primary (as opposed to Async/Secondary/Deferred)
+   // The "texture_mip_lod_bias_offset" this context's bound samplers were last swapped for ("RebindUpgradedSamplers")
+   float applied_texture_mip_lod_bias_offset = 0.f;
 
    CB::LumaInstanceDataPadded cb_luma_instance_data = {};
    // Always start from dirty given that deferred command lists inherit the cbuffers data from the immediate ones, but we don't know when they will get joined, so we always need to assume the data was dirty and needs to be re-set from scratch
