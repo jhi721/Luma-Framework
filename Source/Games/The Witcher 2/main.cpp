@@ -2837,6 +2837,10 @@ public:
             device_data.debug_draw_texture_format = desc.Format;
             device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
          }
+         else if (device_data.debug_draw_texture && (device_data.debug_draw_texture.get() == game_device_data.mv_texture.get() || device_data.debug_draw_texture.get() == game_device_data.mv_reactive.get()))
+         {
+            device_data.debug_draw_texture = nullptr;
+         }
       }
 #endif
 
