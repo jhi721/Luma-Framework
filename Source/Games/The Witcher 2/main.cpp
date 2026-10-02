@@ -29,9 +29,9 @@
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
 #include "..\..\Core\includes\patched_draws.h"
+#include "..\..\External\reshade\deps\minhook\include\MinHook.h"
 #if DEVELOPMENT
 #include "..\..\Core\includes\perf_test.h"
-#include "..\..\External\reshade\deps\minhook\include\MinHook.h"
 #endif
 
 // Every pass is keyed under both dgVoodoo builds: 2.87.3, and 2.81.3 (the build that runs under Proton), which emits
@@ -100,8 +100,9 @@ static bool g_sr_reactive_enable = true;
 static bool g_sr_reactive_debug_view = false;
 static bool g_mv_enable = false;
 static bool g_mv_debug_view = false;
-static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
-static bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
+static bool g_mv_force_jitter = false;        // The projection jitter without an upscaler
+static bool g_mv_disable_jitter = false;      // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
+static bool g_mv_untransformed_static = true; // Draws without a tie-break transform take no other draw's previous frame (see "DrawWithMotionVectors")
 // A/B of the CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy")
 static bool g_mv_buffer_filter = true;
 static bool g_mv_constants_pool = true;
@@ -182,6 +183,7 @@ static constexpr bool g_sr_reactive_enable = true;
 static constexpr bool g_mv_enable = false;
 static constexpr bool g_mv_force_jitter = false;
 static constexpr bool g_mv_disable_jitter = false;
+static constexpr bool g_mv_untransformed_static = true;
 static constexpr bool g_mv_buffer_filter = true;
 static constexpr bool g_mv_constants_pool = true;
 static constexpr bool g_mv_vc4_slots = true;
@@ -195,9 +197,9 @@ static constexpr int GetPerfMotionVectorDraws()
 // "render area" of full size surfaces (the viewport's +0xc/+0x10, copied into each frame at its build). A 3D frame's scene renders
 // into an area shrunk to the scale; at the post chain's entry the area goes back to the window size for every post pass, the grade,
 // the UI and the present blit, and the upscaler turns the shrunk scene into the whole surface there, before any post pass (light
-// shafts, fog, DoF, the bright-pass copy, flares, luminance) reads it ("ResolveRenderArea"). Steam exe only (addresses): other
-// builds keep native rendering. Development only: below 100% any negative mip bias makes the game's fine textures shimmer (NOTES.md
-// "Render scale implemented"), so shipped builds keep DLAA / FSR Native AA (the hooks aren't installed, the state stays inert).
+// shafts, motion blur, DoF, the bright-pass copy, flares, luminance) reads it ("ResolveRenderArea"). DLAA / FSR Native AA runs there
+// too (DLSS-Best-Practices PLC-1: none of the post chain baked into the history). Steam exe only (addresses): other builds upscale at
+// the exposure, after the post chain's first passes, and have no render scale.
 static float g_render_scale = 1.f;
 constexpr float MIN_RENDER_SCALE = 0.5f;
 namespace RenderArea
@@ -222,11 +224,12 @@ namespace RenderArea
    // from it at their start, before they set their own viewport. The scene leaves its area there.
    uint32_t* const current_viewport_size = reinterpret_cast<uint32_t*>(0x237E990);
 
-   bool installed = false;
+   bool installed = false;       // The post chain hook
+   bool scale_installed = false; // The render scale's frame hook
    // On the game thread, as dgVoodoo's D3D11 calls and the present
    float next_scale = 1.f;                   // The next 3D frame's scale ("OnPresent")
    std::array<uint32_t, 2> render_size = {}; // This frame's shrunk area, 0 when not shrunk
-   void (*resolve)() = nullptr;              // The upscaler, at a shrunk frame's post chain entry ("ResolveRenderArea")
+   void (*resolve)() = nullptr;              // The upscaler, at the post chain's entry ("ResolveRenderArea")
    void(__stdcall* frame_scene_original)(int, uint8_t**) = nullptr;
    void(__stdcall* post_chain_original)(void*, int, uint8_t*, int, uint8_t*, uint32_t) = nullptr;
 
@@ -269,32 +272,33 @@ namespace RenderArea
          area[1] = area[5];
          std::memcpy(frame_info + FRAME_INFO_AREA_OFFSET, area, sizeof(render_size));
          std::memcpy(current_viewport_size, area, sizeof(render_size));
-         // dgVoodoo translates synchronously: the scene's draws are in the D3D11 context already
-         if (resolve)
-         {
-            resolve();
-         }
+      }
+      // dgVoodoo translates synchronously: the scene's draws are in the D3D11 context already. UberSampling renders the scene N x N
+      // times: it keeps the exposure's upscaler.
+      const uint8_t* const render_settings = *render_settings_global;
+      if (resolve && render_settings && *reinterpret_cast<const uint32_t*>(render_settings + UBER_SAMPLING_OFFSET) <= 1)
+      {
+         resolve();
       }
       post_chain_original(renderer_part, a2, frame_info, a4, viewport, flags);
    }
 
-#if DEVELOPMENT
    void Install()
    {
       const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(GetModuleHandleW(nullptr));
       const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(dos) + dos->e_lfanew);
-      if (nt->FileHeader.TimeDateStamp != STEAM_TIME_DATE_STAMP || std::memcmp(frame_scene, PROLOGUE, sizeof(PROLOGUE)) != 0 ||
-          std::memcmp(post_chain, PROLOGUE, sizeof(PROLOGUE)) != 0 || MH_Initialize() != MH_OK)
+      if (nt->FileHeader.TimeDateStamp != STEAM_TIME_DATE_STAMP || std::memcmp(post_chain, PROLOGUE, sizeof(PROLOGUE)) != 0 || MH_Initialize() != MH_OK)
          return;
-      installed = MH_CreateHook(frame_scene, reinterpret_cast<void*>(&FrameSceneDetour), reinterpret_cast<void**>(&frame_scene_original)) == MH_OK &&
-                  MH_CreateHook(post_chain, reinterpret_cast<void*>(&PostChainDetour), reinterpret_cast<void**>(&post_chain_original)) == MH_OK &&
-                  MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
+      installed = MH_CreateHook(post_chain, reinterpret_cast<void*>(&PostChainDetour), reinterpret_cast<void**>(&post_chain_original)) == MH_OK;
+      scale_installed = installed && std::memcmp(frame_scene, PROLOGUE, sizeof(PROLOGUE)) == 0 &&
+                        MH_CreateHook(frame_scene, reinterpret_cast<void*>(&FrameSceneDetour), reinterpret_cast<void**>(&frame_scene_original)) == MH_OK;
+      installed = installed && MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
       if (!installed)
       {
+         scale_installed = false;
          MH_Uninitialize();
       }
    }
-#endif
 } // namespace RenderArea
 
 // Optional resources (FSR's masks, SMAA's) go after this many presents without use: ~5 s, so menus and loading screens between
@@ -369,6 +373,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // an upscaler that doesn't run would leave the jitter visible)
    bool mv_previous_scene_done = false;
    float sr_vert_fov = 1.0471976f; // FSR's vertical FOV (radians): the last camera's, 60 degrees until one is seen
+   float scene_mip_bias = 0.f;     // The scene's texture mip bias under the upscaler, set at present (see "SetMipBias")
    // FSR's reactive and transparency & composition masks (written by the fill from "mv_reactive_target", see
    // "Luma_TW2_MotionVectorFill.hlsl")
    com_ptr<ID3D11Texture2D> mv_reactive;
@@ -489,6 +494,18 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ConstantsCopy mv_previous_camera;
    uint32_t mv_frame_index = 0;              // The Luma frame index of the last motion vector frame
    std::vector<uint8_t> mv_camera_only_copy; // An unmatched draw's constants with last frame's camera (reused)
+#if DEVELOPMENT
+   uint32_t mv_logged_untransformed_frame = 0;
+   uint32_t mv_logged_terrain_frame = 0;
+   // Matches whose nearest candidate wasn't exact, by vertex shader: count and largest transform distance (logged every 300 frames)
+   struct InexactMatches
+   {
+      uint32_t count = 0;
+      float max_distance = 0.f;
+   };
+   std::unordered_map<uint32_t, InexactMatches> mv_inexact_by_vs;
+   uint32_t mv_logged_inexact_frame = 0;
+#endif
 
 #if DEVELOPMENT
    bool mv_logged_jitter = false; // The jitter state "[TW2 SR]" last logged
@@ -496,9 +513,11 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    struct MotionVectorStats
    {
       uint32_t motion_vector_draws = 0, jitter_draws = 0, reactive_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, maps = 0, updates = 0, other_maps = 0, sr_draws = 0;
-      uint32_t offset_bindings = 0;     // vc4 bound at a constant buffer offset (a ring: the per-buffer copies would be wrong)
-      uint32_t constants_pool = 0;      // At present: the pooled copies (see "NewConstantsCopy")
-      uint32_t tiebreak_collisions = 0; // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
+      uint32_t untransformed_ambiguous = 0; // Draws without a tie-break transform whose key had several previous candidates
+      uint32_t terrain_inexact = 0;         // Terrain chunks whose nearest previous candidate was another chunk (not drawn last frame)
+      uint32_t offset_bindings = 0;         // vc4 bound at a constant buffer offset (a ring: the per-buffer copies would be wrong)
+      uint32_t constants_pool = 0;          // At present: the pooled copies (see "NewConstantsCopy")
+      uint32_t tiebreak_collisions = 0;     // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
       uint32_t ended_by = 0;
       float near_plane = 0.f, far_plane = 0.f;                   // The upscaler's, from the camera's projection (0: none found)
       uint32_t rejected[size_t(MotionVectorReject::COUNT)] = {}; // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
@@ -1228,6 +1247,17 @@ class TheWitcher2Game final : public Game
       gd->mv_blend_state = blend_state.get();
    }
 
+   // The upscaler's mip bias reaches only the scene's draws (Core swaps the game's samplers for biased ones as they're bound): the shadow
+   // maps before the scene, whose alpha tested foliage it thinned (smaller, flickering shadows, also at DLAA), and the post chain and
+   // the UI after it keep the game's mips
+   static void SetMipBias(DeviceData& device_data, float bias)
+   {
+      if (custom_texture_mip_lod_bias_offset)
+         return;
+      const std::unique_lock lock(s_mutex_samplers);
+      device_data.texture_mip_lod_bias_offset = bias;
+   }
+
    // Opens the scene at the frame's first mesh draw into output sized depth: takes the scene depth and picks the jitter the whole
    // scene draws with. Once per present (the HUD and later passes never reopen it). False if it didn't; a depth of another size is
    // remembered for the frame ("mv_not_scene_dsv").
@@ -1243,6 +1273,7 @@ class TheWitcher2Game final : public Game
       if (!GetPatchedVertexShader(native_device, cmd_list_data, device_data, vertex_shader_hash))
          return false;
       gd.mv_scene_open = true;
+      SetMipBias(device_data, gd.scene_mip_bias);
 #if DEVELOPMENT
       if (auto* const perf_queries = gd.perf_timestamps.frame)
       {
@@ -1573,7 +1604,25 @@ class TheWitcher2Game final : public Game
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
          const TheWitcher2GameDeviceData::MotionVectorObject* match = nullptr;
-         if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end())
+         const auto previous = gd.mv_previous_objects.find(key);
+         // Without a tie-break transform (a vertex shader reading neither LocalToWorld nor bones at the rows the tie-break knows) the
+         // copies of a mesh sharing a key can't be told apart, so any pick is a guess. Such a draw keeps its own constants with last
+         // frame's camera (static).
+         const bool untransformed = gd.mv_last_vertex.transform_offset == 0;
+#if DEVELOPMENT
+         if (untransformed && previous != gd.mv_previous_objects.end() && previous->second.size() > 1)
+         {
+            gd.mv_stats.untransformed_ambiguous++;
+            if (cb_luma_global_settings.FrameIndex - gd.mv_logged_untransformed_frame >= 300)
+            {
+               gd.mv_logged_untransformed_frame = cb_luma_global_settings.FrameIndex;
+               reshade::log::message(reshade::log::level::info, std::format("[TW2 MV] frame {}: no tie-break transform, {} candidates, VS 0x{:08X} PS 0x{:08X}", cb_luma_global_settings.FrameIndex,
+                                                                   previous->second.size(), uint32_t(original_shader_hashes.vertex_shaders[0]), uint32_t(original_shader_hashes.pixel_shaders[0]))
+                                                                   .c_str());
+            }
+         }
+#endif
+         if (previous != gd.mv_previous_objects.end() && !(untransformed && g_mv_untransformed_static))
          {
             float nearest = FLT_MAX;
             for (const auto& candidate : previous->second)
@@ -1585,6 +1634,44 @@ class TheWitcher2Game final : public Game
                   match = &candidate;
                }
             }
+            // Terrain doesn't move: a chunk not drawn last frame (the chunk set changes even with a still camera) would take its
+            // nearest neighbor's position and heightmap window, all its ground moving by hundreds of pixels
+            if (match && nearest != 0.f && gd.mv_last_vertex.transform_offset == TERRAIN_CHUNK_ROW * 16)
+            {
+               match = nullptr;
+#if DEVELOPMENT
+               gd.mv_stats.terrain_inexact++;
+               if (cb_luma_global_settings.FrameIndex - gd.mv_logged_terrain_frame >= 300)
+               {
+                  gd.mv_logged_terrain_frame = cb_luma_global_settings.FrameIndex;
+                  reshade::log::message(reshade::log::level::info, std::format("[TW2 MV] frame {}: terrain chunk without last frame's, nearest distance {}, {} candidates, VS 0x{:08X}", cb_luma_global_settings.FrameIndex,
+                                                                      nearest, previous->second.size(), uint32_t(original_shader_hashes.vertex_shaders[0]))
+                                                                      .c_str());
+               }
+#endif
+            }
+#if DEVELOPMENT
+            if (match && nearest != 0.f)
+            {
+               auto& inexact = gd.mv_inexact_by_vs[uint32_t(original_shader_hashes.vertex_shaders[0])];
+               inexact.count++;
+               inexact.max_distance = (std::max)(inexact.max_distance, nearest);
+            }
+            if (cb_luma_global_settings.FrameIndex - gd.mv_logged_inexact_frame >= 300)
+            {
+               gd.mv_logged_inexact_frame = cb_luma_global_settings.FrameIndex;
+               std::vector<std::pair<uint32_t, TheWitcher2GameDeviceData::InexactMatches>> sorted(gd.mv_inexact_by_vs.begin(), gd.mv_inexact_by_vs.end());
+               std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b)
+                  { return a.second.count > b.second.count; });
+               std::string line = std::format("[TW2 MV] frame {}: inexact matches over 300 frames (VS count max_distance):", cb_luma_global_settings.FrameIndex);
+               for (size_t i = 0; i < (std::min<size_t>)(sorted.size(), 16); i++)
+               {
+                  line += std::format(" 0x{:08X} {} {:.3g};", sorted[i].first, sorted[i].second.count, sorted[i].second.max_distance);
+               }
+               reshade::log::message(reshade::log::level::info, line.c_str());
+               gd.mv_inexact_by_vs.clear();
+            }
+#endif
          }
          if (match)
          {
@@ -1898,11 +1985,12 @@ class TheWitcher2Game final : public Game
    // Ends the scene right after the exposure drew into "scene_rtv" (null: no upscaler), or under the render scale before the post
    // chain's first pass with the linear scene: the depth and camera motion fill (see "Luma_TW2_MotionVectorFill.hlsl"), then the
    // upscaler, before anything reads the scene. Under the render scale, then the linear depth stretched over its surface.
-   static void EndScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11RenderTargetView* scene_rtv)
+   static void EndScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11RenderTargetView* scene_rtv, bool exposed)
    {
       auto& gd = GetGameDeviceData(device_data);
       gd.mv_scene_open = false;
       gd.mv_scene_done = true;
+      SetMipBias(device_data, 0.f);
 #if DEVELOPMENT
       auto* const perf_queries = gd.perf_timestamps.frame;
       if (perf_queries && perf_queries->Marked(PERF_SCENE_START))
@@ -1949,8 +2037,9 @@ class TheWitcher2Game final : public Game
          }
       }
       const bool write_reactive = reactive && gd.mv_reactive_uav && gd.mv_transparency_uav;
-      // The upscaler's exposure: under the render scale the last adaptation's gain (1 with the static exposure perms, which have no
-      // adaptation texture), else 1 (the scene is exposed). Always given: the SR bridge restarts its helper when an input comes or goes.
+      // The upscaler's exposure: on the linear scene (the post chain's entry) the last adaptation's gain (1 with the static exposure
+      // perms, which have no adaptation texture), on the exposure's output 1. Always given: the SR bridge restarts its helper when an
+      // input comes or goes.
       const bool scaled = gd.mv_render_size != std::array<uint32_t, 2>{uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
       if (IsSRActive(device_data) && !gd.sr_exposure_uav)
       {
@@ -1960,7 +2049,7 @@ class TheWitcher2Game final : public Game
             native_device->CreateUnorderedAccessView(gd.sr_exposure.get(), nullptr, &gd.sr_exposure_uav);
          }
       }
-      const bool adapted_exposure = scaled && gd.sr_adaptation_srv;
+      const bool adapted_exposure = !exposed && gd.sr_adaptation_srv;
       if (write_reactive)
       {
          gd.sr_reactive_frame = cb_luma_global_settings.FrameIndex;
@@ -2079,8 +2168,8 @@ class TheWitcher2Game final : public Game
 #endif
    }
 
-   // Render scale: the post chain of a frame whose scene drew into its shrunk area starts (the game thread, outside any D3D11 call):
-   // the scene ends here, upscaled over the whole surface from its last target (the scene color, linear) before any post pass reads it
+   // The post chain starts (the game thread, outside any D3D11 call): the scene ends here, upscaled (over the whole surface from a
+   // shrunk area under the render scale) from its last target (the scene color, linear) before any post pass reads it
    static void ResolveRenderArea()
    {
       const std::shared_lock lock(s_mutex_device);
@@ -2096,7 +2185,7 @@ class TheWitcher2Game final : public Game
 #if DEVELOPMENT
       gd.mv_stats.ended_by = uint32_t(reinterpret_cast<uintptr_t>(RenderArea::post_chain)) | (scene_rtv ? 0u : 0x80000000u);
 #endif
-      EndScene(device_data.native_device, native_device_context.get(), device_data, scene_rtv);
+      EndScene(device_data.native_device, native_device_context.get(), device_data, scene_rtv, false);
    }
 
 #if DEVELOPMENT
@@ -2556,9 +2645,9 @@ class TheWitcher2Game final : public Game
 public:
    void OnInit(bool async) override
    {
-#if DEVELOPMENT
       RenderArea::resolve = &ResolveRenderArea;
       RenderArea::Install();
+#if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
       Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"gtao_enable", &g_gtao_enable}, { "hide_ui",
                                &g_hide_ui }});
@@ -2570,7 +2659,7 @@ public:
          MCP_GAME_TEXTURE("smaa.output", tex_smaa_out),
          MCP_GAME_TEXTURE("gtao.depth_mips", tex_gtao_depth_mips),
          MCP_GAME_TEXTURE("gtao.output", tex_gtao_final)});
-      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter},
+      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_untransformed_static", &g_mv_untransformed_static},
          {"sr_reactive_enable", &g_sr_reactive_enable}, { "sr_reactive_debug_view",
             &g_sr_reactive_debug_view }});
       Mcp::RegisterValues({{"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
@@ -2699,7 +2788,7 @@ public:
       // For the MCP "luma_dev_values" tool: the last complete frame's counts
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.reactive_draws", &stats.reactive_draws}, {"mv.matched", &stats.matched},
-                               {"mv.camera_only", &stats.camera_only}, {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.maps", &stats.maps}, {"mv.updates", &stats.updates},
+                               {"mv.camera_only", &stats.camera_only}, {"mv.untransformed_ambiguous", &stats.untransformed_ambiguous}, {"mv.terrain_inexact", &stats.terrain_inexact}, {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.maps", &stats.maps}, {"mv.updates", &stats.updates},
                                {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.offset_bindings", &stats.offset_bindings}, {"mv.constants_pool", &stats.constants_pool},
                                {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, { "mv.ended_by_hash",
                                   &stats.ended_by }},
@@ -2888,8 +2977,9 @@ public:
          game_device_data.sr_adaptation_srv.reset();
          native_device_context->PSGetShaderResources(1, 1, &game_device_data.sr_adaptation_srv);
       }
-      // DLSS/FSR: the exposed scene is the upscaler's input, upscaled in place right after the exposure (adaptive or static) wrote it,
-      // before anything reads it (glow, light shafts, DoF, the grade). The exposure only multiplies, so it doesn't mind the jitter.
+      // DLSS/FSR without the post chain hook (not the Steam exe) or with UberSampling: the exposed scene is the upscaler's input,
+      // upscaled in place right after the exposure (adaptive or static) wrote it, before the glow, DoF and the grade read it (the
+      // light shafts and motion blur before it are in its history). The exposure only multiplies, so it doesn't mind the jitter.
       if (game_device_data.mv_scene_open && is_exposure && original_draw_dispatch_func && *original_draw_dispatch_func)
       {
          ComPtr<ID3D11RenderTargetView> scene_rtv;
@@ -2905,7 +2995,7 @@ public:
 #if DEVELOPMENT
          game_device_data.mv_stats.ended_by = uint32_t(original_shader_hashes.pixel_shaders[0]);
 #endif
-         EndScene(native_device, native_device_context, device_data, scene_rtv.get());
+         EndScene(native_device, native_device_context, device_data, scene_rtv.get(), true);
          return DrawOrDispatchOverrideType::Replaced; // we ran the original draw ourselves
       }
 
@@ -2952,7 +3042,7 @@ public:
       // which passes the color through) and after a frame whose scene reached its end (menus and loading screens have no post chain,
       // and the first frame after them upscales at full size)
       const SR::InstanceData* const sr_instance_data = (IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr);
-      RenderArea::next_scale = ((RenderArea::installed && g_render_scale < 1.f && game_device_data.mv_scene_done && sr_instance_data && sr_implementations[device_data.sr_type]->IsReady(sr_instance_data)) ? g_render_scale : 1.f);
+      RenderArea::next_scale = ((RenderArea::scale_installed && g_render_scale < 1.f && game_device_data.mv_scene_done && sr_instance_data && sr_implementations[device_data.sr_type]->IsReady(sr_instance_data)) ? g_render_scale : 1.f);
       RenderArea::render_size = {};
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when
       // an upscaler is picked again (the helper takes seconds to start).
@@ -3062,13 +3152,9 @@ public:
       game_device_data.mv_frame_ended = true;
       game_device_data.mv_not_scene_dsv = nullptr;
       game_device_data.mv_fill_pending = false;
-      if (!custom_texture_mip_lod_bias_offset)
-      {
-         const std::unique_lock lock(s_mutex_samplers);
-         // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade). Not below it under the
-         // render scale: NVIDIA's -1.58 at 67% and -2 at 50% made the game's fine textures (cobblestones, rubble) shimmer under the jitter.
-         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? (std::max)(SR::GetMipLODBias(device_data.output_resolution.y * RenderArea::next_scale, device_data.output_resolution.y), -1.f) : 0.f);
-      }
+      // Core biases the anisotropic samplers (all of the game's with the AF16x upgrade): -1 at native resolution, -1.58 at 67%, -2 at 50%
+      game_device_data.scene_mip_bias = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y * RenderArea::next_scale, device_data.output_resolution.y) : 0.f);
+      SetMipBias(device_data, 0.f);
       {
          // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many as
          // the last frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their peak
@@ -3184,10 +3270,8 @@ public:
       reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
 #endif
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
-#if DEVELOPMENT
       reshade::get_config_value(nullptr, NAME, "RenderScale", g_render_scale);
       g_render_scale = std::clamp(g_render_scale, MIN_RENDER_SCALE, 1.f);
-#endif
 
       // HDR grade sliders (cb_luma_global_settings_dirty is already true at init -> uploaded on first frame).
       auto& gs = cb_luma_global_settings.GameSettings;
@@ -3214,8 +3298,7 @@ public:
 #if ENABLE_SMAA
       ImGui::SeparatorText("Anti-Aliasing");
       const bool sr_active = IsSRActive(device_data);
-#if DEVELOPMENT
-      if (RenderArea::installed)
+      if (RenderArea::scale_installed)
       {
          ImGui::BeginDisabled(!sr_active);
          // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
@@ -3235,7 +3318,6 @@ public:
          DrawResetButton(g_render_scale, 1.f, "RenderScale");
          ImGui::EndDisabled();
       }
-#endif
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
@@ -3566,13 +3648,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
    {
       TheWitcher2Game::UnregisterEvents();
-#if DEVELOPMENT
       if (RenderArea::installed)
       {
          MH_DisableHook(MH_ALL_HOOKS);
          MH_Uninitialize();
       }
-#endif
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);
