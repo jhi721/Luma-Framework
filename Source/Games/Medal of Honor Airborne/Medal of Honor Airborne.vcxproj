@@ -58,6 +58,10 @@
     <PlatformToolset>v145</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <UseDgVoodoo>true</UseDgVoodoo>
+    <UseDgVoodooLinux>true</UseDgVoodooLinux>
+  </PropertyGroup>
   <ItemGroup>
     <!-- Luma per-game feature toggles shown in Project Properties -> Configuration
          Properties -> Luma Properties (schema: ..\Luma.Properties.xml). -->

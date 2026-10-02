@@ -60,6 +60,9 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
     <UseLumaSRBridge>true</UseLumaSRBridge>
+    <UseDgVoodoo>true</UseDgVoodoo>
+    <UseDgVoodooLinux>true</UseDgVoodooLinux>
+    <UseD3D9VAFix>true</UseD3D9VAFix>
   </PropertyGroup>
   <ItemGroup>
     <!-- Luma per-game feature toggles shown in Project Properties -> Configuration

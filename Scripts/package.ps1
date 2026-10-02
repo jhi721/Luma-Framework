@@ -9,7 +9,9 @@
     with the project-level (Core/Textures) folders only included when the
     project opts in via UseLumaFastNoise, plus the runtime DLLs the project
     needs (dxcompiler.dll for DXP, d3dcompiler_47.dll, ReShade as dxgi.dll,
-    NGX DLSS when opted in).
+    NGX DLSS when opted in). dgVoodoo games (UseDgVoodoo) also get dgVoodoo2,
+    plus a "-Linux" zip with its Wine/Proton build (UseDgVoodooLinux),
+    optionally behind the D3D9 VA Fix proxy (UseD3D9VAFix).
 
 .EXAMPLE
     .\scripts\package.ps1 -Project "Final Fantasy XV" -Config "Development-Release" -Platform "x64"
@@ -88,7 +90,14 @@ $useLumaFastNoise = Test-PropEnabled $vcxproj "UseLumaFastNoise"
 $useLumaDXP = Test-PropEnabled $vcxproj "UseLumaDXP"
 $useLumaNGX = Test-PropEnabled $vcxproj "UseLumaNGX"
 $useLumaSRBridge = Test-PropEnabled $vcxproj "UseLumaSRBridge"
-Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge"
+$useDgVoodoo = Test-PropEnabled $vcxproj "UseDgVoodoo"
+$useDgVoodooLinux = Test-PropEnabled $vcxproj "UseDgVoodooLinux"
+$useD3D9VAFix = Test-PropEnabled $vcxproj "UseD3D9VAFix"
+Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix"
+if (($useDgVoodooLinux -or $useD3D9VAFix) -and -not $useDgVoodoo) {
+    Write-Error "UseDgVoodooLinux and UseD3D9VAFix need UseDgVoodoo"
+    exit 1
+}
 
 # Locate the addon. When packaging runs from the LumaPackage build target the
 # exact build output is passed in (-AddonPath = $(TargetPath)); standalone runs
@@ -120,7 +129,6 @@ if ($Config -eq "Development-Release") { $zipName += "-Dev" }
 if ($Config -eq "Development-Debug") { $zipName += "-Dev-Dbg" }
 if ($Platform -eq "Win32") { $zipName += "-x32" }
 $zipName = $zipName -replace ' ', '_'
-$zipName += ".zip"
 
 # Temp staging dir (unique per run, in the system temp so interrupted builds
 # don't pollute the repo tree)
@@ -164,13 +172,60 @@ try {
     # Addon at the zip root, under the canonical Luma-<Project>.addon name
     Copy-Item $addonFile.FullName -Destination (Join-Path $tempDir "Luma-$Project.addon") -Force
 
+    # dgVoodoo games ship the dgVoodoo build their shader hashes were taken from. Its license allows shipping
+    # individual files with a game mod, not bundling it for general use. The Linux zip gets an older build, as
+    # 2.87.3 fails under Wine/Proton.
+    $dgVoodooVersion = "2.87.3"
+    $dgVoodooLinuxVersion = "2.81.3"
+    if ($useDgVoodoo) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $dgVoodooDir = Join-Path $repoRoot "Source\External\dgVoodoo"
+        # The D3D9 VA Fix proxy goes in front of dgVoodoo as d3d9.dll, enabled by the flag file next to it
+        $d3d9Path = Join-Path $tempDir "d3d9.dll"
+        if ($useD3D9VAFix) {
+            $vaFixSrc = Join-Path $repoRoot "Binaries\Win32-$Config\Luma-D3D9-VA-Fix.dll"
+            if (-not (Test-Path $vaFixSrc)) {
+                Write-Error "Luma-D3D9-VA-Fix.dll not found: $vaFixSrc (build the ""D3D9 VA Fix"" project)"
+                exit 1
+            }
+            Copy-Item $vaFixSrc -Destination (Join-Path $tempDir "d3d9.dll") -Force
+            New-Item -ItemType File -Path (Join-Path $tempDir "d3d9_vafix.on") -Force | Out-Null
+            $d3d9Path = Join-Path $tempDir "d3d9_chain.dll"
+        }
+        $cplPath = Join-Path $tempDir "dgVoodooCpl.exe"
+        $confPath = Join-Path $tempDir "dgVoodoo.conf"
+        $stageDgVoodoo = {
+            param([string]$Version)
+            $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $dgVoodooDir ("dgVoodoo" + $Version.Replace('.', '_') + ".zip")))
+            try {
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($archive.GetEntry("MS/x86/D3D9.dll"), $d3d9Path, $true)
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($archive.GetEntry("dgVoodooCpl.exe"), $cplPath, $true)
+            } finally {
+                $archive.Dispose()
+            }
+            # One conf per build: an older build ignores a newer build's conf entirely
+            Copy-Item (Join-Path $PSScriptRoot "dgVoodoo\dgVoodoo-$Version.conf") -Destination $confPath -Force
+        }
+        & $stageDgVoodoo $dgVoodooVersion
+    }
+
     # Zip — next to the addon by default
     if ([string]::IsNullOrEmpty($OutDir)) { $OutDir = $addonFile.DirectoryName }
     $OutDir = $OutDir.TrimEnd('\')
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-    $zipPath = Join-Path $OutDir $zipName
+    $zipPath = Join-Path $OutDir "$zipName.zip"
     Compress-Archive -Path "$tempDir\*" -DestinationPath $zipPath -Force
     Write-Host "Packaged: $zipPath"
+
+    # The Linux zip only swaps the dgVoodoo files, so it updates a copy instead of compressing everything (DLSS's
+    # dll included) again.
+    if ($useDgVoodooLinux) {
+        & $stageDgVoodoo $dgVoodooLinuxVersion
+        $linuxZipPath = Join-Path $OutDir "$zipName-Linux.zip"
+        Copy-Item $zipPath -Destination $linuxZipPath -Force
+        Compress-Archive -Path $d3d9Path, $cplPath, $confPath -DestinationPath $linuxZipPath -Update
+        Write-Host "Packaged: $linuxZipPath"
+    }
 } finally {
     # Only remove the unique staging directory created by this invocation.
     $resolvedTempDir = [IO.Path]::GetFullPath($tempDir)
