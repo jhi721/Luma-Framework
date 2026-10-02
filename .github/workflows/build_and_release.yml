@@ -113,7 +113,8 @@ jobs:
             $vcxPath = Join-Path (Get-Location) $proj.Vcxproj
             if (-not (Test-Path $vcxPath)) { continue }
             $vcxContent = Get-Content $vcxPath -Raw
-            if ($vcxContent -match '<ConfigurationType>StaticLibrary</ConfigurationType>') { continue }
+            # Core and the tools (SR Bridge Helper, D3D9 VA Fix) build too, but aren't addons
+            if ($vcxContent -notmatch '<TargetExt[^>]*>\.addon<') { continue }
             $projName = $proj.Name
             if ($vcxContent -match '<ProjectName>([^<]+)</ProjectName>') { $projName = $Matches[1] }
             $projName = $projName -replace '&amp;', '&' -replace '&lt;', '<' -replace '&gt;', '>' -replace '&quot;', '"'
@@ -200,8 +201,8 @@ jobs:
           # Package with the shared script (single source of truth with local packaging):
           # it copies only this game's shaders, Global and Includes, skipping game
           # Dump directories before traversal and excluding all .cso files. It bundles the runtime
-          # DLLs (d3dcompiler_47, ReShade as dxgi.dll, NGX DLSS) and zips next to the
-          # addon or into -OutDir. dxcompiler.dll is intentionally not shipped (SM5-only).
+          # DLLs (d3dcompiler_47, ReShade as dxgi.dll, NGX DLSS), dgVoodoo2 and the D3D9 VA Fix for
+          # the games that opt in (plus a "-Linux" zip), and zips next to the addon or into -OutDir. dxcompiler.dll is intentionally not shipped (SM5-only).
           pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project $projectName -Config "${{ matrix.config }}" -Platform "${{ matrix.platform }}" -AddonPath $addonFile.FullName -OutDir "."
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning::Packaging failed for '$projectName' - it will be excluded from this release."
@@ -254,6 +255,7 @@ jobs:
             Installation instructions:
             - Extract all the files directly in the game main executable folder (replace the previous ones if you are updating)
             - If you already had a ReShade installation (dxgi.dll) overwrite it unless it's the same version. If you have other mods that used the dxgi.dll file, find a way to proxy them
+            - Games that run through dgVoodoo2 ship it in the zip. On Linux (Wine/Proton), use the zip ending in "-Linux" when there is one
             - Boot the game
             - Press home to bring out the ReShade and Luma menus (if they don't appear, ReShade or Luma failed to install or run)
             - Customize the settings if you'd like, the defaults are already good and pick up on your display calibration
