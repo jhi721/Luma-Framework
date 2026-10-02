@@ -361,8 +361,9 @@ namespace DXBC
    }
 
    // Whether the shader reads row "row" of constant buffer "slot" by an immediate index (unlike "ConstantBufferBytes", it tells which
-   // rows a shader declaring the whole buffer uses, e.g. a skinned vertex shader's world matrix past its relatively indexed bones)
-   inline bool ReadsConstantRow(const uint8_t* code, size_t size, uint32_t slot, uint32_t row)
+   // rows a shader declaring the whole buffer uses, e.g. a skinned vertex shader's world matrix past its relatively indexed bones).
+   // "relative_base": also as the base of a relative index ("cb4[r0.x + row]", an array starting there, e.g. a bone palette).
+   inline bool ReadsConstantRow(const uint8_t* code, size_t size, uint32_t slot, uint32_t row, bool relative_base = false)
    {
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
@@ -378,8 +379,10 @@ namespace DXBC
          WalkOperands(tokens, instructions[i], [&](size_t token_position, size_t index_position)
             {
                const uint32_t token = tokens[token_position];
+               const auto representation = DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token);
                reads |= DECODE_D3D10_SB_OPERAND_TYPE(token) == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER && index_position != no_index && tokens[index_position] == slot &&
-                        DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) == D3D10_SB_OPERAND_INDEX_2D && DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) == D3D10_SB_OPERAND_INDEX_IMMEDIATE32 &&
+                        DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) == D3D10_SB_OPERAND_INDEX_2D &&
+                        (representation == D3D10_SB_OPERAND_INDEX_IMMEDIATE32 || (relative_base && representation == D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE)) &&
                         tokens[index_position + 1] == row;
                return true; });
       return reads;
