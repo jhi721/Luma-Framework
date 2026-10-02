@@ -31,6 +31,33 @@ struct LumaGameData
 {
    float Dummy; // hlsl doesn't support empty structs
 };
+
+// The motion vector fill's constants (Luma_TW2_MotionVectorFill.hlsl, b0), written by "EndScene"
+struct MotionVectorFillConstants
+{
+   row_major float4x4 reprojection; // Current clip space to the previous frame's
+   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
+   float2 depth_from_view;          // The projection's depth row: device depth = x + y / view depth
+   float reactive_scale;
+   float reactive_threshold;
+   float reactive_enabled;
+   float padding;
+};
+
+// XeGTAO's runtime knobs (Luma_TW2_XeGTAO.hlsl, b9), written by "RunXeGTAO"
+struct GTAOKnobs
+{
+   float final_value_power;    // primary darkness dial, calibrated to the vanilla AO histogram
+   float depth_scale;          // viewZ divisor (game units -> ~meters); THE dial against broad over-occlusion
+   float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
+   float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
+   float2 viewport_pixel_size; // 1 / AO target resolution (half render res)
+   float2 padding;
+};
 } // namespace CB
+
+#ifdef __cplusplus
+static_assert(sizeof(CB::MotionVectorFillConstants) == 96 && sizeof(CB::GTAOKnobs) == 32); // The HLSL cbuffers' sizes
+#endif
 
 #endif // LUMA_GAME_CB_STRUCTS

@@ -1,6 +1,6 @@
-// The Witcher 2 — pre-rendered video (USM, YUV->RGB) pass. SDR clamp + light AutoHDR for HDR (BL2 pattern).
+// The Witcher 2 — pre-rendered video (USM, Y'CbCr->RGB) pass. SDR clamp + light AutoHDR for HDR (BL2 pattern).
 //
-// Plays the menu background / intro / loading movies: three YUV planes (Y=t0 2048x1024, U/V=t1/t2 1024x512,
+// Plays the menu background / intro / loading movies: three Y'CbCr planes (Y=t0 2048x1024, U/V=t1/t2 1024x512,
 // value in .w of the dgVoodoo r8g8b8a8 plane views) converted BT.601 limited-range to RGB by a fullscreen
 // quad alpha-blended straight onto the fp16 scene canvas. Menu/loading frames run NO tonemap, so on Luma's
 // scRGB output this SDR video would sit flat at paper white: restore the vanilla 8-bit clamp, then apply a
@@ -11,7 +11,7 @@
 // BT.601 constants baked in code (Y-16/255 then *1.164; V*1.596/0.813; U*0.392/2.017), tint/alpha cb4[10],
 // additive bias cb4[11]. The cb3 and/or pairs are dgVoodoo's texture-format bit emulation, kept verbatim.
 // NOTE: dgVoodoo dropped the SM3 `saturate(o)` (vanilla's 8-bit UNORM target clamped for free); the fp16
-// canvas does not, so we re-add it before the AutoHDR (kills YUV overshoot + negatives).
+// canvas does not, so we re-add it before the AutoHDR (kills Y'CbCr conversion overshoot + negatives).
 
 #include "Includes/Common.hlsl"       // game-local: pulls GameCBuffers (LumaGameSettings VideoAutoHDR* fields) + shared Common
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask
@@ -44,7 +44,7 @@ void main(
    float fade = saturate(700.0 * (0.703125 - v5.y)) * saturate(700.0 * (0.625 - v5.x)) * saturate(700.0 * v5.x) * saturate(700.0 * v5.y);
    float3 rgbScale = fade * cb4[10].xyz;
 
-   // --- YUV plane fetch + dgVoodoo format-emulation mask (verbatim; plane value lives in .w) ---
+   // --- Y'CbCr plane fetch + dgVoodoo format-emulation mask (verbatim; plane value lives in .w) ---
    float V = ApplyDgvMask(t2.Sample(s2_s, v5.xy), DgvMaskT2, DgvFillT2).w - 0.501961;
    float U = ApplyDgvMask(t1.Sample(s1_s, v5.xy), DgvMaskT1, DgvFillT1).w - 0.501961;
    float Y = (ApplyDgvMask(t0.Sample(s0_s, v5.xy), DgvMaskT0, DgvFillT0).w - 0.062745) * 1.164;

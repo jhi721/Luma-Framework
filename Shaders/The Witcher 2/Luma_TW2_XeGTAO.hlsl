@@ -26,15 +26,18 @@ cbuffer GameCB4 : register(b4)
 // --- Luma runtime knobs (set from main.cpp; live-tunable via DEV sliders, no recompile) ---
 // b9, NOT b11 (which the sibling MELE/BL GOTY ports use): core's DrawBloom owns b11 for its own constants,
 // so keeping the AO knobs off that slot costs nothing and avoids a clash. Mirrored by kGTAOKnobsCBSlot.
+#include "Includes/GameCBuffers.hlsl"
+
 cbuffer LumaGTAO : register(b9)
 {
-   float FinalValuePowerRT;    // primary darkness dial, calibrated to the vanilla AO histogram
-   float DepthScaleRT;         // viewZ divisor (game units -> ~meters); THE dial against broad over-occlusion
-   float RadiusOverrideRT;     // > 0 overrides EFFECT_RADIUS (view units after DepthScale)
-   float DebugViewRT;          // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
-   float2 ViewportPixelSizeRT; // 1 / AO target resolution (half render res), set by main.cpp
-   float2 PaddingRT;
+   CB::GTAOKnobs gtao_knobs;
 }
+// The names the shared XeGTAO.hlsl reads
+#define FinalValuePowerRT   gtao_knobs.final_value_power
+#define DepthScaleRT        gtao_knobs.depth_scale
+#define RadiusOverrideRT    gtao_knobs.radius_override
+#define DebugViewRT         gtao_knobs.debug_view
+#define ViewportPixelSizeRT gtao_knobs.viewport_pixel_size
 
 // TW2: no normal buffer captured at this point of the frame; derive from depth (a real normal source exists later in the frame, see
 // 0x53AB3429, but not here).

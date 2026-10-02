@@ -10,11 +10,11 @@
 
 // The Witcher 2 EE — tonemap ("exposure") pass SHARED IMPLEMENTATION (REDengine, DX9 via dgVoodoo D3D9->11).
 // Holds the whole pass including main(); the per-hash wrapper files (Tonemap_0x<HASH>.ps_5_0.hlsl, one per
-// permutation × dgVoodoo build) only set TM_BRIGHT_PASS and #include it. No hash in this filename -> not
+// permutation × dgVoodoo build) only set TM_BRIGHT_PASS / TM_STATIC and #include it. No hash in this filename -> not
 // matched/replaced directly.
 //
 // Vanilla body transcribed VERBATIM (register-level) from the dgVoodoo-translated CSOs (0x91348C0F exposure,
-// 0x00E31BF9 bloom bright-pass; DX9 origins 0xC5ADBC35/0xF01A691E), constants remapped DX9 cN -> cb4[N+8].
+// 0x00E31BF9 bloom bright-pass; DX9 origins 0xC5ADBC35/0xF01A691E; static 0xC47569A2/0x6587B8D6), constants remapped DX9 cN -> cb4[N+8].
 // The game's "tone map" (CEnvToneMappingParameters) is only an adaptive exposure multiply — NO curve, NO clamp.
 // The adaptation is histogram auto-levels: black and white are luminance percentiles of the frame, and the
 // exposure maps [black, white] to [0, 1] as one per-pixel ratio (hue kept), capped by m_maxMultiplier, so
@@ -32,8 +32,16 @@
 // TM_BRIGHT_PASS 0 -> DX9 0xC5ADBC35: exposure + post-scale only, alpha passthrough, adaptation at t1/s1.
 // TM_BRIGHT_PASS 1 -> DX9 0xF01A691E, the bloom bright-pass (CEnvBloomParameters): + threshold ramp, saturation
 //                     and colour; writes alpha 1, adaptation at t2/s2, renders the half-res bloom/shaft source.
-// Future static perms (DX9 0xA7D76FB1/0xEC6F063B, DX11 hashes unknown) read the exposure from
-// PSC_LumRanges constants instead of the adaptation texture — add TM_STATIC here when they are dumped.
+// TM_STATIC 1      -> the perms built without HW_TONEMAPPING (DX9 cache md5 3366c0e4 exposure, c46227f6 bright-pass): the same
+//                     body with the levels the CPU writes to c49 PSC_LumRanges instead of the adaptation texture. The engine's
+//                     path without R32F blending (no GPU histogram), dead on dgVoodoo; whether a frozen adaptation cutscene
+//                     picks them is open.
+#ifndef TM_BRIGHT_PASS
+#define TM_BRIGHT_PASS 0
+#endif
+#ifndef TM_STATIC
+#define TM_STATIC 0
+#endif
 #if TM_BRIGHT_PASS
 #define TM_T_ADAPT    t2
 #define TM_S_ADAPT    s2
@@ -46,12 +54,14 @@
 #define TM_ADAPT_FILL DgvFillT1
 #endif
 
-Texture2D<float4> t0 : register(t0);              // scene (fp16, linear light, unclamped)
-Texture2D<float4> t_adapt : register(TM_T_ADAPT); // 1x1 fp16 adaptation (.x black level, .z gain)
-
+Texture2D<float4> t0 : register(t0); // scene (fp16, linear light, unclamped)
 SamplerState s0_s : register(s0);
+#if !TM_STATIC
+Texture2D<float4> t_adapt : register(TM_T_ADAPT); // 1x1 fp16 adaptation (.x black level, .z gain)
 SamplerState s_adapt_s : register(TM_S_ADAPT);
+#endif
 
+#define LumRanges         cb4[57] // c49 PSC_LumRanges — static perms: .x black level, .z gain (the adaptation texel's layout)
 #define LumWeights        cb4[58] // c50 PSC_LumWeights — luminance dot (dp4: folds scene alpha in)
 #define LumRanges2        cb4[59] // c51 PSC_LumRanges2 — .x exposure cap (m_maxMultiplier), .y post-scale
 #define BrightPassWeights cb4[60] // c52 vWeights — bright-pass luminance dot (dp4 folds alpha)
@@ -77,8 +87,12 @@ void main(
     out float4 o0 : SV_TARGET0)
 {
    // --- vanilla body (verbatim transcription) ---
+#if TM_STATIC
+   float4 adaptation = LumRanges;
+#else
    float4 adaptation = t_adapt.SampleLevel(s_adapt_s, float2(0.0, 0.0), 0.0);
    adaptation = ApplyDgvMask(adaptation, TM_ADAPT_MASK, TM_ADAPT_FILL);
+#endif
    float4 scene = t0.Sample(s0_s, v5.xy);
    scene = ApplyDgvMask(scene, DgvMaskT0, DgvFillT0);
 

@@ -38,7 +38,7 @@ SamplerState s0_s : register(s0);
 SamplerState s2_s : register(s2);
 #endif
 
-// FXAA luma approximation the pass uses everywhere: R + 1.963211 * G
+// FXAA's "luma" approximation the pass uses everywhere: R + 1.963211 * G. Here on linear light, so a weighted-sum proxy, not luma
 float FxaaLuma(float4 c)
 {
    return c.y * 1.963211 + c.x;
@@ -186,8 +186,8 @@ void main(
 
    // ---- vanilla grade tail (verbatim) = CEnvFinalColorBalanceParameters: shadow offset, midtone power (log2/exp2),
    // highlight gain, split toning, vignette ----
-   float lumaAA = dot(aaColor, float3(0.299, 0.587, 0.114));
-   float3 color = saturate(lumaAA * cb4[62].w) * -cb4[62].rgb + aaColor; // c54 vShadow: offset, ramped in from black by .w
+   float weightedAA = dot(aaColor, float3(0.299, 0.587, 0.114));             // vanilla's BT.601 weights on linear light: a proxy, not luma
+   float3 color = saturate(weightedAA * cb4[62].w) * -cb4[62].rgb + aaColor; // c54 vShadow: offset, ramped in from black by .w
 
 #if TONEMAP_TYPE == 1
    // HDR: grade the colour at its clip point and give the brightness back after linearization (the HDR block below).
@@ -266,10 +266,8 @@ void main(
          // whitening: a per-channel ReinhardPiecewise(5, 1.5) of the colour itself in BT.2020 supplies a hue DIRECTION,
          // and MacLeod-Boynton rebuilds it on the colour's own purity and T = L + M, before the display map so DICE rolls
          // off the bent colour. Full hue strength and no purity transfer (the RenoDX ports' Hue Shift 100% and Blowout 0),
-         // fixed rather than exposed. Measured in a graded area (2026-09-13): fire (6, 2, 0.4) goes from 8 to 23 degrees
-         // at unchanged purity. The exact clip colour as reference instead (hue 60, half the purity) read as greenish
-         // white at HDR brightness, and a fully clipped reference is achromatic, with no MacLeod-Boynton direction at all
-         // (it turned such fire blue).
+         // fixed rather than exposed. The clip colour itself is no reference: a fully clipped one is achromatic, with no
+         // MacLeod-Boynton direction at all.
          // The gate sits at the reference's shoulder: below it ReinhardPiecewise returns its input exactly, and the
          // BT.2020 channels of a BT.709 colour never exceed its max, so the reference equals the colour, the stage is a
          // no-op up to float rounding, and those pixels skip the MacLeod-Boynton solve. One constant for both keeps them
@@ -286,8 +284,7 @@ void main(
          // Multiplicative around mid-gray, the repo's form (RenoDX_Contrast); 0.18 is mid-gray here too,
          // display-referred with 1.0 = paper white (code 0.5). Gated so the shipped 1.0 stays bit-exact. The pow
          // is spelled out with a floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than
-         // pow(0, 0) = NaN. Black stays black at every setting (0^C = 0), so the upstream fade-to-black no longer
-         // lands on 0.18 * (1 - Contrast) as the old additive pivot did.
+         // pow(0, 0) = NaN. Black stays black at every setting (0^C = 0).
          [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
          {
             const float midGray = 0.18;

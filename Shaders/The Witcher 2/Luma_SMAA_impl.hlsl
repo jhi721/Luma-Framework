@@ -4,7 +4,8 @@
 // on the same canvas. The grade skips its built-in FXAA while SMAA is active (LumaData.CustomData2), so this
 // is a strict replacement rather than double AA.
 // The canvas is GAMMA (POST_PROCESS_SPACE_TYPE=0) and carries display-mapped HDR values, so >1 is possible;
-// edge detection works in gamma, neighborhood blending in linear light (Luma_TW2_SMAALinearize) and re-encodes.
+// edge detection works in gamma; neighborhood blending filters the same snapshot in linear light
+// (SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR, no linear copy) and re-encodes.
 // No HDR/tonemap tail here, core Display Composition runs downstream.
 // Predication uses the game's full-res r32_float depth, turned into an edge-ness signal by the Depth Extract
 // CS; null-predication + scale 1.0 is the no-depth fallback.
@@ -40,6 +41,8 @@ cbuffer SmaaMetricsCB : register(b1)
 
 // Edge detection: tex0 = colorTexGamma (gamma-encoded graded canvas)
 // tex1 = predicationTex (edge-ness in [0,1]; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
-// Neighborhood blending: tex0 = colorTex (linear copy), tex1 = blendTex. Re-encode to the canvas' gamma.
+// Neighborhood blending: tex0 = colorTex, the same gamma snapshot, decoded before its bilinear weights; tex1 = blendTex. Re-encode
+// to the canvas' gamma.
+#define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 #include "../Includes/SMAA_Passes.hlsl"

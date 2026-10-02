@@ -9,8 +9,7 @@
 // A third permutation of this same source exists and is deliberately NOT replaced: 0x262CAE95, identical
 // instruction for instruction except that it combines ADDITIVELY (o0.xyz = canvas + shaftPart) instead of
 // screen-blending. Additive never damps the canvas, so the above-1 restore below would be a no-op there and
-// vanilla is already correct in HDR. Found by a full fingerprint sweep of the 592-shader dump; that sweep
-// also confirmed there is no fourth grade permutation and no SSAO-generator permutation.
+// vanilla is already correct in HDR.
 
 #include "Includes/Common.hlsl"       // game-local: LumaSettings (DisplayMode gates the HDR-only excess restore)
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask
@@ -38,7 +37,7 @@ void main(
     out float4 o0 : SV_TARGET0)
 {
    float4 canvas = ApplyDgvMask(t1.Sample(s1_s, v6.xy), DgvMaskT1, DgvFillT1);
-   float lum = dot(canvas.rgb, float3(0.30, 0.59, 0.11));
+   float lum = dot(canvas.rgb, float3(0.30, 0.59, 0.11)); // vanilla's weighted-sum proxy of linear light (not BT.709 relative luminance)
    // DXBC "exp" is base-2 (the vanilla disasm multiplies by exactly -3, with no folded log2(e) factor), so
    // this must be exp2: HLSL exp() would attenuate the shafts up to 60% too hard on a bright canvas.
    float atten = saturate(exp2(lum * -3.0) * cb4[62].w);
