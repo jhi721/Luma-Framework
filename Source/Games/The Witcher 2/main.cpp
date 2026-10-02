@@ -105,6 +105,7 @@ static bool g_mv_disable_jitter = false; // No projection jitter under the upsca
 // A/B of the CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy")
 static bool g_mv_buffer_filter = true;
 static bool g_mv_constants_pool = true;
+static bool g_mv_vc4_slots = true; // The filtered vc4 buffers' Map/Unmap by their filter slot (see "OnMapBufferRegion")
 // "Performance Test" (see "OnPresent"): GPU timestamps and hook CPU time to ReShade.log ("[TW2 Perf]"). A mode ("Perf::g_test") sets
 // the anti-aliasing, or turns one of the CPU savings above off, while it runs (the user's values come back on leaving it, never saved).
 // Borderlands 2's harness.
@@ -118,6 +119,7 @@ struct PerfTestMode
    // One CPU saving off, the others as the user set them
    bool vc4_filter_off = false;
    bool vc4_pool_off = false;
+   bool vc4_slots_off = false;
 };
 constexpr PerfTestMode PERF_TEST_MODES[] = {
    {.name = "Off"},
@@ -130,12 +132,13 @@ constexpr PerfTestMode PERF_TEST_MODES[] = {
    {.name = "No AA", .set_aa = true},
    {.name = "Without vc4 Filter", .vc4_filter_off = true},
    {.name = "Without vc4 Pool", .vc4_pool_off = true},
+   {.name = "Without vc4 Slots", .vc4_slots_off = true},
 };
 // "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a median
 // per mode against the last one. "CPU Sweep": the CPU savings each off in turn under the current anti-aliasing (DLSS or FSR: without
 // motion vectors the buffer hooks return early), against "Current Settings".
 constexpr int PERF_SWEEP_MODES[] = {2, 3, 4, 5, 6, 7};
-constexpr int PERF_CPU_SWEEP_MODES[] = {8, 9, 1};
+constexpr int PERF_CPU_SWEEP_MODES[] = {8, 9, 10, 1};
 static_assert(std::string_view(PERF_TEST_MODES[PERF_SWEEP_MODES[std::size(PERF_SWEEP_MODES) - 1]].name) == "No AA");
 static_assert(std::string_view(PERF_TEST_MODES[PERF_CPU_SWEEP_MODES[std::size(PERF_CPU_SWEEP_MODES) - 1]].name) == "Current Settings");
 constexpr Perf::SweepDef PERF_SWEEPS[] = {{"Sweep", PERF_SWEEP_MODES}, {"CPU Sweep", PERF_CPU_SWEEP_MODES}};
@@ -181,6 +184,7 @@ static constexpr bool g_mv_force_jitter = false;
 static constexpr bool g_mv_disable_jitter = false;
 static constexpr bool g_mv_buffer_filter = true;
 static constexpr bool g_mv_constants_pool = true;
+static constexpr bool g_mv_vc4_slots = true;
 static constexpr int GetPerfMotionVectorDraws()
 {
    return 2;
@@ -459,6 +463,10 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    std::array<std::atomic<uint64_t>, MAX_FILTERED_BUFFERS> mv_filtered_buffers = {};
    std::array<UINT, MAX_FILTERED_BUFFERS> mv_filtered_buffer_sizes = {};
    std::atomic<uint32_t> mv_filtered_buffer_count = 0;
+   // By filter slot ("g_mv_vc4_slots"): the buffer's entry in "mv_constants_copies" (nodes are never erased) and its mapped memory
+   // until its Unmap. Only the hooks' thread.
+   std::array<ConstantsCopy*, MAX_FILTERED_BUFFERS> mv_filtered_copies = {};
+   std::array<void*, MAX_FILTERED_BUFFERS> mv_filtered_mapped = {};
    std::atomic<bool> mv_filter_overflow = false;
    // Every pooled vc4 copy, and by size those nobody held anymore at the last present (taken by the next copies of that size, instead
    // of a new allocation per Unmap). Under "mv_constants_mutex".
@@ -512,6 +520,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    bool perf_user_smaa = false;
    bool perf_user_vc4_filter = true;
    bool perf_user_vc4_pool = true;
+   bool perf_user_vc4_slots = true;
 #endif
 
    // ---- SMAA (see RunPostFinalGradeSMAA) ----
@@ -884,10 +893,12 @@ class TheWitcher2Game final : public Game
       return GetGameDeviceData(device_data).sr_active;
    }
 
-   // False if the buffer surely isn't a registered vc4 one; "size" its size if known (else 0). Lock free.
-   static bool MayBeRegisteredBuffer(const TheWitcher2GameDeviceData& gd, uint64_t handle, UINT* size)
+   // False if the buffer surely isn't a registered vc4 one; "size" its size if known (else 0), "slot" its filter slot if known (else
+   // -1). Lock free.
+   static bool MayBeRegisteredBuffer(const TheWitcher2GameDeviceData& gd, uint64_t handle, UINT* size, int* slot)
    {
       *size = 0;
+      *slot = -1;
       if (!g_mv_buffer_filter || gd.mv_filter_overflow.load(std::memory_order_relaxed))
          return true;
       const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_acquire);
@@ -896,6 +907,7 @@ class TheWitcher2Game final : public Game
          if (gd.mv_filtered_buffers[i].load(std::memory_order_relaxed) == handle)
          {
             *size = gd.mv_filtered_buffer_sizes[i];
+            *slot = (g_mv_vc4_slots ? int(i) : -1);
             return true;
          }
       }
@@ -903,7 +915,7 @@ class TheWitcher2Game final : public Game
    }
 
    // A buffer registered in "mv_constants_copies" joins the lock free filter. Under "mv_constants_mutex".
-   static void AddFilteredBuffer(TheWitcher2GameDeviceData* gd, ID3D11Buffer* buffer)
+   static void AddFilteredBuffer(TheWitcher2GameDeviceData* gd, ID3D11Buffer* buffer, TheWitcher2GameDeviceData::ConstantsCopy* copy)
    {
       const uint32_t count = gd->mv_filtered_buffer_count.load(std::memory_order_relaxed);
       if (count >= TheWitcher2GameDeviceData::MAX_FILTERED_BUFFERS)
@@ -914,6 +926,7 @@ class TheWitcher2Game final : public Game
       D3D11_BUFFER_DESC desc;
       buffer->GetDesc(&desc);
       gd->mv_filtered_buffer_sizes[count] = desc.ByteWidth;
+      gd->mv_filtered_copies[count] = copy;
       gd->mv_filtered_buffers[count].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_relaxed);
       gd->mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
    }
@@ -954,6 +967,24 @@ class TheWitcher2Game final : public Game
       return copy;
    }
 
+   // A vc4 buffer's copy from its mapped memory, at its Unmap. Under "mv_constants_mutex".
+   static void StoreMappedConstants(TheWitcher2GameDeviceData* gd, TheWitcher2GameDeviceData::ConstantsCopy* copy, const void* mapped, UINT size)
+   {
+      // A copy no draw took (only the registry and the pool hold it: the shadow passes' ~1800 Unmaps a frame, draws that aren't motion
+      // vector ones) is rewritten in place instead of taking another one (Borderlands GOTY's "in place rewrite": a much smaller pool)
+      if (g_mv_constants_pool && *copy && copy->use_count() == 2 && (*copy)->size() == size)
+      {
+         std::memcpy(const_cast<uint8_t*>((*copy)->data()), mapped, size);
+      }
+      else
+      {
+         *copy = NewConstantsCopy(gd, static_cast<const uint8_t*>(mapped), size);
+      }
+#if DEVELOPMENT
+      gd->mv_stats.maps++;
+#endif
+   }
+
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
@@ -965,12 +996,23 @@ class TheWitcher2Game final : public Game
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      int slot;
+      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size, &slot))
          return;
+      const bool whole_write = access == reshade::api::map_access::write_discard && offset == 0;
+      // A filter slot is a registered buffer: no lookups, no lock
+      if (slot >= 0)
+      {
+         gd.mv_filtered_mapped[slot] = (whole_write ? *data : nullptr);
+#if DEVELOPMENT
+         gd.mv_stats.other_maps += !whole_write;
+#endif
+         return;
+      }
       const std::lock_guard lock(gd.mv_constants_mutex);
       if (!gd.mv_constants_copies.contains(resource.handle))
          return;
-      if (access == reshade::api::map_access::write_discard && offset == 0)
+      if (whole_write)
       {
          gd.mv_mapped_constants[resource.handle] = *data;
       }
@@ -993,28 +1035,24 @@ class TheWitcher2Game final : public Game
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      int slot;
+      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size, &slot))
          return;
+      if (slot >= 0)
+      {
+         const void* const mapped = std::exchange(gd.mv_filtered_mapped[slot], nullptr);
+         if (!mapped)
+            return;
+         const std::lock_guard lock(gd.mv_constants_mutex);
+         StoreMappedConstants(&gd, gd.mv_filtered_copies[slot], mapped, buffer_size);
+         return;
+      }
       const std::lock_guard lock(gd.mv_constants_mutex);
       const auto mapped = gd.mv_mapped_constants.find(resource.handle);
       if (mapped == gd.mv_mapped_constants.end())
          return;
-      auto& copy = gd.mv_constants_copies[resource.handle];
-      const UINT size = GetBufferSize(resource.handle, buffer_size);
-      // A copy no draw took (only the registry and the pool hold it: the shadow passes' ~1800 Unmaps a frame, draws that aren't motion
-      // vector ones) is rewritten in place instead of taking another one (Borderlands GOTY's "in place rewrite": a much smaller pool)
-      if (g_mv_constants_pool && copy && copy.use_count() == 2 && copy->size() == size)
-      {
-         std::memcpy(const_cast<uint8_t*>(copy->data()), mapped->second, size);
-      }
-      else
-      {
-         copy = NewConstantsCopy(&gd, static_cast<const uint8_t*>(mapped->second), size);
-      }
+      StoreMappedConstants(&gd, &gd.mv_constants_copies[resource.handle], mapped->second, GetBufferSize(resource.handle, buffer_size));
       gd.mv_mapped_constants.erase(mapped);
-#if DEVELOPMENT
-      gd.mv_stats.maps++;
-#endif
    }
 
    // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs); a partial update is merged into the
@@ -1029,7 +1067,8 @@ class TheWitcher2Game final : public Game
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT known_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &known_size))
+      int slot;
+      if (!MayBeRegisteredBuffer(gd, resource.handle, &known_size, &slot))
          return false;
       const std::lock_guard lock(gd.mv_constants_mutex);
       const auto copy = gd.mv_constants_copies.find(resource.handle);
@@ -1487,7 +1526,7 @@ class TheWitcher2Game final : public Game
             constants = copy->second;
             if (registered)
             {
-               AddFilteredBuffer(&gd, current.get());
+               AddFilteredBuffer(&gd, current.get(), &copy->second);
             }
          }
          if (constants && constants->size() >= VIEW_PROJECTION_OFFSET + CAMERA_SIZE)
@@ -2079,16 +2118,18 @@ class TheWitcher2Game final : public Game
          g_smaa_enable = (mode.set_aa ? mode.smaa : gd.perf_user_smaa);
       }
       const auto sets_cpu = [](const PerfTestMode& test_mode)
-      { return test_mode.vc4_filter_off || test_mode.vc4_pool_off; };
+      { return test_mode.vc4_filter_off || test_mode.vc4_pool_off || test_mode.vc4_slots_off; };
       if (!sets_cpu(previous_mode) && sets_cpu(mode))
       {
          gd.perf_user_vc4_filter = g_mv_buffer_filter;
          gd.perf_user_vc4_pool = g_mv_constants_pool;
+         gd.perf_user_vc4_slots = g_mv_vc4_slots;
       }
       if (sets_cpu(mode) || sets_cpu(previous_mode))
       {
          g_mv_buffer_filter = gd.perf_user_vc4_filter && !mode.vc4_filter_off;
          g_mv_constants_pool = gd.perf_user_vc4_pool && !mode.vc4_pool_off;
+         g_mv_vc4_slots = gd.perf_user_vc4_slots && !mode.vc4_slots_off;
       }
       Perf::g_test = mode_index;
    }
@@ -2534,6 +2575,8 @@ public:
             &g_sr_reactive_debug_view }});
       Mcp::RegisterValues({{"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
       Mcp::RegisterValues({{"render_scale", &g_render_scale, MIN_RENDER_SCALE, 1.f}});
+      Mcp::RegisterToggles({{ "mv_vc4_slots",
+         &g_mv_vc4_slots }});
       Mcp::RegisterToggles({{"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, { "perf_hook_timers",
                                &Perf::g_hook_timers }});
       // As the "Performance Test" combo: a mode cancels a running sweep; "perf_sweep" 1 starts the GPU "Sweep", 2 the "CPU Sweep", 0 stops it
@@ -2949,6 +2992,7 @@ public:
                copy.reset();
             }
             game_device_data.mv_mapped_constants.clear();
+            game_device_data.mv_filtered_mapped = {};
             game_device_data.mv_constants_pool.clear();
             game_device_data.mv_constants_pool_free.clear();
          }
@@ -2969,8 +3013,8 @@ public:
          {
             auto& window = game_device_data.perf_window;
             const char* const aa = (IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : (g_smaa_enable ? "SMAA" : "none")));
-            const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} render_scale={:.2f} vc4_filter={} vc4_pool={} output={}x{}", PERF_TEST_MODES[Perf::g_test].name,
-               Perf::g_hook_timers, aa, RenderArea::next_scale, g_mv_buffer_filter, g_mv_constants_pool, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
+            const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} render_scale={:.2f} vc4_filter={} vc4_pool={} vc4_slots={} output={}x{}", PERF_TEST_MODES[Perf::g_test].name,
+               Perf::g_hook_timers, aa, RenderArea::next_scale, g_mv_buffer_filter, g_mv_constants_pool, g_mv_vc4_slots, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
             // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile), and
             // longer after leaving it
             const bool sr_exit = std::exchange(game_device_data.perf_sr_active, IsSRActive(device_data)) && !IsSRActive(device_data);
