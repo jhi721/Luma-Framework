@@ -2,9 +2,9 @@
 // texture shadow copies, and does the game touch MANAGED resources after their
 // first upload (relocks, READONLY locks)? Install: rename the real D3D9.dll
 // (dgVoodoo or a copy of the system one) to d3d9_chain.dll, put this as
-// d3d9.dll next to the exe. Every 5 s (D3D9_MEMLOG_MS) it appends a line to
-// d3d9_memlog.log next to this dll: live bytes per pool, the process's VA,
-// lock stats.
+// d3d9.dll next to the exe. With d3d9_memlog.on next to this dll, every 5 s
+// (D3D9_MEMLOG_MS) it appends a line to d3d9_memlog.log there: live bytes per
+// pool, the process's VA, lock stats. Without it nothing is logged.
 //
 // VA fix, on when d3d9_vafix.on exists next to this dll:
 // - the device is created as D3D9Ex, so DEFAULT resources survive Reset;
@@ -85,7 +85,8 @@ namespace
    constexpr int SLOT_UPDATE_TEXTURE = 31;
 
    wchar_t g_dir[MAX_PATH] = {};
-   FILE* g_log = nullptr;
+   FILE* g_log = nullptr;        // "NUL" without d3d9_memlog.on
+   bool g_log_enabled = false;   // d3d9_memlog.on present
    bool g_fix_requested = false; // d3d9_vafix.on present
    bool g_fix_active = false;    // the device really is D3D9Ex (one device assumed)
    bool g_user_memory = false;   // the runtime takes user-memory SYSTEMMEM textures
@@ -146,7 +147,10 @@ namespace
          if (g_hooked[i].slot == slot)
             return reinterpret_cast<T>(g_hooked[i].original);
       }
-      return nullptr; // a hook only runs from a slot Patch recorded
+      // Never patched (GetDesc with the fix off, read by the LockRect hook): the
+      // slot still holds the runtime's method. A Patch racing this read can
+      // return the hook, which then finds its recorded original.
+      return reinterpret_cast<T>(*slot);
    }
 
    void Patch(void* object, int index, void* hook)
@@ -1807,8 +1811,11 @@ extern "C" IDirect3D9* WINAPI ProxyDirect3DCreate9(UINT sdk_version)
    if (d3d)
    {
       Patch(d3d, SLOT_CREATE_DEVICE, (void*)&HookCreateDevice);
-      static const HANDLE thread =
-         CreateThread(nullptr, 0, ReportThread, nullptr, 0, nullptr);
+      if (g_log_enabled)
+      {
+         static const HANDLE thread =
+            CreateThread(nullptr, 0, ReportThread, nullptr, 0, nullptr);
+      }
    }
    return d3d;
 }
@@ -1820,9 +1827,12 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
       DisableThreadLibraryCalls(instance);
       GetModuleFileNameW(instance, g_dir, MAX_PATH);
       *(wcsrchr(g_dir, L'\\') + 1) = L'\0';
+      wchar_t log_flag_path[MAX_PATH];
+      swprintf_s(log_flag_path, L"%sd3d9_memlog.on", g_dir);
+      g_log_enabled = GetFileAttributesW(log_flag_path) != INVALID_FILE_ATTRIBUTES;
       wchar_t log_path[MAX_PATH];
       swprintf_s(log_path, L"%sd3d9_memlog.log", g_dir);
-      g_log = _wfopen(log_path, L"a");
+      g_log = _wfopen((g_log_enabled ? log_path : L"NUL"), (g_log_enabled ? L"a" : L"w"));
       if (!g_log)
          return FALSE;
       wchar_t flag_path[MAX_PATH];
