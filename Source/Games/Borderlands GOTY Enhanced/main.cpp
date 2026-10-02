@@ -23,6 +23,8 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
+// FSR 3 frame generation on the upscaler's inputs ("DrawUpscaler"); the HUD is what "Hide Gameplay UI" cancels
+#define ENABLE_FRAME_GENERATION 1
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
@@ -1604,6 +1606,9 @@ class BorderlandsGoty final : public Game
          device_data.sr_suppressed = true;
          return false;
       }
+#if ENABLE_FRAME_GENERATION
+      FrameGeneration::Prepare(&device_data.frame_generation, native_device_context, settings_data, draw_data);
+#endif
       // The post passes after it read the output in place of the input (see "OnDrawOrDispatch"); nothing reads the scene or its copy after
       // the gather (probed in gameplay, the main menu, the inventory, the sniper scope and Fight For Your Life)
       game_device_data.sr_input = scene_resource;

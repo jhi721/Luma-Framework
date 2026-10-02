@@ -119,6 +119,10 @@
 #elif !defined(ENABLE_REFLEX)
 #define ENABLE_REFLEX 1
 #endif // ENABLE_REFLEX
+// FSR 3 frame generation (see "fsr/FrameGeneration.h"): the game also calls "FrameGeneration::Prepare()" after its upscaler
+#ifndef ENABLE_FRAME_GENERATION
+#define ENABLE_FRAME_GENERATION 0
+#endif // ENABLE_FRAME_GENERATION
 #ifndef PROJECT_NAME
 // Matches "Globals::MOD_NAME"
 #define PROJECT_NAME "Luma"
@@ -187,6 +191,10 @@
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
 #include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
 #include "includes/reflex.h" // see "ENABLE_REFLEX"
+#if ENABLE_FRAME_GENERATION && !ENABLE_FIDELITY_SK
+#error "ENABLE_FRAME_GENERATION needs FSR (UseLumaFSR)"
+#endif
+#include "fsr/FrameGeneration.h" // see "ENABLE_FRAME_GENERATION"
 
 #include "includes/containers.h"
 #include "includes/globals.h"
@@ -431,6 +439,9 @@ namespace
    bool use_os_reference_white_level = true;
 #if ENABLE_REFLEX
    Reflex::Mode reflex_mode = Reflex::Mode::On;
+#endif
+#if ENABLE_FRAME_GENERATION
+   bool frame_generation_enabled = false;
 #endif
 
 #if ENABLE_SR
@@ -6198,6 +6209,16 @@ namespace
 
             // Note: we don't really need to re-apply our custom cbuffers in most games (e.g. Prey), they are on indexes that are never used by the game's code
             DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get(), device_data.native_pixel_shaders[CompileTimeStringHash("Display Composition")].get(), device_data.display_composition_srv.get(), target_resource_texture_view.get(), target_desc.Width, target_desc.Height, false);
+#if ENABLE_FRAME_GENERATION
+            // Frame generation's HUD-less color must match the back buffer but for the UI: the same composition, without a UI texture
+            if (device_data.frame_generation.hudless_captured && device_data.frame_generation.hudless_rtv)
+            {
+               ID3D11ShaderResourceView* const no_ui_srv = nullptr;
+               native_device_context->PSSetShaderResources(1, 1, &no_ui_srv);
+               DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")].get(), device_data.native_pixel_shaders[CompileTimeStringHash("Display Composition")].get(), device_data.frame_generation.hudless_source_srv.get(), device_data.frame_generation.hudless_rtv.get(), target_desc.Width, target_desc.Height, false);
+               device_data.frame_generation.hudless_composed = true;
+            }
+#endif
 
 #if DEVELOPMENT
             {
@@ -7068,6 +7089,27 @@ namespace
          //TODOFT: optimize these shader searches by simply marking "CachedPipeline" with a tag on what they are (and whether they have a particular role) (also we can restrict the search to pixel shaders or compute shaders?) upfront. And move these into their own functions. Update: we optimized this enough.
 
          if (test_index == 9) return false;
+#if ENABLE_FRAME_GENERATION
+         // The first draw into the back buffer after the upscaler that isn't Luma's is the UI's (as "Hide UI" assumes): the back
+         // buffer before it is frame generation's HUD-less color
+         if (!is_dispatch && !is_custom_pass && cmd_list_data.is_primary && device_data.frame_generation.prepared && !device_data.frame_generation.hudless_captured)
+         {
+            com_ptr<ID3D11RenderTargetView> rtv;
+            native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+            com_ptr<ID3D11Resource> rtv_resource;
+            if (rtv)
+               rtv->GetResource(&rtv_resource);
+            bool is_back_buffer = false;
+            if (rtv_resource)
+            {
+               const std::shared_lock lock(device_data.mutex);
+               is_back_buffer = device_data.back_buffers.contains(reinterpret_cast<uint64_t>(rtv_resource.get()));
+            }
+            com_ptr<ID3D11Texture2D> back_buffer;
+            if (is_back_buffer && SUCCEEDED(rtv_resource->QueryInterface(&back_buffer)))
+               FrameGeneration::CaptureHudless(&device_data.frame_generation, native_device, native_device_context, back_buffer.get());
+         }
+#endif
          // Use the specific callback if there's one, and fall back on the generic one otherwise.
          if (const DrawOrDispatchCallback draw_or_dispatch_callback = is_dispatch ? cmd_list_data.dispatch_callback : cmd_list_data.draw_callback)
          {
@@ -10347,6 +10389,17 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(runtime->get_device()->get_api());
 
       DeviceData& device_data = *runtime->get_device()->get_private_data<DeviceData>();
+#if ENABLE_FRAME_GENERATION
+      // Here the back buffer has ReShade's effects and overlay, as the game's present (which the presenter drops) would show it
+      {
+         ID3D11DeviceContext* const native_device_context = (ID3D11DeviceContext*)(runtime->get_command_queue()->get_immediate_command_list()->get_native());
+         device_data.frame_generation.enabled = frame_generation_enabled;
+         DrawStateStack<DrawStateStackType::Compute> compute_state_stack;
+         compute_state_stack.Cache(native_device_context, device_data.uav_max_count);
+         FrameGeneration::Present(&device_data.frame_generation, device_data.native_device, native_device_context, (IDXGISwapChain*)(runtime->get_native()), (std::max)(cb_luma_global_settings.ScenePeakWhite, srgb_white_level));
+         compute_state_stack.Restore(native_device_context);
+      }
+#endif
 #if DEVELOPMENT
       {
          // Some games fail to capture input on boot, so use a special key to force a graphics capture
@@ -14511,6 +14564,21 @@ namespace
             }
 #endif // ENABLE_REFLEX
 
+#if ENABLE_FRAME_GENERATION
+            if (ImGui::Checkbox("Frame Generation (FSR 3)", &frame_generation_enabled))
+               reshade::set_config_value(runtime, NAME, "FrameGeneration", frame_generation_enabled);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("Generates a frame between every two rendered frames.\nNeeds Borderless or Windowed mode, and a base frame rate of about 60 or higher.\nRaise external frame rate limiters to twice the rendered rate.");
+#if DEVELOPMENT
+            {
+               FrameGeneration::DeviceData& frame_generation = device_data.frame_generation;
+               ImGui::Checkbox("Frame Generation Tear Lines", &frame_generation.debug_tear_lines);
+               ImGui::Checkbox("Frame Generation Debug View", &frame_generation.debug_view);
+               ImGui::Text("Frame Generation: presenter %s, %.2f ms real interval, %u interpolated / %u real since open", frame_generation.presenter.Running() ? "running" : "stopped", frame_generation.real_interval_ms, frame_generation.interpolated_frames, frame_generation.real_frames);
+            }
+#endif
+#endif // ENABLE_FRAME_GENERATION
+
             auto ChangeDisplayMode = [&](DisplayModeType display_mode, bool enable_hdr_on_display = true, IDXGISwapChain3* swapchain = nullptr)
                {
                   int display_mode_i = int(display_mode);
@@ -16387,6 +16455,9 @@ void Init(bool async)
       reshade::get_config_value(runtime, NAME, "ReflexMode", reflex_mode_i);
       reflex_mode = Reflex::Mode(std::clamp(reflex_mode_i, int(Reflex::Mode::Off), int(Reflex::Mode::Boost)));
 #endif
+#if ENABLE_FRAME_GENERATION
+      reshade::get_config_value(runtime, NAME, "FrameGeneration", frame_generation_enabled);
+#endif
       int display_mode_i = int(cb_luma_global_settings.DisplayMode);
       reshade::get_config_value(runtime, NAME, "DisplayMode", display_mode_i);
       cb_luma_global_settings.DisplayMode = DisplayModeType(display_mode_i);
@@ -16970,6 +17041,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #endif
 
       reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
+#if ENABLE_FRAME_GENERATION
+      FrameGeneration::GamePresentHook::Uninstall();
+#endif
 
 #if DEVELOPMENT || TEST
       reshade::unregister_event<reshade::addon_event::reshade_set_effects_state>(OnReShadeSetEffectsState);

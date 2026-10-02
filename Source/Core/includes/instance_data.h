@@ -576,6 +576,9 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 #if ENABLE_REFLEX
    Reflex::DeviceData reflex; // For the first swapchain (the only one expected)
 #endif
+#if ENABLE_FRAME_GENERATION
+   FrameGeneration::DeviceData frame_generation; // For the first swapchain (the only one expected)
+#endif
    std::unordered_set<uint64_t> back_buffers; // From all the swapchains (whether they are upgraded or not)
    ID3D11Device* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
    reshade::api::device* reshade_device = nullptr; // Always valid as it's our parent. Not owned by this.
