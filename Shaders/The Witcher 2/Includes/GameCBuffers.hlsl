@@ -41,7 +41,9 @@ struct MotionVectorFillConstants
    float reactive_scale;
    float reactive_threshold;
    float reactive_enabled;
-   float padding;
+   float exposure_enabled; // The upscaler's exposure from the adaptation texel (render scale, see main.cpp), else 1
+   float2 render_size;     // The scene's top-left render area (pixels): the output size, or smaller under the render scale
+   float2 padding;
 };
 
 // XeGTAO's runtime knobs (Luma_TW2_XeGTAO.hlsl, b9), written by "RunXeGTAO"
@@ -52,12 +54,12 @@ struct GTAOKnobs
    float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
    float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
    float2 viewport_pixel_size; // 1 / AO target resolution (half render res)
-   float2 padding;
+   float2 area_scale;          // The scene's share of the AO target under the render scale (main.cpp "RenderArea"), else 1
 };
 } // namespace CB
 
 #ifdef __cplusplus
-static_assert(sizeof(CB::MotionVectorFillConstants) == 96 && sizeof(CB::GTAOKnobs) == 32); // The HLSL cbuffers' sizes
+static_assert(sizeof(CB::MotionVectorFillConstants) == 112 && sizeof(CB::GTAOKnobs) == 32); // The HLSL cbuffers' sizes
 #endif
 
 #endif // LUMA_GAME_CB_STRUCTS

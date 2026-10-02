@@ -50,8 +50,10 @@ cbuffer LumaGTAO : register(b9)
 #define EFFECT_FALLOFF_RANGE      0.005
 #define SAMPLE_DISTRIBUTION_POWER 1.5
 
-// Capped at the native HBAO kernel, cb4[16].y pixels.
-#define XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ) min(XeGTAO_EffectRadius(), cb4[16].y * viewspaceZ * NDC_TO_VIEW_MUL_X_PIXEL_SIZE.x)
+// Capped at the native HBAO kernel, cb4[16].y pixels of the full size AO target: under the render scale fewer pixels (the area's share),
+// or each one, covering more of the view, would let the radius grow by 1 / area_scale (larger halos at 50%).
+#define NATIVE_KERNEL_PIXELS                        (cb4[16].y * gtao_knobs.area_scale.x)
+#define XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ) min(XeGTAO_EffectRadius(), NATIVE_KERNEL_PIXELS * viewspaceZ * NDC_TO_VIEW_MUL_X_PIXEL_SIZE.x)
 
 #define NoiseIndexRT                                0
 
@@ -59,7 +61,9 @@ cbuffer LumaGTAO : register(b9)
 
 // Transcribed from the native HBAO PS (0x3FEEC0F7): ndc = (uv.x*2-1, 1-2*uv.y), viewRay = ndc * cb4[9].zw.
 // Expressed as the XeGTAO mul/add pair over raw uv: viewPos.xy = (uv * MUL + ADD) * viewZ.
-#define NDC_TO_VIEW_MUL (float2(2.0, -2.0) * cb4[9].zw)
+// Under the render scale the scene fills only the top-left "area_scale" of the target and cb4[9] stays the full view's (measured
+// 2026-10-02: unchanged at 67%), so the area's NDC spans uv / area_scale (the native HBAO doesn't do it)
+#define NDC_TO_VIEW_MUL (float2(2.0, -2.0) * cb4[9].zw / gtao_knobs.area_scale)
 #define NDC_TO_VIEW_ADD (float2(-1.0, 1.0) * cb4[9].zw)
 
 // Plain float4 (not unorm): the copy-source texture matches the game AO RT's ACTUAL format, which is rgba16_float whenever Luma's

@@ -7,6 +7,9 @@
 // the history of what's behind them (ghosting). The reactive one from all of them: scaled, then 0 under the threshold and 0.9
 // over it (a low one shakes static glows), or without a threshold capped at 0.9 so FSR still keeps a little history. The
 // transparency & composition one from the non-additive ones (smoke, glass, water), as is (AMD's sample passes the alpha).
+// Under the render scale (main.cpp "RenderArea") the scene covers only the top-left "render_size" of the targets: only that area
+// is filled, its NDC over the area. The upscaler then runs before the exposure, on the linear scene: the exposure it needs comes
+// from the last frame's adaptation texel (.z the gain, see "Luma_TW2_Tonemap.hlsl").
 // Ported from Mass Effect 2007 ("Luma_ME1_MotionVectorFill.hlsl"), which reads the depth from the scene's alpha.
 
 #include "Includes/GameCBuffers.hlsl"
@@ -22,12 +25,18 @@ RWTexture2D<float> device_depth : register(u1);
 Texture2D<float2> mask_input : register(t1); // x reactive, y transparency & composition
 RWTexture2D<float> reactive : register(u2);
 RWTexture2D<float> transparency : register(u3);
+Texture2D<float4> adaptation : register(t2);
+RWTexture2D<float> exposure : register(u4);
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
-   uint2 size;
-   motion_vectors.GetDimensions(size.x, size.y);
+   const uint2 size = uint2(fill.render_size);
    if (any(id.xy >= size))
       return;
+   // Bound whenever an upscaler runs (the SR bridge restarts its helper when an input appears or goes): 1 on the exposed scene
+   if (all(id.xy == 0))
+   {
+      exposure[uint2(0, 0)] = fill.exposure_enabled != 0.0 ? adaptation.Load(int3(0, 0, 0)).z : 1.0;
+   }
    if (fill.reactive_enabled != 0.0)
    {
       const float2 mask = mask_input.Load(int3(id.xy, 0));
