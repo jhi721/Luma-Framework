@@ -5749,6 +5749,10 @@ namespace
    {
       if (device_data.sr_type == sr_type)
          return;
+#if DEVELOPMENT
+      // An upscaler starting over (the SR bridge's helper restarts silently otherwise)
+      reshade::log::message(reshade::log::level::info, std::format("SR selection {} -> {}", int(device_data.sr_type), int(sr_type)).c_str());
+#endif
       auto* sr_instance_data = device_data.GetSRInstanceData();
       if (sr_instance_data)
       {

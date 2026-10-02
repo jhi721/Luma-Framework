@@ -312,9 +312,32 @@ namespace SRBridge
          // A dead process's fences read UINT64_MAX, so no GPU wait is left hanging
          if (WaitForSingleObject(custom_data.process, 0) == WAIT_OBJECT_0 || custom_data.fences[1]->GetCompletedValue() == UINT64_MAX)
             return custom_data.Fail(std::format("the helper exited (see {} next to the game's exe)", std::filesystem::path(kLogName).string()));
-         if (!std::equal(std::begin(resources), std::end(resources), std::begin(custom_data.sources), [](ID3D11Resource* resource, const ComPtr<ID3D11Resource>& source)
-                { return resource == source.Get(); }))
-            custom_data.Stop(); // Recreated: the helper restarts on them
+         // An input the bridge copies each frame can come from another texture of the same description (a game that alternates two
+         // targets for one pass): only the source changes, the helper keeps its shared copy
+         for (int i = 0; i < kCount; i++)
+         {
+            if (i == kOutput || !custom_data.copied[i] || !resources[i] || resources[i] == custom_data.sources[i].Get())
+               continue;
+            ComPtr<ID3D11Texture2D> texture;
+            if (FAILED(resources[i]->QueryInterface(IID_PPV_ARGS(&texture))))
+               continue;
+            D3D11_TEXTURE2D_DESC desc;
+            texture->GetDesc(&desc);
+            D3D11_TEXTURE2D_DESC shared_desc;
+            custom_data.shared[i]->GetDesc(&shared_desc);
+            if (desc.Format == shared_desc.Format && desc.Width == shared_desc.Width && desc.Height == shared_desc.Height && desc.ArraySize == shared_desc.ArraySize &&
+                desc.MipLevels == shared_desc.MipLevels && desc.SampleDesc.Count == shared_desc.SampleDesc.Count)
+               custom_data.sources[i] = resources[i];
+         }
+         if (const auto changed = std::mismatch(std::begin(resources), std::end(resources), std::begin(custom_data.sources), [](ID3D11Resource* resource, const ComPtr<ID3D11Resource>& source)
+                { return resource == source.Get(); });
+            changed.first != std::end(resources))
+         {
+            // Recreated: the helper restarts on them (named, so a game that alternates an input is seen as a restart loop's cause)
+            constexpr const char* names[kCount] = {"color", "motion vectors", "depth", "bias mask", "transparency", "exposure", "output"};
+            Log(reshade::log::level::info, std::format("restarting the helper: a new {} texture", names[changed.first - std::begin(resources)]));
+            custom_data.Stop();
+         }
       }
       if (!custom_data.process && !custom_data.Start(command_list, resources))
          return false;
@@ -345,8 +368,7 @@ namespace SRBridge
          if (!custom_data.Send("settings " + FormatSettings(custom_data.settings_data) + "\n"))
             return false;
          custom_data.settings_pending = false;
-         Log(reshade::log::level::info, std::format("new settings for the helper ({}x{} -> {}x{})", custom_data.settings_data.render_width,
-                                           custom_data.settings_data.render_height, custom_data.settings_data.output_width, custom_data.settings_data.output_height));
+         Log(reshade::log::level::info, "new settings for the helper: " + FormatSettings(custom_data.settings_data));
       }
 
       SR_BRIDGE_PROFILE(command_list, 0);
