@@ -2182,6 +2182,14 @@ namespace Mcp
          {"core.bloom", [](DeviceData&) -> ID3D11DeviceChild*
             { return draw_bloom_mips.srv_mips_y.empty() ? nullptr : draw_bloom_mips.srv_mips_y[0]; }}});
 
+      // "Init()" runs again when ReShade re-inits the addon without unloading it (The Witcher creates a probe D3D9 device first):
+      // assigning over the first run's joinable thread would call std::terminate. Keep that server, or restart one that has exited.
+      if (server_thread.joinable())
+      {
+         if (server_running)
+            return;
+         server_thread.join();
+      }
       pipe_name = L"\\\\.\\pipe\\luma-mcp-" + std::to_wstring(GetCurrentProcessId());
       server_running = true;
       server_thread = std::thread(ServerThread);
