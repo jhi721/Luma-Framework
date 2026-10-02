@@ -447,6 +447,9 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // An unmatched draw's b0 with LocalToWorld moved to last frame's PreViewTranslation (see "DrawWithMotionVectors"), kept for its
    // capacity
    std::vector<uint8_t> mv_object_previous_view;
+   // A previous b1 with its view projection moved to this frame's PreViewTranslation, for vertices without LocalToWorld (see
+   // "DrawWithMotionVectors"), kept for its capacity
+   std::vector<uint8_t> mv_camera_previous_view;
    // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld (its translation in world space) and b0 / b1 /
    // b3. A draw takes the previous frame's constants of its key's nearest draw (same object, a frame earlier), its camera included.
    struct MotionVectorObject
@@ -1423,6 +1426,7 @@ class MassEffectLE final : public Game
                }
             }
          }
+         const bool world_camera = camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0);
          if (match)
          {
             // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
@@ -1437,7 +1441,7 @@ class MassEffectLE final : public Game
             game_device_data.mv_stats.matched_same_camera += match->camera->size() == camera->size() && std::memcmp(match->camera->data(), camera->data(), camera->size()) == 0;
 #endif
          }
-         else if (game_device_data.mv_previous_camera && copy_size(game_device_data.mv_previous_camera) == camera->size() && (camera == game_device_data.mv_camera || std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0))
+         else if (game_device_data.mv_previous_camera && copy_size(game_device_data.mv_previous_camera) == camera->size() && world_camera)
          {
             // Not found, drawn with the world camera: its own constants with last frame's world camera (camera motion only), its
             // LocalToWorld moved to last frame's PreViewTranslation
@@ -1466,6 +1470,25 @@ class MassEffectLE final : public Game
             game_device_data.mv_stats.other_camera++;
          }
 #endif
+         // Without LocalToWorld (instanced foliage, VS 0x3297D3EA, 0x69B27D1A, 0x7229C789, 0x8409AC01, 0x893A9F76, 0xC8911A50,
+         // 0xDD268B0A, 0xF846A6D0, and position only 0x56EF072C, 0x9F7AF253: 10 of the 2273 dumped vertex shaders projecting with
+         // b1) the vertices come translated by this frame's PreViewTranslation: previous clip = (translated + previous PVT - PVT) *
+         // previous VP, so the previous camera's translation row gains that delta times its first three rows
+         if (translation_offset == UINT_MAX && world_camera && uploads[1] && uploads[1]->size() >= kPreViewTranslationOffset + 12)
+         {
+            const std::array<float, 3> previous_view_translation = GetPreViewTranslation(*uploads[1]);
+            auto& camera_previous_view = game_device_data.mv_camera_previous_view;
+            camera_previous_view.assign(uploads[1]->begin(), uploads[1]->end());
+            float* const view_projection = reinterpret_cast<float*>(camera_previous_view.data());
+            for (size_t column = 0; column < 4; column++)
+            {
+               for (size_t row = 0; row < 3; row++)
+               {
+                  view_projection[12 + column] += (previous_view_translation[row] - view_translation[row]) * view_projection[row * 4 + column];
+               }
+            }
+            uploads[1] = &camera_previous_view;
+         }
          // Kept as drawn for the next frame
          game_device_data.mv_objects[key].push_back({.transform = transform, .object = std::move(object), .camera = std::move(camera), .bones = std::move(bones)});
       }
@@ -2691,6 +2714,7 @@ public:
          gd.mv_jitter_buffer.reset();
          gd.mv_previous_constants = {};
          gd.mv_object_previous_view = {};
+         gd.mv_camera_previous_view = {};
       }
       gd.sr_input = nullptr;
       gd.sr_rebind_done = false;
