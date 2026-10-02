@@ -382,13 +382,15 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
    // A game shader's patched version (null if refused), patched on first use, by its hash; a vertex shader's with the bytes of vc4 it
-   // reads ("DXBC::ConstantBufferBytes": the previous frame's copy uploads only those) and its LocalToWorld translation row
+   // reads ("DXBC::ConstantBufferBytes": the previous frame's copy uploads only those), its LocalToWorld translation row, and whether
+   // its vertices come already translated by this frame's PreViewTranslation (see "DrawWithMotionVectors")
    template <typename T>
    struct PatchedShader
    {
       com_ptr<T> shader;
       UINT read_size = 0;
       UINT translation_offset = 0;
+      bool camera_relative_vertices = false;
    };
    std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_pixel_shaders;
@@ -1144,6 +1146,7 @@ class Borderlands2 final : public Game
       std::string error = "no bytecode";
       UINT read_size = 0;
       UINT translation_offset = kTranslationOffset;
+      bool camera_relative_vertices = false;
       {
          const std::shared_lock lock(s_mutex_generic);
          if (const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second->subobjects_cache)
@@ -1157,6 +1160,20 @@ class Borderlands2 final : public Game
                if (DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, kSkinnedTranslationOffset / 16))
                {
                   translation_offset = kSkinnedTranslationOffset;
+               }
+               // Camera relative: projects through the whole view projection (its translation row c3) without reading the translation
+               // from vc4, neither PreViewTranslation (c5: world space vertices translated in the shader) nor a LocalToWorld row (c6-c9,
+               // skinned c231-c234), not even as the base of a relative index. 6 of the 737 dumped projecting vertex shaders: instanced
+               // foliage (0x35035418, 0x36AAA831, 0xAF966A18, 0xFD587A0F) and position only ones (0x483A369B, 0x5FC5315D). Screen
+               // space ones read c0-c2 as other constants and keep the copied vc4.
+               camera_relative_vertices = DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, kViewProjectionOffset / 16 + 3) &&
+                                          !DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, kPreViewTranslationOffset / 16, true);
+               for (const size_t row_offset : {kTranslationOffset - 3 * 16, kSkinnedTranslationOffset - 3 * 16})
+               {
+                  for (size_t row = 0; row < 4; row++)
+                  {
+                     camera_relative_vertices &= !DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, uint32_t(row_offset / 16 + row), true);
+                  }
                }
             }
             else if (reactive != 0)
@@ -1192,7 +1209,7 @@ class Borderlands2 final : public Game
             std::format("[BL2 MV] {} 0x{:08X} {}", vertex ? "VS" : (reactive != 0 ? "PS (mask)" : "PS"), hash, shader ? "patched" : error).c_str());
       }
       const std::unique_lock lock(gd.mv_mutex);
-      return shaders->try_emplace(hash, Borderlands2GameDeviceData::PatchedShader<T>{shader, read_size, translation_offset}).first->second;
+      return shaders->try_emplace(hash, Borderlands2GameDeviceData::PatchedShader<T>{shader, read_size, translation_offset, camera_relative_vertices}).first->second;
    }
 
    // The bound vertex shader's patched version (null shader if refused), looked up again only when the game's shader changes
@@ -1582,27 +1599,40 @@ class Borderlands2 final : public Game
                }
             }
          }
-         if (match)
+         // "source" (only what the shader reads, at least the camera) with the view projection of "previous_camera" for this frame's
+         // PreViewTranslation
+         const auto upload_moved_camera = [&](const std::vector<uint8_t>& source, const std::vector<uint8_t>& previous_camera)
          {
-            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
-            upload = &*match->constants;
-#if DEVELOPMENT
-            gd.mv_stats.matched++;
-#endif
-         }
-         else if (frame_camera && gd.mv_previous_camera)
-         {
-            // Not found, drawn with the frame's camera: its own constants with last frame's view projection (camera motion only), only
-            // what the shader reads (at least the camera)
-            const size_t copy_size = (read_size != 0 ? std::clamp<size_t>(read_size, kViewProjectionOffset + kCameraSize, constants->size()) : constants->size());
-            gd.mv_camera_only_copy.assign(constants->begin(), constants->begin() + copy_size);
-            const std::array<double, 16> previous_view_projection = GetPreviousViewProjection(*gd.mv_previous_camera, *constants);
+            const size_t copy_size = (read_size != 0 ? std::clamp<size_t>(read_size, kViewProjectionOffset + kCameraSize, source.size()) : source.size());
+            gd.mv_camera_only_copy.assign(source.begin(), source.begin() + copy_size);
+            const std::array<double, 16> previous_view_projection = GetPreviousViewProjection(previous_camera, *constants);
             float* const view_projection = reinterpret_cast<float*>(gd.mv_camera_only_copy.data() + kViewProjectionOffset);
             for (int i = 0; i < 16; i++)
             {
                view_projection[i] = float(previous_view_projection[i]);
             }
             upload = &gd.mv_camera_only_copy;
+         };
+         if (match)
+         {
+            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start). Camera relative vertices
+            // are already translated by this frame's PreViewTranslation: last frame's constants, with its view projection moved to it.
+            if (gd.mv_last_vertex_shader.camera_relative_vertices)
+            {
+               upload_moved_camera(*match->constants, *match->constants);
+            }
+            else
+            {
+               upload = &*match->constants;
+            }
+#if DEVELOPMENT
+            gd.mv_stats.matched++;
+#endif
+         }
+         else if (frame_camera && gd.mv_previous_camera)
+         {
+            // Not found, drawn with the frame's camera: its own constants with last frame's view projection (camera motion only)
+            upload_moved_camera(*constants, *gd.mv_previous_camera);
 #if DEVELOPMENT
             gd.mv_stats.camera_only++;
 #endif
