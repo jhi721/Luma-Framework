@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cfloat>
 #include <cstring>
 #include <format>
 #include <memory>
@@ -204,6 +205,25 @@ namespace PatchedDraws
       for (size_t i = 0; i < a.size(); i++)
          distance += (a[i] - b[i]) * (a[i] - b[i]);
       return distance;
+   }
+
+   // The candidate (an object of last frame with the same draw key) nearest to "transform" among those "compatible" accepts (same
+   // constants layout), and its squared distance; null and FLT_MAX if none. 0: the same object, else the nearest guess.
+   template <typename Object, typename Compatible>
+   std::pair<const Object*, float> FindNearest(const std::vector<Object>& candidates, const ObjectTransform& transform, Compatible compatible)
+   {
+      const Object* match = nullptr;
+      float nearest = FLT_MAX;
+      for (const Object& candidate : candidates)
+      {
+         const float distance = TransformDistance(candidate.transform, transform);
+         if (compatible(candidate) && distance < nearest)
+         {
+            nearest = distance;
+            match = &candidate;
+         }
+      }
+      return {match, nearest};
    }
 
    // A development check of a frame's motion vector objects by draw key: those with another object's "transform" but other

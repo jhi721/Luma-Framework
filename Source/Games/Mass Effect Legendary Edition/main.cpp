@@ -1415,16 +1415,9 @@ class MassEffectLE final : public Game
          const MassEffectGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
          {
-            float nearest = FLT_MAX;
-            for (const auto& candidate : previous->second)
-            {
-               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
-               if (copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones) && distance < nearest)
-               {
-                  nearest = distance;
-                  match = &candidate;
-               }
-            }
+            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+               { return copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones); })
+                       .first;
          }
          const bool world_camera = camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0);
          if (match)

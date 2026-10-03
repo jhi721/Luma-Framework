@@ -1667,17 +1667,9 @@ class MassEffect final : public Game
          if (const auto previous = gd.mv_previous_objects.find(key);
             previous != gd.mv_previous_objects.end())
          {
-            float nearest = FLT_MAX;
-            for (const auto& candidate : previous->second)
-            {
-               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
-               if (candidate.constants->size() == constants->size() &&
-                   distance < nearest)
-               {
-                  nearest = distance;
-                  match = &candidate;
-               }
-            }
+            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+               { return candidate.constants->size() == constants->size(); })
+                       .first;
          }
          if (match)
          {

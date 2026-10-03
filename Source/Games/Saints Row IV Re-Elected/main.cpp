@@ -1474,16 +1474,9 @@ class SaintsRowIV final : public Game
          const SaintsRowIVGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
          {
-            float nearest = FLT_MAX;
-            for (const auto& candidate : previous->second)
-            {
-               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
-               if (copy_size(candidate.object) == object->size() && copy_size(candidate.bones) == copy_size(bones) && distance < nearest)
-               {
-                  nearest = distance;
-                  match = &candidate;
-               }
-            }
+            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+               { return copy_size(candidate.object) == object->size() && copy_size(candidate.bones) == copy_size(bones); })
+                       .first;
          }
          if (match)
          {

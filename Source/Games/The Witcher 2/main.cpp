@@ -1623,16 +1623,9 @@ class TheWitcher2Game final : public Game
 #endif
          if (previous != gd.mv_previous_objects.end() && !(untransformed && g_mv_untransformed_static))
          {
-            float nearest = FLT_MAX;
-            for (const auto& candidate : previous->second)
-            {
-               const float distance = PatchedDraws::TransformDistance(candidate.transform, transform);
-               if (candidate.constants->size() == object_constants->size() && distance < nearest)
-               {
-                  nearest = distance;
-                  match = &candidate;
-               }
-            }
+            const auto [nearest_match, nearest] = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+               { return candidate.constants->size() == object_constants->size(); });
+            match = nearest_match;
             // Terrain doesn't move: a chunk not drawn last frame (the chunk set changes even with a still camera) would take its
             // nearest neighbor's position and heightmap window, all its ground moving by hundreds of pixels
             if (match && nearest != 0.f && gd.mv_last_vertex.transform_offset == TERRAIN_CHUNK_ROW * 16)

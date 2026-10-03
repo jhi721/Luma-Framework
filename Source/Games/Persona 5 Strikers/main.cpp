@@ -1158,16 +1158,9 @@ class Persona5Strikers final : public Game
          const Persona5StrikersGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
          {
-            float nearest = FLT_MAX;
-            for (const auto& object : previous->second)
-            {
-               const float distance = PatchedDraws::TransformDistance(object.transform, transform);
-               if (object.globals->size() == globals_copy->size() && distance < nearest)
-               {
-                  nearest = distance;
-                  match = &object;
-               }
-            }
+            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& object)
+               { return object.globals->size() == globals_copy->size(); })
+                       .first;
          }
          // Kept as drawn for the next frame
          game_device_data.mv_objects[key].push_back({transform, globals_copy});

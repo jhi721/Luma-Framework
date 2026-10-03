@@ -172,7 +172,7 @@ struct TheWitcherGameDeviceData final : public GameDeviceData
    // frame's vc4 of its key's nearest draw (same object, a frame earlier), its camera included.
    struct MotionVectorObject
    {
-      std::array<float, 3> translation;
+      PatchedDraws::ObjectTransform transform; // The world matrix's translation only (the rest zero)
       ConstantsCopy constants;
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
@@ -677,7 +677,7 @@ class TheWitcherGame final : public Game
             HashCombine(key, value);
          // The world matrix's translation (its rows' w) separates objects that share a key, as a tie-break only; else the world view
          // projection's (the camera's motion is small next to the objects' spacing)
-         std::array<float, 3> translation = {};
+         PatchedDraws::ObjectTransform transform = {};
          if (registers)
          {
             const uint8_t tie_break_register = registers->world != kNoRegister ? registers->world : registers->world_view_projection;
@@ -685,7 +685,7 @@ class TheWitcherGame final : public Game
             if (tie_break_register != kNoRegister && constants->size() >= offset + 3 * 16)
             {
                for (int row = 0; row < 3; row++)
-                  std::memcpy(&translation[row], constants->data() + offset + row * 16 + 12, sizeof(float));
+                  std::memcpy(&transform[row], constants->data() + offset + row * 16 + 12, sizeof(float));
             }
          }
 
@@ -693,17 +693,9 @@ class TheWitcherGame final : public Game
          const TheWitcherGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end())
          {
-            float nearest = FLT_MAX;
-            for (const auto& candidate : previous->second)
-            {
-               const float dx = candidate.translation[0] - translation[0], dy = candidate.translation[1] - translation[1], dz = candidate.translation[2] - translation[2];
-               const float distance = dx * dx + dy * dy + dz * dz;
-               if (candidate.constants->size() == constants->size() && distance < nearest)
-               {
-                  nearest = distance;
-                  match = &candidate;
-               }
-            }
+            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+               { return candidate.constants->size() == constants->size(); })
+                       .first;
          }
          if (match)
          {
@@ -749,7 +741,7 @@ class TheWitcherGame final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         gd.mv_objects[key].push_back({translation, constants});
+         gd.mv_objects[key].push_back({transform, constants});
       }
 #if DEVELOPMENT
       else
