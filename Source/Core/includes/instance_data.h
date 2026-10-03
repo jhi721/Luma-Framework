@@ -621,6 +621,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 
 #if ENABLE_SR
    SR::Type sr_type = SR::Type::None; // If active, the SR tech enabled by the user and supported+initialized correctly on this device
+   std::atomic<SR::Type> sr_type_selected = SR::Type::None; // The overlay's and the MCP's pick, applied to "sr_type" at the next present
    std::map<SR::Type, SR::InstanceData*> sr_implementations_instances; // All implementations allowed by the current mod, might not all be compatible
    SR::InstanceData* GetSRInstanceData() const
    {

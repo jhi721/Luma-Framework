@@ -2900,6 +2900,7 @@ namespace
          const std::unique_lock lock_reshade(s_mutex_reshade);
          sr_user_type = SR::UserType::None; // Reset the global user setting if it's not supported, we want to grey it out in the UI (there's no need to serialize the new value for it though!)
 		}
+      device_data.sr_type_selected = device_data.sr_type;
 #endif // ENABLE_SR
 
       game->OnInitDevice(native_device, device_data);
@@ -5742,11 +5743,12 @@ namespace
       return SR::Type::None;
    }
 
-   // The UI's (or the MCP's) SR selection: inits the new SR. Under "s_mutex_reshade", on the render thread.
+   // Switches the SR. Core applies the overlay's and the MCP's "sr_type_selected" at present, before the game's "OnPresent", so a frame's
+   // draws never see two types and the game can release its resources there.
    // We wouldn't really need to do anything other than clearing "sr_output_color",
    // but to avoid wasting memory allocated by SR texture and other resources, clear it up once disabled.
    // Note that we keep these textures in memory if the user temporarily changed away from an AA method that supports SR, or if users unloaded shaders (there's no reason to, and it'd cause stutters).
-   void SetSRType(DeviceData& device_data, SR::Type sr_type)
+   void ApplySRType(DeviceData& device_data, SR::Type sr_type)
    {
       if (device_data.sr_type == sr_type)
          return;
@@ -5782,6 +5784,13 @@ namespace
          device_data.sr_scene_pre_exposure = 1.f;
          game->CleanExtraSRResources(device_data);
       }
+   }
+
+   // Selects and switches the SR right away: for a game's own pick (e.g. its "Performance Test" sweeps), from its "OnPresent"
+   void SetSRType(DeviceData& device_data, SR::Type sr_type)
+   {
+      device_data.sr_type_selected = sr_type;
+      ApplySRType(device_data, sr_type);
    }
 #endif // ENABLE_SR
 
@@ -6287,6 +6296,10 @@ namespace
       device_data.has_drawn_main_post_processing = false;
 #if ENABLE_SR
       device_data.has_drawn_sr_imgui = device_data.has_drawn_sr;
+#endif // ENABLE_SR
+
+#if ENABLE_SR
+      ApplySRType(device_data, device_data.sr_type_selected);
 #endif // ENABLE_SR
 
       // Free mirrors queued this frame: all command lists have executed by now (usually).
@@ -14572,7 +14585,10 @@ namespace
                }
             }
 
-            SetSRType(device_data, sr_type);
+            if (sr_type != device_data.sr_type)
+            {
+               device_data.sr_type_selected = sr_type;
+            }
 #endif // ENABLE_SR
 
 #if ENABLE_REFLEX

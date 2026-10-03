@@ -2875,24 +2875,6 @@ public:
       Perf::g_test = mode_index;
    }
 
-   // A sweep picks the upscaler as Core's selection change does: the previous one's resources go ("ReleaseResources"), and on None
-   // our upscaler inputs and output ("CleanExtraSRResources")
-   static void SetSRType(DeviceData& device_data, SR::Type sr_type)
-   {
-      if (sr_type != device_data.sr_type)
-      {
-         if (auto* instance = device_data.GetSRInstanceData())
-            sr_implementations[device_data.sr_type]->ReleaseResources(instance);
-         if (sr_type == SR::Type::None)
-         {
-            device_data.sr_output_color = nullptr;
-            GetGameDeviceData(device_data).release_sr_resources = true;
-         }
-      }
-      device_data.sr_type = sr_type;
-      device_data.sr_suppressed = false;
-   }
-
 #if ENABLE_SR_BRIDGE
    // "SR Bridge Profile Sweep": the next mode whose upscaler this device supports ("sweep_step" -1 to start), its profile requested
    // at the next present (which latches the upscaler). False when none is left.

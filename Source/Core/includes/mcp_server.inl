@@ -2171,7 +2171,7 @@ namespace Mcp
                return std::string("Not supported on this device");
             const std::unique_lock lock_reshade(s_mutex_reshade);
             sr_user_type = user_type;
-            SetSRType(device_data, type);
+            device_data.sr_type_selected = type;
             return std::string(); }}});
 #endif
       // "DrawSMAA" and "DrawBloom"'s intermediates, the bloom's mips through "mip"
