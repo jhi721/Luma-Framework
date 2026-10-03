@@ -372,20 +372,31 @@ namespace SRBridge
       }
 
       SR_BRIDGE_PROFILE(command_list, 0);
+      const UINT render_width = (draw_data.render_width ? draw_data.render_width : custom_data.settings_data.render_width);
+      const UINT render_height = (draw_data.render_height ? draw_data.render_height : custom_data.settings_data.render_height);
       for (int i = 0; i < kCount; i++)
       {
-         if (i != kOutput && custom_data.copied[i])
+         if (i == kOutput || !custom_data.copied[i])
+            continue;
+         if (i == kExposure)
+         {
             command_list->CopyResource(custom_data.shared[i].Get(), resources[i]);
+            continue;
+         }
+         // The upscaler reads the render resolution inputs only within the render size (a render scale draws into the top left of
+         // larger targets)
+         D3D11_TEXTURE2D_DESC desc;
+         custom_data.shared[i]->GetDesc(&desc);
+         const D3D11_BOX render_area = {0, 0, 0, (std::min)(render_width, desc.Width), (std::min)(render_height, desc.Height), 1};
+         command_list->CopySubresourceRegion(custom_data.shared[i].Get(), 0, 0, 0, 0, resources[i], 0, &render_area);
       }
       SR_BRIDGE_PROFILE(command_list, 1);
       const uint64_t frame = ++custom_data.frame;
       custom_data.context->Signal(custom_data.fences[0].Get(), frame);
       command_list->Flush();
       SR_BRIDGE_PROFILE(command_list, 2);
-      if (!custom_data.Send(std::format("frame {} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0,
-             draw_data.render_width ? draw_data.render_width : custom_data.settings_data.render_width,
-             draw_data.render_height ? draw_data.render_height : custom_data.settings_data.render_height, draw_data.pre_exposure, draw_data.user_sharpness,
-             draw_data.near_plane, draw_data.far_plane, draw_data.vert_fov)))
+      if (!custom_data.Send(std::format("frame {} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0, render_width,
+             render_height, draw_data.pre_exposure, draw_data.user_sharpness, draw_data.near_plane, draw_data.far_plane, draw_data.vert_fov)))
          return false;
       SR_BRIDGE_PROFILE(command_list, 3);
       custom_data.context->Wait(custom_data.fences[1].Get(), frame);
