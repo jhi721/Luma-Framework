@@ -2,7 +2,7 @@
 // Source: https://github.com/GameTechDev/XeGTAO
 //
 // MELE-specific contracts shared by all three games:
-// - Run at native AO half resolution and write visibility to blur u0, the game's final R8_UNORM AO target.
+// - Run at AO half resolution (on the rendered share under the render scale) and write visibility to blur u0, the game's final R8_UNORM AO target.
 //   The native apply shader 0x2E826C0F still blends dst*src_color into the fp16 scene.
 // - Inherit cb0 HBAO+ $Globals and cb2 CSOffsetConstants; layouts come from live disassembly of
 //   0x80212FD6/0x06D92B08 and retain standard GFSDK offsets.
@@ -47,8 +47,9 @@ cbuffer LumaGTAO : register(b11)
    float FinalValuePowerRT; // Darkness control calibrated to native AO.
    float DepthScaleRT;      // View-Z divisor from UE3 units to approximate meters.
    float RadiusOverrideRT;  // Positive values override EFFECT_RADIUS after depth scaling.
-   float DebugViewRT;       // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
+   float DebugViewRT;       // DEVELOPMENT / TEST debug view (legend in Includes/XeGTAO.hlsl)
    float NoiseIndexRT;      // frame % 64 with DLSS/FSR, 0 otherwise (see the header).
+   float2 PixelSizeRT;      // 1 / the working area: the rendered share of the AO targets (all of them at native).
 }
 
 #include "Includes/Common.hlsl"
@@ -60,11 +61,14 @@ cbuffer LumaGTAO : register(b11)
 #define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility);
 
 // ViewNormalTex z sign; view-space normals face the camera.
-#define NORMAL_Z_SIGN       (-1.0)
+#define NORMAL_Z_SIGN (-1.0)
 
-#define VIEWPORT_PIXEL_SIZE InvFullResolution
+// Under the engine's render scale the scene fills only the top-left DynamicScaleCS.xy share of the AO targets, and
+// InvFullResolution stays the allocation's. XeGTAO's working textures are sized to that share instead (main.cpp), so UVs span the
+// rendered area and the clamped depth samples stop at its edge.
+#define VIEWPORT_PIXEL_SIZE PixelSizeRT
 
-// GFSDK ProjInfo contains the live NDC-to-view multiply/add pair, including dialogue zoom.
+// GFSDK ProjInfo contains the live NDC-to-view multiply/add pair, including dialogue zoom, for UVs of the rendered area.
 #define NDC_TO_VIEW_MUL           ProjInfo.xy
 #define NDC_TO_VIEW_ADD           ProjInfo.zw
 

@@ -8,7 +8,7 @@
 // Sub-native borderless is best-effort: the game allocates desktop-sized targets but renders a top-left
 // sub-rectangle through cb2 DynamicScale, so injected in-place passes process the full allocation.
 //
-// DLSS / FSR 3 (DLAA): the engine's velocity target is unusable (RGBA8, one velocity per object, the player only), so motion
+// DLSS / FSR 3: the engine's velocity target is unusable (RGBA8, one velocity per object, the player only), so motion
 // vectors and jitter come from patched shaders (MotionVectorPatches.h, Borderlands GOTY Enhanced's method): every scene draw's
 // vertex shader runs a second time on its previous frame constants. The upscaler runs at the scene's first post pass; SMAA
 // then steps aside (RCAS stays).
@@ -29,6 +29,7 @@
 #if DEVELOPMENT
 #include "..\..\Core\includes\perf_test.h"
 #endif
+#include "..\..\External\reshade\deps\minhook\include\MinHook.h"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 #include <vector>
 #include <unordered_set>
@@ -185,6 +186,136 @@ static constexpr uint32_t kDOFDownsampleHash = 0x94FA3B53;
 // shader. UE3 draws in world space translated by PreViewTranslation (minus the camera position): LocalToWorld and
 // ViewProjectionMatrix both include it.
 static constexpr size_t kPreViewTranslationOffset = 5 * 16;
+
+// Render scale for DLSS / FSR (DLAA_RESEARCH.md "Render scale RE, exe + shaders"; ME1/2/3 LE). The engine's fixed scale dynamic
+// resolution (built, but off on PC) renders the scene into the top-left share of full size targets, and the stage 1 uber
+// stretches it. The view is set to its unscaled size on entry to the post process DPG's loop, which the engine itself does only
+// after the uber (0x76E17D): DoF, bloom, PSOffsetConstants b2 (rewritten per pass from the view) and the uber then run at output
+// size on the upscaler's output (DLSS best practices PLC-2).
+namespace EngineScale
+{
+   constexpr float MIN_RENDER_SCALE = 0.5f;
+   static float g_render_scale = 1.f; // "RenderScale": applies only while an upscaler draws
+#if DEVELOPMENT
+   static bool g_post_at_output_size = true;
+#else
+   static constexpr bool g_post_at_output_size = true;
+#endif
+
+   int32_t* dynamic_resolution_enabled = nullptr; // "[DynamicResolution] Enabled"
+   int32_t* use_fixed_scale = nullptr;
+   float* fixed_screen_percentage = nullptr;
+   bool enabled_by_us = false;
+   bool installed = false;
+   size_t view_stride = 0;        // sizeof(FViewInfo): ME1 LE 0x12F0, ME3 LE 0x11B0 (read from the hooked function)
+   bool upscaler_drawing = false; // Swap the post process view only on frames the upscaler draws (else the share would show uncovered)
+   uintptr_t (*render_post_process_original)(uint8_t*, uintptr_t, uintptr_t, uintptr_t) = nullptr;
+
+   // FSceneRenderer::RenderPostProcessEffects(DPG, lighting only): the views at +0x60 (count at +0x68, "view_stride" apart)
+   uintptr_t RenderPostProcessDetour(uint8_t* renderer, uintptr_t dpg, uintptr_t lighting_only, uintptr_t argument_4)
+   {
+      constexpr uint8_t SDPG_POST_PROCESS = 4;
+      if (g_post_at_output_size && upscaler_drawing && uint8_t(dpg) == SDPG_POST_PROCESS && uint8_t(lighting_only) == 0)
+      {
+         uint8_t* const views = *reinterpret_cast<uint8_t**>(renderer + 0x60);
+         const int32_t view_count = *reinterpret_cast<const int32_t*>(renderer + 0x68);
+         for (int32_t i = 0; i < view_count; i++)
+         {
+            uint8_t* const view = views + size_t(i) * view_stride;
+            // Floats: the size at +0x64, unscaled at +0x6C. Ints: the render target origin at +0x74, the size at +0x7C, unscaled at +0x84.
+            float* const size = reinterpret_cast<float*>(view + 0x64);
+            int32_t* const target = reinterpret_cast<int32_t*>(view + 0x74);
+            if ((size[0] == size[2] && size[1] == size[3]) || target[4] <= 0 || target[5] <= 0)
+               continue;
+            size[0] = size[2];
+            size[1] = size[3];
+            target[2] = target[4];
+            target[3] = target[5];
+            // ScreenPositionScaleBias, as the engine recomputes it
+            float* const screen_position_scale_bias = reinterpret_cast<float*>(view + 0x4A0);
+            screen_position_scale_bias[0] = size[0] * 0.5f / float(target[4]);
+            screen_position_scale_bias[1] = size[1] * -0.5f / float(target[5]);
+            screen_position_scale_bias[2] = (size[1] * 0.5f + float(target[1])) / float(target[5]);
+            screen_position_scale_bias[3] = (size[0] * 0.5f + float(target[0])) / float(target[4]);
+         }
+      }
+      return render_post_process_original(renderer, dpg, lighting_only, argument_4);
+   }
+
+   void Install()
+   {
+      if (installed) // "OnInit" can run again: the hooked prologue no longer matches
+         return;
+      using System::ANY;
+      // RenderPostProcessEffects' prologue (ME1 LE 0x76DF80, ME3 LE 0x367880)
+      constexpr std::array<System::BytePattern, 22> render_post_process_pattern = {{0x4C, 0x8B, 0xDC, 0x55, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0xA8, 0x00, 0x00, 0x00, 0x33, 0xED}};
+      // In the view setup: cmp [Enabled], 0; je near (ME1 LE 0x4C54DA) or je short (ME3 LE 0x6D01A3); xor edx, edx; mov ecx, 6
+      constexpr std::array<System::BytePattern, 20> enabled_near_pattern = {{0x83, 0x3D, ANY, ANY, ANY, ANY, 0x00, 0x0F, 0x84, ANY, ANY, ANY, ANY, 0x33, 0xD2, 0xB9, 0x06, 0x00, 0x00, 0x00}};
+      constexpr std::array<System::BytePattern, 16> enabled_short_pattern = {{0x83, 0x3D, ANY, ANY, ANY, ANY, 0x00, 0x74, ANY, 0x33, 0xD2, 0xB9, 0x06, 0x00, 0x00, 0x00}};
+      // cmp [UseFixedScale], r12d (ME1 LE 0x4C557C) or 0 (ME3 LE 0x6D0366); je +0x1B; movss xmm0, [FixedScreenPercentage]. Both
+      // compares are 7 bytes, so the movss is at +9 either way.
+      constexpr std::array<System::BytePattern, 17> fixed_scale_register_pattern = {{0x44, 0x39, 0x25, ANY, ANY, ANY, ANY, 0x74, 0x1B, 0xF3, 0x0F, 0x10, 0x05, ANY, ANY, ANY, ANY}};
+      constexpr std::array<System::BytePattern, 17> fixed_scale_zero_pattern = {{0x83, 0x3D, ANY, ANY, ANY, ANY, 0x00, 0x74, 0x1B, 0xF3, 0x0F, 0x10, 0x05, ANY, ANY, ANY, ANY}};
+      const std::vector<std::byte*> render_post_process = System::ScanModuleForPattern(render_post_process_pattern);
+      std::vector<std::byte*> enabled = System::ScanModuleForPattern(enabled_near_pattern);
+      if (enabled.empty())
+      {
+         enabled = System::ScanModuleForPattern(enabled_short_pattern);
+      }
+      std::vector<std::byte*> fixed_scale = System::ScanModuleForPattern(fixed_scale_register_pattern);
+      size_t use_fixed_scale_offset = 3;
+      if (fixed_scale.empty())
+      {
+         fixed_scale = System::ScanModuleForPattern(fixed_scale_zero_pattern);
+         use_fixed_scale_offset = 2;
+      }
+      // The view loop's "add rcx, sizeof(FViewInfo)", within the function
+      if (render_post_process.size() == 1)
+      {
+         constexpr std::array<System::BytePattern, 7> view_stride_pattern = {{0x48, 0x81, 0xC1, ANY, ANY, 0x00, 0x00}};
+         const std::vector<std::byte*> strides = System::ScanMemoryForPattern(render_post_process[0], 0x400, view_stride_pattern, true);
+         const uint32_t stride = (strides.empty() ? 0 : *reinterpret_cast<const uint32_t*>(strides[0] + 3));
+         view_stride = ((stride >= 0x1000 && stride < 0x2000) ? stride : 0);
+      }
+      if (render_post_process.size() != 1 || enabled.size() != 1 || fixed_scale.size() != 1 || view_stride == 0)
+      {
+         reshade::log::message(reshade::log::level::warning, std::format("[MELE Scale] not installed: {} / {} / {} pattern matches, view stride 0x{:X}", render_post_process.size(), enabled.size(), fixed_scale.size(), view_stride).c_str());
+         return;
+      }
+      // Target of a rel32 at "offset" in an instruction ending "end" bytes after the instruction's start
+      const auto rip_target = [](std::byte* instruction, size_t offset, size_t end)
+      { return instruction + end + *reinterpret_cast<const int32_t*>(instruction + offset); };
+      dynamic_resolution_enabled = reinterpret_cast<int32_t*>(rip_target(enabled[0], 2, 7));
+      use_fixed_scale = reinterpret_cast<int32_t*>(rip_target(fixed_scale[0], use_fixed_scale_offset, 7));
+      fixed_screen_percentage = reinterpret_cast<float*>(rip_target(fixed_scale[0], 13, 17));
+      const MH_STATUS initialized = MH_Initialize();
+      installed = (initialized == MH_OK || initialized == MH_ERROR_ALREADY_INITIALIZED) &&
+                  MH_CreateHook(render_post_process[0], reinterpret_cast<void*>(&RenderPostProcessDetour), reinterpret_cast<void**>(&render_post_process_original)) == MH_OK &&
+                  MH_EnableHook(render_post_process[0]) == MH_OK;
+      reshade::log::message(installed ? reshade::log::level::info : reshade::log::level::warning, std::format("[MELE Scale] installed {}: Enabled {} UseFixedScale {} FixedScreenPercentage {} view stride 0x{:X}", installed, *dynamic_resolution_enabled, *use_fixed_scale, *fixed_screen_percentage, view_stride).c_str());
+   }
+
+   // Per frame (next frame's state): the game's options apply writes "Enabled" 0, so it's forced while the scale is below 100% and an
+   // upscaler draws
+   void Apply(bool sr_active)
+   {
+      upscaler_drawing = sr_active;
+      if (!installed)
+         return;
+      if (sr_active && g_render_scale < 0.995f)
+      {
+         *fixed_screen_percentage = g_render_scale * 100.f;
+         *use_fixed_scale = 1;
+         *dynamic_resolution_enabled = 1;
+         enabled_by_us = true;
+      }
+      else if (enabled_by_us)
+      {
+         *dynamic_resolution_enabled = 0;
+         enabled_by_us = false;
+      }
+   }
+} // namespace EngineScale
 
 // Motion vectors for DLSS / FSR: the opaque draws into the fp16 scene draw with patched shaders that also write an extra target,
 // the vertex shader's second run reading the draw's previous frame b0 / b1 / b3.
@@ -355,6 +486,20 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
    ID3D11Resource* sr_input = nullptr; // The scene's last copy, else the scene
    bool sr_rebind_done = false;        // Stage 1, the scene's last reader, has drawn
+   // Under the engine's render scale: output sized scene targets (depth, velocity) stretched from their render share for the post
+   // passes up to stage 1, by the game's resource (see "RebindUpscaledScene"). Restretched once per frame; recreated on a size or
+   // format change, so a reused address is harmless.
+   struct RenderShareStretch
+   {
+      com_ptr<ID3D11Texture2D> texture;
+      com_ptr<ID3D11UnorderedAccessView> uav;
+      com_ptr<ID3D11ShaderResourceView> srv;
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      uint32_t frame = UINT32_MAX;
+      ID3D11ShaderResourceView* source_srv = nullptr; // The view stretched at "frame": a later draw binding it reuses the copy as is
+   };
+   std::unordered_map<ID3D11Resource*, RenderShareStretch> render_share_stretches;
+   com_ptr<ID3D11Buffer> render_share_stretch_buffer;
 
    // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
    // blend state writes it unblended, see "OnCreateBlendState")
@@ -397,6 +542,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // of every mesh draw depth tested against the scene
    std::array<float, 2> mv_jitter = {};
    std::array<float, 2> mv_jitter_ndc = {}; // The same offset in NDC (y up), as the jitter buffer holds it
+   // The scene's viewport (the top-left share of the output sized targets under the engine's render scale), taken when it opens
+   std::array<uint32_t, 2> render_size = {};
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
    // Per-draw lookups kept for the next draw (reset when the scene opens, views and states can be recreated between scenes): the
    // jitter path's last depth view and whether it's the scene depth, the last depth stencil state's depth test and write (null = the
@@ -581,6 +728,7 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameCopyVS = CompileTimeStringHash("Copy VS");
    static constexpr uint32_t kNameSharpenPS = CompileTimeStringHash("MELE Sharpen PS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
+   static constexpr uint32_t kNameRenderShareStretchCS = CompileTimeStringHash("MELE Render Share Stretch CS");
 
    // (Re)create an fp16 scratch target on resolution change, with a view per requested bind flag (render target, shader resource).
    // Returns false if the texture or any requested view is missing.
@@ -980,23 +1128,12 @@ class MassEffectLE final : public Game
       game_device_data->depth_stencil_state = depth_stencil_state.get();
    }
 
-   // A b1 copy's ViewProjectionMatrix (row vectors) as clip z = A * clip w + B, w the view depth: A from the z and w columns, B at the
-   // camera. A <= 1 is an infinite far plane.
-   static std::array<double, 2> ViewDepthTerms(const std::vector<uint8_t>& camera)
-   {
-      if (camera.size() < 16 * sizeof(float))
-         return {};
-      const float* const vp = reinterpret_cast<const float*>(camera.data());
-      const double w_axis = double(vp[3]) * vp[3] + double(vp[7]) * vp[7] + double(vp[11]) * vp[11];
-      const double a = (w_axis > 0.0 ? (double(vp[2]) * vp[3] + double(vp[6]) * vp[7] + double(vp[10]) * vp[11]) / w_axis : 0.0);
-      return {a, double(vp[14]) - a * vp[15]};
-   }
-
-   // Near plane of a b1 copy's ViewProjectionMatrix: -B / A (see "ViewDepthTerms")
+   // Near plane of a b1 copy's ViewProjectionMatrix (row vectors)
    static double ViewNearPlane(const std::vector<uint8_t>& camera)
    {
-      const auto [a, b] = ViewDepthTerms(camera);
-      return a != 0.0 ? -b / a : 0.0;
+      if (camera.size() < 16 * sizeof(float))
+         return 0.0;
+      return SR::GetViewProjectionCamera(reinterpret_cast<const float*>(camera.data()), /*row_vectors*/ true).near_plane;
    }
 
    // Determinant of a b1 copy's ViewProjectionMatrix rotation and scale (its upper 3x3)
@@ -1111,7 +1248,12 @@ class MassEffectLE final : public Game
       jitter &= perf_test_modes[Perf::g_test].motion_vector_draws >= 1; // "Performance Test" without jitter draws
 #endif
       game_device_data.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
-      game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / device_data.output_resolution.x, game_device_data.mv_jitter[1] * -2.f / device_data.output_resolution.y};
+      D3D11_VIEWPORT viewport = {};
+      UINT viewport_count = 1;
+      native_device_context->RSGetViewports(&viewport_count, &viewport);
+      const bool viewport_valid = viewport_count != 0 && viewport.Width >= 1.f && viewport.Height >= 1.f && viewport.Width <= device_data.output_resolution.x && viewport.Height <= device_data.output_resolution.y;
+      game_device_data.render_size = (viewport_valid ? std::array<uint32_t, 2>{uint32_t(viewport.Width), uint32_t(viewport.Height)} : std::array<uint32_t, 2>{uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)});
+      game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / float(game_device_data.render_size[0]), game_device_data.mv_jitter[1] * -2.f / float(game_device_data.render_size[1])};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
       {
@@ -1548,7 +1690,7 @@ class MassEffectLE final : public Game
    }
 
    // DLSS / FSR on the jittered scene (its last copy, which the post passes read, else the scene itself), the scene depth and the motion
-   // vectors, at native resolution; the post passes read its output in place of both (see "RebindUpscaledScene"). False if it didn't
+   // vectors, at output size; the post passes read its output in place of both (see "RebindUpscaledScene"). False if it didn't
    // draw (missing input, or the upscaler failed).
    static bool DrawUpscaler(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
@@ -1594,30 +1736,29 @@ class MassEffectLE final : public Game
          return false;
       }
 
-      // FSR needs the camera (DLSS ignores it). b1's ViewProjectionMatrix multiplies row vectors: column 1 is the up axis /
-      // tan(fov / 2); near and far from "ViewDepthTerms".
-      const float* const vp = reinterpret_cast<const float*>(game_device_data.mv_camera->data());
-      const double up_length = std::sqrt(double(vp[1]) * vp[1] + double(vp[5]) * vp[5] + double(vp[9]) * vp[9]);
+      // FSR needs the camera (DLSS ignores it), from b1's ViewProjectionMatrix (row vectors)
+      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(game_device_data.mv_camera->data()), /*row_vectors*/ true);
       // The last valid field of view is kept (FSR asserts on 0)
-      if (const double vert_fov = (up_length > 0.0 ? 2.0 * std::atan(1.0 / up_length) : 0.0); vert_fov > 0.0 && vert_fov <= 3.14159265358979)
+      if (camera.vert_fov > 0.0 && camera.vert_fov <= 3.14159265358979)
       {
-         game_device_data.sr_vert_fov = float(vert_fov);
+         game_device_data.sr_vert_fov = float(camera.vert_fov);
       }
-      const auto [a, b] = ViewDepthTerms(*game_device_data.mv_camera);
-      const double near_plane = ViewNearPlane(*game_device_data.mv_camera);
 
+      // The scene's top-left share under the engine's render scale
+      const uint32_t render_width = (std::min)(game_device_data.render_size[0] != 0 ? game_device_data.render_size[0] : scene_desc.Width, scene_desc.Width);
+      const uint32_t render_height = (std::min)(game_device_data.render_size[1] != 0 ? game_device_data.render_size[1] : scene_desc.Height, scene_desc.Height);
       const SR::SettingsData settings_data = {
          .output_width = scene_desc.Width,
          .output_height = scene_desc.Height,
-         .render_width = scene_desc.Width,
-         .render_height = scene_desc.Height,
+         .render_width = render_width,
+         .render_height = render_height,
          .dynamic_resolution = false,
          .hdr = true,
          .inverted_depth = false,
          .mvs_jittered = false,
-         // The motion vectors are UV deltas, previous minus current
-         .mvs_x_scale = float(scene_desc.Width),
-         .mvs_y_scale = float(scene_desc.Height),
+         // The motion vectors are UV deltas of the scene's viewport, previous minus current
+         .mvs_x_scale = float(render_width),
+         .mvs_y_scale = float(render_height),
          .auto_exposure = device_data.sr_type != SR::Type::FSR, // FSR's clips highlights (Luma canon)
          // DLAA on scene-referred HDR input takes preset J or K, never L or M (DLSS best practices PRE-4: L crushes saturated
          // highlights): "Default" picks K (11); an explicit choice is kept
@@ -1630,18 +1771,18 @@ class MassEffectLE final : public Game
       draw_data.output_color = device_data.sr_output_color.get();
       draw_data.motion_vectors = game_device_data.mv_texture.get();
       draw_data.depth_buffer = depth.get();
-      draw_data.render_width = scene_desc.Width;
-      draw_data.render_height = scene_desc.Height;
+      draw_data.render_width = render_width;
+      draw_data.render_height = render_height;
       // As applied (pixels, +y down)
       draw_data.jitter_x = game_device_data.mv_jitter[0];
       draw_data.jitter_y = game_device_data.mv_jitter[1];
       draw_data.reset = device_data.force_reset_sr;
       draw_data.vert_fov = game_device_data.sr_vert_fov;
-      if (near_plane > 0.0)
+      if (camera.near_plane > 0.0)
       {
          // ponytail: FSR gets a large finite far for an infinite one (Core sets FFX_FSR3_ENABLE_DEPTH_INFINITE only with inverted depth)
-         draw_data.near_plane = float(near_plane);
-         draw_data.far_plane = float(a > 1.0 ? b / (1.0 - a) : near_plane * 1e6);
+         draw_data.near_plane = float(camera.near_plane);
+         draw_data.far_plane = float(camera.far_plane);
       }
       if (!sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data))
       {
@@ -1715,6 +1856,8 @@ class MassEffectLE final : public Game
          }
          constants[16] = game_device_data.mv_jitter_ndc[0];
          constants[17] = game_device_data.mv_jitter_ndc[1];
+         constants[18] = float(game_device_data.render_size[0]);
+         constants[19] = float(game_device_data.render_size[1]);
          if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
          {
             // The depth may be bound as the depth target, and the motion vectors as a render target
@@ -1726,7 +1869,7 @@ class MassEffectLE final : public Game
             native_device_context->CSSetShaderResources(0, 1, &srv);
             native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
             native_device_context->CSSetShader(fill_shader, nullptr, 0);
-            native_device_context->Dispatch((uint32_t(device_data.output_resolution.x) + 7) / 8, (uint32_t(device_data.output_resolution.y) + 7) / 8, 1);
+            native_device_context->Dispatch((game_device_data.render_size[0] + 7) / 8, (game_device_data.render_size[1] + 7) / 8, 1);
             ID3D11UnorderedAccessView* const null_uav = nullptr;
             native_device_context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
          }
@@ -1784,10 +1927,20 @@ class MassEffectLE final : public Game
       graphics_state.Restore(native_device_context);
    }
 
-   // The post passes from the scene's end up to stage 1 read the upscaled scene where they bind the scene or its copy (any shader
-   // resource slot)
-   static void RebindUpscaledScene(ID3D11DeviceContext* native_device_context, const MassEffectGameDeviceData& gd, bool compute)
+   // Whether the engine's render scale draws the scene into the top-left share of its output sized targets this frame
+   static bool IsRenderShare(const DeviceData& device_data, const MassEffectGameDeviceData* gd)
    {
+      return gd->render_size[0] != 0 && gd->render_size[1] != 0 && (gd->render_size[0] < device_data.output_resolution.x || gd->render_size[1] < device_data.output_resolution.y);
+   }
+
+   // The post passes from the scene's end up to stage 1 read the upscaled scene where they bind the scene or its copy (any shader
+   // resource slot). Under the engine's render scale they run at output size (see "EngineScale"), so any other output sized texture
+   // they read (the scene's depth and velocity, written in the render share) is read stretched ("RenderShareStretch").
+   static void RebindUpscaledScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, bool compute)
+   {
+      const bool render_share = IsRenderShare(device_data, gd);
+      if (!gd->sr_input && !render_share)
+         return;
       com_ptr<ID3D11ShaderResourceView> srvs[16]; // t0-t15
       if (compute)
       {
@@ -1797,40 +1950,139 @@ class MassEffectLE final : public Game
       {
          native_device_context->PSGetShaderResources(0, UINT(std::size(srvs)), &srvs[0]);
       }
-      ID3D11ShaderResourceView* const upscaled = gd.sr_output_srv.get();
+      ID3D11Resource* const upscaled_resource = device_data.sr_output_color.get();
       for (UINT slot = 0; slot < std::size(srvs); slot++)
       {
          if (!srvs[slot])
             continue;
          com_ptr<ID3D11Resource> resource;
          srvs[slot]->GetResource(&resource);
-         // The scene itself too ("mv_scene_color" is fixed once the scene has ended)
-         if (resource.get() != gd.sr_input && resource.get() != gd.mv_scene_color.get())
+         ID3D11ShaderResourceView* replacement = nullptr;
+         // The scene itself too ("mv_scene_color" is fixed once the scene has ended). A frame the upscaler didn't draw stretches it
+         // with the rest (DLSS best practices POST-9).
+         if (gd->sr_input && (resource.get() == gd->sr_input || resource.get() == gd->mv_scene_color.get()))
+         {
+            replacement = gd->sr_output_srv.get();
+         }
+         else if (render_share && resource.get() != upscaled_resource)
+         {
+            replacement = StretchRenderShare(native_device, native_device_context, device_data, gd, resource.get(), srvs[slot].get());
+         }
+         if (!replacement)
             continue;
          if (compute)
          {
-            native_device_context->CSSetShaderResources(slot, 1, &upscaled);
+            native_device_context->CSSetShaderResources(slot, 1, &replacement);
          }
          else
          {
-            native_device_context->PSSetShaderResources(slot, 1, &upscaled);
+            native_device_context->PSSetShaderResources(slot, 1, &replacement);
          }
       }
+   }
+
+   // An output sized 2D texture's render share stretched over a copy (see "RebindUpscaledScene"), or null to keep the game's view:
+   // another size, an integer or stencil view, or a failure
+   static ID3D11ShaderResourceView* StretchRenderShare(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, ID3D11Resource* resource, ID3D11ShaderResourceView* srv)
+   {
+      // Every post draw up to stage 1 rebinds: the checks below ran for this view already
+      if (const auto found = gd->render_share_stretches.find(resource); found != gd->render_share_stretches.end() && found->second.frame == cb_luma_global_settings.FrameIndex && found->second.source_srv == srv)
+         return found->second.srv.get();
+      com_ptr<ID3D11Texture2D> texture;
+      if (FAILED(resource->QueryInterface(&texture)))
+         return nullptr;
+      D3D11_TEXTURE2D_DESC desc;
+      texture->GetDesc(&desc);
+      D3D11_SHADER_RESOURCE_VIEW_DESC view_desc;
+      srv->GetDesc(&view_desc);
+      if (desc.Width != uint32_t(device_data.output_resolution.x) || desc.Height != uint32_t(device_data.output_resolution.y) || desc.SampleDesc.Count != 1 || view_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D)
+         return nullptr;
+      // Single channel depth is kept at full float precision; anything else keeps its view format when it can be a UAV store
+      DXGI_FORMAT format = view_desc.Format;
+      switch (view_desc.Format)
+      {
+      case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+      case DXGI_FORMAT_R32_FLOAT:
+      case DXGI_FORMAT_R16_UNORM:
+      case DXGI_FORMAT_R16_FLOAT:
+         format = DXGI_FORMAT_R32_FLOAT;
+         break;
+      // Stencil and integer views: the stretch's float load can't read them
+      case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+      case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+      case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+      case DXGI_FORMAT_R8_UINT:
+      case DXGI_FORMAT_R16_UINT:
+      case DXGI_FORMAT_R32_UINT:
+      case DXGI_FORMAT_R16G16_UINT:
+      case DXGI_FORMAT_R8G8B8A8_UINT:
+         return nullptr;
+      default:
+      {
+         UINT support = 0;
+         if (FAILED(native_device->CheckFormatSupport(format, &support)) || (support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) == 0)
+         {
+            format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+         }
+         break;
+      }
+      }
+      auto* const stretch_shader = FindShader(device_data.native_compute_shaders, kNameRenderShareStretchCS);
+      if (!stretch_shader)
+         return nullptr;
+      auto& stretch = gd->render_share_stretches[resource];
+      if (!stretch.texture || stretch.format != format)
+      {
+         stretch = {};
+         const D3D11_TEXTURE2D_DESC stretch_desc = {.Width = desc.Width, .Height = desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = format, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
+         if (FAILED(native_device->CreateTexture2D(&stretch_desc, nullptr, &stretch.texture)) || FAILED(native_device->CreateUnorderedAccessView(stretch.texture.get(), nullptr, &stretch.uav)) || FAILED(native_device->CreateShaderResourceView(stretch.texture.get(), nullptr, &stretch.srv)))
+         {
+            gd->render_share_stretches.erase(resource);
+            return nullptr;
+         }
+         stretch.format = format;
+      }
+      if (stretch.frame != cb_luma_global_settings.FrameIndex)
+      {
+         const float render_share[4] = {float(gd->render_size[0]) / float(desc.Width), float(gd->render_size[1]) / float(desc.Height), 0.f, 0.f};
+         if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->render_share_stretch_buffer), render_share, sizeof(render_share)))
+            return nullptr;
+         DrawStateStack<DrawStateStackType::Compute> compute_state;
+         compute_state.Cache(native_device_context, device_data.uav_max_count);
+         ID3D11Buffer* const buffer = gd->render_share_stretch_buffer.get();
+         ID3D11UnorderedAccessView* const uav = stretch.uav.get();
+         native_device_context->CSSetConstantBuffers(0, 1, &buffer);
+         native_device_context->CSSetShaderResources(0, 1, &srv);
+         native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+         native_device_context->CSSetShader(stretch_shader, nullptr, 0);
+         native_device_context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+         compute_state.Restore(native_device_context);
+         stretch.frame = cb_luma_global_settings.FrameIndex;
+         stretch.source_srv = srv;
+#if DEVELOPMENT
+         if (std::string line = std::format("[MELE Scale] stretched {}x{} format {} as {}", desc.Width, desc.Height, int(view_desc.Format), int(format)); gd->probe_logged.insert(line).second)
+         {
+            reshade::log::message(reshade::log::level::info, line.c_str());
+         }
+#endif
+      }
+      return stretch.srv.get();
    }
 
 public:
    void OnInit(bool async) override
    {
+      EngineScale::Install();
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
-      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter},
-         {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, { "mv_read_sizes",
-            &g_mv_read_sizes }});
-      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, { "perf_hook_timers",
-                               &Perf::g_hook_timers }});
+      Mcp::RegisterToggles({{"post_at_output_size", &EngineScale::g_post_at_output_size}, {"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter},
+         {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter},
+         {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}, {"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable},
+         {"hide_ui", &g_hide_ui}, { "perf_hook_timers",
+            &Perf::g_hook_timers }});
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
-      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
-         {"gtao_depth_scale", &g_gtao_depth_scale, 10.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 3.f}});
+      Mcp::RegisterValues({{"render_scale", &EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, 1.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f},
+         {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 10.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 3.f}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_temporal", &g_gtao_temporal, 0, 2},
          { "perf_test",
             &Perf::g_test,
@@ -1898,6 +2150,8 @@ public:
       // per-draw constants, and the motion vector target written by every blend state
       native_shaders_definitions.emplace(kNameMVFillCS,
          ShaderDefinition("Luma_MELE_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
+      native_shaders_definitions.emplace(kNameRenderShareStretchCS,
+         ShaderDefinition("Luma_MELE_RenderShareStretch", reshade::api::pipeline_subobject_type::compute_shader));
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
@@ -2103,156 +2357,159 @@ public:
    // the callback; nullopt means XeGTAO is off or no AO hash matched, and the caller continues.
    std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
    {
-      if (g_gtao_enable)
+      if (!g_gtao_enable)
+         return {};
+
+      // Deinterleave: capture half-resolution R24 depth, prepare all scratch resources, then skip native work.
+      if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
       {
-         // Deinterleave: capture half-resolution R24 depth, prepare all scratch resources, then skip native work.
-         if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
+         if (!HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS))
+            return DrawOrDispatchOverrideType::None;
+
+         ComPtr<ID3D11ShaderResourceView> depth_srv;
+         native_device_context->CSGetShaderResources(0, 1, depth_srv.put());
+         if (!depth_srv)
+            return DrawOrDispatchOverrideType::None;
+         uint4 depth_size{};
+         DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
+         GetResourceInfo(depth_srv.get(), depth_size, depth_format);
+         if (depth_size.x == 0 || depth_size.y == 0)
+            return DrawOrDispatchOverrideType::None;
+         // The working area is the rendered share of the half size AO targets under the engine's render scale (all of them at
+         // native): XeGTAO's clamped samples then stop at its edge instead of reading the stale depth beyond it
+         const float2 output_size = device_data.output_resolution;
+         const bool render_share = IsRenderShare(device_data, gd);
+         const uint32_t w = (render_share ? (std::min)(depth_size.x, uint32_t(std::ceil(float(depth_size.x) * float(gd->render_size[0]) / output_size.x))) : depth_size.x);
+         const uint32_t h = (render_share ? (std::min)(depth_size.y, uint32_t(std::ceil(float(depth_size.y) * float(gd->render_size[1]) / output_size.y))) : depth_size.y);
+
+         if (gd->gtao_w != w || gd->gtao_h != h || !gd->tex_gtao_depth_mips || !gd->tex_gtao_working[1])
          {
-            if (!HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS))
-               return DrawOrDispatchOverrideType::None;
+            ReleaseGTAOScratch(gd);
 
-            ComPtr<ID3D11ShaderResourceView> depth_srv;
-            native_device_context->CSGetShaderResources(0, 1, depth_srv.put());
-            if (!depth_srv)
-               return DrawOrDispatchOverrideType::None;
-            uint4 depth_size{};
-            DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
-            GetResourceInfo(depth_srv.get(), depth_size, depth_format);
-            if (depth_size.x == 0 || depth_size.y == 0)
-               return DrawOrDispatchOverrideType::None;
-            // Native cb0 stays content-dimensioned, so pixel/UV mapping holds even when the allocation is larger.
-            uint32_t w = depth_size.x, h = depth_size.y;
-
-            if (gd->gtao_w != w || gd->gtao_h != h || !gd->tex_gtao_depth_mips || !gd->tex_gtao_working[1])
+            D3D11_TEXTURE2D_DESC texture_desc = {
+               .Width = w,
+               .Height = h,
+               .MipLevels = 5, // XE_GTAO_DEPTH_MIP_LEVELS.
+               .ArraySize = 1,
+               .Format = DXGI_FORMAT_R32_FLOAT,
+               .SampleDesc = {.Count = 1},
+               .Usage = D3D11_USAGE_DEFAULT,
+               .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+            };
+            bool ok = SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_depth_mips.put()));
+            D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {.Format = texture_desc.Format, .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D};
+            for (int i = 0; ok && i < 5; i++)
             {
-               ReleaseGTAOScratch(gd);
-
-               D3D11_TEXTURE2D_DESC texture_desc = {
-                  .Width = w,
-                  .Height = h,
-                  .MipLevels = 5, // XE_GTAO_DEPTH_MIP_LEVELS.
-                  .ArraySize = 1,
-                  .Format = DXGI_FORMAT_R32_FLOAT,
-                  .SampleDesc = {.Count = 1},
-                  .Usage = D3D11_USAGE_DEFAULT,
-                  .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
-               };
-               bool ok = SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_depth_mips.put()));
-               D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {.Format = texture_desc.Format, .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D};
-               for (int i = 0; ok && i < 5; i++)
-               {
-                  uav_desc.Texture2D.MipSlice = i;
-                  ok = SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_depth_mips.get(), &uav_desc, gd->gtao_depth_mip_uavs[i].put()));
-               }
-               ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_depth_mips.get(), nullptr, gd->srv_gtao_depth_mips.put()));
-
-               texture_desc.MipLevels = 1;
-               texture_desc.Format = DXGI_FORMAT_R8G8_UNORM;
-               for (int i = 0; ok && i < 2; i++)
-               {
-                  ok = ok && SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_working[i].put()));
-                  ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_working[i].get(), nullptr, gd->uav_gtao_working[i].put()));
-                  ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_working[i].get(), nullptr, gd->srv_gtao_working[i].put()));
-               }
-               if (!ok)
-               {
-                  ReleaseGTAOScratch(gd);                  // All or nothing; retry clean next frame.
-                  return DrawOrDispatchOverrideType::None; // Leaves the native chain active.
-               }
-               gd->gtao_w = w;
-               gd->gtao_h = h;
+               uav_desc.Texture2D.MipSlice = i;
+               ok = SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_depth_mips.get(), &uav_desc, gd->gtao_depth_mip_uavs[i].put()));
             }
+            ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_depth_mips.get(), nullptr, gd->srv_gtao_depth_mips.put()));
+
+            texture_desc.MipLevels = 1;
+            texture_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+            for (int i = 0; ok && i < 2; i++)
+            {
+               ok = ok && SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_working[i].put()));
+               ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_working[i].get(), nullptr, gd->uav_gtao_working[i].put()));
+               ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_working[i].get(), nullptr, gd->srv_gtao_working[i].put()));
+            }
+            if (!ok)
+            {
+               ReleaseGTAOScratch(gd);                  // All or nothing; retry clean next frame.
+               return DrawOrDispatchOverrideType::None; // Leaves the native chain active.
+            }
+            gd->gtao_w = w;
+            gd->gtao_h = h;
+         }
 
 #if DEVELOPMENT || TEST
-            const float dbg = (float)g_gtao_debug_view;
+         const float dbg = (float)g_gtao_debug_view;
 #else
-            const float dbg = 0.f;
+         const float dbg = 0.f;
 #endif
-            // knobs[4] is the noise index (see "IsGTAOTemporal")
-            const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f};
-            if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), knobs, sizeof(knobs)))
-               return DrawOrDispatchOverrideType::None;
+         // knobs[4] is the noise index (see "IsGTAOTemporal"), [5]-[6] the working area's pixel size
+         const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 1.f / float(w), 1.f / float(h)};
+         if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), knobs, sizeof(knobs)))
+            return DrawOrDispatchOverrideType::None;
 
-            gd->srv_gtao_depth = depth_srv;
-            gd->gtao_active_this_frame = true;
-            return DrawOrDispatchOverrideType::Replaced;
-         }
+         gd->srv_gtao_depth = depth_srv;
+         gd->gtao_active_this_frame = true;
+         return DrawOrDispatchOverrideType::Replaced;
+      }
 
-         // Horizon march: capture packed view normals and skip native work only after a successful takeover.
-         if (original_shader_hashes.Contains(kAOHorizonHash, reshade::api::shader_stage::compute))
+      // Horizon march: capture packed view normals and skip native work only after a successful takeover.
+      if (original_shader_hashes.Contains(kAOHorizonHash, reshade::api::shader_stage::compute))
+      {
+         if (!gd->gtao_active_this_frame)
+            return DrawOrDispatchOverrideType::None;
+         ComPtr<ID3D11ShaderResourceView> normals_srv;
+         native_device_context->CSGetShaderResources(0, 1, normals_srv.put());
+         if (normals_srv)
          {
-            if (!gd->gtao_active_this_frame)
-               return DrawOrDispatchOverrideType::None;
-            ComPtr<ID3D11ShaderResourceView> normals_srv;
-            native_device_context->CSGetShaderResources(0, 1, normals_srv.put());
-            if (normals_srv)
-            {
-               gd->srv_gtao_normals = normals_srv;
-            }
-
-            return DrawOrDispatchOverrideType::Replaced;
+            gd->srv_gtao_normals = normals_srv;
          }
 
-         // Blur: run all XeGTAO passes and write the game's final R8_UNORM u0; native apply performs composition.
-         if (original_shader_hashes.Contains(kAOBlurHash, reshade::api::shader_stage::compute))
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+
+      // Blur: run all XeGTAO passes and write the game's final R8_UNORM u0; native apply performs composition.
+      if (original_shader_hashes.Contains(kAOBlurHash, reshade::api::shader_stage::compute))
+      {
+         if (!gd->gtao_active_this_frame)
+            return DrawOrDispatchOverrideType::None;
+
+         ComPtr<ID3D11UnorderedAccessView> uav_final;
+         native_device_context->CSGetUnorderedAccessViews(0, 1, uav_final.put());
+         if (!uav_final)
+            return DrawOrDispatchOverrideType::Replaced; // Earlier native stages were already skipped.
+         if (!gd->srv_gtao_depth || !gd->srv_gtao_normals)
          {
-            if (!gd->gtao_active_this_frame)
-               return DrawOrDispatchOverrideType::None;
-
-            ComPtr<ID3D11UnorderedAccessView> uav_final;
-            native_device_context->CSGetUnorderedAccessViews(0, 1, uav_final.put());
-            if (!uav_final)
-               return DrawOrDispatchOverrideType::Replaced; // Earlier native stages were already skipped.
-            if (!gd->srv_gtao_depth || !gd->srv_gtao_normals)
-            {
-               // Missing fixed-order inputs: write neutral AO instead of applying stale data.
-               const FLOAT ones[4] = {1.f, 1.f, 1.f, 1.f};
-               native_device_context->ClearUnorderedAccessViewFloat(uav_final.get(), ones);
-               return DrawOrDispatchOverrideType::Replaced;
-            }
-
-            // Dispatch dimensions follow the captured depth allocation, not the DynamicScale content size; native
-            // apply ignores the region outside the content.
-            const uint32_t w = gd->gtao_w, h = gd->gtao_h;
-            DrawStateStack<DrawStateStackType::Compute> compute_state;
-            compute_state.Cache(native_device_context, device_data.uav_max_count);
-
-            ID3D11Buffer* gtao_cb = gd->cb_gtao.get();
-            native_device_context->CSSetConstantBuffers(11, 1, &gtao_cb);
-            ID3D11SamplerState* point_sampler = device_data.sampler_state_point.get();
-            native_device_context->CSSetSamplers(0, 1, &point_sampler);
-            // XeGTAO deliberately inherits native b0 ($Globals/ProjInfo) and b2 (MinZ_MaxZRatioCS): the immediate
-            // context runs a fixed contiguous AO chain with no ClearState, so the horizon-pass bindings persist.
-
-            // Each pass binds its destination UAVs before its source SRVs (the previous pass's SRVs cleared first): D3D11 otherwise keeps
-            // the previous UAV hazard and silently nulls the conflicting SRV
-            const auto dispatch = [&](uint32_t shader_name, std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs, UINT groups_x, UINT groups_y)
-            {
-               static constexpr std::array<ID3D11ShaderResourceView*, 2> srv_nulls = {};
-               static constexpr std::array<ID3D11UnorderedAccessView*, 5> uav_nulls = {};
-               native_device_context->CSSetShaderResources(0, UINT(srv_nulls.size()), srv_nulls.data());
-               native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uavs.begin(), nullptr);
-               native_device_context->CSSetShaderResources(0, UINT(srvs.size()), srvs.begin());
-               native_device_context->CSSetShader(FindShader(device_data.native_compute_shaders, shader_name), nullptr, 0);
-               native_device_context->Dispatch(groups_x, groups_y, 1);
-               native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uav_nulls.data(), nullptr);
-            };
-            // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
-            dispatch(kNameGTAOPrefilterCS, {gd->srv_gtao_depth.get()}, {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(), gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()}, (w + 15) / 16, (h + 15) / 16);
-            // Main pass writes AO and edges to working0.
-            dispatch(kNameGTAOMainPassCS, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get()}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
-            // First denoiser writes working1, two horizontal pixels per thread. Skipped when temporal: the final one reads working0.
-            const bool single_denoise = IsGTAOTemporal(device_data);
-            if (!single_denoise)
-            {
-               dispatch(kNameGTAODenoise1CS, {gd->srv_gtao_working[0].get()}, {gd->uav_gtao_working[1].get()}, (w + 15) / 16, (h + 7) / 8);
-            }
-            // Final denoiser writes the game's R8_UNORM AO target.
-            dispatch(kNameGTAODenoise2CS, {gd->srv_gtao_working[single_denoise ? 0 : 1].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
-
-            compute_state.Restore(native_device_context);
+            // Missing fixed-order inputs: write neutral AO instead of applying stale data.
+            const FLOAT ones[4] = {1.f, 1.f, 1.f, 1.f};
+            native_device_context->ClearUnorderedAccessViewFloat(uav_final.get(), ones);
             return DrawOrDispatchOverrideType::Replaced;
          }
+
+         // Dispatch dimensions follow the working area (the rendered share under the render scale, see the deinterleave)
+         const uint32_t w = gd->gtao_w, h = gd->gtao_h;
+         DrawStateStack<DrawStateStackType::Compute> compute_state;
+         compute_state.Cache(native_device_context, device_data.uav_max_count);
+
+         ID3D11Buffer* gtao_cb = gd->cb_gtao.get();
+         native_device_context->CSSetConstantBuffers(11, 1, &gtao_cb);
+         ID3D11SamplerState* point_sampler = device_data.sampler_state_point.get();
+         native_device_context->CSSetSamplers(0, 1, &point_sampler);
+         // XeGTAO deliberately inherits native b0 ($Globals/ProjInfo) and b2 (MinZ_MaxZRatioCS): the immediate
+         // context runs a fixed contiguous AO chain with no ClearState, so the horizon-pass bindings persist.
+
+         // Each pass binds its destination UAVs before its source SRVs (the previous pass's SRVs cleared first): D3D11 otherwise keeps
+         // the previous UAV hazard and silently nulls the conflicting SRV
+         const auto dispatch = [&](uint32_t shader_name, std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs, UINT groups_x, UINT groups_y)
+         {
+            static constexpr std::array<ID3D11ShaderResourceView*, 2> srv_nulls = {};
+            static constexpr std::array<ID3D11UnorderedAccessView*, 5> uav_nulls = {};
+            native_device_context->CSSetShaderResources(0, UINT(srv_nulls.size()), srv_nulls.data());
+            native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uavs.begin(), nullptr);
+            native_device_context->CSSetShaderResources(0, UINT(srvs.size()), srvs.begin());
+            native_device_context->CSSetShader(FindShader(device_data.native_compute_shaders, shader_name), nullptr, 0);
+            native_device_context->Dispatch(groups_x, groups_y, 1);
+            native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uav_nulls.data(), nullptr);
+         };
+         // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
+         dispatch(kNameGTAOPrefilterCS, {gd->srv_gtao_depth.get()}, {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(), gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()}, (w + 15) / 16, (h + 15) / 16);
+         // Main pass writes AO and edges to working0.
+         dispatch(kNameGTAOMainPassCS, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get()}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
+         // First denoiser writes working1, two horizontal pixels per thread. Skipped when temporal: the final one reads working0.
+         const bool single_denoise = IsGTAOTemporal(device_data);
+         if (!single_denoise)
+         {
+            dispatch(kNameGTAODenoise1CS, {gd->srv_gtao_working[0].get()}, {gd->uav_gtao_working[1].get()}, (w + 15) / 16, (h + 7) / 8);
+         }
+         // Final denoiser writes the game's R8_UNORM AO target.
+         dispatch(kNameGTAODenoise2CS, {gd->srv_gtao_working[single_denoise ? 0 : 1].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
+
+         compute_state.Restore(native_device_context);
+         return DrawOrDispatchOverrideType::Replaced;
       }
 
       return {};
@@ -2357,7 +2614,7 @@ public:
       const float pred_scale = (depth_ok ? kPredScale : 1.f);
 
       // Async loading and live reload may temporarily require the fallback.
-      if (smaa && !(HasSMAAShaders(device_data)))
+      if (smaa && !HasSMAAShaders(device_data))
          return fallback;
 
       const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, kPredThreshold, kPredStrength, 0.f};
@@ -2572,10 +2829,12 @@ public:
          }
       }
       // DLSS / FSR: the post passes up to stage 1 (the scene's last reader) read the upscaled scene; before the bloom capture below,
-      // which takes stage 1's scene
-      if (device_data.has_drawn_sr && gd.sr_input && !gd.sr_rebind_done)
+      // which takes stage 1's scene. The post view was already swapped to output size when the upscaler skips or fails (decided at
+      // the post process entry), so such a frame reads the render share stretched instead of cropped.
+      const bool post_at_output_size = EngineScale::g_post_at_output_size && gd.sr_active && gd.mv_scene_done;
+      if ((gd.sr_input || post_at_output_size) && !gd.sr_rebind_done)
       {
-         RebindUpscaledScene(native_device_context, gd, compute);
+         RebindUpscaledScene(native_device, native_device_context, device_data, &gd, compute);
          gd.sr_rebind_done = stage1;
       }
       // A draw without patched shaders gets the game's own back while the last patched draw's are still bound
@@ -2611,6 +2870,7 @@ public:
       // DLSS / FSR: the upscaler's history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the
       // motion vector state are fixed here for the next frame (see "IsSRActive")
       gd.sr_active = LatchSRFrame(device_data);
+      EngineScale::Apply(gd.sr_active);
       const bool mv_was_active = gd.mv_active.exchange(IsSRActive(device_data) || g_mv_enable);
       if (mv_was_active && !gd.mv_active)
       {
@@ -2629,6 +2889,9 @@ public:
          gd.mv_previous_camera.reset();
          gd.view_camera.reset();
          gd.scene_view_camera.reset();
+         // No scene opens to rewrite it, and the engine's render scale is off from the next frame (see "EngineScale::Apply"): a share
+         // left from the scaled frames would keep XeGTAO's working area cropped (see "IsRenderShare")
+         gd.render_size = {};
       }
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again). The DEV
       // "MV Enable" still draws motion vectors without an upscaler: their resources stay then.
@@ -2657,6 +2920,8 @@ public:
          gd.mv_depth_srv.reset();
          gd.mv_depth.reset();
          gd.mv_depth_copy.reset();
+         gd.render_share_stretches.clear();
+         gd.render_share_stretch_buffer.reset();
          gd.mv_scene_color.reset();
          gd.mv_scene_color_copy.reset();
          gd.mv_fill_buffer.reset();
@@ -2728,12 +2993,8 @@ public:
          gd.mv_stats.constants_pool = uint32_t(gd.mv_constants_pool.size());
 #endif
       }
-      if (!custom_texture_mip_lod_bias_offset)
-      {
-         const std::unique_lock lock(s_mutex_samplers);
-         // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
-         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
-      }
+      // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
+      SetTextureMipLodBias(nullptr, device_data, IsSRActive(device_data) ? SR::GetMipLODBias(gd.render_size[1] != 0 ? float(gd.render_size[1]) : device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
 #if DEVELOPMENT
       // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, after 60
       // settle frames whenever the settings it keys on change) and opens the next frame's
@@ -2879,32 +3140,21 @@ public:
       // The only runtime writer of the effective bloom values: the UI edits only the raw slider and enable, so raw and derived values
       // can't oscillate while dragging. Native bloom keeps intensity 1.
       {
+         const auto set = [&](float* setting, float value)
+         {
+            if (fabsf(*setting - value) > 1e-4f)
+            {
+               *setting = value;
+               device_data.cb_luma_global_settings_dirty = true;
+            }
+         };
          auto& gs = cb_luma_global_settings.GameSettings;
          const float scale = (gd.bloom_scale_live >= 0.f ? std::clamp(gd.bloom_scale_live, 0.f, 4.f) : 1.f);
-         float effective_intensity = 1.f;
-         if (g_bloom_enable)
-         {
-            effective_intensity = g_bloom_intensity * scale;
-         }
-         if (fabsf(gs.BloomIntensity - effective_intensity) > 1e-4f)
-         {
-            gs.BloomIntensity = effective_intensity;
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         set(&gs.BloomIntensity, g_bloom_enable ? g_bloom_intensity * scale : 1.f);
          // The prefilter's cap follows the native scale alone, so the slider still scales capped sources (Luma_Bloom_impl.hlsl)
-         if (fabsf(gs.BloomScale - scale) > 1e-4f)
-         {
-            gs.BloomScale = scale;
-            device_data.cb_luma_global_settings_dirty = true;
-         }
-
+         set(&gs.BloomScale, scale);
          // Follow native per-scene cb0.y; the default until the first readback.
-         const float effective_threshold = (gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : default_luma_global_game_settings.BloomThreshold);
-         if (fabsf(gs.BloomThreshold - effective_threshold) > 1e-4f)
-         {
-            gs.BloomThreshold = effective_threshold;
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         set(&gs.BloomThreshold, gd.bloom_threshold_live >= 0.f ? gd.bloom_threshold_live : default_luma_global_game_settings.BloomThreshold);
       }
    }
 
@@ -2912,6 +3162,8 @@ public:
    {
       reshade::get_config_value(nullptr, PROJECT_NAME, "SMAAEnable", g_smaa_enable);
       reshade::get_config_value(nullptr, PROJECT_NAME, "RCASSharpness", g_rcas_sharpness);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "RenderScale", EngineScale::g_render_scale);
+      EngineScale::g_render_scale = std::clamp(EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, 1.f);
       auto& gs = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, PROJECT_NAME, "Exposure", gs.Exposure);
       reshade::get_config_value(nullptr, PROJECT_NAME, "Saturation", gs.Saturation);
@@ -2935,6 +3187,29 @@ public:
    {
       ImGui::SeparatorText("Anti-Aliasing");
       const bool sr_active = IsSRActive(device_data);
+      if (EngineScale::installed)
+      {
+         ImGui::BeginDisabled(!sr_active);
+         // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
+         static int held_render_scale = 0; // The slider's value while it's held, else 0
+         int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(EngineScale::g_render_scale * 100.f)));
+         ImGui::SliderInt("Render Scale (%)", &render_scale, int(EngineScale::MIN_RENDER_SCALE * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+         held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+         {
+            EngineScale::g_render_scale = float(render_scale) / 100.f;
+            reshade::set_config_value(nullptr, PROJECT_NAME, "RenderScale", EngineScale::g_render_scale);
+         }
+         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
+            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR.");
+         }
+         if (DrawResetButton<float, false>(EngineScale::g_render_scale, 1.f, "RenderScale"))
+         {
+            reshade::set_config_value(nullptr, PROJECT_NAME, "RenderScale", EngineScale::g_render_scale);
+         }
+         ImGui::EndDisabled();
+      }
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
@@ -3180,6 +3455,15 @@ public:
       ImGui::Text("Refused:%s", FormatRejects(stats).c_str());
       ImGui::Text("Last checked target: format %u, dimension %u, %ux%u (output %.0fx%.0f)", stats.rejected_format, stats.rejected_dimension, stats.rejected_width, stats.rejected_height, double(device_data.output_resolution.x), double(device_data.output_resolution.y));
       ImGui::Text("Constant copies: %u registered buffers, %u pooled, %u destroyed; FXAA dispatches skipped: %u", stats.registered_buffers, stats.constants_pool, gd.mv_destroyed_buffers, stats.fxaa_skipped);
+
+      ImGui::SeparatorText("Render scale");
+      ImGui::BeginDisabled(!EngineScale::installed);
+      ImGui::Checkbox("Post At Output Size", &EngineScale::g_post_at_output_size);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Sets the view to its unscaled size before the post process loop: DoF, bloom and stage 1 run at output size on the\nupscaler's output. Off: they run in the render share and read the upscaled scene cropped (A/B only). Not saved.");
+      }
+      ImGui::EndDisabled();
 
       ImGui::SeparatorText("Performance");
       Perf::DrawCombo(perf_test_modes, &g_perf_sweep, [&](int mode_index)
