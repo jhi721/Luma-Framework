@@ -449,7 +449,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    std::array<uint32_t, 2> sr_render_size = {};
    // The upscaler runs before the post chain, on the linear scene: the scene draws' last target (the scene color). Its exposure (1x1,
    // written by the fill) from the last exposure pass's adaptation texture (t1, the gain at .z) and constants; under the render scale
-   // the linear depth's copy and view for its stretch over the surface
+   // the linear depth's copy and view for its stretch over the surface, and the scene color's copy for its stretch on a frame the
+   // upscaler doesn't upscale
    com_ptr<ID3D11RenderTargetView> mv_scene_color_rtv;
    ID3D11RenderTargetView* mv_seen_rtv = nullptr; // The last scene draw's first target, checked once per change
    com_ptr<ID3D11ShaderResourceView> sr_adaptation_srv;
@@ -460,6 +461,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> render_area_depth_copy;
    com_ptr<ID3D11ShaderResourceView> render_area_depth_copy_srv;
    com_ptr<ID3D11RenderTargetView> render_area_depth_rtv;
+   com_ptr<ID3D11Texture2D> render_area_color_copy;
+   com_ptr<ID3D11ShaderResourceView> render_area_color_copy_srv;
    // The projection jitter (pixels, +y down), chosen when the scene opens; its NDC offset is at VS "MotionVectorPatches::jitter_slot"
    // of every mesh draw depth tested against the scene
    std::array<float, 2> mv_jitter = {};
@@ -2159,18 +2162,57 @@ class TheWitcher2Game final : public Game
 #endif
          }
       }
-      // The upscaler's depth comes from the fill
-      if (IsSRActive(device_data) && filled)
-      {
-         [[maybe_unused]] const bool drawn = DrawUpscaler(native_device, native_device_context, device_data, scene_rtv, write_reactive);
+      // The upscaler's depth comes from the fill. Not upscaled while the SR bridge's helper starts (it copies the color as it is), e.g.
+      // the frame an upscaler is picked
+      const bool upscaled = IsSRActive(device_data) && filled && DrawUpscaler(native_device, native_device_context, device_data, scene_rtv, write_reactive) && device_data.has_drawn_sr;
 #if DEVELOPMENT
-         gd.mv_stats.sr_draws += drawn;
+      gd.mv_stats.sr_draws += upscaled;
 #endif
+      // Render scale without an upscaled scene (DLSS-Best-Practices POST-9): the area stretched over the surface from a copy, so the
+      // post chain never shows it in the corner
+      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+      auto* const color_stretch_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Color Stretch PS"));
+      com_ptr<ID3D11Resource> scene_resource;
+      if (scene_rtv)
+      {
+         scene_rtv->GetResource(&scene_resource);
+      }
+      com_ptr<ID3D11Texture2D> scene;
+      if (scaled && !upscaled && gd.mv_jitter_buffer && copy_vs && color_stretch_ps && scene_resource && SUCCEEDED(scene_resource->QueryInterface(&scene)))
+      {
+         D3D11_TEXTURE2D_DESC scene_desc, copy_desc = {};
+         scene->GetDesc(&scene_desc);
+         if (gd.render_area_color_copy)
+         {
+            gd.render_area_color_copy->GetDesc(&copy_desc);
+         }
+         if (copy_desc.Width != scene_desc.Width || copy_desc.Height != scene_desc.Height || copy_desc.Format != scene_desc.Format || copy_desc.ArraySize != scene_desc.ArraySize)
+         {
+            gd.render_area_color_copy.reset();
+            gd.render_area_color_copy_srv.reset();
+            copy_desc = scene_desc;
+            copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            copy_desc.MiscFlags = 0;
+            copy_desc.CPUAccessFlags = 0;
+            copy_desc.Usage = D3D11_USAGE_DEFAULT;
+            // dgVoodoo's targets are single-slice arrays: a plain 2D view of the first slice
+            const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (SUCCEEDED(native_device->CreateTexture2D(&copy_desc, nullptr, &gd.render_area_color_copy)))
+            {
+               native_device->CreateShaderResourceView(gd.render_area_color_copy.get(), &srv_desc, &gd.render_area_color_copy_srv);
+            }
+         }
+         if (gd.render_area_color_copy_srv)
+         {
+            native_device_context->CopyResource(gd.render_area_color_copy.get(), scene.get());
+            ID3D11Buffer* const area_scale = gd.mv_jitter_buffer.get();
+            native_device_context->PSSetConstantBuffers(0, 1, &area_scale);
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, color_stretch_ps, gd.render_area_color_copy_srv.get(), scene_rtv, scene_desc.Width, scene_desc.Height);
+         }
       }
       // Render scale: DoF and the light shafts read the G-buffer's linear depth over the whole surface, the scene drew its area. The
       // upscaler's depth is the fill's, so stretched (nearest) after it, from a copy.
       auto* const stretch_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Depth Stretch PS"));
-      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       com_ptr<ID3D11Texture2D> linear_depth;
       if (scaled && gd.mv_linear_depth && gd.mv_jitter_buffer && stretch_ps && copy_vs && SUCCEEDED(gd.mv_linear_depth->QueryInterface(&linear_depth)))
       {
@@ -2810,6 +2852,8 @@ public:
          ShaderDefinition("Luma_TW2_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Render Area Depth Stretch PS"),
          ShaderDefinition{"Luma_TW2_RenderArea", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_stretch_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Render Area Color Stretch PS"),
+         ShaderDefinition{"Luma_TW2_RenderArea", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "color_stretch_ps"});
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
@@ -3128,6 +3172,8 @@ public:
          game_device_data.render_area_depth_copy.reset();
          game_device_data.render_area_depth_copy_srv.reset();
          game_device_data.render_area_depth_rtv.reset();
+         game_device_data.render_area_color_copy.reset();
+         game_device_data.render_area_color_copy_srv.reset();
          if (!g_mv_enable)
          {
             const std::unique_lock lock(game_device_data.mv_mutex);
