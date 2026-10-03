@@ -156,10 +156,14 @@ static float g_bloom_intensity = 1.0f;
 static constexpr uint32_t kVideoBinkHash = 0x7B5C59DF;
 
 // XeGTAO replaces the half-resolution GFSDK HBAO+ chain, writing the game's R8_UNORM AO target at the blur
-// dispatch; the native apply blit still composites. Noise and denoise pass count follow "IsGTAOTemporal".
-static constexpr uint32_t kAODeinterleaveHash = 0x497830D8; // Depth deinterleave: skipped after capture.
-static constexpr uint32_t kAOHorizonHash = 0x80212FD6;      // Horizon march: skipped after normal capture.
+// dispatch; the game's apply blit composites it. Noise and denoise pass count follow "IsGTAOTemporal".
+// It fills the whole AO target (half the output) at any render scale, from the full size scene depth and view normals:
+// HBAO+'s own inputs are half the render resolution, a quarter of the output at 50%, which washed out contact AO.
+static constexpr uint32_t kAODownsampleHash = 0xA75E6C32;   // Depth and normals downsample (PS): its full size sources captured.
+static constexpr uint32_t kAODeinterleaveHash = 0x497830D8; // Depth deinterleave: skipped.
+static constexpr uint32_t kAOHorizonHash = 0x80212FD6;      // Horizon march: skipped.
 static constexpr uint32_t kAOBlurHash = 0x06D92B08;         // Blur: replaced with XeGTAO.
+static constexpr uint32_t kAOApplyHash = 0x2E826C0F;        // Apply (PS, replaced): AO UV scale in LumaData.CustomData3/4.
 
 static bool g_gtao_enable = true;
 static bool g_video_auto_hdr_enable = true; // Expand Bink highlights in HDR; off preserves vanilla SDR video.
@@ -613,7 +617,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // SMAA or the upscaler owns this frame's FXAA resolve: every FXAA dispatch is skipped (decided at the prepass)
    bool fxaa_replaced = false;
 
-   // XeGTAO inputs at half-res AO size: R24 depth from deinterleave t0, packed R8G8 view normals from horizon t0.
+   // XeGTAO inputs at output size (the downsample's t0 and t1): R24 scene depth and packed view normals (xy in RGBA8).
    ComPtr<ID3D11ShaderResourceView> srv_gtao_depth;
    ComPtr<ID3D11ShaderResourceView> srv_gtao_normals;
    // Set only after a complete takeover at deinterleave; otherwise the native chain remains intact.
@@ -2691,32 +2695,59 @@ public:
    // Take over HBAO+ only when every XeGTAO shader and resource is ready at the first dispatch, otherwise the
    // whole native deinterleave -> horizon -> blur -> apply chain stays active. A returned value is terminal for
    // the callback; nullopt means XeGTAO is off or no AO hash matched, and the caller continues.
-   std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
+   std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, MassEffectGameDeviceData* gd, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool* updated_cbuffers)
    {
+      // Apply (also with XeGTAO off: the replacement always reads the scale): the scene UV reaches only the rendered share of the AO
+      // target, which is all the native chain fills, while XeGTAO fills the whole target
+      if (original_shader_hashes.Contains(kAOApplyHash, reshade::api::shader_stage::pixel))
+      {
+         const bool whole_target = gd->gtao_active_this_frame && IsRenderShare(device_data, *gd);
+         const float uv_scale_x = (whole_target ? device_data.output_resolution.x / float(gd->render_size[0]) : 1.f);
+         const float uv_scale_y = (whole_target ? device_data.output_resolution.y / float(gd->render_size[1]) : 1.f);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, uv_scale_x, uv_scale_y);
+         *updated_cbuffers = true;
+         return {};
+      }
+
       if (!g_gtao_enable)
          return {};
 
-      // Deinterleave: capture half-resolution R24 depth, prepare all scratch resources, then skip native work.
+      // Depth and normals downsample: runs natively (its half size outputs feed only the skipped HBAO+ passes), its sources are XeGTAO's
+      if (original_shader_hashes.Contains(kAODownsampleHash, reshade::api::shader_stage::pixel))
+      {
+         ComPtr<ID3D11ShaderResourceView> depth_srv;
+         ComPtr<ID3D11ShaderResourceView> normals_srv;
+         native_device_context->PSGetShaderResources(0, 1, depth_srv.put());
+         native_device_context->PSGetShaderResources(1, 1, normals_srv.put());
+         gd->srv_gtao_depth = depth_srv;
+         gd->srv_gtao_normals = normals_srv;
+         return {};
+      }
+
+      // Deinterleave: prepare all scratch resources at its depth's size (the AO target's), then skip native work.
       if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
       {
-         if (!HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS))
+         if (!HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS) || !gd->srv_gtao_depth || !gd->srv_gtao_normals)
             return DrawOrDispatchOverrideType::None;
 
-         ComPtr<ID3D11ShaderResourceView> depth_srv;
-         native_device_context->CSGetShaderResources(0, 1, depth_srv.put());
-         if (!depth_srv)
+         ComPtr<ID3D11ShaderResourceView> ao_depth_srv;
+         native_device_context->CSGetShaderResources(0, 1, ao_depth_srv.put());
+         if (!ao_depth_srv)
             return DrawOrDispatchOverrideType::None;
-         uint4 depth_size{};
-         DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
-         GetResourceInfo(depth_srv.get(), depth_size, depth_format);
-         if (depth_size.x == 0 || depth_size.y == 0)
+         uint4 ao_size{};
+         uint4 scene_depth_size{};
+         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+         GetResourceInfo(ao_depth_srv.get(), ao_size, format);
+         GetResourceInfo(gd->srv_gtao_depth.get(), scene_depth_size, format);
+         const uint32_t w = ao_size.x, h = ao_size.y;
+         if (w == 0 || h == 0 || scene_depth_size.x < w || scene_depth_size.y < h)
             return DrawOrDispatchOverrideType::None;
-         // The working area is the rendered share of the half size AO targets under the engine's render scale (the whole target at
-         // native): XeGTAO's clamped samples then stop at its edge instead of reading the stale depth beyond it
-         const float2 output_size = device_data.output_resolution;
+         // Scene depth and normal pixels per AO pixel: the AO target spans the rendered share of the output sized sources (all of them
+         // at native, 2), so at 50% render scale AO is computed per rendered pixel
          const bool render_share = IsRenderShare(device_data, *gd);
-         const uint32_t w = (render_share ? (std::min)(depth_size.x, uint32_t(std::ceil(float(depth_size.x) * float(gd->render_size[0]) / output_size.x))) : depth_size.x);
-         const uint32_t h = (render_share ? (std::min)(depth_size.y, uint32_t(std::ceil(float(depth_size.y) * float(gd->render_size[1]) / output_size.y))) : depth_size.y);
+         const float depth_load_scale_x = float(render_share ? gd->render_size[0] : scene_depth_size.x) / float(w);
+         const float depth_load_scale_y = float(render_share ? gd->render_size[1] : scene_depth_size.y) / float(h);
 
          if (gd->gtao_w != w || gd->gtao_h != h || !gd->tex_gtao_depth_mips || !gd->tex_gtao_working[1])
          {
@@ -2763,30 +2794,18 @@ public:
 #else
          const float dbg = 0.f;
 #endif
-         // knobs[4] is the noise index (see "IsGTAOTemporal"), [5]-[6] the working area's pixel size
-         const float knobs[8] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 1.f / float(w), 1.f / float(h)};
+         // knobs[4] is the noise index (see "IsGTAOTemporal"), [5]-[6] the AO target's pixel size, [8]-[9] the depth load scale
+         const float knobs[12] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 1.f / float(w), 1.f / float(h), 0.f, depth_load_scale_x, depth_load_scale_y};
          if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), knobs, sizeof(knobs)))
             return DrawOrDispatchOverrideType::None;
 
-         gd->srv_gtao_depth = depth_srv;
          gd->gtao_active_this_frame = true;
          return DrawOrDispatchOverrideType::Replaced;
       }
 
-      // Horizon march: capture packed view normals and skip native work only after a successful takeover.
+      // Horizon march: skipped after a successful takeover.
       if (original_shader_hashes.Contains(kAOHorizonHash, reshade::api::shader_stage::compute))
-      {
-         if (!gd->gtao_active_this_frame)
-            return DrawOrDispatchOverrideType::None;
-         ComPtr<ID3D11ShaderResourceView> normals_srv;
-         native_device_context->CSGetShaderResources(0, 1, normals_srv.put());
-         if (normals_srv)
-         {
-            gd->srv_gtao_normals = normals_srv;
-         }
-
-         return DrawOrDispatchOverrideType::Replaced;
-      }
+         return (gd->gtao_active_this_frame ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None);
 
       // Blur: run all XeGTAO passes and write the game's final R8_UNORM u0; native apply performs composition.
       if (original_shader_hashes.Contains(kAOBlurHash, reshade::api::shader_stage::compute))
@@ -2806,7 +2825,7 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
          }
 
-         // Dispatch dimensions follow the working area (the rendered share under the render scale, see the deinterleave)
+         // Dispatch dimensions follow the AO target (see the deinterleave)
          const uint32_t w = gd->gtao_w, h = gd->gtao_h;
          DrawStateStack<DrawStateStackType::Compute> compute_state;
          compute_state.Cache(native_device_context, device_data.uav_max_count);
@@ -3256,7 +3275,7 @@ public:
 
       InjectBloomAndDepth(native_device, native_device_context, device_data, &gd, stage1_perm);
 
-      if (const auto gtao_result = RunXeGTAO(native_device, native_device_context, device_data, &gd, original_shader_hashes))
+      if (const auto gtao_result = RunXeGTAO(native_device, native_device_context, cmd_list_data, device_data, &gd, stages, original_shader_hashes, &updated_cbuffers))
          return *gtao_result;
 
       return RunSMAAResolve(native_device, native_device_context, device_data, &gd, original_shader_hashes, is_custom_pass);

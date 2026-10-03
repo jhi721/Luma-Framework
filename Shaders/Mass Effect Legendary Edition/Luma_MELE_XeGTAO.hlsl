@@ -2,13 +2,14 @@
 // Source: https://github.com/GameTechDev/XeGTAO
 //
 // MELE-specific contracts shared by all three games:
-// - Run at AO half resolution (on the rendered share under the render scale) and write visibility to blur u0, the game's final R8_UNORM AO target.
-//   The native apply shader 0x2E826C0F still blends dst*src_color into the fp16 scene.
+// - Run over the whole AO target (half the output at any render scale) and write visibility to blur u0, the game's final R8_UNORM AO
+//   target. The apply shader 0x2E826C0F (replaced: it scales the scene UV onto the whole target) blends dst*src_color into the fp16 scene.
 // - Inherit cb0 HBAO+ $Globals and cb2 CSOffsetConstants; layouts come from live disassembly of
 //   0x80212FD6/0x06D92B08 and retain standard GFSDK offsets.
-// - Depth input = the game's half-res r24_unorm_x8 depth copy (deinterleave 0x497830D8 t0), read with explicit
-//   Loads (see XeGTAO_PrefilterDepths16x16).
-// - ViewNormalTex from horizon shader 0x80212FD6 stores view-space xy in R8G8_UNORM; reconstruct z locally.
+// - Depth input = the output sized r24_unorm_x8 scene depth (the depth and normals downsample 0xA75E6C32's t0), read with explicit
+//   Loads (see XeGTAO_PrefilterDepths16x16) at DepthLoadScaleRT scene pixels per AO pixel: 2 at native, 1 at 50% render scale.
+// - Normals = that downsample's t1 (FullSizedNormalsTexture, view-space xy in RGBA8; HBAO+'s ViewNormalTex is its half size copy),
+//   read at the same scale; z is reconstructed locally.
 // - Noise: frozen at 0 without an upscaler (the game has no TAA: a frame index would make the pattern boil), and denoise runs
 //   twice. With DLSS/FSR (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once, as
 //   Intel's XeGTAO.h advises with TAA (NoiseIndexRT, set by main.cpp). The quality default is Very High.
@@ -49,7 +50,9 @@ cbuffer LumaGTAO : register(b11)
    float RadiusOverrideRT;  // Positive values override EFFECT_RADIUS after depth scaling.
    float DebugViewRT;       // DEVELOPMENT / TEST debug view (legend in Includes/XeGTAO.hlsl)
    float NoiseIndexRT;      // frame % 64 with DLSS/FSR, 0 otherwise (see the header).
-   float2 PixelSizeRT;      // 1 / the working area: the rendered share of the AO targets (all of them at native).
+   float2 PixelSizeRT;      // 1 / the AO target's size.
+   float PaddingRT;
+   float2 DepthLoadScaleRT; // Scene depth and normal pixels per AO pixel: the rendered size over the AO target's.
 }
 
 #include "Includes/Common.hlsl"
@@ -63,10 +66,10 @@ cbuffer LumaGTAO : register(b11)
 // ViewNormalTex z sign; view-space normals face the camera.
 #define NORMAL_Z_SIGN (-1.0)
 
-// Under the engine's render scale the scene fills only the top-left DynamicScaleCS.xy share of the AO targets, and
-// InvFullResolution stays the allocation's. XeGTAO's working textures are sized to that share instead (main.cpp), so UVs span the
-// rendered area and the clamped depth samples stop at its edge.
-#define VIEWPORT_PIXEL_SIZE PixelSizeRT
+// The AO target spans the rendered area at any render scale (its depth is loaded from the rendered share of the scene depth), so its
+// UVs are the rendered area's. InvFullResolution is the AO allocation's, as HBAO+ fills only its rendered share.
+#define VIEWPORT_PIXEL_SIZE      PixelSizeRT
+#define XE_GTAO_DEPTH_LOAD_SCALE DepthLoadScaleRT
 
 // GFSDK ProjInfo contains the live NDC-to-view multiply/add pair, including dialogue zoom, for UVs of the rendered area.
 #define NDC_TO_VIEW_MUL           ProjInfo.xy
@@ -83,17 +86,17 @@ float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
    return max(0.0, viewZ) / max(1e-3, DepthScaleRT);
 }
 
-Texture2D tex1 : register(t1); // native packed R8G8 view-space normals
+Texture2D tex1 : register(t1); // the scene's packed view-space normals (xy)
 
 // Unit z from the packed view-space xy (see NORMAL_Z_SIGN).
 float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 {
-   float2 nxy = tex1.Load(int3(pixCoord, 0)).xy * 2.0 - 1.0;
+   float2 nxy = tex1.Load(int3(pixCoord * DepthLoadScaleRT, 0)).xy * 2.0 - 1.0;
    float3 viewspaceNormal;
    viewspaceNormal.xy = nxy;
    viewspaceNormal.z = NORMAL_Z_SIGN * sqrt(saturate(1.0 - dot(nxy, nxy)));
    return normalize(viewspaceNormal);
 }
 
-// tex0 = native half-resolution R24_UNORM_X8 depth captured at deinterleave (prefilter).
+// tex0 = the output sized R24_UNORM_X8 scene depth captured at the downsample (prefilter).
 #include "../Includes/XeGTAO.hlsl"
