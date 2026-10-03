@@ -1,13 +1,8 @@
-// DLSS/FSR inputs from the scene's alpha, the encoded view depth (see "Includes/SceneDepth.hlsl"): the device depth, and the camera
-// motion for the motion vector pixels no patched draw wrote (still the marker 65504 from the frame start, the largest float16: sky, unpatched
-// draws), that depth reprojected from the current to the previous frame's camera (vc4 view projection, turned into column vectors
-// on the CPU, PreViewTranslation change included). Depth isn't reversed. As in ME1's fill, the game has no depth view to read.
-// Also FSR's masks, when enabled, from what the alpha blended draws wrote themselves (Mass Effect 2007's, see
-// "MotionVectorPatch::PatchPixelShaderReactive", max blended). They draw without motion vectors of their own, so FSR would keep the
-// history of what's behind them (ghosting). The reactive one from all of them: scaled, then 0 under the threshold and 0.9 over it
-// (a low one shakes static glows), or without a threshold capped at 0.9 so FSR still keeps a little history. The transparency &
-// composition one from the non-additive ones (smoke, glass, water), as is (AMD's sample passes the alpha).
+// DLSS/FSR inputs from the scene's alpha, the encoded view depth (see "Includes/SceneDepth.hlsl"): the device depth, the camera
+// motion (vc4 view projection, turned into column vectors on the CPU, PreViewTranslation change included) and, when enabled, FSR's
+// masks (see "Includes/MotionVectorFill.hlsl"). Depth isn't reversed. As in ME1's fill, the game has no depth view to read.
 
+#include "../Includes/MotionVectorFill.hlsl"
 #include "Includes/SceneDepth.hlsl"
 
 cbuffer MotionVectorFill : register(b0)
@@ -35,18 +30,12 @@ RWTexture2D<float> transparency : register(u3);
       return;
    if (reactive_enabled != 0.0)
    {
-      const float2 mask = mask_input.Load(int3(id.xy, 0));
-      const float reactivity = mask.x * reactive_scale;
-      reactive[id.xy] = reactive_threshold > 0.0 ? (reactivity < reactive_threshold ? 0.0 : 0.9) : min(reactivity, 0.9);
-      transparency[id.xy] = mask.y;
+      WriteFsrMasks(reactive, transparency, id.xy, mask_input.Load(int3(id.xy, 0)), reactive_scale, reactive_threshold);
    }
    // max() also drops a NaN; a cleared (0) alpha lands on the near plane
    const float depth = saturate(depth_from_view.x + depth_from_view.y / max(DecodeFloatW(scene.Load(int3(id.xy, 0)).a), 1e-4));
    device_depth[id.xy] = depth;
-   if (motion_vectors[id.xy].x < 65504.0)
+   if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
       return;
-   const float4 current = float4((id.xy + 0.5) / size * float2(2.0, -2.0) + float2(-1.0, 1.0) - jitter_ndc, depth, 1.0);
-   const float4 previous = mul(reprojection, current);
-   // Previous minus current, UV space, like the patched draws
-   motion_vectors[id.xy] = (previous.xy / previous.w - current.xy) * float2(0.5, -0.5);
+   WriteCameraMotion(motion_vectors, id.xy, size, reprojection, jitter_ndc, depth);
 }
