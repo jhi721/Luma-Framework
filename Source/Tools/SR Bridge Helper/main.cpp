@@ -435,17 +435,24 @@ int main()
          profile.reset();
    }
 
+   // An exit after "ready" first sets "out" past every frame: the game's GPU may already wait for the next frame, and only a killed
+   // process's fences jump there by themselves. The bridge reads it as an exited helper.
+   const auto release_game = [&]
+   {
+      context4->Signal(fence_out.Get(), UINT64_MAX);
+      context->Flush();
+   };
    Frame frame;
-   uint32_t frames = 0, failures = 0;
+   uint32_t frames = 0;
    std::string message;
    while (std::cin >> message)
    {
       if (message == "settings")
       {
          if (!(std::cin >> settings))
-            return printf("[Luma Upscaler] FAIL bad settings line\n"), 1;
+            return release_game(), printf("[Luma Upscaler] FAIL bad settings line\n"), 1;
          if (dlss ? !dlss->CreateFeature(context.Get(), settings) : !fsr->Create(device.Get(), settings))
-            return 1;
+            return release_game(), 1;
          printf("[Luma Upscaler] recreated: %ux%u -> %ux%u, preset %d\n", settings.render_width, settings.render_height, settings.output_width, settings.output_height,
             settings.render_preset);
          fflush(stdout);
@@ -453,7 +460,7 @@ int main()
       }
       if (message != "frame" || !(std::cin >> frame.n >> frame.jitter_x >> frame.jitter_y >> frame.reset >> frame.render_width >> frame.render_height >> frame.pre_exposure >>
                                    frame.sharpness >> frame.near_plane >> frame.far_plane >> frame.vert_fov))
-         return printf("[Luma Upscaler] FAIL bad line \"%s\"\n", message.c_str()), 1;
+         return release_game(), printf("[Luma Upscaler] FAIL bad line \"%s\"\n", message.c_str()), 1;
       if (profile)
          profile->Begin(context.Get(), frame.n);
       context4->Wait(fence_in.Get(), frame.n);
@@ -467,13 +474,17 @@ int main()
       if (profile)
          profile->End();
       frames++;
-      if (!drawn && failures++ < 5)
+      // Exiting tells the game: its bridge then fails like an in-process upscaler and the game falls back, instead of showing the
+      // last good output as its frames
+      if (!drawn)
       {
-         printf("[Luma Upscaler] frame %llu: the upscaler failed\n", (unsigned long long)frame.n);
-         fflush(stdout);
+         release_game();
+         if (profile)
+            profile->Finish(context.Get());
+         return printf("[Luma Upscaler] FAIL frame %llu: the upscaler failed\n", (unsigned long long)frame.n), 1;
       }
    }
-   printf("[Luma Upscaler] the game closed the pipe after %u frames (%u failed)\n", frames, failures);
+   printf("[Luma Upscaler] the game closed the pipe after %u frames\n", frames);
    if (profile)
       profile->Finish(context.Get());
    return 0;

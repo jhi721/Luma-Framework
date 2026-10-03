@@ -13,7 +13,8 @@
 // Then a line per message:
 // "settings <settings>": the helper recreates the upscaler on the same textures (it exits if it can't).
 // "frame <n> <jitter x> <jitter y> <reset> <render width> <render height> <pre exposure> <sharpness> <near> <far> <vertical fov>":
-//   the helper waits for "in" n, upscales and signals "out" n (n past "kReady").
+//   the helper waits for "in" n, upscales and signals "out" n (n past "kReady"); it exits if the upscaler failed.
+// Any exit after "kReady" first signals "out" UINT64_MAX (no game wait is left hanging; the bridge reads it as an exit).
 // EOF ends it.
 namespace SRBridgeProtocol
 {
