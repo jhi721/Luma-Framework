@@ -578,10 +578,11 @@ enum MotionVectorReject : int
    REJECT_SIZE,
    REJECT_CREATE,
    REJECT_BLEND,
+   REJECT_DEPTH_TEST,
    REJECT_SHADERS,
    REJECT_COUNT
 };
-static constexpr const char* kMotionVectorRejectNames[REJECT_COUNT] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
+static constexpr const char* kMotionVectorRejectNames[REJECT_COUNT] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "depth_test", "shaders"};
 
 // Per-device resources and per-frame state. SMAA detects edges on a gamma snapshot and blends it filtered in linear light.
 struct MassEffectGameDeviceData final : public GameDeviceData
@@ -1656,12 +1657,13 @@ class MassEffectLE final : public Game
       }
       // A draw that writes no color owns its pixels only if it writes depth: the alpha tested depth pass of long hair (ME3 LE
       // 0x89BD83EE, its color drawn blended afterwards), not occlusion query bounding boxes (depth tested, not written)
-      if (game_device_data.mv_blend_depth_only)
-      {
-         CacheDepthStencilState(native_device_context, &game_device_data);
-      }
+      CacheDepthStencilState(native_device_context, &game_device_data);
       if (!game_device_data.mv_blend_opaque && !(game_device_data.mv_blend_depth_only && game_device_data.depth_write))
          return MV_REJECT(REJECT_BLEND);
+      // Nor does a screen effect material drawn as a quad without depth test (ME1 LE 0x19008AFC, opaque, over the whole output on snow
+      // planets): its motion vectors (none) replaced the whole scene's, and DLSS / FSR smeared any camera motion
+      if (!game_device_data.depth_test)
+         return MV_REJECT(REJECT_DEPTH_TEST);
 
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
       if (const uint32_t pixel_shader_hash = original_shader_hashes.pixel_shaders[0]; pixel_shader_hash != game_device_data.mv_last_pixel_shader_hash)
