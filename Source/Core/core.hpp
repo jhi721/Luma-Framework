@@ -6543,6 +6543,23 @@ namespace
       }
    }
 
+   // Sets the mip bias of the upgraded samplers. Core's per-draw check swaps the bound samplers at the next draw; from inside a draw
+   // (after that check: pass "cmd_list_data") they're swapped right away, and recorded so the check doesn't swap them again.
+   void SetTextureMipLodBias(ID3D11DeviceContext* native_device_context, DeviceData& device_data, float bias, CommandListData* cmd_list_data = nullptr)
+   {
+      if (custom_texture_mip_lod_bias_offset)
+         return;
+      const std::unique_lock lock(s_mutex_samplers);
+      if (device_data.texture_mip_lod_bias_offset == bias)
+         return;
+      device_data.texture_mip_lod_bias_offset = bias;
+      if (cmd_list_data && enable_samplers_upgrade && !ignore_upgraded_samplers)
+      {
+         RebindUpgradedSamplers(native_device_context, device_data);
+         cmd_list_data->applied_texture_mip_lod_bias_offset = bias;
+      }
+   }
+
    // Return false to prevent the original draw call from running (e.g. if you replaced it or just want to skip it)
    // Most games (e.g. Prey, Dishonored 2) always draw in direct mode (as opposed to indirect), but uses different command lists on different threads (e.g. on Prey, that's almost only used for the shadow projection maps, in Dishonored 2, for almost every separate pass).
    // Usually there's a few compute shaders but most passes are "classic" pixel shaders.

@@ -407,7 +407,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // an upscaler that doesn't run would leave the jitter visible)
    bool mv_previous_scene_done = false;
    float sr_vert_fov = 1.0471976f; // FSR's vertical FOV (radians): the last camera's, 60 degrees until one is seen
-   float scene_mip_bias = 0.f;     // The scene's texture mip bias under the upscaler, set at present (see "SetMipBias")
+   float scene_mip_bias = 0.f;     // The scene's texture mip bias under the upscaler, set at present (see "OpenScene")
    // FSR's reactive and transparency & composition masks (written by the fill from "mv_reactive_target", see
    // "Luma_TW2_MotionVectorFill.hlsl")
    com_ptr<ID3D11Texture2D> mv_reactive;
@@ -1264,25 +1264,6 @@ class TheWitcher2Game final : public Game
       gd->mv_blend_state = blend_state.get();
    }
 
-   // The upscaler's mip bias reaches only the scene's draws (Core swaps the game's samplers for biased ones): the shadow maps before the
-   // scene, whose alpha tested foliage it thinned (smaller, flickering shadows, also at DLAA), and the post chain and the UI after it keep
-   // the game's mips. Core's per-draw check swaps the bound samplers at the next draw; inside a draw ("cmd_list_data": the scene opens
-   // in its first one, after that check) they're swapped right away, and recorded so the check doesn't swap them again.
-   static void SetMipBias(ID3D11DeviceContext* native_device_context, DeviceData& device_data, float bias, CommandListData* cmd_list_data = nullptr)
-   {
-      if (custom_texture_mip_lod_bias_offset)
-         return;
-      const std::unique_lock lock(s_mutex_samplers);
-      if (device_data.texture_mip_lod_bias_offset == bias)
-         return;
-      device_data.texture_mip_lod_bias_offset = bias;
-      if (cmd_list_data)
-      {
-         RebindUpgradedSamplers(native_device_context, device_data);
-         cmd_list_data->applied_texture_mip_lod_bias_offset = bias;
-      }
-   }
-
    // Opens the scene at the frame's first mesh draw into output sized depth: takes the scene depth and picks the jitter the whole
    // scene draws with. Once per present (the HUD and later passes never reopen it). False if it didn't; a depth of another size is
    // remembered for the frame ("mv_not_scene_dsv").
@@ -1298,7 +1279,10 @@ class TheWitcher2Game final : public Game
       if (!GetPatchedVertexShader(native_device, cmd_list_data, device_data, vertex_shader_hash))
          return false;
       gd.mv_scene_open = true;
-      SetMipBias(native_device_context, device_data, gd.scene_mip_bias, &cmd_list_data);
+      // The upscaler's mip bias reaches only the scene's draws: the shadow maps before the scene, whose alpha tested foliage it thinned
+      // (smaller, flickering shadows, also at DLAA), and the post chain and the UI after it keep the game's mips. The scene opens inside
+      // its first draw, so the bound samplers are swapped right away.
+      SetTextureMipLodBias(native_device_context, device_data, gd.scene_mip_bias, &cmd_list_data);
 #if DEVELOPMENT
       if (auto* const perf_queries = gd.perf_timestamps.frame)
       {
@@ -2015,7 +1999,7 @@ class TheWitcher2Game final : public Game
       auto& gd = GetGameDeviceData(device_data);
       gd.mv_scene_open = false;
       gd.mv_scene_done = true;
-      SetMipBias(native_device_context, device_data, 0.f);
+      SetTextureMipLodBias(native_device_context, device_data, 0.f);
 #if DEVELOPMENT
       auto* const perf_queries = gd.perf_timestamps.frame;
       if (perf_queries && perf_queries->Marked(PERF_SCENE_START))
@@ -3223,7 +3207,7 @@ public:
       {
          com_ptr<ID3D11DeviceContext> native_device_context;
          native_device->GetImmediateContext(&native_device_context);
-         SetMipBias(native_device_context.get(), device_data, 0.f);
+         SetTextureMipLodBias(native_device_context.get(), device_data, 0.f);
       }
       {
          // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many as
