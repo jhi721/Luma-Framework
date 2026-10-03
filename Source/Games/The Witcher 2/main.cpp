@@ -355,6 +355,14 @@ enum class MotionVectorReject : uint8_t
 constexpr std::array<const char*, size_t(MotionVectorReject::COUNT)> MOTION_VECTOR_REJECT_NAMES = {"extra_target", "no_scene", "other_depth", "array_or_msaa", "size", "create", "blend", "shaders"};
 #endif
 
+// A scene draw's blend for FSR's masks (see "ClassifyBoundBlend")
+enum class ReactiveBlend : uint8_t
+{
+   NONE,
+   ALPHA,
+   ADDITIVE,
+};
+
 struct TheWitcher2GameDeviceData final : public GameDeviceData
 {
    // Set when the final grade runs, cleared every Present: scopes the Hide UI skip to this frame's
@@ -388,7 +396,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_pixel_shaders;
-   // The alpha blended draws' pixel shaders with the mask target, by blend (see "ClassifyBoundBlend", index - 1)
+   // The alpha blended draws' pixel shaders with the mask target, by blend (index "ReactiveBlend" - 1)
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> mv_reactive_pixel_shaders[2];
    // The motion vector target (output sized; every blend state writes it unblended, see "OnCreateBlendState")
    com_ptr<ID3D11Texture2D> mv_texture;
@@ -486,7 +494,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    bool mv_reactive_rtv_scene = false;
    ID3D11BlendState* mv_blend_state = nullptr; // See "ClassifyBoundBlend"
    bool mv_blend_opaque = true;
-   uint8_t mv_reactive_blend = 0;
+   ReactiveBlend mv_reactive_blend = ReactiveBlend::NONE;
    // The last draw's patched shaders, by the game's hash
    uint32_t mv_last_vertex_shader_hash = 0;
    PatchedShader<ID3D11VertexShader> mv_last_vertex;
@@ -1129,12 +1137,12 @@ class TheWitcher2Game final : public Game
       return false;
    }
 
-   // The bound shader's motion vector version (or, "reactive" > 0, a pixel shader's reactive mask one, see "ClassifyBoundBlend"),
+   // The bound shader's motion vector version (or, with a "reactive" blend, a pixel shader's reactive mask one),
    // patched from Core's bytecode copy on first use (null if it can't be, e.g. a vertex shader that doesn't place vertices with
    // WorldToScreen)
    template <typename T>
    static TheWitcher2GameDeviceData::PatchedShader<T> GetMotionVectorShader(ID3D11Device* native_device, DeviceData& device_data,
-      std::unordered_map<uint32_t, TheWitcher2GameDeviceData::PatchedShader<T>>* shaders, uint32_t hash, reshade::api::pipeline pipeline, uint8_t reactive = 0)
+      std::unordered_map<uint32_t, TheWitcher2GameDeviceData::PatchedShader<T>>* shaders, uint32_t hash, reshade::api::pipeline pipeline, ReactiveBlend reactive = ReactiveBlend::NONE)
    {
       constexpr bool vertex = std::is_same_v<T, ID3D11VertexShader>;
       auto& gd = GetGameDeviceData(device_data);
@@ -1172,9 +1180,9 @@ class TheWitcher2Game final : public Game
                   transform_offset = BONES_ROW * 16;
                }
             }
-            else if (reactive != 0)
+            else if (reactive != ReactiveBlend::NONE)
             {
-               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot, reactive == 2, &error);
+               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot, reactive == ReactiveBlend::ADDITIVE, &error);
             }
             else
             {
@@ -1201,8 +1209,9 @@ class TheWitcher2Game final : public Game
       const bool screen_space = error.starts_with("screen space");
       if (DEVELOPMENT || (!shader && !screen_space))
       {
+         constexpr const char* pixel_shader_kinds[] = {"PS", "PS reactive alpha", "PS reactive additive"}; // By "ReactiveBlend"
          reshade::log::message((shader || screen_space) ? reshade::log::level::info : reshade::log::level::warning,
-            std::format("[TW2 MV] {} 0x{:08X} {}", vertex ? "VS" : (reactive == 0 ? "PS" : (reactive == 2 ? "PS reactive additive" : "PS reactive alpha")), hash, shader ? "patched" : error).c_str());
+            std::format("[TW2 MV] {} 0x{:08X} {}", vertex ? "VS" : pixel_shader_kinds[size_t(reactive)], hash, shader ? "patched" : error).c_str());
       }
       const std::unique_lock lock(gd.mv_mutex);
       return shaders->try_emplace(hash, TheWitcher2GameDeviceData::PatchedShader<T>{shader, read_size, transform_offset, reads_resources}).first->second;
@@ -1221,9 +1230,9 @@ class TheWitcher2Game final : public Game
    }
 
    // Classifies the bound blend state (cached in "mv_blend_state"): "mv_blend_opaque" for the motion vectors (decals, lights and
-   // translucents keep the motion vectors of what's behind them, and so do colorless draws), and "mv_reactive_blend": 0 not alpha
-   // blended (opaque, additive lights and emissive passes ONE / ONE), 1 alpha blended (SRC_ALPHA or, premultiplied, ONE / INV_SRC_ALPHA:
-   // smoke, glass, water; reactive and transparency & composition), 2 additive (SRC_ALPHA / ONE: sparks, glows; reactive). REDengine's
+   // translucents keep the motion vectors of what's behind them, and so do colorless draws), and "mv_reactive_blend": NONE not alpha
+   // blended (opaque, additive lights and emissive passes ONE / ONE), ALPHA (SRC_ALPHA or, premultiplied, ONE / INV_SRC_ALPHA: smoke,
+   // glass, water; reactive and transparency & composition), ADDITIVE (SRC_ALPHA / ONE: sparks, glows; reactive). REDengine's
    // translucents are premultiplied (ONE / INV_SRC_ALPHA, e.g. 0x171B986E): Mass Effect 2007's SRC_ALPHA-only test found none.
    static void ClassifyBoundBlend(ID3D11DeviceContext* native_device_context, TheWitcher2GameDeviceData* gd)
    {
@@ -1240,7 +1249,7 @@ class TheWitcher2Game final : public Game
       gd->mv_blend_opaque = rt0.RenderTargetWriteMask != 0 && (!rt0.BlendEnable || (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_ZERO && rt0.BlendOp == D3D11_BLEND_OP_ADD));
       const bool alpha_blended = rt0.BlendEnable && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA && (rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_ONE);
       const bool additive = rt0.BlendEnable && rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA && rt0.DestBlend == D3D11_BLEND_ONE;
-      gd->mv_reactive_blend = (alpha_blended ? 1 : (additive ? 2 : 0));
+      gd->mv_reactive_blend = (alpha_blended ? ReactiveBlend::ALPHA : (additive ? ReactiveBlend::ADDITIVE : ReactiveBlend::NONE));
       gd->mv_blend_state = blend_state.get();
    }
 
@@ -1303,7 +1312,7 @@ class TheWitcher2Game final : public Game
       gd.mv_reactive_rtv = nullptr;
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
-      gd.mv_reactive_blend = 0;
+      gd.mv_reactive_blend = ReactiveBlend::NONE;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). Only after a frame the upscaler drew ("force_reset_sr" is
       // set at present when it didn't): not while the bridge's helper starts (the scene shows as it is, antialiased with SMAA), not
       // when the motion vector fill can't run (no upscaler then), not after a frame whose scene didn't reach the exposure (menus,
@@ -1314,7 +1323,8 @@ class TheWitcher2Game final : public Game
       {
          sr_instance_data = nullptr;
       }
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
+      const int phase_count = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
+      const unsigned int phase = cb_luma_global_settings.FrameIndex % unsigned(phase_count);
       const bool upscaled_last_frame = sr_instance_data && !device_data.force_reset_sr;
       const bool jitter = (upscaled_last_frame || g_mv_force_jitter) && !g_mv_disable_jitter && gd.mv_previous_scene_done && GetPerfMotionVectorDraws() != 0;
       gd.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
@@ -1779,9 +1789,9 @@ class TheWitcher2Game final : public Game
             gd.mv_reactive_rtv_scene = std::ranges::find(gd.mv_gbuffer_rtvs, rtvs[0].get()) == gd.mv_gbuffer_rtvs.end() && size.x == device_data.output_resolution.x && size.y == device_data.output_resolution.y;
          }
          ClassifyBoundBlend(native_device_context, &gd);
-         if (const uint8_t blend = gd.mv_reactive_blend; blend != 0 && gd.mv_reactive_rtv_scene)
+         if (const ReactiveBlend blend = gd.mv_reactive_blend; blend != ReactiveBlend::NONE && gd.mv_reactive_rtv_scene)
          {
-            reactive_shader = GetMotionVectorShader(native_device, device_data, &gd.mv_reactive_pixel_shaders[blend - 1], original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, blend).shader.get();
+            reactive_shader = GetMotionVectorShader(native_device, device_data, &gd.mv_reactive_pixel_shaders[size_t(blend) - 1], original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, blend).shader.get();
          }
       }
 
@@ -1945,6 +1955,77 @@ class TheWitcher2Game final : public Game
       return true;
    }
 
+   // Render scale ("RenderArea"): a surface's shrunk area stretched over it from a copy of the area (all the stretch shaders read),
+   // before the post chain reads it whole: the scene color (bilinear) when no upscaled image replaced it (DLSS-Best-Practices POST-9:
+   // never in the corner), and the G-buffer's linear depth (nearest), which DoF and the light shafts read (the upscaler's depth is the
+   // fill's, so after it). Nothing without a scene color target seen yet (no target to stretch into).
+   static void StretchRenderArea(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool stretch_color)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      const std::array<uint32_t, 2> area = RenderArea::render_size;
+      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+      // The jitter buffer's area share (zw), written here too: a scene that never opened didn't write it (the jitter is unused now)
+      const float area_scale[4] = {0.f, 0.f, float(area[0]) / device_data.output_resolution.x, float(area[1]) / device_data.output_resolution.y};
+      if (area[0] == 0 || !copy_vs || !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_jitter_buffer), area_scale, sizeof(area_scale)))
+         return;
+      const auto stretch = [&](ID3D11Resource* source, DXGI_FORMAT view_format, ID3D11PixelShader* pixel_shader, com_ptr<ID3D11Texture2D>* copy, com_ptr<ID3D11ShaderResourceView>* copy_srv, ID3D11RenderTargetView* target)
+      {
+         com_ptr<ID3D11Texture2D> texture;
+         if (!source || !target || !pixel_shader || FAILED(source->QueryInterface(&texture)))
+            return;
+         D3D11_TEXTURE2D_DESC desc, copy_desc = {};
+         texture->GetDesc(&desc);
+         if (*copy)
+         {
+            (*copy)->GetDesc(&copy_desc);
+         }
+         if (copy_desc.Width != desc.Width || copy_desc.Height != desc.Height || copy_desc.Format != desc.Format || copy_desc.ArraySize != desc.ArraySize)
+         {
+            copy->reset();
+            copy_srv->reset();
+            copy_desc = desc;
+            copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            copy_desc.MiscFlags = 0;
+            copy_desc.CPUAccessFlags = 0;
+            copy_desc.Usage = D3D11_USAGE_DEFAULT;
+            // dgVoodoo's targets are single-slice arrays: a plain 2D view of the first slice
+            const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, view_format);
+            if (SUCCEEDED(native_device->CreateTexture2D(&copy_desc, nullptr, &*copy)))
+            {
+               native_device->CreateShaderResourceView(copy->get(), &srv_desc, &*copy_srv);
+            }
+         }
+         if (!*copy_srv)
+            return;
+         const D3D11_BOX source_area = {0, 0, 0, (std::min)(area[0], desc.Width), (std::min)(area[1], desc.Height), 1};
+         native_device_context->CopySubresourceRegion(copy->get(), 0, 0, 0, 0, texture.get(), 0, &source_area);
+         ID3D11Buffer* const area_scale_buffer = gd.mv_jitter_buffer.get();
+         native_device_context->PSSetConstantBuffers(0, 1, &area_scale_buffer);
+         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, pixel_shader, copy_srv->get(), target, desc.Width, desc.Height);
+      };
+      if (stretch_color && gd.mv_scene_color_rtv)
+      {
+         com_ptr<ID3D11Resource> scene;
+         gd.mv_scene_color_rtv->GetResource(&scene);
+         stretch(scene.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Color Stretch PS")), std::addressof(gd.render_area_color_copy), std::addressof(gd.render_area_color_copy_srv), gd.mv_scene_color_rtv.get());
+      }
+      if (gd.mv_linear_depth)
+      {
+         com_ptr<ID3D11Resource> rtv_resource;
+         if (gd.render_area_depth_rtv)
+         {
+            gd.render_area_depth_rtv->GetResource(&rtv_resource);
+         }
+         if (rtv_resource != gd.mv_linear_depth)
+         {
+            gd.render_area_depth_rtv.reset();
+            const CD3D11_RENDER_TARGET_VIEW_DESC rtv_desc(D3D11_RTV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_FLOAT);
+            native_device->CreateRenderTargetView(gd.mv_linear_depth.get(), &rtv_desc, &gd.render_area_depth_rtv);
+         }
+         stretch(gd.mv_linear_depth.get(), DXGI_FORMAT_R32_FLOAT, FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Depth Stretch PS")), std::addressof(gd.render_area_depth_copy), std::addressof(gd.render_area_depth_copy_srv), gd.render_area_depth_rtv.get());
+      }
+   }
+
    // Ends the scene right after the exposure drew into "scene_rtv" (null: no upscaler), or under the render scale before the post
    // chain's first pass with the linear scene: the depth and camera motion fill (see "Luma_TW2_MotionVectorFill.hlsl"), then the
    // upscaler, before anything reads the scene. Under the render scale, then the linear depth stretched over its surface.
@@ -2003,13 +2084,17 @@ class TheWitcher2Game final : public Game
       // The upscaler's exposure: on the linear scene (the post chain's entry) the last adaptation's gain (1 with the static exposure
       // perms, which have no adaptation texture), on the exposure's output 1. Always given: the SR bridge restarts its helper when an
       // input comes or goes.
-      const bool scaled = gd.mv_render_size != std::array<uint32_t, 2>{uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
       if (gd.sr_active && !gd.sr_exposure_uav)
       {
          gd.sr_exposure.reset();
          if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R32_FLOAT, 1, 1, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS), &gd.sr_exposure)))
          {
             native_device->CreateUnorderedAccessView(gd.sr_exposure.get(), nullptr, &gd.sr_exposure_uav);
+         }
+         // Without it the bridge would restart its helper every frame: back to SMAA until the upscaler is picked again
+         if (!gd.sr_exposure_uav)
+         {
+            device_data.sr_suppressed = true;
          }
       }
       const bool game_exposure = !exposed && gd.sr_exposure_constants && (gd.sr_exposure_static || gd.sr_adaptation_srv);
@@ -2080,70 +2165,7 @@ class TheWitcher2Game final : public Game
 #if DEVELOPMENT
       gd.mv_stats.sr_draws += upscaled;
 #endif
-      // Render scale: a surface's area stretched over it from a copy of the area (all the stretch shaders read)
-      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-      const auto stretch = [&](ID3D11Resource* source, DXGI_FORMAT view_format, ID3D11PixelShader* pixel_shader, com_ptr<ID3D11Texture2D>* copy, com_ptr<ID3D11ShaderResourceView>* copy_srv, ID3D11RenderTargetView* target)
-      {
-         com_ptr<ID3D11Texture2D> texture;
-         if (!source || !target || !pixel_shader || !copy_vs || !gd.mv_jitter_buffer || FAILED(source->QueryInterface(&texture)))
-            return;
-         D3D11_TEXTURE2D_DESC desc, copy_desc = {};
-         texture->GetDesc(&desc);
-         if (*copy)
-         {
-            (*copy)->GetDesc(&copy_desc);
-         }
-         if (copy_desc.Width != desc.Width || copy_desc.Height != desc.Height || copy_desc.Format != desc.Format || copy_desc.ArraySize != desc.ArraySize)
-         {
-            copy->reset();
-            copy_srv->reset();
-            copy_desc = desc;
-            copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            copy_desc.MiscFlags = 0;
-            copy_desc.CPUAccessFlags = 0;
-            copy_desc.Usage = D3D11_USAGE_DEFAULT;
-            // dgVoodoo's targets are single-slice arrays: a plain 2D view of the first slice
-            const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, view_format);
-            if (SUCCEEDED(native_device->CreateTexture2D(&copy_desc, nullptr, &*copy)))
-            {
-               native_device->CreateShaderResourceView(copy->get(), &srv_desc, &*copy_srv);
-            }
-         }
-         if (!*copy_srv)
-            return;
-         const D3D11_BOX area = {0, 0, 0, (std::min)(gd.mv_render_size[0], desc.Width), (std::min)(gd.mv_render_size[1], desc.Height), 1};
-         native_device_context->CopySubresourceRegion(copy->get(), 0, 0, 0, 0, texture.get(), 0, &area);
-         ID3D11Buffer* const area_scale = gd.mv_jitter_buffer.get();
-         native_device_context->PSSetConstantBuffers(0, 1, &area_scale);
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, pixel_shader, copy_srv->get(), target, desc.Width, desc.Height);
-      };
-      if (scaled)
-      {
-         // No upscaled scene (DLSS-Best-Practices POST-9): the scene color, bilinear, so the post chain never shows it in the corner
-         if (!upscaled && scene_rtv)
-         {
-            com_ptr<ID3D11Resource> scene;
-            scene_rtv->GetResource(&scene);
-            stretch(scene.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Color Stretch PS")), std::addressof(gd.render_area_color_copy), std::addressof(gd.render_area_color_copy_srv), scene_rtv);
-         }
-         // DoF and the light shafts read the G-buffer's linear depth over the whole surface (nearest; the upscaler's depth is the fill's,
-         // so after it)
-         if (gd.mv_linear_depth)
-         {
-            com_ptr<ID3D11Resource> rtv_resource;
-            if (gd.render_area_depth_rtv)
-            {
-               gd.render_area_depth_rtv->GetResource(&rtv_resource);
-            }
-            if (rtv_resource != gd.mv_linear_depth)
-            {
-               gd.render_area_depth_rtv.reset();
-               const CD3D11_RENDER_TARGET_VIEW_DESC rtv_desc(D3D11_RTV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_FLOAT);
-               native_device->CreateRenderTargetView(gd.mv_linear_depth.get(), &rtv_desc, &gd.render_area_depth_rtv);
-            }
-            stretch(gd.mv_linear_depth.get(), DXGI_FORMAT_R32_FLOAT, FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Depth Stretch PS")), std::addressof(gd.render_area_depth_copy), std::addressof(gd.render_area_depth_copy_srv), gd.render_area_depth_rtv.get());
-         }
-      }
+      StretchRenderArea(native_device, native_device_context, device_data, !upscaled);
       compute_state.Restore(native_device_context);
       graphics_state.Restore(native_device_context);
 #if DEVELOPMENT
@@ -2163,11 +2185,21 @@ class TheWitcher2Game final : public Game
          return;
       DeviceData& device_data = *global_devices_data[0];
       auto& gd = GetGameDeviceData(device_data);
-      if (!gd.mv_scene_open)
-         return;
-      ID3D11RenderTargetView* const scene_rtv = gd.mv_scene_color_rtv.get();
       com_ptr<ID3D11DeviceContext> native_device_context;
       device_data.native_device->GetImmediateContext(&native_device_context);
+      if (!gd.mv_scene_open)
+      {
+         // A shrunk frame whose scene never opened (its first mesh draw refused): nothing upscales it
+         if (RenderArea::render_size[0] != 0)
+         {
+            DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+            graphics_state.Cache(native_device_context.get(), device_data.uav_max_count);
+            StretchRenderArea(device_data.native_device, native_device_context.get(), device_data, true);
+            graphics_state.Restore(native_device_context.get());
+         }
+         return;
+      }
+      ID3D11RenderTargetView* const scene_rtv = gd.mv_scene_color_rtv.get();
 #if DEVELOPMENT
       gd.mv_stats.ended_by = uint32_t(reinterpret_cast<uintptr_t>(RenderArea::post_chain)) | (scene_rtv ? 0u : 0x80000000u);
 #endif
@@ -3284,7 +3316,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's Anti-aliasing setting on or off; not used with DLSS/FSR).");
+         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR).");
       }
       ImGui::EndDisabled();
       // Canon deviation (docs/UI-Toggle-Standard.md), as Saints Row The Third Remastered: RCAS runs after any anti-aliasing, in place
@@ -3316,63 +3348,6 @@ public:
       }
 #endif
       ImGui::EndDisabled();
-#endif
-
-#if DEVELOPMENT
-      ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
-      ImGui::Checkbox("MV Enable", &g_mv_enable);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Draws the scene with the motion vector shaders without an upscaler: camera and object motion (each draw finds its own\nprevious frame vc4). The image must not change; the debug view is black with a static camera and lights up only\nwhat moves. ReShade.log: patched/refused shaders, \"[TW2 MV]\" counts every 300 frames. Not saved.");
-      }
-      ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Shows the motion vector target (absolute value, in pixels) instead of the frame. Not saved.");
-      }
-      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without an upscaler, with MV Enable. The image shakes by a subpixel; nothing\nmay flicker or lose pixels, and the debug view stays black with a static camera. Not saved.");
-      }
-      ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("No projection jitter under the upscaler (it gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
-      }
-      ImGui::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("FSR's reactive and transparency & composition masks from the alpha blended draws (smoke, glass, water, sparks). Not saved.");
-      }
-      ImGui::Checkbox("FSR Reactive Mask Debug View", &g_sr_reactive_debug_view);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Shows FSR's reactive mask instead of the frame. Not saved.");
-      }
-      ImGui::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("The alpha blended draws' reactivity, scaled before the threshold (AMD's default 1). Not saved.");
-      }
-      ImGui::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Reactivity under it 0, over it 0.9 (AMD's 0.2, Mass Effect's 0.5); 0 = the scaled reactivity, capped at 0.9. Not saved.");
-      }
-      const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
-      ImGui::Text("MV draws %u (matched %u, camera only %u, other camera %u, uncopied %u), jitter draws %u, upscaled %u", stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.sr_draws);
-      Perf::DrawCombo(PERF_TEST_MODES, &g_perf_sweep, [&](int mode_index)
-         { ApplyPerfTestMode(device_data, mode_index); });
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([TW2 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill, the upscaler, copy back) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still. \"Sweep\" runs the anti-aliasing modes, 3 rounds, then logs medians against No AA; \"CPU Sweep\"\nthe CPU savings each off in turn under the current DLSS/FSR, against Current Settings. Not saved.");
-      }
-      ImGui::Checkbox("Hook Timers", &Perf::g_hook_timers);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. Not saved.");
-      }
 #endif
 
       // Exposure and Color Grading Intensity act on SDR and HDR alike; the gated block below is HDR-only.
@@ -3499,6 +3474,64 @@ public:
       {
          ImGui::SetTooltip("Disables the in-game UI.");
       }
+
+      // Diagnostics below the user-facing sections (docs/UI-Toggle-Standard.md)
+#if DEVELOPMENT
+      ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
+      ImGui::Checkbox("MV Enable", &g_mv_enable);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Draws the scene with the motion vector shaders without an upscaler: camera and object motion (each draw finds its own\nprevious frame vc4). The image must not change; the debug view is black with a static camera and lights up only\nwhat moves. ReShade.log: patched/refused shaders, \"[TW2 MV]\" counts every 300 frames. Not saved.");
+      }
+      ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Shows the motion vector target (absolute value, in pixels) instead of the frame. Not saved.");
+      }
+      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without an upscaler, with MV Enable. The image shakes by a subpixel; nothing\nmay flicker or lose pixels, and the debug view stays black with a static camera. Not saved.");
+      }
+      ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("No projection jitter under the upscaler (it gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
+      }
+      ImGui::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("FSR's reactive and transparency & composition masks from the alpha blended draws (smoke, glass, water, sparks). Not saved.");
+      }
+      ImGui::Checkbox("FSR Reactive Mask Debug View", &g_sr_reactive_debug_view);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Shows FSR's reactive mask instead of the frame. Not saved.");
+      }
+      ImGui::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("The alpha blended draws' reactivity, scaled before the threshold (AMD's default 1). Not saved.");
+      }
+      ImGui::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Reactivity under it 0, over it 0.9 (AMD's 0.2, Mass Effect's 0.5); 0 = the scaled reactivity, capped at 0.9. Not saved.");
+      }
+      const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
+      ImGui::Text("MV draws %u (matched %u, camera only %u, other camera %u, uncopied %u), jitter draws %u, upscaled %u", stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.sr_draws);
+      Perf::DrawCombo(PERF_TEST_MODES, &g_perf_sweep, [&](int mode_index)
+         { ApplyPerfTestMode(device_data, mode_index); });
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([TW2 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill, the upscaler, copy back) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still. \"Sweep\" runs the anti-aliasing modes, 3 rounds, then logs medians against No AA; \"CPU Sweep\"\nthe CPU savings each off in turn under the current DLSS/FSR, against Current Settings. Not saved.");
+      }
+      ImGui::Checkbox("Hook Timers", &Perf::g_hook_timers);
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. Not saved.");
+      }
+#endif
    }
 
    void PrintImGuiAbout() override
