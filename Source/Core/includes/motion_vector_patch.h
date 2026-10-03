@@ -55,6 +55,41 @@ namespace MotionVectorPatch
       }
    };
 
+   // D3D9 games through dgVoodoo: the slots and registers come from its translation, not the game
+   namespace DgVoodoo
+   {
+      // dgVoodoo mirrors every D3D9 vertex shader constant into vc4 (c<N> at cb4[N + 20]); the second run reads the previous
+      // frame's copy at b10. vc3 holds dgVoodoo's own per-device constants, the same in both runs.
+      constexpr uint32_t object_slot = 4;
+      constexpr uint32_t object_row_offset = 20;
+      constexpr std::pair<uint32_t, uint32_t> previous_slots[] = {{object_slot, 10}};
+      constexpr uint32_t jitter_slot = 9;
+      // The second run reads t0-t15 at t64-t79
+      constexpr uint32_t resource_slots = 16;
+      constexpr uint32_t previous_resources_slot = 64;
+      // Past every register the translated shaders use (vertex outputs end at o12), within SM4's 16 vertex outputs
+      // (D3D10_VS_OUTPUT_REGISTER_COUNT), which dgVoodoo 2.81.3 emits
+      constexpr uint32_t current_position_register = 14;
+      constexpr uint32_t previous_position_register = 15;
+      // Past D3D9's 4 simultaneous targets, within SM4's 8
+      constexpr uint32_t target_slot = 4;
+
+      constexpr Layout MakeLayout(uint32_t view_projection_row = Layout::no_row)
+      {
+         return {
+            .object_slot = object_slot,
+            .previous_slots = previous_slots,
+            .jitter_slot = jitter_slot,
+            .resource_slots = resource_slots,
+            .previous_resources_slot = previous_resources_slot,
+            .current_position_register = current_position_register,
+            .previous_position_register = previous_position_register,
+            .target_slot = target_slot,
+            .view_projection_row = view_projection_row,
+         };
+      }
+   } // namespace DgVoodoo
+
    // The vertex shader with the second run, or empty if unpatchable (the draw then keeps the original shaders)
    inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error)
    {
