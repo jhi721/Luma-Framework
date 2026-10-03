@@ -1101,22 +1101,6 @@ class TheWitcherGame final : public Game
       graphics_state.Restore(native_device_context);
    }
 
-   // Every blend state writes the motion vector target ("MotionVectorPatches::target_slot", bound only by the motion vector draws)
-   // unblended: no per-draw copy of the game's state. ReShade turns independent blending on only when a target now differs.
-   static bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
-   {
-      for (uint32_t i = 0; i < subobject_count; i++)
-      {
-         if (subobjects[i].type != reshade::api::pipeline_subobject_type::blend_state)
-            continue;
-         auto& desc = *static_cast<reshade::api::blend_desc*>(subobjects[i].data);
-         desc.blend_enable[MotionVectorPatches::target_slot] = false;
-         desc.render_target_write_mask[MotionVectorPatches::target_slot] = 0xF;
-         return true;
-      }
-      return false;
-   }
-
    // Frames without post passes: the scene ends at the depth clear before the UI (the 3D HUD medallion draws with the scene depth).
    // Stencil only clears (the shadow volumes' per light) don't end it.
    static bool OnClearDepthStencilView(reshade::api::command_list* cmd_list, reshade::api::resource_view dsv, const float* depth, const uint8_t* stencil, uint32_t rect_count, const reshade::api::rect* rects)
@@ -1203,7 +1187,7 @@ public:
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
       reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
    }
 
@@ -1212,7 +1196,7 @@ public:
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
       reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
    }
 

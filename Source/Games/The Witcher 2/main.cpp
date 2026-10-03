@@ -2211,53 +2211,6 @@ class TheWitcher2Game final : public Game
 
 #endif
 
-   // Every blend state writes the motion vector target ("MotionVectorPatches::target_slot", bound only by the motion vector draws)
-   // unblended, and max blends the mask target: no per-draw copy of the game's state. ReShade turns independent blending on only when
-   // a target now differs.
-   static bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
-   {
-      for (uint32_t i = 0; i < subobject_count; i++)
-      {
-         if (subobjects[i].type != reshade::api::pipeline_subobject_type::blend_state)
-            continue;
-         auto& desc = *static_cast<reshade::api::blend_desc*>(subobjects[i].data);
-         // dgVoodoo sometimes leaves blending on for a secondary render target while RT0 has it off. D3D9 has one global blend state
-         // and only per-RT write masks (D3DRS_COLORWRITEENABLE1/2/3), so the game never asked for it and that target is corrupted.
-         // Flotsam water (PS 0xDA16C815): RT1 is the r32_float linear depth fog reads, and the shader ends "mov o1.xyzw, v7.xxxx", so
-         // src_alpha is the depth. RT0's blend goes to the game's other targets, their write masks stay (legal per-RT in D3D9). An
-         // unbound target's blend does nothing, so repairing every state equals repairing the bound targets of each draw.
-         if (!desc.blend_enable[0])
-         {
-            for (uint32_t rt = 1; rt < MotionVectorPatches::target_slot; rt++)
-            {
-               if (!desc.blend_enable[rt])
-                  continue;
-               desc.blend_enable[rt] = false;
-               desc.logic_op_enable[rt] = desc.logic_op_enable[0];
-               desc.source_color_blend_factor[rt] = desc.source_color_blend_factor[0];
-               desc.dest_color_blend_factor[rt] = desc.dest_color_blend_factor[0];
-               desc.color_blend_op[rt] = desc.color_blend_op[0];
-               desc.source_alpha_blend_factor[rt] = desc.source_alpha_blend_factor[0];
-               desc.dest_alpha_blend_factor[rt] = desc.dest_alpha_blend_factor[0];
-               desc.alpha_blend_op[rt] = desc.alpha_blend_op[0];
-               desc.logic_op[rt] = desc.logic_op[0];
-            }
-         }
-         desc.blend_enable[MotionVectorPatches::target_slot] = false;
-         desc.render_target_write_mask[MotionVectorPatches::target_slot] = 0xF;
-         // The masks (reactive x, transparency & composition y): the strongest alpha blended draw per pixel (max never exceeds what one
-         // wrote)
-         constexpr uint32_t reactive = MotionVectorPatches::reactive_slot;
-         desc.blend_enable[reactive] = true;
-         desc.source_color_blend_factor[reactive] = desc.dest_color_blend_factor[reactive] = reshade::api::blend_factor::one;
-         desc.source_alpha_blend_factor[reactive] = desc.dest_alpha_blend_factor[reactive] = reshade::api::blend_factor::one;
-         desc.color_blend_op[reactive] = desc.alpha_blend_op[reactive] = reshade::api::blend_op::max;
-         desc.render_target_write_mask[reactive] = 0x3;
-         return true;
-      }
-      return false;
-   }
-
    static bool CreateImmutableCB(ID3D11Device* device, const void* data, UINT size, ComPtr<ID3D11Buffer>* out)
    {
       out->reset();
@@ -2743,7 +2696,7 @@ public:
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true>);
    }
 
    static void UnregisterEvents()
@@ -2751,7 +2704,7 @@ public:
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true>);
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override

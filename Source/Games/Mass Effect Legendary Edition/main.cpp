@@ -1825,22 +1825,6 @@ class MassEffectLE final : public Game
       }
    }
 
-   // Every blend state writes the motion vector target ("MotionVectorPatches::target_slot", bound only by the motion vector draws)
-   // unblended: no per-draw copy of the game's state. ReShade turns independent blending on only when a target now differs.
-   static bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
-   {
-      for (uint32_t i = 0; i < subobject_count; i++)
-      {
-         if (subobjects[i].type != reshade::api::pipeline_subobject_type::blend_state)
-            continue;
-         auto& desc = *static_cast<reshade::api::blend_desc*>(subobjects[i].data);
-         desc.blend_enable[MotionVectorPatches::target_slot] = false;
-         desc.render_target_write_mask[MotionVectorPatches::target_slot] = 0xF;
-         return true;
-      }
-      return false;
-   }
-
 public:
    void OnInit(bool async) override
    {
@@ -1923,7 +1907,7 @@ public:
          ShaderDefinition("Luma_MELE_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
-      reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
 
       // Very High slice count for spatial stability (no TAA without DLSS/FSR).
       std::vector<ShaderDefineData> game_shader_defines_data = {

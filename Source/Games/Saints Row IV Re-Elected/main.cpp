@@ -2663,22 +2663,6 @@ public:
       return true;
    }
 
-   // Every blend state writes the motion vector target ("MotionVectorPatches::target_slot", bound only by the motion vector draws)
-   // unblended: no per-draw copy of the game's state. ReShade turns independent blending on only when a target now differs.
-   static bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
-   {
-      for (uint32_t i = 0; i < subobject_count; i++)
-      {
-         if (subobjects[i].type != reshade::api::pipeline_subobject_type::blend_state)
-            continue;
-         auto& desc = *static_cast<reshade::api::blend_desc*>(subobjects[i].data);
-         desc.blend_enable[MotionVectorPatches::target_slot] = false;
-         desc.render_target_write_mask[MotionVectorPatches::target_slot] = 0xF;
-         return true;
-      }
-      return false;
-   }
-
    // The game's one ResolveSubresource (grab_scene_color) resolves the FP16 MSAA scene before the tonemap: draw
    // Luma_SR4_MSAAResolve instead. Anything else, or a target we cannot bind, keeps the hardware resolve.
    static bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
@@ -2832,7 +2816,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 XeGTAO Denoise Pass 2 CS"), ShaderDefinition{"Luma_SR4_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR4 XeGTAO Downsample CS"), ShaderDefinition{"Luma_SR4_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "downsample_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
       reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
-      reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
       reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
@@ -2844,7 +2828,7 @@ public:
    static void UnregisterEvents()
    {
       reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
-      reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
       reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);

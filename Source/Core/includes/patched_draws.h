@@ -255,4 +255,53 @@ namespace PatchedDraws
    {
       return a == b || (a && b && *a == *b);
    }
+
+   // A "create_pipeline" callback giving every blend state Luma's extra targets, so no draw needs its own copy of the game's state
+   // (ReShade turns independent blending on only when a target now differs): the motion vector target ("target_slot", bound only by
+   // the motion vector draws) unblended and, with a "reactive_slot", FSR's masks (x reactive, y transparency & composition) max
+   // blended: the strongest alpha blended draw per pixel (max never exceeds what one wrote).
+   // "repair_per_target_blend" (dgVoodoo): it sometimes leaves blending on for a secondary target while RT0 has it off. D3D9 has one
+   // global blend state and only per-target write masks (D3DRS_COLORWRITEENABLE1/2/3), so the game never asked for it and that target
+   // is corrupted (The Witcher 2's Flotsam water, PS 0xDA16C815: RT1 is the linear depth fog reads, the shader writes it to every
+   // channel, so src_alpha is the depth). RT0's blend goes to the game's other targets, their write masks stay (legal per target in
+   // D3D9). An unbound target's blend does nothing, so repairing every state equals repairing the bound targets of each draw.
+   template <uint32_t target_slot, uint32_t reactive_slot = UINT32_MAX, bool repair_per_target_blend = false>
+   bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
+   {
+      for (uint32_t i = 0; i < subobject_count; i++)
+      {
+         if (subobjects[i].type != reshade::api::pipeline_subobject_type::blend_state)
+            continue;
+         auto& desc = *static_cast<reshade::api::blend_desc*>(subobjects[i].data);
+         if (repair_per_target_blend && !desc.blend_enable[0])
+         {
+            for (uint32_t rt = 1; rt < target_slot; rt++)
+            {
+               if (!desc.blend_enable[rt])
+                  continue;
+               desc.blend_enable[rt] = false;
+               desc.logic_op_enable[rt] = desc.logic_op_enable[0];
+               desc.source_color_blend_factor[rt] = desc.source_color_blend_factor[0];
+               desc.dest_color_blend_factor[rt] = desc.dest_color_blend_factor[0];
+               desc.color_blend_op[rt] = desc.color_blend_op[0];
+               desc.source_alpha_blend_factor[rt] = desc.source_alpha_blend_factor[0];
+               desc.dest_alpha_blend_factor[rt] = desc.dest_alpha_blend_factor[0];
+               desc.alpha_blend_op[rt] = desc.alpha_blend_op[0];
+               desc.logic_op[rt] = desc.logic_op[0];
+            }
+         }
+         desc.blend_enable[target_slot] = false;
+         desc.render_target_write_mask[target_slot] = 0xF;
+         if constexpr (reactive_slot != UINT32_MAX)
+         {
+            desc.blend_enable[reactive_slot] = true;
+            desc.source_color_blend_factor[reactive_slot] = desc.dest_color_blend_factor[reactive_slot] = reshade::api::blend_factor::one;
+            desc.source_alpha_blend_factor[reactive_slot] = desc.dest_alpha_blend_factor[reactive_slot] = reshade::api::blend_factor::one;
+            desc.color_blend_op[reactive_slot] = desc.alpha_blend_op[reactive_slot] = reshade::api::blend_op::max;
+            desc.render_target_write_mask[reactive_slot] = 0x3;
+         }
+         return true;
+      }
+      return false;
+   }
 } // namespace PatchedDraws

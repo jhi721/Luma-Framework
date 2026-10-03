@@ -2029,38 +2029,13 @@ class Borderlands2 final : public Game
 #endif
    }
 
-   // Every blend state writes the motion vector target ("MotionVectorPatches::target_slot", bound only by the motion vector draws)
-   // unblended, and FSR's mask target ("reactive_slot", bound only by the alpha blended draws that write it) max blended: no per-draw
-   // copy of the game's state. ReShade turns independent blending on only when a target now differs.
-   static bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
-   {
-      for (uint32_t i = 0; i < subobject_count; i++)
-      {
-         if (subobjects[i].type != reshade::api::pipeline_subobject_type::blend_state)
-            continue;
-         auto& desc = *static_cast<reshade::api::blend_desc*>(subobjects[i].data);
-         desc.blend_enable[MotionVectorPatches::target_slot] = false;
-         desc.render_target_write_mask[MotionVectorPatches::target_slot] = 0xF;
-         // The masks (reactive x, transparency & composition y): the strongest alpha blended draw per pixel (max never exceeds what one
-         // wrote)
-         constexpr uint32_t reactive = MotionVectorPatches::reactive_slot;
-         desc.blend_enable[reactive] = true;
-         desc.source_color_blend_factor[reactive] = desc.dest_color_blend_factor[reactive] = reshade::api::blend_factor::one;
-         desc.source_alpha_blend_factor[reactive] = desc.dest_alpha_blend_factor[reactive] = reshade::api::blend_factor::one;
-         desc.color_blend_op[reactive] = desc.alpha_blend_op[reactive] = reshade::api::blend_op::max;
-         desc.render_target_write_mask[reactive] = 0x3;
-         return true;
-      }
-      return false;
-   }
-
 public:
    static void UnregisterEvents()
    {
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot>);
    }
 
    void OnInit(bool async) override
@@ -2147,7 +2122,7 @@ public:
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::register_event<reshade::addon_event::create_pipeline>(OnCreateBlendState);
+      reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot>);
 
       // The game's post passes use cb0..cb5 and no translated shader reads one past b4, so b9/b10 (the motion vector draws, see
       // "MotionVectorPatches"), b11 (core DrawBloom's own constants) and b12/b13 are free for Luma.
