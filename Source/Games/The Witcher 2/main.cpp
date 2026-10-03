@@ -3097,8 +3097,9 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
-      // Menu/loading frames run no tonemap: "has_drawn_main_post_processing" stays false there so the core
-      // display composition treats the frame as plain SDR UI at UIPaperWhite (do NOT force it here).
+      // Core never clears this (and reads it before this call): left set, menu/loading frames, which run no tonemap, would count as
+      // a scene instead of plain SDR UI at UIPaperWhite
+      device_data.has_drawn_main_post_processing = false;
       game_device_data.final_grade_fired_this_frame = false; // re-arm the Hide UI window for the next frame
 
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
