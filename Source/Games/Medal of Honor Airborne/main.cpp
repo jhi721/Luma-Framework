@@ -934,7 +934,7 @@ public:
       constexpr uint32_t kBuildCheckFrame = 120;
       if (gd.frames_presented < kBuildCheckFrame && ++gd.frames_presented == kBuildCheckFrame && !gd.ever_matched_final_pass)
          reshade::log::message(reshade::log::level::warning,
-            "[Luma] MOHA: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
+            "[Luma] MOHA: no keyed final color pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3/2.87.5 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
    }
 
    void LoadConfigs() override

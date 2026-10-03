@@ -1401,7 +1401,7 @@ public:
       constexpr uint32_t kBuildCheckFrames = 3600;
       if (game_device_data.frames_presented < kBuildCheckFrames && ++game_device_data.frames_presented == kBuildCheckFrames && !game_device_data.ever_matched_keyed_pass)
          reshade::log::message(reshade::log::level::warning,
-            "[Luma] ME2: no keyed scene pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
+            "[Luma] ME2: no keyed scene pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3/2.87.5 nor 2.81.3, so every shader replacement is inactive (re-dump the shaders for it).");
 
       game_device_data.has_drawn_uber = false;
       game_device_data.has_finished_canvas = false;

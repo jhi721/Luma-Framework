@@ -978,7 +978,7 @@ public:
          gd.build_check_done = true;
          if (!gd.ever_matched_tonemap)
             reshade::log::message(reshade::log::level::warning,
-               "[Luma] MoH 2010: no keyed tonemap pass seen after warmup -- the dgVoodoo build is probably not 2.87.3, so every shader replacement is inactive (re-dump the shaders for it).");
+               "[Luma] MoH 2010: no keyed tonemap pass seen after warmup -- the dgVoodoo build is probably neither 2.87.3 nor 2.87.5, so every shader replacement is inactive (re-dump the shaders for it).");
       }
 
 #if DEVELOPMENT || TEST
@@ -1331,7 +1331,6 @@ public:
       ImGui::Text(
          "Luma for \"Medal of Honor\" (2010) is open source and free.\n"
          "It adds native HDR, HDR bloom and SMAA anti-aliasing to the single player campaign.\n"
-         "It runs through dgVoodoo2 (DirectX 9 -> 11), build 2.87.3.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.");
       ImGui::PopTextWrapPos();
