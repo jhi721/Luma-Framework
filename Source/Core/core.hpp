@@ -3019,7 +3019,6 @@ namespace
             ASSERT_ONCE(device_data.custom_sampler_by_original_sampler.empty()); // These should have been cleared already ("OnDestroySampler()")
             samplers = std::move(device_data.custom_sampler_by_original_sampler);
             device_data.custom_sampler_by_original_sampler.clear();
-            device_data.original_sampler_by_custom_sampler.clear();
          }
       }
 
@@ -6501,23 +6500,6 @@ namespace
       return sampler;
    }
 
-   // Stores "custom_sampler" (null: not upgraded) as the variant of the game's sampler "original" for "bias", replacing any, and keeps
-   // the reverse map in sync. Returns it. Expects "s_mutex_samplers" to be locked exclusively.
-   ID3D11SamplerState* SetSamplerVariant(DeviceData& device_data, uint64_t original, float bias, com_ptr<ID3D11SamplerState> custom_sampler)
-   {
-      com_ptr<ID3D11SamplerState>& variant = device_data.custom_sampler_by_original_sampler[original][bias];
-      if (variant)
-      {
-         device_data.original_sampler_by_custom_sampler.erase(reinterpret_cast<uint64_t>(variant.get()));
-      }
-      variant = std::move(custom_sampler);
-      if (variant)
-      {
-         device_data.original_sampler_by_custom_sampler[reinterpret_cast<uint64_t>(variant.get())] = original;
-      }
-      return variant.get();
-   }
-
    // Core swaps the game's samplers for upgraded ones only as they're bound (the descriptor push of "sampler" type below), so after a
    // change of "texture_mip_lod_bias_offset" a sampler that stayed bound keeps the previous bias until the game rebinds it, which a game
    // or wrapper skipping redundant binds may never do (The Witcher 2 under dgVoodoo: the scene kept the shadow pass's unbiased samplers).
@@ -6548,27 +6530,22 @@ namespace
             auto original = device_data.custom_sampler_by_original_sampler.find(reinterpret_cast<uint64_t>(sampler));
             if (original == device_data.custom_sampler_by_original_sampler.end())
             {
-               const auto original_handle = device_data.original_sampler_by_custom_sampler.find(reinterpret_cast<uint64_t>(sampler));
-               if (original_handle == device_data.original_sampler_by_custom_sampler.end())
-                  continue;
-               original = device_data.custom_sampler_by_original_sampler.find(original_handle->second);
+               original = std::find_if(device_data.custom_sampler_by_original_sampler.begin(), device_data.custom_sampler_by_original_sampler.end(), [sampler](const auto& entry)
+                  { return std::any_of(entry.second.begin(), entry.second.end(), [sampler](const auto& variant)
+                       { return variant.second.get() == sampler; }); });
                if (original == device_data.custom_sampler_by_original_sampler.end())
                   continue;
             }
-            const uint64_t original_handle = original->first;
-            ID3D11SamplerState* variant = nullptr;
-            if (const auto existing = original->second.find(bias); existing != original->second.end())
-            {
-               variant = existing->second.get();
-            }
-            else
+            auto& [original_handle, variants] = *original;
+            auto variant = variants.find(bias);
+            if (variant == variants.end())
             {
                D3D11_SAMPLER_DESC desc;
                reinterpret_cast<ID3D11SamplerState*>(original_handle)->GetDesc(&desc);
-               variant = SetSamplerVariant(device_data, original_handle, bias, CreateCustomSampler(device_data, device_data.native_device, desc));
+               variant = variants.emplace(bias, CreateCustomSampler(device_data, device_data.native_device, desc)).first;
             }
             // No variant: a sampler Core doesn't upgrade, the game's own
-            ID3D11SamplerState* const replacement = (variant ? variant : reinterpret_cast<ID3D11SamplerState*>(original_handle));
+            ID3D11SamplerState* const replacement = (variant->second ? variant->second.get() : reinterpret_cast<ID3D11SamplerState*>(original_handle));
             if (replacement != sampler)
             {
                sampler->Release();
@@ -8431,7 +8408,7 @@ namespace
       native_sampler->GetDesc(&native_desc);
       com_ptr<ID3D11SamplerState> custom_sampler = CreateCustomSampler(device_data, (ID3D11Device*)device->get_native(), native_desc);
       std::unique_lock unique_lock_samplers(s_mutex_samplers);
-      SetSamplerVariant(device_data, sampler.handle, device_data.texture_mip_lod_bias_offset, custom_sampler);
+      device_data.custom_sampler_by_original_sampler[sampler.handle][device_data.texture_mip_lod_bias_offset] = custom_sampler;
    }
 
    void OnDestroySampler(reshade::api::device* device, reshade::api::sampler sampler)
@@ -8447,13 +8424,6 @@ namespace
       // Release custom samplers outside lock as OnDestroySampler can be called recursively
       auto samplers = std::move(device_data.custom_sampler_by_original_sampler[sampler.handle]);
       device_data.custom_sampler_by_original_sampler.erase(sampler.handle);
-      for (const auto& [bias, custom_sampler] : samplers)
-      {
-         if (custom_sampler)
-         {
-            device_data.original_sampler_by_custom_sampler.erase(reinterpret_cast<uint64_t>(custom_sampler.get()));
-         }
-      }
       s_mutex_samplers.unlock();
    }
 
@@ -9367,7 +9337,8 @@ namespace
                      native_sampler->GetDesc(&native_desc);
                      com_ptr<ID3D11SamplerState> custom_sampler = CreateCustomSampler(device_data, (ID3D11Device*)device->get_native(), native_desc);
                      std::unique_lock unique_lock_samplers(s_mutex_samplers); // Only lock for reading if necessary. It doesn't matter if we released the shared lock above for a tiny amount of time, it's safe anyway
-                     custom_sampler_ptr = SetSamplerVariant(device_data, sampler.handle, last_texture_mip_lod_bias_offset, custom_sampler);
+                     custom_samplers[last_texture_mip_lod_bias_offset] = custom_sampler;
+                     custom_sampler_ptr = custom_samplers[last_texture_mip_lod_bias_offset].get();
                   }
                   shared_lock_samplers.lock();
                }
@@ -15968,7 +15939,7 @@ namespace
                         native_sampler->GetDesc(&native_desc);
                         com_ptr<ID3D11SamplerState> custom_sampler = CreateCustomSampler(device_data, (ID3D11Device*)runtime->get_device()->get_native(), native_desc);
                         lock_samplers.lock();
-                        SetSamplerVariant(device_data, samplers_handle.first, device_data.texture_mip_lod_bias_offset, custom_sampler);
+                        samplers_handle.second[device_data.texture_mip_lod_bias_offset] = custom_sampler;
                      }
                   }
                }
