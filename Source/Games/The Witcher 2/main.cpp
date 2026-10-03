@@ -639,7 +639,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // The size and format the set was built for. Committed even when the allocation fails, so a null set under a
    // matching triple means "failed" and no per-frame retry fragments the 32-bit address space. ReleaseGTAOScratch
    // clears it.
-   uint32_t gtao_w = 0, gtao_h = 0;
+   uint32_t gtao_w = 0, gtao_h = 0;                  // The game's AO target (the final texture's size)
+   uint32_t gtao_work_w = 0, gtao_work_h = 0;        // The working textures: the scene's share of it under the render scale
    DXGI_FORMAT gtao_final_fmt = DXGI_FORMAT_UNKNOWN; // actual (possibly Luma-upgraded) AO RT format
    com_ptr<ID3D11Buffer> cb_gtao;                    // knobs + viewport (GTAO_KNOBS_CB_SLOT), dynamic: the noise index changes every frame
 
@@ -680,6 +681,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       uav_gtao_final.reset();
       gtao_w = 0;
       gtao_h = 0;
+      gtao_work_w = 0;
+      gtao_work_h = 0;
       gtao_final_fmt = DXGI_FORMAT_UNKNOWN;
       cb_gtao.reset(); // it holds the viewport size
    }
@@ -2477,12 +2480,20 @@ class TheWitcher2Game final : public Game
       if (!game_cb4)
          return DrawOrDispatchOverrideType::None;
 
-      // (Re)create the scratch set on first use, resolution change, or RT format change (all-or-nothing).
-      if (gd->gtao_w != w || gd->gtao_h != h || gd->gtao_final_fmt != final_fmt)
+      // Under the render scale the scene fills only the top-left "area_scale" of the AO target: XeGTAO works on that share alone, so
+      // its clamped depth samples stop at the share's edge instead of reading the stale depth beyond it (a dark band at the right and
+      // bottom), and nothing is computed outside it
+      const float2 area_scale = {(RenderArea::render_size[0] != 0 ? float(RenderArea::render_size[0]) / device_data.output_resolution.x : 1.f),
+         (RenderArea::render_size[1] != 0 ? float(RenderArea::render_size[1]) / device_data.output_resolution.y : 1.f)};
+      const uint32_t work_w = std::clamp(uint32_t(std::ceil(float(w) * area_scale.x)), 1u, w);
+      const uint32_t work_h = std::clamp(uint32_t(std::ceil(float(h) * area_scale.y)), 1u, h);
+
+      // (Re)create the scratch set on first use, resolution or render scale change, or RT format change (all-or-nothing).
+      if (gd->gtao_w != w || gd->gtao_h != h || gd->gtao_work_w != work_w || gd->gtao_work_h != work_h || gd->gtao_final_fmt != final_fmt)
       {
          gd->ReleaseGTAOScratch();
 
-         const CD3D11_TEXTURE2D_DESC td(DXGI_FORMAT_R32_FLOAT, w, h, 1, 5 /* XE_GTAO_DEPTH_MIP_LEVELS */, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         const CD3D11_TEXTURE2D_DESC td(DXGI_FORMAT_R32_FLOAT, work_w, work_h, 1, 5 /* XE_GTAO_DEPTH_MIP_LEVELS */, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          bool ok = SUCCEEDED(native_device->CreateTexture2D(&td, nullptr, gd->tex_gtao_depth_mips.put()));
          for (UINT i = 0; ok && i < 5; i++)
          {
@@ -2493,7 +2504,7 @@ class TheWitcher2Game final : public Game
 
          for (int i = 0; ok && i < 2; i++)
          {
-            ok = ok && CreateDefaultTex(native_device, w, h, td.BindFlags, std::addressof(gd->tex_gtao_working[i]), DXGI_FORMAT_R8G8_UNORM);
+            ok = ok && CreateDefaultTex(native_device, work_w, work_h, td.BindFlags, std::addressof(gd->tex_gtao_working[i]), DXGI_FORMAT_R8G8_UNORM);
             ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_working[i].get(), nullptr, gd->uav_gtao_working[i].put()));
             ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_working[i].get(), nullptr, gd->srv_gtao_working[i].put()));
          }
@@ -2510,6 +2521,8 @@ class TheWitcher2Game final : public Game
          // Commit the target triple either way: a null set under it then reads as "failed", with no retry.
          gd->gtao_w = w;
          gd->gtao_h = h;
+         gd->gtao_work_w = work_w;
+         gd->gtao_work_h = work_h;
          gd->gtao_final_fmt = final_fmt;
       }
       if (!gd->tex_gtao_final)
@@ -2526,9 +2539,8 @@ class TheWitcher2Game final : public Game
          .depth_scale = g_gtao_depth_scale,
          .radius_override = g_gtao_radius_override,
          .debug_view = debug_view,
-         .viewport_pixel_size = {1.f / float(w), 1.f / float(h)},
-         .area_scale = {(RenderArea::render_size[0] != 0 ? float(RenderArea::render_size[0]) / device_data.output_resolution.x : 1.f),
-            (RenderArea::render_size[1] != 0 ? float(RenderArea::render_size[1]) / device_data.output_resolution.y : 1.f)},
+         .viewport_pixel_size = {1.f / float(work_w), 1.f / float(work_h)},
+         .area_scale = area_scale,
          .noise_index = (gd->sr_active ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f),
       };
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), &knobs, sizeof(knobs)))
@@ -2554,7 +2566,7 @@ class TheWitcher2Game final : public Game
          native_device_context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
          native_device_context->CSSetShaderResources(0, 1, srv_depth.get_addressof());
          native_device_context->CSSetShader(cs_prefilter, nullptr, 0);
-         native_device_context->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
+         native_device_context->Dispatch((work_w + 15) / 16, (work_h + 15) / 16, 1);
          native_device_context->CSSetUnorderedAccessViews(0, 5, uav_nulls5.data(), nullptr);
       }
       // Bind each destination UAV before its source SRVs: D3D11 otherwise keeps the previous UAV hazard and
@@ -2564,7 +2576,7 @@ class TheWitcher2Game final : public Game
          native_device_context->CSSetUnorderedAccessViews(0, 1, gd->uav_gtao_working[0].get_addressof(), nullptr);
          native_device_context->CSSetShaderResources(0, 1, gd->srv_gtao_depth_mips.get_addressof());
          native_device_context->CSSetShader(cs_main, nullptr, 0);
-         native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+         native_device_context->Dispatch((work_w + 7) / 8, (work_h + 7) / 8, 1);
       }
       // First denoiser writes working1, two horizontal pixels per thread.
       {
@@ -2572,14 +2584,14 @@ class TheWitcher2Game final : public Game
          native_device_context->CSSetUnorderedAccessViews(0, 1, gd->uav_gtao_working[1].get_addressof(), nullptr);
          native_device_context->CSSetShaderResources(0, 1, gd->srv_gtao_working[0].get_addressof());
          native_device_context->CSSetShader(cs_denoise_1, nullptr, 0);
-         native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
+         native_device_context->Dispatch((work_w + 15) / 16, (work_h + 7) / 8, 1);
       }
       {
          native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
          native_device_context->CSSetUnorderedAccessViews(0, 1, gd->uav_gtao_final.get_addressof(), nullptr);
          native_device_context->CSSetShaderResources(0, 1, gd->srv_gtao_working[1].get_addressof());
          native_device_context->CSSetShader(cs_denoise_2, nullptr, 0);
-         native_device_context->Dispatch((w + 15) / 16, (h + 7) / 8, 1);
+         native_device_context->Dispatch((work_w + 15) / 16, (work_h + 7) / 8, 1);
          native_device_context->CSSetUnorderedAccessViews(0, 1, uav_nulls5.data(), nullptr);
       }
 
@@ -2591,7 +2603,9 @@ class TheWitcher2Game final : public Game
          ComPtr<ID3D11DepthStencilView> dsv_orig;
          native_device_context->OMGetRenderTargets(0, nullptr, dsv_orig.put());
          native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-         native_device_context->CopyResource(rt_res.get(), gd->tex_gtao_final.get());
+         // Only the share XeGTAO wrote (all of it at native); the vanilla chain reads no further
+         const D3D11_BOX share = {0, 0, 0, work_w, work_h, 1};
+         native_device_context->CopySubresourceRegion(rt_res.get(), 0, 0, 0, 0, gd->tex_gtao_final.get(), 0, &share);
          native_device_context->OMSetRenderTargets(1, rtv.get_addressof(), dsv_orig.get());
       }
 

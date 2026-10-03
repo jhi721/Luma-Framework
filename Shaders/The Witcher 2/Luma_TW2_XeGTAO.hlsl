@@ -61,9 +61,9 @@ cbuffer LumaGTAO : register(b9)
 
 // Transcribed from the native HBAO PS (0x3FEEC0F7): ndc = (uv.x*2-1, 1-2*uv.y), viewRay = ndc * cb4[9].zw.
 // Expressed as the XeGTAO mul/add pair over raw uv: viewPos.xy = (uv * MUL + ADD) * viewZ.
-// Under the render scale the scene fills only the top-left "area_scale" of the target and cb4[9] stays the full view's, so the
-// area's NDC spans uv / area_scale (the native HBAO doesn't do it)
-#define NDC_TO_VIEW_MUL (float2(2.0, -2.0) * cb4[9].zw / gtao_knobs.area_scale)
+// Under the render scale XeGTAO's working textures cover only the scene's share of the target (main.cpp), so uv spans the
+// rendered area and cb4[9] (the full view's) applies as is
+#define NDC_TO_VIEW_MUL (float2(2.0, -2.0) * cb4[9].zw)
 #define NDC_TO_VIEW_ADD (float2(-1.0, 1.0) * cb4[9].zw)
 
 // Plain float4 (not unorm): the copy-source texture matches the game AO RT's ACTUAL format, which is rgba16_float whenever Luma's
