@@ -1358,7 +1358,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
       uint32_t mod_version = 1;
       Globals::SetGlobals(cleared_project_name, "Medal of Honor (2010) Luma HDR mod", "", mod_version);
-      Globals::DEVELOPMENT_STATE = Globals::ModDevelopmentState::WorkInProgress;
+      Globals::DEVELOPMENT_STATE = Globals::ModDevelopmentState::Finished;
 
       // scRGB fp16 swapchain (the game's backbuffer is 8-bit).
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
