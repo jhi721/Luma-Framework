@@ -1359,6 +1359,13 @@ class MassEffectLE final : public Game
    // only when something rebound the slot or the buffer was recreated ("g_opt_jitter_bind_once")
    static void BindJitterBuffer(ID3D11DeviceContext* native_device_context, ID3D11Buffer* jitter)
    {
+      if (ImmediateState::check && ImmediateState::jitter_buffer)
+      {
+         com_ptr<ID3D11Buffer> bound;
+         native_device_context->VSGetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &bound);
+         ImmediateState::checks++;
+         ImmediateState::mismatches += bound.get() != ImmediateState::jitter_buffer;
+      }
       if (g_opt_jitter_bind_once && ImmediateState::jitter_buffer == jitter)
          return;
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
@@ -1760,6 +1767,12 @@ class MassEffectLE final : public Game
             {
                DXGI_FORMAT index_format;
                native_device_context->IAGetIndexBuffer(&*held, &index_format, &index_offset); });
+         // The draw key's offsets too ("Read" checks the buffers)
+         if (ImmediateState::check && ImmediateState::vertex_buffer_known && ImmediateState::index_buffer_known)
+         {
+            ImmediateState::checks++;
+            ImmediateState::mismatches += vertex_offset != ImmediateState::vertex_offset || index_offset != ImmediateState::index_offset;
+         }
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
          uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
