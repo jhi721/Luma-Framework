@@ -12,7 +12,6 @@
 #include <wrl/client.h>
 
 #include <algorithm>
-#include <chrono>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -34,9 +33,6 @@ namespace SRBridge
       {
          reshade::log::message(level, ("[SR Bridge] " + message).c_str());
       }
-
-      // Before trying again after the helper failed, so a game that keeps drawing doesn't start one per frame
-      constexpr auto retry_delay = std::chrono::seconds(2);
 
       // The protocol's "<settings>"
       std::string FormatSettings(const SR::SettingsData& settings)
@@ -67,7 +63,6 @@ namespace SRBridge
       bool settings_pending = false; // Changed since the helper started: sent before the next frame
 
       bool failed = false;
-      std::chrono::steady_clock::time_point failure_time;
 
       ~BridgeInstanceData()
       {
@@ -113,7 +108,6 @@ namespace SRBridge
    {
       Stop();
       failed = true;
-      failure_time = std::chrono::steady_clock::now();
       Log(reshade::log::level::warning, reason);
       return false;
    }
@@ -279,7 +273,11 @@ namespace SRBridge
    void Bridge::ReleaseResources(SR::InstanceData* data)
    {
       if (data)
+      {
          static_cast<BridgeInstanceData*>(data)->Stop();
+         // A new pick starts over after a failure (games stop drawing a failed upscaler until it's picked again)
+         static_cast<BridgeInstanceData*>(data)->failed = false;
+      }
    }
 
    // The helper starts on the next draw with these, or a running one recreates the upscaler with them
@@ -299,12 +297,9 @@ namespace SRBridge
    bool Bridge::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data)
    {
       auto& custom_data = *const_cast<BridgeInstanceData*>(static_cast<const BridgeInstanceData*>(data));
+      // Until picked again ("ReleaseResources") or new settings
       if (custom_data.failed)
-      {
-         if (std::chrono::steady_clock::now() - custom_data.failure_time < retry_delay)
-            return false;
-         custom_data.failed = false;
-      }
+         return false;
       ID3D11Resource* const resources[kCount] = {draw_data.source_color, draw_data.motion_vectors, draw_data.depth_buffer, draw_data.bias_mask, draw_data.transparency_alpha,
          draw_data.exposure, draw_data.output_color};
       if (custom_data.process)
