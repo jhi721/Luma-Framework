@@ -226,12 +226,7 @@ namespace Perf
       template <typename OnWindow>
       void Finish(bool measuring, OnWindow&& on_window)
       {
-         if (!measuring)
-         {
-            settle_frames--;
-            Reset();
-         }
-         else
+         if (measuring)
          {
             cpu_frame_ms += std::chrono::duration<double, std::milli>(present - last_present).count();
             if (++frames >= 120)
@@ -239,6 +234,11 @@ namespace Perf
                on_window();
                Reset();
             }
+         }
+         else
+         {
+            settle_frames--;
+            Reset();
          }
          last_present = present;
       }

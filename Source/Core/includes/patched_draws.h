@@ -194,7 +194,9 @@ namespace PatchedDraws
    {
       ObjectTransform transform;
       for (size_t row = 0; row < 4; row++)
+      {
          std::memcpy(transform.data() + row * 3, first_row + row * 16, 3 * sizeof(float));
+      }
       return transform;
    }
 
@@ -203,7 +205,9 @@ namespace PatchedDraws
    {
       float distance = 0.f;
       for (size_t i = 0; i < a.size(); i++)
+      {
          distance += (a[i] - b[i]) * (a[i] - b[i]);
+      }
       return distance;
    }
 

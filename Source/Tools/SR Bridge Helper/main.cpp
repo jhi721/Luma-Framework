@@ -450,9 +450,16 @@ int main()
       if (message == "settings")
       {
          if (!(std::cin >> settings))
-            return release_game(), printf("[Luma Upscaler] FAIL bad settings line\n"), 1;
+         {
+            release_game();
+            printf("[Luma Upscaler] FAIL bad settings line\n");
+            return 1;
+         }
          if (dlss ? !dlss->CreateFeature(context.Get(), settings) : !fsr->Create(device.Get(), settings))
-            return release_game(), 1;
+         {
+            release_game();
+            return 1;
+         }
          printf("[Luma Upscaler] recreated: %ux%u -> %ux%u, preset %d\n", settings.render_width, settings.render_height, settings.output_width, settings.output_height,
             settings.render_preset);
          fflush(stdout);
@@ -460,7 +467,11 @@ int main()
       }
       if (message != "frame" || !(std::cin >> frame.n >> frame.jitter_x >> frame.jitter_y >> frame.reset >> frame.render_width >> frame.render_height >> frame.pre_exposure >>
                                    frame.sharpness >> frame.near_plane >> frame.far_plane >> frame.vert_fov))
-         return release_game(), printf("[Luma Upscaler] FAIL bad line \"%s\"\n", message.c_str()), 1;
+      {
+         release_game();
+         printf("[Luma Upscaler] FAIL bad line \"%s\"\n", message.c_str());
+         return 1;
+      }
       if (profile)
          profile->Begin(context.Get(), frame.n);
       context4->Wait(fence_in.Get(), frame.n);
@@ -480,8 +491,11 @@ int main()
       {
          release_game();
          if (profile)
+         {
             profile->Finish(context.Get());
-         return printf("[Luma Upscaler] FAIL frame %llu: the upscaler failed\n", (unsigned long long)frame.n), 1;
+         }
+         printf("[Luma Upscaler] FAIL frame %llu: the upscaler failed\n", (unsigned long long)frame.n);
+         return 1;
       }
    }
    printf("[Luma Upscaler] the game closed the pipe after %u frames\n", frames);
