@@ -21,10 +21,13 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
+// Scales the offset screen position reads of material pixel shaders below native (see "SceneOffsetPatch.h")
+#define LUMA_PATCH_BYTECODE_SYNC 1
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
+#include "SceneOffsetPatch.h"
 #include "..\..\Core\includes\patched_draws.h"
 #if DEVELOPMENT
 #include "..\..\Core\includes\perf_test.h"
@@ -1211,7 +1214,11 @@ class MassEffectLE final : public Game
             }
             else
             {
-               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error);
+               // On top of the game's shader as created ("PatchShaderBytecodeSync"; the pipeline cache keeps the original bytecode)
+               const std::shared_ptr<Patch::PatchedShaderData> created = device_data.patch_context.GetShaderData(hash);
+               const uint8_t* const pixel_code = (created ? created->code.data() : code);
+               const size_t pixel_code_size = (created ? created->code.size() : desc->code_size);
+               patched = MotionVectorPatch::PatchPixelShader(pixel_code, pixel_code_size, MotionVectorPatches::layout, &error);
             }
             com_ptr<ID3D11ShaderReflection> reflection;
             if (vertex && !patched.empty() && Shader::d3d_reflect && SUCCEEDED(Shader::d3d_reflect(code, desc->code_size, IID_PPV_ARGS(&reflection))))
@@ -2494,6 +2501,27 @@ public:
          Mcp::RegisterCounter(std::string("mv.rejected.") + kMotionVectorRejectNames[reject], &stats.rejected[reject], &device_data);
       }
 #endif
+   }
+
+   // Core's sync provider takes the program after its version and length tokens
+   std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
+   {
+      if (type != reshade::api::pipeline_subobject_type::pixel_shader || !shader_object)
+         return nullptr;
+      SceneOffsetPatch::Stats stats;
+      const std::vector<uint32_t> patched = SceneOffsetPatch::PatchPixelShaderProgram(reinterpret_cast<const uint8_t*>(shader_object), shader_object_size, &stats);
+#if DEVELOPMENT
+      if (stats.patched_reads || stats.refused_reads)
+      {
+         reshade::log::message(reshade::log::level::info, std::format("[MELE SceneOffset] PS 0x{:08X} {} reads scaled, {} refused", uint32_t(shader_hash), stats.patched_reads, stats.refused_reads).c_str());
+      }
+#endif
+      if (patched.empty())
+         return nullptr;
+      size = (patched.size() - 2) * sizeof(uint32_t);
+      auto program_body = std::make_unique<std::byte[]>(size);
+      std::memcpy(program_body.get(), patched.data() + 2, size);
+      return program_body;
    }
 
    void OnDestroyDeviceData(DeviceData& device_data) override
