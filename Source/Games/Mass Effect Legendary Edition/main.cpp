@@ -337,6 +337,151 @@ namespace EngineScale
    }
 } // namespace EngineScale
 
+// CPU cost of the motion vector hooks (docs/D3D11-Hook-CPU-Profiling-And-Optimization.md "Immediate-context state queries"): each
+// optimization is a DEV toggle (MCP "opt_*") to A/B them in one session with the "Performance Test"; Publishing has them all.
+#if DEVELOPMENT
+static bool g_opt_shadow_state = true;     // The bound state from ReShade's bind events, not Get* (see "ImmediateState")
+static bool g_opt_shader_shadow = true;    // Patched shaders bound against the tracked shaders, not VSGetShader / PSGetShader
+static bool g_opt_jitter_bind_once = true; // The jitter buffer bound once, not on every draw
+static int g_opt_shadow_check = 0;         // Compares the tracked state with Get* on 1 draw in N (0: never), see "opt.shadow_mismatches"
+#else
+static constexpr bool g_opt_shadow_state = true;
+static constexpr bool g_opt_shader_shadow = true;
+static constexpr bool g_opt_jitter_bind_once = true;
+static constexpr int g_opt_shadow_check = 0;
+#endif
+
+// The immediate context's bound state as the game's Set* calls leave it, from ReShade's bind events, so the scene's per-draw hooks
+// skip Get* calls and their AddRef / Release. Raw pointers: the context holds the objects while they're bound. A field is known once an
+// event set it (until then, and after each present, the hooks Get* it). Luma's own native Set* calls raise no event: the motion vector
+// draws update what they leave bound (targets, patched shaders, jitter buffer); everything else of Luma restores what it changes.
+// Render thread only (the immediate context's events and draws).
+namespace ImmediateState
+{
+   std::atomic<uint64_t> context = 0; // The immediate context's native pointer, from its first draw
+   ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+   ID3D11DepthStencilView* dsv = nullptr;
+   ID3D11Buffer* vs_cbs[4] = {}; // b0-b3
+   ID3D11BlendState* blend = nullptr;
+   ID3D11DepthStencilState* depth_stencil = nullptr;
+   ID3D11Buffer* vertex_buffer = nullptr; // Slot 0
+   UINT vertex_offset = 0;
+   ID3D11Buffer* index_buffer = nullptr;
+   UINT index_offset = 0;
+   ID3D11VertexShader* vertex_shader = nullptr;
+   ID3D11PixelShader* pixel_shader = nullptr;
+   bool targets_known = false, blend_known = false, depth_stencil_known = false, vertex_buffer_known = false, index_buffer_known = false, vertex_shader_known = false, pixel_shader_known = false;
+   uint8_t vs_cbs_known = 0;              // A bit per slot
+   ID3D11Buffer* jitter_buffer = nullptr; // What VS "MotionVectorPatches::jitter_slot" holds since we bound it (null: unknown; no game shader reads it)
+   bool check = false;                    // This draw compares the tracked state with Get* ("g_opt_shadow_check")
+   uint32_t checks = 0, mismatches = 0;
+
+   bool IsImmediate(reshade::api::command_list* cmd_list)
+   {
+      return cmd_list->get_native() == context.load(std::memory_order_relaxed);
+   }
+
+   void Forget()
+   {
+      targets_known = blend_known = depth_stencil_known = vertex_buffer_known = index_buffer_known = vertex_shader_known = pixel_shader_known = false;
+      jitter_buffer = nullptr;
+      vs_cbs_known = 0;
+   }
+
+   void OnBindRenderTargetsAndDepthStencil(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* views, reshade::api::resource_view depth_view)
+   {
+      if (!IsImmediate(cmd_list))
+         return;
+      // Slots past "count" are unbound
+      for (uint32_t i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+      {
+         rtvs[i] = (i < count ? reinterpret_cast<ID3D11RenderTargetView*>(views[i].handle) : nullptr);
+      }
+      dsv = reinterpret_cast<ID3D11DepthStencilView*>(depth_view.handle);
+      targets_known = true;
+   }
+
+   // "stages" is "all" for ClearState (every pipeline null)
+   void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
+   {
+      if (!IsImmediate(cmd_list))
+         return;
+      if ((stages & reshade::api::pipeline_stage::output_merger) != 0)
+      {
+         blend = reinterpret_cast<ID3D11BlendState*>(pipeline.handle);
+         blend_known = true;
+      }
+      if ((stages & reshade::api::pipeline_stage::depth_stencil) != 0)
+      {
+         depth_stencil = reinterpret_cast<ID3D11DepthStencilState*>(pipeline.handle);
+         depth_stencil_known = true;
+      }
+      if ((stages & reshade::api::pipeline_stage::vertex_shader) != 0)
+      {
+         vertex_shader = reinterpret_cast<ID3D11VertexShader*>(pipeline.handle);
+         vertex_shader_known = true;
+      }
+      if ((stages & reshade::api::pipeline_stage::pixel_shader) != 0)
+      {
+         pixel_shader = reinterpret_cast<ID3D11PixelShader*>(pipeline.handle);
+         pixel_shader_known = true;
+      }
+   }
+
+   void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
+   {
+      if (update.type != reshade::api::descriptor_type::constant_buffer || (stages & reshade::api::shader_stage::vertex) == 0 || !IsImmediate(cmd_list))
+         return;
+      const auto* const ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
+      for (uint32_t i = 0; i < update.count; i++)
+      {
+         const uint32_t slot = update.binding + i;
+         if (slot < std::size(vs_cbs))
+         {
+            vs_cbs[slot] = reinterpret_cast<ID3D11Buffer*>(ranges[i].buffer.handle);
+            vs_cbs_known |= uint8_t(1u << slot);
+         }
+         else if (slot == MotionVectorPatches::jitter_slot)
+         {
+            jitter_buffer = nullptr;
+         }
+      }
+   }
+
+   void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
+   {
+      if (first != 0 || count == 0 || !IsImmediate(cmd_list))
+         return;
+      vertex_buffer = reinterpret_cast<ID3D11Buffer*>(buffers[0].handle);
+      vertex_offset = UINT(offsets[0]);
+      vertex_buffer_known = true;
+   }
+
+   void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   {
+      if (!IsImmediate(cmd_list))
+         return;
+      index_buffer = reinterpret_cast<ID3D11Buffer*>(buffer.handle);
+      index_offset = UINT(offset);
+      index_buffer_known = true;
+   }
+
+   // A tracked value, or (unknown, or the toggle off) the queried one, held by "held"; on a check draw both, a mismatch counted
+   template <typename T, typename Query>
+   T* Read(T* tracked, bool known, com_ptr<T>* held, Query query)
+   {
+      if (g_opt_shadow_state && known && !check)
+         return tracked;
+      query(held);
+      if (check && known)
+      {
+         checks++;
+         mismatches += held->get() != tracked;
+      }
+      return held->get();
+   }
+} // namespace ImmediateState
+
 // Motion vectors for DLSS / FSR: the opaque draws into the fp16 scene draw with patched shaders that also write an extra target,
 // the vertex shader's second run reading the draw's previous frame b0 / b1 / b3.
 #if DEVELOPMENT
@@ -1135,9 +1280,10 @@ class MassEffectLE final : public Game
    // The bound depth stencil state's depth test and write, looked up again only when it changes (both draw paths)
    static void CacheDepthStencilState(ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData* game_device_data)
    {
-      com_ptr<ID3D11DepthStencilState> depth_stencil_state;
-      native_device_context->OMGetDepthStencilState(&depth_stencil_state, nullptr);
-      if (depth_stencil_state.get() == game_device_data->depth_stencil_state)
+      com_ptr<ID3D11DepthStencilState> held_depth_stencil_state;
+      ID3D11DepthStencilState* const depth_stencil_state = ImmediateState::Read(ImmediateState::depth_stencil, ImmediateState::depth_stencil_known, std::addressof(held_depth_stencil_state), [&](com_ptr<ID3D11DepthStencilState>* held)
+         { native_device_context->OMGetDepthStencilState(&*held, nullptr); });
+      if (depth_stencil_state == game_device_data->depth_stencil_state)
          return;
       D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
       if (depth_stencil_state)
@@ -1146,7 +1292,77 @@ class MassEffectLE final : public Game
       }
       game_device_data->depth_test = depth_desc.DepthEnable;
       game_device_data->depth_write = depth_desc.DepthEnable && depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
-      game_device_data->depth_stencil_state = depth_stencil_state.get();
+      game_device_data->depth_stencil_state = depth_stencil_state;
+   }
+
+   // The tracked bound vertex or pixel shader and whether it's known (see "ImmediateState")
+   template <typename T>
+   static std::pair<T**, bool*> TrackedShader()
+   {
+      if constexpr (std::is_same_v<T, ID3D11VertexShader>)
+         return {&ImmediateState::vertex_shader, &ImmediateState::vertex_shader_known};
+      else
+         return {&ImmediateState::pixel_shader, &ImmediateState::pixel_shader_known};
+   }
+
+   // "PatchedDraws::BindPatchedShader" / "RestoreGameShader" against the tracked bound shader (no Get*) once the game's bind events
+   // made it known ("g_opt_shader_shadow"); both keep it current, as their native Set* raises no event
+   template <typename T>
+   static void BindPatchedShader(ID3D11DeviceContext* native_device_context, T* patched, PatchedDraws::BoundShader<T>* bound)
+   {
+      const auto [tracked, known] = TrackedShader<T>();
+      if (ImmediateState::check && *known)
+      {
+         ImmediateState::checks++;
+         ImmediateState::mismatches += PatchedDraws::GetBoundShader<T>(native_device_context).get() != *tracked;
+      }
+      if (g_opt_shader_shadow && *known)
+      {
+         if (*tracked == patched)
+            return;
+         bound->game.reset(*tracked);
+         bound->patched = patched;
+         PatchedDraws::SetBoundShader(native_device_context, patched);
+      }
+      else
+      {
+         PatchedDraws::BindPatchedShader(native_device_context, patched, bound);
+      }
+      *tracked = patched;
+   }
+
+   template <typename T>
+   static void RestoreGameShader(ID3D11DeviceContext* native_device_context, PatchedDraws::BoundShader<T>* bound)
+   {
+      if (!bound->patched)
+         return;
+      const auto [tracked, known] = TrackedShader<T>();
+      if (g_opt_shader_shadow && *known)
+      {
+         if (*tracked == bound->patched)
+         {
+            PatchedDraws::SetBoundShader(native_device_context, bound->game.get());
+            *tracked = bound->game.get();
+         }
+         bound->patched = nullptr;
+         bound->game.reset();
+      }
+      else
+      {
+         // Core's version may or may not put the game's back: the tracked shader is unknown until the game binds one
+         PatchedDraws::RestoreGameShader(native_device_context, bound);
+         *known = false;
+      }
+   }
+
+   // The jitter buffer at VS "MotionVectorPatches::jitter_slot", left bound after the draw (no game shader reads the slot); bound again
+   // only when something rebound the slot or the buffer was recreated ("g_opt_jitter_bind_once")
+   static void BindJitterBuffer(ID3D11DeviceContext* native_device_context, ID3D11Buffer* jitter)
+   {
+      if (g_opt_jitter_bind_once && ImmediateState::jitter_buffer == jitter)
+         return;
+      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
+      ImmediateState::jitter_buffer = jitter;
    }
 
    // Near plane of a b1 copy's ViewProjectionMatrix (row vectors)
@@ -1171,12 +1387,13 @@ class MassEffectLE final : public Game
    // main view, so their draws would also be matched with the reflection's camera.
    static bool IsMirroredView(ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData* game_device_data)
    {
-      com_ptr<ID3D11Buffer> camera_buffer;
-      native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, &camera_buffer);
+      com_ptr<ID3D11Buffer> held_camera_buffer;
+      ID3D11Buffer* const camera_buffer = ImmediateState::Read(ImmediateState::vs_cbs[MotionVectorPatches::object_slot], (ImmediateState::vs_cbs_known >> MotionVectorPatches::object_slot) & 1, std::addressof(held_camera_buffer), [&](com_ptr<ID3D11Buffer>* held)
+         { native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, &*held); });
       MassEffectGameDeviceData::ConstantsCopy camera;
       {
          const std::lock_guard lock(game_device_data->mv_constants_mutex);
-         camera = GetConstantsCopy(game_device_data, camera_buffer.get());
+         camera = GetConstantsCopy(game_device_data, camera_buffer);
       }
       if (camera != game_device_data->view_camera)
       {
@@ -1309,26 +1526,26 @@ class MassEffectLE final : public Game
    // Draws an opaque draw into the fp16 scene (the base pass: the scene target and its other targets below "target_slot", output
    // sized, with the scene depth) with the patched shaders, adding the motion vector target ("target_slot") and the previous frame's
    // b0 / b1 / b3 ("previous_slots"). False if it can't (the draw then goes to "DrawWithJitter").
-   static bool DrawWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, const com_ptr<ID3D11RenderTargetView> (&rtvs)[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT], ID3D11DepthStencilView* dsv)
+   static bool DrawWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, ID3D11RenderTargetView* const (&rtvs)[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT], ID3D11DepthStencilView* dsv)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       // Nothing at or past the motion vector slot, but the motion vector target the last motion vector draw left bound
       for (UINT slot = MotionVectorPatches::target_slot; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; slot++)
       {
-         if (rtvs[slot] && (slot != MotionVectorPatches::target_slot || rtvs[slot] != game_device_data.mv_rtv))
+         if (rtvs[slot] && (slot != MotionVectorPatches::target_slot || rtvs[slot] != game_device_data.mv_rtv.get()))
             return MV_REJECT(REJECT_EXTRA_TARGET);
       }
       if (!rtvs[0] || !dsv || !game_device_data.mv_scene_open)
          return MV_REJECT(REJECT_NO_SCENE);
       // Targets other than the last accepted ones: checked, and the motion vector target sized for them
-      if (rtvs[0].get() != game_device_data.mv_accepted_rtv || dsv != game_device_data.mv_accepted_dsv)
+      if (rtvs[0] != game_device_data.mv_accepted_rtv || dsv != game_device_data.mv_accepted_dsv)
       {
          // Refused targets stay refused until the scene reopens (the scene depth and color only change there)
-         if (rtvs[0].get() == game_device_data.mv_refused_rtv && dsv == game_device_data.mv_refused_dsv)
+         if (rtvs[0] == game_device_data.mv_refused_rtv && dsv == game_device_data.mv_refused_dsv)
             return MV_REJECT(game_device_data.mv_refused_reason);
          const auto refuse = [&](MotionVectorReject reason)
          {
-            game_device_data.mv_refused_rtv = rtvs[0].get();
+            game_device_data.mv_refused_rtv = rtvs[0];
             game_device_data.mv_refused_dsv = dsv;
             game_device_data.mv_refused_reason = reason;
             return MV_REJECT(reason);
@@ -1389,12 +1606,13 @@ class MassEffectLE final : public Game
             }
             game_device_data.mv_frame_ended = true;
          }
-         game_device_data.mv_accepted_rtv = rtvs[0].get();
+         game_device_data.mv_accepted_rtv = rtvs[0];
          game_device_data.mv_accepted_dsv = dsv;
       }
-      com_ptr<ID3D11BlendState> blend_state;
-      native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
-      if (blend_state.get() != game_device_data.mv_blend_state)
+      com_ptr<ID3D11BlendState> held_blend_state;
+      ID3D11BlendState* const blend_state = ImmediateState::Read(ImmediateState::blend, ImmediateState::blend_known, std::addressof(held_blend_state), [&](com_ptr<ID3D11BlendState>* held)
+         { native_device_context->OMGetBlendState(&*held, nullptr, nullptr); });
+      if (blend_state != game_device_data.mv_blend_state)
       {
          D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
          if (blend_state)
@@ -1406,7 +1624,7 @@ class MassEffectLE final : public Game
          const D3D11_RENDER_TARGET_BLEND_DESC& rt0_blend = blend_desc.RenderTarget[0];
          game_device_data.mv_blend_opaque = rt0_blend.RenderTargetWriteMask != 0 && (!rt0_blend.BlendEnable || (rt0_blend.SrcBlend == D3D11_BLEND_ONE && rt0_blend.DestBlend == D3D11_BLEND_ZERO && rt0_blend.BlendOp == D3D11_BLEND_OP_ADD));
          game_device_data.mv_blend_depth_only = rt0_blend.RenderTargetWriteMask == 0;
-         game_device_data.mv_blend_state = blend_state.get();
+         game_device_data.mv_blend_state = blend_state;
       }
       // A draw that writes no color owns its pixels only if it writes depth: the alpha tested depth pass of long hair (ME3 LE
       // 0x89BD83EE, its color drawn blended afterwards), not occlusion query bounding boxes (depth tested, not written)
@@ -1487,9 +1705,14 @@ class MassEffectLE final : public Game
 
       // The game's b0 / b1 / b3. The slots added past them stay bound after the draw: no game vertex shader reads a constant buffer
       // at slot 4 or above.
-      com_ptr<ID3D11Buffer> game_cbs[4];
-      native_device_context->VSGetConstantBuffers(0, UINT(std::size(game_cbs)), &game_cbs[0]);
-      ID3D11Buffer* const current[std::size(MotionVectorPatches::previous_slots)] = {game_cbs[MotionVectorPatches::previous_slots[0].first].get(), game_cbs[MotionVectorPatches::previous_slots[1].first].get(), game_cbs[MotionVectorPatches::previous_slots[2].first].get()};
+      ID3D11Buffer* current[std::size(MotionVectorPatches::previous_slots)];
+      com_ptr<ID3D11Buffer> held_cbs[std::size(MotionVectorPatches::previous_slots)];
+      for (size_t i = 0; i < std::size(current); i++)
+      {
+         const UINT slot = MotionVectorPatches::previous_slots[i].first;
+         current[i] = ImmediateState::Read(ImmediateState::vs_cbs[slot], (ImmediateState::vs_cbs_known >> slot) & 1, std::addressof(held_cbs[i]), [&](com_ptr<ID3D11Buffer>* held)
+            { native_device_context->VSGetConstantBuffers(slot, 1, &*held); });
+      }
       const bool skinned = game_device_data.mv_last_vertex_shader->skinned;
       // b1's copy was taken for this draw by "IsMirroredView" (every draw with a depth target)
       MassEffectGameDeviceData::ConstantsCopy object, camera = game_device_data.view_camera, bones;
@@ -1527,16 +1750,19 @@ class MassEffectLE final : public Game
          }
 
          // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by translation. No instance count.
-         com_ptr<ID3D11Buffer> vertex_buffer;
-         UINT vertex_stride = 0, vertex_offset = 0;
-         native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vertex_offset);
-         com_ptr<ID3D11Buffer> index_buffer;
-         DXGI_FORMAT index_format;
-         UINT index_offset = 0;
-         native_device_context->IAGetIndexBuffer(&index_buffer, &index_format, &index_offset);
+         UINT vertex_offset = ImmediateState::vertex_offset, index_offset = ImmediateState::index_offset;
+         com_ptr<ID3D11Buffer> held_vertex_buffer, held_index_buffer;
+         ID3D11Buffer* const vertex_buffer = ImmediateState::Read(ImmediateState::vertex_buffer, ImmediateState::vertex_buffer_known, std::addressof(held_vertex_buffer), [&](com_ptr<ID3D11Buffer>* held)
+            {
+               UINT vertex_stride = 0;
+               native_device_context->IAGetVertexBuffers(0, 1, &*held, &vertex_stride, &vertex_offset); });
+         ID3D11Buffer* const index_buffer = ImmediateState::Read(ImmediateState::index_buffer, ImmediateState::index_buffer_known, std::addressof(held_index_buffer), [&](com_ptr<ID3D11Buffer>* held)
+            {
+               DXGI_FORMAT index_format;
+               native_device_context->IAGetIndexBuffer(&*held, &index_format, &index_offset); });
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
          uint64_t key = 0;
-         for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
+         for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer), uint64_t(vertex_offset), reinterpret_cast<uint64_t>(index_buffer), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)), uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
          {
             HashCombine(key, value);
          }
@@ -1635,8 +1861,7 @@ class MassEffectLE final : public Game
 #endif
       const std::span<const UINT> read_sizes = (g_mv_read_sizes ? std::span<const UINT>(game_device_data.mv_last_vertex_shader->read_sizes) : std::span<const UINT>());
       game_device_data.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, uploads, current, "MELE", read_sizes);
-      ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
-      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
+      BindJitterBuffer(native_device_context, game_device_data.mv_jitter_buffer.get());
       // Left bound after the draw (set directly, bypassing Core's state tracking): the game's next draws either bind their own
       // targets and shaders, or are motion vector draws too. The draws in between write no "o4" (no game pixel shader declares a
       // fifth target), so the motion vector target keeps its contents.
@@ -1645,13 +1870,17 @@ class MassEffectLE final : public Game
          ID3D11RenderTargetView* targets[MotionVectorPatches::target_slot + 1] = {};
          for (UINT slot = 0; slot < MotionVectorPatches::target_slot; slot++)
          {
-            targets[slot] = rtvs[slot].get();
+            targets[slot] = rtvs[slot];
          }
          targets[MotionVectorPatches::target_slot] = game_device_data.mv_rtv.get();
          native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
+         // Slots past the motion vector target are unbound
+         std::copy(std::begin(targets), std::end(targets), ImmediateState::rtvs);
+         std::fill(std::begin(ImmediateState::rtvs) + std::size(targets), std::end(ImmediateState::rtvs), nullptr);
+         ImmediateState::dsv = dsv;
       }
-      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
-      PatchedDraws::BindPatchedShader(native_device_context, pixel_shader, &game_device_data.mv_bound_pixel_shader);
+      BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
+      BindPatchedShader(native_device_context, pixel_shader, &game_device_data.mv_bound_pixel_shader);
 
       draw();
 #if DEVELOPMENT
@@ -1692,9 +1921,11 @@ class MassEffectLE final : public Game
       CacheDepthStencilState(native_device_context, &game_device_data);
       if (!game_device_data.depth_test)
          return false;
-      com_ptr<ID3D11Buffer> vertex_buffer;
-      UINT vertex_stride, vertex_offset;
-      native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vertex_offset);
+      com_ptr<ID3D11Buffer> held_vertex_buffer;
+      const ID3D11Buffer* const vertex_buffer = ImmediateState::Read(ImmediateState::vertex_buffer, ImmediateState::vertex_buffer_known, std::addressof(held_vertex_buffer), [&](com_ptr<ID3D11Buffer>* held)
+         {
+            UINT vertex_stride, vertex_offset;
+            native_device_context->IAGetVertexBuffers(0, 1, &*held, &vertex_stride, &vertex_offset); });
       if (!vertex_buffer)
          return false;
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
@@ -1703,10 +1934,9 @@ class MassEffectLE final : public Game
 
       // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel shader
       // (a motion vector draw's is put back)
-      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
-      ID3D11Buffer* const jitter = game_device_data.mv_jitter_buffer.get();
-      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
-      PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
+      BindPatchedShader(native_device_context, vertex_shader, &game_device_data.mv_bound_vertex_shader);
+      BindJitterBuffer(native_device_context, game_device_data.mv_jitter_buffer.get());
+      RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
       draw();
 #if DEVELOPMENT
       game_device_data.mv_stats.jitter_draws++;
@@ -2102,6 +2332,11 @@ public:
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(ImmediateState::OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(ImmediateState::OnBindPipeline);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(ImmediateState::OnPushDescriptors);
+      reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(ImmediateState::OnBindVertexBuffers);
+      reshade::unregister_event<reshade::addon_event::bind_index_buffer>(ImmediateState::OnBindIndexBuffer);
    }
 
    void OnInit(bool async) override
@@ -2109,6 +2344,8 @@ public:
       EngineScale::Install();
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
+      Mcp::RegisterToggles({{"opt_shadow_state", &g_opt_shadow_state}, {"opt_shader_shadow", &g_opt_shader_shadow}, { "opt_jitter_bind_once",
+                               &g_opt_jitter_bind_once }});
       Mcp::RegisterToggles({{"post_at_output_size", &EngineScale::g_post_at_output_size}, {"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter},
          {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter},
          {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}, {"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable},
@@ -2117,6 +2354,7 @@ public:
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       Mcp::RegisterValues({{"render_scale", &EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, 1.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f},
          {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 10.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 3.f}});
+      Mcp::RegisterInts({{"opt_shadow_check", &g_opt_shadow_check, 0, 1000}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_temporal", &g_gtao_temporal, 0, 2},
          { "perf_test",
             &Perf::g_test,
@@ -2189,6 +2427,11 @@ public:
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(ImmediateState::OnBindRenderTargetsAndDepthStencil);
+      reshade::register_event<reshade::addon_event::bind_pipeline>(ImmediateState::OnBindPipeline);
+      reshade::register_event<reshade::addon_event::push_descriptors>(ImmediateState::OnPushDescriptors);
+      reshade::register_event<reshade::addon_event::bind_vertex_buffers>(ImmediateState::OnBindVertexBuffers);
+      reshade::register_event<reshade::addon_event::bind_index_buffer>(ImmediateState::OnBindIndexBuffer);
 
       // Very High slice count for spatial stability (no TAA without DLSS/FSR).
       std::vector<ShaderDefineData> game_shader_defines_data = {
@@ -2223,7 +2466,7 @@ public:
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.matched", &stats.matched}, {"mv.camera_only", &stats.camera_only},
                                {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.updates", &stats.updates}, {"mv.sr_draws", &stats.sr_draws}, {"mv.matched_same_camera", &stats.matched_same_camera},
                                {"mv.mirrored", &stats.mirrored}, {"mv.view_restarts", &stats.view_restarts}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.ended_by_hash", &stats.ended_by},
-                               {"mv.registered_buffers", &stats.registered_buffers}, {"mv.constants_pool", &stats.constants_pool}, {"mv.destroyed_buffers", &GetGameDeviceData(device_data).mv_destroyed_buffers},
+                               {"mv.registered_buffers", &stats.registered_buffers}, {"mv.constants_pool", &stats.constants_pool}, {"mv.destroyed_buffers", &GetGameDeviceData(device_data).mv_destroyed_buffers}, {"opt.shadow_checks", &ImmediateState::checks}, {"opt.shadow_mismatches", &ImmediateState::mismatches},
                                { "fxaa.skipped",
                                   &stats.fxaa_skipped }},
          &device_data);
@@ -2746,6 +2989,10 @@ public:
       // stage-1 tonemap still supplies SMAA depth and the bloom slot; native-only branches check !is_custom_pass themselves.
       if (!cmd_list_data.is_primary)
          return DrawOrDispatchOverrideType::None;
+      if (ImmediateState::context.load(std::memory_order_relaxed) == 0)
+      {
+         ImmediateState::context.store(reinterpret_cast<uint64_t>(native_device_context), std::memory_order_relaxed);
+      }
 
       const bool compute = (stages & reshade::api::shader_stage::compute) != 0;
       const TonemapPermDesc* const stage1_perm = (compute ? nullptr : FindTonemapPerm(original_shader_hashes));
@@ -2804,15 +3051,39 @@ public:
 #if DEVELOPMENT
             const Perf::HookTimer timer{&gd.perf_window.hook_ns}; // The draw's own submission included
 #endif
-            com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-            com_ptr<ID3D11DepthStencilView> dsv;
-            native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
+#if DEVELOPMENT
+            static uint32_t draw_count = 0;
+            ImmediateState::check = g_opt_shadow_check > 0 && ++draw_count % uint32_t(g_opt_shadow_check) == 0;
+#endif
+            ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+            ID3D11DepthStencilView* dsv;
+            com_ptr<ID3D11RenderTargetView> held_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+            com_ptr<ID3D11DepthStencilView> held_dsv;
+            if (g_opt_shadow_state && ImmediateState::targets_known && !ImmediateState::check)
+            {
+               std::copy(std::begin(ImmediateState::rtvs), std::end(ImmediateState::rtvs), rtvs);
+               dsv = ImmediateState::dsv;
+            }
+            else
+            {
+               native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &held_rtvs[0], &held_dsv);
+               for (size_t i = 0; i < std::size(rtvs); i++)
+               {
+                  rtvs[i] = held_rtvs[i].get();
+               }
+               dsv = held_dsv.get();
+               if (ImmediateState::check && ImmediateState::targets_known)
+               {
+                  ImmediateState::checks++;
+                  ImmediateState::mismatches += dsv != ImmediateState::dsv || !std::equal(std::begin(rtvs), std::end(rtvs), std::begin(ImmediateState::rtvs));
+               }
+            }
             const bool mirrored = dsv && IsMirroredView(native_device_context, &gd);
 #if DEVELOPMENT
             gd.mv_stats.mirrored += mirrored;
 #endif
             const bool scene_view = dsv && !mirrored;
-            if (gd.mv_scene_open && scene_view && IsNewView(device_data, &gd, dsv.get()))
+            if (gd.mv_scene_open && scene_view && IsNewView(device_data, &gd, dsv))
             {
                // The earlier view's motion vectors (cleared again at the next motion vector draw), camera and objects go. Before the
                // frame's first motion vector draw they are still last frame's (see "DrawWithMotionVectors"): kept.
@@ -2832,7 +3103,7 @@ public:
             }
             if (!gd.mv_scene_open && scene_view)
             {
-               OpenScene(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0], dsv.get());
+               OpenScene(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0], dsv);
 #if DEVELOPMENT
                if (gd.mv_scene_open && gd.view_camera && gd.view_camera->size() >= kPreViewTranslationOffset + 12)
                {
@@ -2849,8 +3120,8 @@ public:
                gd.views.back().draws++;
             }
 #endif
-            const bool motion_vectors = !mirrored && DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
-            const bool jitter = !mirrored && !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv.get());
+            const bool motion_vectors = !mirrored && DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv);
+            const bool jitter = !mirrored && !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv);
 #if DEVELOPMENT
             Mcp::Annotate(cmd_list_data, mirrored ? "mirrored" : (motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched")));
             if (const int reject = std::exchange(gd.mv_draw_reject, -1); reject >= 0)
@@ -2872,8 +3143,8 @@ public:
          gd.sr_rebind_done = stage1;
       }
       // A draw without patched shaders gets the game's own back while the last patched draw's are still bound
-      PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
-      PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
+      RestoreGameShader(native_device_context, &gd.mv_bound_vertex_shader);
+      RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
 
       // "Hide Gameplay UI": the HUD draws after the FXAA resolve. Only plain game draws after it are skipped, so stage 1, stage 2,
       // movies without a scene resolve and pre-scene menus stay.
@@ -2900,6 +3171,8 @@ public:
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
+      // Whatever Luma and ReShade did around the present: the next frame's draws query until the game binds again
+      ImmediateState::Forget();
 
       // DLSS / FSR: the upscaler's history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the
       // motion vector state are fixed here for the next frame (see "IsSRActive")
