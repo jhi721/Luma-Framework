@@ -1,5 +1,6 @@
 // RCAS sharpening of a texture drawn over a target of its size (games draw it with Core's "Copy VS" and "DrawCustomPixelShader",
-// usually on the SMAA output). paperWhite = 1: the input is the gamma canvas or already normalized.
+// usually on the SMAA output). paperWhite = 1, the input sharpened as is: most games' gamma SDR canvas, MEA's display encoded color,
+// ME1's and MoH's fp16 canvas (above 1.0 where the scene is).
 
 #include "../Includes/RCAS.hlsl"
 

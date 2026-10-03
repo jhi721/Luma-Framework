@@ -779,7 +779,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 };
 
 // A Luma native shader ("native_*_shaders") by name, null until compiled. Looked up with "find": "operator[]" would insert on a miss,
-// mutating a map Core's draw helpers read concurrently.
+// mutating a map Core's draw helpers read concurrently. A caller that can race a shader (re)load holds "s_mutex_shader_objects".
 template <typename ShaderMap>
 auto FindShader(const ShaderMap& shaders, uint32_t name)
 {

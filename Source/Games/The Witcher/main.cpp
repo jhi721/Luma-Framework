@@ -861,7 +861,7 @@ class TheWitcherGame final : public Game
       // FSR needs the camera (column vectors). It errors on a 0 FOV: a frame without a camera keeps the last one.
       if (gd.mv_camera)
       {
-         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(gd.mv_camera->GetData(), false);
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(gd.mv_camera->GetData(), /* row_vectors */ false);
          if (camera.vert_fov > 0.0)
             gd.sr_vert_fov = float(camera.vert_fov);
          if (camera.near_plane > 0.0)

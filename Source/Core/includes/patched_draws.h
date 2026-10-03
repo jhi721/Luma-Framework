@@ -264,9 +264,8 @@ namespace PatchedDraws
    // blended: the strongest alpha blended draw per pixel (max never exceeds what one wrote).
    // "repair_per_target_blend" (dgVoodoo): it sometimes leaves blending on for a secondary target while RT0 has it off. D3D9 has one
    // global blend state and only per-target write masks (D3DRS_COLORWRITEENABLE1/2/3), so the game never asked for it and that target
-   // is corrupted (The Witcher 2's Flotsam water, PS 0xDA16C815: RT1 is the linear depth fog reads, the shader writes it to every
-   // channel, so src_alpha is the depth). RT0's blend goes to the game's other targets, their write masks stay (legal per target in
-   // D3D9). An unbound target's blend does nothing, so repairing every state equals repairing the bound targets of each draw.
+   // is corrupted. RT0's blend goes to the game's other targets, their write masks stay (legal per target in D3D9). An unbound
+   // target's blend does nothing, so repairing every state equals repairing the bound targets of each draw.
    template <uint32_t target_slot, uint32_t reactive_slot = UINT32_MAX, bool repair_per_target_blend = false>
    bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
    {

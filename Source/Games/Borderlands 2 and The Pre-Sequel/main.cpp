@@ -1769,7 +1769,7 @@ class Borderlands2 final : public Game
       }
 
       // FSR needs the camera (vc4's view projection multiplies row vectors)
-      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + kViewProjectionOffset), true);
+      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + kViewProjectionOffset), /* row_vectors */ true);
 
       const SR::SettingsData settings_data = {
          .output_width = scene_desc.Width,
@@ -1960,7 +1960,7 @@ class Borderlands2 final : public Game
             current.Invert();
          }
          const Math::Matrix44D reprojection = previous * current;
-         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, true);
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, /* row_vectors */ true);
          float constants[24] = {}; // A multiple of 16 bytes
          for (int i = 0; i < 16; i++)
          {

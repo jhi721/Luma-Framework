@@ -1178,7 +1178,7 @@ class TheWitcher2Game final : public Game
             }
             else
             {
-               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error, true);
+               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error, /* targets_only */ true);
             }
          }
       }
@@ -1864,7 +1864,7 @@ class TheWitcher2Game final : public Game
       }
 
       // FSR needs the camera (WorldToScreen: column vectors)
-      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET), false);
+      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET), /* row_vectors */ false);
 
       const uint32_t render_width = (std::min)(gd.mv_render_size[0], scene_desc.Width);
       const uint32_t render_height = (std::min)(gd.mv_render_size[1], scene_desc.Height);
@@ -2033,7 +2033,7 @@ class TheWitcher2Game final : public Game
             current.Invert();
          }
          const Math::Matrix44D reprojection = previous * current;
-         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, false);
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, /* row_vectors */ false);
          CB::MotionVectorFillConstants constants = {
             .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
             .depth_from_view = {float(camera.depth_a), float(camera.depth_b)},
@@ -2696,6 +2696,8 @@ public:
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
+      // dgVoodoo's per-target blend repaired: Flotsam water (PS 0xDA16C815) blended RT1, the linear depth fog reads (the shader writes it
+      // to every channel, so src_alpha is the depth)
       reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true>);
    }
 

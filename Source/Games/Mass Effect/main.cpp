@@ -1270,7 +1270,7 @@ class MassEffect final : public Game
                patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout,
                   MotionVectorPatches::reactive_slot, reactive == 2, &error);
             else
-               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error, true);
+               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error, /* targets_only */ true);
          }
       }
       com_ptr<T> shader;
@@ -1876,7 +1876,7 @@ class MassEffect final : public Game
       }
 
       // FSR needs the camera (vc4's view projection multiplies row vectors)
-      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + kViewProjectionOffset), true);
+      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + kViewProjectionOffset), /* row_vectors */ true);
 
       SR::SettingsData settings_data;
       settings_data.output_width = scene_desc.Width;
@@ -2056,7 +2056,7 @@ class MassEffect final : public Game
             current.Invert();
          }
          const Math::Matrix44D reprojection = previous * current;
-         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, true);
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, /* row_vectors */ true);
          float constants[24] = {}; // A multiple of 16 bytes
          for (int i = 0; i < 16; i++)
             constants[i] = float(reprojection.GetData()[i]);

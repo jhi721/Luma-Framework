@@ -410,7 +410,7 @@ namespace MotionVectorPatch
    inline std::vector<uint8_t> PatchPixelShaderReactive(const uint8_t* code, size_t size, const Layout& layout, uint32_t reactive_slot, bool additive, std::string* error)
    {
       PixelShader shader;
-      if (!ReadPixelShader(code, size, layout, &shader, error, true))
+      if (!ReadPixelShader(code, size, layout, &shader, error, /* targets_only */ true))
          return {};
       auto& [chunks, program, input_signature, output_signature, inputs, outputs, target, tokens, instructions, first_body] = shader;
       if (outputs.size() != 1)
