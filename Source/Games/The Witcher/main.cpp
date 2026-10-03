@@ -233,14 +233,6 @@ class TheWitcherGame final : public Game
       return *static_cast<TheWitcherGameDeviceData*>(device_data.game);
    }
 
-   // Look injected shaders up with find(): operator[] default-inserts on a miss, mutating a map Core's draw helpers read (ME1)
-   template <typename ShaderMap>
-   static auto FindShader(const ShaderMap& shaders, uint32_t name)
-   {
-      const auto it = shaders.find(name);
-      return it != shaders.end() ? it->second.get() : nullptr;
-   }
-
    // An upscaler is picked and hasn't failed. Fixed for the whole frame (see "OnPresent"): a selection made after the motion vector
    // state was set would otherwise run the upscaler on mixed state.
    static bool IsSRActive(DeviceData& device_data)

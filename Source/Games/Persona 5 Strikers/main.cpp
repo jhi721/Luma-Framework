@@ -119,21 +119,6 @@ namespace
    constexpr bool g_post_output_resolution = true;
 #endif
 
-   // A Luma shader, null until compiled. The caller holds s_mutex_shader_objects.
-   template <typename T>
-   typename T::mapped_type FindShader(const T& shaders, uint32_t name)
-   {
-      const auto it = shaders.find(name);
-      return it != shaders.end() ? it->second : typename T::mapped_type{};
-   }
-
-   // True when all the named Luma shaders are compiled. The caller holds s_mutex_shader_objects.
-   template <typename T, typename... Names>
-   bool HasShaders(const T& shaders, Names... names)
-   {
-      return (bool(FindShader(shaders, names)) && ...);
-   }
-
    // The view's resource, null without a view
    com_ptr<ID3D11Resource> GetViewResource(ID3D11View* view)
    {

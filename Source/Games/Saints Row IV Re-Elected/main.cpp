@@ -90,18 +90,6 @@ namespace
    constexpr uint32_t bloom_brightpass_pixel_shader = 0x12F9FD30; // rl_hdr_prep_08: vc0 c22 Bloom_curve_values, vc4 c1 Tint_color
    constexpr uint32_t bloom_combine_pixel_shader = 0x52563AB4;    // rl_hdr_prep_07: vc4 c1 Tint_color
 
-   // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
-   template <typename T, typename... Names>
-   bool HasShaders(const T& shaders, Names... names)
-   {
-      const auto has = [&](uint32_t name)
-      {
-         const auto it = shaders.find(name);
-         return it != shaders.end() && it->second;
-      };
-      return (has(names) && ...);
-   }
-
    // Snapshots the pixel shader cbuffer bound at `slot` into `*copy`, on the GPU. The game re-uploads the same vc0 / vc4
    // buffers for every pass, so a later pass sees an earlier pass's constants only through a copy.
    void CopyBoundPSConstantBuffer(ID3D11Device* device, ID3D11DeviceContext* device_context, UINT slot, com_ptr<ID3D11Buffer>* copy)

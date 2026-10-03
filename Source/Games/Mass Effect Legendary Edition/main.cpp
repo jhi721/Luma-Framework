@@ -588,24 +588,6 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameSharpenPS = CompileTimeStringHash("MELE Sharpen PS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
 
-   // operator[] default-inserts on a miss, which would mutate a map the render thread otherwise only reads.
-   template <typename ShaderMap>
-   static auto FindShader(const ShaderMap& shaders, uint32_t name)
-   {
-      const auto it = shaders.find(name);
-      return it != shaders.end() ? it->second.get() : nullptr;
-   }
-   template <typename ShaderMap>
-   static bool AllShadersReady(const ShaderMap& shaders, std::initializer_list<uint32_t> names)
-   {
-      for (const uint32_t name : names)
-      {
-         if (FindShader(shaders, name) == nullptr)
-            return false;
-      }
-      return true;
-   }
-
    // (Re)create an fp16 scratch target on resolution change, with a view per requested bind flag (render target, shader resource).
    // Returns false if the texture or any requested view is missing.
    static bool EnsureRGBA16FTarget(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, RGBA16FTarget* target)
@@ -2115,8 +2097,8 @@ public:
       }
 
       // Build fp16 bloom from the tonemap's linear scene and rebind its native bloom slot.
-      if (g_bloom_enable && AllShadersReady(device_data.native_vertex_shaders, {kNameBloomVS}) &&
-          AllShadersReady(device_data.native_pixel_shaders, {kNameBloomPrefilterPS, kNameBloomDownsamplePS, kNameBloomUpsamplePS}))
+      if (g_bloom_enable && HasShaders(device_data.native_vertex_shaders, kNameBloomVS) &&
+          HasShaders(device_data.native_pixel_shaders, kNameBloomPrefilterPS, kNameBloomDownsamplePS, kNameBloomUpsamplePS))
       {
          ComPtr<ID3D11ShaderResourceView> srv_scene;
          native_device_context->PSGetShaderResources(perm->scene_slot, 1, srv_scene.put());
@@ -2149,7 +2131,7 @@ public:
          // Deinterleave: capture half-resolution R24 depth, prepare all scratch resources, then skip native work.
          if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
          {
-            if (!AllShadersReady(device_data.native_compute_shaders, {kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS}))
+            if (!HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS))
                return DrawOrDispatchOverrideType::None;
 
             ComPtr<ID3D11ShaderResourceView> depth_srv;
@@ -2398,8 +2380,8 @@ public:
       const float pred_scale = (depth_ok ? kPredScale : 1.f);
 
       // Async loading and live reload may temporarily require the fallback.
-      if (smaa && !(AllShadersReady(device_data.native_pixel_shaders, {kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS}) &&
-                     AllShadersReady(device_data.native_vertex_shaders, {kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS})))
+      if (smaa && !(HasShaders(device_data.native_pixel_shaders, kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS) &&
+                     HasShaders(device_data.native_vertex_shaders, kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS)))
          return fallback;
 
       const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, kPredThreshold, kPredStrength, 0.f};

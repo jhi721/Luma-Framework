@@ -289,18 +289,6 @@ namespace
    constexpr int g_gtao_debug_view = 0;
 #endif
 
-   // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
-   template <typename T, typename... Names>
-   bool HasShaders(const T& shaders, Names... names)
-   {
-      const auto has = [&](uint32_t name)
-      {
-         const auto it = shaders.find(name);
-         return it != shaders.end() && it->second;
-      };
-      return (has(names) && ...);
-   }
-
    // The four XeGTAO passes are compiled. The caller holds s_mutex_shader_objects.
    bool HasXeGTAOShaders(const DeviceData& device_data)
    {

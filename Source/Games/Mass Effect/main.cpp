@@ -699,24 +699,6 @@ class MassEffect final : public Game
    }
 #endif
 
-   // Look injected shaders up with find(): operator[] default-inserts on a miss, mutating a map core's draw helpers read.
-   template <typename ShaderMap>
-   static auto FindShader(const ShaderMap& shaders, uint32_t name)
-   {
-      const auto it = shaders.find(name);
-      return it != shaders.end() ? it->second.get() : nullptr;
-   }
-   template <typename ShaderMap>
-   static bool AllShadersReady(const ShaderMap& shaders, std::initializer_list<uint32_t> names)
-   {
-      for (const uint32_t name : names)
-      {
-         if (FindShader(shaders, name) == nullptr)
-            return false;
-      }
-      return true;
-   }
-
    static bool CreateImmutableCB(ID3D11Device* device, const void* data, UINT size, ComPtr<ID3D11Buffer>& out)
    {
       out.reset();
@@ -2419,7 +2401,7 @@ public:
       gd.smaa_idle_frames = 0;
 
       // Shader-readiness gate (async loader / dev live-reload): skip SMAA this frame if anything is missing.
-      const bool smaa_ready = AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) && AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
+      const bool smaa_ready = HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")) && HasShaders(device_data.native_vertex_shaders, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS"));
       if (!smaa_ready)
          return;
 

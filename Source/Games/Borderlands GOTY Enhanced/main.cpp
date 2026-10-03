@@ -667,26 +667,6 @@ class BorderlandsGoty final : public Game
    }
 #endif
 
-   // Named injected shaders live in unordered_maps the render thread otherwise only reads: look them up with
-   // "find" (operator[] would default-insert on a miss and mutate a map DrawSMAA reads concurrently).
-   template <typename ShaderMap>
-   static auto FindShader(const ShaderMap& shaders, uint32_t name_hash)
-   {
-      const auto it = shaders.find(name_hash);
-      return it != shaders.end() ? it->second.get() : nullptr;
-   }
-
-   template <typename ShaderMap>
-   static bool AllShadersReady(const ShaderMap& shaders, std::initializer_list<uint32_t> name_hashes)
-   {
-      for (uint32_t name_hash : name_hashes)
-      {
-         if (FindShader(shaders, name_hash) == nullptr)
-            return false;
-      }
-      return true;
-   }
-
    // A DEFAULT usage 2D texture (1 mip, 1 sample), fp16 unless "format" says otherwise. Resets "out".
    static bool CreateDefaultTex(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, ComPtr<ID3D11Texture2D>* out, DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT)
    {
@@ -2072,7 +2052,7 @@ public:
          // dispatch. Both dispatches of the pair come here (the second is a cheap re-capture).
          if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
          {
-            if (!AllShadersReady(device_data.native_compute_shaders, {CompileTimeStringHash("BL XeGTAO Prefilter Depths CS"), CompileTimeStringHash("BL XeGTAO Main Pass CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS")}))
+            if (!HasShaders(device_data.native_compute_shaders, CompileTimeStringHash("BL XeGTAO Prefilter Depths CS"), CompileTimeStringHash("BL XeGTAO Main Pass CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("BL XeGTAO Denoise Pass 2 CS")))
                return DrawOrDispatchOverrideType::None;
 
             ComPtr<ID3D11ShaderResourceView> srv_d;
@@ -2323,8 +2303,8 @@ public:
          const float pred_scale = pred_ok ? 2.f : 1.f;
 
          // Shader-readiness gate (async loader / dev live-reload): anything missing takes "fallback".
-         if (smaa && (!AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) ||
-                        !AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")})))
+         if (smaa && (!HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")) ||
+                        !HasShaders(device_data.native_vertex_shaders, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS"))))
             return fallback;
 
          const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, 0.f, 0.f, 0.f};

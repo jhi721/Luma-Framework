@@ -780,6 +780,22 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    ManagedResources managed_resources;
 };
 
+// A Luma native shader ("native_*_shaders") by name, null until compiled. Looked up with "find": "operator[]" would insert on a miss,
+// mutating a map Core's draw helpers read concurrently.
+template <typename ShaderMap>
+auto FindShader(const ShaderMap& shaders, uint32_t name)
+{
+   const auto it = shaders.find(name);
+   return (it != shaders.end() ? it->second.get() : nullptr);
+}
+
+// Whether all the named Luma native shaders are compiled (shaders load asynchronously and reload live in development)
+template <typename ShaderMap, typename... Names>
+bool HasShaders(const ShaderMap& shaders, Names... names)
+{
+   return ((FindShader(shaders, names) != nullptr) && ...);
+}
+
 struct __declspec(uuid("c5805458-2c02-4ebf-b139-38b85118d971")) SwapchainData
 {
    // Probably not particularly useful as the swapchain would be single threaded, if not for its destruction callback

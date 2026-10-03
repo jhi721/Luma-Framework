@@ -905,26 +905,6 @@ class TheWitcher2Game final : public Game
    }
 #endif
 
-   // Named injected shaders live in unordered_maps the render thread otherwise only reads: look them up with
-   // "find" (operator[] would default-insert on a miss and mutate a map DrawSMAA reads concurrently).
-   template <typename ShaderMap>
-   static auto FindShader(const ShaderMap& shaders, uint32_t name_hash)
-   {
-      const auto it = shaders.find(name_hash);
-      return it != shaders.end() ? it->second.get() : nullptr;
-   }
-
-   template <typename ShaderMap>
-   static bool AllShadersReady(const ShaderMap& shaders, std::initializer_list<uint32_t> name_hashes)
-   {
-      for (uint32_t name_hash : name_hashes)
-      {
-         if (FindShader(shaders, name_hash) == nullptr)
-            return false;
-      }
-      return true;
-   }
-
    // Any of the four final-grade permutations (FXAA and vignette are compiled in or out independently); all
    // four host the Luma HDR block through the same shader file.
    static bool IsFinalGrade(const ShaderHashesList<OneShaderPerPipeline>& shader_hashes)
@@ -2363,8 +2343,8 @@ class TheWitcher2Game final : public Game
       }
 
       // Skip SMAA this frame if a pass is still missing (async loader / live reload).
-      const bool smaa_ready = AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) &&
-                              AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")});
+      const bool smaa_ready = HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")) &&
+                              HasShaders(device_data.native_vertex_shaders, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS"));
       if (!smaa_ready)
       {
          return;

@@ -341,24 +341,6 @@ class MassEffect3Game final : public Game
          device_data.cb_luma_global_settings_dirty = true;
    }
 
-   // Look injected shaders up with find(): operator[] default-inserts on a miss, mutating a map core's draw helpers read.
-   template <typename ShaderMap>
-   static auto FindShader(const ShaderMap& shaders, uint32_t name)
-   {
-      const auto it = shaders.find(name);
-      return it != shaders.end() ? it->second.get() : nullptr;
-   }
-   template <typename ShaderMap>
-   static bool AllShadersReady(const ShaderMap& shaders, std::initializer_list<uint32_t> names)
-   {
-      for (const uint32_t name : names)
-      {
-         if (FindShader(shaders, name) == nullptr)
-            return false;
-      }
-      return true;
-   }
-
    // GPU copy of the bound PS b4 (dgVoodoo's constant mirror) into a private cbuffer, recreated on a size change: the
    // pass's constants for a later pass of the same frame, no stall.
    static bool CopyBoundPSConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, ComPtr<ID3D11Buffer>* copy)
@@ -597,7 +579,7 @@ class MassEffect3Game final : public Game
 
       // Shader-readiness gate (async loader / dev live-reload).
       auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("ME3 SMAA Linearize CS"));
-      if (linearize_cs == nullptr || !AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")}) || !AllShadersReady(device_data.native_vertex_shaders, {CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")}))
+      if (linearize_cs == nullptr || !HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")) || !HasShaders(device_data.native_vertex_shaders, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")))
          return false;
 
       // Resolution change: drop every size-bound resource, ours and DrawSMAA's core-managed intermediates.
@@ -1297,7 +1279,7 @@ public:
 #if ENABLE_BLOOM
          // Pyramid off the fp16 LINEAR scene at t0, pre-glow, once per frame (ME1 2007). Karis average first: no TAA, so
          // fireflies die spatially. Core's draw helpers look their shaders up with at(): run only once all compiled.
-         if (luma_bloom && !game_device_data.bloom_drawn_this_frame && game_device_data.srv_scene && FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Bloom VS")) && FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Karis Average CS")) && AllShadersReady(device_data.native_pixel_shaders, {CompileTimeStringHash("Bloom Prefilter PS"), CompileTimeStringHash("Bloom Downsample PS"), CompileTimeStringHash("Bloom Upsample PS")}))
+         if (luma_bloom && !game_device_data.bloom_drawn_this_frame && game_device_data.srv_scene && FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Bloom VS")) && FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Karis Average CS")) && HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("Bloom Prefilter PS"), CompileTimeStringHash("Bloom Downsample PS"), CompileTimeStringHash("Bloom Upsample PS")))
          {
             game_device_data.bloom_drawn_this_frame = true;
             // The bloom passes read BloomThreshold from LumaSettings: push it at this seam (ME1), then cache it with the rest.

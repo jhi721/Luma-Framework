@@ -221,18 +221,6 @@ namespace
       return out;
    }
 
-   // A Luma shader is usable only once compiled; true when all the named ones are. The caller holds s_mutex_shader_objects.
-   template <typename T, typename... Names>
-   bool HasShaders(const T& shaders, Names... names)
-   {
-      const auto has = [&](uint32_t name)
-      {
-         const auto it = shaders.find(name);
-         return it != shaders.end() && it->second;
-      };
-      return (has(names) && ...);
-   }
-
    // The scene chain's targets: swapchain-sized, or scaled by the game's render scale (Y5R also by its dynamic resolution),
    // which keeps the output aspect ratio up to a pixel of rounding (as Core's SwapchainAspectRatio upgrade filter).
    bool IsSceneSized(const DeviceData& device_data, uint32_t width, uint32_t height)
