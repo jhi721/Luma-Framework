@@ -810,7 +810,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("ME3 Depth Extract CS"),
          ShaderDefinition("Luma_ME3_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("ME3 Sharpen PS"),
-         ShaderDefinition{"Luma_ME3_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 #endif
 
       // Same encoding as ME1/ME2: gamma canvas (FXAA and the gamma GFx HUD run on it after the uber), plain power 2.2

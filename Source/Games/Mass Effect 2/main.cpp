@@ -632,7 +632,7 @@ public:
          ShaderDefinition("Luma_ME2_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
       // RCAS sharpen PS, drawn via core "Copy VS" + DrawCustomPixelShader after SMAA.
       native_shaders_definitions.emplace(CompileTimeStringHash("ME2 Sharpen PS"),
-         ShaderDefinition{"Luma_ME2_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 #endif
       native_shaders_definitions.emplace(CompileTimeStringHash("ME2 Display Map PS"),
          ShaderDefinition{"Luma_ME2_DisplayMap", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "display_map_ps"});

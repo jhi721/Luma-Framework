@@ -709,7 +709,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("MOH Depth Extract CS"),
          ShaderDefinition("Luma_MOH_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("MOH Sharpen PS"),
-         ShaderDefinition{"Luma_MOH_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 #endif
 
       // Post-process buffers stay in GAMMA space: the HUD blends src-alpha onto the same canvas the tonemap writes,

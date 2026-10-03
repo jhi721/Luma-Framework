@@ -1930,7 +1930,7 @@ public:
       // Core registers SMAA through ENABLE_SMAA; its neighborhood blend filters the gamma post buffer in linear light.
       // RCAS runs afterwards through Copy VS and DrawCustomPixelShader.
       native_shaders_definitions.emplace(kNameSharpenPS,
-         ShaderDefinition{"Luma_MELE_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 
       // Four XeGTAO compute entries share one source; XE_GTAO_FINAL_APPLY selects the game's R8_UNORM target.
       native_shaders_definitions.emplace(kNameGTAOPrefilterCS,
