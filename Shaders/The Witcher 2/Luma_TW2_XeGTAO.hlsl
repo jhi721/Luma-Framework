@@ -25,7 +25,7 @@ cbuffer GameCB4 : register(b4)
 
 // --- Luma runtime knobs (set from main.cpp; live-tunable via DEV sliders, no recompile) ---
 // b9, NOT b11 (which the sibling MELE/BL GOTY ports use): core's DrawBloom owns b11 for its own constants,
-// so keeping the AO knobs off that slot costs nothing and avoids a clash. Mirrored by kGTAOKnobsCBSlot.
+// so keeping the AO knobs off that slot costs nothing and avoids a clash. Mirrored by GTAO_KNOBS_CB_SLOT (main.cpp).
 #include "Includes/GameCBuffers.hlsl"
 
 cbuffer LumaGTAO : register(b9)

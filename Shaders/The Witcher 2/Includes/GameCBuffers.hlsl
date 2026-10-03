@@ -50,8 +50,8 @@ struct MotionVectorFillConstants
 // XeGTAO's runtime knobs (Luma_TW2_XeGTAO.hlsl, b9), written by "RunXeGTAO"
 struct GTAOKnobs
 {
-   float final_value_power;    // primary darkness dial, calibrated to the vanilla AO histogram
-   float depth_scale;          // viewZ divisor (game units -> ~meters); THE dial against broad over-occlusion
+   float final_value_power;    // primary darkness dial (2.2 a preference; 1.0 matches the vanilla AO histogram)
+   float depth_scale;          // viewZ divisor (game units -> ~meters); 1 here, the depth is in meters already
    float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
    float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
    float2 viewport_pixel_size; // 1 / AO target resolution (half render res)
