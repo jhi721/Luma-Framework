@@ -6282,6 +6282,9 @@ namespace
 #endif // DEVELOPMENT
 
       device_data.has_drawn_main_post_processing_previous = device_data.has_drawn_main_post_processing;
+      // Per frame: the game's draws set it again (a game that always has a scene sets it in its "OnPresent", as "_Template" does; reads in
+      // "OnPresent" use "has_drawn_main_post_processing_previous")
+      device_data.has_drawn_main_post_processing = false;
 #if ENABLE_SR
       device_data.has_drawn_sr_imgui = device_data.has_drawn_sr;
 #endif // ENABLE_SR

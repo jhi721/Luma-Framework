@@ -150,7 +150,6 @@ public:
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
-      device_data.has_drawn_main_post_processing = false;
    }
 
    void LoadConfigs() override

@@ -3282,7 +3282,6 @@ public:
       auto& gd = GetGameDeviceData(device_data);
       gd.tonemap_fired_this_frame = false; // new frame: re-arm Hide UI's post-tonemap alpha-blend scope
       // Core never clears this: left set, it would claim a scene on menu, video and loading frames
-      device_data.has_drawn_main_post_processing = false;
       gd.frame_counter++;
       // Never carry a Scaleform mask span across frames.
       gd.dsv_scaleform_mask_active.reset();

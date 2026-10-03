@@ -3209,7 +3209,6 @@ public:
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       // Set by the composite; Core copies it into "has_drawn_main_post_processing_previous" before this, but never clears it
-      device_data.has_drawn_main_post_processing = false;
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
       auto& game_device_data = GetGameDeviceData(device_data);
       device_data.force_reset_sr = !device_data.has_drawn_sr;

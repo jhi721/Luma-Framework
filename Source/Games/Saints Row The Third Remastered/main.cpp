@@ -1162,7 +1162,6 @@ public:
       game_device_data.ssao_chain_ran_this_frame = false;
       game_device_data.gtao_tried_this_frame = false;
       device_data.taa_detected = std::exchange(game_device_data.temporal_aa_this_frame, false);
-      device_data.has_drawn_main_post_processing = false;
 #if ENABLE_SR
       // SR resolves more detail than the game's TAA, so sharpen texture sampling while it draws (-1 at native resolution).
       // The offset is added to the game's own sampler bias, which is unknown, so the game's TAA keeps it unchanged.

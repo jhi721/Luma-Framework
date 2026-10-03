@@ -257,7 +257,6 @@ public:
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
-      device_data.has_drawn_main_post_processing = false;
 
       static std::mt19937 random_generator(std::chrono::system_clock::now().time_since_epoch().count());
       static auto random_range = static_cast<float>((std::mt19937::max)() - (std::mt19937::min)());

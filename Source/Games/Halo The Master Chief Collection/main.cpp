@@ -1287,8 +1287,6 @@ public:
       // reset cb_luma_global_settings.GameSettings.UIBlurDown0Count
       cb_luma_global_settings.GameSettings.UIBlurDown0Count = 0; // will apply start of next frame
       
-      // reset device_data.has_drawn_main_post_processing
-      device_data.has_drawn_main_post_processing = false;
 
       // allow_pause_screen_skiptoken
       allow_pause_screen_skiptoken = false;

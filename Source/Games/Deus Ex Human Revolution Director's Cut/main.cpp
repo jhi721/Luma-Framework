@@ -1202,7 +1202,7 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
-      if (device_data.has_drawn_main_post_processing)
+      if (device_data.has_drawn_main_post_processing_previous)
       {
          has_custom_gold_filter = game_device_data.has_drawn_custom_gold_filter;
          has_gold_filter = game_device_data.has_drawn_gold_filter;
@@ -1224,7 +1224,6 @@ public:
          game_device_data.depth_buffer_srv = nullptr;
       }
 
-      device_data.has_drawn_main_post_processing = false;
       game_device_data.has_drawn_any_shader = false;
       game_device_data.has_drawn_ssao = false;
       game_device_data.has_drawn_xegtao = false;

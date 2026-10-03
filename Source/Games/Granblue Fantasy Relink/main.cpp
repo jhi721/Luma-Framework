@@ -783,7 +783,6 @@ public:
 #if TEST || DEVELOPMENT
       game_device_data.taa_detected_this_frame = false;
 #endif
-      device_data.has_drawn_main_post_processing = false;
       game_device_data.remainder_command_list.store(nullptr, std::memory_order_relaxed);
       game_device_data.draw_device_context = nullptr;
       game_device_data.sr_source_color = nullptr;

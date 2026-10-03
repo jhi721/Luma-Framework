@@ -1154,7 +1154,6 @@ public:
       game_device_data.motion_vectors = nullptr;
       game_device_data.depth = nullptr;
 
-      device_data.has_drawn_main_post_processing = false;
       device_data.has_drawn_sr = false;
       game_device_data.try_draw_dlss_next = false;
       //ASSERT_ONCE(game_device_data.found_per_view_globals);

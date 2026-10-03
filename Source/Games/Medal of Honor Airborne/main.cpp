@@ -877,7 +877,6 @@ public:
       gd.canvas_res.reset(); // do not hold a reference across frames: it would outlive a resize or a mirror swap
       // Core never clears this, so leaving it set would claim a tonemapped scene on frames with no final pass
       // (movies, loading). Inert here: consumers need enable_ui_separation (off).
-      device_data.has_drawn_main_post_processing = false;
       gd.srv_scene.reset(); // recaptured at the final pass every frame; never hold it across one
 #if ENABLE_BLOOM
       gd.bloom_scale_captured_this_frame = false; // re-arm the once-per-frame ring advance

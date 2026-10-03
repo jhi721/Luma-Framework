@@ -1792,7 +1792,6 @@ public:
       // }
 
       game_device_data.camera_cut = (!game_device_data.has_drawn_taa && !device_data.has_drawn_sr && !device_data.force_reset_sr) || game_device_data.camera_cut;
-      device_data.has_drawn_main_post_processing = false;
       game_device_data.has_drawn_upscaling = false;
       if (!game_device_data.has_drawn_taa)
       {
