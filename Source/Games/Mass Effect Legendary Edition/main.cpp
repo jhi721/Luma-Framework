@@ -702,6 +702,11 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Resource> mv_depth;
    com_ptr<ID3D11Resource> mv_depth_copy;
    com_ptr<ID3D11ShaderResourceView> mv_depth_srv;
+   // The scene depth as it was before UE3's quad clears it (depth ALWAYS + write, before the foreground DPG and post, every frame):
+   // "mv_depth_srv" views it from then on, else the fill and the upscaler would read a depth of 1 everywhere
+   com_ptr<ID3D11Texture2D> mv_depth_snapshot;
+   com_ptr<ID3D11ShaderResourceView> mv_depth_snapshot_srv;
+   bool mv_depth_snapshot_taken = false;
    bool mv_fill_pending = false;
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    // The fp16 scene the motion vector draws write, and its last copy (UE3's resolve into "SceneColorTexture": the post passes read it)
@@ -724,6 +729,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ID3D11DepthStencilState* depth_stencil_state = nullptr;
    bool depth_test = true;
    bool depth_write = true;
+   bool depth_always = false;
    ID3D11RenderTargetView* mv_accepted_rtv = nullptr;
    ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
    ID3D11RenderTargetView* mv_refused_rtv = nullptr;
@@ -1299,6 +1305,7 @@ class MassEffectLE final : public Game
       }
       game_device_data->depth_test = depth_desc.DepthEnable;
       game_device_data->depth_write = depth_desc.DepthEnable && depth_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
+      game_device_data->depth_always = depth_desc.DepthEnable && depth_desc.DepthFunc == D3D11_COMPARISON_ALWAYS;
       game_device_data->depth_stencil_state = depth_stencil_state;
    }
 
@@ -1669,6 +1676,7 @@ class MassEffectLE final : public Game
       {
          // The camera fill's and the upscaler's depth: the scene depth if it can be read, else its copy (taken after the depth prepass)
          game_device_data.mv_depth_srv.reset();
+         game_device_data.mv_depth_snapshot_taken = false;
          com_ptr<ID3D11Resource> depth = game_device_data.mv_depth;
          com_ptr<ID3D11Texture2D> depth_texture;
          D3D11_TEXTURE2D_DESC depth_desc = {};
@@ -3167,6 +3175,46 @@ public:
                gd.views.back().draws++;
             }
 #endif
+            // UE3's quad clear of the scene depth (see "mv_depth_snapshot"): copied once before it, the fill and the upscaler read the copy
+            if (gd.mv_scene_open && scene_view && !gd.mv_depth_snapshot_taken && gd.mv_depth_srv)
+            {
+               CacheDepthStencilState(native_device_context, &gd);
+               com_ptr<ID3D11Resource> depth;
+               com_ptr<ID3D11Resource> read_depth;
+               if (gd.depth_write && gd.depth_always)
+               {
+                  dsv->GetResource(&depth);
+                  gd.mv_depth_srv->GetResource(&read_depth);
+               }
+               com_ptr<ID3D11Texture2D> depth_texture;
+               if (depth && depth == gd.mv_depth && read_depth == depth && SUCCEEDED(depth->QueryInterface(&depth_texture)))
+               {
+                  D3D11_TEXTURE2D_DESC depth_desc = {};
+                  D3D11_TEXTURE2D_DESC snapshot_desc = {};
+                  depth_texture->GetDesc(&depth_desc);
+                  if (gd.mv_depth_snapshot)
+                  {
+                     gd.mv_depth_snapshot->GetDesc(&snapshot_desc);
+                  }
+                  if (!gd.mv_depth_snapshot || snapshot_desc.Width != depth_desc.Width || snapshot_desc.Height != depth_desc.Height || snapshot_desc.Format != depth_desc.Format)
+                  {
+                     gd.mv_depth_snapshot_srv.reset();
+                     gd.mv_depth_snapshot.reset();
+                     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+                     gd.mv_depth_srv->GetDesc(&srv_desc);
+                     if (SUCCEEDED(native_device->CreateTexture2D(&depth_desc, nullptr, &gd.mv_depth_snapshot)))
+                     {
+                        native_device->CreateShaderResourceView(gd.mv_depth_snapshot.get(), &srv_desc, &gd.mv_depth_snapshot_srv);
+                     }
+                  }
+                  if (gd.mv_depth_snapshot_srv)
+                  {
+                     native_device_context->CopyResource(gd.mv_depth_snapshot.get(), depth_texture.get());
+                     gd.mv_depth_srv = gd.mv_depth_snapshot_srv;
+                  }
+                  gd.mv_depth_snapshot_taken = true;
+               }
+            }
             const bool motion_vectors = !mirrored && DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv);
             const bool jitter = !mirrored && !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, dsv);
 #if DEVELOPMENT
@@ -3274,6 +3322,8 @@ public:
          gd.mv_depth_srv.reset();
          gd.mv_depth.reset();
          gd.mv_depth_copy.reset();
+         gd.mv_depth_snapshot_srv.reset();
+         gd.mv_depth_snapshot.reset();
          gd.render_share_stretches.clear();
          gd.render_share_stretch_buffer.reset();
          gd.mv_scene_color.reset();
