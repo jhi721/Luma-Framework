@@ -207,24 +207,33 @@ namespace EngineScale
    float* fixed_screen_percentage = nullptr;
    bool enabled_by_us = false;
    bool installed = false;
-   size_t view_stride = 0;        // sizeof(FViewInfo): ME1 LE 0x12F0, ME3 LE 0x11B0 (read from the hooked function)
-   bool upscaler_drawing = false; // Swap the post process view only on frames the upscaler draws (else the share would show uncovered)
+   size_t view_stride = 0; // sizeof(FViewInfo): ME1 LE 0x12F0, ME3 LE 0x11B0 (read from the hooked function)
+   // Swap the post process view only on frames the upscaler draws (else the share would show uncovered). Latched at present, read
+   // in the engine's post process call.
+   std::atomic<bool> upscaler_drawing = false;
    uintptr_t (*render_post_process_original)(uint8_t*, uintptr_t, uintptr_t, uintptr_t) = nullptr;
 
-   // FSceneRenderer::RenderPostProcessEffects(DPG, lighting only): the views at +0x60 (count at +0x68, "view_stride" apart)
+   // FSceneRenderer: the views array and its count
+   constexpr size_t RENDERER_VIEWS_OFFSET = 0x60;
+   constexpr size_t RENDERER_VIEW_COUNT_OFFSET = 0x68;
+   // FViewInfo. Floats: the size, then unscaled (+8). Ints: the render target origin, the size (+8), unscaled (+0x10).
+   constexpr size_t VIEW_SIZE_OFFSET = 0x64;
+   constexpr size_t VIEW_TARGET_OFFSET = 0x74;
+   constexpr size_t VIEW_SCREEN_POSITION_SCALE_BIAS_OFFSET = 0x4A0;
+
+   // FSceneRenderer::RenderPostProcessEffects(DPG, lighting only)
    uintptr_t RenderPostProcessDetour(uint8_t* renderer, uintptr_t dpg, uintptr_t lighting_only, uintptr_t argument_4)
    {
       constexpr uint8_t SDPG_POST_PROCESS = 4;
       if (g_post_at_output_size && upscaler_drawing && uint8_t(dpg) == SDPG_POST_PROCESS && uint8_t(lighting_only) == 0)
       {
-         uint8_t* const views = *reinterpret_cast<uint8_t**>(renderer + 0x60);
-         const int32_t view_count = *reinterpret_cast<const int32_t*>(renderer + 0x68);
+         uint8_t* const views = *reinterpret_cast<uint8_t**>(renderer + RENDERER_VIEWS_OFFSET);
+         const int32_t view_count = *reinterpret_cast<const int32_t*>(renderer + RENDERER_VIEW_COUNT_OFFSET);
          for (int32_t i = 0; i < view_count; i++)
          {
             uint8_t* const view = views + size_t(i) * view_stride;
-            // Floats: the size at +0x64, unscaled at +0x6C. Ints: the render target origin at +0x74, the size at +0x7C, unscaled at +0x84.
-            float* const size = reinterpret_cast<float*>(view + 0x64);
-            int32_t* const target = reinterpret_cast<int32_t*>(view + 0x74);
+            float* const size = reinterpret_cast<float*>(view + VIEW_SIZE_OFFSET);
+            int32_t* const target = reinterpret_cast<int32_t*>(view + VIEW_TARGET_OFFSET);
             if ((size[0] == size[2] && size[1] == size[3]) || target[4] <= 0 || target[5] <= 0)
                continue;
             size[0] = size[2];
@@ -232,7 +241,7 @@ namespace EngineScale
             target[2] = target[4];
             target[3] = target[5];
             // ScreenPositionScaleBias, as the engine recomputes it
-            float* const screen_position_scale_bias = reinterpret_cast<float*>(view + 0x4A0);
+            float* const screen_position_scale_bias = reinterpret_cast<float*>(view + VIEW_SCREEN_POSITION_SCALE_BIAS_OFFSET);
             screen_position_scale_bias[0] = size[0] * 0.5f / float(target[4]);
             screen_position_scale_bias[1] = size[1] * -0.5f / float(target[5]);
             screen_position_scale_bias[2] = (size[1] * 0.5f + float(target[1])) / float(target[5]);
@@ -314,6 +323,17 @@ namespace EngineScale
          *dynamic_resolution_enabled = 0;
          enabled_by_us = false;
       }
+   }
+
+   // On unload: the game back at native resolution, the hook removed
+   void Uninstall()
+   {
+      if (!installed)
+         return;
+      Apply(false);
+      MH_DisableHook(MH_ALL_HOOKS);
+      MH_Uninitialize();
+      installed = false;
    }
 } // namespace EngineScale
 
@@ -484,8 +504,9 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    bool sr_output_recreated = false;
    // The upscaler's output, read in place of its input (the scene) by the post passes up to stage 1 (see "RebindUpscaledScene")
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
-   ID3D11Resource* sr_input = nullptr; // The scene's last copy, else the scene
-   bool sr_rebind_done = false;        // Stage 1, the scene's last reader, has drawn
+   ID3D11Resource* sr_input = nullptr;          // The scene's last copy, else the scene
+   std::array<uint32_t, 2> sr_render_size = {}; // The last draw's, its history restarts on a change
+   bool sr_rebind_done = false;                 // Stage 1, the scene's last reader, has drawn
    // Under the engine's render scale: output sized scene targets (depth, velocity) stretched from their render share for the post
    // passes up to stage 1, by the game's resource (see "RebindUpscaledScene"). Restretched once per frame; recreated on a size or
    // format change, so a reused address is harmless.
@@ -1210,7 +1231,7 @@ class MassEffectLE final : public Game
    // Opens the scene at the frame's first mesh draw into output sized depth (the depth prepass), and again for a later view (see
    // "IsNewView"): takes the scene depth and picks the jitter the whole scene draws with. Never after the scene's end (the HUD and
    // later passes).
-   static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash, ID3D11DepthStencilView* dsv)
+   static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash, ID3D11DepthStencilView* dsv)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       if (!IsOutputSizedDepth(device_data, &game_device_data, dsv) || !GetPatchedVertexShader(native_device, cmd_list_data, device_data, vertex_shader_hash))
@@ -1253,6 +1274,10 @@ class MassEffectLE final : public Game
       native_device_context->RSGetViewports(&viewport_count, &viewport);
       const bool viewport_valid = viewport_count != 0 && viewport.Width >= 1.f && viewport.Height >= 1.f && viewport.Width <= device_data.output_resolution.x && viewport.Height <= device_data.output_resolution.y;
       game_device_data.render_size = (viewport_valid ? std::array<uint32_t, 2>{uint32_t(viewport.Width), uint32_t(viewport.Height)} : std::array<uint32_t, 2>{uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)});
+      // The upscaler's mip bias for this frame's own render size (a render scale change takes effect on the frame after the slider's
+      // release), -1 at native resolution. The scene opens inside its first draw: Core rebinds the bound samplers right away. Without
+      // an upscaler it's reset at present.
+      SetTextureMipLodBias(native_device_context, device_data, (sr_instance_data ? SR::GetMipLODBias(float(game_device_data.render_size[1]), device_data.output_resolution.y) : 0.f), &cmd_list_data);
       game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / float(game_device_data.render_size[0]), game_device_data.mv_jitter[1] * -2.f / float(game_device_data.render_size[1])};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -1776,7 +1801,7 @@ class MassEffectLE final : public Game
       // As applied (pixels, +y down)
       draw_data.jitter_x = game_device_data.mv_jitter[0];
       draw_data.jitter_y = game_device_data.mv_jitter[1];
-      draw_data.reset = device_data.force_reset_sr;
+      draw_data.reset = device_data.force_reset_sr || game_device_data.sr_render_size != std::array<uint32_t, 2>{render_width, render_height};
       draw_data.vert_fov = game_device_data.sr_vert_fov;
       if (camera.near_plane > 0.0)
       {
@@ -1791,6 +1816,7 @@ class MassEffectLE final : public Game
          return false;
       }
       game_device_data.sr_input = scene_resource;
+      game_device_data.sr_render_size = {render_width, render_height};
       // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame shows
       // the texture's stale memory until its feature is created again after a draw. Settings changed once here force that at the next
       // frame's "UpdateSettings".
@@ -1928,9 +1954,9 @@ class MassEffectLE final : public Game
    }
 
    // Whether the engine's render scale draws the scene into the top-left share of its output sized targets this frame
-   static bool IsRenderShare(const DeviceData& device_data, const MassEffectGameDeviceData* gd)
+   static bool IsRenderShare(const DeviceData& device_data, const MassEffectGameDeviceData& gd)
    {
-      return gd->render_size[0] != 0 && gd->render_size[1] != 0 && (gd->render_size[0] < device_data.output_resolution.x || gd->render_size[1] < device_data.output_resolution.y);
+      return gd.render_size[0] != 0 && gd.render_size[1] != 0 && (gd.render_size[0] < device_data.output_resolution.x || gd.render_size[1] < device_data.output_resolution.y);
    }
 
    // The post passes from the scene's end up to stage 1 read the upscaled scene where they bind the scene or its copy (any shader
@@ -1938,7 +1964,7 @@ class MassEffectLE final : public Game
    // they read (the scene's depth and velocity, written in the render share) is read stretched ("RenderShareStretch").
    static void RebindUpscaledScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, bool compute)
    {
-      const bool render_share = IsRenderShare(device_data, gd);
+      const bool render_share = IsRenderShare(device_data, *gd);
       if (!gd->sr_input && !render_share)
          return;
       com_ptr<ID3D11ShaderResourceView> srvs[16]; // t0-t15
@@ -2070,6 +2096,14 @@ class MassEffectLE final : public Game
    }
 
 public:
+   // The events "OnInit" registers
+   static void UnregisterEvents()
+   {
+      reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
+   }
+
    void OnInit(bool async) override
    {
       EngineScale::Install();
@@ -2378,7 +2412,7 @@ public:
          // The working area is the rendered share of the half size AO targets under the engine's render scale (all of them at
          // native): XeGTAO's clamped samples then stop at its edge instead of reading the stale depth beyond it
          const float2 output_size = device_data.output_resolution;
-         const bool render_share = IsRenderShare(device_data, gd);
+         const bool render_share = IsRenderShare(device_data, *gd);
          const uint32_t w = (render_share ? (std::min)(depth_size.x, uint32_t(std::ceil(float(depth_size.x) * float(gd->render_size[0]) / output_size.x))) : depth_size.x);
          const uint32_t h = (render_share ? (std::min)(depth_size.y, uint32_t(std::ceil(float(depth_size.y) * float(gd->render_size[1]) / output_size.y))) : depth_size.y);
 
@@ -2993,8 +3027,12 @@ public:
          gd.mv_stats.constants_pool = uint32_t(gd.mv_constants_pool.size());
 #endif
       }
-      // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
-      SetTextureMipLodBias(nullptr, device_data, IsSRActive(device_data) ? SR::GetMipLODBias(gd.render_size[1] != 0 ? float(gd.render_size[1]) : device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
+      // No scene opens to set the upscaler's mip bias (see "OpenScene"): the game's own. Core biases the anisotropic samplers, all of the
+      // game's with the AF16x upgrade.
+      if (!IsSRActive(device_data))
+      {
+         SetTextureMipLodBias(nullptr, device_data, 0.f);
+      }
 #if DEVELOPMENT
       // "Performance Test": closes this frame's timestamp set, reads back the finished ones (a log line every 120 frames, after 60
       // settle frames whenever the settings it keys on change) and opens the next frame's
@@ -3024,7 +3062,9 @@ public:
             {
                std::string aa = g_smaa_enable ? "SMAA" : "None";
                if (IsSRActive(device_data))
+               {
                   aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
+               }
                // In "PerfColumn" order
                const Perf::Sweep<PERF_COLUMN_COUNT>::Row row = {stats.frame.Average(), stats.scene.Average(), stats.sr.Average(), window.HookMs(), stats.fill.Average()};
                const char* const game_name = GameName(g_me_game);
@@ -3470,10 +3510,14 @@ public:
          { ApplyPerfTestMode(device_data, mode_index); }, [&](const PerfTestMode& mode)
          { return IsPerfTestModeAvailable(device_data, mode); });
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("GPU timestamps (frame, scene, upscaler, camera fill) and the motion vector hooks' CPU time, a \"[MELE Perf]\" ReShade.log\nline every 120 frames after 60 settle frames. Sweep: DLSS K, jitter only, no motion vector draws and SMAA Off in turn,\n3 rounds, then the medians. Hold the camera still. Not saved.");
+      }
       ImGui::Checkbox("Hook Timers", &Perf::g_hook_timers);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Times the motion vector hooks for \"cpu hooks\" (two clock reads per hooked draw and constant upload).\nRun a Sweep with it off to see their own cost in the frame times.");
+      }
    }
 #endif
 
@@ -3568,6 +3612,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       samplers_upgrade_mode = 4;
 
       game = new MassEffectLE();
+   }
+   else if (ul_reason_for_call == DLL_PROCESS_DETACH)
+   {
+      MassEffectLE::UnregisterEvents();
+      EngineScale::Uninstall();
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);
