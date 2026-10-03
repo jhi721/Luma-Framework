@@ -4121,7 +4121,6 @@ public:
 
       // reset game/device_data
       DrawingState::ResetOnPresent();
-      device_data.has_drawn_main_post_processing = false;
 
       // CachedCB
       CachedCB::Update(); 

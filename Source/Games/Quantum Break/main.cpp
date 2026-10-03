@@ -649,7 +649,6 @@ public:
 
       device_data.taa_detected = game_device_data.saw_history_reprojection_pass;
       device_data.has_drawn_sr = false;
-      device_data.has_drawn_main_post_processing = false;
 
       const uint32_t back_buffer_count = (std::max)(2u, static_cast<uint32_t>(device_data.back_buffers.size()));
       // Hold the paused state across the swapchain queue so UI-only frames do not look like gameplay frames.

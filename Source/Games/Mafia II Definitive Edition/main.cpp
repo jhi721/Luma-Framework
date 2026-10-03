@@ -236,7 +236,6 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
-      device_data.has_drawn_main_post_processing = false;
       game_device_data.pending_draws_to_black_bars = 0; // Unnecessary, but clean
 
       game_device_data.has_drawn_anything = false;

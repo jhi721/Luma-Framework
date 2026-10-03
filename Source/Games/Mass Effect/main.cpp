@@ -1039,8 +1039,6 @@ public:
 #endif
 
       gd.canvas_res.reset(); // do not hold a reference across frames: it would outlive a resize or a mirror swap
-      // Core never clears this: left set, it would claim a tonemapped scene on movie and loading frames.
-      device_data.has_drawn_main_post_processing = false;
       gd.srv_scene.reset(); // recaptured every frame; never held across one
 
 #if ENABLE_BLOOM

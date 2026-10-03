@@ -1501,7 +1501,7 @@ public:
          {
             game_device_data.CleanGTAOResources();
          }
-         if (!device_data.has_drawn_main_post_processing && (game_device_data.lens_distortion_texture.get() || game_device_data.lens_distortion_rtvs[0].get() || game_device_data.lens_distortion_rtvs[1].get())) // This seemengly can't happen
+         if (!device_data.has_drawn_main_post_processing_previous && (game_device_data.lens_distortion_texture.get() || game_device_data.lens_distortion_rtvs[0].get() || game_device_data.lens_distortion_rtvs[1].get())) // This seemengly can't happen
          {
             game_device_data.CleanLensDistortionResources();
          }
@@ -1513,8 +1513,8 @@ public:
 
       // Update all variables as this is on the only thing guaranteed to run once per frame:
       ASSERT_ONCE(!game_device_data.has_drawn_composed_gbuffers || game_device_data.found_per_view_globals); // We failed to find and assign global cbuffer 13 this frame (could it be that the scene is empty if this triggers?)
-      ASSERT_ONCE(game_device_data.has_drawn_composed_gbuffers == device_data.has_drawn_main_post_processing); // Why is g-buffer composition drawing but post processing isn't? We don't expect this to ever happen as PP should always be on
-      if (device_data.has_drawn_main_post_processing)
+      ASSERT_ONCE(game_device_data.has_drawn_composed_gbuffers == device_data.has_drawn_main_post_processing_previous); // Why is g-buffer composition drawing but post processing isn't? We don't expect this to ever happen as PP should always be on
+      if (device_data.has_drawn_main_post_processing_previous)
       {
          game_device_data.previous_prey_taa_active[1] = game_device_data.previous_prey_taa_active[0];
          game_device_data.previous_prey_taa_active[0] = game_device_data.prey_taa_active;
@@ -1550,7 +1550,6 @@ public:
       game_device_data.has_drawn_motion_blur_previous = game_device_data.has_drawn_motion_blur;
       game_device_data.has_drawn_motion_blur = false;
       game_device_data.has_drawn_tonemapping = false;
-      device_data.has_drawn_main_post_processing = false;
       game_device_data.has_drawn_upscaling = false;
       device_data.has_drawn_sr = false;
 #if 1 // Not much need to reset this, but let's do it anyway (e.g. in case the game scene isn't currently rendering)

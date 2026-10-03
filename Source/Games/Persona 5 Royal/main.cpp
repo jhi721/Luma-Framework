@@ -1052,7 +1052,6 @@ public:
       }
 
       device_data.has_drawn_sr = false;
-      device_data.has_drawn_main_post_processing = false;
    }
 
    static void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)

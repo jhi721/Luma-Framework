@@ -877,7 +877,6 @@ public:
 
       depth = nullptr;
 
-      device_data.has_drawn_main_post_processing = false;
       device_data.has_drawn_sr = false;
       has_drawn_taa = false;
       has_downscaled_bloom = false;

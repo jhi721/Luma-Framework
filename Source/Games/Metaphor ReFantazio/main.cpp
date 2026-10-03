@@ -2325,7 +2325,6 @@ public:
       device_data.force_reset_sr = !game_device_data.has_drawn_upscaling;
       game_device_data.has_drawn_upscaling = false;
       device_data.has_drawn_sr = false;
-      device_data.has_drawn_main_post_processing = false;
 
       if (!custom_texture_mip_lod_bias_offset)
       {
