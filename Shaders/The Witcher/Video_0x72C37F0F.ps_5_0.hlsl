@@ -1,6 +1,7 @@
 // clang-format off
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings (VideoAutoHDR*) before the shared Settings.hlsl, keep FIRST
 // clang-format on
+#include "../Includes/DgVoodoo.hlsl"
 
 // The Witcher EE Bink movie pass ("_yuv2rgb_.bfx" ps_2_0, dgVoodoo 2.87.3 -> ps_5_0 0x72C37F0F), YUV -> RGB straight onto the
 // canvas. Transcribed from the translated disassembly, then the vanilla clamp (the 8-bit canvas gave it, the fp16 mirror doesn't)
@@ -32,11 +33,6 @@ Texture2D<float4> t2 : register(t2); // chroma plane
 SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
 SamplerState s2_s : register(s2);
-
-float4 ApplyDgvMask(float4 value, float4 mask, float4 fill)
-{
-   return asfloat((asuint(value) & asuint(mask)) | asuint(fill));
-}
 
 // Full dgVoodoo interpolator set; v5 = TEXCOORD0 (Y) and v6 = TEXCOORD1 (chroma planes) carry the UVs
 void main(

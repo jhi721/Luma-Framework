@@ -1,6 +1,8 @@
 #ifndef LUMA_ME2_GAME_BINDINGS
 #define LUMA_ME2_GAME_BINDINGS
 
+#include "../../Includes/DgVoodoo.hlsl"
+
 // Mass Effect 2 (2010) - bindings the replaced passes share, and nothing else. Deliberately no textures, samplers
 // or game-content row aliases: slot and row meaning is per pass. Name rows in the pass that reads them.
 
@@ -23,11 +25,6 @@ cbuffer PixelShaderConstants : register(b4)
 #define DgvFillT1 DgvConstants[47]
 #define DgvMaskT2 DgvConstants[48]
 #define DgvFillT2 DgvConstants[49]
-
-float4 ApplyDgvMask(float4 value, float4 mask, float4 fill)
-{
-   return asfloat((asuint(value) & asuint(mask)) | asuint(fill));
-}
 
 // The grade's pow() as the original computes it. The tiny floor replaces the compiler's own log2(0) guard.
 float3 PowUE3(float3 base, float3 exponent)

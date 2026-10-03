@@ -10,6 +10,8 @@
 #ifndef LUMA_MOH_DGVOODOO
 #define LUMA_MOH_DGVOODOO
 
+#include "../../Includes/DgVoodoo.hlsl"
+
 cbuffer DgVoodooState : register(b3)
 {
    float4 DgvConstants[77] : packoffset(c0);
@@ -29,10 +31,5 @@ cbuffer PixelShaderConstants : register(b4)
 #define DgvFillBlur  DgvConstants[49]
 #define DgvMaskDepth DgvConstants[50]
 #define DgvFillDepth DgvConstants[51]
-
-float4 ApplyDgvMask(float4 value, float4 mask, float4 fill)
-{
-   return asfloat((asuint(value) & asuint(mask)) | asuint(fill));
-}
 
 #endif // LUMA_MOH_DGVOODOO
