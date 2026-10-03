@@ -1436,7 +1436,13 @@ class MassEffectLE final : public Game
       // PreViewTranslation (the camera position), near plane and determinant (field of view, mirroring)
       const auto& scene_camera = game_device_data->scene_view_camera;
       const auto& camera = game_device_data->view_camera;
-      if (!scene_camera)
+      if (!scene_camera || camera->size() < 16 * sizeof(float))
+         return false;
+      // No perspective (clip w doesn't depend on position): no camera. A screen space draw after shooting an enemy (ME1) has an
+      // identity ViewProjectionMatrix and an output sized viewport even below native render scale; reopening the scene for it took
+      // that viewport as the render size.
+      const float* const m = reinterpret_cast<const float*>(camera->data());
+      if (std::abs(m[3]) + std::abs(m[7]) + std::abs(m[11]) < 0.5f)
          return false;
       const std::array<float, 3> scene_translation = GetPreViewTranslation(*scene_camera), translation = GetPreViewTranslation(*camera);
       const double scene_near = ViewNearPlane(*scene_camera), near_plane = ViewNearPlane(*camera);
