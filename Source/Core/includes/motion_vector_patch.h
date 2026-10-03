@@ -283,6 +283,12 @@ namespace MotionVectorPatch
       return WriteChunks(chunks);
    }
 
+   // A pixel shader's color target: known by name, its system value is left undefined in the signature
+   inline bool IsTarget(const SignatureElement& element)
+   {
+      return _stricmp(element.name.c_str(), "SV_Target") == 0;
+   }
+
    // A pixel shader's container, signatures and program, checked for the pixel shader patches: game targets below the layout's
    // "target_slot", inputs below the added ones, one final ret. "targets_only" also refuses other outputs (depth writers such as
    // dgVoodoo's depth restores, as a target declared after oDepth).
@@ -308,12 +314,9 @@ namespace MotionVectorPatch
       shader->output_signature = FindChunk(&shader->chunks, FourCC("OSGN"));
       if (!shader->program || !shader->input_signature || !shader->output_signature || !ReadSignature(shader->input_signature->data, &shader->inputs) || !ReadSignature(shader->output_signature->data, &shader->outputs))
          return (*error = "chunks", false);
-      // Targets are known by name, their system value is left undefined in the signature
-      const auto is_target = [](const SignatureElement& element)
-      { return _stricmp(element.name.c_str(), "SV_Target") == 0; };
-      const auto target = std::ranges::find_if(shader->outputs, is_target);
+      const auto target = std::ranges::find_if(shader->outputs, IsTarget);
       if (target == shader->outputs.end() || std::ranges::any_of(shader->outputs, [&](const SignatureElement& element)
-                                                { return is_target(element) ? element.reg >= layout.target_slot : targets_only; }) ||
+                                                { return IsTarget(element) ? element.reg >= layout.target_slot : targets_only; }) ||
           std::ranges::any_of(shader->inputs, [&](const SignatureElement& element)
              { return element.reg >= layout.current_position_register; }))
          return (*error = "signatures", false);
@@ -338,9 +341,6 @@ namespace MotionVectorPatch
       const auto& tokens = shader.tokens;
       const auto& instructions = shader.instructions;
       const size_t first_body = shader.first_body;
-      // Targets are known by name, their system value is left undefined in the signature
-      const auto is_target = [](const SignatureElement& element)
-      { return _stricmp(element.name.c_str(), "SV_Target") == 0; };
 
       // The two inputs after the last input (or before the outputs), the target after the last output
       const size_t first_output = size_t(std::ranges::find_if(instructions.begin(), instructions.begin() + first_body, [](const Instruction& instruction)
@@ -396,7 +396,7 @@ namespace MotionVectorPatch
       output.reg = layout.target_slot;
       output.mask = 0x3;
       output.rw_mask = 0;
-      shader.outputs.insert(std::ranges::find_if(shader.outputs.rbegin(), shader.outputs.rend(), is_target).base(), output);
+      shader.outputs.insert(std::ranges::find_if(shader.outputs.rbegin(), shader.outputs.rend(), IsTarget).base(), output);
       shader.output_signature->data = WriteSignature(shader.outputs);
       return WriteChunks(shader.chunks);
    }
