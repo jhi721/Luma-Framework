@@ -2296,8 +2296,7 @@ class TheWitcher2Game final : public Game
       }
 
       // Skip SMAA this frame if a pass is still missing (async loader / live reload).
-      const bool smaa_ready = HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")) &&
-                              HasShaders(device_data.native_vertex_shaders, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS"));
+      const bool smaa_ready = HasSMAAShaders(device_data);
       if (!smaa_ready)
       {
          return;

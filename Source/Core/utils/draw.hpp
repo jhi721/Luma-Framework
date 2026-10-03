@@ -1384,6 +1384,13 @@ uint2 GetViewTextureSize(ID3D11View* view)
    return uint2{desc.Width, desc.Height};
 }
 
+// Whether Core's SMAA passes ("DrawSMAA" below) are compiled
+inline bool HasSMAAShaders(const DeviceData& device_data)
+{
+   return HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h) &&
+          HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h);
+}
+
 void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11RenderTargetView* rtv, ID3D11ShaderResourceView* srv_color_tex, ID3D11ShaderResourceView* srv_color_tex_gamma, ID3D11ShaderResourceView* srv_predication_tex = nullptr)
 {
    auto& managed_resources = device_data.managed_resources;

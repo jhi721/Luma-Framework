@@ -578,12 +578,6 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameGTAOMainPassCS = CompileTimeStringHash("MELE XeGTAO Main Pass CS");
    static constexpr uint32_t kNameGTAODenoise1CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 1 CS");
    static constexpr uint32_t kNameGTAODenoise2CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 2 CS");
-   static constexpr uint32_t kNameSMAAEdgeVS = CompileTimeStringHash("SMAA Edge Detection VS");
-   static constexpr uint32_t kNameSMAAEdgePS = CompileTimeStringHash("SMAA Edge Detection PS");
-   static constexpr uint32_t kNameSMAAWeightVS = CompileTimeStringHash("SMAA Blending Weight Calculation VS");
-   static constexpr uint32_t kNameSMAAWeightPS = CompileTimeStringHash("SMAA Blending Weight Calculation PS");
-   static constexpr uint32_t kNameSMAABlendVS = CompileTimeStringHash("SMAA Neighborhood Blending VS");
-   static constexpr uint32_t kNameSMAABlendPS = CompileTimeStringHash("SMAA Neighborhood Blending PS");
    static constexpr uint32_t kNameCopyVS = CompileTimeStringHash("Copy VS");
    static constexpr uint32_t kNameSharpenPS = CompileTimeStringHash("MELE Sharpen PS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
@@ -2363,8 +2357,7 @@ public:
       const float pred_scale = (depth_ok ? kPredScale : 1.f);
 
       // Async loading and live reload may temporarily require the fallback.
-      if (smaa && !(HasShaders(device_data.native_pixel_shaders, kNameSMAAEdgePS, kNameSMAAWeightPS, kNameSMAABlendPS) &&
-                     HasShaders(device_data.native_vertex_shaders, kNameSMAAEdgeVS, kNameSMAAWeightVS, kNameSMAABlendVS)))
+      if (smaa && !(HasSMAAShaders(device_data)))
          return fallback;
 
       const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, kPredThreshold, kPredStrength, 0.f};

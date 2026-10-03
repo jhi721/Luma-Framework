@@ -943,7 +943,7 @@ public:
       // Shader-readiness gate (async loader / dev live-reload): skip SMAA this frame if anything is missing.
       auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("ME2 SMAA Linearize CS"));
       const bool smaa_ready = linearize_cs != nullptr &&
-                              HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")) && HasShaders(device_data.native_vertex_shaders, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS"));
+                              HasSMAAShaders(device_data);
       if (!smaa_ready)
          return;
 

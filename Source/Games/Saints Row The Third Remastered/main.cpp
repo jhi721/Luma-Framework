@@ -1155,7 +1155,7 @@ public:
       // The offset is added to the game's own sampler bias, which is unknown, so the game's TAA keeps it unchanged.
       if (enable_samplers_upgrade)
       {
-         SetTextureMipLodBias(nullptr, device_data, device_data.has_drawn_sr ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f);
+         SetTextureMipLodBias(nullptr, device_data, (device_data.has_drawn_sr ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f));
       }
       // Any frame SR didn't draw (off, skipped, failed, no TAA dispatch) restarts its history at the next one
       const bool sr_active = LatchSRFrame(device_data);

@@ -579,7 +579,7 @@ class MassEffect3Game final : public Game
 
       // Shader-readiness gate (async loader / dev live-reload).
       auto* linearize_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("ME3 SMAA Linearize CS"));
-      if (linearize_cs == nullptr || !HasShaders(device_data.native_pixel_shaders, CompileTimeStringHash("SMAA Edge Detection PS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), CompileTimeStringHash("SMAA Neighborhood Blending PS")) || !HasShaders(device_data.native_vertex_shaders, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Neighborhood Blending VS")))
+      if (linearize_cs == nullptr || !HasSMAAShaders(device_data))
          return false;
 
       // Resolution change: drop every size-bound resource, ours and DrawSMAA's core-managed intermediates.
