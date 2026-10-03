@@ -174,8 +174,8 @@ try {
 
     # dgVoodoo games ship the dgVoodoo build their shader hashes were taken from. Its license allows shipping
     # individual files with a game mod, not bundling it for general use. The Linux zip gets an older build, as
-    # 2.87.3 fails under Wine/Proton.
-    $dgVoodooVersion = "2.87.3"
+    # 2.87.x fails under Wine/Proton. 2.87.5 emits the same shader hashes as 2.87.3.
+    $dgVoodooVersion = "2.87.5"
     $dgVoodooLinuxVersion = "2.81.3"
     if ($useDgVoodoo) {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
