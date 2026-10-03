@@ -90,8 +90,9 @@ namespace MotionVectorPatch
       }
    } // namespace DgVoodoo
 
-   // The vertex shader with the second run, or empty if unpatchable (the draw then keeps the original shaders)
-   inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error)
+   // The vertex shader with the second run, or empty if unpatchable (the draw then keeps the original shaders). "declares_resources":
+   // whether it reads resources, which its second run reads at "previous_resources_slot" (the game binds them there).
+   inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error, bool* declares_resources = nullptr)
    {
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
@@ -130,6 +131,10 @@ namespace MotionVectorPatch
          // A 1D immediate register: operand token, then the slot
          if (is_resource_declaration(instruction.opcode) && (instruction.length < 3 || DECODE_D3D10_SB_OPERAND_TYPE(tokens[instruction.begin + 1]) != D3D10_SB_OPERAND_TYPE_RESOURCE || DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(tokens[instruction.begin + 1]) != D3D10_SB_OPERAND_INDEX_1D || tokens[instruction.begin + 2] >= layout.resource_slots))
             return (*error = "resources", std::vector<uint8_t>());
+         if (declares_resources && is_resource_declaration(instruction.opcode))
+         {
+            *declares_resources = true;
+         }
          if (instruction.opcode == D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER && instruction.length == 4)
          {
             const uint32_t slot = tokens[instruction.begin + 2];
@@ -278,36 +283,64 @@ namespace MotionVectorPatch
       return WriteChunks(chunks);
    }
 
-   // The pixel shader with the motion vector target, or empty if unpatchable
-   inline std::vector<uint8_t> PatchPixelShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error)
+   // A pixel shader's container, signatures and program, checked for the pixel shader patches: game targets below the layout's
+   // "target_slot", inputs below the added ones, one final ret. "targets_only" also refuses other outputs (depth writers such as
+   // dgVoodoo's depth restores, as a target declared after oDepth).
+   struct PixelShader
    {
       std::vector<Chunk> chunks;
-      if (!ReadChunks(code, size, &chunks))
-         return (*error = "container", std::vector<uint8_t>());
-      Chunk* const program = FindChunk(&chunks, FourCC("SHEX"), FourCC("SHDR"));
-      Chunk* const input_signature = FindChunk(&chunks, FourCC("ISGN"));
-      Chunk* const output_signature = FindChunk(&chunks, FourCC("OSGN"));
+      Chunk* program = nullptr;
+      Chunk* input_signature = nullptr;
+      Chunk* output_signature = nullptr;
       std::vector<SignatureElement> inputs, outputs;
-      if (!program || !input_signature || !output_signature || !ReadSignature(input_signature->data, &inputs) || !ReadSignature(output_signature->data, &outputs))
-         return (*error = "chunks", std::vector<uint8_t>());
+      SignatureElement target;
+      std::vector<uint32_t> tokens;
+      std::vector<Instruction> instructions;
+      size_t first_body = 0;
+   };
+
+   inline bool ReadPixelShader(const uint8_t* code, size_t size, const Layout& layout, PixelShader* shader, std::string* error, bool targets_only = true)
+   {
+      if (!ReadChunks(code, size, &shader->chunks))
+         return (*error = "container", false);
+      shader->program = FindChunk(&shader->chunks, FourCC("SHEX"), FourCC("SHDR"));
+      shader->input_signature = FindChunk(&shader->chunks, FourCC("ISGN"));
+      shader->output_signature = FindChunk(&shader->chunks, FourCC("OSGN"));
+      if (!shader->program || !shader->input_signature || !shader->output_signature || !ReadSignature(shader->input_signature->data, &shader->inputs) || !ReadSignature(shader->output_signature->data, &shader->outputs))
+         return (*error = "chunks", false);
       // Targets are known by name, their system value is left undefined in the signature
       const auto is_target = [](const SignatureElement& element)
       { return _stricmp(element.name.c_str(), "SV_Target") == 0; };
-      const auto target = std::ranges::find_if(outputs, is_target);
-      if (target == outputs.end() || std::ranges::any_of(outputs, [&](const SignatureElement& element)
-                                        { return is_target(element) && element.reg >= layout.target_slot; }) ||
-          std::ranges::any_of(inputs, [&](const SignatureElement& element)
+      const auto target = std::ranges::find_if(shader->outputs, is_target);
+      if (target == shader->outputs.end() || std::ranges::any_of(shader->outputs, [&](const SignatureElement& element)
+                                                { return is_target(element) ? element.reg >= layout.target_slot : targets_only; }) ||
+          std::ranges::any_of(shader->inputs, [&](const SignatureElement& element)
              { return element.reg >= layout.current_position_register; }))
-         return (*error = "signatures", std::vector<uint8_t>());
+         return (*error = "signatures", false);
+      shader->target = *target;
 
-      std::vector<uint32_t> tokens;
-      std::vector<Instruction> instructions;
-      size_t first_body;
-      if (!ReadProgram(*program, &tokens, &instructions, &first_body))
-         return (*error = "lengths", std::vector<uint8_t>());
-      if (first_body >= instructions.size() || instructions.back().opcode != D3D10_SB_OPCODE_RET || std::ranges::any_of(instructions.begin() + first_body, instructions.end() - 1, [](const Instruction& instruction)
-                                                                                                       { return instruction.opcode == D3D10_SB_OPCODE_RET || instruction.opcode == D3D10_SB_OPCODE_RETC; }))
-         return (*error = "returns", std::vector<uint8_t>());
+      if (!ReadProgram(*shader->program, &shader->tokens, &shader->instructions, &shader->first_body))
+         return (*error = "lengths", false);
+      const auto& instructions = shader->instructions;
+      if (shader->first_body >= instructions.size() || instructions.back().opcode != D3D10_SB_OPCODE_RET || std::ranges::any_of(instructions.begin() + shader->first_body, instructions.end() - 1, [](const Instruction& instruction)
+                                                                                                               { return instruction.opcode == D3D10_SB_OPCODE_RET || instruction.opcode == D3D10_SB_OPCODE_RETC; }))
+         return (*error = "returns", false);
+      return true;
+   }
+
+   // The pixel shader with the motion vector target, or empty if unpatchable. "targets_only": see "ReadPixelShader" (a target
+   // declared after oDepth stays after it otherwise).
+   inline std::vector<uint8_t> PatchPixelShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error, bool targets_only = false)
+   {
+      PixelShader shader;
+      if (!ReadPixelShader(code, size, layout, &shader, error, targets_only))
+         return std::vector<uint8_t>();
+      const auto& tokens = shader.tokens;
+      const auto& instructions = shader.instructions;
+      const size_t first_body = shader.first_body;
+      // Targets are known by name, their system value is left undefined in the signature
+      const auto is_target = [](const SignatureElement& element)
+      { return _stricmp(element.name.c_str(), "SV_Target") == 0; };
 
       // The two inputs after the last input (or before the outputs), the target after the last output
       const size_t first_output = size_t(std::ranges::find_if(instructions.begin(), instructions.begin() + first_body, [](const Instruction& instruction)
@@ -352,65 +385,20 @@ namespace MotionVectorPatch
       declarations.insert(declarations.end(), tokens.begin() + instructions[first_body].begin, tokens.begin() + last);
       declarations.insert(declarations.end(), motion_vector.begin(), motion_vector.end());
       declarations.insert(declarations.end(), tokens.begin() + last, tokens.end());
-      WriteProgram(&declarations, program);
+      WriteProgram(&declarations, shader.program);
 
       // Signature masks are plain component bits (x = 1), unlike the operand token masks above
-      inputs.push_back({semantic_name, 0, 0, 3, layout.current_position_register, 0xF, 0xB});
-      inputs.push_back({semantic_name, 1, 0, 3, layout.previous_position_register, 0xF, 0xB});
-      input_signature->data = WriteSignature(inputs);
-      SignatureElement output = *target;
+      shader.inputs.push_back({semantic_name, 0, 0, 3, layout.current_position_register, 0xF, 0xB});
+      shader.inputs.push_back({semantic_name, 1, 0, 3, layout.previous_position_register, 0xF, 0xB});
+      shader.input_signature->data = WriteSignature(shader.inputs);
+      SignatureElement output = shader.target;
       output.semantic_index = layout.target_slot;
       output.reg = layout.target_slot;
       output.mask = 0x3;
       output.rw_mask = 0;
-      outputs.insert(std::ranges::find_if(outputs.rbegin(), outputs.rend(), is_target).base(), output);
-      output_signature->data = WriteSignature(outputs);
-      return WriteChunks(chunks);
-   }
-
-   // A pixel shader's container, signatures and program, checked for "PatchPixelShaderReactive" (games also use it as a pre-check):
-   // only game targets, below the layout's "target_slot" (depth writers such as dgVoodoo's depth restores are refused, as a target
-   // declared after oDepth), inputs below the added ones, one final ret
-   struct PixelShader
-   {
-      std::vector<Chunk> chunks;
-      Chunk* program = nullptr;
-      Chunk* input_signature = nullptr;
-      Chunk* output_signature = nullptr;
-      std::vector<SignatureElement> inputs, outputs;
-      SignatureElement target;
-      std::vector<uint32_t> tokens;
-      std::vector<Instruction> instructions;
-      size_t first_body = 0;
-   };
-
-   inline bool ReadPixelShader(const uint8_t* code, size_t size, const Layout& layout, PixelShader* shader, std::string* error)
-   {
-      if (!ReadChunks(code, size, &shader->chunks))
-         return (*error = "container", false);
-      shader->program = FindChunk(&shader->chunks, FourCC("SHEX"), FourCC("SHDR"));
-      shader->input_signature = FindChunk(&shader->chunks, FourCC("ISGN"));
-      shader->output_signature = FindChunk(&shader->chunks, FourCC("OSGN"));
-      if (!shader->program || !shader->input_signature || !shader->output_signature || !ReadSignature(shader->input_signature->data, &shader->inputs) || !ReadSignature(shader->output_signature->data, &shader->outputs))
-         return (*error = "chunks", false);
-      // Targets are known by name, their system value is left undefined in the signature
-      const auto is_target = [](const SignatureElement& element)
-      { return _stricmp(element.name.c_str(), "SV_Target") == 0; };
-      const auto target = std::ranges::find_if(shader->outputs, is_target);
-      if (target == shader->outputs.end() || std::ranges::any_of(shader->outputs, [&](const SignatureElement& element)
-                                                { return !is_target(element) || element.reg >= layout.target_slot; }) ||
-          std::ranges::any_of(shader->inputs, [&](const SignatureElement& element)
-             { return element.reg >= layout.current_position_register; }))
-         return (*error = "signatures", false);
-      shader->target = *target;
-
-      if (!ReadProgram(*shader->program, &shader->tokens, &shader->instructions, &shader->first_body))
-         return (*error = "lengths", false);
-      const auto& instructions = shader->instructions;
-      if (shader->first_body >= instructions.size() || instructions.back().opcode != D3D10_SB_OPCODE_RET || std::ranges::any_of(instructions.begin() + shader->first_body, instructions.end() - 1, [](const Instruction& instruction)
-                                                                                                               { return instruction.opcode == D3D10_SB_OPCODE_RET || instruction.opcode == D3D10_SB_OPCODE_RETC; }))
-         return (*error = "returns", false);
-      return true;
+      shader.outputs.insert(std::ranges::find_if(shader.outputs.rbegin(), shader.outputs.rend(), is_target).base(), output);
+      shader.output_signature->data = WriteSignature(shader.outputs);
+      return WriteChunks(shader.chunks);
    }
 
    // FSR's reactive and transparency & composition masks from a game's alpha blended draws (first written for Mass Effect 2007).

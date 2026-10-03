@@ -1176,7 +1176,7 @@ class TheWitcher2Game final : public Game
             const auto* code = static_cast<const uint8_t*>(desc->code);
             if constexpr (vertex)
             {
-               patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error);
+               patched = MotionVectorPatch::PatchVertexShader(code, desc->code_size, MotionVectorPatches::layout, &error, &reads_resources);
                read_size = DXBC::ConstantBufferBytes(code, desc->code_size, MotionVectorPatches::object_slot);
                // None (world space vertices: billboards) leaves the transform zero
                if (DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, TERRAIN_CHUNK_ROW))
@@ -1191,19 +1191,6 @@ class TheWitcher2Game final : public Game
                {
                   transform_offset = BONES_ROW * 16;
                }
-               std::vector<DXBC::Chunk> chunks;
-               std::vector<uint32_t> tokens;
-               std::vector<DXBC::Instruction> instructions;
-               size_t first_body = 0;
-               if (DXBC::ReadChunks(code, desc->code_size, &chunks))
-               {
-                  if (const DXBC::Chunk* const program = DXBC::FindChunk(&chunks, DXBC::FourCC("SHEX"), DXBC::FourCC("SHDR"));
-                     program && DXBC::ReadProgram(*program, &tokens, &instructions, &first_body))
-                  {
-                     reads_resources = std::any_of(instructions.begin(), instructions.begin() + first_body, [](const DXBC::Instruction& instruction)
-                        { return instruction.opcode == D3D10_SB_OPCODE_DCL_RESOURCE; });
-                  }
-               }
             }
             else if (reactive != 0)
             {
@@ -1211,11 +1198,7 @@ class TheWitcher2Game final : public Game
             }
             else
             {
-               MotionVectorPatch::PixelShader pixel_shader;
-               if (MotionVectorPatch::ReadPixelShader(code, desc->code_size, MotionVectorPatches::layout, &pixel_shader, &error))
-               {
-                  patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error);
-               }
+               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error, true);
             }
          }
       }

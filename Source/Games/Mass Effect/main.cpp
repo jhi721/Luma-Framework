@@ -1288,8 +1288,7 @@ class MassEffect final : public Game
                patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout,
                   MotionVectorPatches::reactive_slot, reactive == 2, &error);
             else
-               patched = MotionVectorPatches::PatchPixelShader(code, desc->code_size,
-                  &error);
+               patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error, true);
          }
       }
       com_ptr<T> shader;

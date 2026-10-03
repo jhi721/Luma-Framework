@@ -1,8 +1,5 @@
 #pragma once
 
-#include <string>
-#include <vector>
-
 #include "..\..\Core\includes\motion_vector_patch.h"
 
 // The game's slots for Core's DXBC motion vector patch (described in "motion_vector_patch.h"; dgVoodoo's registers in
@@ -25,13 +22,6 @@ namespace MotionVectorPatches
    // FSR's reactive mask, written by the scene's alpha blended draws (their pixel shaders patched with "PatchPixelShaderReactive")
    constexpr uint32_t reactive_slot = target_slot + 1;
 
-   // For Core's patches ("motion_vector_patch.h"; its pixel shader patch only on the shaders "ReadPixelShader" accepts)
+   // For Core's patches ("motion_vector_patch.h"; its pixel shader patch with "targets_only")
    constexpr MotionVectorPatch::Layout layout = MotionVectorPatch::DgVoodoo::MakeLayout(view_projection_row);
-
-   // The pixel shader with the motion vector target, or empty if unpatchable
-   inline std::vector<uint8_t> PatchPixelShader(const uint8_t* code, size_t size, std::string* error)
-   {
-      MotionVectorPatch::PixelShader shader;
-      return MotionVectorPatch::ReadPixelShader(code, size, layout, &shader, error) ? MotionVectorPatch::PatchPixelShader(code, size, layout, error) : std::vector<uint8_t>();
-   }
 } // namespace MotionVectorPatches
