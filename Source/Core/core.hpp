@@ -5794,11 +5794,13 @@ namespace
       return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
    }
 
-   // Selects and switches the SR right away: for a game's own pick (e.g. its "Performance Test" sweeps), from its "OnPresent"
+   // Selects and switches the SR right away: for a game's own pick (e.g. its "Performance Test" sweeps), from its "OnPresent". A pick
+   // starts over, also of the same type after a failure suppressed it.
    void SetSRType(DeviceData& device_data, SR::Type sr_type)
    {
       device_data.sr_type_selected = sr_type;
       ApplySRType(device_data, sr_type);
+      device_data.sr_suppressed = false;
    }
 #endif // ENABLE_SR
 
