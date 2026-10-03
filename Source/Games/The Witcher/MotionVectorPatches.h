@@ -14,9 +14,7 @@ namespace MotionVectorPatches
    using MotionVectorPatch::DgVoodoo::jitter_slot;
    using MotionVectorPatch::DgVoodoo::object_row_offset;
    using MotionVectorPatch::DgVoodoo::object_slot;
-   using MotionVectorPatch::DgVoodoo::previous_resources_slot;
    using MotionVectorPatch::DgVoodoo::previous_slots;
-   using MotionVectorPatch::DgVoodoo::resource_slots;
    using MotionVectorPatch::DgVoodoo::target_slot;
 
    constexpr MotionVectorPatch::Layout layout = MotionVectorPatch::DgVoodoo::MakeLayout();

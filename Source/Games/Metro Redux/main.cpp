@@ -257,7 +257,6 @@ public:
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
-
       static std::mt19937 random_generator(std::chrono::system_clock::now().time_since_epoch().count());
       static auto random_range = static_cast<float>((std::mt19937::max)() - (std::mt19937::min)());
       cb_luma_global_settings.GameSettings.custom_random = static_cast<float>(random_generator() + (std::mt19937::min)()) / random_range;

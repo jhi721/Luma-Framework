@@ -208,22 +208,24 @@ namespace PatchedDraws
    }
 
    // The candidate (an object of last frame with the same draw key) nearest to "transform" among those "compatible" accepts (same
-   // constants layout), and its squared distance; null and FLT_MAX if none. 0: the same object, else the nearest guess.
+   // constants layout); null if none. At distance 0 the same object, else the nearest guess.
    template <typename Object, typename Compatible>
-   std::pair<const Object*, float> FindNearest(const std::vector<Object>& candidates, const ObjectTransform& transform, Compatible compatible)
+   const Object* FindNearest(const std::vector<Object>& candidates, const ObjectTransform& transform, Compatible compatible)
    {
       const Object* match = nullptr;
       float nearest = FLT_MAX;
       for (const Object& candidate : candidates)
       {
+         if (!compatible(candidate))
+            continue;
          const float distance = TransformDistance(candidate.transform, transform);
-         if (compatible(candidate) && distance < nearest)
+         if (distance < nearest)
          {
             nearest = distance;
             match = &candidate;
          }
       }
-      return {match, nearest};
+      return match;
    }
 
    // A development check of a frame's motion vector objects by draw key: those with another object's "transform" but other

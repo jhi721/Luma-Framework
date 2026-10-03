@@ -1085,8 +1085,6 @@ public:
 #endif
 
       gd.has_drawn_tonemap = false;
-      // Core never clears this one itself, so leaving it set would claim a scene was tonemapped on frames that ran
-      // no tonemap at all (movies, loading).
    }
 
    void LoadConfigs() override

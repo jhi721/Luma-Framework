@@ -1463,8 +1463,7 @@ class SaintsRowIV final : public Game
          if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
          {
             match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
-               { return copy_size(candidate.object) == object->size() && copy_size(candidate.bones) == copy_size(bones); })
-                       .first;
+               { return copy_size(candidate.object) == object->size() && copy_size(candidate.bones) == copy_size(bones); });
          }
          if (match)
          {
@@ -3013,9 +3012,9 @@ public:
       game_device_data.gtao_tried_this_frame = false;
       game_device_data.gtao_ran_this_frame = false;
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
-      LatchSRFrame(device_data);
+      const bool sr_active = LatchSRFrame(device_data);
       game_device_data.msaa_scene = std::exchange(game_device_data.msaa_scene_resolved, false);
-      game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed && !game_device_data.msaa_scene;
+      game_device_data.sr_active = sr_active && !game_device_data.msaa_scene;
       const bool mv_was_active = game_device_data.mv_active.exchange(IsSRActive(device_data) || g_mv_enable);
       if (mv_was_active && !game_device_data.mv_active)
       {

@@ -412,8 +412,6 @@ public:
       game_device_data.has_drawn_scene = false;
       game_device_data.final_post_process_command_list = nullptr;
 
-      //TODOFT: do this in the super?
-
       device_data.taa_detected = true;
       device_data.has_drawn_sr = false;
       game_device_data.found_per_view_globals = false;

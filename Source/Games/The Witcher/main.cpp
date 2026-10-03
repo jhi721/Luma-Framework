@@ -671,8 +671,7 @@ class TheWitcherGame final : public Game
          if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end())
          {
             match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
-               { return candidate.constants->size() == constants->size(); })
-                       .first;
+               { return candidate.constants->size() == constants->size(); });
          }
          if (match)
          {

@@ -1650,8 +1650,7 @@ class MassEffect final : public Game
             previous != gd.mv_previous_objects.end())
          {
             match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
-               { return candidate.constants->size() == constants->size(); })
-                       .first;
+               { return candidate.constants->size() == constants->size(); });
          }
          if (match)
          {
@@ -3308,7 +3307,6 @@ public:
 #endif
 
       gd.canvas_res.reset(); // do not hold a reference across frames: it would outlive a resize or a mirror swap
-      // Core never clears this: left set, it would claim a tonemapped scene on movie and loading frames.
       gd.srv_scene.reset(); // recaptured every frame; never held across one
 
 #if ENABLE_BLOOM

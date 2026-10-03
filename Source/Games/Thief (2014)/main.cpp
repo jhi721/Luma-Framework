@@ -148,10 +148,6 @@ public:
       return DrawOrDispatchOverrideType::None;
    }
 
-   void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
-   {
-   }
-
    void LoadConfigs() override
    {
       reshade::api::effect_runtime* runtime = nullptr;

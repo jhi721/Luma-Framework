@@ -1603,9 +1603,9 @@ class TheWitcher2Game final : public Game
 #endif
          if (previous != gd.mv_previous_objects.end() && !(untransformed && g_mv_untransformed_static))
          {
-            const auto [nearest_match, nearest] = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
                { return candidate.constants->size() == object_constants->size(); });
-            match = nearest_match;
+            const float nearest = (match ? PatchedDraws::TransformDistance(match->transform, transform) : FLT_MAX);
             // Terrain doesn't move: a chunk not drawn last frame (the chunk set changes even with a still camera) would take its
             // nearest neighbor's position and heightmap window, all its ground moving by hundreds of pixels
             if (match && nearest != 0.f && gd.mv_last_vertex.transform_offset == TERRAIN_CHUNK_ROW * 16)
@@ -2980,8 +2980,6 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
-      // Core never clears this (and reads it before this call): left set, menu/loading frames, which run no tonemap, would count as
-      // a scene instead of plain SDR UI at UIPaperWhite
       game_device_data.final_grade_fired_this_frame = false; // re-arm the Hide UI window for the next frame
 
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion

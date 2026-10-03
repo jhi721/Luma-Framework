@@ -299,7 +299,7 @@ namespace MotionVectorPatch
       size_t first_body = 0;
    };
 
-   inline bool ReadPixelShader(const uint8_t* code, size_t size, const Layout& layout, PixelShader* shader, std::string* error, bool targets_only = true)
+   inline bool ReadPixelShader(const uint8_t* code, size_t size, const Layout& layout, PixelShader* shader, std::string* error, bool targets_only)
    {
       if (!ReadChunks(code, size, &shader->chunks))
          return (*error = "container", false);
@@ -410,7 +410,7 @@ namespace MotionVectorPatch
    inline std::vector<uint8_t> PatchPixelShaderReactive(const uint8_t* code, size_t size, const Layout& layout, uint32_t reactive_slot, bool additive, std::string* error)
    {
       PixelShader shader;
-      if (!ReadPixelShader(code, size, layout, &shader, error))
+      if (!ReadPixelShader(code, size, layout, &shader, error, true))
          return {};
       auto& [chunks, program, input_signature, output_signature, inputs, outputs, target, tokens, instructions, first_body] = shader;
       if (outputs.size() != 1)

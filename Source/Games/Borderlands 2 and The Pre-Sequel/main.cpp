@@ -1560,8 +1560,7 @@ class Borderlands2 final : public Game
          if (const auto previous = gd.mv_previous_objects.find(key); g_mv_match_objects && previous != gd.mv_previous_objects.end())
          {
             match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
-               { return candidate.constants->size() == constants->size(); })
-                       .first;
+               { return candidate.constants->size() == constants->size(); });
          }
          // "source" (only what the shader reads, at least the camera) with the view projection of "previous_camera" for this frame's
          // PreViewTranslation
@@ -3237,7 +3236,6 @@ public:
    {
       auto& gd = GetGameDeviceData(device_data);
       gd.tonemap_fired_this_frame = false; // new frame: re-arm Hide UI's post-tonemap alpha-blend scope
-      // Core never clears this: left set, it would claim a scene on menu, video and loading frames
       gd.frame_counter++;
       // Never carry a Scaleform mask span across frames.
       gd.dsv_scaleform_mask_active.reset();

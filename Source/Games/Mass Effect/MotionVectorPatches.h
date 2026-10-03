@@ -12,9 +12,7 @@ namespace MotionVectorPatches
    using MotionVectorPatch::DgVoodoo::jitter_slot;
    using MotionVectorPatch::DgVoodoo::object_row_offset;
    using MotionVectorPatch::DgVoodoo::object_slot;
-   using MotionVectorPatch::DgVoodoo::previous_resources_slot;
    using MotionVectorPatch::DgVoodoo::previous_slots;
-   using MotionVectorPatch::DgVoodoo::resource_slots;
    using MotionVectorPatch::DgVoodoo::target_slot;
    // The first vc4 row of the view projection (c0). Vertex shaders that never read it (shadow and LocalToView projections, the 29 of
    // 420 in the shader cache that don't place vertices with it) are refused: they don't draw the scene's camera view.

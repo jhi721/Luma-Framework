@@ -1144,8 +1144,7 @@ class Persona5Strikers final : public Game
          if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
          {
             match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& object)
-               { return object.globals->size() == globals_copy->size(); })
-                       .first;
+               { return object.globals->size() == globals_copy->size(); });
          }
          // Kept as drawn for the next frame
          game_device_data.mv_objects[key].push_back({transform, globals_copy});
@@ -3193,7 +3192,6 @@ public:
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
-      // Set by the composite; Core copies it into "has_drawn_main_post_processing_previous" before this, but never clears it
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
       auto& game_device_data = GetGameDeviceData(device_data);
       game_device_data.sr_drew = device_data.has_drawn_sr.load();

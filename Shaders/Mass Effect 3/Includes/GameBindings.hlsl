@@ -1,6 +1,8 @@
 #ifndef LUMA_ME3_GAME_BINDINGS
 #define LUMA_ME3_GAME_BINDINGS
 
+#include "../../Includes/DgVoodoo.hlsl"
+
 // Bindings and vanilla math shared by the replaced passes: no textures, samplers or cbuffer-row aliases, since slot and
 // row meaning is per pass.
 
@@ -15,11 +17,10 @@ cbuffer PixelShaderConstants : register(b4)
    float4 PsConstants[236] : packoffset(c0);
 }
 
-// dgVoodoo texture-format emulation masks: one (mask, fill) pair per sampler slot, s<N> at cb3[44 + 2N] / cb3[45 + 2N].
-// Every texture fetch in a translated shader is followed by this pair; dropping it shifts colour.
+// dgVoodoo's texture format emulation ("ApplyDgvMask"): one (mask, fill) pair per sampler slot, s<N> at cb3[44 + 2N] / cb3[45 + 2N]
 float4 ApplyDgvMask(float4 value, uint slot)
 {
-   return asfloat((asuint(value) & asuint(DgvConstants[44 + 2 * slot])) | asuint(DgvConstants[45 + 2 * slot]));
+   return ApplyDgvMask(value, DgvConstants[44 + 2 * slot], DgvConstants[45 + 2 * slot]);
 }
 
 // The grade's pow() as the original computes it. The tiny floor replaces the compiler's own log2(0) guard.

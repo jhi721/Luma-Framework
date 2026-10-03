@@ -1153,23 +1153,17 @@ public:
 #if ENABLE_SR
       // SR resolves more detail than the game's TAA, so sharpen texture sampling while it draws (-1 at native resolution).
       // The offset is added to the game's own sampler bias, which is unknown, so the game's TAA keeps it unchanged.
-      if (enable_samplers_upgrade && !custom_texture_mip_lod_bias_offset)
+      if (enable_samplers_upgrade)
       {
-         const float mip_lod_bias_offset = (device_data.has_drawn_sr ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f);
-         if (mip_lod_bias_offset != device_data.texture_mip_lod_bias_offset)
-         {
-            std::unique_lock lock_samplers(s_mutex_samplers); // The offset is a key of the samplers map, read by other threads
-            device_data.texture_mip_lod_bias_offset = mip_lod_bias_offset;
-         }
+         SetTextureMipLodBias(nullptr, device_data, device_data.has_drawn_sr ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f);
       }
       // Any frame SR didn't draw (off, skipped, failed, no TAA dispatch) restarts its history at the next one
-      LatchSRFrame(device_data);
+      const bool sr_active = LatchSRFrame(device_data);
       if (game_device_data.sr_motion_vectors && cb_luma_global_settings.FrameIndex - game_device_data.sr_inputs_last_frame > idle_release_frames)
       {
          CleanExtraSRResources(device_data);
       }
       // Only switched on changes, so the development combo stays usable
-      const bool sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
       if (int32_t* jitter_mode = GetGameAddresses().jitter_mode; jitter_mode && sr_active != halton_jitter_mode_applied)
       {
          halton_jitter_mode_applied = sr_active;

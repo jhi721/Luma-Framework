@@ -272,11 +272,11 @@ namespace SRBridge
 
    void Bridge::ReleaseResources(SR::InstanceData* data)
    {
-      if (data)
+      if (auto* const bridge = static_cast<BridgeInstanceData*>(data))
       {
-         static_cast<BridgeInstanceData*>(data)->Stop();
+         bridge->Stop();
          // A new pick starts over after a failure (games stop drawing a failed upscaler until it's picked again)
-         static_cast<BridgeInstanceData*>(data)->failed = false;
+         bridge->failed = false;
       }
    }
 

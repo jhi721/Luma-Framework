@@ -1286,7 +1286,6 @@ public:
 
       // reset cb_luma_global_settings.GameSettings.UIBlurDown0Count
       cb_luma_global_settings.GameSettings.UIBlurDown0Count = 0; // will apply start of next frame
-      
 
       // allow_pause_screen_skiptoken
       allow_pause_screen_skiptoken = false;
