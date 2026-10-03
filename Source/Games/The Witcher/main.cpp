@@ -295,21 +295,6 @@ class TheWitcherGame final : public Game
          values[i] = float(matrix.GetData()[i]);
    }
 
-   // The projection's depth rows from the view projection (column vectors: clip = M * p): row 2 = A * row 3 + (0, 0, 0, B) for an
-   // affine view, so device depth = A + B / view depth
-   static std::array<double, 2> GetDepthFromView(const Math::Matrix44D& view_projection)
-   {
-      const double* const m = view_projection.GetData();
-      double dot_23 = 0.0, dot_33 = 0.0;
-      for (int column = 0; column < 3; column++)
-      {
-         dot_23 += m[8 + column] * m[12 + column];
-         dot_33 += m[12 + column] * m[12 + column];
-      }
-      const double a = dot_33 > 0.0 ? dot_23 / dot_33 : 1.0;
-      return {a, m[11] - a * m[15]};
-   }
-
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
@@ -882,21 +867,16 @@ class TheWitcherGame final : public Game
       draw_data.jitter_x = gd.mv_jitter[0];
       draw_data.jitter_y = gd.mv_jitter[1];
       draw_data.reset = device_data.force_reset_sr;
-      // FSR needs the camera: the view projection's row 1 is the up axis / tan(fov / 2). It errors on a 0 FOV: a frame without a
-      // camera keeps the last one.
+      // FSR needs the camera (column vectors). It errors on a 0 FOV: a frame without a camera keeps the last one.
       if (gd.mv_camera)
       {
-         const double* const m = gd.mv_camera->GetData();
-         const double up_length = std::sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
-         if (up_length > 0.0)
-            gd.sr_vert_fov = float(2.0 * std::atan(1.0 / up_length));
-         const auto [depth_a, depth_b] = GetDepthFromView(*gd.mv_camera);
-         const double near_plane = depth_a != 0.0 ? -depth_b / depth_a : 0.0;
-         if (near_plane > 0.0)
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(gd.mv_camera->GetData(), false);
+         if (camera.vert_fov > 0.0)
+            gd.sr_vert_fov = float(camera.vert_fov);
+         if (camera.near_plane > 0.0)
          {
-            // A finite far (depth 1) when the projection has one, else a large one
-            draw_data.near_plane = float(near_plane);
-            draw_data.far_plane = float(depth_a > 1.0 + 1e-6 ? depth_b / (1.0 - depth_a) : near_plane * 1e6);
+            draw_data.near_plane = float(camera.near_plane);
+            draw_data.far_plane = float(camera.far_plane);
          }
       }
       draw_data.vert_fov = gd.sr_vert_fov;

@@ -84,6 +84,40 @@ namespace SR
 		return GetMipLODBias(float(render_height), float(output_height));
 	}
 
+	// The camera an upscaler needs (FSR), from a view projection with an affine view: element (row, column) at m[row * 4 + column] for
+	// column vectors (clip = M * p), at m[column * 4 + row] with "row_vectors" (clip = p * M). Clip z = A * clip w + B, so device
+	// depth = A + B / view depth (A = 1 for an infinite far plane, then B = -near). Each value is 0 when the projection lacks it.
+	struct ViewProjectionCamera
+	{
+		double depth_a = 0.0;
+		double depth_b = 0.0;
+		double vert_fov = 0.0; // Radians: the up axis has length 1 / tan(fov / 2)
+		double near_plane = 0.0;
+		double far_plane = 0.0; // Finite: near x 1e6 for an infinite projection
+	};
+	template <typename T>
+	ViewProjectionCamera GetViewProjectionCamera(const T* m, bool row_vectors)
+	{
+		const auto at = [&](int row, int column) { return double(row_vectors ? m[column * 4 + row] : m[row * 4 + column]); };
+		double dot_23 = 0.0, dot_33 = 0.0;
+		for (int column = 0; column < 3; column++)
+		{
+			dot_23 += at(2, column) * at(3, column);
+			dot_33 += at(3, column) * at(3, column);
+		}
+		ViewProjectionCamera camera;
+		camera.depth_a = (dot_33 > 0.0 ? dot_23 / dot_33 : 1.0);
+		camera.depth_b = at(2, 3) - camera.depth_a * at(3, 3);
+		const double up_length = std::sqrt(at(1, 0) * at(1, 0) + at(1, 1) * at(1, 1) + at(1, 2) * at(1, 2));
+		camera.vert_fov = (up_length > 0.0 ? 2.0 * std::atan(1.0 / up_length) : 0.0);
+		camera.near_plane = (camera.depth_a != 0.0 ? -camera.depth_b / camera.depth_a : 0.0);
+		if (camera.near_plane > 0.0)
+		{
+			camera.far_plane = (camera.depth_a > 1.0 + 1e-6 ? camera.depth_b / (1.0 - camera.depth_a) : camera.near_plane * 1e6);
+		}
+		return camera;
+	}
+
 	struct SettingsData
 	{
 		unsigned int output_width = 1;

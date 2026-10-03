@@ -1838,22 +1838,6 @@ class MassEffect final : public Game
       return true;
    }
 
-   // The projection's depth row from the view projection (row vectors: clip = p * M): column 2 = A * column 3 + (0, 0, 0, B) for
-   // an affine view, so device depth = A + B / view depth (A = 1 for UE3's infinite far plane, then B = -near)
-   static std::array<double, 2> GetDepthFromView(const float* view_projection)
-   {
-      double dot_23 = 0.0, dot_33 = 0.0;
-      for (int row = 0; row < 3; row++)
-      {
-         dot_23 +=
-            double(view_projection[row * 4 + 2]) * view_projection[row * 4 + 3];
-         dot_33 +=
-            double(view_projection[row * 4 + 3]) * view_projection[row * 4 + 3];
-      }
-      const double a = dot_33 > 0.0 ? dot_23 / dot_33 : 1.0;
-      return {a, double(view_projection[14]) - a * view_projection[15]};
-   }
-
    // DLAA or FSR 3 Native AA on the jittered scene, its depth (from its alpha, see the fill) and the motion vectors; the result goes
    // back into the scene's color (or its copy, see "mv_scene_copy"), its alpha (the post passes' linear depth) kept. False if it
    // didn't draw (missing input, or the upscaler failed). "reactive_mask": the fill wrote this scene's mask.
@@ -1910,17 +1894,8 @@ class MassEffect final : public Game
             return false;
       }
 
-      // FSR needs the camera. vc4's view projection multiplies row vectors: column 1 is the up axis / tan(fov / 2).
-      const float* const view_projection = reinterpret_cast<const float*>(
-         gd.mv_camera->data() + kViewProjectionOffset);
-      const double up_length =
-         std::sqrt(double(view_projection[1]) * view_projection[1] +
-                   double(view_projection[5]) * view_projection[5] +
-                   double(view_projection[9]) * view_projection[9]);
-      const double vert_fov =
-         up_length > 0.0 ? 2.0 * std::atan(1.0 / up_length) : 0.0;
-      const auto [depth_a, depth_b] = GetDepthFromView(view_projection);
-      const double near_plane = depth_a != 0.0 ? -depth_b / depth_a : 0.0;
+      // FSR needs the camera (vc4's view projection multiplies row vectors)
+      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + kViewProjectionOffset), true);
 
       SR::SettingsData settings_data;
       settings_data.output_width = scene_desc.Width;
@@ -1951,17 +1926,15 @@ class MassEffect final : public Game
       draw_data.jitter_y = gd.mv_jitter[1];
       draw_data.reset = device_data.force_reset_sr;
       // FSR requires a FOV (it errors on 0): a camera without an up axis keeps the last one
-      if (vert_fov > 0.0)
-         gd.sr_vert_fov = float(vert_fov);
+      if (camera.vert_fov > 0.0)
+         gd.sr_vert_fov = float(camera.vert_fov);
       draw_data.vert_fov = gd.sr_vert_fov;
-      if (near_plane > 0.0)
+      // A finite far (depth 1) even when the projection has none (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE only with inverted
+      // depth)
+      if (camera.near_plane > 0.0)
       {
-         // A finite far (depth 1) when the projection has one, else a large one (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE
-         // only with inverted depth)
-         const double far_plane =
-            depth_a > 1.0 + 1e-6 ? depth_b / (1.0 - depth_a) : near_plane * 1e6;
-         draw_data.near_plane = float(near_plane);
-         draw_data.far_plane = float(far_plane);
+         draw_data.near_plane = float(camera.near_plane);
+         draw_data.far_plane = float(camera.far_plane);
       }
 #if DEVELOPMENT
       gd.mv_stats.near_plane = draw_data.near_plane;
@@ -2102,14 +2075,14 @@ class MassEffect final : public Game
             current.Invert();
          }
          const Math::Matrix44D reprojection = previous * current;
-         const auto depth_from_view = GetDepthFromView(view_projection);
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, true);
          float constants[24] = {}; // A multiple of 16 bytes
          for (int i = 0; i < 16; i++)
             constants[i] = float(reprojection.GetData()[i]);
          constants[16] = gd.mv_jitter_ndc[0];
          constants[17] = gd.mv_jitter_ndc[1];
-         constants[18] = float(depth_from_view[0]);
-         constants[19] = float(depth_from_view[1]);
+         constants[18] = float(camera.depth_a);
+         constants[19] = float(camera.depth_b);
          constants[20] = g_sr_reactive_scale;
          constants[21] = g_sr_reactive_threshold;
          constants[22] = write_reactive ? 1.f : 0.f;

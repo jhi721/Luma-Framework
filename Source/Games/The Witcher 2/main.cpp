@@ -1829,20 +1829,6 @@ class TheWitcher2Game final : public Game
       return true;
    }
 
-   // The projection's depth row from WorldToScreen (column vectors: clip = M * p, rows c4-c7): row 2 = A * row 3 + (0, 0, 0, B) for an
-   // affine view, so device depth = A + B / view depth (row 3 gives the view depth, as the G-buffer's linear depth)
-   static std::array<double, 2> GetDepthFromView(const float* view_projection)
-   {
-      double dot_23 = 0.0, dot_33 = 0.0;
-      for (int column = 0; column < 3; column++)
-      {
-         dot_23 += double(view_projection[8 + column]) * view_projection[12 + column];
-         dot_33 += double(view_projection[12 + column]) * view_projection[12 + column];
-      }
-      const double a = (dot_33 > 0.0 ? dot_23 / dot_33 : 1.0);
-      return {a, double(view_projection[11]) - a * view_projection[15]};
-   }
-
    // DLAA or FSR 3 Native AA on the exposed, jittered scene (the exposure's target), or under the render scale DLSS/FSR on the linear
    // scene's render area before the exposure (with the exposure the fill wrote); its depth (from the G-buffer's, see the fill) and the
    // motion vectors. The result goes back into that target, its alpha kept. False if it didn't draw (missing input, or the upscaler
@@ -1897,12 +1883,8 @@ class TheWitcher2Game final : public Game
             return false;
       }
 
-      // FSR needs the camera. WorldToScreen's row 1 is the up axis / tan(fov / 2).
-      const float* const view_projection = reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET);
-      const double up_length = std::sqrt(double(view_projection[4]) * view_projection[4] + double(view_projection[5]) * view_projection[5] + double(view_projection[6]) * view_projection[6]);
-      const double vert_fov = (up_length > 0.0 ? 2.0 * std::atan(1.0 / up_length) : 0.0);
-      const auto [depth_a, depth_b] = GetDepthFromView(view_projection);
-      const double near_plane = (depth_a != 0.0 ? -depth_b / depth_a : 0.0);
+      // FSR needs the camera (WorldToScreen: column vectors)
+      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET), false);
 
       const uint32_t render_width = (std::min)(gd.mv_render_size[0], scene_desc.Width);
       const uint32_t render_height = (std::min)(gd.mv_render_size[1], scene_desc.Height);
@@ -1923,9 +1905,9 @@ class TheWitcher2Game final : public Game
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
       // FSR requires a FOV (it errors on 0): a camera without an up axis keeps the last one
-      if (vert_fov > 0.0)
+      if (camera.vert_fov > 0.0)
       {
-         gd.sr_vert_fov = float(vert_fov);
+         gd.sr_vert_fov = float(camera.vert_fov);
       }
       SR::SuperResolutionImpl::DrawData draw_data = {
          .reset = device_data.force_reset_sr || gd.sr_render_size != std::array<uint32_t, 2>{render_width, render_height},
@@ -1943,13 +1925,12 @@ class TheWitcher2Game final : public Game
          .jitter_y = gd.mv_jitter[1],
          .vert_fov = gd.sr_vert_fov,
       };
-      if (near_plane > 0.0)
+      // A finite far (depth 1) even when the projection has none (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE only with inverted
+      // depth)
+      if (camera.near_plane > 0.0)
       {
-         // A finite far (depth 1) when the projection has one, else a large one (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE only
-         // with inverted depth)
-         const double far_plane = (depth_a > 1.0 + 1e-6 ? depth_b / (1.0 - depth_a) : near_plane * 1e6);
-         draw_data.near_plane = float(near_plane);
-         draw_data.far_plane = float(far_plane);
+         draw_data.near_plane = float(camera.near_plane);
+         draw_data.far_plane = float(camera.far_plane);
       }
 #if DEVELOPMENT
       gd.mv_stats.near_plane = draw_data.near_plane;
@@ -2072,10 +2053,10 @@ class TheWitcher2Game final : public Game
             current.Invert();
          }
          const Math::Matrix44D reprojection = previous * current;
-         const auto depth_from_view = GetDepthFromView(view_projection);
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, false);
          CB::MotionVectorFillConstants constants = {
             .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
-            .depth_from_view = {float(depth_from_view[0]), float(depth_from_view[1])},
+            .depth_from_view = {float(camera.depth_a), float(camera.depth_b)},
             .reactive_scale = g_sr_reactive_scale,
             .reactive_threshold = g_sr_reactive_threshold,
             .reactive_enabled = (write_reactive ? 1.f : 0.f),
