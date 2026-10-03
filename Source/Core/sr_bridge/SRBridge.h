@@ -12,8 +12,20 @@
 
 #if ENABLE_SR_BRIDGE
 
+#include <d3d11.h>
+
 namespace SRBridge
 {
+   // A texture the bridge hands to its helper as is (NT handle shared), else a plain one (the bridge copies those every frame)
+   inline HRESULT CreateSharableTexture(ID3D11Device* native_device, D3D11_TEXTURE2D_DESC desc, ID3D11Texture2D** texture)
+   {
+      desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+      if (SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, texture)))
+         return S_OK;
+      desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+      return native_device->CreateTexture2D(&desc, nullptr, texture);
+   }
+
    // One per SR type, registered as that type's implementation
    class Bridge : public SR::SuperResolutionImpl
    {
