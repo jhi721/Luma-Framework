@@ -193,7 +193,7 @@ static constexpr size_t kPreViewTranslationOffset = 5 * 16;
 // Render scale for DLSS / FSR (DLAA_RESEARCH.md "Render scale RE, exe + shaders"; ME1/2/3 LE). The engine's fixed scale dynamic
 // resolution (built, but off on PC) renders the scene into the top-left share of full size targets, and the stage 1 uber
 // stretches it. The view is set to its unscaled size on entry to the post process DPG's loop, which the engine itself does only
-// after the uber (0x76E17D): DoF, bloom, PSOffsetConstants b2 (rewritten per pass from the view) and the uber then run at output
+// after the uber (ME1 LE 0x76E17D): DoF, bloom, PSOffsetConstants b2 (rewritten per pass from the view) and the uber then run at output
 // size on the upscaler's output (DLSS best practices PLC-2).
 namespace EngineScale
 {
@@ -469,7 +469,8 @@ namespace ImmediateState
       index_buffer_known = true;
    }
 
-   // A tracked value, or (unknown, or the toggle off) the queried one, held by "held"; on a check draw both, a mismatch counted
+   // The tracked value, else (unknown, or the toggle off) the queried one, held by "held". A check draw queries too and counts a
+   // mismatch.
    template <typename T, typename Query>
    T* Read(T* tracked, bool known, com_ptr<T>* held, Query query)
    {
@@ -514,7 +515,7 @@ static constexpr bool g_mv_read_sizes = true;
 struct PerfTestMode
 {
    const char* name;
-   bool set_aa = false; // Else the current settings (the fields below too)
+   bool set_aa = false; // False: the current settings, the fields below unused
    SR::Type sr_type = SR::Type::None;
    unsigned int dlss_preset = 0; // NVSDK_NGX_DLSS_Hint_Render_Preset (5 = E, 11 = K, ...)
    bool smaa = false;
@@ -558,7 +559,7 @@ enum PerfStamp : size_t
 };
 #endif
 
-// fp16 scratch target and the views it was created with; EnsureRGBA16FTarget rebuilds it on resolution change.
+// fp16 scratch target and its views (see "EnsureRGBA16FTarget").
 struct RGBA16FTarget
 {
    ComPtr<ID3D11Texture2D> tex;
@@ -1278,7 +1279,7 @@ class MassEffectLE final : public Game
       return shaders->try_emplace(hash, std::move(entry)).first->second;
    }
 
-   // The bound vertex shader's patched version (null if refused), looked up again only when the game's changes
+   // The bound vertex shader's patched version (null if refused), looked up again only when the game's shader changes
    static ID3D11VertexShader* GetPatchedVertexShader(ID3D11Device* native_device, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t hash)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1452,8 +1453,8 @@ class MassEffectLE final : public Game
       const auto& camera = game_device_data->view_camera;
       if (!scene_camera || camera->size() < 16 * sizeof(float))
          return false;
-      // No perspective (clip w doesn't depend on position): no camera. A screen space draw after shooting an enemy (ME1) has an
-      // identity ViewProjectionMatrix and an output sized viewport even below native render scale; reopening the scene for it took
+      // No perspective (clip w doesn't depend on position): no camera. ME1's screen space draw after shooting an enemy has an
+      // identity ViewProjectionMatrix and an output sized viewport even below native render scale; reopening the scene would take
       // that viewport as the render size.
       const float* const m = reinterpret_cast<const float*>(camera->data());
       if (std::abs(m[3]) + std::abs(m[7]) + std::abs(m[11]) < 0.5f)
@@ -1674,7 +1675,8 @@ class MassEffectLE final : public Game
       const bool frame_start = std::exchange(game_device_data.mv_frame_ended, false);
       if (frame_start || std::exchange(game_device_data.mv_view_restarted, false))
       {
-         // The camera fill's and the upscaler's depth: the scene depth if it can be read, else its copy (taken after the depth prepass)
+         // The camera fill's and the upscaler's depth: the scene depth if it can be read, else UE3's last copy of it (see
+         // "OverrideCopyResource"); replaced by "mv_depth_snapshot" before UE3's quad clear
          game_device_data.mv_depth_srv.reset();
          game_device_data.mv_depth_snapshot_taken = false;
          com_ptr<ID3D11Resource> depth = game_device_data.mv_depth;
@@ -2225,7 +2227,7 @@ class MassEffectLE final : public Game
 
    // The post passes from the scene's end up to stage 1 read the upscaled scene where they bind the scene or its copy (any shader
    // resource slot). Under the engine's render scale they run at output size (see "EngineScale"), so any other output sized texture
-   // they read (the scene's depth and velocity, written in the render share) is read stretched ("RenderShareStretch").
+   // they read (the scene's depth and velocity, written in the render share) is read stretched ("StretchRenderShare").
    static void RebindUpscaledScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, bool compute)
    {
       const bool render_share = IsRenderShare(device_data, *gd);
@@ -2452,8 +2454,8 @@ public:
       native_shaders_definitions.emplace(kNameGTAODenoise2CS,
          ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
 
-      // DLSS / FSR: camera motion for the motion vector pixels no patched draw wrote (sky, unpatched draws), the CPU copies of the
-      // per-draw constants, and the motion vector target written by every blend state
+      // DLSS / FSR: camera motion for the motion vector pixels no patched draw wrote (sky, unpatched draws), the render share stretch
+      // ("StretchRenderShare"), the CPU copies of the per-draw constants, and the motion vector target written by every blend state
       native_shaders_definitions.emplace(kNameMVFillCS,
          ShaderDefinition("Luma_MELE_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(kNameRenderShareStretchCS,
@@ -2707,7 +2709,7 @@ public:
          GetResourceInfo(depth_srv.get(), depth_size, depth_format);
          if (depth_size.x == 0 || depth_size.y == 0)
             return DrawOrDispatchOverrideType::None;
-         // The working area is the rendered share of the half size AO targets under the engine's render scale (all of them at
+         // The working area is the rendered share of the half size AO targets under the engine's render scale (the whole target at
          // native): XeGTAO's clamped samples then stop at its edge instead of reading the stale depth beyond it
          const float2 output_size = device_data.output_resolution;
          const bool render_share = IsRenderShare(device_data, *gd);
@@ -2945,7 +2947,7 @@ public:
       // Threshold and strength are inert without the depth-edge term.
       const float pred_scale = (depth_ok ? kPredScale : 1.f);
 
-      // Async loading and live reload may temporarily require the fallback.
+      // The SMAA shaders can be missing during async loading or a live reload.
       if (smaa && !HasSMAAShaders(device_data))
          return fallback;
 
@@ -3647,8 +3649,8 @@ public:
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& default_game_settings = default_luma_global_game_settings;
-      // A [0, max] float setting: slider saved on edit, and a reset button saved here (DrawResetButton's own save writes NAME, but
-      // LoadConfigs reads PROJECT_NAME)
+      // A [0, max] float setting: slider saved on edit, and a reset button saved here (DrawResetButton's own save, off here, writes
+      // NAME, but LoadConfigs reads PROJECT_NAME)
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
          if (ImGui::SliderFloat(label, value, 0.f, max))
@@ -3977,7 +3979,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
       texture_format_upgrades_type = TextureFormatUpgradesType::None; // HDR buffers are already fp16.
 
-      // Mode 4 sets MaxAnisotropy=16. LOD bias 0 without DLSS/FSR, set per frame with them (see "OnPresent").
+      // Mode 4: 16x anisotropy plus Core's LOD bias offset, 0 without DLSS/FSR and set per scene with them (see "OpenScene").
       enable_samplers_upgrade = true; // Boot-time only.
       samplers_upgrade_mode = 4;
 

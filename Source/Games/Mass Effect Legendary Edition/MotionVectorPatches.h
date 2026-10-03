@@ -4,12 +4,12 @@
 
 #include "..\..\Core\includes\motion_vector_patch.h"
 
-// The game's slots and registers for Core's DXBC motion vector patch (described in "motion_vector_patch.h"). The second vertex
-// shader run reads the previous frame's UE3 per-draw constants (b0 $Globals: LocalToWorld, material parameters;
-// b1 VSOffsetConstants: ViewProjectionMatrix, CameraPosition; b3 VSBoneConstants: the bone palette) from other slots.
-// Borderlands GOTY Enhanced's patch (same UE3 slots). Tested offline on each game's full shader cache, vertex shaders equal on WARP
-// stream-out with no jitter mismatch (the rest have no b1: shadow depth, screen quads), pixel shaders created: ME1 18723 of 20278 VS,
-// 78186 of 78188 PS; ME2 27593 of 29867 VS, 108562 of 108564 PS; ME3 28349 of 30293 VS, 150326 of 150328 PS.
+// The game's slots and registers for Core's DXBC motion vector patch (described in "motion_vector_patch.h"), the same UE3 slots as
+// Borderlands GOTY Enhanced's. The second vertex shader run reads the previous frame's UE3 per-draw constants (b0 $Globals:
+// LocalToWorld, material parameters; b1 VSOffsetConstants: ViewProjectionMatrix, CameraPosition; b3 VSBoneConstants: the bone
+// palette) from other slots. Tested offline on each game's full shader cache (patched vertex shaders equal on WARP stream-out with
+// no jitter mismatch, the rest have no b1; patched pixel shaders created): ME1 18723 of 20278 VS, 78186 of 78188 PS; ME2 27593 of
+// 29867 VS, 108562 of 108564 PS; ME3 28349 of 30293 VS, 150326 of 150328 PS.
 namespace MotionVectorPatches
 {
    // The camera buffer (see "MotionVectorPatch::Layout"); shaders without it (shadow depth with its own ProjectionMatrix, screen quads)
