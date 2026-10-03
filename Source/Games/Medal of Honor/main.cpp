@@ -703,6 +703,15 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
+#if ENABLE_SMAA
+      // The 6 SMAA passes are auto-registered by core from Luma_SMAA_impl. Ours: the predication CS that turns the scene's alpha
+      // (linear depth) into R16F edge-ness, and RCAS on the SMAA output (core "Copy VS" + DrawCustomPixelShader).
+      native_shaders_definitions.emplace(CompileTimeStringHash("MOH Depth Extract CS"),
+         ShaderDefinition("Luma_MOH_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
+      native_shaders_definitions.emplace(CompileTimeStringHash("MOH Sharpen PS"),
+         ShaderDefinition{"Luma_MOH_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+#endif
+
       // Post-process buffers stay in GAMMA space: the HUD blends src-alpha onto the same canvas the tonemap writes,
       // and a linear buffer washes it out. The replacement pre-scales by GamePaperWhite/UIPaperWhite (UI_DRAW_TYPE 2);
       // the core Display Composition decodes, applies paper white, encodes scRGB and gamut-maps at present.
