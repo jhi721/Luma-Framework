@@ -3211,10 +3211,8 @@ public:
       // Set by the composite; Core copies it into "has_drawn_main_post_processing_previous" before this, but never clears it
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
       auto& game_device_data = GetGameDeviceData(device_data);
-      device_data.force_reset_sr = !device_data.has_drawn_sr;
       game_device_data.sr_drew = device_data.has_drawn_sr.load();
-      device_data.has_drawn_sr = false;
-      game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+      game_device_data.sr_active = LatchSRFrame(device_data);
       game_device_data.mv_presents++;
       // A letterboxed target's aspect ratio (e.g. 2.4 at 3840x1600) isn't the swapchain's: the targets made after a rebuild are upgraded
       // at it too (the scene, for the upscaling, and the target itself, for HDR)

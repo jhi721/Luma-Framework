@@ -3053,9 +3053,7 @@ public:
 
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
       // vector state are fixed here for the next frame (see "sr_active")
-      device_data.force_reset_sr = !device_data.has_drawn_sr;
-      device_data.has_drawn_sr = false;
-      game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+      game_device_data.sr_active = LatchSRFrame(device_data);
       game_device_data.fsr_masks_active = game_device_data.sr_active && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable;
       game_device_data.mv_active = game_device_data.sr_active || g_mv_enable;
       // Render scale: the next 3D frame's scene shrinks only with an upscaler ready to draw (not while the SR bridge's helper starts,

@@ -2652,9 +2652,7 @@ public:
 
       // DLSS / FSR: the upscaler's history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the
       // motion vector state are fixed here for the next frame (see "IsSRActive")
-      device_data.force_reset_sr = !device_data.has_drawn_sr;
-      device_data.has_drawn_sr = false;
-      gd.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+      gd.sr_active = LatchSRFrame(device_data);
       const bool mv_was_active = gd.mv_active.exchange(IsSRActive(device_data) || g_mv_enable);
       if (mv_was_active && !gd.mv_active)
       {

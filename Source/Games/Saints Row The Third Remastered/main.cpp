@@ -1175,8 +1175,7 @@ public:
          }
       }
       // Any frame SR didn't draw (off, skipped, failed, no TAA dispatch) restarts its history at the next one
-      device_data.force_reset_sr = !device_data.has_drawn_sr;
-      device_data.has_drawn_sr = false;
+      LatchSRFrame(device_data);
       if (game_device_data.sr_motion_vectors && cb_luma_global_settings.FrameIndex - game_device_data.sr_inputs_last_frame > idle_release_frames)
       {
          CleanExtraSRResources(device_data);

@@ -5786,6 +5786,15 @@ namespace
       }
    }
 
+   // The per-frame SR latches of a game that draws SR at most once a frame, from its "OnPresent": a frame SR didn't draw (menus, loading,
+   // just picked) restarts the history at the next one. Returns whether SR is on for the next frame (a failure suppresses it mid frame).
+   bool LatchSRFrame(DeviceData& device_data)
+   {
+      device_data.force_reset_sr = !device_data.has_drawn_sr;
+      device_data.has_drawn_sr = false;
+      return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+   }
+
    // Selects and switches the SR right away: for a game's own pick (e.g. its "Performance Test" sweeps), from its "OnPresent"
    void SetSRType(DeviceData& device_data, SR::Type sr_type)
    {

@@ -3041,8 +3041,7 @@ public:
       game_device_data.gtao_tried_this_frame = false;
       game_device_data.gtao_ran_this_frame = false;
       // The upscaler's history restarts after any frame it didn't draw (menus, loading, just picked)
-      device_data.force_reset_sr = !device_data.has_drawn_sr;
-      device_data.has_drawn_sr = false;
+      LatchSRFrame(device_data);
       game_device_data.msaa_scene = std::exchange(game_device_data.msaa_scene_resolved, false);
       game_device_data.sr_active = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed && !game_device_data.msaa_scene;
       const bool mv_was_active = game_device_data.mv_active.exchange(IsSRActive(device_data) || g_mv_enable);
