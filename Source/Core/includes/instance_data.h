@@ -616,6 +616,8 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 
    // Custom samplers mapped to original ones by texture LOD bias
    std::unordered_map<uint64_t, std::unordered_map<float, com_ptr<ID3D11SamplerState>>> custom_sampler_by_original_sampler;
+   // The reverse: a bound sampler is usually a custom one (see "SetSamplerVariant")
+   std::unordered_map<uint64_t, uint64_t> original_sampler_by_custom_sampler;
 
 #if ENABLE_SR
    SR::Type sr_type = SR::Type::None; // If active, the SR tech enabled by the user and supported+initialized correctly on this device
