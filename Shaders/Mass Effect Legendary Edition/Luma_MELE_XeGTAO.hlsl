@@ -63,7 +63,7 @@ cbuffer LumaGTAO : register(b11)
 // Intel's floor: disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible)
 #define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility);
 
-// ViewNormalTex z sign; view-space normals face the camera.
+// Packed normals' z sign; view-space normals face the camera.
 #define NORMAL_Z_SIGN (-1.0)
 
 // The AO target spans the rendered area at any render scale (its depth is loaded from the rendered share of the scene depth), so its
@@ -91,7 +91,7 @@ Texture2D tex1 : register(t1); // the scene's packed view-space normals (xy)
 // Unit z from the packed view-space xy (see NORMAL_Z_SIGN).
 float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 {
-   float2 nxy = tex1.Load(int3(pixCoord * DepthLoadScaleRT, 0)).xy * 2.0 - 1.0;
+   float2 nxy = tex1.Load(int3(pixCoord * XE_GTAO_DEPTH_LOAD_SCALE, 0)).xy * 2.0 - 1.0;
    float3 viewspaceNormal;
    viewspaceNormal.xy = nxy;
    viewspaceNormal.z = NORMAL_Z_SIGN * sqrt(saturate(1.0 - dot(nxy, nxy)));

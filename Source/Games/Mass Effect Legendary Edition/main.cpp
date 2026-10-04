@@ -156,7 +156,7 @@ static float g_bloom_intensity = 1.0f;
 static constexpr uint32_t kVideoBinkHash = 0x7B5C59DF;
 
 // XeGTAO replaces the half-resolution GFSDK HBAO+ chain, writing the game's R8_UNORM AO target at the blur
-// dispatch; the game's apply blit composites it. Noise and denoise pass count follow "IsGTAOTemporal".
+// dispatch; the apply blit (see "kAOApplyHash") composites it. Noise and denoise pass count follow "IsGTAOTemporal".
 // It fills the whole AO target (half the output) at any render scale, from the full size scene depth and view normals:
 // HBAO+'s own inputs are half the render resolution, a quarter of the output at 50%, which washed out contact AO.
 static constexpr uint32_t kAODownsampleHash = 0xA75E6C32;   // Depth and normals downsample (PS): its full size sources captured.
@@ -2695,33 +2695,16 @@ public:
    // Take over HBAO+ only when every XeGTAO shader and resource is ready at the first dispatch, otherwise the
    // whole native deinterleave -> horizon -> blur -> apply chain stays active. A returned value is terminal for
    // the callback; nullopt means XeGTAO is off or no AO hash matched, and the caller continues.
-   std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, MassEffectGameDeviceData* gd, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool* updated_cbuffers)
+   std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
    {
-      // Apply (also with XeGTAO off: the replacement always reads the scale): the scene UV reaches only the rendered share of the AO
-      // target, which is all the native chain fills, while XeGTAO fills the whole target
-      if (original_shader_hashes.Contains(kAOApplyHash, reshade::api::shader_stage::pixel))
-      {
-         const bool whole_target = gd->gtao_active_this_frame && IsRenderShare(device_data, *gd);
-         const float uv_scale_x = (whole_target ? device_data.output_resolution.x / float(gd->render_size[0]) : 1.f);
-         const float uv_scale_y = (whole_target ? device_data.output_resolution.y / float(gd->render_size[1]) : 1.f);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, uv_scale_x, uv_scale_y);
-         *updated_cbuffers = true;
-         return {};
-      }
-
       if (!g_gtao_enable)
          return {};
 
       // Depth and normals downsample: runs natively (its half size outputs feed only the skipped HBAO+ passes), its sources are XeGTAO's
       if (original_shader_hashes.Contains(kAODownsampleHash, reshade::api::shader_stage::pixel))
       {
-         ComPtr<ID3D11ShaderResourceView> depth_srv;
-         ComPtr<ID3D11ShaderResourceView> normals_srv;
-         native_device_context->PSGetShaderResources(0, 1, depth_srv.put());
-         native_device_context->PSGetShaderResources(1, 1, normals_srv.put());
-         gd->srv_gtao_depth = depth_srv;
-         gd->srv_gtao_normals = normals_srv;
+         native_device_context->PSGetShaderResources(0, 1, gd->srv_gtao_depth.put());
+         native_device_context->PSGetShaderResources(1, 1, gd->srv_gtao_normals.put());
          return {};
       }
 
@@ -2737,14 +2720,14 @@ public:
             return DrawOrDispatchOverrideType::None;
          uint4 ao_size{};
          uint4 scene_depth_size{};
-         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-         GetResourceInfo(ao_depth_srv.get(), ao_size, format);
-         GetResourceInfo(gd->srv_gtao_depth.get(), scene_depth_size, format);
+         DXGI_FORMAT unused_format = DXGI_FORMAT_UNKNOWN;
+         GetResourceInfo(ao_depth_srv.get(), ao_size, unused_format);
+         GetResourceInfo(gd->srv_gtao_depth.get(), scene_depth_size, unused_format);
          const uint32_t w = ao_size.x, h = ao_size.y;
          if (w == 0 || h == 0 || scene_depth_size.x < w || scene_depth_size.y < h)
             return DrawOrDispatchOverrideType::None;
-         // Scene depth and normal pixels per AO pixel: the AO target spans the rendered share of the output sized sources (all of them
-         // at native, 2), so at 50% render scale AO is computed per rendered pixel
+         // Scene depth and normal pixels per AO pixel: the AO target spans the rendered share of the output sized sources, so 2 at
+         // native and 1 (AO per rendered pixel) at 50% render scale
          const bool render_share = IsRenderShare(device_data, *gd);
          const float depth_load_scale_x = float(render_share ? gd->render_size[0] : scene_depth_size.x) / float(w);
          const float depth_load_scale_y = float(render_share ? gd->render_size[1] : scene_depth_size.y) / float(h);
@@ -3275,8 +3258,24 @@ public:
 
       InjectBloomAndDepth(native_device, native_device_context, device_data, &gd, stage1_perm);
 
-      if (const auto gtao_result = RunXeGTAO(native_device, native_device_context, cmd_list_data, device_data, &gd, stages, original_shader_hashes, &updated_cbuffers))
+      // AO apply (also with XeGTAO off: the replacement always reads the scale): the scene UV reaches only the rendered share of the AO
+      // target, which is all the native chain fills, while XeGTAO fills the whole target
+      if (original_shader_hashes.Contains(kAOApplyHash, reshade::api::shader_stage::pixel))
+      {
+         float uv_scale[2] = {1.f, 1.f};
+         if (gd.gtao_active_this_frame && IsRenderShare(device_data, gd))
+         {
+            uv_scale[0] = device_data.output_resolution.x / float(gd.render_size[0]);
+            uv_scale[1] = device_data.output_resolution.y / float(gd.render_size[1]);
+         }
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, uv_scale[0], uv_scale[1]);
+         updated_cbuffers = true;
+      }
+      else if (const auto gtao_result = RunXeGTAO(native_device, native_device_context, device_data, &gd, original_shader_hashes))
+      {
          return *gtao_result;
+      }
 
       return RunSMAAResolve(native_device, native_device_context, device_data, &gd, original_shader_hashes, is_custom_pass);
    }
@@ -3315,7 +3314,7 @@ public:
          gd.view_camera.reset();
          gd.scene_view_camera.reset();
          // No scene opens to rewrite it, and the engine's render scale is off from the next frame (see "EngineScale::Apply"): a share
-         // left from the scaled frames would keep XeGTAO's working area cropped (see "IsRenderShare")
+         // left from the scaled frames would keep XeGTAO's depth loads and the AO apply's UV scale on it (see "IsRenderShare")
          gd.render_size = {};
       }
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again). The DEV
