@@ -867,14 +867,15 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
-   // The frame's world camera (b1 of its first motion vector draw) and the previous frame's
+   // The frame's world camera (b1 of its first motion vector draw with a perspective) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
-   // The last draw's b1 copy and whether it's a mirrored view (see "IsMirroredView"); the b1 of the view that opened the scene, the last
-   // depth view checked for output size, and whether the scene reopened for a later view since the target was last cleared (see
-   // "IsNewView")
+   // The last draw's b1 copy and whether it's a mirrored view and a camera (see "IsMirroredView"); the b1 of the view that opened the
+   // scene, the last depth view checked for output size, and whether the scene reopened for a later view since the target was last
+   // cleared (see "IsNewView")
    ConstantsCopy view_camera;
    bool view_mirrored = false;
+   bool view_perspective = false;
    ConstantsCopy scene_view_camera;
    ID3D11DepthStencilView* view_dsv = nullptr;
    bool view_dsv_output = false;
@@ -1503,6 +1504,10 @@ class MassEffectLE final : public Game
       if (camera != game_device_data->view_camera)
       {
          game_device_data->view_mirrored = camera && ViewDeterminant(*camera) < 0.0;
+         // A camera has a perspective (clip w depends on position); ME1's screen space draw after shooting an enemy has an identity
+         // ViewProjectionMatrix
+         const float* const m = (camera && camera->size() >= 16 * sizeof(float) ? reinterpret_cast<const float*>(camera->data()) : nullptr);
+         game_device_data->view_perspective = m && std::abs(m[3]) + std::abs(m[7]) + std::abs(m[11]) >= 0.5f;
          game_device_data->view_camera = std::move(camera);
       }
       return game_device_data->view_mirrored;
@@ -1530,18 +1535,21 @@ class MassEffectLE final : public Game
    {
       if (!game_device_data->view_camera || game_device_data->view_camera == game_device_data->scene_view_camera || !IsOutputSizedDepth(device_data, game_device_data, dsv))
          return false;
+      // No camera: ME1's screen space draw has an output sized viewport even below native render scale; reopening the scene would take
+      // that viewport as the render size
+      if (!game_device_data->view_perspective)
+         return false;
+      // The scene opened at a draw without a camera (no CPU copy of its b1 yet, the first frame after the upscaler is picked, or a screen
+      // space draw): the first camera after it is the scene's, else no later view could ever be told apart
+      if (!game_device_data->scene_view_camera)
+      {
+         game_device_data->scene_view_camera = game_device_data->view_camera;
+         return false;
+      }
       // The same view (re-uploaded after shadow views, or its ViewProjectionMatrix slightly changed between passes): the same
       // PreViewTranslation (the camera position), near plane and determinant (field of view, mirroring)
       const auto& scene_camera = game_device_data->scene_view_camera;
       const auto& camera = game_device_data->view_camera;
-      if (!scene_camera || camera->size() < 16 * sizeof(float))
-         return false;
-      // No perspective (clip w doesn't depend on position): no camera. ME1's screen space draw after shooting an enemy has an
-      // identity ViewProjectionMatrix and an output sized viewport even below native render scale; reopening the scene would take
-      // that viewport as the render size.
-      const float* const m = reinterpret_cast<const float*>(camera->data());
-      if (std::abs(m[3]) + std::abs(m[7]) + std::abs(m[11]) < 0.5f)
-         return false;
       const std::array<float, 3> scene_translation = GetPreViewTranslation(*scene_camera), translation = GetPreViewTranslation(*camera);
       const double scene_near = ViewNearPlane(*scene_camera), near_plane = ViewNearPlane(*camera);
       const double scene_determinant = ViewDeterminant(*scene_camera), determinant = ViewDeterminant(*camera);
@@ -1571,7 +1579,7 @@ class MassEffectLE final : public Game
          perf_queries->Mark(native_device_context, PERF_SCENE_START);
       }
 #endif
-      game_device_data.scene_view_camera = game_device_data.view_camera;
+      game_device_data.scene_view_camera = (game_device_data.view_perspective ? game_device_data.view_camera : nullptr);
       game_device_data.mv_depth.reset();
       dsv->GetResource(&game_device_data.mv_depth);
       game_device_data.mv_depth_copy.reset();
@@ -1840,29 +1848,23 @@ class MassEffectLE final : public Game
       }
       const auto copy_size = [](const MassEffectGameDeviceData::ConstantsCopy& copy)
       { return copy ? copy->size() : size_t(0); };
+      // The world camera: the frame's first motion vector draw's with a perspective. A screen space draw (identity) taken as it would
+      // feed its inverse to the camera fill and its field of view to FSR.
+      if (object && camera && !game_device_data.mv_camera && game_device_data.view_perspective)
+      {
+         game_device_data.mv_camera = camera;
+      }
 #if DEVELOPMENT
       // "Performance Test" without motion vector draws: the frame (camera, target clear, camera fill, upscaler) still happens, the draws
       // run jittered only, or untouched
       if (perf_test_modes[Perf::g_test].motion_vector_draws < 2)
-      {
-         if (object && camera && !game_device_data.mv_camera)
-         {
-            game_device_data.mv_camera = camera;
-         }
          return false;
-      }
 #endif
       // The previous frame's b0 / b1 / b3: the same object's from last frame, else this draw's with last frame's world camera (no object
       // motion). None (no CPU copy yet, or an unmatched draw with another camera): the current ones (zero motion).
       const std::vector<uint8_t>* uploads[std::size(MotionVectorPatches::previous_slots)] = {};
       if (object && camera && (!skinned || bones))
       {
-         // The world camera: the frame's first motion vector draw's
-         if (!game_device_data.mv_camera)
-         {
-            game_device_data.mv_camera = camera;
-         }
-
          // Draw key: same mesh, same shaders. Objects sharing it (props) are told apart by translation. No instance count.
          UINT vertex_offset = ImmediateState::vertex_offset, index_offset = ImmediateState::index_offset;
          com_ptr<ID3D11Buffer> held_vertex_buffer, held_index_buffer;
