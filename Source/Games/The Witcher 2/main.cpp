@@ -649,15 +649,12 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    float2 ao_uv_scale = {1.f, 1.f};
    // The native generator's depth (t0) and view normals (t2) stretched to the AO target ("RunNativeAOWholeTarget"), and a 2D view of
    // its game normals target (dgVoodoo's views are single-slice arrays)
-   ComPtr<ID3D11Texture2D> ao_native_depth;
    ComPtr<ID3D11RenderTargetView> ao_native_depth_rtv;
    ComPtr<ID3D11ShaderResourceView> ao_native_depth_srv;
-   ComPtr<ID3D11Texture2D> ao_native_normals;
    ComPtr<ID3D11RenderTargetView> ao_native_normals_rtv;
    ComPtr<ID3D11ShaderResourceView> ao_native_normals_srv;
-   ComPtr<ID3D11Resource> ao_native_normals_source;
    ComPtr<ID3D11ShaderResourceView> ao_native_normals_source_srv;
-   com_ptr<ID3D11Buffer> cb_ao_native_depth_stretch; // b0 of "point_stretch_ps": its scale in .zw
+   com_ptr<ID3D11Buffer> cb_ao_native_stretch; // b0 of "point_stretch_ps": its scale in .zw
 
 #if DEVELOPMENT
    // ---- Vanilla constant logger (see LogVanillaGrade / LogVanillaTonemap) ----
@@ -682,12 +679,10 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    {
       ao_native_depth_srv.reset();
       ao_native_depth_rtv.reset();
-      ao_native_depth.reset();
       ao_native_normals_srv.reset();
       ao_native_normals_rtv.reset();
-      ao_native_normals.reset();
       ao_native_normals_source_srv.reset();
-      ao_native_normals_source.reset();
+      cb_ao_native_stretch.reset();
    }
 
    void ReleaseGTAOScratch()
@@ -2573,7 +2568,7 @@ class TheWitcher2Game final : public Game
          .radius_override = g_gtao_radius_override,
          .debug_view = debug_view,
          .viewport_pixel_size = {1.f / float(work_w), 1.f / float(work_h)},
-         .area_scale = work_share,
+         .work_share = work_share,
          .noise_index = (gd->sr_active ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f),
          .depth_load_scale = depth_load_scale,
       };
@@ -2671,42 +2666,44 @@ class TheWitcher2Game final : public Game
 
       D3D11_SHADER_RESOURCE_VIEW_DESC game_normals_desc;
       game_normals_srv->GetDesc(&game_normals_desc);
-      D3D11_TEXTURE2D_DESC depth_desc = {}, normals_desc = {};
-      if (gd->ao_native_depth && gd->ao_native_normals)
+      D3D11_SHADER_RESOURCE_VIEW_DESC normals_desc = {};
+      if (gd->ao_native_normals_srv)
       {
-         gd->ao_native_depth->GetDesc(&depth_desc);
-         gd->ao_native_normals->GetDesc(&normals_desc);
+         gd->ao_native_normals_srv->GetDesc(&normals_desc);
       }
-      if (depth_desc.Width != w || depth_desc.Height != h || normals_desc.Format != game_normals_desc.Format)
+      if (GetViewTextureSize(gd->ao_native_depth_srv.get()) != uint2{w, h} || normals_desc.Format != game_normals_desc.Format)
       {
          gd->ReleaseAONativeInputs();
          constexpr UINT bind_flags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-         if (CreateDefaultTex(native_device, w, h, bind_flags, std::addressof(gd->ao_native_depth), DXGI_FORMAT_R32_FLOAT) && CreateDefaultTex(native_device, w, h, bind_flags, std::addressof(gd->ao_native_normals), game_normals_desc.Format))
+         ComPtr<ID3D11Texture2D> depth, normals;
+         if (CreateDefaultTex(native_device, w, h, bind_flags, std::addressof(depth), DXGI_FORMAT_R32_FLOAT) && CreateDefaultTex(native_device, w, h, bind_flags, std::addressof(normals), game_normals_desc.Format))
          {
-            native_device->CreateRenderTargetView(gd->ao_native_depth.get(), nullptr, gd->ao_native_depth_rtv.put());
-            native_device->CreateShaderResourceView(gd->ao_native_depth.get(), nullptr, gd->ao_native_depth_srv.put());
-            native_device->CreateRenderTargetView(gd->ao_native_normals.get(), nullptr, gd->ao_native_normals_rtv.put());
-            native_device->CreateShaderResourceView(gd->ao_native_normals.get(), nullptr, gd->ao_native_normals_srv.put());
+            native_device->CreateRenderTargetView(depth.get(), nullptr, gd->ao_native_depth_rtv.put());
+            native_device->CreateShaderResourceView(depth.get(), nullptr, gd->ao_native_depth_srv.put());
+            native_device->CreateRenderTargetView(normals.get(), nullptr, gd->ao_native_normals_rtv.put());
+            native_device->CreateShaderResourceView(normals.get(), nullptr, gd->ao_native_normals_srv.put());
          }
       }
-      ComPtr<ID3D11Resource> game_normals;
+      ComPtr<ID3D11Resource> game_normals, cached_normals;
       game_normals_srv->GetResource(game_normals.put());
-      if (game_normals != gd->ao_native_normals_source)
+      if (gd->ao_native_normals_source_srv)
       {
-         gd->ao_native_normals_source = game_normals;
-         gd->ao_native_normals_source_srv.reset();
+         gd->ao_native_normals_source_srv->GetResource(cached_normals.put());
+      }
+      if (game_normals != cached_normals)
+      {
          const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, game_normals_desc.Format);
          native_device->CreateShaderResourceView(game_normals.get(), &srv_desc, gd->ao_native_normals_source_srv.put());
       }
       // Source pixels per AO target pixel (1 at 50% render scale): the linear depth and the normals are render sized in their surfaces
       const float stretch_scale[4] = {0.f, 0.f, float(RenderArea::render_size[0]) / float(w), float(RenderArea::render_size[1]) / float(h)};
       if (!gd->ao_native_depth_rtv || !gd->ao_native_depth_srv || !gd->ao_native_normals_rtv || !gd->ao_native_normals_srv || !gd->ao_native_normals_source_srv ||
-          !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_ao_native_depth_stretch), stretch_scale, sizeof(stretch_scale)))
+          !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_ao_native_stretch), stretch_scale, sizeof(stretch_scale)))
          return DrawOrDispatchOverrideType::None;
 
       DrawStateStack<DrawStateStackType::FullGraphics> game_state;
       game_state.Cache(native_device_context, device_data.uav_max_count);
-      ID3D11Buffer* const stretch_cb = gd->cb_ao_native_depth_stretch.get();
+      ID3D11Buffer* const stretch_cb = gd->cb_ao_native_stretch.get();
       native_device_context->PSSetConstantBuffers(0, 1, &stretch_cb);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, stretch_ps, gd->mv_linear_depth_srv.get(), gd->ao_native_depth_rtv.get(), w, h);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, stretch_ps, gd->ao_native_normals_source_srv.get(), gd->ao_native_normals_rtv.get(), w, h);
@@ -3181,7 +3178,6 @@ public:
          game_device_data.render_area_color_copy.reset();
          game_device_data.render_area_color_copy_srv.reset();
          game_device_data.ReleaseAONativeInputs();
-         game_device_data.cb_ao_native_depth_stretch.reset();
          if (!g_mv_enable)
          {
             const std::unique_lock lock(game_device_data.mv_mutex);

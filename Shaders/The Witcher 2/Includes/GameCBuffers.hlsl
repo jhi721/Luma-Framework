@@ -55,7 +55,7 @@ struct GTAOKnobs
    float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
    float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
    float2 viewport_pixel_size; // 1 / XeGTAO's working size
-   float2 area_scale;          // The share of the AO target XeGTAO works on: the scene's under the render scale without the full size depth, else 1
+   float2 work_share;          // The share of the AO target XeGTAO works on: the scene's under the render scale without the full size depth, else 1
    float noise_index;          // XeGTAO's temporal noise: frame % 64 while DLSS/FSR accumulates the AO, else 0
    float2 depth_load_scale;    // Depth pixels per working pixel: the render size over the AO target's with the full size depth, else 1
    float padding;

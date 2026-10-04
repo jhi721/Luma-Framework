@@ -54,7 +54,7 @@ cbuffer LumaGTAO : register(b9)
 
 // Capped at the native HBAO kernel, cb4[16].y pixels of the full size AO target: under the render scale fewer pixels (the area's share),
 // or each one, covering more of the view, would let the radius grow by 1 / area_scale (larger halos at 50%).
-#define NATIVE_KERNEL_PIXELS                        (cb4[16].y * gtao_knobs.area_scale.x)
+#define NATIVE_KERNEL_PIXELS                        (cb4[16].y * gtao_knobs.work_share.x)
 #define XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ) min(XeGTAO_EffectRadius(), NATIVE_KERNEL_PIXELS * viewspaceZ * NDC_TO_VIEW_MUL_X_PIXEL_SIZE.x)
 
 #define NoiseIndexRT                                gtao_knobs.noise_index
