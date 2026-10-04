@@ -58,8 +58,9 @@ static constexpr DgVoodooHashes FINAL_GRADE_NO_VIGNETTE = {0xBABBFFAD, 0x2CA0631
 // FXAA on, vignette off: the fourth corner of the 2x2 permutation matrix.
 static constexpr DgVoodooHashes FINAL_GRADE_AA_NO_VIGNETTE = {0x058E2498, 0xA966D512};
 // Native SSAO generator (HBAO variant, VS 0x5D9D0449): half-res r32_float LINEAR view depth at t0 -> half-res
-// r8g8b8a8 (.x = AO, .y = viewZ). Replaced by XeGTAO; the chain downstream reads just .x: pack 0x953119B5 (replaced, see
-// "AO_PACK") -> ping-pong 0xC131C40D x2 -> blur 0xD01CBD13 x2 -> apply 0x5C63E1C2.
+// r8g8b8a8 (.x = AO, .y = viewZ). Replaced by XeGTAO, or redrawn over the whole target under the render scale
+// ("RunNativeAOWholeTarget"); the chain downstream reads just .x: pack 0x953119B5 (replaced, see "AO_PACK") -> ping-pong
+// 0xC131C40D x2 -> blur 0xD01CBD13 x2 -> apply 0x5C63E1C2.
 // Needs SSAO on in the game's video settings.
 static constexpr DgVoodooHashes AO_GEN = {0x3FEEC0F7, 0x6EC596CA};
 // AO pack (t0 = full-res r32_float LINEAR depth, t1 = the AO target): replaced to scale its AO UV ("ao_uv_scale"), and the depth
@@ -646,6 +647,17 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // The replaced pack's AO UV scale (AOPack_0x953119B5): output / render size when this frame's generator filled the whole AO target,
    // else 1 (reset at present)
    float2 ao_uv_scale = {1.f, 1.f};
+   // The native generator's depth (t0) and view normals (t2) stretched to the AO target ("RunNativeAOWholeTarget"), and a 2D view of
+   // its game normals target (dgVoodoo's views are single-slice arrays)
+   ComPtr<ID3D11Texture2D> ao_native_depth;
+   ComPtr<ID3D11RenderTargetView> ao_native_depth_rtv;
+   ComPtr<ID3D11ShaderResourceView> ao_native_depth_srv;
+   ComPtr<ID3D11Texture2D> ao_native_normals;
+   ComPtr<ID3D11RenderTargetView> ao_native_normals_rtv;
+   ComPtr<ID3D11ShaderResourceView> ao_native_normals_srv;
+   ComPtr<ID3D11Resource> ao_native_normals_source;
+   ComPtr<ID3D11ShaderResourceView> ao_native_normals_source_srv;
+   com_ptr<ID3D11Buffer> cb_ao_native_depth_stretch; // b0 of "point_stretch_ps": its scale in .zw
 
 #if DEVELOPMENT
    // ---- Vanilla constant logger (see LogVanillaGrade / LogVanillaTonemap) ----
@@ -665,6 +677,18 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    std::string last_tonemap_line;
    std::string last_aogen_line;
 #endif
+
+   void ReleaseAONativeInputs()
+   {
+      ao_native_depth_srv.reset();
+      ao_native_depth_rtv.reset();
+      ao_native_depth.reset();
+      ao_native_normals_srv.reset();
+      ao_native_normals_rtv.reset();
+      ao_native_normals.reset();
+      ao_native_normals_source_srv.reset();
+      ao_native_normals_source.reset();
+   }
 
    void ReleaseGTAOScratch()
    {
@@ -2031,7 +2055,7 @@ class TheWitcher2Game final : public Game
             const CD3D11_RENDER_TARGET_VIEW_DESC rtv_desc(D3D11_RTV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_FLOAT);
             native_device->CreateRenderTargetView(gd.mv_linear_depth.get(), &rtv_desc, &gd.render_area_depth_rtv);
          }
-         stretch(gd.mv_linear_depth.get(), DXGI_FORMAT_R32_FLOAT, FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Depth Stretch PS")), std::addressof(gd.render_area_depth_copy), std::addressof(gd.render_area_depth_copy_srv), gd.render_area_depth_rtv.get());
+         stretch(gd.mv_linear_depth.get(), DXGI_FORMAT_R32_FLOAT, FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Point Stretch PS")), std::addressof(gd.render_area_depth_copy), std::addressof(gd.render_area_depth_copy_srv), gd.render_area_depth_rtv.get());
       }
    }
 
@@ -2432,7 +2456,7 @@ class TheWitcher2Game final : public Game
 
    // Take over the AO_GEN draw: 4 XeGTAO compute passes into our scratch, then CopyResource into the game's AO
    // RT so the vanilla chain keeps working. Inputs come from the hooked draw (depth SRV t0, RTV, cb4 for the
-   // NDC->view ray scale); a missing one returns None so the native HBAO draw runs.
+   // NDC->view ray scale); a missing one returns None so the native HBAO runs ("RunNativeAOWholeTarget").
    DrawOrDispatchOverrideType RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, TheWitcher2GameDeviceData* gd, float2 area_scale)
    {
       // The four passes, null until the async loader (or a live reload) has them: the native draw runs then
@@ -2626,6 +2650,83 @@ class TheWitcher2Game final : public Game
       return DrawOrDispatchOverrideType::Replaced;
    }
 
+   // The native generator (AO_GEN) over the whole AO target under the render scale, from the full size linear depth and view normals
+   // stretched to it (see Luma_TW2_AOGenerator.hlsl). None (the game's share draw) when not shrunk or anything is missing.
+   DrawOrDispatchOverrideType RunNativeAOWholeTarget(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, TheWitcher2GameDeviceData* gd, float2 area_scale)
+   {
+      if (area_scale.x >= 1.f && area_scale.y >= 1.f)
+         return DrawOrDispatchOverrideType::None;
+      auto* const fullscreen_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("TW2 AO Generator Fullscreen VS"));
+      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+      auto* const stretch_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Render Area Point Stretch PS"));
+      ComPtr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+      ComPtr<ID3D11ShaderResourceView> game_normals_srv;
+      native_device_context->PSGetShaderResources(2, 1, game_normals_srv.put());
+      if (!fullscreen_vs || !copy_vs || !stretch_ps || !gd->mv_linear_depth_srv || !rtv || !game_normals_srv)
+         return DrawOrDispatchOverrideType::None;
+      const auto [w, h] = GetViewTextureSize(rtv.get());
+      if (w == 0 || h == 0)
+         return DrawOrDispatchOverrideType::None;
+
+      D3D11_SHADER_RESOURCE_VIEW_DESC game_normals_desc;
+      game_normals_srv->GetDesc(&game_normals_desc);
+      D3D11_TEXTURE2D_DESC depth_desc = {}, normals_desc = {};
+      if (gd->ao_native_depth && gd->ao_native_normals)
+      {
+         gd->ao_native_depth->GetDesc(&depth_desc);
+         gd->ao_native_normals->GetDesc(&normals_desc);
+      }
+      if (depth_desc.Width != w || depth_desc.Height != h || normals_desc.Format != game_normals_desc.Format)
+      {
+         gd->ReleaseAONativeInputs();
+         constexpr UINT bind_flags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+         if (CreateDefaultTex(native_device, w, h, bind_flags, std::addressof(gd->ao_native_depth), DXGI_FORMAT_R32_FLOAT) && CreateDefaultTex(native_device, w, h, bind_flags, std::addressof(gd->ao_native_normals), game_normals_desc.Format))
+         {
+            native_device->CreateRenderTargetView(gd->ao_native_depth.get(), nullptr, gd->ao_native_depth_rtv.put());
+            native_device->CreateShaderResourceView(gd->ao_native_depth.get(), nullptr, gd->ao_native_depth_srv.put());
+            native_device->CreateRenderTargetView(gd->ao_native_normals.get(), nullptr, gd->ao_native_normals_rtv.put());
+            native_device->CreateShaderResourceView(gd->ao_native_normals.get(), nullptr, gd->ao_native_normals_srv.put());
+         }
+      }
+      ComPtr<ID3D11Resource> game_normals;
+      game_normals_srv->GetResource(game_normals.put());
+      if (game_normals != gd->ao_native_normals_source)
+      {
+         gd->ao_native_normals_source = game_normals;
+         gd->ao_native_normals_source_srv.reset();
+         const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, game_normals_desc.Format);
+         native_device->CreateShaderResourceView(game_normals.get(), &srv_desc, gd->ao_native_normals_source_srv.put());
+      }
+      // Source pixels per AO target pixel (1 at 50% render scale): the linear depth and the normals are render sized in their surfaces
+      const float stretch_scale[4] = {0.f, 0.f, float(RenderArea::render_size[0]) / float(w), float(RenderArea::render_size[1]) / float(h)};
+      if (!gd->ao_native_depth_rtv || !gd->ao_native_depth_srv || !gd->ao_native_normals_rtv || !gd->ao_native_normals_srv || !gd->ao_native_normals_source_srv ||
+          !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_ao_native_depth_stretch), stretch_scale, sizeof(stretch_scale)))
+         return DrawOrDispatchOverrideType::None;
+
+      DrawStateStack<DrawStateStackType::FullGraphics> game_state;
+      game_state.Cache(native_device_context, device_data.uav_max_count);
+      ID3D11Buffer* const stretch_cb = gd->cb_ao_native_depth_stretch.get();
+      native_device_context->PSSetConstantBuffers(0, 1, &stretch_cb);
+      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, stretch_ps, gd->mv_linear_depth_srv.get(), gd->ao_native_depth_rtv.get(), w, h);
+      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, stretch_ps, gd->ao_native_normals_source_srv.get(), gd->ao_native_normals_rtv.get(), w, h);
+      // The game's generator draw again, over the whole target from the stretched depth and normals
+      game_state.Restore(native_device_context);
+      native_device_context->VSSetShader(fullscreen_vs, nullptr, 0);
+      native_device_context->IASetInputLayout(nullptr);
+      native_device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      SetViewportFullscreen(native_device_context, {w, h});
+      const D3D11_RECT scissor = {.left = 0, .top = 0, .right = LONG(w), .bottom = LONG(h)};
+      native_device_context->RSSetScissorRects(1, &scissor);
+      native_device_context->PSSetShaderResources(0, 1, gd->ao_native_depth_srv.get_addressof());
+      native_device_context->PSSetShaderResources(2, 1, gd->ao_native_normals_srv.get_addressof());
+      native_device_context->Draw(3, 0);
+      game_state.Restore(native_device_context);
+
+      gd->ao_uv_scale = {1.f / area_scale.x, 1.f / area_scale.y};
+      return DrawOrDispatchOverrideType::Replaced;
+   }
+
 public:
    void OnInit(bool async) override
    {
@@ -2748,10 +2849,12 @@ public:
       sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Motion Vector Fill CS"),
          ShaderDefinition("Luma_TW2_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
-      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Render Area Depth Stretch PS"),
-         ShaderDefinition{"Luma_TW2_RenderArea", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_stretch_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Render Area Point Stretch PS"),
+         ShaderDefinition{"Luma_TW2_RenderArea", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "point_stretch_ps"});
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Render Area Color Stretch PS"),
          ShaderDefinition{"Luma_TW2_RenderArea", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "color_stretch_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 AO Generator Fullscreen VS"),
+         ShaderDefinition{"Luma_TW2_AOGenerator", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "fullscreen_dgv_vs"});
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
@@ -3022,8 +3125,9 @@ public:
          // The scene's share of the AO target under the render scale, else 1
          const float2 area_scale = {(RenderArea::render_size[0] != 0 ? float(RenderArea::render_size[0]) / device_data.output_resolution.x : 1.f),
             (RenderArea::render_size[1] != 0 ? float(RenderArea::render_size[1]) / device_data.output_resolution.y : 1.f)};
-         if (g_gtao_enable)
-            return RunXeGTAO(native_device, native_device_context, device_data, &game_device_data, area_scale);
+         if (g_gtao_enable && RunXeGTAO(native_device, native_device_context, device_data, &game_device_data, area_scale) != DrawOrDispatchOverrideType::None)
+            return DrawOrDispatchOverrideType::Replaced;
+         return RunNativeAOWholeTarget(native_device, native_device_context, device_data, &game_device_data, area_scale);
       }
       if (ContainsPixelShader(original_shader_hashes, AO_PACK))
       {
@@ -3076,6 +3180,8 @@ public:
          game_device_data.render_area_depth_rtv.reset();
          game_device_data.render_area_color_copy.reset();
          game_device_data.render_area_color_copy_srv.reset();
+         game_device_data.ReleaseAONativeInputs();
+         game_device_data.cb_ao_native_depth_stretch.reset();
          if (!g_mv_enable)
          {
             const std::unique_lock lock(game_device_data.mv_mutex);

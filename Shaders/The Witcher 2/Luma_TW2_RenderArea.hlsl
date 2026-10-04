@@ -10,11 +10,13 @@ cbuffer RenderArea : register(b0) // The motion vector jitter buffer ("MotionVec
    float2 area_scale; // The render area's share of the surface
 };
 
-Texture2D<float> linear_depth : register(t0);
+// Nearest, any format: the linear depth over its surface, and the AO generator's depth and normals over the AO target
+// ("RunNativeAOWholeTarget", its own b0 with the scale)
+Texture2D<float4> point_source : register(t0);
 
-float depth_stretch_ps(float4 position : SV_Position) : SV_Target
+float4 point_stretch_ps(float4 position : SV_Position) : SV_Target
 {
-   return linear_depth.Load(int3(position.xy * area_scale, 0));
+   return point_source.Load(int3(position.xy * area_scale, 0));
 }
 
 // The scene color in the area stretched over the surface, from a copy

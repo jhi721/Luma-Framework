@@ -1,6 +1,6 @@
 // The Witcher 2 AO pack (dgVoodoo -> ps_5_0, hash 0x953119B5): the first pass after the AO generator, packing the AO target's .x and
 // the full size linear depth into one R16G16 target the blurs read. Vanilla samples both at the same scene UV (v5).
-// Below native render scale the AO generator (XeGTAO) fills the whole AO target instead
+// Below native render scale the AO generator (XeGTAO, or the native one in "RunNativeAOWholeTarget") fills the whole AO target instead
 // of the scene's share, so the AO UV is scaled onto it by LumaData.CustomData3/4 (output size over render size, else 1; main.cpp
 // "ao_uv_scale"). The depth stays at the scene UV.
 #include "Includes/Common.hlsl"
