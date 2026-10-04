@@ -58,12 +58,12 @@ static constexpr DgVoodooHashes FINAL_GRADE_NO_VIGNETTE = {0xBABBFFAD, 0x2CA0631
 // FXAA on, vignette off: the fourth corner of the 2x2 permutation matrix.
 static constexpr DgVoodooHashes FINAL_GRADE_AA_NO_VIGNETTE = {0x058E2498, 0xA966D512};
 // Native SSAO generator (HBAO variant, VS 0x5D9D0449): half-res r32_float LINEAR view depth at t0 -> half-res
-// r8g8b8a8 (.x = AO, .y = viewZ). Only this draw is replaced; the vanilla chain downstream reads just .x:
-// pack 0x953119B5 -> ping-pong 0xC131C40D x2 -> blur 0xD01CBD13 x2 -> apply 0x5C63E1C2.
+// r8g8b8a8 (.x = AO, .y = viewZ). Replaced by XeGTAO; the chain downstream reads just .x: pack 0x953119B5 (replaced, see
+// "AO_PACK") -> ping-pong 0xC131C40D x2 -> blur 0xD01CBD13 x2 -> apply 0x5C63E1C2.
 // Needs SSAO on in the game's video settings.
 static constexpr DgVoodooHashes AO_GEN = {0x3FEEC0F7, 0x6EC596CA};
-// AO pack (t0 = full-res r32_float LINEAR depth, t1 = the AO target): depth-capture fallback for SMAA
-// predication, since it runs every frame while the tonemap capture only fires on the BRIGHT-PASS perm.
+// AO pack (t0 = full-res r32_float LINEAR depth, t1 = the AO target): replaced to scale its AO UV ("ao_uv_scale"), and the depth
+// capture fallback for SMAA predication, since it runs every frame while the tonemap capture only fires on the BRIGHT-PASS perm.
 static constexpr DgVoodooHashes AO_PACK = {0x953119B5, 0x495E9133};
 
 // The engine's glow chain (halo around candles and torches, distinct from the god rays): copy 0x5A8E5532 and the
@@ -643,6 +643,9 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    uint32_t gtao_work_w = 0, gtao_work_h = 0;        // The working textures: the scene's share of it under the render scale
    DXGI_FORMAT gtao_final_fmt = DXGI_FORMAT_UNKNOWN; // actual (possibly Luma-upgraded) AO RT format
    com_ptr<ID3D11Buffer> cb_gtao;                    // knobs + viewport (GTAO_KNOBS_CB_SLOT), dynamic: the noise index changes every frame
+   // The replaced pack's AO UV scale (AOPack_0x953119B5): output / render size when this frame's generator filled the whole AO target,
+   // else 1 (reset at present)
+   float2 ao_uv_scale = {1.f, 1.f};
 
 #if DEVELOPMENT
    // ---- Vanilla constant logger (see LogVanillaGrade / LogVanillaTonemap) ----
@@ -1473,6 +1476,9 @@ class TheWitcher2Game final : public Game
             {
                gd.mv_linear_depth = linear_depth;
                gd.mv_linear_depth_srv.reset();
+               // dgVoodoo's targets are single-slice arrays: a plain 2D view of the first slice
+               const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_FLOAT);
+               native_device->CreateShaderResourceView(linear_depth.get(), &srv_desc, &gd.mv_linear_depth_srv);
             }
          }
       }
@@ -2050,12 +2056,6 @@ class TheWitcher2Game final : public Game
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
       compute_state.Cache(native_device_context, device_data.uav_max_count);
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 Motion Vector Fill CS"));
-      if (gd.mv_linear_depth && !gd.mv_linear_depth_srv)
-      {
-         // dgVoodoo's targets are single-slice arrays: a plain 2D view of the first slice
-         const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_FLOAT);
-         native_device->CreateShaderResourceView(gd.mv_linear_depth.get(), &srv_desc, &gd.mv_linear_depth_srv);
-      }
       // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote. FSR only:
       // DLSS's current presets ignore them (DLSS-Best-Practices TRN-2)
       const bool reactive = gd.fsr_masks_active && gd.mv_reactive_target_srv;
@@ -2433,7 +2433,7 @@ class TheWitcher2Game final : public Game
    // Take over the AO_GEN draw: 4 XeGTAO compute passes into our scratch, then CopyResource into the game's AO
    // RT so the vanilla chain keeps working. Inputs come from the hooked draw (depth SRV t0, RTV, cb4 for the
    // NDC->view ray scale); a missing one returns None so the native HBAO draw runs.
-   DrawOrDispatchOverrideType RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, TheWitcher2GameDeviceData* gd)
+   DrawOrDispatchOverrideType RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, TheWitcher2GameDeviceData* gd, float2 area_scale)
    {
       // The four passes, null until the async loader (or a live reload) has them: the native draw runs then
       auto* cs_prefilter = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 XeGTAO Prefilter Depths CS"));
@@ -2480,13 +2480,22 @@ class TheWitcher2Game final : public Game
       if (!game_cb4)
          return DrawOrDispatchOverrideType::None;
 
-      // Under the render scale the scene fills only the top-left "area_scale" of the AO target: XeGTAO works on that share alone, so
-      // its clamped depth samples stop at the share's edge instead of reading the stale depth beyond it (a dark band at the right and
-      // bottom), and nothing is computed outside it
-      const float2 area_scale = {(RenderArea::render_size[0] != 0 ? float(RenderArea::render_size[0]) / device_data.output_resolution.x : 1.f),
-         (RenderArea::render_size[1] != 0 ? float(RenderArea::render_size[1]) / device_data.output_resolution.y : 1.f)};
-      const uint32_t work_w = std::clamp(uint32_t(std::ceil(float(w) * area_scale.x)), 1u, w);
-      const uint32_t work_h = std::clamp(uint32_t(std::ceil(float(h) * area_scale.y)), 1u, h);
+      // Under the render scale the generator's depth is half the render size (a quarter of the output at 50%, which washed out contact
+      // AO): from the G-buffer's full size linear depth XeGTAO fills the whole AO target instead (half the output, as at native). Without
+      // it, it works on the scene's share alone, so its clamped depth samples stop at the share's edge instead of reading the stale depth
+      // beyond it (a dark band at the right and bottom).
+      float2 work_share = area_scale;
+      float2 depth_load_scale = {1.f, 1.f};
+      ID3D11ShaderResourceView* depth = srv_depth.get();
+      const bool whole_target = (area_scale.x < 1.f || area_scale.y < 1.f) && gd->mv_linear_depth_srv;
+      if (whole_target)
+      {
+         work_share = {1.f, 1.f};
+         depth_load_scale = {float(RenderArea::render_size[0]) / float(w), float(RenderArea::render_size[1]) / float(h)};
+         depth = gd->mv_linear_depth_srv.get();
+      }
+      const uint32_t work_w = std::clamp(uint32_t(std::ceil(float(w) * work_share.x)), 1u, w);
+      const uint32_t work_h = std::clamp(uint32_t(std::ceil(float(h) * work_share.y)), 1u, h);
 
       // (Re)create the scratch set on first use, resolution or render scale change, or RT format change (all-or-nothing).
       if (gd->gtao_w != w || gd->gtao_h != h || gd->gtao_work_w != work_w || gd->gtao_work_h != work_h || gd->gtao_final_fmt != final_fmt)
@@ -2540,8 +2549,9 @@ class TheWitcher2Game final : public Game
          .radius_override = g_gtao_radius_override,
          .debug_view = debug_view,
          .viewport_pixel_size = {1.f / float(work_w), 1.f / float(work_h)},
-         .area_scale = area_scale,
+         .area_scale = work_share,
          .noise_index = (gd->sr_active ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f),
+         .depth_load_scale = depth_load_scale,
       };
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), &knobs, sizeof(knobs)))
          return DrawOrDispatchOverrideType::None;
@@ -2564,7 +2574,7 @@ class TheWitcher2Game final : public Game
          ID3D11UnorderedAccessView* uavs[5] = {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(),
             gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()};
          native_device_context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, srv_depth.get_addressof());
+         native_device_context->CSSetShaderResources(0, 1, &depth);
          native_device_context->CSSetShader(cs_prefilter, nullptr, 0);
          native_device_context->Dispatch((work_w + 15) / 16, (work_h + 15) / 16, 1);
          native_device_context->CSSetUnorderedAccessViews(0, 5, uav_nulls5.data(), nullptr);
@@ -2609,6 +2619,10 @@ class TheWitcher2Game final : public Game
          native_device_context->OMSetRenderTargets(1, rtv.get_addressof(), dsv_orig.get());
       }
 
+      if (whole_target)
+      {
+         gd->ao_uv_scale = {1.f / area_scale.x, 1.f / area_scale.y};
+      }
       return DrawOrDispatchOverrideType::Replaced;
    }
 
@@ -3005,20 +3019,26 @@ public:
 #if DEVELOPMENT
          LogAOGenLayout(native_device, native_device_context, device_data, &game_device_data); // with XeGTAO off too
 #endif
+         // The scene's share of the AO target under the render scale, else 1
+         const float2 area_scale = {(RenderArea::render_size[0] != 0 ? float(RenderArea::render_size[0]) / device_data.output_resolution.x : 1.f),
+            (RenderArea::render_size[1] != 0 ? float(RenderArea::render_size[1]) / device_data.output_resolution.y : 1.f)};
          if (g_gtao_enable)
-            return RunXeGTAO(native_device, native_device_context, device_data, &game_device_data);
+            return RunXeGTAO(native_device, native_device_context, device_data, &game_device_data, area_scale);
       }
-#if ENABLE_SMAA
       if (ContainsPixelShader(original_shader_hashes, AO_PACK))
       {
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0u, 0u, game_device_data.ao_uv_scale.x, game_device_data.ao_uv_scale.y);
+         updated_cbuffers = true;
+#if ENABLE_SMAA
          // Depth capture for SMAA predication: the AO pack pass binds the same r32_float depth at t0 (with SSAO on), before the
          // bright-pass. The frame's first capture wins.
          if (g_smaa_predication && !game_device_data.srv_scene_depth)
          {
             native_device_context->PSGetShaderResources(0, 1, game_device_data.srv_scene_depth.put());
          }
-      }
 #endif
+      }
 
       return DrawOrDispatchOverrideType::None;
    }
@@ -3028,6 +3048,7 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
 
       game_device_data.final_grade_fired_this_frame = false; // re-arm the Hide UI window for the next frame
+      game_device_data.ao_uv_scale = {1.f, 1.f};
 
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
       // vector state are fixed here for the next frame (see "sr_active")

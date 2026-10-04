@@ -4,10 +4,12 @@
 // TW2 specifics:
 // - Only the native generator draw (PS 0x3FEEC0F7 / VS 0x5D9D0449, half-res HBAO) is replaced, by the 4
 //   XeGTAO dispatches; the result is CopyResource'd into the game's AO target, which is created without a
-//   UAV bind, hence the copy through our own texture. Downstream stays vanilla and reads only .x:
-//   pack 0x953119B5 -> ping-pong 0xC131C40D x2 -> blur 0xD01CBD13 x2 -> apply 0x5C63E1C2.
+//   UAV bind, hence the copy through our own texture. Downstream reads only .x: pack 0x953119B5 (replaced,
+//   AOPack_0x953119B5) -> ping-pong 0xC131C40D x2 -> blur 0xD01CBD13 x2 -> apply 0x5C63E1C2.
 // - Depth input = the generator's own t0: r32_float half-res, ALREADY LINEAR view-space depth, so no
-//   unpack, only the DepthScaleRT unit rescale.
+//   unpack, only the DepthScaleRT unit rescale. Below native render scale it is the G-buffer's full size linear depth instead, read
+//   at depth_load_scale pixels per working pixel, and XeGTAO fills the whole AO target (half the output) rather than the scene's
+//   share of it; the replaced pack (AOPack_0x953119B5) scales its AO UV onto it.
 // - Normals are generated from depth in-place (XE_GTAO_GENERATE_NORMALS) using the same NDC->view
 //   convention as the native HBAO, so the space stays self-consistent.
 // - NDC->view from the game's cb4 (copied PS->CS by main.cpp):
@@ -56,13 +58,14 @@ cbuffer LumaGTAO : register(b9)
 #define XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ) min(XeGTAO_EffectRadius(), NATIVE_KERNEL_PIXELS * viewspaceZ * NDC_TO_VIEW_MUL_X_PIXEL_SIZE.x)
 
 #define NoiseIndexRT                                gtao_knobs.noise_index
+#define XE_GTAO_DEPTH_LOAD_SCALE                    gtao_knobs.depth_load_scale
 
 #define VIEWPORT_PIXEL_SIZE                         ViewportPixelSizeRT
 
 // Transcribed from the native HBAO PS (0x3FEEC0F7): ndc = (uv.x*2-1, 1-2*uv.y), viewRay = ndc * cb4[9].zw.
 // Expressed as the XeGTAO mul/add pair over raw uv: viewPos.xy = (uv * MUL + ADD) * viewZ.
-// Under the render scale XeGTAO's working textures cover only the scene's share of the target (main.cpp), so uv spans the
-// rendered area and cb4[9] (the full view's) applies as is
+// XeGTAO's working textures span the rendered area at any render scale (the scene's share of the AO target, or the whole target
+// from the full size depth; main.cpp), so cb4[9] (the full view's) applies as is
 #define NDC_TO_VIEW_MUL (float2(2.0, -2.0) * cb4[9].zw)
 #define NDC_TO_VIEW_ADD (float2(-1.0, 1.0) * cb4[9].zw)
 
