@@ -1,5 +1,6 @@
 // Mass Effect: Andromeda — Luma anti-aliasing mod (Frostbite 3, D3D11).
-// Injects DLSS or FSR 3, as AA or upscaling (in-game AA = TAA), and replaces FXAA with SMAA (in-game AA = FXAA).
+// Injects DLSS or FSR 3, as AA or upscaling (in-game AA = TAA; upscaling runs the native AO at the output size), and replaces
+// FXAA with SMAA (in-game AA = FXAA).
 
 #define GAME_MASS_EFFECT_ANDROMEDA 1
 
@@ -11,21 +12,20 @@
 
 #define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1 // replaces the game's FXAA pass (FXAA AA mode) with SMAA
-// The dialogue/cutscene DOF-variant resolve is run-native-then-override via original_draw_dispatch_func,
-// which the core only populates with this enabled — otherwise it is null outside DEVELOPMENT builds and
-// every DOF resolve silently bails to native TAA in Test/Publishing.
+// The DOF-variant resolve (run natively, then overwritten), the upscaled tonemap and the draws after it, and the tonemap's RCAS
+// issue the game's draw themselves through "original_draw_dispatch_func": Core only provides it outside DEVELOPMENT with this
+// set (without it every one of them silently falls back to native in Test/Publishing).
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 
 #include "..\..\Core\core.hpp"
 #include <d3d11_1.h>  // ID3D11DeviceContext1 (bound-range CB queries)
 #include <shellapi.h> // ShellExecuteA for the About-tab link buttons (system("start") hangs in exclusive fullscreen)
 
-// TAA color-resolve CS — DLAA/FSR injection point. The game ships this resolve as a permutation matrix: 4
-// logic variants × 2 GPU tile-sizes (32x16 = warp-32/NVIDIA, 8x8 = wave-64/AMD+Intel), and picks the tile by
-// GPU arch at runtime — so different vendors dispatch DIFFERENT hashes of the SAME pass, instruction-for-
-// instruction identical per pair (e.g. 0x70E49B83 (8x8) == 0xD7E13B2A (32x16)). Hooking only one perm
-// silently no-ops SR on every other vendor, so we match the whole set. (Broader feature variants with extra
-// t5/t6 SRVs + u4/u5 UAVs are NOT hooked until confirmed color-resolve, not a temporal SSR/AO pass.)
+// TAA color-resolve CS, the DLSS/FSR injection point. The game ships it as 4 logic variants x 2 tile sizes (32x16 for
+// warp-32/NVIDIA, 8x8 for wave-64/AMD and Intel) and picks the tile by GPU at runtime, so each vendor dispatches another hash
+// of the same pass (each pair is instruction-identical, e.g. 0x70E49B83 (8x8) == 0xD7E13B2A (32x16)): the whole set is hooked,
+// one perm alone silently no-ops SR on the other vendors. Wider variants with extra t5/t6 SRVs and u4/u5 UAVs aren't hooked
+// until confirmed to be this resolve, not a temporal SSR/AO pass.
 static const ShaderHashesList shader_hashes_taa_resolve = {
    .compute_shaders = {
       0xD7E13B2A,
@@ -36,9 +36,8 @@ static const ShaderHashesList shader_hashes_taa_resolve = {
       0x3D06A19E, // variant C
       0x960B6C89,
       0x1986BDD0, // variant D
-      // E family = the same resolve quality ladder minus the t2 mask input / u0 mask output (96% identical
-      // body, tile twins instruction-identical). Dispatched for the MAIN MENU / loading background scene —
-      // hooked so DLAA covers the menu too. I/O contract is a strict subset of A-D (t0/t1/t3/t4 in, u2/u3 out).
+      // E family: the same quality ladder without the t2 mask input and u0 mask output (96% identical body, tile twins
+      // identical), used by the main menu and loading background. Its I/O is a subset of A-D (t0/t1/t3/t4 in, u2/u3 out).
       0x1C0D65CC,
       0x3DD7FD62, // variant E-A (32x16 / 8x8)
       0x40918D68,
@@ -49,11 +48,9 @@ static const ShaderHashesList shader_hashes_taa_resolve = {
       0x633550DF, // variant E-D
    },
 };
-// DOF variant of the resolve (dialogue / cutscene): additionally temporally filters the DOF CoC
-// (t5/t6 r16f current+history in -> u4/u5 filtered+history out; u4 is consumed by the DOF-setup CS right
-// after the resolve). We must NOT cancel this dispatch — u4/u5 would go stale and break the bokeh.
-// Instead: run the native dispatch first (it writes u0/u4/u5 with the game's own math — zero quality
-// loss), then run SR and overwrite only its u2/u3 color output.
+// DOF variant of the resolve (dialogue, cutscenes): it also filters the DOF CoC temporally (t5/t6 r16f current and history in,
+// u4/u5 out; the DOF setup CS reads u4 right after). Cancelling it would leave u4/u5 stale and break the bokeh, so it runs
+// natively first and SR then overwrites only its u2/u3 color.
 static const ShaderHashesList shader_hashes_taa_resolve_dof = {
    .compute_shaders = {
       0x42871661,
@@ -86,14 +83,12 @@ static constexpr uint32_t kAOBlurYHash = 0xC4844743;
 static const ShaderHashesList shader_hashes_tonemap = {
    .pixel_shaders = {0xB6A91712, 0x376C116B, 0xE3D57A10, 0xEB91AB31, 0x339025EE, 0x71562FF9, 0x18AC2B1A, 0x66BE1F36, 0x18F31608, 0xF8A12BF4, 0x62D3752D, 0xA42A680A},
 };
-// DLSS far_plane stand-in: MEA's projection is reverse-Z INFINITE-far (no finite far). DLSS is insensitive to the
-// exact large value (used only for depth linearization).
+// DLSS far_plane stand-in: MEA's reverse-Z projection has no finite far plane, and DLSS only uses it to linearize depth.
 static constexpr float kCamFar = 100000.f;
 // Presents after which SMAA's and RCAS's resources go once they stopped running
 static constexpr uint32_t smaa_idle_release_frames = 600;
 
-// --- User-facing settings (persisted via ReShade config; loaded in LoadConfigs, saved on UI change). Kept as
-// file-scope globals so LoadConfigs (pre-device) can populate them. ---
+// --- User settings (ReShade config: loaded in LoadConfigs, before the device exists, saved on UI change) ---
 static constexpr bool kDefaultSmaaEnable = true;
 static constexpr float kDefaultRcasSharpness = 0.f;       // RCAS on SMAA or DLSS/FSR, off by default
 static constexpr bool kDefaultSmaaPredication = true;     // predicate SMAA on geometry, using the game's linear view depth
@@ -158,7 +153,7 @@ static float g_render_scale = 1.f; // "RenderScale": applies only while an upsca
 static bool g_mv_flip_x = true;      // -> MV X scale = -0.5*W
 static bool g_mv_flip_y = true;      // -> MV Y scale = +0.5*H
 static float g_mv_scale_mult = 1.f;  // 0.25..4
-static bool g_jitter_flip_x = false; // jitter X = -clipX*0.5*W (flipping X shakes — keep off)
+static bool g_jitter_flip_x = false; // jitter X = -clipX*0.5*W
 static bool g_jitter_flip_y = true;  // jitter Y = +clipY*0.5*H (removes shimmer)
 static bool g_mv_jittered = false;
 static bool g_ao_output_size = true; // Upscaling: the native AO at the output size (see "RunOutputSizedAOPass")
@@ -259,7 +254,7 @@ struct MassEffectAndromedaGameDeviceData final : public GameDeviceData
 #if ENABLE_SR
    // --- SR (the output texture is Core's device_data.sr_output_color; DLSS/FSR write there, we copy into u2/u3) ---
    ComPtr<ID3D11ShaderResourceView> sr_output_srv; // t0 of the format-converting hand-off CS
-   // A new output texture: DLSS needs its feature recreated after the first draw into it (see the Draw block)
+   // A new output texture: DLSS needs its feature recreated after the first draw into it (see "ReplaceTAAResolve")
    bool sr_output_recreated = false;
    // "LatchSRFrame" at present: an upscaler is picked and hasn't failed. Fixed for the whole frame.
    bool sr_active = false;
@@ -490,14 +485,12 @@ class MassEffectAndromeda final : public Game
       return false;
    }
 
-   // Cache the CPU map ptr of every large (≥64KB) WRITE_NO_OVERWRITE DYNAMIC CB (camera ring among them), deduped
-   // by handle. NO_OVERWRITE only (allocation stays committed → post-Unmap read is safe). A DISCARD map of a
-   // tracked handle BANS it (data=nullptr, kept in the array): DISCARD hands the driver a new allocation and can
-   // free the old one, so the cached pointer is a use-after-free for the camera probe — and a buffer the game
-   // EVER discard-maps is not the always-NO_OVERWRITE camera ring, so re-caching it later would just re-arm the
-   // hazard (the wide slot probe crashed on exactly this in menus, where UI CBs are DISCARD-cycled every frame).
-   // OnDestroyResource removes the record entirely, which also un-bans a handle the runtime later recycles.
-   // Fires on Frostbite worker threads → the map cache's mutex.
+   // Caches the CPU map pointer of every large (>= 64 KB) WRITE_NO_OVERWRITE dynamic CB (the ring holding the camera and the AO
+   // constants among them), deduped by handle: a NO_OVERWRITE allocation stays committed, so reading after Unmap is safe. A
+   // DISCARD map bans a tracked handle (data = nullptr, record kept): the driver may free the old allocation, and a buffer the
+   // game ever discard-maps isn't the always-NO_OVERWRITE ring, so caching it again would re-arm a use-after-free (the wide
+   // camera slot probe crashed on it in menus, where UI CBs are DISCARD-cycled every frame). OnDestroyResource drops the
+   // record, which also lifts the ban for a handle the runtime recycles. Runs on Frostbite worker threads too, hence the mutex.
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
       DeviceData& device_data = *device->get_private_data<DeviceData>();
@@ -946,7 +939,7 @@ class MassEffectAndromeda final : public Game
 
    // The tonemap while upscaling. Reading the resolve's target directly (no pass ran in between), it draws from the upscaler's
    // output into "upscaled_scene" at the output size; RT1, the FXAA luma, is left out (all targets must share a size, and FXAA
-   // doesn't run with TAA). Else (None) it draws natively at the render size and is stretched at the first read.
+   // doesn't run with TAA). Else (false) it draws natively at the render size and is stretched at the first read.
    static bool DrawUpscaledTonemap(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, [[maybe_unused]] CommandListData& cmd_list_data, DeviceData& device_data,
       MassEffectAndromedaGameDeviceData* gd, const std::function<void()>& original_draw)
    {
@@ -1312,8 +1305,7 @@ class MassEffectAndromeda final : public Game
       if (!sr_instance_data)
          return DrawOrDispatchOverrideType::None;
 
-      // Capture the TAA's CS bindings FIRST — we need the real input texture size (and the camera CB keyed to it)
-      // before configuring SR or probing the camera.
+      // The resolve's bindings first: its input size keys the camera probe and the SR settings
       ComPtr<ID3D11ShaderResourceView> srv_depth, srv_mvs, srv_color;
       native_device_context->CSGetShaderResources(0, 1, srv_depth.put()); // t0
       native_device_context->CSGetShaderResources(1, 1, srv_mvs.put());   // t1
@@ -1601,7 +1593,7 @@ public:
       luma_data_cbuffer_index = -1;
       luma_ui_cbuffer_index = -1;
 #if ENABLE_SMAA
-      // RCAS sharpening PS for the SMAA output (reuses core's "Copy VS" fullscreen vertex shader).
+      // RCAS PS, after SMAA or on the tonemap under DLSS/FSR (with Core's "Copy VS")
       native_shaders_definitions.emplace(CompileTimeStringHash("MEA Sharpen PS"),
          ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
       native_shaders_definitions.emplace(CompileTimeStringHash("MEA Depth Extract CS"),
@@ -1614,8 +1606,8 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("MEA SR History Copy CS"),
          ShaderDefinition{"Luma_MEA_CopyColor", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "copy_color_history_cs"});
 #endif
-      // Cache the camera ring-buffer's CPU map pointer (read at the gbuffer draw / TAA dispatch by bound offset) —
-      // replaces a per-frame GPU readback stall. Must run in all configs.
+      // The dynamic CB rings' CPU map pointers (the camera, the AO constants), read by bound offset with no GPU readback.
+      // Needed in every config.
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
    }
@@ -1636,8 +1628,7 @@ public:
    {
       auto& gd = GetGameDeviceData(device_data);
 
-      // OnDrawOrDispatch also fires on Frostbite deferred contexts (worker threads); GetType() is invariant for this
-      // call, so evaluate it once. All immediacy gates below use this.
+      // Also fires on Frostbite's deferred contexts (worker threads)
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
 
       if (is_immediate && !gd.cam_valid_this_frame && (stages & reshade::api::shader_stage::vertex) != 0)
@@ -1993,8 +1984,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // the backbuffer even with no upgrades.
       force_disable_display_composition = true;
 
-      // Sharper textures: AF16x + negative mip LOD bias (mode 4 = AF16x + additive bias). The bias value is set
-      // per-frame by the active AA mode in OnPresent.
+      // Sharper textures: AF16x + negative mip LOD bias (mode 4 = AF16x + additive bias), the bias set every present from the
+      // render size (see OnPresent)
       enable_samplers_upgrade = true; // boot-time only
       samplers_upgrade_mode = 4;
 

@@ -3,7 +3,7 @@
 
 #include "../Includes/Common.hlsl"
 
-// (1/W, 1/H, W, H) at output resolution — filled by the mod's SMAA block in main.cpp.
+// (1/W, 1/H, W, H) at output resolution, from ReplaceFXAAWithSMAA in main.cpp
 cbuffer SmaaMetricsCB : register(b1)
 {
    float4 SmaaRtMetrics;
