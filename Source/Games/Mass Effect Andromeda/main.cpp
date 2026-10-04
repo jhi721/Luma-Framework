@@ -1,5 +1,5 @@
 // Mass Effect: Andromeda — Luma anti-aliasing mod (Frostbite 3, D3D11).
-// Injects DLAA or FSR 3 native AA (in-game AA = TAA) and replaces FXAA with SMAA (in-game AA = FXAA).
+// Injects DLSS or FSR 3, as AA or upscaling (in-game AA = TAA), and replaces FXAA with SMAA (in-game AA = FXAA).
 
 #define GAME_MASS_EFFECT_ANDROMEDA 1
 
@@ -73,9 +73,19 @@ static constexpr uint32_t kGbufferVS_B = 0xFF93953D; // (reliable jitter capture
 // PS that turns the D24 reverse-Z depth into the game's linear view depth (r32_float, metres; near / device Z), the SMAA
 // predication source. Drawn twice per frame, in gameplay and the main menu alike; the second write is the final depth.
 static constexpr uint32_t kLinearDepthHash = 0xDE1C9EB9;
-// Tonemap PS (LUT 33^3, also writes an R8 mask at RT1): its RT0 is display-encoded and bounded, the FXAA pass' input, and
-// only UI and the final encode follow it. RCAS runs on it under DLSS/FSR.
-static constexpr uint32_t kTonemapHash = 0xB6A91712;
+// Native AO ("HBAO Full" = interleaved GTAO, all before the resolve, at the render size): the deinterleave splits depth (times
+// cb0[5].x) and normals into 4x4 layers of a quarter size, the horizon pass traces them and writes the full-size AO target
+// (r8g8b8a8: .x AO, .yzw bent normal, read by the tiled lighting), then a depth-aware blur X into a temporary and Y back.
+static constexpr uint32_t kAODeinterleaveHash = 0xAFD03D17;
+static constexpr uint32_t kAOHorizonHash = 0x3DC1C671;
+static constexpr uint32_t kAOBlurXHash = 0xA93EB2C5;
+static constexpr uint32_t kAOBlurYHash = 0xC4844743;
+// Tonemap PS (LUT 33^3, also writes an R8 luma at RT1 for FXAA): its RT0 is display-encoded and bounded, the FXAA pass' input,
+// and only UI and the final encode follow it. RCAS runs on it under DLSS/FSR; upscaling, it draws at the output size. Twelve
+// permutations: {distortion warp | chromatic aberration} x {radial lens warp} x {t4 unused | film grain | screen overlay}.
+static const ShaderHashesList shader_hashes_tonemap = {
+   .pixel_shaders = {0xB6A91712, 0x376C116B, 0xE3D57A10, 0xEB91AB31, 0x339025EE, 0x71562FF9, 0x18AC2B1A, 0x66BE1F36, 0x18F31608, 0xF8A12BF4, 0x62D3752D, 0xA42A680A},
+};
 // DLSS far_plane stand-in: MEA's projection is reverse-Z INFINITE-far (no finite far). DLSS is insensitive to the
 // exact large value (used only for depth linearization).
 static constexpr float kCamFar = 100000.f;
@@ -118,6 +128,31 @@ static uint8_t* g_world_render_settings = nullptr;                     // Render
 static WorldRenderSettingsValues g_world_render_settings_vanilla = {}; // Valid while "g_world_render_settings" is set
 static bool g_world_render_settings_rejected = false;                  // The container failed the layout check: not this build
 
+// Frostbite's "Render" settings container (reflected class GameRenderSettings, 0x110 bytes): the engine's render scale, applied
+// to the whole frame up to the tonemap from the next frame on (no reload). The in-game Resolution Scale writes the scale and
+// Custom. While an upscaler draws, Luma's render scale replaces the user's; otherwise the container follows the game.
+static constexpr size_t kGrsResolutionScaleGame = 0x20; // float: the scale, read in Custom mode only
+static constexpr size_t kGrsResolutionScaleMode = 0x2C; // enum: Disabled 0, Auto720p 1, Auto900p 2 (vanilla), Auto1080p 3, Custom 4
+// enum: the present's upscale filter. Point 0, Linear 1, Bicubic 2, Lanczos 3, LanczosSeparable 4, BicubicSharp 5 (vanilla),
+// BicubicSharpSeparable 6. Upscaling, the present reads an output-sized image at the size it believes is the render size: a
+// single bilinear tap at the pixel centre is the only filter that stays 1:1 then.
+static constexpr size_t kGrsRenderScaleResampleMode = 0x78;
+static constexpr int kResolutionScaleModeCustom = 4;
+static constexpr int kResampleModeLinear = 1;
+struct GameRenderSettingsValues
+{
+   float resolution_scale_game = 1.f;
+   int resolution_scale_mode = 0;
+   int render_scale_resample_mode = 0;
+};
+static uint8_t* g_game_render_settings = nullptr;                    // Render thread only (OnPresent)
+static GameRenderSettingsValues g_game_render_settings_vanilla = {}; // The game's own, re-read every present Luma's aren't in
+static bool g_game_render_settings_written = false;                  // Luma's values are in the container
+static bool g_game_render_settings_rejected = false;                 // The container failed the layout check: not this build
+
+static constexpr float kMinRenderScale = 0.5f;
+static float g_render_scale = 1.f; // "RenderScale": applies only while an upscaler draws
+
 // --- Live dev knobs (DEV overlay and MCP, not saved). Default signs are the stable trail-free set:
 // MV flip X+Y, jitter flip Y; jitter flip X shakes. ---
 static bool g_mv_flip_x = true;      // -> MV X scale = -0.5*W
@@ -126,6 +161,7 @@ static float g_mv_scale_mult = 1.f;  // 0.25..4
 static bool g_jitter_flip_x = false; // jitter X = -clipX*0.5*W (flipping X shakes — keep off)
 static bool g_jitter_flip_y = true;  // jitter Y = +clipY*0.5*H (removes shimmer)
 static bool g_mv_jittered = false;
+static bool g_ao_output_size = true; // Upscaling: the native AO at the output size (see "RunOutputSizedAOPass")
 
 #if DEVELOPMENT
 // What the TAA and FXAA hooks did in a frame, for the MCP "luma_dev_values" tool ("last" = the last complete frame).
@@ -147,6 +183,11 @@ struct FrameCounters
    uint32_t fxaa_draws = 0;            // the game's FXAA pass
    uint32_t smaa_draws = 0;            // SMAA replaced it
    uint32_t rcas_draws = 0;            // RCAS ran (on SMAA's output or the SR tonemap's)
+   uint32_t tonemaps_upscaled = 0;     // upscaling: the tonemap drew at the output size from the upscaler's output
+   uint32_t tonemaps_stretched = 0;    // upscaling: the tonemap drew natively (a render-sized pass ran first), stretched at the first read
+   uint32_t tonemap_redirects = 0;     // upscaling: draws after the tonemap moved to Luma's output-sized target
+   uint32_t ao_output_size_passes = 0; // upscaling: native AO passes run at the output size (4 per frame)
+   uint32_t ao_output_size_aborts = 0; // upscaling: a later AO pass failed, it and the rest skipped (stale AO)
 };
 static FrameCounters g_counters_this_frame;
 static FrameCounters g_counters_last_frame;
@@ -224,6 +265,48 @@ struct MassEffectAndromedaGameDeviceData final : public GameDeviceData
    bool sr_active = false;
    // "CleanExtraSRResources" ran (None picked): ours go at the next present
    std::atomic<bool> release_sr_resources = false;
+
+   // --- Upscaling (the upscaler drew above the render size): the frame from the tonemap on at the output size. The engine's
+   // tonemap target stays render sized; Luma's "upscaled_scene" replaces it for every later draw that reads or writes it (the
+   // letterbox bars, the present). All but the textures are this frame's, reset at present. ---
+   ComPtr<ID3D11Resource> resolve_target; // The upscaler drew above the render size this frame, into this resolve target (u2):
+                                          // the tonemap's scene input when no pass ran in between
+   ComPtr<ID3D11Resource> tonemap_target; // The engine's tonemap target, once the tonemap drew
+   // The tonemap drew into "upscaled_scene" from the upscaler's output. Else (motion blur or DOF ran between, their passes
+   // are render sized) it drew the engine's target at the render size, stretched into "upscaled_scene" at the first read.
+   bool tonemap_upscaled = false;
+   bool upscaled_scene_filled = false;
+   ComPtr<ID3D11Texture2D> upscaled_scene;
+   ComPtr<ID3D11ShaderResourceView> upscaled_scene_srv;
+   ComPtr<ID3D11RenderTargetView> upscaled_scene_rtv;
+
+   void ReleaseUpscaledScene()
+   {
+      upscaled_scene_rtv.reset();
+      upscaled_scene_srv.reset();
+      upscaled_scene.reset();
+   }
+
+   // --- Native AO at the output size while upscaling (see "RunOutputSizedAOPass"), all at "size" ---
+   struct OutputSizedAO
+   {
+      uint32_t frame = UINT32_MAX;        // The frame its first pass ran at the output size: the later ones follow
+      uint32_t broken_frame = UINT32_MAX; // A later pass failed that frame: the rest are skipped
+      uint2 size = {};
+      uint2 render_size = {}; // The engine's AO size that frame
+      // The deinterleave's inputs stretched (point) to the output size: depth (r32, also the blurs' t0), normals, material ids
+      ComPtr<ID3D11Texture2D> depth, normals, material;
+      ComPtr<ID3D11ShaderResourceView> depth_srv, normals_srv, material_srv;
+      ComPtr<ID3D11RenderTargetView> depth_rtv, normals_rtv, material_rtv;
+      // The 16 deinterleaved layers (depth, normals), the AO target and the blur's temporary
+      ComPtr<ID3D11Texture2D> layer_depth, layer_normals, result, blur;
+      ComPtr<ID3D11ShaderResourceView> layer_depth_srv, layer_normals_srv, result_srv, blur_srv;
+      ComPtr<ID3D11UnorderedAccessView> layer_depth_uav, layer_normals_uav, result_uav, blur_uav;
+      ComPtr<ID3D11Buffer> cb;              // A pass's constants, copied from the engine's and patched
+      ComPtr<ID3D11Resource> engine_target; // The engine's AO target, and the view Luma scales the result down into
+      ComPtr<ID3D11RenderTargetView> engine_target_rtv;
+   };
+   OutputSizedAO ao;
 #endif
 
 #if ENABLE_SMAA
@@ -289,9 +372,9 @@ class MassEffectAndromeda final : public Game
 
    // A texture with a SRV, plus a RTV and/or a UAV when asked. False on any failure (the caller resets what was made).
    static bool CreateTexture(ID3D11Device* native_device, DXGI_FORMAT format, uint2 size, UINT bind_flags, ID3D11Texture2D** texture, ID3D11ShaderResourceView** srv,
-      ID3D11RenderTargetView** rtv = nullptr, ID3D11UnorderedAccessView** uav = nullptr)
+      ID3D11RenderTargetView** rtv = nullptr, ID3D11UnorderedAccessView** uav = nullptr, UINT array_size = 1)
    {
-      const CD3D11_TEXTURE2D_DESC desc(format, size.x, size.y, 1, 1, bind_flags);
+      const CD3D11_TEXTURE2D_DESC desc(format, size.x, size.y, array_size, 1, bind_flags);
       if (FAILED(native_device->CreateTexture2D(&desc, nullptr, texture)) || FAILED(native_device->CreateShaderResourceView(*texture, nullptr, srv)))
          return false;
       if (rtv && FAILED(native_device->CreateRenderTargetView(*texture, nullptr, rtv)))
@@ -475,16 +558,16 @@ class MassEffectAndromeda final : public Game
       }
    }
 
-   // The engine's "WorldRender" settings container, null until the engine made it, or on an unknown build. Found through the
-   // function that creates it: sub rsp, 0x48; mov rcx, [rip+settings_manager]; lea rdx, [rip+"WorldRender"]; call get_container;
-   // test rax, rax; jnz; lea r8d, [rax+0x10]; lea rcx, [rip+?]; mov edx, 0x4E0 (the class size). Its get_container call is reused.
-   static uint8_t* FindWorldRenderSettings()
+   // An engine settings container by name ("WorldRender", "Render"...), null until the engine made it, or on an unknown build. The
+   // settings manager and its lookup come from the function that creates "WorldRender": sub rsp, 0x48; mov rcx, [rip+settings_manager];
+   // lea rdx, [rip+"WorldRender"]; call get_container; test rax, rax; jnz; lea r8d, [rax+0x10]; lea rcx, [rip+?]; mov edx, 0x4E0 (the
+   // class size)
+   static uint8_t* FindSettingsContainer(const char* name)
    {
       using GetContainer = uint8_t* (*)(void* manager, const char* name);
       struct Locator
       {
          void* const* manager = nullptr;
-         const char* name = nullptr;
          GetContainer get_container = nullptr;
       };
       static const Locator locator = []
@@ -504,18 +587,16 @@ class MassEffectAndromeda final : public Game
             return Locator{};
          const auto rip_target = [&](size_t operand, size_t next)
          { return function + next + *reinterpret_cast<const int32_t*>(function + operand); };
-         const char* name = reinterpret_cast<const char*>(rip_target(0x0E, 0x12));
-         if (std::strcmp(name, "WorldRender") != 0)
+         if (std::strcmp(reinterpret_cast<const char*>(rip_target(0x0E, 0x12)), "WorldRender") != 0)
             return Locator{};
          return Locator{
             .manager = reinterpret_cast<void* const*>(rip_target(0x07, 0x0B)),
-            .name = name,
             .get_container = reinterpret_cast<GetContainer>(const_cast<uint8_t*>(rip_target(0x13, 0x17))),
          };
       }();
       if (!locator.get_container || *locator.manager == nullptr)
          return nullptr;
-      return locator.get_container(*locator.manager, locator.name);
+      return locator.get_container(*locator.manager, name);
    }
 
    // The engine's jitter table, a vector of float2 pixel offsets in [-0.5, 0.5] that it fills with a correlated multi-jittered
@@ -566,7 +647,7 @@ class MassEffectAndromeda final : public Game
       {
          if (g_world_render_settings_rejected)
             return;
-         g_world_render_settings = FindWorldRenderSettings();
+         g_world_render_settings = FindSettingsContainer("WorldRender");
          if (!g_world_render_settings)
             return;
          WorldRenderSettingsValues vanilla = {.jitter_use_cmj = g_world_render_settings[kWrsJitterUseCmj]};
@@ -606,6 +687,56 @@ class MassEffectAndromeda final : public Game
          values.post_sharpening_amount = 0.f;
       }
       WriteWorldRenderSettings(values);
+   }
+
+   static GameRenderSettingsValues ReadGameRenderSettings(const uint8_t* settings)
+   {
+      GameRenderSettingsValues values;
+      std::memcpy(&values.resolution_scale_game, settings + kGrsResolutionScaleGame, sizeof(values.resolution_scale_game));
+      std::memcpy(&values.resolution_scale_mode, settings + kGrsResolutionScaleMode, sizeof(values.resolution_scale_mode));
+      std::memcpy(&values.render_scale_resample_mode, settings + kGrsRenderScaleResampleMode, sizeof(values.render_scale_resample_mode));
+      return values;
+   }
+
+   static void WriteGameRenderSettings(const GameRenderSettingsValues& values)
+   {
+      std::memcpy(g_game_render_settings + kGrsResolutionScaleGame, &values.resolution_scale_game, sizeof(values.resolution_scale_game));
+      std::memcpy(g_game_render_settings + kGrsResolutionScaleMode, &values.resolution_scale_mode, sizeof(values.resolution_scale_mode));
+      std::memcpy(g_game_render_settings + kGrsRenderScaleResampleMode, &values.render_scale_resample_mode, sizeof(values.render_scale_resample_mode));
+   }
+
+   // Luma's render scale while an upscaler draws (it upscales whatever the engine renders below the output size), else the
+   // game's own settings, put back once
+   static void UpdateGameRenderSettings(bool sr_active)
+   {
+      if (!g_game_render_settings)
+      {
+         if (g_game_render_settings_rejected)
+            return;
+         g_game_render_settings = FindSettingsContainer("Render");
+         if (!g_game_render_settings)
+            return;
+         const GameRenderSettingsValues vanilla = ReadGameRenderSettings(g_game_render_settings);
+         // A layout check: known enums and a sane scale, else this isn't the build the offsets come from
+         if (uint32_t(vanilla.resolution_scale_mode) > uint32_t(kResolutionScaleModeCustom) || uint32_t(vanilla.render_scale_resample_mode) > 6 ||
+             !(vanilla.resolution_scale_game > 0.f && vanilla.resolution_scale_game <= 4.f))
+         {
+            g_game_render_settings = nullptr;
+            g_game_render_settings_rejected = true;
+            return;
+         }
+      }
+      if (sr_active)
+      {
+         WriteGameRenderSettings({.resolution_scale_game = g_render_scale, .resolution_scale_mode = kResolutionScaleModeCustom, .render_scale_resample_mode = kResampleModeLinear});
+         g_game_render_settings_written = true;
+         return;
+      }
+      if (std::exchange(g_game_render_settings_written, false))
+      {
+         WriteGameRenderSettings(g_game_render_settings_vanilla);
+      }
+      g_game_render_settings_vanilla = ReadGameRenderSettings(g_game_render_settings);
    }
 
    // Camera capture (jitter/near/FOV) at a scene VS draw, once per frame (retries on the next draw if this one's camera map
@@ -768,7 +899,7 @@ class MassEffectAndromeda final : public Game
 #endif // ENABLE_SMAA
 
 #if ENABLE_SMAA && ENABLE_SR
-   // RCAS on top of DLSS/FSR, on the tonemap's output (see "kTonemapHash"): the tonemap draws into RCAS's input (RT1, its mask,
+   // RCAS on top of DLSS/FSR, on the tonemap's output (see "shader_hashes_tonemap"): the tonemap draws into RCAS's input (RT1, its mask,
    // stays the game's), then RCAS writes the tonemap's own target
    static DrawOrDispatchOverrideType DrawTonemapWithRCAS(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, [[maybe_unused]] CommandListData& cmd_list_data,
       DeviceData& device_data, MassEffectAndromedaGameDeviceData* gd, const std::function<void()>& original_draw)
@@ -795,6 +926,384 @@ class MassEffectAndromeda final : public Game
 #endif
 
 #if ENABLE_SR
+   // Luma's output-sized stand-in for the engine's tonemap target, in its format
+   static bool EnsureUpscaledScene(ID3D11Device* native_device, MassEffectAndromedaGameDeviceData* gd, uint2 size, DXGI_FORMAT format)
+   {
+      if (gd->upscaled_scene)
+      {
+         D3D11_TEXTURE2D_DESC desc;
+         gd->upscaled_scene->GetDesc(&desc);
+         if (desc.Width == size.x && desc.Height == size.y && desc.Format == format)
+            return true;
+      }
+      gd->ReleaseUpscaledScene();
+      if (CreateTexture(native_device, format, size, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd->upscaled_scene.put(), gd->upscaled_scene_srv.put(),
+             gd->upscaled_scene_rtv.put()))
+         return true;
+      gd->ReleaseUpscaledScene();
+      return false;
+   }
+
+   // The tonemap while upscaling. Reading the resolve's target directly (no pass ran in between), it draws from the upscaler's
+   // output into "upscaled_scene" at the output size; RT1, the FXAA luma, is left out (all targets must share a size, and FXAA
+   // doesn't run with TAA). Else (None) it draws natively at the render size and is stretched at the first read.
+   static bool DrawUpscaledTonemap(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, [[maybe_unused]] CommandListData& cmd_list_data, DeviceData& device_data,
+      MassEffectAndromedaGameDeviceData* gd, const std::function<void()>& original_draw)
+   {
+      com_ptr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+      com_ptr<ID3D11ShaderResourceView> scene_srv;
+      native_device_context->PSGetShaderResources(0, 1, &scene_srv);
+      if (!rtv || !scene_srv)
+         return false;
+      rtv->GetResource(gd->tonemap_target.put());
+      com_ptr<ID3D11Resource> scene;
+      scene_srv->GetResource(&scene);
+      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+      rtv->GetDesc(&rtv_desc);
+      const uint2 size = GetViewTextureSize(gd->sr_output_srv.get());
+      if (scene.get() != gd->resolve_target.get() || !EnsureUpscaledScene(native_device, gd, size, rtv_desc.Format))
+         return false;
+#if ENABLE_SMAA
+      const bool rcas = PrepareRCAS(native_device, device_data, gd, size);
+#else
+      constexpr bool rcas = false;
+#endif
+      DrawStateStack<DrawStateStackType::SimpleGraphics> tonemap_state;
+      tonemap_state.Cache(native_device_context, device_data.uav_max_count);
+      ID3D11ShaderResourceView* const upscaled_color = gd->sr_output_srv.get();
+      native_device_context->PSSetShaderResources(0, 1, &upscaled_color);
+      ID3D11RenderTargetView* const target = (rcas ? gd->tex_rcas_input_rtv.get() : gd->upscaled_scene_rtv.get());
+      native_device_context->OMSetRenderTargets(1, &target, nullptr);
+      SetViewportFullscreen(native_device_context, size);
+      original_draw();
+      tonemap_state.Restore(native_device_context);
+#if ENABLE_SMAA
+      if (rcas)
+      {
+         MEA_COUNT(rcas_draws);
+         DrawRCAS(native_device_context, device_data, gd, gd->upscaled_scene_rtv.get(), size);
+      }
+#endif
+      gd->tonemap_upscaled = true;
+      gd->upscaled_scene_filled = true;
+      MEA_COUNT(tonemaps_upscaled);
+      return true;
+   }
+
+   // A draw after the tonemap that reads or writes the engine's tonemap target uses "upscaled_scene" instead: the letterbox bars
+   // draw into it at the output size, the present reads it (stretched first when the tonemap drew natively at the render size)
+   static bool RedirectTonemapTarget(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, [[maybe_unused]] CommandListData& cmd_list_data, DeviceData& device_data,
+      MassEffectAndromedaGameDeviceData* gd, const std::function<void()>& original_draw)
+   {
+      constexpr UINT read_slots = 8;
+      com_ptr<ID3D11ShaderResourceView> srvs[read_slots];
+      native_device_context->PSGetShaderResources(0, read_slots, &srvs[0]);
+      int read_slot = -1;
+      for (UINT i = 0; i < read_slots; i++)
+      {
+         if (!srvs[i])
+            continue;
+         com_ptr<ID3D11Resource> resource;
+         srvs[i]->GetResource(&resource);
+         if (resource.get() == gd->tonemap_target.get())
+         {
+            read_slot = int(i);
+            break;
+         }
+      }
+      com_ptr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+      com_ptr<ID3D11Resource> written;
+      if (rtv)
+      {
+         rtv->GetResource(&written);
+      }
+      // Drawn natively, the target stays the engine's until it's read
+      const bool writes = gd->tonemap_upscaled && written.get() == gd->tonemap_target.get();
+      if (read_slot < 0 && !writes)
+         return false;
+
+      const uint2 size = GetViewTextureSize(gd->sr_output_srv.get());
+      if (read_slot >= 0 && !gd->upscaled_scene_filled)
+      {
+         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+         srvs[read_slot]->GetDesc(&srv_desc);
+         auto* scale_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Scale VS"));
+         auto* scale_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Scale PS"));
+         if (scale_vs == nullptr || scale_ps == nullptr || !EnsureUpscaledScene(native_device, gd, size, srv_desc.Format))
+            return false;
+         // DrawCustomPixelShader does NOT restore state
+         DrawStateStack<DrawStateStackType::FullGraphics> stretch_state;
+         stretch_state.Cache(native_device_context, device_data.uav_max_count);
+         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(),
+            scale_vs, scale_ps, srvs[read_slot].get(), gd->upscaled_scene_rtv.get(), size.x, size.y);
+         stretch_state.Restore(native_device_context);
+         gd->upscaled_scene_filled = true;
+         MEA_COUNT(tonemaps_stretched);
+      }
+
+      DrawStateStack<DrawStateStackType::SimpleGraphics> redirect_state;
+      redirect_state.Cache(native_device_context, device_data.uav_max_count);
+      if (read_slot >= 0)
+      {
+         ID3D11ShaderResourceView* const upscaled_scene = gd->upscaled_scene_srv.get();
+         native_device_context->PSSetShaderResources(UINT(read_slot), 1, &upscaled_scene);
+      }
+      if (writes)
+      {
+         // The draw's viewports and scissors, from the render size to the output size
+         UINT viewports_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+         D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+         native_device_context->RSGetViewports(&viewports_count, viewports);
+         UINT scissors_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+         D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+         native_device_context->RSGetScissorRects(&scissors_count, scissors);
+         const float scale_x = float(size.x) / float(gd->scene_size.x);
+         const float scale_y = float(size.y) / float(gd->scene_size.y);
+         for (UINT i = 0; i < viewports_count; i++)
+         {
+            viewports[i].TopLeftX *= scale_x;
+            viewports[i].TopLeftY *= scale_y;
+            viewports[i].Width *= scale_x;
+            viewports[i].Height *= scale_y;
+         }
+         for (UINT i = 0; i < scissors_count; i++)
+         {
+            scissors[i] = {.left = LONG(scissors[i].left * scale_x), .top = LONG(scissors[i].top * scale_y), .right = LONG(std::ceil(scissors[i].right * scale_x)), .bottom = LONG(std::ceil(scissors[i].bottom * scale_y))};
+         }
+         native_device_context->RSSetViewports(viewports_count, viewports);
+         native_device_context->RSSetScissorRects(scissors_count, scissors);
+         ID3D11RenderTargetView* const target = gd->upscaled_scene_rtv.get();
+         native_device_context->OMSetRenderTargets(1, &target, nullptr);
+      }
+      MEA_COUNT(tonemap_redirects);
+      original_draw();
+      redirect_state.Restore(native_device_context);
+      return true;
+   }
+#endif
+
+#if ENABLE_SR
+   // The native AO at the output size while upscaling. The engine scales its AO radius with the render size, but the horizon
+   // steps and the bilateral blur work in render pixels: below 100% every tap covers more of the world and the occlusion spreads
+   // (+4.3% at 50%). Luma runs the same four shaders on output-sized copies of their inputs, with the constants they get at
+   // 100% (the render-size ones scaled by output/render), and scales the result down into the engine's AO target. The first
+   // pass decides for the frame; false = the pass runs natively. After it, a pass that can't run is skipped, never run
+   // natively: it would read inputs no pass wrote this frame (the engine's AO target keeps the last frame's instead).
+   static bool RunOutputSizedAOPass(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, [[maybe_unused]] CommandListData& cmd_list_data, DeviceData& device_data,
+      MassEffectAndromedaGameDeviceData* gd, uint32_t hash)
+   {
+      const uint32_t frame = cb_luma_global_settings.FrameIndex;
+      const bool first_pass = (hash == kAODeinterleaveHash);
+      if (first_pass)
+      {
+         if (!g_ao_output_size || !gd->sr_active)
+            return false;
+      }
+      else if (gd->ao.frame != frame)
+      {
+         return false;
+      }
+      else if (gd->ao.broken_frame == frame)
+      {
+         return true;
+      }
+      const auto fail = [&]
+      {
+         if (first_pass)
+            return false;
+         gd->ao.broken_frame = frame;
+         MEA_COUNT(ao_output_size_aborts);
+         return true;
+      };
+
+      ID3D11DeviceContext1* const context1 = GetImmediateContext1(native_device_context, gd);
+      auto* const scale_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Scale VS"));
+      auto* const scale_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Scale PS"));
+      if (!context1 || scale_vs == nullptr || scale_ps == nullptr)
+         return fail();
+      com_ptr<ID3D11ShaderResourceView> srvs[3];
+      native_device_context->CSGetShaderResources(0, 3, &srvs[0]);
+      uint2 render_size = gd->ao.render_size;
+      if (first_pass)
+      {
+         if (!srvs[0] || !srvs[1] || !srvs[2])
+            return false;
+         render_size = GetViewTextureSize(srvs[0].get());
+         const uint2 output_size = {uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
+         if (render_size.x == 0 || render_size.x >= output_size.x || render_size.y >= output_size.y)
+            return false;
+         if (gd->ao.size != output_size)
+         {
+            gd->ao = {};
+            const uint2 layer_size = {(output_size.x + 3) / 4, (output_size.y + 3) / 4};
+            constexpr UINT rt_bind = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            constexpr UINT uav_bind = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+            const CD3D11_BUFFER_DESC cb_desc(32 * 16, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
+            const bool created = CreateTexture(native_device, DXGI_FORMAT_R32_FLOAT, output_size, rt_bind, gd->ao.depth.put(), gd->ao.depth_srv.put(), gd->ao.depth_rtv.put()) &&
+                                 CreateTexture(native_device, DXGI_FORMAT_R10G10B10A2_UNORM, output_size, rt_bind, gd->ao.normals.put(), gd->ao.normals_srv.put(), gd->ao.normals_rtv.put()) &&
+                                 CreateTexture(native_device, DXGI_FORMAT_R8_UNORM, output_size, rt_bind, gd->ao.material.put(), gd->ao.material_srv.put(), gd->ao.material_rtv.put()) &&
+                                 CreateTexture(native_device, DXGI_FORMAT_R16_FLOAT, layer_size, uav_bind, gd->ao.layer_depth.put(), gd->ao.layer_depth_srv.put(), nullptr, gd->ao.layer_depth_uav.put(), 16) &&
+                                 CreateTexture(native_device, DXGI_FORMAT_R8G8_SNORM, layer_size, uav_bind, gd->ao.layer_normals.put(), gd->ao.layer_normals_srv.put(), nullptr, gd->ao.layer_normals_uav.put(), 16) &&
+                                 CreateTexture(native_device, DXGI_FORMAT_R8G8B8A8_UNORM, output_size, uav_bind, gd->ao.result.put(), gd->ao.result_srv.put(), nullptr, gd->ao.result_uav.put()) &&
+                                 CreateTexture(native_device, DXGI_FORMAT_R8G8B8A8_UNORM, output_size, uav_bind, gd->ao.blur.put(), gd->ao.blur_srv.put(), nullptr, gd->ao.blur_uav.put()) &&
+                                 SUCCEEDED(native_device->CreateBuffer(&cb_desc, nullptr, gd->ao.cb.put()));
+            if (!created)
+            {
+               gd->ao = {};
+               return false;
+            }
+            gd->ao.size = output_size;
+         }
+      }
+      const uint2 size = gd->ao.size;
+      const uint2 layer_size = {(size.x + 3) / 4, (size.y + 3) / 4};
+      const float scale = float(size.x) / float(render_size.x);
+
+      // The pass's constants: a window of the engine's dynamic ring, read through its CPU map pointer
+      constexpr UINT max_rows = 32;
+      float rows[max_rows][4] = {};
+      const UINT rows_count = (hash == kAODeinterleaveHash ? 24 : (hash == kAOHorizonHash ? 8 : 2)); // The shaders' dcl_constantbuffer sizes
+      {
+         ID3D11Buffer* engine_cb = nullptr;
+         UINT first_constant = 0;
+         UINT num_constants = 0;
+         context1->CSGetConstantBuffers1(0, 1, &engine_cb, &first_constant, &num_constants);
+         if (!engine_cb)
+            return fail();
+         const uint64_t engine_cb_handle = reinterpret_cast<uint64_t>(engine_cb);
+         engine_cb->Release(); // Only the handle is needed, as the map cache key
+         const std::shared_lock lock(gd->map_cache.mutex);
+         const int i = gd->map_cache.Find(engine_cb_handle);
+         if (i < 0 || gd->map_cache.recs[i].data == nullptr || uint64_t(first_constant + rows_count) * 16 > gd->map_cache.recs[i].size)
+            return fail();
+         std::memcpy(rows, reinterpret_cast<const uint8_t*>(gd->map_cache.recs[i].data) + first_constant * 16, rows_count * 16);
+      }
+
+      ID3D11ShaderResourceView* pass_srvs[3] = {srvs[0].get(), srvs[1].get(), srvs[2].get()};
+      ID3D11UnorderedAccessView* pass_uavs[2] = {};
+      UINT groups[3] = {1, 1, 1};
+      switch (hash)
+      {
+      case kAODeinterleaveHash:
+      {
+         // Point stretch: depth must not blend across edges, the material id indexes a normal basis table
+         DrawStateStack<DrawStateStackType::FullGraphics> stretch_state;
+         stretch_state.Cache(native_device_context, device_data.uav_max_count);
+         ID3D11RenderTargetView* const targets[3] = {gd->ao.depth_rtv.get(), gd->ao.normals_rtv.get(), gd->ao.material_rtv.get()};
+         for (UINT i = 0; i < 3; i++)
+         {
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_point.get(), scale_vs,
+               scale_ps, srvs[i].get(), targets[i], size.x, size.y);
+         }
+         stretch_state.Restore(native_device_context);
+         rows[5][0] /= scale; // The depth scale, inversely proportional to the size
+         pass_srvs[0] = gd->ao.depth_srv.get();
+         pass_srvs[1] = gd->ao.normals_srv.get();
+         pass_srvs[2] = gd->ao.material_srv.get();
+         pass_uavs[0] = gd->ao.layer_depth_uav.get();
+         pass_uavs[1] = gd->ao.layer_normals_uav.get();
+         // 16x16 threads per group, one 4x4 block of each layer (the engine adds a group)
+         groups[0] = (size.x + 15) / 16 + 1;
+         groups[1] = (size.y + 15) / 16 + 1;
+         break;
+      }
+      case kAOHorizonHash:
+      {
+         // The layer texel size, the deinterleave's depth scale back, the radius in pixels and its cap
+         rows[1][0] = 1.f / float(layer_size.x);
+         rows[1][1] = 1.f / float(layer_size.y);
+         rows[1][2] = float(layer_size.x);
+         rows[1][3] = float(layer_size.y);
+         rows[2][0] *= scale;
+         rows[2][1] *= scale;
+         rows[2][2] *= scale;
+         pass_srvs[0] = gd->ao.layer_depth_srv.get();
+         pass_srvs[1] = gd->ao.layer_normals_srv.get();
+         pass_uavs[0] = gd->ao.result_uav.get();
+         groups[0] = (layer_size.x + 7) / 8;
+         groups[1] = (layer_size.y + 7) / 8;
+         groups[2] = 4; // 16 layers, 4 per group
+         break;
+      }
+      case kAOBlurXHash:
+      case kAOBlurYHash:
+      {
+         // (W, H) as uints, then the texel size
+         const UINT size_bits[2] = {size.x, size.y};
+         std::memcpy(&rows[0][0], size_bits, sizeof(size_bits));
+         rows[0][2] = 1.f / float(size.x);
+         rows[0][3] = 1.f / float(size.y);
+         const bool blur_x = (hash == kAOBlurXHash);
+         pass_srvs[0] = gd->ao.depth_srv.get();
+         pass_srvs[1] = (blur_x ? gd->ao.result_srv.get() : gd->ao.blur_srv.get());
+         pass_uavs[0] = (blur_x ? gd->ao.blur_uav.get() : gd->ao.result_uav.get());
+         // 192 pixels along the blur, 2 lines across it, per group
+         const uint2 blur_size = (blur_x ? size : uint2{size.y, size.x});
+         groups[0] = (blur_size.x + 191) / 192;
+         groups[1] = (blur_size.y + 1) / 2;
+         break;
+      }
+      default:
+         return fail();
+      }
+
+      D3D11_MAPPED_SUBRESOURCE mapped;
+      if (FAILED(native_device_context->Map(gd->ao.cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+         return fail();
+      std::memcpy(mapped.pData, rows, sizeof(rows));
+      native_device_context->Unmap(gd->ao.cb.get(), 0);
+
+      com_ptr<ID3D11UnorderedAccessView> engine_target_uav;
+      if (hash == kAOBlurYHash)
+      {
+         native_device_context->CSGetUnorderedAccessViews(0, 1, &engine_target_uav);
+         if (!engine_target_uav)
+            return fail();
+      }
+
+      DrawStateStack<DrawStateStackType::Compute> compute_state;
+      compute_state.Cache(native_device_context, device_data.uav_max_count);
+      ID3D11Buffer* const cb = gd->ao.cb.get();
+      native_device_context->CSSetConstantBuffers(0, 1, &cb);
+      native_device_context->CSSetShaderResources(0, 3, pass_srvs);
+      native_device_context->CSSetUnorderedAccessViews(0, 2, pass_uavs, nullptr);
+      native_device_context->Dispatch(groups[0], groups[1], groups[2]);
+      compute_state.Restore(native_device_context);
+      MEA_COUNT(ao_output_size_passes);
+      if (first_pass)
+      {
+         gd->ao.render_size = render_size;
+         gd->ao.frame = frame;
+      }
+
+      if (hash == kAOBlurYHash)
+      {
+         // Into the engine's AO target, bilinear (a 2x2 average at 50%)
+         com_ptr<ID3D11Resource> engine_target;
+         engine_target_uav->GetResource(&engine_target);
+         if (gd->ao.engine_target.get() != engine_target.get())
+         {
+            gd->ao.engine_target_rtv.reset();
+            gd->ao.engine_target = engine_target.get();
+            const CD3D11_RENDER_TARGET_VIEW_DESC rtv_desc(D3D11_RTV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R8G8B8A8_UNORM);
+            if (FAILED(native_device->CreateRenderTargetView(engine_target.get(), &rtv_desc, gd->ao.engine_target_rtv.put())))
+            {
+               gd->ao.engine_target_rtv.reset();
+               gd->ao.engine_target.reset(); // Retried next frame
+               return fail();
+            }
+         }
+         DrawStateStack<DrawStateStackType::FullGraphics> downscale_state;
+         downscale_state.Cache(native_device_context, device_data.uav_max_count);
+         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(), scale_vs,
+            scale_ps, gd->ao.result_srv.get(), gd->ao.engine_target_rtv.get(), gd->ao.render_size.x, gd->ao.render_size.y);
+         downscale_state.Restore(native_device_context);
+      }
+      return true;
+   }
+
    // The hooked TAA resolve dispatch replaced with DLSS/FSR (or, for the DOF variant, run first and then overwritten by them)
    static DrawOrDispatchOverrideType ReplaceTAAResolve(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, [[maybe_unused]] CommandListData& cmd_list_data,
       DeviceData& device_data, MassEffectAndromedaGameDeviceData* gd, bool dof_variant, std::function<void()>* original_draw_dispatch_func)
@@ -821,15 +1330,17 @@ class MassEffectAndromeda final : public Game
       srv_color->GetResource(res_color.put());
       uav_resolved->GetResource(res_u2.put());
 
-      // The REAL render res comes from the t3 scene-color texture, not core's swapchain-sized render_resolution —
-      // under Resolution Scale they diverge and a wrong size breaks AA (camera-CB res-key mismatch + corner-only u2
-      // copy). DLAA keeps render==output.
+      // The render res comes from the t3 scene-color texture: the engine renders the whole frame up to the tonemap at its
+      // render scale (separate, smaller targets), which also keys the camera CB. The upscaler outputs at the swapchain size
+      // when the engine renders below it, else at the render size (DLAA).
       const uint2 size = GetViewTextureSize(srv_color.get());
       if (size.x == 0 || size.y == 0)
          return DrawOrDispatchOverrideType::None;
       const uint32_t w = size.x, h = size.y;
       const float rw = (float)w, rh = (float)h;
       gd->scene_size = size;
+      const uint2 swapchain_size = {uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
+      const uint2 output_size = ((w <= swapchain_size.x && h <= swapchain_size.y) ? swapchain_size : size);
 
       // Camera was normally captured at the gbuffer VS this frame. Only fall back to the bound-CB probe if that missed
       // (e.g. a frame with no main gbuffer pass).
@@ -874,6 +1385,7 @@ class MassEffectAndromeda final : public Game
 
       // The hand-off into u2/u3 is the copy CS (see Luma_MEA_CopyColor.hlsl): the game's "Buffer Format" setting swaps them
       // between rgba16f and r11g11b10_float, where a plain copy silently no-ops, and u3 needs the native history encoding.
+      // Upscaling, it downsamples: u2 feeds the render-sized passes up to the tonemap, u3 the native fallback.
       // Without it (shaders still compiling, or u2 of another size) the native resolve runs. Checked every dispatch: the
       // transient pool can recycle a pointer for a texture of another format, so a pointer key would go stale.
       auto* copy_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("MEA SR Output Copy CS"));
@@ -913,18 +1425,18 @@ class MassEffectAndromeda final : public Game
          return (dof_variant ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None);
       };
 
-      // (Re)create the output texture at the scene size
+      // (Re)create the output texture at the output size
       D3D11_TEXTURE2D_DESC output_desc = {};
       if (device_data.sr_output_color)
       {
          device_data.sr_output_color->GetDesc(&output_desc);
       }
-      const bool output_resized = output_desc.Width != w || output_desc.Height != h;
+      const bool output_resized = output_desc.Width != output_size.x || output_desc.Height != output_size.y;
       if (output_resized || !gd->sr_output_srv)
       {
          gd->sr_output_srv.reset();
          device_data.sr_output_color.reset();
-         CreateTexture(native_device, DXGI_FORMAT_R16G16B16A16_FLOAT, size, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &device_data.sr_output_color,
+         CreateTexture(native_device, DXGI_FORMAT_R16G16B16A16_FLOAT, output_size, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &device_data.sr_output_color,
             gd->sr_output_srv.put());
          gd->sr_output_recreated = true;
       }
@@ -932,8 +1444,8 @@ class MassEffectAndromeda final : public Game
          return suppress_sr();
 
       const SR::SettingsData settings_data = {
-         .output_width = w,
-         .output_height = h,
+         .output_width = output_size.x,
+         .output_height = output_size.y,
          .render_width = w,
          .render_height = h,
          .hdr = true,            // MEA scene color = linear HDR
@@ -983,6 +1495,8 @@ class MassEffectAndromeda final : public Game
          native_device_context->CSSetUnorderedAccessViews(0, device_data.uav_max_count, uavs, nullptr);
          ID3D11ShaderResourceView* srv = gd->sr_output_srv.get();
          native_device_context->CSSetShaderResources(0, 1, &srv);
+         ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get(); // a downsample when upscaling
+         native_device_context->CSSetSamplers(0, 1, &linear_sampler);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
          if (uav_history)
          {
@@ -1007,6 +1521,11 @@ class MassEffectAndromeda final : public Game
          sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
       }
       MEA_COUNT(sr_draws);
+      if (output_size != size)
+      {
+         gd->resolve_target = res_u2;
+      }
+      device_data.render_resolution = {rw, rh};
       device_data.has_drawn_sr = true;
       device_data.has_drawn_main_post_processing = true;
       return DrawOrDispatchOverrideType::Replaced; // cancel native TAA
@@ -1023,6 +1542,10 @@ public:
       if (restore_engine_settings && g_world_render_settings)
       {
          WriteWorldRenderSettings(g_world_render_settings_vanilla);
+      }
+      if (restore_engine_settings && g_game_render_settings_written)
+      {
+         WriteGameRenderSettings(g_game_render_settings_vanilla);
       }
    }
 
@@ -1041,9 +1564,10 @@ public:
          {"disable_taa_sharpening", &g_disable_taa_sharpening},
          {"halton_jitter", &g_halton_jitter},
          {"improve_taa_jitter", &g_improve_taa_jitter},
+         {"ao_output_size", &g_ao_output_size},
       });
       Mcp::RegisterInts({{"halton_jitter_native_phases", &g_halton_jitter_native_phases, 1, 64}});
-      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"mv_scale_mult", &g_mv_scale_mult, 0.25f, 4.f}});
+      Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"mv_scale_mult", &g_mv_scale_mult, 0.25f, 4.f}, {"render_scale", &g_render_scale, kMinRenderScale, 1.f}});
       const FrameCounters& c = g_counters_last_frame;
       Mcp::RegisterCounters({
          {"taa.resolves", &c.taa_resolves},
@@ -1061,9 +1585,14 @@ public:
          {"fxaa.draws", &c.fxaa_draws},
          {"smaa.draws", &c.smaa_draws},
          {"rcas.draws", &c.rcas_draws},
+         {"upscale.tonemaps", &c.tonemaps_upscaled},
+         {"upscale.stretched", &c.tonemaps_stretched},
+         {"upscale.redirects", &c.tonemap_redirects},
+         {"ao.output_size_passes", &c.ao_output_size_passes},
+         {"ao.output_size_aborts", &c.ao_output_size_aborts},
       });
 #if ENABLE_SR
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("sr.output", sr_output_srv)});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("sr.output", sr_output_srv), MCP_GAME_TEXTURE("ao.result", ao.result_srv)});
 #endif
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("rcas.input", tex_rcas_input_srv), MCP_GAME_TEXTURE("smaa.predication", srv_pred)});
 #endif
@@ -1135,10 +1664,34 @@ public:
       }
 #endif
 
+#if ENABLE_SR
+      if (is_immediate && (stages & reshade::api::shader_stage::compute) != 0)
+      {
+         const uint32_t compute_hash = original_shader_hashes.compute_shaders[0];
+         if ((compute_hash == kAODeinterleaveHash || compute_hash == kAOHorizonHash || compute_hash == kAOBlurXHash || compute_hash == kAOBlurYHash) &&
+             RunOutputSizedAOPass(native_device, native_device_context, cmd_list_data, device_data, &gd, compute_hash))
+            return DrawOrDispatchOverrideType::Replaced;
+      }
+
+      // Upscaling: the tonemap at the output size, then every draw on its target (see "upscaled_scene")
+      const bool is_tonemap = shader_hashes_tonemap.Contains(original_shader_hashes.pixel_shaders[0], reshade::api::shader_stage::pixel);
+      if (is_immediate && gd.resolve_target && (stages & reshade::api::shader_stage::pixel) != 0 && original_draw_dispatch_func && *original_draw_dispatch_func)
+      {
+         if (gd.tonemap_target)
+         {
+            if (RedirectTonemapTarget(native_device, native_device_context, cmd_list_data, device_data, &gd, *original_draw_dispatch_func))
+               return DrawOrDispatchOverrideType::Replaced;
+         }
+         else if (is_tonemap && DrawUpscaledTonemap(native_device, native_device_context, cmd_list_data, device_data, &gd, *original_draw_dispatch_func))
+         {
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+      }
+#endif
+
 #if ENABLE_SMAA && ENABLE_SR
       // "has_drawn_sr" is this frame's (reset at present)
-      if (g_rcas_sharpness > 0.f && device_data.has_drawn_sr && is_immediate && original_draw_dispatch_func && *original_draw_dispatch_func &&
-          original_shader_hashes.Contains(kTonemapHash, reshade::api::shader_stage::pixel))
+      if (g_rcas_sharpness > 0.f && device_data.has_drawn_sr && is_immediate && original_draw_dispatch_func && *original_draw_dispatch_func && is_tonemap)
       {
          return DrawTonemapWithRCAS(native_device, native_device_context, cmd_list_data, device_data, &gd, *original_draw_dispatch_func);
       }
@@ -1179,11 +1732,18 @@ public:
 #endif
       UpdateWorldRenderSettings(device_data);
 #if ENABLE_SR
+      UpdateGameRenderSettings(gd.sr_active);
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again)
       if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
+         gd.ReleaseUpscaledScene();
+         gd.ao = {};
       }
+      gd.resolve_target.reset();
+      gd.tonemap_target.reset();
+      gd.tonemap_upscaled = false;
+      gd.upscaled_scene_filled = false;
 #endif
 
 #if ENABLE_SMAA
@@ -1204,9 +1764,10 @@ public:
       }
 #endif
 
-      // -1 at native resolution (Core biases the game's anisotropic samplers, all upgraded to AF16x); vanilla without SR
+      // From the last resolve's render height to the output: -1 at native resolution, -2 at half (Core biases the game's
+      // anisotropic samplers, all upgraded to AF16x); vanilla without SR
 #if ENABLE_SR
-      const float mip_lod_bias = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
+      const float mip_lod_bias = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f);
 #else
       constexpr float mip_lod_bias = 0.f;
 #endif
@@ -1238,6 +1799,8 @@ public:
       reshade::get_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       reshade::get_config_value(nullptr, NAME, "DisableTAASharpening", g_disable_taa_sharpening);
       reshade::get_config_value(nullptr, NAME, "ImproveTAAJitter", g_improve_taa_jitter);
+      reshade::get_config_value(nullptr, NAME, "RenderScale", g_render_scale);
+      g_render_scale = std::clamp(g_render_scale, kMinRenderScale, 1.f);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -1248,6 +1811,28 @@ public:
       constexpr bool sr_selected = false;
 #endif
       ImGui::SeparatorText("Anti-Aliasing");
+#if ENABLE_SR
+      ImGui::BeginDisabled(!sr_selected);
+      // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
+      static int held_render_scale = 0; // The slider's value while it's held, else 0
+      int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(g_render_scale * 100.f)));
+      ImGui::SliderInt("Render Scale (%)", &render_scale, int(kMinRenderScale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+      held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         g_render_scale = float(render_scale) / 100.f;
+         reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR. Replaces the game's Resolution Scale while they run.");
+      }
+      if (DrawResetButton<float, false>(g_render_scale, 1.f, "RenderScale"))
+      {
+         reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
+      }
+      ImGui::EndDisabled();
+#endif
       if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
@@ -1345,8 +1930,8 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Mass Effect: Andromeda\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds DLAA or FSR 3 native anti-aliasing, and replaces the game's FXAA with SMAA, plus 16x anisotropic filtering.\n"
-         "Set Anti-Aliasing to TAA in the game's video settings for DLAA and FSR 3 to apply, or to FXAA for SMAA.\n"
+         "It adds DLSS or FSR 3 anti-aliasing and upscaling, and replaces the game's FXAA with SMAA, plus 16x anisotropic filtering.\n"
+         "Set Anti-Aliasing to TAA in the game's video settings for DLSS and FSR 3 to apply, or to FXAA for SMAA.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
       ImGui::PopTextWrapPos();
