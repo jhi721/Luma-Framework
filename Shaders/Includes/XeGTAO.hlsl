@@ -13,6 +13,7 @@
 // - float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord), unless XE_GTAO_GENERATE_NORMALS reconstructs normals from depth
 // Optional hooks (no-op when undefined):
 // - XE_GTAO_DEPTH_LOAD_SCALE: game depth pixels per working pixel (prefilter reads a larger depth buffer)
+// - XE_GTAO_DEPTH_LOAD_COORD(pixCoord): the game depth pixel a working pixel loads, replacing the XE_GTAO_DEPTH_LOAD_SCALE product
 // - XE_GTAO_EFFECT_RADIUS(viewspaceZ): effect radius at a view z (default: XeGTAO_EffectRadius(), constant)
 // - XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ): the main pass radius only (default: XE_GTAO_EFFECT_RADIUS)
 // - XE_GTAO_ADJUST_SCREENSPACE_RADIUS(screenspaceRadius): statement adjusting the radius in pixels
@@ -86,10 +87,12 @@
 #define XE_GTAO_PI                   3.1415926535897932384626433832795
 #define XE_GTAO_PI_HALF              1.5707963267948966192313216916398
 
+#ifndef XE_GTAO_DEPTH_LOAD_COORD
 #ifdef XE_GTAO_DEPTH_LOAD_SCALE
 #define XE_GTAO_DEPTH_LOAD_COORD(pixCoord) ((pixCoord) * (XE_GTAO_DEPTH_LOAD_SCALE))
 #else
 #define XE_GTAO_DEPTH_LOAD_COORD(pixCoord) (pixCoord)
+#endif
 #endif
 
 #if XE_GTAO_PIXEL_SIZE_FROM_SOURCE
