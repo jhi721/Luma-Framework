@@ -4,7 +4,7 @@
 #include "../../Includes/DgVoodoo.hlsl"
 
 // The Witcher 2 - dgVoodoo bindings and ops the replaced passes share, and nothing else. Included by the tonemap, the
-// final grade, the glow and light-shaft blends and the video pass.
+// final grade, the glow and light-shaft blends, the video pass and the AO pack and blur.
 // Deliberately holds no textures or samplers, and no alias for a game-content cb4 row: row meaning is per pass (cb4[60]
 // is vHighlight in the grade but the glow UV clamp rect in the glow blend). Name rows in the pass that reads them.
 // Needs no includes of its own: its helpers use intrinsics only, so this file stays out of the load-bearing include

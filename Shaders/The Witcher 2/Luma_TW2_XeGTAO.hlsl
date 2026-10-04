@@ -52,8 +52,9 @@ cbuffer LumaGTAO : register(b9)
 #define EFFECT_FALLOFF_RANGE      0.005
 #define SAMPLE_DISTRIBUTION_POWER 1.5
 
-// Capped at the native HBAO kernel, cb4[16].y pixels of the full size AO target: under the render scale fewer pixels (the area's share),
-// or each one, covering more of the view, would let the radius grow by 1 / area_scale (larger halos at 50%).
+// Capped at the native HBAO kernel, cb4[16].y pixels of the full size AO target: when XeGTAO works on the scene's share alone (work_share
+// < 1, see GameCBuffers.hlsl), its fewer pixels each cover more of the view and would let the radius grow by 1 / work_share (larger halos
+// at 50%). 1 on the whole target.
 #define NATIVE_KERNEL_PIXELS                        (cb4[16].y * gtao_knobs.work_share.x)
 #define XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ) min(XeGTAO_EffectRadius(), NATIVE_KERNEL_PIXELS * viewspaceZ * NDC_TO_VIEW_MUL_X_PIXEL_SIZE.x)
 

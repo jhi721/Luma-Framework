@@ -25,10 +25,15 @@ void main(
     float4 v12 : TEXCOORD7,
     out float4 o0 : SV_TARGET0)
 {
-   // cb4[60]: .xy the surface's texel size (min clamp, a half texel in), .zw the area's max UV; cb4[62]: .xy the direction, .z the
-   // depth falloff; cb4[63..69].x the kernel weights
-   const float2 uv = min(cb4[60].zw, max(v5.xy, cb4[60].xy));
-   const float2 step = cb4[62].xy * cb4[60].xy * cb4[42].zw;
+   const float2 texel_size = cb4[60].xy; // 1 / the surface, also the min UV clamp (a half texel in)
+   const float2 max_uv = cb4[60].zw;     // The area's
+   const float2 direction = cb4[62].xy;
+   const float depth_falloff = cb4[62].z;
+   const float2 area_share = cb4[42].zw; // c34 "PSC_ViewportSubSize"
+   // cb4[63..69].x: the kernel weights, center first
+
+   const float2 uv = min(max_uv, max(v5.xy, texel_size));
+   const float2 step = direction * texel_size * area_share;
    const float4 center = ApplyDgvMask(t0.Sample(s0_s, uv), DgvMaskT0, DgvFillT0);
 
    float sum = center.x * cb4[63].x;
@@ -40,12 +45,12 @@ void main(
          const float offset = (side == 0 ? 2.0 : -2.0) * float(i);
          const float4 tap = ApplyDgvMask(t0.Sample(s0_s, step * offset + uv), DgvMaskT0, DgvFillT0);
          // Depth aware weight, relaxed toward 1 with distance (full at 100 units)
-         const float depth_weight = saturate(1.0 - cb4[62].z * abs(tap.y - center.y));
+         const float depth_weight = saturate(1.0 - depth_falloff * abs(tap.y - center.y));
          const float weight = saturate(tap.y * 0.01) * (1.0 - depth_weight) + depth_weight;
          norm += cb4[63 + i].x * weight;
          sum += weight * cb4[63 + i].x * tap.x;
       }
    }
-   o0.x = sum * ((abs(norm) > 0.0) ? rcp(norm) : 9999999933815812510711506376257961984.0);
+   o0.x = sum * DgVoodooRcp(norm);
    o0.yzw = float3(center.y, 0.0, 0.0);
 }

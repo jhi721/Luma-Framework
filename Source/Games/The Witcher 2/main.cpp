@@ -641,7 +641,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // matching triple means "failed" and no per-frame retry fragments the 32-bit address space. ReleaseGTAOScratch
    // clears it.
    uint32_t gtao_w = 0, gtao_h = 0;                  // The game's AO target (the final texture's size)
-   uint32_t gtao_work_w = 0, gtao_work_h = 0;        // The working textures: the scene's share of it under the render scale
+   uint32_t gtao_work_w = 0, gtao_work_h = 0;        // The working textures: the whole AO target, or its scene share without the full size depth
    DXGI_FORMAT gtao_final_fmt = DXGI_FORMAT_UNKNOWN; // actual (possibly Luma-upgraded) AO RT format
    com_ptr<ID3D11Buffer> cb_gtao;                    // knobs + viewport (GTAO_KNOBS_CB_SLOT), dynamic: the noise index changes every frame
    // The replaced pack's AO UV scale (AOPack_0x953119B5): output / render size when this frame's generator filled the whole AO target,
