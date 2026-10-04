@@ -159,10 +159,12 @@ static constexpr uint32_t kVideoBinkHash = 0x7B5C59DF;
 // dispatch; the apply blit (see "kAOApplyHash") composites it. Noise and denoise pass count follow "IsGTAOTemporal".
 // It fills the whole AO target (half the output) at any render scale, from the full size scene depth and view normals:
 // HBAO+'s own inputs are half the render resolution, a quarter of the output at 50%, which washed out contact AO.
+// Without XeGTAO the native chain fills the whole target too under the render scale (see "RunAO"): the engine's fixed scale
+// (off on PC) never adapted HBAO+, whose radius is scaled twice and whose ProjInfo spans the whole view over the target's UVs.
 static constexpr uint32_t kAODownsampleHash = 0xA75E6C32;   // Depth and normals downsample (PS): its full size sources captured.
 static constexpr uint32_t kAODeinterleaveHash = 0x497830D8; // Depth deinterleave: skipped.
-static constexpr uint32_t kAOHorizonHash = 0x80212FD6;      // Horizon march: skipped.
-static constexpr uint32_t kAOBlurHash = 0x06D92B08;         // Blur: replaced with XeGTAO.
+static constexpr uint32_t kAOHorizonHash = 0x80212FD6;      // Horizon march: skipped, or its radius scaled.
+static constexpr uint32_t kAOBlurHash = 0x06D92B08;         // Blur: replaced with XeGTAO, or dispatched over the whole target.
 static constexpr uint32_t kAOApplyHash = 0x2E826C0F;        // Apply (PS, replaced): AO UV scale in LumaData.CustomData3/4.
 
 static bool g_gtao_enable = true;
@@ -700,6 +702,12 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> srv_gtao_normals;
    // Set only after a complete takeover at deinterleave; otherwise the native chain remains intact.
    bool gtao_active_this_frame = false;
+   // The native chain's downsample drew over the whole AO target under the render scale (see "RunAO").
+   bool hbao_stretched_this_frame = false;
+   // A stretched pass after the downsample couldn't patch its constants: the blur writes neutral AO (see "RunAO").
+   bool hbao_stretch_failed = false;
+   // The last AO apply drew its replacement, the only reader of a whole target AO under the render scale (see "RunAO").
+   bool ao_apply_replaced = false;
 
    // Five-level R32F view-space-depth pyramid.
    ComPtr<ID3D11Texture2D> tex_gtao_depth_mips;
@@ -713,7 +721,14 @@ struct MassEffectGameDeviceData final : public GameDeviceData
 
    // b11 = (FinalValuePower, DepthScale, RadiusOverride, DebugView, NoiseIndex), written every frame.
    com_ptr<ID3D11Buffer> cb_gtao;
-
+   // The stretched native horizon pass's b2 (immutable, allocated with the patch buffers): only c7 (DynamicScaleCS) is read, 1.
+   com_ptr<ID3D11Buffer> cb_hbao_dynamic_scale;
+   // The stretched native horizon and blur passes' b0, the game's patched on the GPU (see "PatchGameConstants"): the patch's
+   // parameters, its UAV target and the constant buffer it is copied into.
+   com_ptr<ID3D11Buffer> cb_hbao_patch;
+   com_ptr<ID3D11Buffer> buffer_hbao_patched;
+   com_ptr<ID3D11UnorderedAccessView> uav_hbao_patched;
+   com_ptr<ID3D11Buffer> cb_hbao_patched;
    // Bright-pass cb0 staging ring for no-stall per-scene BloomScale and threshold capture.
    ComPtr<ID3D11Buffer> bloom_scale_ring[3];
    int bloom_scale_ring_wr = 0;
@@ -989,6 +1004,7 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameSharpenPS = CompileTimeStringHash("MELE Sharpen PS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
    static constexpr uint32_t kNameRenderShareStretchCS = CompileTimeStringHash("MELE Render Share Stretch CS");
+   static constexpr uint32_t kNameConstantsPatchCS = CompileTimeStringHash("MELE Constants Patch CS");
 
    // (Re)create an fp16 scratch target on resolution change, with a view per requested bind flag (render target, shader resource).
    // Returns false if the texture or any requested view is missing.
@@ -2546,6 +2562,8 @@ public:
          ShaderDefinition("Luma_MELE_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(kNameRenderShareStretchCS,
          ShaderDefinition("Luma_MELE_RenderShareStretch", reshade::api::pipeline_subobject_type::compute_shader));
+      native_shaders_definitions.emplace(kNameConstantsPatchCS,
+         ShaderDefinition("Luma_MELE_ConstantsPatch", reshade::api::pipeline_subobject_type::compute_shader));
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
@@ -2772,26 +2790,115 @@ public:
       }
    }
 
+   // A copy of the first 16 rows of "game_constants" with one row's components multiplied and offset, made on the GPU (see
+   // Luma_MELE_ConstantsPatch.hlsl), into the buffers the stretched downsample allocated: the game rewrites the HBAO+ passes' b0
+   // before each dispatch. Null on failure.
+   ID3D11Buffer* PatchGameConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, ID3D11Buffer* game_constants, uint32_t row, const std::array<float, 4>& scale, const std::array<float, 4>& bias)
+   {
+      auto* const patch_shader = FindShader(device_data.native_compute_shaders, kNameConstantsPatchCS);
+      if (!patch_shader || !game_constants || !gd->cb_hbao_patched)
+         return nullptr;
+      struct ConstantsPatch
+      {
+         std::array<float, 4> scale;
+         std::array<float, 4> bias;
+         uint32_t row;
+         uint32_t padding[3] = {};
+      };
+      const ConstantsPatch patch = {.scale = scale, .bias = bias, .row = row};
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_hbao_patch), &patch, sizeof(patch)))
+         return nullptr;
+      DrawStateStack<DrawStateStackType::Compute> compute_state;
+      compute_state.Cache(native_device_context, device_data.uav_max_count);
+      ID3D11Buffer* const constant_buffers[2] = {game_constants, gd->cb_hbao_patch.get()};
+      native_device_context->CSSetConstantBuffers(0, 2, constant_buffers);
+      ID3D11UnorderedAccessView* const uav = gd->uav_hbao_patched.get();
+      native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+      native_device_context->CSSetShader(patch_shader, nullptr, 0);
+      native_device_context->Dispatch(1, 1, 1);
+      compute_state.Restore(native_device_context);
+      // A UAV can't view a constant buffer.
+      native_device_context->CopyResource(gd->cb_hbao_patched.get(), gd->buffer_hbao_patched.get());
+      return gd->cb_hbao_patched.get();
+   }
+
    // Take over HBAO+ only when every XeGTAO shader and resource is ready at the first dispatch, otherwise the
    // whole native deinterleave -> horizon -> blur -> apply chain stays active. A returned value is terminal for
-   // the callback; nullopt means XeGTAO is off or no AO hash matched, and the caller continues.
-   std::optional<DrawOrDispatchOverrideType> RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes)
+   // the callback; nullopt means no AO hash matched (or the pass runs untouched), and the caller continues.
+   // Under the render scale either chain fills the whole AO target, which only the apply replacement reads (its UV scaled onto
+   // it), so both wait for the last apply to have drawn it; otherwise the native chain runs untouched, as the native apply expects
+   std::optional<DrawOrDispatchOverrideType> RunAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, std::function<void()>* original_draw_dispatch_func)
    {
-      if (!g_gtao_enable)
-         return {};
+      const bool render_share = IsRenderShare(device_data, *gd);
+      const bool fill_target_allowed = !render_share || gd->ao_apply_replaced;
+      const auto gtao_ready = [&]
+      {
+         return g_gtao_enable && fill_target_allowed && HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS);
+      };
 
-      // Depth and normals downsample: runs natively (its half size outputs feed only the skipped HBAO+ passes), its sources are XeGTAO's
+      // Depth and normals downsample: its sources are XeGTAO's, whose takeover leaves its half size outputs unread
       if (original_shader_hashes.Contains(kAODownsampleHash, reshade::api::shader_stage::pixel))
       {
-         native_device_context->PSGetShaderResources(0, 1, gd->srv_gtao_depth.put());
-         native_device_context->PSGetShaderResources(1, 1, gd->srv_gtao_normals.put());
-         return {};
+         if (gtao_ready())
+         {
+            native_device_context->PSGetShaderResources(0, 1, gd->srv_gtao_depth.put());
+            native_device_context->PSGetShaderResources(1, 1, gd->srv_gtao_normals.put());
+            return {};
+         }
+         if (!render_share || !fill_target_allowed || !original_draw_dispatch_func || !*original_draw_dispatch_func || !HasShaders(device_data.native_compute_shaders, kNameConstantsPatchCS))
+            return {};
+         // The main view draws its render share's half (the 512x512 secondary view a 256x256 one): drawn over the whole target
+         // instead, its pass-through VS quad stretches the render share of the full size depth and normals over it
+         D3D11_VIEWPORT viewport = {};
+         UINT viewport_count = 1;
+         native_device_context->RSGetViewports(&viewport_count, &viewport);
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         if (!rtv)
+            return {};
+         uint4 target_size{};
+         DXGI_FORMAT unused_format = DXGI_FORMAT_UNKNOWN;
+         GetResourceInfo(rtv.get(), target_size, unused_format);
+         const bool main_view = std::abs(viewport.Width - float(gd->render_size[0]) * 0.5f) <= 1.f && std::abs(viewport.Height - float(gd->render_size[1]) * 0.5f) <= 1.f;
+         if (!main_view || float(target_size.x) <= viewport.Width || float(target_size.y) <= viewport.Height)
+            return {};
+         // Everything the later stretched passes need is allocated before committing, so none of them can leave the chain half
+         // stretched for want of a resource
+         if (!gd->cb_hbao_patched || !gd->cb_hbao_dynamic_scale)
+         {
+            static constexpr UINT kPatchedRows = 16; // The horizon pass reads b0 c0-c15
+            const D3D11_BUFFER_DESC uav_buffer_desc = {.ByteWidth = kPatchedRows * 16, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_UNORDERED_ACCESS};
+            const D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {.Format = DXGI_FORMAT_R32G32B32A32_UINT, .ViewDimension = D3D11_UAV_DIMENSION_BUFFER, .Buffer = {.NumElements = kPatchedRows}};
+            const D3D11_BUFFER_DESC cb_desc = {.ByteWidth = kPatchedRows * 16, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_CONSTANT_BUFFER};
+            float dynamic_scale_constants[8 * 4] = {};
+            dynamic_scale_constants[7 * 4 + 0] = 1.f;
+            dynamic_scale_constants[7 * 4 + 1] = 1.f;
+            const D3D11_BUFFER_DESC dynamic_scale_desc = {.ByteWidth = sizeof(dynamic_scale_constants), .Usage = D3D11_USAGE_IMMUTABLE, .BindFlags = D3D11_BIND_CONSTANT_BUFFER};
+            const D3D11_SUBRESOURCE_DATA dynamic_scale_data = {.pSysMem = dynamic_scale_constants};
+            bool ok = SUCCEEDED(native_device->CreateBuffer(&uav_buffer_desc, nullptr, &gd->buffer_hbao_patched));
+            ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->buffer_hbao_patched.get(), &uav_desc, &gd->uav_hbao_patched));
+            ok = ok && SUCCEEDED(native_device->CreateBuffer(&cb_desc, nullptr, &gd->cb_hbao_patched));
+            ok = ok && SUCCEEDED(native_device->CreateBuffer(&dynamic_scale_desc, &dynamic_scale_data, &gd->cb_hbao_dynamic_scale));
+            if (!ok)
+            {
+               gd->buffer_hbao_patched.reset();
+               gd->uav_hbao_patched.reset();
+               gd->cb_hbao_patched.reset();
+               gd->cb_hbao_dynamic_scale.reset();
+               return {};
+            }
+         }
+         SetViewportFullscreen(native_device_context, uint2{target_size.x, target_size.y});
+         (*original_draw_dispatch_func)();
+         native_device_context->RSSetViewports(1, &viewport);
+         gd->hbao_stretched_this_frame = true;
+         return DrawOrDispatchOverrideType::Replaced;
       }
 
       // Deinterleave: prepare all scratch resources at its depth's size (the AO target's), then skip native work.
       if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
       {
-         if (!HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS) || !gd->srv_gtao_depth || !gd->srv_gtao_normals)
+         if (!gtao_ready() || !gd->srv_gtao_depth || !gd->srv_gtao_normals)
             return DrawOrDispatchOverrideType::None;
 
          ComPtr<ID3D11ShaderResourceView> ao_depth_srv;
@@ -2808,7 +2915,6 @@ public:
             return DrawOrDispatchOverrideType::None;
          // Scene depth and normal pixels per AO pixel: the AO target spans the rendered share of the output sized sources, so 2 at
          // native and 1 (AO per rendered pixel) at 50% render scale
-         const bool render_share = IsRenderShare(device_data, *gd);
          const float depth_load_scale_x = float(render_share ? gd->render_size[0] : scene_depth_size.x) / float(w);
          const float depth_load_scale_y = float(render_share ? gd->render_size[1] : scene_depth_size.y) / float(h);
 
@@ -2866,15 +2972,73 @@ public:
          return DrawOrDispatchOverrideType::Replaced;
       }
 
-      // Horizon march: skipped after a successful takeover.
+      // Horizon march: skipped after a successful takeover. Stretched, it marches the whole target as at native: its RadiusToScreen
+      // (b0 c0.x) follows the render size, so it is scaled by output / render; DynamicScaleCS (b2 c7.xy, its only b2 read) goes to 1,
+      // as it also scales the ray's first one texel step; ProjInfo already spans the whole view over the target's UVs
       if (original_shader_hashes.Contains(kAOHorizonHash, reshade::api::shader_stage::compute))
-         return (gd->gtao_active_this_frame ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None);
+      {
+         if (gd->gtao_active_this_frame)
+            return DrawOrDispatchOverrideType::Replaced;
+         if (!gd->hbao_stretched_this_frame || !original_draw_dispatch_func || !*original_draw_dispatch_func)
+            return DrawOrDispatchOverrideType::None;
+         com_ptr<ID3D11Buffer> cb_globals;
+         native_device_context->CSGetConstantBuffers(0, 1, &cb_globals);
+         com_ptr<ID3D11Buffer> cb_offsets;
+         native_device_context->CSGetConstantBuffers(2, 1, &cb_offsets);
+         const float radius_scale = device_data.output_resolution.y / float(gd->render_size[1]);
+         ID3D11Buffer* const cb_globals_patched = PatchGameConstants(native_device, native_device_context, device_data, gd, cb_globals.get(), 0, {radius_scale, 1.f, 1.f, 1.f}, {});
+         if (!cb_globals_patched)
+         {
+            gd->hbao_stretch_failed = true;
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         ID3D11Buffer* const cb_dynamic_scale = gd->cb_hbao_dynamic_scale.get();
+         native_device_context->CSSetConstantBuffers(0, 1, &cb_globals_patched);
+         native_device_context->CSSetConstantBuffers(2, 1, &cb_dynamic_scale);
+         (*original_draw_dispatch_func)();
+         ID3D11Buffer* const cb_globals_raw = cb_globals.get();
+         ID3D11Buffer* const cb_offsets_raw = cb_offsets.get();
+         native_device_context->CSSetConstantBuffers(0, 1, &cb_globals_raw);
+         native_device_context->CSSetConstantBuffers(2, 1, &cb_offsets_raw);
+         return DrawOrDispatchOverrideType::Replaced;
+      }
 
       // Blur: run all XeGTAO passes and write the game's final R8_UNORM u0; native apply performs composition.
       if (original_shader_hashes.Contains(kAOBlurHash, reshade::api::shader_stage::compute))
       {
+         // Stretched, it is still dispatched over the render share's AO size (8x8 pixel groups) and clamps its loads to it
+         // (AOTexDimensions, b0 c7.xy): both become the whole target's
          if (!gd->gtao_active_this_frame)
-            return DrawOrDispatchOverrideType::None;
+         {
+            if (!gd->hbao_stretched_this_frame)
+               return DrawOrDispatchOverrideType::None;
+            com_ptr<ID3D11Buffer> cb_globals;
+            native_device_context->CSGetConstantBuffers(0, 1, &cb_globals);
+            com_ptr<ID3D11UnorderedAccessView> uav_ao;
+            native_device_context->CSGetUnorderedAccessViews(0, 1, &uav_ao);
+            if (!uav_ao)
+               return DrawOrDispatchOverrideType::Replaced;
+            uint4 ao_size{};
+            DXGI_FORMAT unused_format = DXGI_FORMAT_UNKNOWN;
+            GetResourceInfo(uav_ao.get(), ao_size, unused_format);
+            ID3D11Buffer* cb_globals_patched = nullptr;
+            if (!gd->hbao_stretch_failed)
+            {
+               cb_globals_patched = PatchGameConstants(native_device, native_device_context, device_data, gd, cb_globals.get(), 7, {0.f, 0.f, 1.f, 1.f}, {float(ao_size.x), float(ao_size.y), 0.f, 0.f});
+            }
+            if (!cb_globals_patched)
+            {
+               // The apply reads the whole target: neutral AO rather than a half stretched chain's
+               const FLOAT ones[4] = {1.f, 1.f, 1.f, 1.f};
+               native_device_context->ClearUnorderedAccessViewFloat(uav_ao.get(), ones);
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+            native_device_context->CSSetConstantBuffers(0, 1, &cb_globals_patched);
+            native_device_context->Dispatch((ao_size.x + 7) / 8, (ao_size.y + 7) / 8, 1);
+            ID3D11Buffer* const cb_globals_raw = cb_globals.get();
+            native_device_context->CSSetConstantBuffers(0, 1, &cb_globals_raw);
+            return DrawOrDispatchOverrideType::Replaced;
+         }
 
          ComPtr<ID3D11UnorderedAccessView> uav_final;
          native_device_context->CSGetUnorderedAccessViews(0, 1, uav_final.put());
@@ -3338,12 +3502,13 @@ public:
 
       InjectBloomAndDepth(native_device, native_device_context, device_data, &gd, stage1_perm);
 
-      // AO apply (also with XeGTAO off: the replacement always reads the scale): the scene UV reaches only the rendered share of the AO
-      // target, which is all the native chain fills, while XeGTAO fills the whole target
+      // AO apply (the replacement always reads the scale): the scene UV reaches only the rendered share of the AO target, which is all
+      // the untouched native chain fills, while XeGTAO or the stretched native chain fill the whole target (see "RunAO")
       if (original_shader_hashes.Contains(kAOApplyHash, reshade::api::shader_stage::pixel))
       {
+         gd.ao_apply_replaced = is_custom_pass && custom_shaders_enabled; // Core binds the clone only while custom shaders are enabled
          float uv_scale[2] = {1.f, 1.f};
-         if (gd.gtao_active_this_frame && IsRenderShare(device_data, gd))
+         if ((gd.gtao_active_this_frame || gd.hbao_stretched_this_frame) && IsRenderShare(device_data, gd))
          {
             uv_scale[0] = device_data.output_resolution.x / float(gd.render_size[0]);
             uv_scale[1] = device_data.output_resolution.y / float(gd.render_size[1]);
@@ -3352,9 +3517,9 @@ public:
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, uv_scale[0], uv_scale[1]);
          updated_cbuffers = true;
       }
-      else if (const auto gtao_result = RunXeGTAO(native_device, native_device_context, device_data, &gd, original_shader_hashes))
+      else if (const auto ao_result = RunAO(native_device, native_device_context, device_data, &gd, original_shader_hashes, original_draw_dispatch_func))
       {
-         return *gtao_result;
+         return *ao_result;
       }
 
       return RunSMAAResolve(native_device, native_device_context, device_data, &gd, original_shader_hashes, is_custom_pass);
@@ -3643,6 +3808,8 @@ public:
       gd.srv_gtao_depth.reset();
       gd.srv_gtao_normals.reset();
       gd.gtao_active_this_frame = false;
+      gd.hbao_stretched_this_frame = false;
+      gd.hbao_stretch_failed = false;
       gd.bloom_scale_captured_this_frame = false; // Re-arms the bright pass capture.
       gd.scene_post_done_this_frame = false;      // Set again by the FXAA resolve.
 #if DEVELOPMENT
