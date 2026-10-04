@@ -258,6 +258,74 @@ namespace EngineScale
       return render_post_process_original(renderer, dpg, lighting_only, argument_4);
    }
 
+   // The disp8 of each view size load "PatchViewSizeLoads" pointed at the unscaled size, restored on uninstall
+   std::vector<std::byte*> unscaled_view_size_loads;
+
+   // The engine sizes three things by the view's size in pixels, the scaled one below native render scale (ME1 LE, found by the
+   // "max(SizeX * ProjectionMatrix[0][0], SizeY * ProjectionMatrix[1][1])" reads): per-object shadow depths ("ShadowTexelsPerPixel",
+   // 2 functions: half the shadow texels at 50%, so the Mako lost its self-shadowing), skeletal mesh LODs (the screen radius over 320
+   // against each LOD's DisplayFactor) and texture streaming's screen size (the 3 "AddViewInformation" calls). Their loads read the
+   // unscaled size (+8) instead, as at native, where both are equal. Each group must match exactly its sites (summed over its pattern
+   // variants), else it stays as is.
+   void PatchViewSizeLoads()
+   {
+      using System::ANY;
+      // movss [view + 0x64]; lea rcx, [rip]; movss [view + 0x68]; xor edx, edx (ME1 LE 0x89CD9B)
+      constexpr std::array<System::BytePattern, 19> shadow_pattern = {{0xF3, 0x0F, 0x10, ANY, 0x64, 0x48, 0x8D, 0x0D, ANY, ANY, ANY, ANY, 0xF3, 0x0F, 0x10, ANY, 0x68, 0x33, 0xD2}};
+      // movss [view + 0x64]; mov rcx, r15; movss xmm8, [view + 0x68]; movss xmm6, [rsp + x] (ME1 LE 0x89D486)
+      constexpr std::array<System::BytePattern, 20> shadow_2_pattern = {{0xF3, 0x0F, 0x10, ANY, 0x64, ANY, 0x8B, ANY, 0xF3, 0x44, 0x0F, 0x10, ANY, 0x68, 0xF3, 0x0F, 0x10, 0x74, 0x24, ANY}};
+      // movss [view + 0x64]; mov rcx, rsi; movss [view + 0x68]; mov rax, [rsi]; 2 mulss; mulss [view + 0xE4] (ME1 LE 0x5AFA03)
+      constexpr std::array<System::BytePattern, 32> skeletal_lod_pattern = {{0xF3, 0x0F, 0x10, ANY, 0x64, 0x48, 0x8B, ANY, 0xF3, 0x0F, 0x10, ANY, 0x68, 0x48, 0x8B, ANY, 0xF3, 0x0F, 0x59, ANY, 0xF3, 0x0F, 0x59, ANY, 0xF3, 0x0F, 0x59, ANY, 0xE4, 0x00, 0x00, 0x00}};
+      // The same, scheduled differently: movss [view + 0x64]; xor edx, edx; movss [view + 0x68]; mov rcx, rsi; mov rax, [rsi]; ...
+      // (ME3 LE 0x7AD6A3)
+      constexpr std::array<System::BytePattern, 34> skeletal_lod_me3_pattern = {{0xF3, 0x0F, 0x10, ANY, 0x64, 0x33, 0xD2, 0xF3, 0x0F, 0x10, ANY, 0x68, 0x48, 0x8B, ANY, 0x48, 0x8B, ANY, 0xF3, 0x0F, 0x59, ANY, 0xF3, 0x0F, 0x59, ANY, 0xF3, 0x0F, 0x59, ANY, 0xE4, 0x00, 0x00, 0x00}};
+      // movss xmm2, [view + 0x64]; movaps xmm3, xmm2; mulss xmm3, [view + 0xD0]; movss xmm0, [view + 0x320] (ME1 LE 0x3110EC, 0x4C7E0C)
+      constexpr std::array<System::BytePattern, 24> streaming_pattern = {{0xF3, 0x0F, 0x10, ANY, 0x64, 0x0F, 0x28, 0xDA, 0xF3, 0x0F, 0x59, ANY, 0xD0, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x10, ANY, 0x20, 0x03, 0x00, 0x00}};
+      // movss xmm2, [view + 0x64]; lea rdx, [rsp + x]; movaps xmm3, xmm2; mov rcx, r; mulss xmm3, [view + 0xD0]; call (ME1 LE 0x74149D)
+      constexpr std::array<System::BytePattern, 25> streaming_2_pattern = {{0xF3, 0x0F, 0x10, ANY, 0x64, 0x48, 0x8D, 0x54, 0x24, ANY, 0x0F, 0x28, 0xDA, 0x48, 0x8B, ANY, 0xF3, 0x0F, 0x59, ANY, 0xD0, 0x00, 0x00, 0x00, 0xE8}};
+      std::string log;
+      struct Variant
+      {
+         std::span<const System::BytePattern> pattern;
+         std::initializer_list<size_t> disp_offsets;
+      };
+      const auto patch = [&](const char* name, size_t sites, std::initializer_list<Variant> variants)
+      {
+         size_t found = 0;
+         std::vector<std::byte*> disps;
+         for (const auto& [pattern, disp_offsets] : variants)
+         {
+            const std::vector<std::byte*> matches = System::ScanModuleForPattern(pattern);
+            found += matches.size();
+            for (std::byte* const match : matches)
+            {
+               for (const size_t offset : disp_offsets)
+               {
+                  disps.push_back(match + offset);
+               }
+            }
+         }
+         log += std::format(" {} {}/{}", name, found, sites);
+         if (found != sites)
+            return;
+         for (std::byte* const disp : disps)
+         {
+            const std::byte unscaled = std::byte(uint8_t(*disp) + 8);
+            if (System::PatchMemory(disp, &unscaled, 1))
+            {
+               unscaled_view_size_loads.push_back(disp);
+            }
+         }
+      };
+      patch("shadow", 1, {{.pattern = shadow_pattern, .disp_offsets = {4, 16}}});
+      patch("shadow_2", 1, {{.pattern = shadow_2_pattern, .disp_offsets = {4, 13}}});
+      patch("skeletal_lod", 1,
+         {{.pattern = skeletal_lod_pattern, .disp_offsets = {4, 12}}, {.pattern = skeletal_lod_me3_pattern, .disp_offsets = {4, 11}}});
+      patch("streaming", 2, {{.pattern = streaming_pattern, .disp_offsets = {4}}});
+      patch("streaming_2", 1, {{.pattern = streaming_2_pattern, .disp_offsets = {4}}});
+      reshade::log::message(reshade::log::level::info, std::format("[MELE Scale] unscaled view size loads ({} patched):{}", unscaled_view_size_loads.size(), log).c_str());
+   }
+
    void Install()
    {
       if (installed) // "OnInit" can run again: the hooked prologue no longer matches
@@ -309,6 +377,10 @@ namespace EngineScale
                   MH_CreateHook(render_post_process[0], reinterpret_cast<void*>(&RenderPostProcessDetour), reinterpret_cast<void**>(&render_post_process_original)) == MH_OK &&
                   MH_EnableHook(render_post_process[0]) == MH_OK;
       reshade::log::message(installed ? reshade::log::level::info : reshade::log::level::warning, std::format("[MELE Scale] installed {}: Enabled {} UseFixedScale {} FixedScreenPercentage {} view stride 0x{:X}", installed, *dynamic_resolution_enabled, *use_fixed_scale, *fixed_screen_percentage, view_stride).c_str());
+      if (installed)
+      {
+         PatchViewSizeLoads();
+      }
    }
 
    // Per frame (next frame's state): the game's options apply writes "Enabled" 0, so it's forced while the scale is below 100% and an
@@ -338,6 +410,12 @@ namespace EngineScale
       if (!installed)
          return;
       Apply(false);
+      for (std::byte* const disp : unscaled_view_size_loads)
+      {
+         const std::byte scaled = std::byte(uint8_t(*disp) - 8);
+         System::PatchMemory(disp, &scaled, 1);
+      }
+      unscaled_view_size_loads.clear();
       MH_DisableHook(MH_ALL_HOOKS);
       MH_Uninitialize();
       installed = false;
