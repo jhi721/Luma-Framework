@@ -7,7 +7,8 @@
 // - Inherit cb0 HBAO+ $Globals and cb2 CSOffsetConstants; layouts come from live disassembly of
 //   0x80212FD6/0x06D92B08 and retain standard GFSDK offsets.
 // - Depth input = the output sized r24_unorm_x8 scene depth (the depth and normals downsample 0xA75E6C32's t0), read with explicit
-//   Loads (see XeGTAO_PrefilterDepths16x16) at DepthLoadScaleRT scene pixels per AO pixel: 2 at native, 1 at 50% render scale.
+//   Loads (see XeGTAO_PrefilterDepths16x16) at DepthLoadScaleRT scene pixels per AO pixel: 2 at native, 1 at 50% render scale,
+//   each AO pixel loading the scene pixel nearest its center (fractional at most render scales).
 // - Normals = that downsample's t1 (FullSizedNormalsTexture, view-space xy in RGBA8; HBAO+'s ViewNormalTex is its half size copy),
 //   read at the same scale; z is reconstructed locally.
 // - Noise: frozen at 0 without an upscaler (the game has no TAA: a frame index would make the pattern boil), and denoise runs
@@ -67,9 +68,9 @@ cbuffer LumaGTAO : register(b11)
 #define NORMAL_Z_SIGN (-1.0)
 
 // The AO target spans the rendered area at any render scale (its depth is loaded from the rendered share of the scene depth), so its
-// UVs are the rendered area's. InvFullResolution is the AO allocation's, as HBAO+ fills only its rendered share.
-#define VIEWPORT_PIXEL_SIZE      PixelSizeRT
-#define XE_GTAO_DEPTH_LOAD_SCALE DepthLoadScaleRT
+// UVs are the rendered area's. InvFullResolution is the AO allocation's, as the untouched HBAO+ fills only its rendered share.
+#define VIEWPORT_PIXEL_SIZE                PixelSizeRT
+#define XE_GTAO_DEPTH_LOAD_COORD(pixCoord) uint2(((pixCoord) + 0.5) * DepthLoadScaleRT)
 
 // GFSDK ProjInfo contains the live NDC-to-view multiply/add pair, including dialogue zoom, for UVs of the rendered area.
 #define NDC_TO_VIEW_MUL           ProjInfo.xy
@@ -91,7 +92,7 @@ Texture2D tex1 : register(t1); // the scene's packed view-space normals (xy)
 // Unit z from the packed view-space xy (see NORMAL_Z_SIGN).
 float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 {
-   float2 nxy = tex1.Load(int3(pixCoord * XE_GTAO_DEPTH_LOAD_SCALE, 0)).xy * 2.0 - 1.0;
+   float2 nxy = tex1.Load(int3(XE_GTAO_DEPTH_LOAD_COORD(pixCoord), 0)).xy * 2.0 - 1.0;
    float3 viewspaceNormal;
    viewspaceNormal.xy = nxy;
    viewspaceNormal.z = NORMAL_Z_SIGN * sqrt(saturate(1.0 - dot(nxy, nxy)));
