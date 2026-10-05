@@ -59,6 +59,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
+    <UseLumaSRBridge>true</UseLumaSRBridge>
     <UseDgVoodoo>true</UseDgVoodoo>
     <UseDgVoodooLinux>true</UseDgVoodooLinux>
   </PropertyGroup>
@@ -168,7 +169,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Publishing-Release|Win32'">
@@ -217,7 +218,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Test-Release|Win32'">
@@ -266,7 +267,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Development-Release|Win32'">
@@ -315,7 +316,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_MOHA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_MOHA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_MOHA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
