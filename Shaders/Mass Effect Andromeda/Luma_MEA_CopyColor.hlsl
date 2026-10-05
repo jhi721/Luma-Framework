@@ -2,17 +2,17 @@
 // swaps the HDR color chain, the resolve target (u2) and history (u3) included, between rgba16f and r11g11b10_float, and a
 // CopySubresourceRegion across formats silently no-ops (black scene, live UI): the typed store converts, and the view is
 // writable since the native resolve stores through it.
-// copy_color_history_cs: the native resolve (0xD7E13B2A) keeps its history encoded, enc = (log2(c + 0.008632) - 6.643856) /
-// 13.5 + 1 stored x512 and read back as sampled / 512. Raw linear RGB there reads back as garbage on the frames the native
-// resolve runs (SR <-> native switches, the dialogue run-native path), which its neighborhood clamp turns into a history
-// reset (1-2 frames of shimmer); encoding makes the hand-off seamless. w carries no current-frame data natively: 0.
+// copy_color_history_cs: the native resolve (0xD7E13B2A) keeps its history log encoded (see "kHistoryLogOffset"). Raw linear
+// RGB there reads back as garbage on the frames the native resolve runs (SR <-> native switches, the dialogue run-native path),
+// which its neighborhood clamp turns into a history reset (1-2 frames of shimmer); encoding makes the hand-off seamless. w
+// carries no current-frame data natively: 0.
 // Above the render size both downsample, bilinear at the target's pixel centres (a 2x2 box at 50%): the targets stay render
 // sized for the passes that read them and for the native fallback.
 Texture2D<float4> src : register(t0);   // Luma SR output (rgba16f), at the target's size or larger
 RWTexture2D<float4> dst : register(u0); // the game's resolve/history target, bound via its own typed UAV
 SamplerState linear_sampler : register(s0);
 
-// The native history encoding: enc = (log2(c + offset) - log2(100)) / range + 1, stored x512
+// The native history encoding: enc = (log2(c + offset) - log2(100)) / range + 1, stored x512 and read back as sampled / 512
 static const float kHistoryLogOffset = 0.008632;
 static const float kHistoryLog2Of100 = 6.643856;
 static const float kHistoryLogRange = 13.5;
