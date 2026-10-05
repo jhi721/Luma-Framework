@@ -51,6 +51,20 @@ ANALYSIS = {
     "laplacian": {"type": "boolean", "description": "Variance of the Laplacian of mean(rgb), a sharpness measure (inside/outside region too)"},
     "threshold": {"type": "number", "description": "Count values whose magnitude (first 2 channels, e.g. motion vectors) is above it"},
 }
+READ_TARGET = {
+    "view": {"type": "string", "description": "rtv (default), srv, uav, depth, stencil, swapchain, ui, registered:<name>"},
+    "slot": {"type": "integer", "description": "View slot (default 0)"},
+    "mip": {"type": "integer"},
+    "replaced": {"type": "boolean", "description": "Read the bindings of Luma's replaced pass (default true) or the original ones"},
+}
+COMPARE_OPTIONS = {
+    "region": ANALYSIS["region"],
+    "rect_a": {"type": "array", "items": {"type": "integer"}, "description": "[x, y, w, h] of a to compare"},
+    "rect_b": {"type": "array", "items": {"type": "integer"}, "description": "[x, y, w, h] of b to compare"},
+    "metrics": {"type": "array", "items": {"type": "string"},
+                "description": "Per image on the plain mean of the first 3 channels (stored encoding, not luminance): mean, below:<t> (fraction "
+                               "under t, e.g. deep AO), detail (mean |x - 2x2 box average|); and correlation (Pearson, a vs b)"},
+}
 OUT_DIR = {"out_dir": {"type": "string", "description": "%TEMP%\\luma-mcp (default) or a subfolder of it"}}  # The backend refuses anything else
 BRIDGE_ONLY_ARGS = set(ANALYSIS) | {"rows", "save_as"}
 
@@ -71,7 +85,8 @@ def tool(name, description, properties=None, required=None, annotations=READ_ONL
 
 TOOLS = [
     tool("luma_list_games", "List running games that expose the Luma dev MCP pipe (Development builds only)."),
-    tool("luma_status", "Game, resolutions, swapchain formats (real, after Luma upgrades), mod state, replaced shader count, compilation error flag, process address space use (x86 OOM watch)."),
+    tool("luma_status", "Game, resolutions, swapchain formats (real, after Luma upgrades), mod state, replaced shader count, compilation error flag, process address space use (x86 OOM watch). "
+         "Answers even when the game stopped presenting (presenting=false, ms_since_present, pending_jobs, active_tool): the other tools would time out then."),
     tool("luma_log", "Tail of the game's ReShade.log (where Luma and the game mods log, e.g. the per 300 frames motion vector stats), optionally filtered by a regex.",
          {"pattern": {"type": "string", "description": "Python regex, lines matching it are kept"},
           "lines": {"type": "integer", "description": "Last N (matching) lines, default 200"},
@@ -80,11 +95,13 @@ TOOLS = [
         "luma_trace_capture",
         "Capture one frame with Luma's own frame trace. Unlike RenoDX DevKit it includes Luma's injected passes (type custom: SMAA, bloom, SR, AO...), "
         "merged deferred context work, clears/copies, and which shader variant ran. With 'trigger' it keeps capturing until a frame contains that shader. "
-        "With 'frames' it captures several frames and returns draws per shader hash per frame (a capture spans two presents).",
+        "With 'frames' it captures several frames and returns draws per shader hash per frame (a capture spans two presents). "
+        "'Did X draw at all' over a long window: trigger=<hash> max_frames=<N> (trigger_found).",
         {"trigger": {"type": "string", "description": "Shader hash that must appear in the captured frame"},
-         "max_frames": {"type": "integer", "description": "Frames to try with trigger (default 120)"},
-         "frames": {"type": "integer", "description": "Consecutive captures to count draws per hash over (no trigger)"},
+         "max_frames": {"type": "integer", "description": "Frames to try with trigger (default 120, max 3600)"},
+         "frames": {"type": "integer", "description": "Consecutive captures to count draws per hash over (no trigger, max 600)"},
          "top": {"type": "integer", "description": "With frames: most drawn hashes returned (default 64)"},
+         "summary": {"type": "boolean", "description": "With frames: frames_seen/min/max per hash instead of the per frame array (long windows)"},
          "save_as": {"type": "string", "description": "Store the capture's entry list under this name for luma_trace_diff"}},
     ),
     tool(
@@ -119,17 +136,39 @@ TOOLS = [
         "textures (SMAA input/predication mask/output, GTAO depth mips, motion vectors, core.bloom with mip=, core.smaa_edges...; see luma_dev_values kind "
         "texture) at present: its last content, usually this frame's.",
         {**TARGET,
-         "view": {"type": "string", "description": "rtv (default), srv, uav, depth, stencil, swapchain, ui, registered:<name>"},
-         "slot": {"type": "integer", "description": "View slot (default 0)"},
-         "mip": {"type": "integer"},
-         "replaced": {"type": "boolean", "description": "Read the bindings of Luma's replaced pass (default true) or the original ones"},
+         **READ_TARGET,
          **OUT_DIR,
          **ANALYSIS},
     ),
     tool(
         "luma_compare",
-        "Per-pixel difference of two readbacks (.bin paths from luma_read_resource / luma_sr_capture, e.g. an A/B with a dev toggle): abs diff stats, the max's position, diff.png.",
-        {"a": {"type": "string"}, "b": {"type": "string"}, "region": ANALYSIS["region"]}, ["a", "b"],
+        "Per-pixel difference of two readbacks (.bin paths from luma_read_resource / luma_sr_capture, e.g. an A/B with a dev toggle): abs diff stats, the max's position, diff.png. "
+        "rect_a/rect_b crop first; if the sizes still differ the smaller is stretched bilinearly to the bigger (e.g. a render scale sub-rect vs a 100% readback).",
+        {"a": {"type": "string"}, "b": {"type": "string"}, **COMPARE_OPTIONS}, ["a", "b"],
+    ),
+    tool(
+        "luma_ab",
+        "A/B a dev value on one readback in one call: per repeat sets 'a', waits 'settle' frames, reads back, same for 'b'; restores the original value "
+        "even on failure. Returns a vs b diffs and the noise floor (a vs a, b vs b across repeats: the scene's own drift) with within_noise. "
+        "Target arguments as luma_read_resource (index/hash/instance, view, slot, mip; view=swapchain needs no pass).",
+        {"name": {"type": "string", "description": "Toggle, float or int from luma_dev_values"},
+         "a": {"type": ["string", "number", "boolean"]}, "b": {"type": ["string", "number", "boolean"]},
+         "settle": {"type": "integer", "description": "Frames waited after each change (default 8; TAA/upscaler history needs more)"},
+         "repeats": {"type": "integer", "description": "Reads per side (default 2, max 8), 2+ gives a noise floor"},
+         **TARGET, **READ_TARGET, **COMPARE_OPTIONS},
+        ["name", "a", "b"], annotations=ONE_SHOT,
+    ),
+    tool(
+        "luma_perf",
+        "Frame times over a window: CPU present to present and the GPU timestamp span between the same points (it includes GPU idle time when "
+        "CPU bound), median/p95/min/max. Uncap the frame rate and disable vsync first (a cap lowers clocks). With name + values: interleaved "
+        "rounds over a dev value's values (order rotated per round), medians per value, original value restored.",
+        {"frames": {"type": "integer", "description": "Measured frames per window (default 120)"},
+         "settle": {"type": "integer", "description": "Frames skipped first (default 30)"},
+         "name": {"type": "string", "description": "Dev value to sweep (e.g. render_scale, perf_test)"},
+         "values": {"type": "array", "items": {"type": ["string", "number", "boolean"]}},
+         "rounds": {"type": "integer", "description": "Sweep rounds (default 3)"}},
+        annotations=ONE_SHOT,
     ),
     tool(
         "luma_read_cbuffer",
@@ -386,10 +425,65 @@ def postprocess_resource(result, opts):
         result["decode_error"] = str(e)
 
 
-def compare(a, b, region):
-    va, vb = load_readback(a), load_readback(b)
+def crop(values, rect):
+    if not rect:
+        return values
+    x, y, w, h = (int(v) for v in rect)
+    return values[:, max(y, 0):y + h, max(x, 0):x + w]
+
+
+def resize_bilinear(values, height, width):
+    """[planes, h, w, c] -> [planes, height, width, c], texel centers aligned and edges clamped, like a GPU bilinear stretch."""
+    def taps(source, target):
+        position = np.clip((np.arange(target) + 0.5) * source / target - 0.5, 0, source - 1)
+        low = np.floor(position).astype(int)
+        return low, np.minimum(low + 1, source - 1), (position - low).astype(np.float32)
+
+    y0, y1, fy = taps(values.shape[1], height)
+    x0, x1, fx = taps(values.shape[2], width)
+    fy, fx = fy[None, :, None, None], fx[None, None, :, None]
+    rows = values[:, y0] * (1 - fy) + values[:, y1] * fy
+    return rows[:, :, x0] * (1 - fx) + rows[:, :, x1] * fx
+
+
+def plain_mean(values):
+    """First plane, mean of the first (up to 3) channels in the stored encoding: not a luminance."""
+    return values[0, ..., : min(3, values.shape[-1])].mean(-1)
+
+
+def image_metrics(values, metrics):
+    mean = plain_mean(values)
+    finite = mean[np.isfinite(mean)]
+    out = {}
+    for metric in metrics:
+        if metric == "mean":
+            out["mean"] = float(finite.mean()) if finite.size else None
+        elif metric.startswith("below:"):
+            out[metric] = float((finite < float(metric[len("below:"):])).mean()) if finite.size else None
+        elif metric == "detail":
+            # What a lower resolution loses (e.g. AO contact detail): |x - its 2x2 box average|
+            h, w = mean.shape[0] // 2 * 2, mean.shape[1] // 2 * 2
+            even = np.nan_to_num(mean[:h, :w])
+            box = even.reshape(h // 2, 2, w // 2, 2).mean((1, 3))
+            out["detail"] = float(np.abs(even - box.repeat(2, 0).repeat(2, 1)).mean()) if box.size else None
+    return out
+
+
+def compare(a, b, region=None, rect_a=None, rect_b=None, metrics=None):
+    metrics = list(metrics or [])
+    unknown = [m for m in metrics if m not in ("mean", "detail", "correlation") and not re.fullmatch(r"below:-?[0-9.eE+-]+", m)]
+    if unknown:
+        return {"ok": False, "error": f"Unknown metrics {unknown}, use mean, below:<t>, detail, correlation"}
+    va, vb = crop(load_readback(a), rect_a), crop(load_readback(b), rect_b)
+    resampled = None
     if va.shape[:3] != vb.shape[:3]:
-        return {"ok": False, "error": f"Different sizes: {list(va.shape[:3])} vs {list(vb.shape[:3])} (planes, height, width)"}
+        if not (rect_a or rect_b) or va.shape[0] != vb.shape[0] or 0 in va.shape[1:3] or 0 in vb.shape[1:3]:
+            return {"ok": False, "error": f"Different sizes: {list(va.shape[:3])} vs {list(vb.shape[:3])} (planes, height, width); "
+                                          "pass rect_a/rect_b to compare a sub-rect, the smaller is then stretched to the bigger"}
+        if va.shape[1] * va.shape[2] < vb.shape[1] * vb.shape[2]:
+            va, resampled = resize_bilinear(va, *vb.shape[1:3]), "a"
+        else:
+            vb, resampled = resize_bilinear(vb, *va.shape[1:3]), "b"
     channels = min(va.shape[-1], vb.shape[-1])
     va, vb = va[..., :channels], vb[..., :channels]
     nan_a, nan_b = np.isnan(va), np.isnan(vb)
@@ -399,8 +493,19 @@ def compare(a, b, region):
     plane, y, x, c = np.unravel_index(int(np.argmax(diff)), diff.shape)
     result["max"] = {"value": float(diff[plane, y, x, c]), "x": int(x), "y": int(y), "plane": int(plane), "channel": int(c),
                      "a": va[plane, y, x].tolist(), "b": vb[plane, y, x].tolist()}
+    if resampled:
+        result["resampled"] = resampled
+        result["size"] = list(va.shape[1:3])
     if region:
         result.update(analyze(diff, {"region": region}))
+    if metrics:
+        image_metric_names = [m for m in metrics if m != "correlation"]
+        result["metrics"] = {"a": image_metrics(va, image_metric_names), "b": image_metrics(vb, image_metric_names)}
+        if "correlation" in metrics:
+            ma, mb = plain_mean(va), plain_mean(vb)
+            finite = np.isfinite(ma) & np.isfinite(mb)
+            ma, mb = ma[finite], mb[finite]
+            result["metrics"]["correlation"] = float(np.corrcoef(ma, mb)[0, 1]) if ma.size > 1 and ma.std() > 0 and mb.std() > 0 else None
     peak = float(pixel_diff[0].max())
     gray = (np.clip(pixel_diff[0] / peak, 0, 1) * 255 + 0.5).astype(np.uint8) if peak > 0 else np.zeros(pixel_diff.shape[1:], np.uint8)
     png = os.path.join(os.path.dirname(a), f"diff_{os.path.splitext(os.path.basename(a))[0]}_vs_{os.path.splitext(os.path.basename(b))[0]}.png")
@@ -584,7 +689,7 @@ class Backend:
             if len(pids) > 1:
                 raise RuntimeError(f"Several Luma games are running (pids {pids}), pass 'pid'")
             pid = pids[0]
-        # The single pipe instance is briefly missing between two clients
+        # The listening instance is briefly missing or busy while the backend hands the previous one to its client
         for _ in range(20):
             try:
                 self.pipe = open(f"{PIPE_DIR}{PIPE_PREFIX}{pid}", "r+b", buffering=0)
@@ -593,8 +698,10 @@ class Backend:
             except FileNotFoundError:
                 time.sleep(0.1)
             except OSError as e:
-                raise RuntimeError(f"Could not open the pipe of pid {pid} (another client connected, or a timed out call still holds it?): {e}")
-        raise RuntimeError(f"The pipe of pid {pid} did not come back")
+                if getattr(e, "winerror", None) != 231:  # ERROR_PIPE_BUSY
+                    raise RuntimeError(f"Could not open the pipe of pid {pid}: {e}")
+                time.sleep(0.1)
+        raise RuntimeError(f"The pipe of pid {pid} did not come back (a build older than the multi client backend serves one client at a time)")
 
     @staticmethod
     def read_exact(pipe, size):
@@ -625,8 +732,7 @@ class Backend:
         worker.join(wait_s)
         if worker.is_alive():
             # ponytail: the 5 s margin also covers the backend writing the readback files (a huge sr_capture on a slow disk can exceed it:
-            # raise it, or send progress notifications). The abandoned worker holds the single pipe instance until the game answers or
-            # exits, so reconnects fail as busy meanwhile (CancelSynchronousIo on the worker, via ctypes, would free it at once)
+            # raise it, or send progress notifications). The abandoned worker keeps its own pipe instance until the game answers or exits.
             self.pipe, self.pid = None, None
             raise RuntimeError(f"The game did not answer within {wait_s:.0f} s (suspended in a debugger, or its pipe thread is stuck), dropped the connection")
         if "error" in reply:
@@ -654,6 +760,96 @@ class Backend:
 backend = Backend()
 
 
+def game_call(tool_name, args):
+    result = backend.call(tool_name, dict(args))
+    if not result.get("ok"):
+        raise RuntimeError(f"{tool_name}: {result.get('error')}")
+    return result
+
+
+def dev_value_text(common, name):
+    """The knob's current value as set_dev_value parses it, to restore it after an A/B or a sweep."""
+    values = game_call("dev_values", {"filter": name, **common})["values"]
+    match = next((v for v in values if v["name"] == name), None)
+    if match is None or match["kind"] not in ("toggle", "float", "int"):
+        raise RuntimeError(f"{name} is not a toggle, float or int dev value (see luma_dev_values)")
+    return ("1" if match["value"] else "0") if match["kind"] == "toggle" else repr(match["value"])
+
+
+def set_dev_value(common, name, value):
+    game_call("set_dev_value", {"name": name, "value": value if isinstance(value, str) else json.dumps(value), **common})
+
+
+def pair_mean_diff(result):
+    return float(np.mean([s.get("mean", 0.0) for s in result["stats"]]))
+
+
+def ab_test(args):
+    common = {k: args[k] for k in ("pid", "timeout_ms") if args.get(k) is not None}
+    name, settle, repeats = args["name"], int(args.get("settle") or 8), min(max(int(args.get("repeats") or 2), 1), 8)
+    read_args = {k: args[k] for k in (*TARGET, *READ_TARGET) if args.get(k) is not None}
+    compare_args = {k: args.get(k) for k in COMPARE_OPTIONS}
+    original = dev_value_text(common, name)
+    paths = {"a": [], "b": []}
+    try:
+        for _ in range(repeats):
+            for side in ("a", "b"):
+                set_dev_value(common, name, args[side])
+                game_call("wait_frames", {"frames": settle, **common})
+                read = game_call("read_resource", {**read_args, **common})
+                postprocess_resource(read, {"preview": False})  # Writes the .json meta luma_compare loads
+                paths[side].append(read["path"])
+    finally:
+        set_dev_value(common, name, original)
+
+    a_vs_b = [compare(a, b, **compare_args) for a, b in zip(paths["a"], paths["b"])]
+    noise = [compare(paths[side][0], other, region=compare_args["region"]) for side in ("a", "b") for other in paths[side][1:]]
+    for result in a_vs_b + noise:
+        if not result.get("ok"):
+            return result
+    a_vs_b_mean = float(np.median([pair_mean_diff(r) for r in a_vs_b]))
+    result = {"ok": True, "name": name, "restored": original, "paths": paths, "a_vs_b": a_vs_b[0] if len(a_vs_b) == 1 else a_vs_b,
+              "a_vs_b_mean_abs_diff": a_vs_b_mean}
+    if noise:
+        noise_mean = max(pair_mean_diff(r) for r in noise)
+        result.update(noise_mean_abs_diff=noise_mean, within_noise=a_vs_b_mean <= noise_mean,
+                      noise_differing_pixels=max(r["differing_pixels"] for r in noise))
+    return result
+
+
+def perf(args):
+    common = {"pid": args["pid"]} if args.get("pid") is not None else {}
+    window = {k: args[k] for k in ("frames", "settle") if args.get(k) is not None}
+    # A window waits frames + settle presents: allow 10 fps
+    window["timeout_ms"] = args.get("timeout_ms") or min(max(TIMEOUT_MS, (int(args.get("frames") or 120) + int(args.get("settle") or 30)) * 100), TIMEOUT_MS_RANGE[1])
+    name = args.get("name")
+    if not name:
+        return backend.call("perf", {**window, **common})
+    values = args.get("values") or []
+    if not values:
+        return {"ok": False, "error": "Pass 'values' with 'name'"}
+    rounds = min(max(int(args.get("rounds") or 3), 1), 10)
+    original = dev_value_text(common, name)
+    windows = {json.dumps(v): [] for v in values}
+    try:
+        for r in range(rounds):
+            # Rotated, so no value always runs first (after the change of the previous round)
+            for value in values[r % len(values):] + values[: r % len(values)]:
+                set_dev_value(common, name, value)
+                windows[json.dumps(value)].append(game_call("perf", {**window, **common}))
+    finally:
+        set_dev_value(common, name, original)
+
+    def median_of(results, key):
+        medians = [r[key]["median"] for r in results if "median" in r[key]]
+        return float(np.median(medians)) if medians else None
+
+    return {"ok": True, "name": name, "restored": original, "rounds": rounds,
+            "values": [{"value": json.loads(k), "cpu_frame_ms": median_of(rs, "cpu_frame_ms"), "gpu_frame_ms": median_of(rs, "gpu_frame_ms"),
+                        "per_round_cpu": [r["cpu_frame_ms"].get("median") for r in rs], "per_round_gpu": [r["gpu_frame_ms"].get("median") for r in rs],
+                        "render_resolution": rs[-1].get("render_resolution")} for k, rs in windows.items()]}
+
+
 def call_tool(name, args):
     # Tools that don't need the game (or only for a lookup)
     if name == "luma_list_games":
@@ -661,7 +857,11 @@ def call_tool(name, args):
     if name == "luma_log":
         return tail_log(args)
     if name == "luma_compare":
-        return compare(args["a"], args["b"], args.get("region"))
+        return compare(args["a"], args["b"], **{k: args.get(k) for k in COMPARE_OPTIONS})
+    if name == "luma_ab":
+        return ab_test(args)
+    if name == "luma_perf":
+        return perf(args)
     if name == "luma_trace_diff":
         return trace_diff(args["a"], args["b"], int(args.get("max_blocks") or 60))
 
@@ -691,9 +891,10 @@ INSTRUCTIONS = (
     "Flow: luma_status -> luma_trace_capture (trigger=<hash> for a pass that doesn't draw every frame) -> luma_trace_list -> luma_trace_get / "
     "luma_read_resource / luma_read_cbuffer by entry index.\n"
     "Readbacks are files in %TEMP%\\luma-mcp (.bin + .json + a .png preview to open with Read) plus channel stats in the result; luma_compare diffs two .bin.\n"
-    "A/B: luma_dev_values -> luma_set_dev_value (live, not saved), then read back again; one-shot knobs report in luma_log.\n"
+    "A/B: luma_ab name=<dev value> a=.. b=.. (one call, restores the value, gives the noise floor); manual: luma_dev_values -> luma_set_dev_value "
+    "(live, not saved) -> read back; one-shot knobs report in luma_log. Frame times: luma_perf (name + values sweeps a dev value).\n"
     "'ignored_args' in a result means a misspelt or unknown argument. A timeout usually means the game isn't presenting (minimized, paused, "
-    "in a loading screen or a debugger)."
+    "in a loading screen or a debugger): luma_status still answers then (presenting=false)."
 )
 
 
@@ -747,7 +948,47 @@ def dispatch(method, params):
     raise RpcError(-32601, f"Unknown method {method}")
 
 
+def self_test():
+    """python Scripts/luma_mcp.py --self-test: the bridge-side math on synthetic R32_FLOAT readbacks, no game needed."""
+    root = tempfile.mkdtemp(prefix="luma-mcp-selftest-")
+
+    def readback(name, image):
+        image = np.ascontiguousarray(image, np.float32)
+        path = os.path.join(root, name + ".bin")
+        image.tofile(path)
+        with open(os.path.join(root, name + ".json"), "w") as f:
+            json.dump({"format_id": 41, "view_format_id": 41, "width": image.shape[1], "rows": image.shape[0], "row_pitch": image.shape[1] * 4,
+                       "slices": 1, "depth": 1}, f)
+        return path
+
+    ramp = np.tile((np.arange(16) + 0.5) / 16, (16, 1))
+    full, same = readback("full", ramp), readback("same", ramp)
+    result = compare(full, same, metrics=["correlation", "mean"])
+    assert result["ok"] and result["differing_pixels"] == 0 and abs(result["metrics"]["correlation"] - 1) < 1e-6, result
+
+    # The same ramp rendered at 50% into the top-left quarter of a full size target, stretched back over the whole frame
+    sub_rect = np.zeros((16, 16))
+    sub_rect[:8, :8] = (np.arange(8) + 0.5) / 8
+    sub = readback("sub", sub_rect)
+    result = compare(sub, full, rect_a=[0, 0, 8, 8], metrics=["correlation"])
+    assert result["ok"] and result["resampled"] == "a" and result["metrics"]["correlation"] > 0.99, result
+    assert compare(readback("small", sub_rect[:8, :8]), full)["ok"] is False  # Different sizes without rects
+
+    halves = readback("halves", np.repeat([[0.0] * 8 + [1.0] * 8], 16, 0))
+    checker = readback("checker", np.indices((16, 16)).sum(0) % 2)
+    result = compare(halves, checker, metrics=["below:0.5", "detail"])
+    assert result["metrics"]["a"]["below:0.5"] == 0.5 and result["metrics"]["a"]["detail"] == 0, result
+    assert result["metrics"]["b"]["detail"] == 0.5, result
+    assert compare(halves, checker, metrics=["bogus"])["ok"] is False
+
+    assert {"luma_ab", "luma_perf"} <= TOOL_NAMES and len(INSTRUCTIONS) <= 2048, len(INSTRUCTIONS)
+    print("self test passed")
+
+
 def main():
+    if "--self-test" in sys.argv:
+        self_test()
+        return
     for line in sys.stdin.buffer:
         if not line.strip():
             continue
