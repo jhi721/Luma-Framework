@@ -590,6 +590,11 @@ namespace
       float custom_sdr_gamma = 0.f;
 
       bool force_disable_display_composition = false;
+      // The Display Mode, Peak and Paper White settings even with "force_disable_display_composition" (a mod encoding its own HDR
+      // output, e.g. in its replaced present shaders); "SDR in HDR" needs Luma's composition and isn't offered then
+      bool show_display_settings_without_composition = false;
+      // The UI Paper White slider whatever "UI_DRAW_TYPE" is (a mod scaling the UI on its own)
+      bool force_separate_ui_paper_white = false;
 
       //
       // Samplers
@@ -11296,6 +11301,72 @@ namespace
 
    // @see https://pthom.github.io/imgui_manual_online/manual/imgui_manual.html
    // This runs within the swapchain "Present()" function, and thus it's thread safe
+   // Switches Luma's display mode (and the display's HDR when asked), loading or defaulting the peak and paper white of the new mode
+   void ChangeDisplayMode(DeviceData& device_data, DisplayModeType display_mode, bool enable_hdr_on_display = true, IDXGISwapChain3* swapchain = nullptr, reshade::api::effect_runtime* runtime = nullptr)
+   {
+      int display_mode_i = int(display_mode);
+      reshade::set_config_value(runtime, NAME, "DisplayMode", display_mode_i);
+      cb_luma_global_settings.DisplayMode = display_mode;
+      OnDisplayModeChanged();
+      if (display_mode >= DisplayModeType::HDR)
+      {
+         if (enable_hdr_on_display)
+         {
+            Display::SetHDREnabled(game_window);
+            bool dummy_bool;
+            Display::IsHDRSupportedAndEnabled(game_window, dummy_bool, hdr_enabled_display, swapchain); // This should always succeed, so we don't fallback to SDR in case it didn't
+
+#if ENABLE_NVAPI
+            // Enable HDR10+ GAMING if supported, it generally makes Samsung displays more accurate, so there's no reason to not enable it really.
+            // For now we only do this if we are also enforcing HDR enabled on the display.
+            Display::NVAPI::SetDisplayOutputMode(game_window, NV_DISPLAY_OUTPUT_MODE_HDR10PLUS_GAMING, false, false);
+#endif
+         }
+         if (!reshade::get_config_value(runtime, NAME, "ScenePeakWhite", cb_luma_global_settings.ScenePeakWhite) || cb_luma_global_settings.ScenePeakWhite <= 0.f)
+         {
+            cb_luma_global_settings.ScenePeakWhite = device_data.default_user_peak_white;
+         }
+         if (use_os_reference_white_level)
+         {
+            float hdr_paper_white = 80.f;
+            if (Display::GetSDRWhiteLevel(game_window, hdr_paper_white))
+            {
+               cb_luma_global_settings.ScenePaperWhite = hdr_paper_white;
+               cb_luma_global_settings.UIPaperWhite = hdr_paper_white;
+            }
+            else
+            {
+               use_os_reference_white_level = false;
+            }
+         }
+         if (!use_os_reference_white_level)
+         {
+            if (!reshade::get_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite))
+            {
+               cb_luma_global_settings.ScenePaperWhite = default_paper_white;
+            }
+            if (!reshade::get_config_value(runtime, NAME, "UIPaperWhite", cb_luma_global_settings.UIPaperWhite))
+            {
+               cb_luma_global_settings.UIPaperWhite = default_paper_white;
+            }
+         }
+         // Align all the parameters for the SDR on HDR mode (the game paper white can still be changed)
+         if (display_mode >= DisplayModeType::SDRInHDR)
+         {
+            // For now we don't default to 203 nits game paper white when changing to this mode
+            cb_luma_global_settings.UIPaperWhite = cb_luma_global_settings.ScenePaperWhite;
+            cb_luma_global_settings.ScenePeakWhite = cb_luma_global_settings.ScenePaperWhite; // No, we don't want "default_peak_white" here
+         }
+      }
+      else
+      {
+         cb_luma_global_settings.ScenePeakWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : (display_mode >= DisplayModeType::SDRInHDR ? default_paper_white : default_peak_white);
+         cb_luma_global_settings.ScenePaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
+         cb_luma_global_settings.UIPaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
+      }
+      device_data.cb_luma_global_settings_dirty = true;
+   }
+
    void OnRegisterMainOverlay(reshade::api::effect_runtime* runtime)
    {
       SKIP_UNSUPPORTED_DEVICE_API(runtime->get_device()->get_api());
@@ -14637,70 +14708,6 @@ namespace
             }
 #endif // ENABLE_REFLEX
 
-            auto ChangeDisplayMode = [&](DisplayModeType display_mode, bool enable_hdr_on_display = true, IDXGISwapChain3* swapchain = nullptr)
-               {
-                  int display_mode_i = int(display_mode);
-                  reshade::set_config_value(runtime, NAME, "DisplayMode", display_mode_i);
-                  cb_luma_global_settings.DisplayMode = display_mode;
-                  OnDisplayModeChanged();
-                  if (display_mode >= DisplayModeType::HDR)
-                  {
-                     if (enable_hdr_on_display)
-                     {
-                        Display::SetHDREnabled(game_window);
-                        bool dummy_bool;
-                        Display::IsHDRSupportedAndEnabled(game_window, dummy_bool, hdr_enabled_display, swapchain); // This should always succeed, so we don't fallback to SDR in case it didn't
-
-#if ENABLE_NVAPI
-                        // Enable HDR10+ GAMING if supported, it generally makes Samsung displays more accurate, so there's no reason to not enable it really.
-                        // For now we only do this if we are also enforcing HDR enabled on the display.
-                        Display::NVAPI::SetDisplayOutputMode(game_window, NV_DISPLAY_OUTPUT_MODE_HDR10PLUS_GAMING, false, false);
-#endif
-                     }
-                     if (!reshade::get_config_value(runtime, NAME, "ScenePeakWhite", cb_luma_global_settings.ScenePeakWhite) || cb_luma_global_settings.ScenePeakWhite <= 0.f)
-                     {
-                        cb_luma_global_settings.ScenePeakWhite = device_data.default_user_peak_white;
-                     }
-                     if (use_os_reference_white_level)
-                     {
-                        float hdr_paper_white = 80.f;
-                        if (Display::GetSDRWhiteLevel(game_window, hdr_paper_white))
-                        {
-                           cb_luma_global_settings.ScenePaperWhite = hdr_paper_white;
-                           cb_luma_global_settings.UIPaperWhite = hdr_paper_white;
-                        }
-                        else
-                        {
-                           use_os_reference_white_level = false;
-                        }
-                     }
-                     if (!use_os_reference_white_level)
-                     {
-                        if (!reshade::get_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite))
-                        {
-                           cb_luma_global_settings.ScenePaperWhite = default_paper_white;
-                        }
-                        if (!reshade::get_config_value(runtime, NAME, "UIPaperWhite", cb_luma_global_settings.UIPaperWhite))
-                        {
-                           cb_luma_global_settings.UIPaperWhite = default_paper_white;
-                        }
-                     }
-                     // Align all the parameters for the SDR on HDR mode (the game paper white can still be changed)
-                     if (display_mode >= DisplayModeType::SDRInHDR)
-                     {
-                        // For now we don't default to 203 nits game paper white when changing to this mode
-                        cb_luma_global_settings.UIPaperWhite = cb_luma_global_settings.ScenePaperWhite;
-                        cb_luma_global_settings.ScenePeakWhite = cb_luma_global_settings.ScenePaperWhite; // No, we don't want "default_peak_white" here
-                     }
-                  }
-                  else
-                  {
-                     cb_luma_global_settings.ScenePeakWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : (display_mode >= DisplayModeType::SDRInHDR ? default_paper_white : default_peak_white);
-                     cb_luma_global_settings.ScenePaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
-                     cb_luma_global_settings.UIPaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
-                  }
-               };
-
             auto DrawScenePaperWhite = [&](bool has_separate_ui_paper_white = true)
                {
                   static const char* scene_paper_white_name = "Scene Paper White";
@@ -14794,11 +14801,11 @@ namespace
                Display::IsHDRSupportedAndEnabled(game_window, hdr_supported_display, hdr_enabled_display, device_data.GetMainNativeSwapchain().get());
             }
 
-            if (!force_disable_display_composition)
+            if (!force_disable_display_composition || show_display_settings_without_composition)
             {
                DisplayModeType display_mode = cb_luma_global_settings.DisplayMode;
                int display_mode_max = 1;
-               if (hdr_supported_display)
+               if (hdr_supported_display && !force_disable_display_composition)
                {
 #if DEVELOPMENT || TEST
                   display_mode_max++; // Add "SDR in HDR for HDR" mode
@@ -14808,7 +14815,7 @@ namespace
                static_assert(sizeof(display_mode) == sizeof(int));
                if (ImGui::SliderInt("Display Mode", reinterpret_cast<int*>(&display_mode), 0, display_mode_max, display_mode_preset_strings[(size_t)display_mode], ImGuiSliderFlags_NoInput))
                {
-                  ChangeDisplayMode(display_mode, true, device_data.GetMainNativeSwapchain().get());
+                  ChangeDisplayMode(device_data, display_mode, true, device_data.GetMainNativeSwapchain().get(), runtime);
                }
                ImGui::EndDisabled();
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -14824,7 +14831,7 @@ namespace
                   {
                      display_mode = hdr_enabled_display ? DisplayModeType::HDR : DisplayModeType::SDR;
                      // Don't toggle HDR/SDR on the display here, we are matching the game state to the display state
-                     ChangeDisplayMode(display_mode, false, device_data.GetMainNativeSwapchain().get());
+                     ChangeDisplayMode(device_data, display_mode, false, device_data.GetMainNativeSwapchain().get(), runtime);
                   }
                   ImGui::PopID();
                }
@@ -14838,7 +14845,7 @@ namespace
                }
 
                const bool mod_active = IsModActive(device_data);
-               const bool has_separate_ui_paper_white = GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 1 && !use_os_reference_white_level;
+               const bool has_separate_ui_paper_white = (GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 1 || force_separate_ui_paper_white) && !use_os_reference_white_level;
                if (display_mode == DisplayModeType::HDR)
                {
                   ImGui::BeginDisabled(!mod_active);
