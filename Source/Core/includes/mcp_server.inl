@@ -1,7 +1,8 @@
 #pragma once
 
 // Luma MCP backend (DEVELOPMENT only), included by "core.hpp" inside its anonymous namespace, after the dev globals it drives.
-// A named pipe ("\\.\pipe\luma-mcp-<pid>") serves one client at a time, usually "Scripts/luma_mcp.py" (the stdio MCP bridge).
+// A named pipe ("\\.\pipe\luma-mcp-<pid>") serves any number of clients, usually "Scripts/luma_mcp.py" (the stdio MCP bridge, one
+// per agent session). Their requests share one queue and the game's state (knobs, the last trace).
 // Requests run serially on the render thread from "OnPresent" (before display composition), so they share the dev UI's
 // trace, debug draw and constant buffer tracking state without new locks in the draw hot paths, and a debug draw copy
 // requested here is consumed before it could be composed on screen.
@@ -227,6 +228,15 @@ namespace Mcp
          std::vector<uint32_t> per_frame;
       };
       std::unordered_map<uint32_t, HashCounts> hash_counts; // Draws per shader hash over consecutive captures
+      struct PerfState
+      {
+         Perf::TimestampRing<2> timestamps;
+         std::vector<double> cpu_frame_ms;
+         std::vector<double> gpu_frame_ms;
+         uint32_t disjoint = 0;
+         std::chrono::steady_clock::time_point last_present;
+      };
+      std::unique_ptr<PerfState> perf;
       std::optional<DebugDrawSelection> saved_debug_draw;
       std::optional<TrackBufferSelection> saved_track_buffer;
 
@@ -271,12 +281,16 @@ namespace Mcp
 
    std::mutex s_mutex_jobs;
    std::vector<std::shared_ptr<Job>> pending_jobs; // Guarded by "s_mutex_jobs"
+   std::string active_tool;                        // Guarded by "s_mutex_jobs", the running job's, for the status and timeout replies
    std::atomic<bool> has_pending_jobs = false;     // Set under "s_mutex_jobs", read without it
    std::shared_ptr<Job> active_job;                // Render thread only
    std::thread server_thread;
    std::atomic<bool> server_stop = false;
    std::atomic<bool> server_running = false;
-   std::atomic<bool> client_connected = false; // Skips the per draw bookkeeping nobody would read
+   std::atomic<int> connected_clients = 0; // Skips the per draw bookkeeping nobody would read
+   // Written at every present, so "status" can answer from the pipe thread while the game doesn't present
+   std::atomic<uint64_t> last_present_ms = 0; // GetTickCount64()
+   std::atomic<uint32_t> last_frame_index = 0;
    std::wstring pipe_name;
 
    // Game dev values (toggles, tweakables, counters and textures) exposed to "luma_dev_values", registered by the game code.
@@ -1012,7 +1026,7 @@ namespace Mcp
             const std::lock_guard lock(mutex);
             last_draw = draw_data;
             // The resource descriptions cost a few queries and allocations per draw, only worth it with a client that can read them
-            if (client_connected)
+            if (connected_clients > 0)
             {
                for (size_t i = 0; i < std::size(resources); i++)
                {
@@ -1075,7 +1089,7 @@ namespace Mcp
             w->Key(sr_resource_names[i]);
             if (resource.resource.empty())
             {
-               w->Value("none"); // Or drawn before a client connected, see "client_connected"
+               w->Value("none"); // Or drawn before a client connected, see "connected_clients"
                continue;
             }
             w->BeginObject().Format("format", resource.format).Key("size").BeginArray().Value(resource.size.x).Value(resource.size.y).Value(resource.size.z).EndArray().Field("resource", resource.resource).EndObject();
@@ -1192,7 +1206,7 @@ namespace Mcp
       w.Field("game", Globals::GAME_NAME).Field("version", Globals::VERSION);
       w.Field("pid", GetCurrentProcessId()).Field("bits", sizeof(void*) * 8);
       w.Path("exe_path", System::GetModulePath()); // ReShade writes its log next to it by default
-      w.Field("frame_index", cb_luma_global_settings.FrameIndex);
+      w.Field("frame_index", cb_luma_global_settings.FrameIndex).Field("presenting", true);
       w.Key("output_resolution").BeginArray().Value(device_data.output_resolution.x).Value(device_data.output_resolution.y).EndArray();
       w.Key("render_resolution").BeginArray().Value(device_data.render_resolution.x).Value(device_data.render_resolution.y).EndArray();
       w.Field("mod_active", IsModActive(device_data));
@@ -1314,11 +1328,24 @@ namespace Mcp
          std::sort(totals.begin(), totals.end(), [](const auto& a, const auto& b)
             { return a.second > b.second; });
          const size_t top = size_t(job->IntArg("top", 64, 1, 5000));
+         // Long windows: per hash aggregates instead of a per frame array
+         const bool summary = job->BoolArg("summary", false);
          w.Field("count", trace_count).Field("frames_captured", job->frames).Field("distinct_shaders", totals.size()).Key("hash_counts").BeginArray();
          for (size_t i = 0; i < (std::min)(top, totals.size()); i++)
          {
             const auto& counts = job->hash_counts[totals[i].first];
-            w.BeginObject().Hash("hash", totals[i].first).Field("stage", counts.stage).Field("total", totals[i].second).Key("per_frame").BeginArray();
+            w.BeginObject().Hash("hash", totals[i].first).Field("stage", counts.stage).Field("total", totals[i].second);
+            if (summary)
+            {
+               const auto [min, max] = std::minmax_element(counts.per_frame.begin(), counts.per_frame.end());
+               w.Field("frames_seen", std::ranges::count_if(counts.per_frame, [](uint32_t count)
+                                         { return count != 0; }))
+                  .Field("min", *min)
+                  .Field("max", *max)
+                  .EndObject();
+               continue;
+            }
+            w.Key("per_frame").BeginArray();
             for (const uint32_t count : counts.per_frame)
                w.Value(count);
             w.EndArray().EndObject();
@@ -1961,11 +1988,73 @@ namespace Mcp
       return true;
    }
 
+   // Lets a knob change settle (history resets, targets rebuilt) before the bridge reads back again
+   bool RunWaitFrames(Job* job)
+   {
+      if (++job->frames < uint32_t(job->IntArg("frames", 1, 1, 600)))
+         return false;
+      job->result.Field("frames", job->frames).Field("frame_index", cb_luma_global_settings.FrameIndex);
+      return true;
+   }
+
+   // Frame times over a window: CPU present to present, and the GPU timestamp span between the same two points (it includes GPU
+   // idle time when the game is CPU bound). A frame cap or vsync lowers the GPU clocks and bounds both.
+   bool RunPerf(Job* job, DeviceData& device_data, ID3D11DeviceContext* native_device_context)
+   {
+      const uint32_t frames = uint32_t(job->IntArg("frames", 120, 10, 3600));
+      const uint32_t settle = uint32_t(job->IntArg("settle", 30, 0, 600));
+      if (!job->perf)
+         job->perf = std::make_unique<Job::PerfState>();
+      auto& perf = *job->perf;
+      const auto present = std::chrono::steady_clock::now();
+      const bool measuring = job->frames > settle; // The first frame has no previous present
+      if (measuring)
+         perf.cpu_frame_ms.push_back(std::chrono::duration<double, std::milli>(present - perf.last_present).count());
+      perf.last_present = present;
+      job->frames++;
+      perf.disjoint += perf.timestamps.Collect(native_device_context, measuring, [&perf](const Perf::TimestampReadback<2>& readback)
+         { perf.gpu_frame_ms.push_back(readback.Ms(Perf::FRAME_START, Perf::FRAME_END)); });
+      perf.timestamps.Close(native_device_context);
+      if (perf.cpu_frame_ms.size() < frames)
+      {
+         com_ptr<ID3D11Device> native_device;
+         native_device_context->GetDevice(&native_device);
+         perf.timestamps.Open(native_device.get(), native_device_context);
+         return false;
+      }
+
+      auto& w = job->result;
+      // The GPU sets read back a few frames late, so a few less of them
+      const auto write_stats = [&w](std::string_view key, std::vector<double>* values)
+      {
+         w.Key(key).BeginObject().Field("frames", values->size());
+         if (!values->empty())
+         {
+            std::sort(values->begin(), values->end());
+            w.Field("median", (*values)[values->size() / 2]).Field("p95", (*values)[values->size() * 95 / 100]).Field("min", values->front()).Field("max", values->back());
+         }
+         w.EndObject();
+      };
+      write_stats("cpu_frame_ms", &perf.cpu_frame_ms);
+      write_stats("gpu_frame_ms", &perf.gpu_frame_ms);
+      w.Field("disjoint", perf.disjoint).Field("settle", settle);
+      w.Key("render_resolution").BeginArray().Value(device_data.render_resolution.x).Value(device_data.render_resolution.y).EndArray();
+      w.Key("output_resolution").BeginArray().Value(device_data.output_resolution.x).Value(device_data.output_resolution.y).EndArray();
+#if ENABLE_SR
+      w.Field("sr_type", int(device_data.sr_type_selected.load()));
+#endif
+      return true;
+   }
+
    bool RunJob(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, ID3D11DeviceContext* native_device_context, reshade::api::swapchain* swapchain)
    {
       const std::string& tool = job->tool;
       if (tool == "status")
          return RunStatus(job, device_data);
+      if (tool == "wait_frames")
+         return RunWaitFrames(job);
+      if (tool == "perf")
+         return RunPerf(job, device_data, native_device_context);
       if (tool == "trace_capture")
          return RunTraceCapture(job, device_data, cmd_list_data);
       if (tool == "trace_list")
@@ -2037,6 +2126,118 @@ namespace Mcp
       return job;
    }
 
+   // "status" answered by the pipe thread while the game doesn't present (minimized, paused, hung, or a loading screen that doesn't
+   // present), when every queued tool would only time out
+   std::optional<std::string> StatusWithoutPresents()
+   {
+      const uint64_t since_present_ms = GetTickCount64() - last_present_ms;
+      if (since_present_ms < 1000)
+         return std::nullopt;
+      JsonWriter w;
+      w.BeginObject().Field("ok", true).Field("game", Globals::GAME_NAME).Field("pid", GetCurrentProcessId());
+      w.Field("presenting", false).Field("ms_since_present", since_present_ms).Field("frame_index", last_frame_index.load());
+      {
+         const std::lock_guard lock(s_mutex_jobs);
+         w.Field("pending_jobs", pending_jobs.size()).Field("active_tool", active_tool);
+      }
+      w.Field("note", "Answered without the render thread: the game isn't presenting, the other tools would time out").EndObject();
+      return std::move(w.out);
+   }
+
+   // One connected client's requests, on its own thread
+   void ServeClient(HANDLE pipe)
+   {
+      connected_clients++;
+      const auto write_response = [pipe](const std::string& response)
+      {
+         const uint32_t response_size = uint32_t(response.size());
+         DWORD written = 0;
+         return WriteFile(pipe, &response_size, sizeof(response_size), &written, nullptr) && WriteFile(pipe, response.data(), response_size, &written, nullptr) && written == response_size;
+      };
+      uint32_t size = 0;
+      while (!server_stop && ReadExact(pipe, &size, sizeof(size)) && size <= (1u << 20))
+      {
+         std::string request(size, '\0');
+         if (!ReadExact(pipe, request.data(), size))
+            break;
+         auto job = ParseRequest(request);
+         if (job->tool == "status")
+         {
+            if (const std::optional<std::string> status = StatusWithoutPresents())
+            {
+               if (!write_response(*status))
+                  break;
+               continue;
+            }
+         }
+         const DWORD timeout_ms = DWORD(job->IntArg("timeout_ms", 15000, 100, 600000)); // Mirrored by "TIMEOUT_MS" in "Scripts/luma_mcp.py"
+         // Readbacks may only land inside "ReadbackRoot()": refused before the job runs, and checked again per file below (the stems come from arguments too)
+         // Not "Arg()", so a tool that doesn't take it still reports it in "ignored_args"
+         const auto out_dir = job->args.find("out_dir");
+         const bool refused = out_dir != job->args.end() && !out_dir->second.empty() && !IsInReadbackRoot(Utf8Path(out_dir->second));
+         if (!refused)
+         {
+            const std::lock_guard lock(s_mutex_jobs);
+            pending_jobs.push_back(job);
+            has_pending_jobs = true;
+         }
+         const ULONGLONG start = GetTickCount64();
+         bool finished = false;
+         while (!refused && !server_stop && !(finished = WaitForSingleObject(job->done, 50) == WAIT_OBJECT_0) && GetTickCount64() - start < timeout_ms)
+         {
+         }
+         // A timed out job that never started is dropped (nobody reads its result), a started one finishes (and restores the dev UI state) on its own
+         bool dropped = false;
+         std::string running_tool;
+         if (!refused && !finished)
+         {
+            const std::lock_guard lock(s_mutex_jobs);
+            dropped = std::erase(pending_jobs, job) != 0;
+            has_pending_jobs = !pending_jobs.empty();
+            running_tool = active_tool;
+         }
+         const auto path_error = [](std::string_view error, std::string_view key, const std::filesystem::path& path)
+         {
+            JsonWriter w;
+            w.BeginObject().Field("ok", false).Field("error", error).Path(key, path).EndObject();
+            return std::move(w.out);
+         };
+         const auto timeout_error = [&]
+         {
+            const std::string_view reason = (dropped ? "it was queued behind an earlier call that is still running, and was dropped" : "the game might not be presenting (minimized or paused?) or the job is waiting for a pass that doesn't draw");
+            JsonWriter w;
+            w.BeginObject().Field("ok", false).Field("error", std::format("Timed out after {} ms, {}", timeout_ms, reason));
+            w.Field("ms_since_present", GetTickCount64() - last_present_ms).Field("active_tool", running_tool).EndObject();
+            return std::move(w.out);
+         };
+         constexpr std::string_view outside_root = "out_dir must be the \"root\" folder or a subfolder of it";
+         std::string response = refused ? path_error(outside_root, "root", ReadbackRoot()) : finished ? std::move(job->result.out)
+                                                                                                      : timeout_error();
+         // Readbacks are written here rather than on the render thread
+         for (const auto& [path, bytes] : job->files)
+         {
+            if (!IsInReadbackRoot(path.parent_path()))
+            {
+               response = path_error(outside_root, "root", ReadbackRoot());
+               break;
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            if (!file.write(bytes.data(), std::streamsize(bytes.size())))
+            {
+               response = path_error("Failed to write", "path", path);
+               break;
+            }
+         }
+         if (!write_response(response))
+            break;
+      }
+      connected_clients--;
+      DisconnectNamedPipe(pipe);
+      CloseHandle(pipe);
+   }
+
    void ServerThread()
    {
       // The default pipe security of an elevated game (e.g. a "Run as administrator" compatibility flag) has a high integrity label and no
@@ -2060,91 +2261,65 @@ namespace Mcp
       if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &security_attributes.lpSecurityDescriptor, nullptr))
          security_attributes.lpSecurityDescriptor = nullptr;
 
+      struct Client
+      {
+         std::thread thread;
+         std::atomic<bool> finished = false;
+      };
+      std::vector<std::shared_ptr<Client>> clients;
+      const auto unfinished = [&clients]
+      {
+         return std::ranges::any_of(clients, [](const std::shared_ptr<Client>& client)
+            { return !client->finished; });
+      };
       while (!server_stop)
       {
-         HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, &security_attributes);
+         // One listening instance at a time, each connected client keeps its own
+         HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, &security_attributes);
          if (pipe == INVALID_HANDLE_VALUE)
          {
             Sleep(1000);
             continue;
          }
-         if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED)
+         if (!(ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) || server_stop)
          {
-            client_connected = true;
-            uint32_t size = 0;
-            while (!server_stop && ReadExact(pipe, &size, sizeof(size)) && size <= (1u << 20))
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            continue;
+         }
+         std::erase_if(clients, [](const std::shared_ptr<Client>& client)
             {
-               std::string request(size, '\0');
-               if (!ReadExact(pipe, request.data(), size))
-                  break;
-               auto job = ParseRequest(request);
-               const DWORD timeout_ms = DWORD(job->IntArg("timeout_ms", 15000, 100, 600000)); // Mirrored by "TIMEOUT_MS" in "Scripts/luma_mcp.py"
-               // Readbacks may only land inside "ReadbackRoot()": refused before the job runs, and checked again per file below (the stems come from arguments too)
-               // Not "Arg()", so a tool that doesn't take it still reports it in "ignored_args"
-               const auto out_dir = job->args.find("out_dir");
-               const bool refused = out_dir != job->args.end() && !out_dir->second.empty() && !IsInReadbackRoot(Utf8Path(out_dir->second));
-               if (!refused)
-               {
-                  const std::lock_guard lock(s_mutex_jobs);
-                  pending_jobs.push_back(job);
-                  has_pending_jobs = true;
-               }
-               const ULONGLONG start = GetTickCount64();
-               bool finished = false;
-               while (!refused && !server_stop && !(finished = WaitForSingleObject(job->done, 50) == WAIT_OBJECT_0) && GetTickCount64() - start < timeout_ms)
-               {
-               }
-               // A timed out job that never started is dropped (nobody reads its result), a started one finishes (and restores the dev UI state) on its own
-               bool dropped = false;
-               if (!refused && !finished)
-               {
-                  const std::lock_guard lock(s_mutex_jobs);
-                  dropped = std::erase(pending_jobs, job) != 0;
-                  has_pending_jobs = !pending_jobs.empty();
-               }
-               const std::string_view timeout_reason = (dropped ? "it was queued behind an earlier call that is still running, and was dropped" : "the game might not be presenting (minimized or paused?) or the job is waiting for a pass that doesn't draw");
-               const auto path_error = [](std::string_view error, std::string_view key, const std::filesystem::path& path)
-               {
-                  JsonWriter w;
-                  w.BeginObject().Field("ok", false).Field("error", error).Path(key, path).EndObject();
-                  return std::move(w.out);
-               };
-               constexpr std::string_view outside_root = "out_dir must be the \"root\" folder or a subfolder of it";
-               std::string response = refused ? path_error(outside_root, "root", ReadbackRoot())
-                                      : finished
-                                         ? std::move(job->result.out)
-                                         : std::format("{{\"ok\":false,\"error\":\"Timed out after {} ms, {}\"}}", timeout_ms, timeout_reason);
-               // Readbacks are written here rather than on the render thread
-               for (const auto& [path, bytes] : job->files)
-               {
-                  if (!IsInReadbackRoot(path.parent_path()))
-                  {
-                     response = path_error(outside_root, "root", ReadbackRoot());
-                     break;
-                  }
-                  std::error_code ec;
-                  std::filesystem::create_directories(path.parent_path(), ec);
-                  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-                  if (!file.write(bytes.data(), std::streamsize(bytes.size())))
-                  {
-                     response = path_error("Failed to write", "path", path);
-                     break;
-                  }
-               }
-               const uint32_t response_size = uint32_t(response.size());
-               DWORD written = 0;
-               if (!WriteFile(pipe, &response_size, sizeof(response_size), &written, nullptr) || !WriteFile(pipe, response.data(), response_size, &written, nullptr) || written != response_size)
-                  break;
+               if (!client->finished)
+                  return false;
+               client->thread.join();
+               return true; });
+         auto client = std::make_shared<Client>();
+         client->thread = std::thread([client, pipe]
+            {
+               ServeClient(pipe);
+               client->finished = true; });
+         clients.push_back(std::move(client));
+      }
+      // Not joined: on DLL unload the loader lock keeps a thread from exiting (see "Shutdown"). Cancelled repeatedly, a client could
+      // enter a blocking read right after a cancel.
+      for (int i = 0; i < 150 && unfinished(); i++)
+      {
+         for (const auto& client : clients)
+         {
+            if (!client->finished)
+            {
+               CancelSynchronousIo(client->thread.native_handle());
             }
          }
-         client_connected = false;
-         DisconnectNamedPipe(pipe);
-         CloseHandle(pipe);
+         Sleep(10);
+      }
+      for (const auto& client : clients)
+      {
+         client->thread.detach();
       }
       LocalFree(security_attributes.lpSecurityDescriptor);
       server_running = false;
    }
-
    // Called from "Init()": starts the pipe server and registers Core's knobs
    void Start()
    {
@@ -2198,6 +2373,8 @@ namespace Mcp
    // Called from "OnPresent" on the render thread, before display composition
    void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, ID3D11DeviceContext* native_device_context, reshade::api::swapchain* swapchain)
    {
+      last_present_ms = GetTickCount64();
+      last_frame_index = cb_luma_global_settings.FrameIndex;
       if (!active_job && !has_pending_jobs) // Unlocked early out, every present comes through here
          return;
       if (!active_job)
@@ -2208,6 +2385,7 @@ namespace Mcp
          active_job = pending_jobs.front();
          pending_jobs.erase(pending_jobs.begin());
          has_pending_jobs = !pending_jobs.empty();
+         active_tool = active_job->tool;
       }
       // Multi frame jobs stay on the device they started on
       if (active_job->device_data && active_job->device_data != &device_data)
@@ -2244,6 +2422,8 @@ namespace Mcp
       job.result.EndObject();
       SetEvent(active_job->done);
       active_job.reset();
+      const std::lock_guard lock(s_mutex_jobs);
+      active_tool.clear();
    }
 
    // Called on DLL unload
@@ -2252,7 +2432,7 @@ namespace Mcp
       if (!server_thread.joinable())
          return;
       server_stop = true;
-      // Unblock a connected client read, or a pending connection wait, by connecting to ourselves
+      // Unblock the pending connection wait by connecting to ourselves; the server thread then cancels its clients' reads
       CancelSynchronousIo(server_thread.native_handle());
       HANDLE self = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
       if (self != INVALID_HANDLE_VALUE)

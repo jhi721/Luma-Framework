@@ -202,6 +202,9 @@
 #include "includes/instance_data.h"
 #include "includes/game.h"
 #include "includes/com_ptr.h"
+#if DEVELOPMENT
+#include "includes/perf_test.h" // Also "luma_perf" in "includes/mcp_server.inl"
+#endif // DEVELOPMENT
 
 #include "utils/format.hpp"
 #include "utils/pipeline.hpp"
