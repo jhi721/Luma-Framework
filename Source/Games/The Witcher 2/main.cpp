@@ -29,7 +29,6 @@
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
 #include "..\..\Core\includes\patched_draws.h"
-#include "..\..\External\reshade\deps\minhook\include\MinHook.h"
 #if DEVELOPMENT
 #include "..\..\Core\includes\perf_test.h"
 #endif
@@ -3780,7 +3779,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       {
          MH_RemoveHook(RenderArea::post_chain);
          if (RenderArea::scale_installed)
+         {
             MH_RemoveHook(RenderArea::frame_scene);
+         }
       }
    }
 

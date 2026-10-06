@@ -22,7 +22,6 @@
 #include <shellapi.h> // ShellExecuteA for the About-tab link buttons (system("start") hangs in exclusive fullscreen)
 #include <bit>        // std::countr_zero (an AO pass's mode bit)
 #include <deque>
-#include "..\..\External\reshade\deps\minhook\include\MinHook.h"
 #include "..\..\External\NVAPI\nvapi.h" // types only (the HDR call is hooked, not linked)
 
 // TAA color-resolve CS, the DLSS/FSR injection point. The game ships it as 4 logic variants x 2 tile sizes (32x16 for

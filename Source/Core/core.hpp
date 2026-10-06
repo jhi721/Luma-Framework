@@ -112,8 +112,12 @@
 #ifndef ENABLE_NVAPI
 #define ENABLE_NVAPI 0
 #endif // ENABLE_NVAPI
-// NVIDIA Reflex injected at present (see "includes/reflex.h"). Needs NVAPI; a game can define it to 0 to leave latency to the game
-#if !ENABLE_NVAPI
+#ifndef ENABLE_MINHOOK
+#define ENABLE_MINHOOK 0
+#endif // ENABLE_MINHOOK
+// NVIDIA Reflex injected at present (see "includes/reflex.h"). Needs NVAPI and MinHook; a game can define it to 0 to leave latency
+// to the game
+#if !ENABLE_NVAPI || !ENABLE_MINHOOK
 #undef ENABLE_REFLEX
 #define ENABLE_REFLEX 0
 #elif !defined(ENABLE_REFLEX)
@@ -187,7 +191,9 @@
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
 #include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
 #include "includes/reflex.h" // see "ENABLE_REFLEX"
-#include "includes/minhook.h" // see "ENABLE_MINHOOK"
+#if ENABLE_MINHOOK
+#include "includes/minhook.h"
+#endif
 
 #include "includes/containers.h"
 #include "includes/globals.h"
@@ -2967,11 +2973,10 @@ namespace
       game->OnDestroyDeviceData(device_data);
 
 #if ENABLE_REFLEX
-      // Its ping thread and message hook run the addon's code, as does the sleep hook
-      if (device_data.reflex.pcl)
-         Reflex::PCL::Stop();
-      if (device_data.reflex.sleep_hook && !Reflex::SleepHook::Remove())
+      if (!Reflex::OnDestroyDevice(&device_data.reflex))
+      {
          reshade::log::message(reshade::log::level::warning, "[Reflex] Another module hooked NvAPI_D3D_Sleep over Luma's hook, so it stays and the addon stays loaded");
+      }
 #endif
 
       // It can apparently happen that in DX11 the device destructor callback is sent before its pipelines, so make sure we empty the memory before.
@@ -5732,8 +5737,8 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
-      // Final states only update the DEV stats (and stop PCLStats). Only the device's first swapchain (the only one expected), so there's one sleep per frame.
-      if ((!DEVELOPMENT && device_data.reflex.state > Reflex::State::Running && !device_data.reflex.pcl) || device_data.reflex.swapchain != swapchain)
+      // Only the device's first swapchain (the only one expected), so there's one sleep per frame
+      if (device_data.reflex.swapchain != swapchain)
          return;
       // The UI's setting, read without the lock like the other per frame settings
       Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), (HWND)swapchain->get_hwnd(), &device_data.reflex, reflex_mode);
@@ -17127,7 +17132,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #if ENABLE_MINHOOK
       // The game's and Core's hooks are removed by now (see "includes/minhook.h"), this frees its heap. Not needed at process exit.
       if (lpv_reserved == nullptr)
-         MH_Uninitialize();
+      {
+         UninitializeMinHook();
+      }
 #endif
 
       // In case our threads are still not joined, detach them and safely do a busy loop

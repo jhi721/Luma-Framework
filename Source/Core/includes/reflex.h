@@ -7,12 +7,14 @@
 #if ENABLE_REFLEX
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <random>
 #include <shared_mutex>
 #include <thread>
+#include <utility>
 
 #include <evntrace.h>
 #include <TraceLoggingProvider.h>
@@ -65,14 +67,23 @@ namespace Reflex
    {
       TRACELOGGING_DEFINE_PROVIDER(provider, "PCLStatsTraceLoggingProvider", (0x0d216f06, 0x82a6, 0x4d49, 0xbc, 0x4f, 0x8f, 0x38, 0xae, 0x56, 0xef, 0xab));
 
-      std::atomic<bool> listened = false; // An ETW session (FrameView, the NVIDIA App) enabled the provider
-      std::atomic<bool> ping = false;     // Taken from the game's message queue, marked on the frame's next present
+      std::atomic<bool> ping_pending = false; // Taken from the game's message queue, marked on the frame's next present
       UINT ping_message = 0;
 
+      // Whether an ETW session (FrameView, the NVIDIA App) enabled the provider, which wakes the ping thread
+      struct Listener
+      {
+         std::shared_mutex mutex;
+         bool enabled = false;
+         std::condition_variable_any changed;
+      };
+      Listener listener;
+
+      // Shared by the devices whose frames Luma marks, stopped with the last one
       struct Session
       {
          std::shared_mutex mutex;
-         bool running = false;
+         uint32_t users = 0;
          HHOOK message_hook = nullptr;
          std::jthread ping_thread;
       };
@@ -83,11 +94,15 @@ namespace Reflex
          switch (control_code)
          {
          case EVENT_CONTROL_CODE_ENABLE_PROVIDER:
-            listened = true;
-            break;
          case EVENT_CONTROL_CODE_DISABLE_PROVIDER:
-            listened = false;
+         {
+            {
+               const std::unique_lock lock(listener.mutex);
+               listener.enabled = control_code == EVENT_CONTROL_CODE_ENABLE_PROVIDER;
+            }
+            listener.changed.notify_all();
             break;
+         }
          // No "PCLSTATS_NO_PRESENT_MARKERS": Luma sets the present markers
          case EVENT_CONTROL_CODE_CAPTURE_STATE:
             TraceLoggingWrite(provider, "PCLStatsFlags", TraceLoggingUInt32(0u, "Flags"));
@@ -101,22 +116,30 @@ namespace Reflex
       LRESULT CALLBACK OnGetMessage(int code, WPARAM wparam, LPARAM lparam)
       {
          if (code == HC_ACTION && wparam == PM_REMOVE && reinterpret_cast<const MSG*>(lparam)->message == ping_message)
-            ping = true;
+         {
+            ping_pending = true;
+         }
          return CallNextHookEx(nullptr, code, wparam, lparam);
       }
 
-      // Pings every 100 to 300 ms (random, as NVIDIA's) while listened to and the game is in the foreground
+      // Pings every 100 to 300 ms (random, as NVIDIA's) while listened to and the game is in the foreground, asleep otherwise
       void PingLoop(std::stop_token stop, HWND window)
       {
-         std::mutex mutex;
-         std::condition_variable_any wake;
          std::minstd_rand random(GetCurrentThreadId());
-         std::unique_lock lock(mutex);
-         while (!wake.wait_for(lock, stop, std::chrono::milliseconds(100 + random() % 200), [&stop]
-            { return stop.stop_requested(); }))
+         std::unique_lock lock(listener.mutex);
+         while (!stop.stop_requested())
          {
+            // Asleep until a session listens ("wait" also returns on a stop, which ends the loop)
+            if (!listener.changed.wait(lock, stop, []
+                   { return listener.enabled; }))
+               continue;
+            // Then a random wait, cut short by a stop or the session ending
+            if (listener.changed.wait_for(lock, stop, std::chrono::milliseconds(100 + random() % 200), []
+                   { return !listener.enabled; }) ||
+                stop.stop_requested())
+               continue;
             DWORD foreground_process = 0;
-            if (!listened || !GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process) || foreground_process != GetCurrentProcessId())
+            if (!GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process) || foreground_process != GetCurrentProcessId())
                continue;
             TraceLoggingWrite(provider, "PCLStatsInput", TraceLoggingUInt32(ping_message, "MsgId"));
             PostMessageW(window, ping_message, 0, 0);
@@ -126,94 +149,110 @@ namespace Reflex
       void Start(HWND window)
       {
          const std::unique_lock lock(session.mutex);
-         if (session.running)
+         if (session.users++ != 0)
             return;
-         session.running = true;
-         ping_message = RegisterWindowMessageW(L"PC_Latency_Stats_Ping");
-         ping = false;
+         if (!ping_message)
+         {
+            ping_message = RegisterWindowMessageW(L"PC_Latency_Stats_Ping");
+         }
+         ping_pending = false;
          TraceLoggingRegisterEx(provider, OnProviderControl, nullptr);
          TraceLoggingWrite(provider, "PCLStatsInit");
          session.message_hook = SetWindowsHookExW(WH_GETMESSAGE, OnGetMessage, nullptr, GetWindowThreadProcessId(window, nullptr));
          session.ping_thread = std::jthread(PingLoop, window);
       }
 
-      // Also before the addon unloads: the hook and the thread run its code
+      // For each "Start()", also before the addon unloads: the hook and the thread run its code
       void Stop()
       {
          const std::unique_lock lock(session.mutex);
-         if (!session.running)
+         if (--session.users != 0)
             return;
-         session.running = false;
          session.ping_thread = {}; // Stops and joins it
-         if (session.message_hook)
-            UnhookWindowsHookEx(std::exchange(session.message_hook, nullptr));
+         UnhookWindowsHookEx(std::exchange(session.message_hook, nullptr));
          TraceLoggingWrite(provider, "PCLStatsShutdown");
          TraceLoggingUnregister(provider);
+         // Unregistering sends no disable: a later start without a session must not ping
+         const std::unique_lock listener_lock(listener.mutex);
+         listener.enabled = false;
       }
    } // namespace PCL
 
    // Another caller's "NvAPI_D3D_Sleep()": the game's or a tool's Reflex, found on its first call, also one without markers that
-   // starts after the detection presents (Reflex-Best-Practices RXL-G2), which the driver's status can't tell from Luma's own sleep.
-   // Hooked on the driver's function, the address "nvapi_QueryInterface()" gives every caller (Display Commander hooks the same
-   // one, chained either way). A tool that sleeps through its own hook's trampoline (Display Commander's own sleep, only done
-   // while nobody else sleeps) bypasses it.
+   // starts after the detection presents, which the driver's status can't tell from Luma's own sleep. Hooked on the driver's
+   // function, the address "nvapi_QueryInterface()" gives every caller (Display Commander hooks the same one, chained either way).
+   // A tool that sleeps through its own hook's trampoline (Display Commander's own sleep, only done while nobody else sleeps)
+   // bypasses it.
    namespace SleepHook
    {
       using SleepFunction = NvAPI_Status(__cdecl*)(IUnknown*);
       constexpr NvU32 sleep_interface_id = 0x852CD1D2; // "NvAPI_D3D_Sleep" in "nvapi_interface.h"
 
-      std::shared_mutex mutex; // Install and remove
-      void* target = nullptr;
-      SleepFunction original = nullptr;
-      // The target's start right after Luma's hook went in: different later means another module hooked over Luma's
-      std::array<uint8_t, 8> hooked_prologue = {};
+      // Shared by the devices that run Luma's Reflex, removed with the last one
+      struct Hook
+      {
+         std::shared_mutex mutex;
+         uint32_t users = 0;
+         void* target = nullptr;
+         SleepFunction original = nullptr;
+         // The target's start right after Luma's hook went in: different later means another module hooked over Luma's
+         std::array<uint8_t, 8> hooked_prologue = {};
+      };
+      Hook hook;
       thread_local bool luma_sleeping = false;
-      std::atomic<bool> other_sleep = false;
+      // Counts every other caller's sleep: each device compares it with the count from when it started watching, so none clears
+      // another's finding
+      std::atomic<uint32_t> other_sleeps = 0;
 
       NvAPI_Status __cdecl Detour(IUnknown* device)
       {
          if (!luma_sleeping)
-            other_sleep = true;
-         return original(device);
+         {
+            other_sleeps++;
+         }
+         return hook.original(device);
       }
 
+      // True if the hook is in, the caller then being one of its users
       bool Install()
       {
-         const std::lock_guard lock(mutex);
-         other_sleep = false;
-         if (target)
-            return true;
-         using QueryInterfaceFunction = void*(__cdecl*)(NvU32);
-         const HMODULE nvapi = GetModuleHandleW(sizeof(void*) == 8 ? L"nvapi64.dll" : L"nvapi.dll");
-         const auto query_interface = nvapi ? reinterpret_cast<QueryInterfaceFunction>(GetProcAddress(nvapi, "nvapi_QueryInterface")) : nullptr;
-         void* const sleep = query_interface ? query_interface(sleep_interface_id) : nullptr;
-         if (!sleep || !InitializeMinHook() || MH_CreateHook(sleep, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) != MH_OK)
-            return false;
-         if (MH_EnableHook(sleep) != MH_OK)
+         const std::lock_guard lock(hook.mutex);
+         if (!hook.target)
          {
-            MH_RemoveHook(sleep);
-            return false;
+            using QueryInterfaceFunction = void*(__cdecl*)(NvU32);
+            const HMODULE nvapi = GetModuleHandleW(sizeof(void*) == 8 ? L"nvapi64.dll" : L"nvapi.dll");
+            const auto query_interface = nvapi ? reinterpret_cast<QueryInterfaceFunction>(GetProcAddress(nvapi, "nvapi_QueryInterface")) : nullptr;
+            void* const sleep = query_interface ? query_interface(sleep_interface_id) : nullptr;
+            if (!sleep || !InitializeMinHook() || MH_CreateHook(sleep, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&hook.original)) != MH_OK)
+               return false;
+            if (MH_EnableHook(sleep) != MH_OK)
+            {
+               MH_RemoveHook(sleep);
+               return false;
+            }
+            std::memcpy(hook.hooked_prologue.data(), sleep, hook.hooked_prologue.size());
+            hook.target = sleep;
          }
-         std::memcpy(hooked_prologue.data(), sleep, hooked_prologue.size());
-         target = sleep;
+         hook.users++;
          return true;
       }
 
-      // False if it had to stay: another module hooked over it, so its trampoline jumps to "Detour", and the addon is pinned to keep
-      // that code loaded. ponytail: a pinned addon isn't initialized again if ReShade reloads it in the same process.
+      // For each successful "Install()". False if the last user's hook had to stay: another module hooked over it, so its trampoline
+      // jumps to "Detour", and the addon is pinned to keep that code loaded. ponytail: a pinned addon isn't initialized again if
+      // ReShade reloads it in the same process.
       bool Remove()
       {
-         const std::lock_guard lock(mutex);
-         if (!target)
+         const std::lock_guard lock(hook.mutex);
+         if (--hook.users != 0)
             return true;
-         if (std::memcmp(target, hooked_prologue.data(), hooked_prologue.size()) != 0)
+         if (std::memcmp(hook.target, hook.hooked_prologue.data(), hook.hooked_prologue.size()) != 0)
          {
             HMODULE module = nullptr;
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&Detour), &module);
             return false;
          }
-         MH_RemoveHook(target);
-         target = nullptr;
+         MH_RemoveHook(hook.target);
+         hook.target = nullptr;
          return true;
       }
    } // namespace SleepHook
@@ -242,8 +281,9 @@ namespace Reflex
       bool markers = false;               // The frame "frame_id" has Luma's markers
       uint32_t mode_presents = 0;         // Since Luma last set the sleep mode, or since the driver last agreed with it
       const char* other_reason = nullptr; // Why the state became "Other"
-      bool pcl = false;                   // This device started "PCL"
-      bool sleep_hook = false;            // This device installed "SleepHook"
+      bool pcl = false;                   // One of "PCL"'s users (while its frames are marked)
+      bool sleep_hook = false;            // One of "SleepHook"'s users
+      uint32_t other_sleeps_seen = 0;     // "SleepHook::other_sleeps" when this device started watching
       // The device's first swapchain, the only one followed (only compared)
       std::atomic<void*> swapchain = nullptr;
 #if DEVELOPMENT
@@ -331,8 +371,10 @@ namespace Reflex
       if (!data.markers)
          return;
       // The ping arrived during this frame's simulation (the game's message loop)
-      if (PCL::ping.exchange(false))
+      if (PCL::ping_pending.exchange(false))
+      {
          SetMarker(device, data.frame_id, PC_LATENCY_PING);
+      }
       SetMarker(device, data.frame_id, SIMULATION_END);
       SetMarker(device, data.frame_id, RENDERSUBMIT_END);
       SetMarker(device, data.frame_id, PRESENT_START);
@@ -343,41 +385,50 @@ namespace Reflex
    {
 #if DEVELOPMENT
       if (data->state != State::Unsupported && ++data->latency_stats_presents % check_interval == 0)
-         UpdateLatencyStats(device, data);
-#endif
-      // Every return but the last leaves the next frame unmarked
-      const bool had_markers = std::exchange(data->markers, false);
-      if (data->state > State::Running)
       {
-         if (std::exchange(data->pcl, false))
-            PCL::Stop();
+         UpdateLatencyStats(device, data);
+      }
+#endif
+      // Every return but the last leaves the next frame unmarked. PCLStats runs while Luma marks the frames, so it stops a present
+      // after the state became final, Off (non-DEV) or detecting.
+      const bool had_markers = std::exchange(data->markers, false);
+      if (!had_markers && std::exchange(data->pcl, false))
+      {
+         PCL::Stop();
+      }
+      if (data->state > State::Running)
+         return;
+      if (data->sleep_hook && SleepHook::other_sleeps != data->other_sleeps_seen)
+      {
+         data->state = State::Other;
+         data->other_reason = "other sleep call";
          return;
       }
       if (data->presents < detection_presents)
       {
-         // First, as it also drops a foreign sleep seen before this device (on a previous one)
-         if (data->presents == 0)
-            data->sleep_hook = SleepHook::Install();
          NV_GET_SLEEP_STATUS_PARAMS status = {NV_GET_SLEEP_STATUS_PARAMS_VER};
          if (NvAPI_D3D_GetSleepStatus(device, &status) != NVAPI_OK) // Also when NVAPI didn't initialize
+         {
             data->state = State::Unsupported;
+         }
          // Its present layer, loaded with the device
          else if (GetModuleHandleW(sizeof(void*) == 8 ? L"NvPresent64.dll" : L"NvPresent.dll"))
+         {
             data->state = State::SmoothMotion;
-         // Not "bLowLatencyMode" alone: the control panel's "Low Latency Mode" can set it (Reflex-Best-Practices RXL-G1)
-         else if (status.bUseGameSleep || SleepHook::other_sleep.exchange(false))
+         }
+         // Not "bLowLatencyMode" alone: the control panel's "Low Latency Mode" can set it (the game's own sleep can't)
+         else if (status.bUseGameSleep)
          {
             data->state = State::Other;
-            data->other_reason = status.bUseGameSleep ? "sleep status at start" : "other sleep call";
+            data->other_reason = "sleep status at start";
+         }
+         // Watches other callers' sleeps from here on
+         else if (data->presents == 0)
+         {
+            data->other_sleeps_seen = SleepHook::other_sleeps;
+            data->sleep_hook = SleepHook::Install();
          }
          data->presents++;
-         return;
-      }
-
-      if (SleepHook::other_sleep.exchange(false))
-      {
-         data->state = State::Other;
-         data->other_reason = "other sleep call";
          return;
       }
 
@@ -409,7 +460,9 @@ namespace Reflex
       {
          NV_GET_SLEEP_STATUS_PARAMS status = {NV_GET_SLEEP_STATUS_PARAMS_VER};
          if (NvAPI_D3D_GetSleepStatus(device, &status) != NVAPI_OK || (status.bLowLatencyMode && status.bUseGameSleep))
+         {
             data->mode_presents = detection_presents;
+         }
          else if (data->mode_presents >= detection_presents + owner_presents)
          {
             data->state = State::Other;
@@ -418,15 +471,13 @@ namespace Reflex
          }
       }
       if (had_markers)
+      {
          SetMarker(device, data->frame_id, PRESENT_END);
+      }
       data->state = mode == Mode::Off ? State::Inactive : State::Running;
       // DEV also marks the frames with Reflex off (no sleep), to compare their latency
       if (mode == Mode::Off && !DEVELOPMENT)
-      {
-         if (std::exchange(data->pcl, false))
-            PCL::Stop();
          return;
-      }
       if (mode != Mode::Off)
       {
 #if DEVELOPMENT
@@ -440,12 +491,26 @@ namespace Reflex
          data->sleeps++;
 #endif
       }
+      // Before the frame's first markers, so the trace has all of them
       if (!std::exchange(data->pcl, true))
+      {
          PCL::Start(window);
+      }
       data->frame_id++;
       data->markers = true;
       SetMarker(device, data->frame_id, SIMULATION_START);
       SetMarker(device, data->frame_id, RENDERSUBMIT_START);
+   }
+
+   // When the device is destroyed: its ping thread, message hook and sleep hook run the addon's code. False if the sleep hook had
+   // to stay ("SleepHook::Remove()").
+   bool OnDestroyDevice(DeviceData* data)
+   {
+      if (std::exchange(data->pcl, false))
+      {
+         PCL::Stop();
+      }
+      return !std::exchange(data->sleep_hook, false) || SleepHook::Remove();
    }
 } // namespace Reflex
 #endif // ENABLE_REFLEX

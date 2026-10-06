@@ -6,7 +6,6 @@
 #define ENABLE_SMAA 1
 
 #include "..\..\Core\core.hpp"
-#include "..\..\External\reshade\deps\minhook\include\MinHook.h"
 #if DEVELOPMENT
 #include <dxgi1_4.h> // "Memory Sweep": IDXGIAdapter3::QueryVideoMemoryInfo
 #include <psapi.h>   // "Memory Sweep": GetProcessMemoryInfo
@@ -1572,10 +1571,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          SetJitterIndexFix(false);
       }
       if (uint8_t* camera_build = GetGameAddresses().camera_build)
+      {
          MH_RemoveHook(camera_build);
+      }
 #if DEVELOPMENT
       if (uint8_t* camera_counter_increment = GetGameAddresses().camera_counter_increment)
+      {
          MH_RemoveHook(camera_counter_increment);
+      }
 #endif
    }
 

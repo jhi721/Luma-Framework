@@ -32,7 +32,6 @@
 #if DEVELOPMENT
 #include "..\..\Core\includes\perf_test.h"
 #endif
-#include "..\..\External\reshade\deps\minhook\include\MinHook.h"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
 #include <vector>
 #include <unordered_set>
@@ -377,8 +376,8 @@ namespace EngineScale
       fixed_screen_percentage = reinterpret_cast<float*>(rip_target(fixed_scale[0], 13, 17));
       render_post_process_target = render_post_process[0];
       installed = InitializeMinHook() &&
-                  MH_CreateHook(render_post_process[0], reinterpret_cast<void*>(&RenderPostProcessDetour), reinterpret_cast<void**>(&render_post_process_original)) == MH_OK &&
-                  MH_EnableHook(render_post_process[0]) == MH_OK;
+                  MH_CreateHook(render_post_process_target, reinterpret_cast<void*>(&RenderPostProcessDetour), reinterpret_cast<void**>(&render_post_process_original)) == MH_OK &&
+                  MH_EnableHook(render_post_process_target) == MH_OK;
       reshade::log::message(installed ? reshade::log::level::info : reshade::log::level::warning, std::format("[MELE Scale] installed {}: Enabled {} UseFixedScale {} FixedScreenPercentage {} view stride 0x{:X}", installed, *dynamic_resolution_enabled, *use_fixed_scale, *fixed_screen_percentage, view_stride).c_str());
       if (installed)
       {

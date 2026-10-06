@@ -3,7 +3,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
-#include "../../External/reshade/deps/minhook/include/MinHook.h"
+#include "../../Core/includes/minhook.h"
 
 namespace FC5::NativeUploads
 {
@@ -14,7 +14,6 @@ namespace FC5::NativeUploads
    struct Hook { void* target = nullptr; void* original = nullptr; };
    inline std::array<Hook, 8> maps{}, unmaps{};
    inline std::mutex install_mutex;
-   inline bool initialized = false;
    inline std::atomic<MapObserver> on_map{nullptr};
    inline std::atomic<UnmapObserver> before_unmap{nullptr}, after_unmap{nullptr};
    inline thread_local unsigned nesting = 0;
@@ -56,11 +55,7 @@ namespace FC5::NativeUploads
    inline bool Install(ID3D11DeviceContext* ctx)
    {
       std::lock_guard lock(install_mutex);
-      if (!initialized)
-      {
-         if (!InitializeMinHook()) return false;
-         initialized = true;
-      }
+      if (!InitializeMinHook()) return false;
       auto** table = *reinterpret_cast<void***>(ctx);
       // ID3D11DeviceContext ABI: IUnknown(3), DeviceChild(4), 7 methods, Map/Unmap.
       const bool a = InstallOne(table[14], maps, map_detours);
@@ -71,12 +66,10 @@ namespace FC5::NativeUploads
    {
       on_map = nullptr; before_unmap = nullptr; after_unmap = nullptr;
       std::lock_guard lock(install_mutex);
-      if (!initialized) return;
       for (const auto& h : maps) if (h.target) MH_QueueDisableHook(h.target);
       for (const auto& h : unmaps) if (h.target) MH_QueueDisableHook(h.target);
       MH_ApplyQueued();
       for (auto& h : maps) { if (h.target) MH_RemoveHook(h.target); h = {}; }
       for (auto& h : unmaps) { if (h.target) MH_RemoveHook(h.target); h = {}; }
-      initialized = false;
    }
 }
