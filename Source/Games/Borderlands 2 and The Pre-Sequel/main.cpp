@@ -1141,20 +1141,13 @@ class Borderlands2 final : public Game
                {
                   translation_offset = kSkinnedTranslationOffset;
                }
-               // Camera relative: projects through the whole view projection (its translation row c3) without reading the translation
-               // from vc4, neither PreViewTranslation (c5: world space vertices translated in the shader) nor a LocalToWorld row (c6-c9,
-               // skinned c231-c234), not even as the base of a relative index. 6 of the 737 dumped projecting vertex shaders: instanced
-               // foliage (0x35035418, 0x36AAA831, 0xAF966A18, 0xFD587A0F) and position only ones (0x483A369B, 0x5FC5315D). Screen
-               // space ones read c0-c2 as other constants and keep the copied vc4.
-               camera_relative_vertices = DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, kViewProjectionOffset / 16 + 3) &&
-                                          !DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, kPreViewTranslationOffset / 16, true);
-               for (const size_t row_offset : {kTranslationOffset - 3 * 16, kSkinnedTranslationOffset - 3 * 16})
-               {
-                  for (size_t row = 0; row < 4; row++)
-                  {
-                     camera_relative_vertices &= !DXBC::ReadsConstantRow(code, desc->code_size, MotionVectorPatches::object_slot, uint32_t(row_offset / 16 + row), true);
-                  }
-               }
+               // Camera relative: the position depends on vc4's view projection (c0-c3) alone, no translation from it (PreViewTranslation
+               // c5, LocalToWorld c6-c9 or skinned c231-c234, terrain's c10-c13, a sprite's center...). The rows read don't tell: instanced
+               // foliage reads c6 as its light map scale and bias, with its camera relative instance matrices in v4-v7 (0x726C5819, the dry
+               // bushes' color pass), while other instanced meshes add c6 to their instance translation. 13 of the 874 dumped vertex
+               // shaders: instanced foliage (0x35035418, 0x36AAA831, 0x4562B3A2, 0x55238014, 0x69DB8300, 0x726C5819, 0xAF966A18,
+               // 0xBADE03D9, 0xCBBB7761, 0xD59C4FB4, 0xFD587A0F) and position only ones (0x483A369B, 0x5FC5315D).
+               camera_relative_vertices = DXBC::PositionDependsOnlyOnConstantRows(code, desc->code_size, MotionVectorPatches::object_slot, kViewProjectionOffset / 16, kViewProjectionOffset / 16 + 3);
             }
             else if (reactive != 0)
             {

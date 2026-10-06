@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -386,6 +387,98 @@ namespace DXBC
                         tokens[index_position + 1] == row;
                return true; });
       return reads;
+   }
+
+   // Whether the vertex shader's SV_Position depends on rows "first_row" to "last_row" of constant buffer "slot" and on no other row
+   // of it (e.g. projects through the view projection alone, its vertices already in camera space). Data flow through temps,
+   // each written component taking every source operand's dependencies (control flow ignored, so it errs on "other rows"). False
+   // if the bytecode can't be read.
+   inline bool PositionDependsOnlyOnConstantRows(const uint8_t* code, size_t size, uint32_t slot, uint32_t first_row, uint32_t last_row)
+   {
+      std::vector<Chunk> chunks;
+      if (!ReadChunks(code, size, &chunks))
+         return false;
+      const Chunk* const program = FindChunk(&chunks, FourCC("SHEX"), FourCC("SHDR"));
+      const Chunk* const output_signature = FindChunk(&chunks, FourCC("OSGN"));
+      std::vector<SignatureElement> outputs;
+      std::vector<uint32_t> tokens;
+      std::vector<Instruction> instructions;
+      size_t first_body;
+      if (!program || !output_signature || !ReadSignature(output_signature->data, &outputs) || !ReadProgram(*program, &tokens, &instructions, &first_body))
+         return false;
+      const auto position = std::ranges::find_if(outputs, [](const SignatureElement& element)
+         { return element.system_value == 1; }); // D3D_NAME_POSITION
+      if (position == outputs.end())
+         return false;
+
+      // Per temp and output component: bit 0 the rows, bit 1 other rows of the buffer
+      constexpr uint8_t in_rows = 1, other_rows = 2;
+      std::unordered_map<uint64_t, std::array<uint8_t, 4>> dependencies;
+      const auto key = [](D3D10_SB_OPERAND_TYPE type, uint32_t index)
+      { return (uint64_t(type) << 32) | index; };
+      for (size_t i = first_body; i < instructions.size(); i++)
+      {
+         uint8_t sources = 0;
+         std::vector<std::pair<uint64_t, uint32_t>> destinations; // Register and its written components mask
+         bool readable = WalkOperands(tokens, instructions[i], [&](size_t token_position, size_t index_position)
+            {
+               const uint32_t token = tokens[token_position];
+               const D3D10_SB_OPERAND_TYPE type = DECODE_D3D10_SB_OPERAND_TYPE(token);
+               if (type == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER)
+               {
+                  if (index_position != no_index && tokens[index_position] == slot)
+                  {
+                     const bool immediate_row = DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) == D3D10_SB_OPERAND_INDEX_2D && DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) == D3D10_SB_OPERAND_INDEX_IMMEDIATE32;
+                     const uint32_t row = tokens[index_position + 1];
+                     sources |= (immediate_row && row >= first_row && row <= last_row) ? in_rows : other_rows;
+                  }
+                  return true;
+               }
+               // Not tracked (indexable temps): they could hold anything
+               if (type == D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP)
+               {
+                  sources |= other_rows;
+                  return true;
+               }
+               if (type != D3D10_SB_OPERAND_TYPE_TEMP && type != D3D10_SB_OPERAND_TYPE_OUTPUT)
+                  return true;
+               if (index_position == no_index)
+                  return false;
+               const uint64_t reg = key(type, tokens[index_position]);
+               const auto mode = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(token);
+               if (mode == D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE)
+               {
+                  destinations.emplace_back(reg, DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(token) >> 4);
+                  return true;
+               }
+               const auto found = dependencies.find(reg);
+               if (found == dependencies.end())
+                  return true;
+               for (uint32_t component = 0; component < 4; component++)
+               {
+                  const uint32_t selected = (mode == D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE ? DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(token) : DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(token, component));
+                  sources |= found->second[selected];
+               }
+               return true; });
+         if (!readable)
+            return false;
+         for (const auto& [reg, mask] : destinations)
+         {
+            auto& components = dependencies[reg];
+            for (uint32_t component = 0; component < 4; component++)
+            {
+               if (mask & (1u << component))
+                  components[component] = sources;
+            }
+         }
+      }
+      const auto found = dependencies.find(key(D3D10_SB_OPERAND_TYPE_OUTPUT, position->reg));
+      if (found == dependencies.end())
+         return false;
+      uint8_t position_dependencies = 0;
+      for (const uint8_t component : found->second)
+         position_dependencies |= component;
+      return position_dependencies == in_rows;
    }
 
    // The patched tokens as the program, with their length token set
