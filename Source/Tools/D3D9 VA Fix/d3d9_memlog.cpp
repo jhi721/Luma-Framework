@@ -157,35 +157,61 @@ namespace
    {
       void** slot;
       void* original;
-      void* hook;
    };
    constexpr int MAX_HOOKED_SLOTS = 128;
    HookedSlot g_hooked[MAX_HOOKED_SLOTS];
    std::atomic<int> g_hooked_count{0};
    std::mutex g_patch_mutex;
 
+   // Windows d3d9 keeps the device's vtable inside the device, right after a
+   // pointer to the static table it came from, and copies that table over it
+   // again in BeginStateBlock and for every later device. Patch hooks the tables
+   // it validated (append-only, like g_hooked).
+   constexpr int MAX_SOURCE_TABLES = 4;
+   void** g_source_tables[MAX_SOURCE_TABLES];
+   std::atomic<int> g_source_table_count{0};
+
+   // The hooked static table a vtable was copied from, or nullptr.
+   void** HookedSourceTable(void** vtable)
+   {
+      const int count = g_source_table_count.load(std::memory_order_acquire);
+      if (!count || InChainImage(vtable))
+         return nullptr;
+      void** source = (void**)vtable[-1];
+      for (int i = 0; i < count; i++)
+      {
+         if (g_source_tables[i] == source)
+            return source;
+      }
+      return nullptr;
+   }
+
    template <typename T>
    T Original(void* object, int index)
    {
-      void** slot = &(*(void***)object)[index];
+      void** vtable = *(void***)object;
+      void** slot = &vtable[index];
       const int count = g_hooked_count.load(std::memory_order_acquire);
       for (int i = 0; i < count; i++)
       {
          if (g_hooked[i].slot == slot)
             return reinterpret_cast<T>(g_hooked[i].original);
       }
-      // A vtable copied from a table we patched (Windows d3d9's device vtable
-      // of a later device) holds our hook in an unrecorded slot.
-      void* const current = *slot;
-      for (int i = 0; i < count; i++)
+      // A later device's vtable, copied from a table we hooked: its slot isn't
+      // recorded and may hold another module's hook that calls ours (apphelp.dll's
+      // COM router on an exe's first run), the table's slot is.
+      if (void** source = HookedSourceTable(vtable))
       {
-         if (g_hooked[i].hook == current)
-            return reinterpret_cast<T>(g_hooked[i].original);
+         for (int i = 0; i < count; i++)
+         {
+            if (g_hooked[i].slot == &source[index])
+               return reinterpret_cast<T>(g_hooked[i].original);
+         }
       }
       // Never patched (GetDesc with the fix off, read by the LockRect hook): the
       // slot still holds the runtime's method. A Patch racing this read can
       // return the hook, which then finds its recorded original.
-      return reinterpret_cast<T>(current);
+      return reinterpret_cast<T>(*slot);
    }
 
    void WriteSlot(void** slot, void* value)
@@ -204,38 +230,37 @@ namespace
          return;
       std::lock_guard lock(g_patch_mutex);
       const int count = g_hooked_count.load(std::memory_order_relaxed);
-      if (*slot == hook || count == MAX_HOOKED_SLOTS)
+      if (*slot == hook || count + 2 > MAX_HOOKED_SLOTS)
          return;
       for (int i = 0; i < count; i++)
       {
          if (g_hooked[i].slot == slot)
             return; // patched before; the CSMT layer may sit above our hook now
       }
+      if (void** source = HookedSourceTable(vtable); source && source[index] == hook)
+         return; // copied from a table we hooked: our hook is in this slot's chain
       // A slot the CSMT layer owns: our hook goes below it, so it runs in the
       // layer's order (on the worker for deferred calls).
       if (void* below = Csmt::InsertBelow(object, index, hook))
       {
-         g_hooked[count] = {.slot = slot, .original = below, .hook = hook};
+         g_hooked[count] = {.slot = slot, .original = below};
          g_hooked_count.store(count + 1, std::memory_order_release);
          return;
       }
-      void* const original = *slot;
-      g_hooked[count] = {.slot = slot, .original = original, .hook = hook};
+      g_hooked[count] = {.slot = slot, .original = *slot};
       g_hooked_count.store(count + 1, std::memory_order_release);
       WriteSlot(slot, hook);
-      // Windows d3d9 keeps the device's vtable inside the device, right after a
-      // pointer to the static table it came from, and BeginStateBlock copies that
-      // table over it again: hook the static table too, or the copy drops our
-      // hooks (MANAGED creates then reach D3D9Ex, which rejects them) while other
-      // threads may already call in. Taken only if the pointer is a table in the
-      // runtime's image that matches most of this vtable: the copy differs in our
-      // hooks and in others' (apphelp.dll shims CreateAdditionalSwapChain on an
-      // exe's first run, overlays hook Present).
+      // Hook the static table of a Windows d3d9 device vtable too, or its copies
+      // drop our hooks (MANAGED creates then reach D3D9Ex, which rejects them)
+      // while other threads may already call in. Taken only if the pointer is a
+      // table in the runtime's image that matches most of this vtable: the copy
+      // differs in our hooks and in others' (apphelp.dll shims Release and
+      // CreateAdditionalSwapChain on an exe's first run, overlays hook Present).
       constexpr int DEVICE9_METHODS = 119; // what BeginStateBlock copies
-      if (InChainImage(vtable) || count + 1 == MAX_HOOKED_SLOTS)
+      if (InChainImage(vtable))
          return;
       void** source = (void**)vtable[-1];
-      if (!InChainImage(source) || !InChainImage(source + DEVICE9_METHODS))
+      if (!InChainImage(source) || !InChainImage(source + DEVICE9_METHODS) || source[index] == hook)
          return;
       int same = 0;
       for (int i = 0; i < DEVICE9_METHODS; i++)
@@ -244,8 +269,15 @@ namespace
       }
       if (same < 90)
          return;
-      g_hooked[count + 1] = {.slot = &source[index], .original = original, .hook = hook};
+      g_hooked[count + 1] = {.slot = &source[index], .original = source[index]};
       g_hooked_count.store(count + 2, std::memory_order_release);
+      // Known before any copy can carry the hook.
+      const int tables = g_source_table_count.load(std::memory_order_relaxed);
+      if (!HookedSourceTable(vtable) && tables < MAX_SOURCE_TABLES)
+      {
+         g_source_tables[tables] = source;
+         g_source_table_count.store(tables + 1, std::memory_order_release);
+      }
       WriteSlot(&source[index], hook);
    }
 

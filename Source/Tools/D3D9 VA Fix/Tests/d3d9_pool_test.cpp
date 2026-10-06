@@ -231,6 +231,7 @@ static void Threads(IDirect3DDevice9* dev, int thread_count)
 int main(int argc, char** argv)
 {
    SetUnhandledExceptionFilter(&CrashReport);
+   setvbuf(stdout, nullptr, _IONBF, 0); // a crash loses buffered output
    if (argc < 3)
       return printf(
                 "usage: d3d9_pool_test <d3d9.dll> <managed|default|dynamic> "
