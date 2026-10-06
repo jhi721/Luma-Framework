@@ -33,6 +33,7 @@
 #if DEVELOPMENT
 #include "..\..\Core\includes\perf_test.h"
 #endif
+#include <share.h>
 #include <shellapi.h> // ShellExecuteA for About links (system("start ...") hangs the render thread in exclusive fullscreen)
 
 // FXAA resolve PS (only present when AA is enabled in the game's video settings). Cancelled while SMAA is on (see
@@ -169,6 +170,7 @@ enum PerfColumn : size_t
    PERF_COLUMN_UPSCALER,
    PERF_COLUMN_COPY_BACK,
    PERF_COLUMN_SCENE_COPY,
+   PERF_COLUMN_HELPER_EVALUATE, // The SR bridge helper's upscaler on its own GPU queue, within "PERF_COLUMN_UPSCALER"
    PERF_COLUMN_COUNT
 };
 static Perf::Sweep<PERF_COLUMN_COUNT> g_perf_sweep = {.defs = perf_sweeps, .rounds = 3, .windows = 1};
@@ -465,9 +467,13 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, null until its first upload), from
    // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest copy
    using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
+   struct RegisteredConstants
+   {
+      ConstantsCopy copy;
+      void* mapped = nullptr; // Mapped now, until its Unmap (one entry for both: dgVoodoo maps a vc4 buffer for every draw)
+   };
    std::mutex mv_constants_mutex;
-   std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
-   std::unordered_map<uint64_t, void*> mv_mapped_constants; // Registered buffers mapped now, until their Unmap
+   std::unordered_map<uint64_t, RegisteredConstants> mv_constants_copies;
    // "g_mv_buffer_filter": the first registered buffers and their sizes, read by the buffer hooks without the lock (written under it,
    // on the immediate context's thread as the hooks). With more registered, every buffer takes the lock as without the filter.
    static constexpr uint32_t kMaxFilteredBuffers = 8;
@@ -530,6 +536,9 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    Perf::TimestampRing<PERF_STAMP_COUNT> perf_timestamps;
    Perf::Window<PerfStats> perf_window;
    bool perf_sr_active = false; // The last measured frame's upscaler
+   // The SR bridge helper's "LUMA_UPSCALER_PROFILE" CSV while a test runs, and how far it was read
+   std::wstring perf_helper_profile_path;
+   int64_t perf_helper_profile_read = 0;
    // The user's anti-aliasing and CPU savings while a mode that sets its own runs
    SR::Type perf_user_sr_type = SR::Type::None;
    bool perf_user_smaa = false;
@@ -1020,7 +1029,58 @@ class Borderlands2 final : public Game
          g_mv_constants_pool = gd.perf_user_vc4_pool && !mode.vc4_pool_off;
          g_blend_memo = gd.perf_user_blend_memo && !mode.blend_memo_off;
       }
+      // A helper started from now on writes its profile (one already running doesn't: its rows come once it restarts, at the next
+      // upscaler change)
+      if (Perf::g_test == 0 && mode_index != 0)
+      {
+         wchar_t temp[MAX_PATH];
+         GetTempPathW(MAX_PATH, temp);
+         gd.perf_helper_profile_path = std::format(L"{}Luma-Upscaler-profile-{}.csv", temp, GetCurrentProcessId());
+         gd.perf_helper_profile_read = 0;
+         SetEnvironmentVariableW(L"LUMA_UPSCALER_PROFILE", gd.perf_helper_profile_path.c_str());
+      }
+      else if (Perf::g_test != 0 && mode_index == 0)
+      {
+         SetEnvironmentVariableW(L"LUMA_UPSCALER_PROFILE", nullptr);
+         DeleteFileW(gd.perf_helper_profile_path.c_str()); // Fails while a helper still writes it; the next test rewrites it
+      }
       Perf::g_test = mode_index;
+   }
+
+   // The helper's evaluation in ms (GPU timestamps after its wait for the game's "in" and after the upscaler), the median of the
+   // profile rows written since the last call; NaN without rows
+   static double ReadHelperEvaluateMs(Borderlands2GameDeviceData& gd)
+   {
+      FILE* csv = _wfsopen(gd.perf_helper_profile_path.c_str(), L"rb", _SH_DENYNO);
+      if (!csv)
+         return std::numeric_limits<double>::quiet_NaN();
+      _fseeki64(csv, 0, SEEK_END);
+      const int64_t size = _ftelli64(csv);
+      if (size < gd.perf_helper_profile_read)
+      {
+         gd.perf_helper_profile_read = 0; // A new helper rewrote it
+      }
+      std::string text(size_t(size - gd.perf_helper_profile_read), '\0');
+      _fseeki64(csv, gd.perf_helper_profile_read, SEEK_SET);
+      text.resize(fread(text.data(), 1, text.size(), csv));
+      fclose(csv);
+      std::vector<double> values;
+      size_t start = 0;
+      // Whole lines only (the last one may be half written); the header doesn't parse
+      for (size_t end; (end = text.find('\n', start)) != std::string::npos; start = end + 1)
+      {
+         unsigned long long n, queued, waited, evaluated, frequency;
+         long long cpu[4];
+         int disjoint;
+         if (sscanf_s(text.c_str() + start, "%llu,%lld,%lld,%lld,%lld,%llu,%llu,%llu,%llu,%d", &n, &cpu[0], &cpu[1], &cpu[2], &cpu[3], &queued, &waited, &evaluated, &frequency,
+                &disjoint) == 10 &&
+             !disjoint && frequency != 0 && evaluated >= waited)
+         {
+            values.push_back(double(evaluated - waited) * 1000.0 / double(frequency));
+         }
+      }
+      gd.perf_helper_profile_read += int64_t(start);
+      return values.empty() ? std::numeric_limits<double>::quiet_NaN() : Perf::Median(std::move(values));
    }
 
 #endif
@@ -1039,11 +1099,12 @@ class Borderlands2 final : public Game
       if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
          return;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      if (!gd.mv_constants_copies.contains(resource.handle))
+      const auto registered = gd.mv_constants_copies.find(resource.handle);
+      if (registered == gd.mv_constants_copies.end())
          return;
       if (access == reshade::api::map_access::write_discard && offset == 0)
       {
-         gd.mv_mapped_constants[resource.handle] = *data;
+         registered->second.mapped = *data;
       }
 #if DEVELOPMENT
       else
@@ -1067,11 +1128,10 @@ class Borderlands2 final : public Game
       if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
          return;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto mapped = gd.mv_mapped_constants.find(resource.handle);
-      if (mapped == gd.mv_mapped_constants.end())
+      const auto registered = gd.mv_constants_copies.find(resource.handle);
+      if (registered == gd.mv_constants_copies.end() || !registered->second.mapped)
          return;
-      gd.mv_constants_copies[resource.handle] = NewConstantsCopy(gd, static_cast<const uint8_t*>(mapped->second), GetBufferSize(resource.handle, buffer_size));
-      gd.mv_mapped_constants.erase(mapped);
+      registered->second.copy = NewConstantsCopy(gd, static_cast<const uint8_t*>(std::exchange(registered->second.mapped, nullptr)), GetBufferSize(resource.handle, buffer_size));
 #if DEVELOPMENT
       gd.mv_stats.maps++;
 #endif
@@ -1099,10 +1159,11 @@ class Borderlands2 final : public Game
       if (offset >= buffer_size)
          return false;
       const size_t updated_size = size_t((std::min)(size, uint64_t(buffer_size) - offset));
-      const bool merge = copy->second && copy->second->size() == buffer_size;
-      auto updated = NewConstantsCopy(gd, merge ? copy->second->data() : nullptr, buffer_size);
+      const auto& last = copy->second.copy;
+      const bool merge = last && last->size() == buffer_size;
+      auto updated = NewConstantsCopy(gd, merge ? last->data() : nullptr, buffer_size);
       std::memcpy(updated->data() + offset, data, updated_size);
-      copy->second = std::move(updated);
+      copy->second.copy = std::move(updated);
 #if DEVELOPMENT
       gd.mv_stats.updates++;
 #endif
@@ -1500,7 +1561,7 @@ class Borderlands2 final : public Game
          if (current)
          {
             const auto [copy, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current.get()));
-            constants = copy->second;
+            constants = copy->second.copy;
             if (registered)
             {
                AddFilteredBuffer(&gd, current.get());
@@ -3361,15 +3422,18 @@ public:
             {
             const double fill = stats.end_parts[0].Average(), upscaler = stats.end_parts[1].Average(), copy_back = stats.end_parts[2].Average(), scene_copy = stats.end_parts[3].Average();
             const double hooks = window.HookMs();
-            reshade::log::message(reshade::log::level::info, std::format("[BL2 Perf] {} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) end avg/max={:.3f}/{:.3f} ms ({}) = fill {:.3f} + upscaler {:.3f} + copy back {:.3f} + scene copy {:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}",
-                                                                settings, stats.frame.Average(), stats.frame.max_ms, stats.scene.Average(), stats.scene.max_ms, stats.scene.samples, stats.end.Average(), stats.end.max_ms, stats.end.samples, fill, upscaler, copy_back, scene_copy, stats.end_parts[0].samples, window.CpuFrameMs(), hooks, stats.frame.samples, window.frames, window.disjoint)
+            // Read every window (a helper still exiting after the upscaler was left keeps writing), kept only where the upscaler ran
+            const double helper_rows = ReadHelperEvaluateMs(gd);
+            const double helper_evaluate = (stats.end_parts[1].samples != 0 ? helper_rows : std::numeric_limits<double>::quiet_NaN());
+            reshade::log::message(reshade::log::level::info, std::format("[BL2 Perf] {} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) end avg/max={:.3f}/{:.3f} ms ({}) = fill {:.3f} + upscaler {:.3f} (helper evaluate {:.3f}) + copy back {:.3f} + scene copy {:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}",
+                                                                settings, stats.frame.Average(), stats.frame.max_ms, stats.scene.Average(), stats.scene.max_ms, stats.scene.samples, stats.end.Average(), stats.end.max_ms, stats.end.samples, fill, upscaler, helper_evaluate, copy_back, scene_copy, stats.end_parts[0].samples, window.CpuFrameMs(), hooks, stats.frame.samples, window.frames, window.disjoint)
                                                                 .c_str());
             // The row in "PerfColumn" order
-            g_perf_sweep.OnWindow(Perf::g_test, {stats.frame.Average(), stats.scene.Average(), stats.end.Average(), hooks, window.CpuFrameMs(), fill, upscaler, copy_back, scene_copy}, [&](int mode_index)
+            g_perf_sweep.OnWindow(Perf::g_test, {stats.frame.Average(), stats.scene.Average(), stats.end.Average(), hooks, window.CpuFrameMs(), fill, upscaler, copy_back, scene_copy, helper_evaluate}, [&](int mode_index)
                { ApplyPerfTestMode(device_data, mode_index); }, [&](int mode, int baseline_mode, double baseline)
                {
                      const double cpu_frame = g_perf_sweep.Median(mode, PERF_COLUMN_CPU_FRAME);
-                     reshade::log::message(reshade::log::level::info, std::format("[BL2 Perf] sweep mode=\"{}\" hook_timers={} windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, Perf::g_hook_timers, g_perf_sweep.results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, g_perf_sweep.Median(mode, PERF_COLUMN_FRAME), g_perf_sweep.Median(mode, PERF_COLUMN_FRAME) - baseline, perf_test_modes[baseline_mode].name, g_perf_sweep.Median(mode, PERF_COLUMN_SCENE), g_perf_sweep.Median(mode, PERF_COLUMN_TAIL), g_perf_sweep.Median(mode, PERF_COLUMN_FILL), g_perf_sweep.Median(mode, PERF_COLUMN_UPSCALER), g_perf_sweep.Median(mode, PERF_COLUMN_COPY_BACK), g_perf_sweep.Median(mode, PERF_COLUMN_SCENE_COPY), g_perf_sweep.Median(mode, PERF_COLUMN_HOOKS)).c_str()); }); });
+                     reshade::log::message(reshade::log::level::info, std::format("[BL2 Perf] sweep mode=\"{}\" hook_timers={} windows={} cpu frame median={:.3f} ms ({:.1f} fps) gpu frame median={:.3f} ms ({:+.3f} vs \"{}\") scene median={:.3f} ms end median={:.3f} ms (fill {:.3f} upscaler {:.3f} helper evaluate {:.3f} copy back {:.3f} scene copy {:.3f}) cpu hooks median={:.3f} ms/frame", perf_test_modes[mode].name, Perf::g_hook_timers, g_perf_sweep.results[mode].size(), cpu_frame, cpu_frame > 0.0 ? 1000.0 / cpu_frame : 0.0, g_perf_sweep.Median(mode, PERF_COLUMN_FRAME), g_perf_sweep.Median(mode, PERF_COLUMN_FRAME) - baseline, perf_test_modes[baseline_mode].name, g_perf_sweep.Median(mode, PERF_COLUMN_SCENE), g_perf_sweep.Median(mode, PERF_COLUMN_TAIL), g_perf_sweep.Median(mode, PERF_COLUMN_FILL), g_perf_sweep.Median(mode, PERF_COLUMN_UPSCALER), g_perf_sweep.Median(mode, PERF_COLUMN_HELPER_EVALUATE), g_perf_sweep.Median(mode, PERF_COLUMN_COPY_BACK), g_perf_sweep.Median(mode, PERF_COLUMN_SCENE_COPY), g_perf_sweep.Median(mode, PERF_COLUMN_HOOKS)).c_str()); }); });
          gd.perf_timestamps.Open(native_device, perf_context.get());
       }
 #endif
