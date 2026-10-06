@@ -1,5 +1,6 @@
-// Medal of Honor: Airborne — UE3 DOFAndBloomGather (VS 0xE3D90B67). Replacement, for ONE purpose: to switch the
-// game's own bloom off at its source when the Luma HDR bloom pyramid replaces it.
+// Medal of Honor: Airborne — UE3 DOFAndBloomGather (VS 0xE3D90B67). Replacement, for two purposes: to switch the
+// game's own bloom off at its source when the Luma HDR bloom pyramid replaces it, and under DLSS/FSR to take the DoF
+// amount from a per pixel history instead of the jittered depth (see DoFAmountHistory).
 //
 // WHY THIS PASS AND NOT THE GRADE. This shader writes a single quarter-res target that carries BOTH the depth-of
 // -field blur and the bloom, summed into .xyz, with the DoF weight in .w:
@@ -24,6 +25,8 @@
 // Only what this pass samples; the grade's t1/t6 are none of its business.
 SamplerState SceneColorTextureSampler_s : register(s0);
 Texture2D<float4> SceneColorTexture : register(t0); // fp16 scene color; .w carries SCENE DEPTH, not alpha
+// DLSS/FSR only: every scene pixel's DoF amount accumulated over frames (Luma_MOHA_DOFHistory.hlsl)
+Texture2D<float> DoFAmountHistory : register(t1);
 
 // cb4 is dgVoodoo's SHARED constant mirror, so the same row means different things per pass: row 10 is the grade's
 // shadows lift, but HERE it is the engine's bloom scale (measured 1.0). Named per pass on purpose.
@@ -71,7 +74,19 @@ void main(
 
    // Depth of field, from all four taps. The alpha carries scene depth (UE3 packs it in the fp16 alpha).
    const float4 sum = s0 + s1 + s2 + s3;
-   const float blurAmount = DoFBlurAmount(sum.w * 0.25, DoFParams, DoFMaxBlur);
+   float blurAmount = DoFBlurAmount(sum.w * 0.25, DoFParams, DoFMaxBlur);
+   // Under DLSS/FSR the depth is jittered and the amount of its mean flips at silhouettes every frame: the mean of the taps'
+   // accumulated per pixel amounts instead (they follow the covered area, not the block's mean depth)
+   // (sized like the scene: otherwise it's nothing, or dgVoodoo's 1x1 placeholder for an unused slot)
+   uint2 historySize, sceneSize;
+   DoFAmountHistory.GetDimensions(historySize.x, historySize.y);
+   SceneColorTexture.GetDimensions(sceneSize.x, sceneSize.y);
+   if (all(historySize == sceneSize))
+   {
+      blurAmount = (DoFAmountHistory.Sample(SceneColorTextureSampler_s, v5.xy) + DoFAmountHistory.Sample(SceneColorTextureSampler_s, v6.xy) +
+                    DoFAmountHistory.Sample(SceneColorTextureSampler_s, v5.wz) + DoFAmountHistory.Sample(SceneColorTextureSampler_s, v6.wz)) *
+                   0.25;
+   }
 
    // The target is quarter-res and the grade multiplies it back by 4, hence the trailing 0.25 (the engine stores
    // this buffer pre-divided so it fits an 8-bit range; the fp16 upgrade lifted that ceiling but not the scale).

@@ -1,9 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <initializer_list>
 #include <map>
+#include <utility>
 #include <vector>
 
+#include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "..\..\Core\includes\motion_vector_patch.h"
 
 // Motion vectors for a game that renders none, by patching whole DXBC containers (Core's "motion_vector_patch.h"; this file holds
@@ -66,17 +70,21 @@ namespace MotionVectorPatches
                if (type == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER)
                {
                   const bool immediate = DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) == D3D10_SB_OPERAND_INDEX_2D && DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) == D3D10_SB_OPERAND_INDEX_IMMEDIATE32;
-                  if (!immediate || index_position == DXBC::no_index || tokens[index_position] != object_slot || row != UINT32_MAX)
-                     single = false;
-                  else
+                  if (immediate && index_position != DXBC::no_index && tokens[index_position] == object_slot && row == UINT32_MAX)
+                  {
                      row = tokens[index_position + 1];
+                  }
+                  else
+                  {
+                     single = false;
+                  }
                   return true;
                }
                if ((type != D3D10_SB_OPERAND_TYPE_TEMP && type != D3D10_SB_OPERAND_TYPE_INPUT) || index_position == DXBC::no_index ||
                    DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(token) != D3D10_SB_OPERAND_4_COMPONENT)
                   return true;
                // One component, replicated (".yyyy") or selected
-               uint32_t selected;
+               uint32_t selected = 0;
                switch (DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(token))
                {
                case D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE:
@@ -94,12 +102,16 @@ namespace MotionVectorPatches
                   return true;
                }
                if (broadcast != UINT64_MAX)
+               {
                   single = false;
+               }
                broadcast = (uint64_t(type) << 32) | tokens[index_position];
                component = selected;
                return true; });
          if (single && row != UINT32_MAX && broadcast != UINT64_MAX && row >= object_row_offset)
+         {
             products[broadcast].push_back(row * 4 + component);
+         }
       }
       for (auto& [broadcast, rows] : products)
       {
@@ -108,7 +120,9 @@ namespace MotionVectorPatches
          {
             if (first % 4 == 0 && std::ranges::all_of(std::initializer_list<uint32_t>{1, 2, 3}, [&](uint32_t k)
                                      { return std::ranges::binary_search(rows, first + k * 4 + k); }))
+            {
                registers.push_back(first / 4 - object_row_offset);
+            }
          }
       }
       std::ranges::sort(registers);

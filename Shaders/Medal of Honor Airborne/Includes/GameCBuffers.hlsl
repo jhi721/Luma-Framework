@@ -32,6 +32,29 @@ struct LumaGameData
 {
    float Dummy; // hlsl doesn't support empty structs
 };
+
+// The motion vector fill's constants (Luma_MOHA_MotionVectorFill.hlsl, b0), written by "EndScene"
+struct MotionVectorFillConstants
+{
+   row_major float4x4 reprojection; // Current clip space to the previous frame's
+   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
+   float2 depth_from_view;          // The projection's depth row: device depth = x + y / view depth
+   float reactive_scale;
+   float reactive_threshold;
+   float reactive_enabled;
+   float padding;
+};
+
+// The DoF history's constants (Luma_MOHA_DOFHistory.hlsl, b0), written by "DrawDOFHistory"
+struct DOFHistoryConstants
+{
+   float history_weight; // Weight of the current frame, 1 = no history
+   float3 padding;
+};
 } // namespace CB
+
+#ifdef __cplusplus
+static_assert(sizeof(CB::MotionVectorFillConstants) == 96 && sizeof(CB::DOFHistoryConstants) == 16); // The HLSL cbuffers' sizes
+#endif
 
 #endif // LUMA_GAME_CB_STRUCTS

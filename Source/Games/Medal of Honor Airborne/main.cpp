@@ -30,7 +30,6 @@
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
 
 #include "..\..\Core\core.hpp"
-#include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
 #include "..\..\Core\includes\patched_draws.h"
 #include <shellapi.h> // ShellExecuteA for About links (system() hangs the render thread in exclusive fullscreen)
@@ -107,6 +106,29 @@ static bool g_sr_reactive_enable = true;
 static bool g_sr_reactive_debug_view = false;
 #else
 static constexpr bool g_sr_reactive_enable = true;
+#endif
+// Why "DrawWithMotionVectors" refused a draw (it then only gets the jitter); DEV counters "mv.rejected.<name>", in this order
+enum class MotionVectorReject : uint8_t
+{
+   EXTRA_TARGET,
+   NO_SCENE,
+   OTHER_DEPTH_COLOR,
+   FORMAT,
+   SIZE,
+   CREATE,
+   BLEND,
+   SHADERS,
+   COUNT
+};
+#if DEVELOPMENT
+static constexpr const char* motion_vector_reject_names[] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
+static_assert(std::size(motion_vector_reject_names) == size_t(MotionVectorReject::COUNT));
+#endif
+
+#if DEVELOPMENT
+static bool g_dof_history_enable = true; // Under DLSS/FSR, the gather's DoF amount from its history (see "DrawDOFHistory")
+#else
+static constexpr bool g_dof_history_enable = true;
 #endif
 
 struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
@@ -233,6 +255,7 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no upscaler)
+   com_ptr<ID3D11ShaderResourceView> mv_srv;  // The DoF history's reprojection (see "DrawDOFHistory")
    // The upscaler's depth, built from the scene's alpha by the fill (the game's depth has no shader resource view)
    com_ptr<ID3D11Texture2D> mv_device_depth;
    com_ptr<ID3D11UnorderedAccessView> mv_device_depth_uav;
@@ -248,17 +271,22 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11RenderTargetView> mv_reactive_target_rtv;
    com_ptr<ID3D11ShaderResourceView> mv_reactive_target_srv;
 
-   // The targets sized like the scene (made again at a resize, see "DrawWithMotionVectors")
+   // The targets sized like the scene (made again at a resize, see "DrawWithMotionVectors"; FSR's masks at the scene's end)
    void ReleaseMotionVectorTargets()
    {
       mv_texture.reset();
       mv_rtv.reset();
       mv_uav.reset();
+      mv_srv.reset();
       mv_device_depth.reset();
       mv_device_depth_uav.reset();
       mv_reactive_target.reset();
       mv_reactive_target_rtv.reset();
       mv_reactive_target_srv.reset();
+      mv_reactive.reset();
+      mv_reactive_uav.reset();
+      mv_transparency.reset();
+      mv_transparency_uav.reset();
    }
    // A frame opens at its first mesh draw into output sized depth (the jitter is chosen there), starts at its first motion vector
    // draw (the target is cleared) and ends at the first post pass (the gather, or a final pass), once per present.
@@ -266,6 +294,7 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
    bool mv_scene_done = false;
    bool mv_frame_ended = true;
    bool mv_fill_pending = false;
+   bool mv_fsr_masks = false;        // FSR's reactive masks this frame (set when the scene opens, so a toggle mid frame doesn't split them)
    float sr_vert_fov = 1.0471976f;   // FSR's vertical FOV (radians): the last camera's, 60 degrees until one is seen
    com_ptr<ID3D11Resource> mv_depth; // The scene depth (the depth view's resource)
    // The fp16 scene the motion vector draws write, and the game's view of it (the upscaler's copy back)
@@ -375,6 +404,24 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
    };
    DeferredMotionBlur mv_motion_blur;
 
+   // The gather's DoF amount per scene pixel accumulated over frames (see "DrawDOFHistory"): last frame's is read, the other written
+   com_ptr<ID3D11ShaderResourceView> dof_history_srvs[2]; // The views hold the textures
+   com_ptr<ID3D11UnorderedAccessView> dof_history_uavs[2];
+   uint2 dof_history_size = {}; // Zero while released
+   uint32_t dof_history_index = 0;
+   bool dof_history_drawn = false; // This frame
+   bool dof_history_valid = false; // Drawn last frame (taken at present)
+   com_ptr<ID3D11Buffer> dof_history_buffer;
+   void ReleaseDOFHistory()
+   {
+      for (size_t i = 0; i < std::size(dof_history_srvs); i++)
+      {
+         dof_history_srvs[i].reset();
+         dof_history_uavs[i].reset();
+      }
+      dof_history_size = {};
+   }
+
 #if DEVELOPMENT
    // Per frame counts for the DEV panel (the last complete frame's shown)
    struct MotionVectorStats
@@ -385,7 +432,7 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
       uint32_t motion_blur_replays = 0, motion_blur_masked = 0;              // "ReplayMotionBlur"s, and those with the weapon masked out
       uint32_t ended_by = 0;                                                 // The ending pass's PS hash
       float near_plane = 0.f, far_plane = 0.f;                               // The upscaler's, from the camera's projection (0: none found)
-      uint32_t rejected[8] = {};                                             // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
+      uint32_t rejected[size_t(MotionVectorReject::COUNT)] = {};             // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
       uint32_t rejected_format = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
    };
    MotionVectorStats mv_stats, mv_last_stats;
@@ -502,7 +549,9 @@ class MedalOfHonorAirborne final : public Game
       native_device_context->Unmap(oldest, 0);
       // Reject implausible readback data rather than let it reach the frame.
       if (bloom_scale >= 0.f && bloom_scale < 100.f)
+      {
          gd->bloom_scale_live = bloom_scale;
+      }
    }
 
    // RTV 0 as bound right now, and the resource behind it (both null when nothing is bound). Identifies the canvas at
@@ -513,7 +562,9 @@ class MedalOfHonorAirborne final : public Game
       res->reset();
       native_device_context->OMGetRenderTargets(1, rtv->put(), nullptr);
       if (*rtv)
+      {
          (*rtv)->GetResource(res->put());
+      }
    }
 
 #if DEVELOPMENT
@@ -572,12 +623,16 @@ class MedalOfHonorAirborne final : public Game
             std::memcpy(&w[row], constants.data() + offset + row * 16 + 3 * sizeof(float), sizeof(float));
          }
          const bool projects = w[0] != 0.f || w[1] != 0.f || w[2] != 0.f || w[3] != 1.f;
-         size_t& found = projects ? matrices.view_projection : matrices.world;
+         size_t& found = (projects ? matrices.view_projection : matrices.world);
          if (found == SIZE_MAX)
+         {
             found = offset;
+         }
       }
       if (matrices.world == SIZE_MAX && matrices.view_projection != SIZE_MAX && matrices.view_projection >= (MotionVectorPatches::object_row_offset + 4) * 16)
+      {
          matrices.world = matrices.view_projection - 4 * 16;
+      }
       return matrices;
    }
 
@@ -634,12 +689,16 @@ class MedalOfHonorAirborne final : public Game
          auto copy = gd.mv_constants_pool[gd.mv_constants_pool_free.back()];
          gd.mv_constants_pool_free.pop_back();
          if (bytes)
+         {
             copy->assign(bytes, bytes + size);
+         }
          else
+         {
             copy->assign(size, 0);
+         }
          return copy;
       }
-      auto copy = bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size);
+      auto copy = (bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size));
       gd.mv_constants_pool.push_back(copy);
       return copy;
    }
@@ -657,12 +716,14 @@ class MedalOfHonorAirborne final : public Game
       const std::lock_guard lock(gd.mv_constants_mutex);
       if (!gd.mv_constants_copies.contains(resource.handle))
          return;
-      if (access == reshade::api::map_access::write_discard && offset == 0)
-         gd.mv_mapped_constants[resource.handle] = *data;
+      if (access != reshade::api::map_access::write_discard || offset != 0)
+      {
 #if DEVELOPMENT
-      else
          gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
 #endif
+         return;
+      }
+      gd.mv_mapped_constants[resource.handle] = *data;
    }
 
    // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
@@ -766,20 +827,44 @@ class MedalOfHonorAirborne final : public Game
       com_ptr<T> shader;
       if (!patched.empty())
       {
-         HRESULT hr;
+         HRESULT hr = E_FAIL;
          if constexpr (vertex)
+         {
             hr = native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &shader);
+         }
          else
+         {
             hr = native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &shader);
+         }
          if (FAILED(hr))
+         {
             error = std::format("create 0x{:08X}", uint32_t(hr));
+         }
       }
       // Failures in every build (bug reports), every patched shader only in development
       if (DEVELOPMENT || !shader)
-         reshade::log::message(shader ? reshade::log::level::info : reshade::log::level::warning,
-            std::format("[MOHA MV] {} 0x{:08X} {} ({} matrices)", vertex ? "VS" : (reactive == 0 ? "PS" : (reactive == 2 ? "PS reactive additive" : "PS reactive alpha")), hash, shader ? "patched" : error, matrix_registers.size()).c_str());
+      {
+         const char* kind = "VS";
+         if constexpr (!vertex)
+         {
+            switch (reactive)
+            {
+            case 0:
+               kind = "PS";
+               break;
+            case 2:
+               kind = "PS reactive additive";
+               break;
+            default:
+               kind = "PS reactive alpha";
+               break;
+            }
+         }
+         reshade::log::message((shader ? reshade::log::level::info : reshade::log::level::warning),
+            std::format("[MOHA MV] {} 0x{:08X} {} ({} matrices)", kind, hash, (shader ? "patched" : error), matrix_registers.size()).c_str());
+      }
       const std::unique_lock lock(gd.mv_mutex);
-      return shaders->try_emplace(hash, MedalOfHonorAirborneGameDeviceData::PatchedShader<T>{shader, read_size, std::move(matrix_registers)}).first->second;
+      return shaders->try_emplace(hash, MedalOfHonorAirborneGameDeviceData::PatchedShader<T>{.shader = shader, .read_size = read_size, .matrix_registers = std::move(matrix_registers)}).first->second;
    }
 
    // The bound vertex shader's patched version (null shader if refused), looked up again only when the game's changes
@@ -806,10 +891,12 @@ class MedalOfHonorAirborne final : public Game
          return;
       D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
       if (blend_state)
+      {
          blend_state->GetDesc(&blend_desc);
+      }
       const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = blend_desc.RenderTarget[0];
       gd->mv_blend_opaque = rt0.RenderTargetWriteMask != 0 && (!rt0.BlendEnable || (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_ZERO && rt0.BlendOp == D3D11_BLEND_OP_ADD));
-      gd->mv_reactive_blend = (!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? 0 : (rt0.DestBlend == D3D11_BLEND_ONE ? 2 : 1);
+      gd->mv_reactive_blend = ((!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? 0 : (rt0.DestBlend == D3D11_BLEND_ONE ? 2 : 1));
       gd->mv_blend_state = blend_state.get();
    }
 
@@ -835,13 +922,16 @@ class MedalOfHonorAirborne final : public Game
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
       gd.mv_reactive_blend = 0;
+      gd.mv_fsr_masks = g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's helper
       // starting shows the scene as it is, antialiased with SMAA).
-      const SR::InstanceData* sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
+      const SR::InstanceData* sr_instance_data = (IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr);
       if (sr_instance_data && !sr_implementations[device_data.sr_type]->IsReady(sr_instance_data))
+      {
          sr_instance_data = nullptr;
+      }
       const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      gd.mv_jitter = (sr_instance_data || g_mv_force_jitter) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+      gd.mv_jitter = ((sr_instance_data || g_mv_force_jitter) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
       gd.mv_jitter_ndc = {gd.mv_jitter[0] * 2.f / device_data.output_resolution.x, gd.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -855,7 +945,7 @@ class MedalOfHonorAirborne final : public Game
 
 #if DEVELOPMENT
 #define MV_REJECT(reason) \
-   ([&](auto& gd) { gd.mv_stats.rejected[reason]++; gd.mv_draw_reject = int(reason); return false; }(GetGameDeviceData(device_data)))
+   ([&](auto& gd) { gd.mv_stats.rejected[size_t(reason)]++; gd.mv_draw_reject = int(reason); return false; }(GetGameDeviceData(device_data)))
 #else
 #define MV_REJECT(reason) false
 #endif
@@ -872,13 +962,13 @@ class MedalOfHonorAirborne final : public Game
       {
          if (rtvs[slot] && (slot != MotionVectorPatches::target_slot || rtvs[slot] != gd.mv_rtv) &&
              (slot != MotionVectorPatches::reactive_slot || rtvs[slot] != gd.mv_reactive_target_rtv))
-            return MV_REJECT(0);
+            return MV_REJECT(MotionVectorReject::EXTRA_TARGET);
       }
       if (!rtvs[0] || !dsv || !gd.mv_scene_open)
-         return MV_REJECT(1);
+         return MV_REJECT(MotionVectorReject::NO_SCENE);
       ClassifyBoundBlend(native_device_context, &gd);
       if (!gd.mv_blend_opaque)
-         return MV_REJECT(6);
+         return MV_REJECT(MotionVectorReject::BLEND);
       // Targets other than the last accepted ones: checked, and the motion vector target sized for them
       if (rtvs[0] != gd.mv_scene_rtv || dsv != gd.mv_scene_dsv.get())
       {
@@ -887,13 +977,15 @@ class MedalOfHonorAirborne final : public Game
          com_ptr<ID3D11Resource> color;
          rtvs[0]->GetResource(&color);
          if (depth != gd.mv_depth || !color || (gd.mv_scene_color && color != gd.mv_scene_color))
-            return MV_REJECT(2);
+            return MV_REJECT(MotionVectorReject::OTHER_DEPTH_COLOR);
          D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
          rtvs[0]->GetDesc(&rtv_desc);
          com_ptr<ID3D11Texture2D> color_texture;
          D3D11_TEXTURE2D_DESC color_desc = {};
          if (SUCCEEDED(color->QueryInterface(&color_texture)))
+         {
             color_texture->GetDesc(&color_desc);
+         }
 #if DEVELOPMENT
          gd.mv_stats.rejected_format = rtv_desc.Format;
          gd.mv_stats.rejected_width = color_desc.Width;
@@ -902,14 +994,16 @@ class MedalOfHonorAirborne final : public Game
          // The fill reads the scene: it needs a shader resource view. Filtered by the resource, not the view (dgVoodoo binds
          // single-slice array views).
          if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || color_desc.ArraySize != 1 || color_desc.SampleDesc.Count != 1 || (color_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0)
-            return MV_REJECT(3);
+            return MV_REJECT(MotionVectorReject::FORMAT);
          const uint2 size = {color_desc.Width, color_desc.Height};
          if (size.x != device_data.output_resolution.x || size.y != device_data.output_resolution.y)
-            return MV_REJECT(4);
+            return MV_REJECT(MotionVectorReject::SIZE);
          const std::unique_lock lock(gd.mv_mutex);
          D3D11_TEXTURE2D_DESC desc = {};
          if (gd.mv_texture)
+         {
             gd.mv_texture->GetDesc(&desc);
+         }
          // R16G16_FLOAT: FSR keeps 16 bits internally; the error is under 0.1% of the motion (BL GOTY)
          constexpr DXGI_FORMAT format = DXGI_FORMAT_R16G16_FLOAT;
          if (desc.Width != size.x || desc.Height != size.y)
@@ -923,17 +1017,24 @@ class MedalOfHonorAirborne final : public Game
             {
                gd.mv_texture.reset();
                gd.mv_rtv.reset();
-               return MV_REJECT(5);
+               return MV_REJECT(MotionVectorReject::CREATE);
             }
+            native_device->CreateShaderResourceView(gd.mv_texture.get(), nullptr, &gd.mv_srv);
             if (typed_uav_load)
+            {
                native_device->CreateUnorderedAccessView(gd.mv_texture.get(), nullptr, &gd.mv_uav);
+            }
             const CD3D11_TEXTURE2D_DESC depth_desc(DXGI_FORMAT_R32_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
             if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, depth_desc, &gd.mv_device_depth)))
+            {
                native_device->CreateUnorderedAccessView(gd.mv_device_depth.get(), nullptr, &gd.mv_device_depth_uav);
+            }
             const CD3D11_TEXTURE2D_DESC reactive_desc(DXGI_FORMAT_R8G8_UNORM, size.x, size.y, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
             if (SUCCEEDED(native_device->CreateTexture2D(&reactive_desc, nullptr, &gd.mv_reactive_target)) &&
                 SUCCEEDED(native_device->CreateRenderTargetView(gd.mv_reactive_target.get(), nullptr, &gd.mv_reactive_target_rtv)))
+            {
                native_device->CreateShaderResourceView(gd.mv_reactive_target.get(), nullptr, &gd.mv_reactive_target_srv);
+            }
             gd.mv_frame_ended = true;
          }
          gd.mv_scene_color = color;
@@ -949,12 +1050,12 @@ class MedalOfHonorAirborne final : public Game
       }
       ID3D11PixelShader* const pixel_shader = gd.mv_last_pixel_shader;
       if (!vertex_shader.shader || !pixel_shader || !gd.mv_jitter_buffer)
-         return MV_REJECT(7);
+         return MV_REJECT(MotionVectorReject::SHADERS);
       if (std::exchange(gd.mv_frame_ended, false))
       {
          gd.mv_fill_pending = gd.mv_uav && gd.mv_device_depth_uav && FindShader(device_data.native_compute_shaders, CompileTimeStringHash("MOHA Motion Vector Fill CS")) != nullptr;
          // The fill's marker: the largest float16 (a larger clear value is stored as it in R16G16_FLOAT)
-         const FLOAT clear_value = gd.mv_fill_pending ? 65504.f : 0.f;
+         const FLOAT clear_value = (gd.mv_fill_pending ? 65504.f : 0.f);
          const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
          native_device_context->ClearRenderTargetView(gd.mv_rtv.get(), clear);
          if (gd.mv_reactive_target_rtv)
@@ -964,7 +1065,7 @@ class MedalOfHonorAirborne final : public Game
          }
          // Last frame's camera and objects are the previous ones, unless frames without a scene (menus, videos) came between
          const bool previous_valid = gd.mv_camera && cb_luma_global_settings.FrameIndex - gd.mv_frame_index <= 1;
-         gd.mv_previous_camera = previous_valid ? gd.mv_camera : std::nullopt;
+         gd.mv_previous_camera = (previous_valid ? gd.mv_camera : std::nullopt);
          gd.mv_camera.reset();
          gd.mv_frame_index = cb_luma_global_settings.FrameIndex;
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the
@@ -977,9 +1078,13 @@ class MedalOfHonorAirborne final : public Game
          std::erase_if(gd.mv_objects, [](const auto& entry)
             { return entry.second.empty(); });
          for (auto& entry : gd.mv_objects)
+         {
             entry.second.clear();
+         }
          if (!previous_valid)
+         {
             gd.mv_previous_objects.clear();
+         }
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
@@ -995,7 +1100,9 @@ class MedalOfHonorAirborne final : public Game
             const auto [copy, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current.get()));
             constants = copy->second;
             if (registered)
+            {
                AddFilteredBuffer(gd, current.get());
+            }
          }
       }
       // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
@@ -1010,7 +1117,9 @@ class MedalOfHonorAirborne final : public Game
          {
             std::memcpy(view_projection.data(), constants->data() + matrices.view_projection, sizeof(view_projection));
             if (!gd.mv_camera)
+            {
                gd.mv_camera = view_projection;
+            }
          }
 
          // Draw key: same mesh, same shaders, no instance count
@@ -1026,15 +1135,20 @@ class MedalOfHonorAirborne final : public Game
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset),
                  reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)),
                  uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
+         {
             HashCombine(key, value);
+         }
 
          // LocalToWorld separates objects that share a key (props, soldiers of one model), as a tie-break only (see
          // "PatchedDraws::ObjectTransform")
          PatchedDraws::ObjectTransform transform = {};
          if (matrices.world != SIZE_MAX)
+         {
             transform = PatchedDraws::ReadRowVectorTransform(constants->data() + matrices.world);
+         }
 
-         // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
+         // A linear search among the key's candidates: a handful at most here (a spatial lookup would pay off only for big crowds
+         // sharing one mesh)
          const MedalOfHonorAirborneGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end())
          {
@@ -1070,7 +1184,7 @@ class MedalOfHonorAirborne final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         gd.mv_objects[key].push_back({transform, constants});
+         gd.mv_objects[key].push_back({.transform = transform, .constants = constants});
       }
 #if DEVELOPMENT
       else
@@ -1125,7 +1239,9 @@ class MedalOfHonorAirborne final : public Game
       {
          D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
          if (depth_stencil_state)
+         {
             depth_stencil_state->GetDesc(&depth_desc);
+         }
          gd.jitter_depth_test = depth_desc.DepthEnable;
          gd.jitter_depth_stencil_state = depth_stencil_state.get();
       }
@@ -1142,11 +1258,13 @@ class MedalOfHonorAirborne final : public Game
       // An alpha blended draw into the scene writes its mask, reactive or transparency & composition (its pixel shader patched, the
       // mask target added past the motion vector one). FSR only: DLSS's current presets ignore them (DLSS-Best-Practices TRN-2).
       ID3D11PixelShader* reactive_shader = nullptr;
-      if (g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
+      if (gd.mv_fsr_masks && gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
       {
          ClassifyBoundBlend(native_device_context, &gd);
          if (const uint8_t blend = gd.mv_reactive_blend; blend != 0)
+         {
             reactive_shader = GetMotionVectorShader(native_device, device_data, &gd.mv_reactive_pixel_shaders[blend - 1], original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, blend).shader.get();
+         }
       }
 
       // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel shader
@@ -1160,7 +1278,9 @@ class MedalOfHonorAirborne final : public Game
          {
             ID3D11RenderTargetView* targets[MotionVectorPatches::reactive_slot + 1] = {};
             for (uint32_t slot = 0; slot < MotionVectorPatches::reactive_slot; slot++)
+            {
                targets[slot] = rtvs[slot].get();
+            }
             targets[MotionVectorPatches::reactive_slot] = gd.mv_reactive_target_rtv.get();
             native_device_context->OMSetRenderTargets(MotionVectorPatches::reactive_slot + 1, targets, dsv);
          }
@@ -1180,6 +1300,29 @@ class MedalOfHonorAirborne final : public Game
       return true;
    }
 
+   // "*texture" made again from "desc" when it's missing or its size or format differ (empty; the caller makes its views again): true
+   // if it was (null if that failed). "sharable": for the SR bridge's helper.
+   static bool RecreateTexture(ID3D11Device* native_device, const D3D11_TEXTURE2D_DESC& desc, bool sharable, com_ptr<ID3D11Texture2D>* texture)
+   {
+      if (*texture)
+      {
+         D3D11_TEXTURE2D_DESC current = {};
+         (*texture)->GetDesc(&current);
+         if (current.Width == desc.Width && current.Height == desc.Height && current.Format == desc.Format)
+            return false;
+      }
+      texture->reset();
+      if (sharable)
+      {
+         SRBridge::CreateSharableTexture(native_device, desc, &*texture);
+      }
+      else
+      {
+         native_device->CreateTexture2D(&desc, nullptr, &*texture);
+      }
+      return true;
+   }
+
    // Whether the scene's end writes into the copy of the scene the first post pass reads ("mv_scene_copy") rather than the scene: the
    // pass reads the copy only, and it's render target bindable (its view made here, "mv_scene_copy_rtv")
    static bool IsSceneCopyTarget(ID3D11Device* native_device, MedalOfHonorAirborneGameDeviceData* gd)
@@ -1188,19 +1331,23 @@ class MedalOfHonorAirborne final : public Game
          return false;
       com_ptr<ID3D11Resource> copy_rtv_resource;
       if (gd->mv_scene_copy_rtv)
+      {
          gd->mv_scene_copy_rtv->GetResource(&copy_rtv_resource);
+      }
       if (copy_rtv_resource != gd->mv_scene_copy)
       {
          gd->mv_scene_copy_rtv.reset();
          com_ptr<ID3D11Texture2D> copy;
-         D3D11_TEXTURE2D_DESC copy_desc;
-         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
          if (SUCCEEDED(gd->mv_scene_copy->QueryInterface(&copy)))
          {
+            D3D11_TEXTURE2D_DESC copy_desc = {};
             copy->GetDesc(&copy_desc);
+            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
             gd->mv_scene_rtv->GetDesc(&rtv_desc);
             if (copy_desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+            {
                native_device->CreateRenderTargetView(copy.get(), &rtv_desc, &gd->mv_scene_copy_rtv);
+            }
          }
       }
       return gd->mv_scene_copy_rtv != nullptr;
@@ -1218,7 +1365,9 @@ class MedalOfHonorAirborne final : public Game
       buffer->GetDesc(&desc);
       D3D11_BUFFER_DESC copy_desc = {};
       if (*copy)
+      {
          (*copy)->GetDesc(&copy_desc);
+      }
       if (copy_desc.ByteWidth != desc.ByteWidth || copy_desc.BindFlags != desc.BindFlags)
       {
          copy->reset();
@@ -1290,26 +1439,24 @@ class MedalOfHonorAirborne final : public Game
       if (!std::exchange(mb.pending, false) || !gd.mv_scene_color || !gd.mv_scene_rtv)
          return false;
       const bool into_copy = IsSceneCopyTarget(native_device, &gd);
-      ID3D11Resource* const target = into_copy ? gd.mv_scene_copy.get() : gd.mv_scene_color.get();
-      ID3D11RenderTargetView* const target_rtv = into_copy ? gd.mv_scene_copy_rtv.get() : gd.mv_scene_rtv.get();
+      ID3D11Resource* const target = (into_copy ? gd.mv_scene_copy.get() : gd.mv_scene_color.get());
+      ID3D11RenderTargetView* const target_rtv = (into_copy ? gd.mv_scene_copy_rtv.get() : gd.mv_scene_rtv.get());
       com_ptr<ID3D11Texture2D> target_texture;
       if (FAILED(target->QueryInterface(&target_texture)))
          return false;
-      D3D11_TEXTURE2D_DESC desc;
-      target_texture->GetDesc(&desc);
       D3D11_TEXTURE2D_DESC source_desc = {};
-      if (mb.source)
-         mb.source->GetDesc(&source_desc);
-      if (source_desc.Width != desc.Width || source_desc.Height != desc.Height || source_desc.Format != desc.Format)
+      target_texture->GetDesc(&source_desc);
+      source_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      source_desc.MiscFlags = 0;
+      source_desc.CPUAccessFlags = 0;
+      source_desc.Usage = D3D11_USAGE_DEFAULT;
+      if (RecreateTexture(native_device, source_desc, /* sharable */ false, std::addressof(mb.source)))
       {
-         mb.source.reset();
          mb.source_srv.reset();
-         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-         desc.MiscFlags = 0;
-         desc.CPUAccessFlags = 0;
-         desc.Usage = D3D11_USAGE_DEFAULT;
-         if (SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &mb.source)))
+         if (mb.source)
+         {
             native_device->CreateShaderResourceView(mb.source.get(), &mb.source_view_desc, &mb.source_srv);
+         }
       }
       if (!mb.depth_stencil_state)
       {
@@ -1328,26 +1475,45 @@ class MedalOfHonorAirborne final : public Game
          com_ptr<ID3D11Texture2D> depth_texture;
          D3D11_TEXTURE2D_DESC depth_desc = {};
          if (gd.mv_depth && SUCCEEDED(gd.mv_depth->QueryInterface(&depth_texture)))
+         {
             depth_texture->GetDesc(&depth_desc);
-         D3D11_TEXTURE2D_DESC copy_desc = {};
-         if (mb.weapon_depth)
-            mb.weapon_depth->GetDesc(&copy_desc);
-         if (copy_desc.Width != depth_desc.Width || copy_desc.Height != depth_desc.Height || copy_desc.Format != depth_desc.Format)
+         }
+         DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
+         switch (depth_desc.Format)
+         {
+         case DXGI_FORMAT_R24G8_TYPELESS:
+            view_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            break;
+         case DXGI_FORMAT_R32G8X24_TYPELESS:
+            view_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            break;
+         case DXGI_FORMAT_R32_TYPELESS:
+            view_format = DXGI_FORMAT_R32_FLOAT;
+            break;
+         default:
+            break;
+         }
+         if (depth_texture && depth_desc.SampleDesc.Count == 1 && view_format != DXGI_FORMAT_UNKNOWN)
+         {
+            D3D11_TEXTURE2D_DESC copy_desc = depth_desc;
+            copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            copy_desc.MiscFlags = 0;
+            copy_desc.CPUAccessFlags = 0;
+            copy_desc.Usage = D3D11_USAGE_DEFAULT;
+            if (RecreateTexture(native_device, copy_desc, /* sharable */ false, std::addressof(mb.weapon_depth)))
+            {
+               mb.weapon_depth_srv.reset();
+               const CD3D11_SHADER_RESOURCE_VIEW_DESC view_desc(D3D11_SRV_DIMENSION_TEXTURE2D, view_format, 0, 1);
+               if (mb.weapon_depth)
+               {
+                  native_device->CreateShaderResourceView(mb.weapon_depth.get(), &view_desc, &mb.weapon_depth_srv);
+               }
+            }
+         }
+         else
          {
             mb.weapon_depth.reset();
             mb.weapon_depth_srv.reset();
-            const DXGI_FORMAT view_format = depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : (depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT);
-            if (depth_texture && depth_desc.SampleDesc.Count == 1 && (depth_desc.Format == DXGI_FORMAT_R24G8_TYPELESS || depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || depth_desc.Format == DXGI_FORMAT_R32_TYPELESS))
-            {
-               copy_desc = depth_desc;
-               copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-               copy_desc.MiscFlags = 0;
-               copy_desc.CPUAccessFlags = 0;
-               copy_desc.Usage = D3D11_USAGE_DEFAULT;
-               const CD3D11_SHADER_RESOURCE_VIEW_DESC view_desc(D3D11_SRV_DIMENSION_TEXTURE2D, view_format, 0, 1);
-               if (SUCCEEDED(native_device->CreateTexture2D(&copy_desc, nullptr, &mb.weapon_depth)))
-                  native_device->CreateShaderResourceView(mb.weapon_depth.get(), &view_desc, &mb.weapon_depth_srv);
-            }
          }
          if (mb.weapon_depth_srv)
          {
@@ -1392,9 +1558,13 @@ class MedalOfHonorAirborne final : public Game
       native_device_context->VSSetShader(mb.vertex_shader.get(), nullptr, 0);
       native_device_context->PSSetShader(mb.pixel_shader.get(), nullptr, 0);
       if (mb.draw.indexed)
+      {
          native_device_context->DrawIndexed(mb.draw.index_count, mb.draw.first_index, mb.draw.vertex_offset);
+      }
       else
+      {
          native_device_context->Draw(mb.draw.vertex_count, mb.draw.first_vertex);
+      }
 
       ID3D11Buffer* const restored_vertex_buffer = vertex_buffer.get();
       native_device_context->IASetVertexBuffers(0, 1, &restored_vertex_buffer, &vertex_stride, &vertex_offset);
@@ -1418,7 +1588,9 @@ class MedalOfHonorAirborne final : public Game
       com_ptr<ID3D11Resource> cleared;
       reinterpret_cast<ID3D11DepthStencilView*>(dsv.handle)->GetResource(&cleared);
       if (cleared == gd.mv_depth)
+      {
          gd.mv_motion_blur.depth_cleared = true;
+      }
       return false;
    }
 
@@ -1441,16 +1613,14 @@ class MedalOfHonorAirborne final : public Game
       if (!sr_instance_data)
          return false;
 
-      D3D11_TEXTURE2D_DESC output_desc = {};
-      if (device_data.sr_output_color)
-         device_data.sr_output_color->GetDesc(&output_desc);
-      if (output_desc.Width != scene_desc.Width || output_desc.Height != scene_desc.Height)
+      const CD3D11_TEXTURE2D_DESC output_desc(DXGI_FORMAT_R16G16B16A16_FLOAT, scene_desc.Width, scene_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+      if (RecreateTexture(native_device, output_desc, /* sharable */ true, std::addressof(device_data.sr_output_color)))
       {
-         device_data.sr_output_color.reset();
          gd.sr_output_srv.reset();
-         output_desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R16G16B16A16_FLOAT, scene_desc.Width, scene_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, output_desc, &device_data.sr_output_color)))
+         if (device_data.sr_output_color)
+         {
             native_device->CreateShaderResourceView(device_data.sr_output_color.get(), nullptr, &gd.sr_output_srv);
+         }
       }
       if (!device_data.sr_output_color || !gd.sr_output_srv)
       {
@@ -1470,36 +1640,40 @@ class MedalOfHonorAirborne final : public Game
       // FSR needs the camera (vc4's view projection multiplies row vectors)
       const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(gd.mv_camera->data(), /* row_vectors */ true);
 
-      SR::SettingsData settings_data;
-      settings_data.output_width = scene_desc.Width;
-      settings_data.output_height = scene_desc.Height;
-      settings_data.render_width = scene_desc.Width;
-      settings_data.render_height = scene_desc.Height;
-      settings_data.hdr = true;
-      // The motion vectors are UV deltas, previous minus current
-      settings_data.mvs_x_scale = float(scene_desc.Width);
-      settings_data.mvs_y_scale = float(scene_desc.Height);
-      // DLSS's own (DLSS-Best-Practices EXP-4 canon; presets L and M ignore the texture anyway); FSR's clips highlights
-      // (FSR-Best-Practices FIN-3), and the scene is already exposed
-      settings_data.auto_exposure = device_data.sr_type != SR::Type::FSR;
-      settings_data.render_preset = dlss_render_preset;
+      const SR::SettingsData settings_data = {
+         .output_width = scene_desc.Width,
+         .output_height = scene_desc.Height,
+         .render_width = scene_desc.Width,
+         .render_height = scene_desc.Height,
+         .hdr = true,
+         // The motion vectors are UV deltas, previous minus current
+         .mvs_x_scale = float(scene_desc.Width),
+         .mvs_y_scale = float(scene_desc.Height),
+         // DLSS's own (DLSS-Best-Practices EXP-4 canon; presets L and M ignore the texture anyway); FSR's clips highlights
+         // (FSR-Best-Practices FIN-3), and the scene is already exposed
+         .auto_exposure = (device_data.sr_type != SR::Type::FSR),
+         .render_preset = dlss_render_preset,
+      };
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
-      SR::SuperResolutionImpl::DrawData draw_data;
-      draw_data.source_color = scene.get();
-      draw_data.output_color = device_data.sr_output_color.get();
-      draw_data.motion_vectors = gd.mv_texture.get();
-      draw_data.depth_buffer = gd.mv_device_depth.get();
-      draw_data.bias_mask = reactive_mask ? gd.mv_reactive.get() : nullptr;
-      draw_data.transparency_alpha = reactive_mask ? gd.mv_transparency.get() : nullptr;
-      // As applied (pixels, +y down)
-      draw_data.jitter_x = gd.mv_jitter[0];
-      draw_data.jitter_y = gd.mv_jitter[1];
-      draw_data.reset = device_data.force_reset_sr;
       // FSR requires a FOV (it errors on 0): a camera without an up axis keeps the last one
       if (camera.vert_fov > 0.0)
+      {
          gd.sr_vert_fov = float(camera.vert_fov);
-      draw_data.vert_fov = gd.sr_vert_fov;
+      }
+      SR::SuperResolutionImpl::DrawData draw_data = {
+         .reset = device_data.force_reset_sr,
+         .output_color = device_data.sr_output_color.get(),
+         .source_color = scene.get(),
+         .motion_vectors = gd.mv_texture.get(),
+         .depth_buffer = gd.mv_device_depth.get(),
+         .bias_mask = (reactive_mask ? gd.mv_reactive.get() : nullptr),
+         .transparency_alpha = (reactive_mask ? gd.mv_transparency.get() : nullptr),
+         // As applied (pixels, +y down)
+         .jitter_x = gd.mv_jitter[0],
+         .jitter_y = gd.mv_jitter[1],
+         .vert_fov = gd.sr_vert_fov,
+      };
       if (camera.near_plane > 0.0)
       {
          draw_data.near_plane = float(camera.near_plane);
@@ -1516,12 +1690,66 @@ class MedalOfHonorAirborne final : public Game
          return false;
       }
       // The copy's alpha is the game's resolve of the same scene (the RGB write mask keeps its linear depth)
-      const bool copy_only = IsSceneCopyTarget(native_device, &gd);
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), gd.sr_rgb_blend_state.get(), nullptr, copy_vs, copy_ps,
-         gd.sr_output_srv.get(), copy_only ? gd.mv_scene_copy_rtv.get() : gd.mv_scene_rtv.get(), scene_desc.Width, scene_desc.Height);
+         gd.sr_output_srv.get(), (IsSceneCopyTarget(native_device, &gd) ? gd.mv_scene_copy_rtv.get() : gd.mv_scene_rtv.get()), scene_desc.Width, scene_desc.Height);
       // Not while the bridge's helper starts (the color copied as it is): SMAA stays on and the next frame resets
       device_data.has_drawn_sr = sr_implementations[device_data.sr_type]->IsReady(sr_instance_data);
       return true;
+   }
+
+   // DLSS/FSR, at the gather's draw: its DoF amount for every scene pixel, blended into last frame's (see "Luma_MOHA_DOFHistory.hlsl"),
+   // from what it reads (t0, b3/b4). The new history's view, null if it didn't draw (the gather then keeps its own amount).
+   static ID3D11ShaderResourceView* DrawDOFHistory(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      auto* const history_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("MOHA DOF History CS"));
+      if (!g_dof_history_enable || !device_data.has_drawn_sr || !history_shader || !gd.mv_srv)
+         return nullptr;
+      const uint2 size = {uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
+      const bool resized = size.x != gd.dof_history_size.x || size.y != gd.dof_history_size.y;
+      if (resized)
+      {
+         gd.ReleaseDOFHistory();
+         gd.dof_history_size = size;
+         const CD3D11_TEXTURE2D_DESC history_desc(DXGI_FORMAT_R16_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         for (size_t i = 0; i < std::size(gd.dof_history_srvs); i++)
+         {
+            com_ptr<ID3D11Texture2D> texture;
+            if (SUCCEEDED(native_device->CreateTexture2D(&history_desc, nullptr, &texture)))
+            {
+               native_device->CreateShaderResourceView(texture.get(), nullptr, &gd.dof_history_srvs[i]);
+               native_device->CreateUnorderedAccessView(texture.get(), nullptr, &gd.dof_history_uavs[i]);
+            }
+         }
+      }
+      const uint32_t previous = gd.dof_history_index, next = gd.dof_history_index ^ 1;
+      // Weight of this frame: 0.1 (about ten frames, BL GOTY's), 1 when the history restarts with the upscaler's
+      const CB::DOFHistoryConstants constants = {.history_weight = ((!resized && gd.dof_history_valid && !device_data.force_reset_sr) ? 0.1f : 1.f)};
+      com_ptr<ID3D11ShaderResourceView> scene_srv;
+      native_device_context->PSGetShaderResources(0, 1, &scene_srv);
+      if (!scene_srv || !gd.dof_history_srvs[previous] || !gd.dof_history_uavs[next] ||
+          !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.dof_history_buffer), &constants, sizeof(constants)))
+         return nullptr;
+
+      DrawStateStack<DrawStateStackType::Compute> compute_state;
+      compute_state.Cache(native_device_context, device_data.uav_max_count);
+      // dgVoodoo's b3 (the texture masks) and b4 (the gather's DoF rows)
+      com_ptr<ID3D11Buffer> game_constants[2];
+      native_device_context->PSGetConstantBuffers(3, UINT(std::size(game_constants)), &game_constants[0]);
+      ID3D11Buffer* const buffers[5] = {gd.dof_history_buffer.get(), nullptr, nullptr, game_constants[0].get(), game_constants[1].get()};
+      ID3D11ShaderResourceView* const srvs[3] = {scene_srv.get(), gd.mv_srv.get(), gd.dof_history_srvs[previous].get()};
+      ID3D11UnorderedAccessView* const uav = gd.dof_history_uavs[next].get();
+      ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get();
+      native_device_context->CSSetConstantBuffers(0, UINT(std::size(buffers)), buffers);
+      native_device_context->CSSetShaderResources(0, UINT(std::size(srvs)), srvs);
+      native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+      native_device_context->CSSetSamplers(0, 1, &linear_sampler);
+      native_device_context->CSSetShader(history_shader, nullptr, 0);
+      native_device_context->Dispatch((size.x + 7) / 8, (size.y + 7) / 8, 1);
+      compute_state.Restore(native_device_context);
+      gd.dof_history_index = next;
+      gd.dof_history_drawn = true;
+      return gd.dof_history_srvs[next].get();
    }
 
    // Ends the scene at its first post pass: the depth and camera motion fill (see "Luma_MOHA_MotionVectorFill.hlsl"), then the
@@ -1542,27 +1770,28 @@ class MedalOfHonorAirborne final : public Game
          com_ptr<ID3D11Resource> srv_resource;
          gd.mv_scene_srv->GetResource(&srv_resource);
          if (srv_resource != gd.mv_scene_color)
+         {
             gd.mv_scene_srv.reset();
+         }
       }
       // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote (FSR only)
-      const bool reactive = IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable && gd.mv_reactive_target_srv;
+      const bool reactive = gd.mv_fsr_masks && gd.mv_reactive_target_srv;
       if (reactive)
       {
-         D3D11_TEXTURE2D_DESC desc = {};
-         if (gd.mv_reactive)
-            gd.mv_reactive->GetDesc(&desc);
-         if (desc.Width != uint32_t(device_data.output_resolution.x) || desc.Height != uint32_t(device_data.output_resolution.y))
+         const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R8_UNORM, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         const auto recreate_mask = [&](com_ptr<ID3D11Texture2D>* mask, com_ptr<ID3D11UnorderedAccessView>* mask_uav)
          {
-            gd.mv_reactive.reset();
-            gd.mv_reactive_uav.reset();
-            gd.mv_transparency.reset();
-            gd.mv_transparency_uav.reset();
-            desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R8_UNORM, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv_reactive)))
-               native_device->CreateUnorderedAccessView(gd.mv_reactive.get(), nullptr, &gd.mv_reactive_uav);
-            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv_transparency)))
-               native_device->CreateUnorderedAccessView(gd.mv_transparency.get(), nullptr, &gd.mv_transparency_uav);
-         }
+            if (RecreateTexture(native_device, desc, /* sharable */ true, mask))
+            {
+               mask_uav->reset();
+               if (*mask)
+               {
+                  native_device->CreateUnorderedAccessView(mask->get(), nullptr, &*mask_uav);
+               }
+            }
+         };
+         recreate_mask(std::addressof(gd.mv_reactive), std::addressof(gd.mv_reactive_uav));
+         recreate_mask(std::addressof(gd.mv_transparency), std::addressof(gd.mv_transparency_uav));
       }
       const bool write_reactive = reactive && gd.mv_reactive_uav && gd.mv_transparency_uav;
       if (std::exchange(gd.mv_fill_pending, false) && fill_shader && gd.mv_camera && gd.mv_scene_color &&
@@ -1583,23 +1812,24 @@ class MedalOfHonorAirborne final : public Game
          }
          const Math::Matrix44D reprojection = previous * current;
          const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(gd.mv_camera->data(), /* row_vectors */ true);
-         float constants[24] = {}; // A multiple of 16 bytes
+         CB::MotionVectorFillConstants constants = {
+            .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
+            .depth_from_view = {float(camera.depth_a), float(camera.depth_b)},
+            .reactive_scale = g_sr_reactive_scale,
+            .reactive_threshold = g_sr_reactive_threshold,
+            .reactive_enabled = (write_reactive ? 1.f : 0.f),
+         };
          for (int i = 0; i < 16; i++)
-            constants[i] = float(reprojection.GetData()[i]);
-         constants[16] = gd.mv_jitter_ndc[0];
-         constants[17] = gd.mv_jitter_ndc[1];
-         constants[18] = float(camera.depth_a);
-         constants[19] = float(camera.depth_b);
-         constants[20] = g_sr_reactive_scale;
-         constants[21] = g_sr_reactive_threshold;
-         constants[22] = write_reactive ? 1.f : 0.f;
-         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_fill_buffer), constants, sizeof(constants)))
+         {
+            constants.reprojection.GetData()[i] = float(reprojection.GetData()[i]);
+         }
+         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_fill_buffer), &constants, sizeof(constants)))
          {
             // The scene and the motion vectors may be bound as render targets
             native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
             ID3D11Buffer* const buffer = gd.mv_fill_buffer.get();
-            ID3D11ShaderResourceView* const srvs[2] = {gd.mv_scene_srv.get(), write_reactive ? gd.mv_reactive_target_srv.get() : nullptr};
-            ID3D11UnorderedAccessView* const uavs[4] = {gd.mv_uav.get(), gd.mv_device_depth_uav.get(), write_reactive ? gd.mv_reactive_uav.get() : nullptr, write_reactive ? gd.mv_transparency_uav.get() : nullptr};
+            ID3D11ShaderResourceView* const srvs[2] = {gd.mv_scene_srv.get(), (write_reactive ? gd.mv_reactive_target_srv.get() : nullptr)};
+            ID3D11UnorderedAccessView* const uavs[4] = {gd.mv_uav.get(), gd.mv_device_depth_uav.get(), (write_reactive ? gd.mv_reactive_uav.get() : nullptr), (write_reactive ? gd.mv_transparency_uav.get() : nullptr)};
             native_device_context->CSSetConstantBuffers(0, 1, &buffer);
             native_device_context->CSSetShaderResources(0, UINT(std::size(srvs)), srvs);
             native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(uavs)), uavs, nullptr);
@@ -1620,7 +1850,9 @@ class MedalOfHonorAirborne final : public Game
       const bool blurred = ReplayMotionBlur(native_device, native_device_context, gd);
       // Both drew into the copy the first post pass reads, or into the scene, which the copy then takes again
       if ((upscaled || blurred) && gd.mv_scene_copy && !IsSceneCopyTarget(native_device, &gd))
+      {
          native_device_context->CopyResource(gd.mv_scene_copy.get(), gd.mv_scene_color.get());
+      }
       compute_state.Restore(native_device_context);
       graphics_state.Restore(native_device_context);
    }
@@ -1639,8 +1871,8 @@ public:
    {
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
-      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"sr_reactive_enable", &g_sr_reactive_enable}, { "sr_reactive_debug_view",
-                               &g_sr_reactive_debug_view }});
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"sr_reactive_enable", &g_sr_reactive_enable}, {"sr_reactive_debug_view", &g_sr_reactive_debug_view}, { "dof_history_enable",
+                               &g_dof_history_enable }});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("mv.velocity", mv_texture), MCP_GAME_TEXTURE("mv.depth", mv_device_depth), MCP_GAME_TEXTURE("sr.reactive", mv_reactive), MCP_GAME_TEXTURE("sr.transparency", mv_transparency)});
       Mcp::RegisterMirroredToggle("luma_bloom_enable", &g_luma_bloom_enable, &cb_luma_global_settings.GameSettings.LumaBloomEnable);
       Mcp::RegisterValues({{"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}});
@@ -1679,6 +1911,9 @@ public:
       // motion vector target written by every blend state
       native_shaders_definitions.emplace(CompileTimeStringHash("MOHA Motion Vector Fill CS"),
          ShaderDefinition("Luma_MOHA_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
+      // DLSS/FSR: the gather's DoF amount accumulated per pixel (the jittered depth flips it at silhouettes)
+      native_shaders_definitions.emplace(CompileTimeStringHash("MOHA DOF History CS"),
+         ShaderDefinition("Luma_MOHA_DOFHistory", reshade::api::pipeline_subobject_type::compute_shader));
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
@@ -1736,9 +1971,10 @@ public:
                                {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.reactive_draws", &stats.reactive_draws}, {"mv.motion_blur_replays", &stats.motion_blur_replays}, {"mv.motion_blur_masked", &stats.motion_blur_masked}, { "mv.ended_by_hash",
                                   &stats.ended_by }},
          &device_data);
-      constexpr const char* reject_names[] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders"};
-      for (size_t i = 0; i < std::size(reject_names); i++)
-         Mcp::RegisterCounter(std::string("mv.rejected.") + reject_names[i], &stats.rejected[i], &device_data);
+      for (size_t i = 0; i < std::size(motion_vector_reject_names); i++)
+      {
+         Mcp::RegisterCounter(std::string("mv.rejected.") + motion_vector_reject_names[i], &stats.rejected[i], &device_data);
+      }
 #endif
    }
 
@@ -1787,7 +2023,9 @@ public:
       {
          const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
          if (CreateImmutableCB(native_device, sp, sizeof(sp), gd.cb_sharpen))
+         {
             gd.sharpen_amount = g_rcas_sharpness;
+         }
       }
       do_sharpen = do_sharpen && gd.cb_sharpen;
       const auto sharpen = [&](ID3D11ShaderResourceView* source)
@@ -1809,7 +2047,9 @@ public:
          {
             gd.tex_input.reset();
             if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE, gd.tex_input, cfmt))
+            {
                native_device->CreateShaderResourceView(gd.tex_input.get(), nullptr, gd.srv_input.put());
+            }
          }
          if (!gd.srv_input)
             return;
@@ -1964,7 +2204,9 @@ public:
 
       // RCAS on the SMAA output, written into the canvas.
       if (do_sharpen)
+      {
          sharpen(gd.tex_smaa_out_srv.get());
+      }
 
       ID3D11Buffer* vcb = vs_cb1_orig.get();
       ID3D11Buffer* pcb = ps_cb1_orig.get();
@@ -2012,13 +2254,19 @@ public:
                   {
                      com_ptr<ID3D11Resource> resource;
                      if (srv)
+                     {
                         srv->GetResource(&resource);
+                     }
                      if (!resource || (resource != gd.mv_scene_color && !AreResourcesEqual(resource.get(), gd.mv_scene_color.get())))
                         continue;
                      if (resource == gd.mv_scene_color)
+                     {
                         gd.mv_scene_read_by_end = true;
+                     }
                      else if (!gd.mv_scene_copy)
+                     {
                         gd.mv_scene_copy = resource;
+                     }
                   }
                }
                EndScene(native_device, native_device_context, device_data);
@@ -2036,14 +2284,18 @@ public:
             com_ptr<ID3D11DepthStencilView> dsv;
             native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
             if (!gd.mv_scene_open && dsv)
+            {
                OpenScene(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0], dsv.get());
+            }
             const std::function<void()>& draw = *original_draw_dispatch_func;
             const bool motion_vectors = DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, draw, rtvs, dsv.get());
             const bool jitter = !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, draw, rtvs, dsv.get());
 #if DEVELOPMENT
             Mcp::Annotate(cmd_list_data, motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched"));
             if (const int reject = std::exchange(gd.mv_draw_reject, -1); reject >= 0)
+            {
                Mcp::Annotate(cmd_list_data, "mv_reject", reject);
+            }
 #endif
             if (motion_vectors || jitter)
                return DrawOrDispatchOverrideType::Replaced;
@@ -2147,7 +2399,7 @@ public:
          // Run the grade ourselves, then SMAA on its output, so the antialiasing lands before the HUD. Falls back to
          // a plain draw when the callback is unavailable (one frame without AA) rather than skipping the grade. On a
          // frame the upscaler already antialiased only RCAS runs.
-         const bool antialias = device_data.has_drawn_sr ? g_rcas_sharpness > 0.f : g_smaa_enable;
+         const bool antialias = (device_data.has_drawn_sr ? (g_rcas_sharpness > 0.f) : g_smaa_enable);
          if (antialias && original_draw_dispatch_func != nullptr && canvas_rtv && gd.canvas_res)
          {
             (*original_draw_dispatch_func)();
@@ -2155,6 +2407,24 @@ public:
             return DrawOrDispatchOverrideType::Replaced; // we ran the original draw ourselves
          }
 #endif
+      }
+
+      // DLSS/FSR: the gather takes its DoF amount from the per pixel history at t1 (see "DrawDOFHistory"), drawn here so the slot goes
+      // back to dgVoodoo's binding after it (its state cache would skip rebinding it)
+      if (is_immediate && original_draw_dispatch_func && *original_draw_dispatch_func && IsDofBloomGather(original_shader_hashes))
+      {
+         if (ID3D11ShaderResourceView* const history = DrawDOFHistory(native_device, native_device_context, device_data))
+         {
+            com_ptr<ID3D11ShaderResourceView> game_srv;
+            native_device_context->PSGetShaderResources(1, 1, &game_srv);
+            native_device_context->PSSetShaderResources(1, 1, &history);
+            // Core uploads none for a draw we replaced, and the gather reads LumaSettings (Luma bloom)
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            (*original_draw_dispatch_func)();
+            ID3D11ShaderResourceView* const restored = game_srv.get();
+            native_device_context->PSSetShaderResources(1, 1, &restored);
+            return DrawOrDispatchOverrideType::Replaced;
+         }
       }
 
       return DrawOrDispatchOverrideType::None; // never cancel the original draw (the replacement is by hash)
@@ -2178,14 +2448,11 @@ public:
       if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
+         gd.ReleaseDOFHistory();
          if (!g_mv_enable)
          {
             const std::unique_lock lock(gd.mv_mutex);
             gd.ReleaseMotionVectorTargets();
-            gd.mv_reactive.reset();
-            gd.mv_reactive_uav.reset();
-            gd.mv_transparency.reset();
-            gd.mv_transparency_uav.reset();
             // The game's scene, depth and scene copy (taken again at the next scene), so a resize after None doesn't keep the old
             // ones alive; and the vc4 copies the object tables hold
             gd.mv_depth.reset();
@@ -2208,13 +2475,16 @@ public:
       gd.mv_scene_done = false;
       gd.mv_frame_ended = true;
       gd.mv_fill_pending = false;
+      gd.mv_fsr_masks = false;
       gd.mv_motion_blur.pending = false;
+      // The DoF history continues only from a frame that drew it (menus, loading and frames without the gather restart it)
+      gd.dof_history_valid = std::exchange(gd.dof_history_drawn, false);
       {
          // The pooled vc4 copies only the pool holds (superseded, no object keeps them) are free for the next ones, as many as the last
          // frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their peak otherwise.
          // Without motion vectors, none.
          const std::lock_guard lock(gd.mv_constants_mutex);
-         size_t kept_free = gd.mv_active ? std::exchange(gd.mv_constants_made, 0) : 0;
+         size_t kept_free = (gd.mv_active ? std::exchange(gd.mv_constants_made, 0) : 0);
          std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
             {
                if (copy.use_count() != 1)
@@ -2227,14 +2497,16 @@ public:
          for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
          {
             if (gd.mv_constants_pool[i].use_count() == 1)
+            {
                gd.mv_constants_pool_free.push_back(i);
+            }
          }
       }
       if (!custom_texture_mip_lod_bias_offset)
       {
          const std::unique_lock lock(s_mutex_samplers);
          // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
-         device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f;
+         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
       }
 #if DEVELOPMENT
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
@@ -2388,9 +2660,13 @@ public:
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
       if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
          ImGui::SetTooltip("Adds SMAA anti-aliasing (the game has none of its own; not used with DLAA/FSR).");
+      }
       ImGui::EndDisabled();
       if (g_smaa_enable || sr_active)
       {
@@ -2415,7 +2691,9 @@ public:
          if (ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f))
             reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
          if (ImGui::IsItemHovered())
+         {
             ImGui::SetTooltip("Sharpening applied on top of SMAA, DLAA or FSR (0 = off).");
+         }
          DrawResetButton(g_rcas_sharpness, 0.f, "RCASSharpness"); // writes the config itself (Serialize defaults true)
       }
 #endif
@@ -2539,6 +2817,7 @@ public:
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
       ImGui::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
       ImGui::Checkbox("FSR Reactive Debug View", &g_sr_reactive_debug_view);
+      ImGui::Checkbox("DoF History (DLSS/FSR)", &g_dof_history_enable);
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
       ImGui::Text("MV draws %u (matched %u, camera only %u, other camera %u, no camera %u, uncopied %u), jitter draws %u", stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.no_camera, stats.uncopied, stats.jitter_draws);
       ImGui::Text("Ended by 0x%08X, upscaler draws %u, near %.3f far %.0f, motion blur replays %u (masked %u)", stats.ended_by, stats.sr_draws, stats.near_plane, stats.far_plane, stats.motion_blur_replays, stats.motion_blur_masked);
