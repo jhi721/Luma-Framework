@@ -215,7 +215,7 @@ namespace
    void InstallCameraHooks()
    {
       uint8_t* camera_build = GetGameAddresses().camera_build;
-      if (!camera_build || MH_Initialize() != MH_OK)
+      if (!camera_build || !InitializeMinHook())
          return;
       if (MH_CreateHook(camera_build, reinterpret_cast<void*>(&CameraBuildDetour), reinterpret_cast<void**>(&camera_build_original)) == MH_OK)
       {
@@ -1571,8 +1571,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          }
          SetJitterIndexFix(false);
       }
-      MH_DisableHook(MH_ALL_HOOKS);
-      MH_Uninitialize();
+      if (uint8_t* camera_build = GetGameAddresses().camera_build)
+         MH_RemoveHook(camera_build);
+#if DEVELOPMENT
+      if (uint8_t* camera_counter_increment = GetGameAddresses().camera_counter_increment)
+         MH_RemoveHook(camera_counter_increment);
+#endif
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);

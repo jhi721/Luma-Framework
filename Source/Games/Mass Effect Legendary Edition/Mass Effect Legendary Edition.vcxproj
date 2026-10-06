@@ -320,12 +320,6 @@ IF DEFINED LUMA_ME3LE_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(Projec
   <ItemGroup>
     <ClCompile Include="..\..\Core\unity_build.cpp" />
     <ClCompile Include="main.cpp" />
-    <ClCompile Include="..\..\External\reshade\deps\minhook\src\buffer.c;..\..\External\reshade\deps\minhook\src\hook.c;..\..\External\reshade\deps\minhook\src\trampoline.c;..\..\External\reshade\deps\minhook\src\hde\hde64.c">
-      <CompileAs>CompileAsC</CompileAs>
-      <TreatWarningAsError>false</TreatWarningAsError>
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <ForcedIncludeFiles></ForcedIncludeFiles>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="MotionVectorPatches.h" />

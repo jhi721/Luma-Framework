@@ -221,6 +221,7 @@ namespace EngineScale
    // in the engine's post process call.
    std::atomic<bool> upscaler_drawing = false;
    uintptr_t (*render_post_process_original)(uint8_t*, uintptr_t, uintptr_t, uintptr_t) = nullptr;
+   std::byte* render_post_process_target = nullptr;
 
    // FSceneRenderer: the views array and its count
    constexpr size_t RENDERER_VIEWS_OFFSET = 0x60;
@@ -374,8 +375,8 @@ namespace EngineScale
       dynamic_resolution_enabled = reinterpret_cast<int32_t*>(rip_target(enabled[0], 2, 7));
       use_fixed_scale = reinterpret_cast<int32_t*>(rip_target(fixed_scale[0], use_fixed_scale_offset, 7));
       fixed_screen_percentage = reinterpret_cast<float*>(rip_target(fixed_scale[0], 13, 17));
-      const MH_STATUS initialized = MH_Initialize();
-      installed = (initialized == MH_OK || initialized == MH_ERROR_ALREADY_INITIALIZED) &&
+      render_post_process_target = render_post_process[0];
+      installed = InitializeMinHook() &&
                   MH_CreateHook(render_post_process[0], reinterpret_cast<void*>(&RenderPostProcessDetour), reinterpret_cast<void**>(&render_post_process_original)) == MH_OK &&
                   MH_EnableHook(render_post_process[0]) == MH_OK;
       reshade::log::message(installed ? reshade::log::level::info : reshade::log::level::warning, std::format("[MELE Scale] installed {}: Enabled {} UseFixedScale {} FixedScreenPercentage {} view stride 0x{:X}", installed, *dynamic_resolution_enabled, *use_fixed_scale, *fixed_screen_percentage, view_stride).c_str());
@@ -418,8 +419,7 @@ namespace EngineScale
          System::PatchMemory(disp, &scaled, 1);
       }
       unscaled_view_size_loads.clear();
-      MH_DisableHook(MH_ALL_HOOKS);
-      MH_Uninitialize();
+      MH_RemoveHook(render_post_process_target);
       installed = false;
    }
 } // namespace EngineScale

@@ -187,6 +187,7 @@
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
 #include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
 #include "includes/reflex.h" // see "ENABLE_REFLEX"
+#include "includes/minhook.h" // see "ENABLE_MINHOOK"
 
 #include "includes/containers.h"
 #include "includes/globals.h"
@@ -2966,9 +2967,11 @@ namespace
       game->OnDestroyDeviceData(device_data);
 
 #if ENABLE_REFLEX
-      // Its ping thread and message hook run the addon's code
+      // Its ping thread and message hook run the addon's code, as does the sleep hook
       if (device_data.reflex.pcl)
          Reflex::PCL::Stop();
+      if (device_data.reflex.sleep_hook && !Reflex::SleepHook::Remove())
+         reshade::log::message(reshade::log::level::warning, "[Reflex] Another module hooked NvAPI_D3D_Sleep over Luma's hook, so it stays and the addon stays loaded");
 #endif
 
       // It can apparently happen that in DX11 the device destructor callback is sent before its pipelines, so make sure we empty the memory before.
@@ -17120,6 +17123,12 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_overlay(NAME, OnRegisterMainOverlay);
 
       reshade::unregister_addon(h_module);
+
+#if ENABLE_MINHOOK
+      // The game's and Core's hooks are removed by now (see "includes/minhook.h"), this frees its heap. Not needed at process exit.
+      if (lpv_reserved == nullptr)
+         MH_Uninitialize();
+#endif
 
       // In case our threads are still not joined, detach them and safely do a busy loop
       // until they finished running, so we don't risk them reading/writing to stale memory.

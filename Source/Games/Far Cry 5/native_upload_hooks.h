@@ -58,7 +58,7 @@ namespace FC5::NativeUploads
       std::lock_guard lock(install_mutex);
       if (!initialized)
       {
-         if (MH_Initialize() != MH_OK) return false;
+         if (!InitializeMinHook()) return false;
          initialized = true;
       }
       auto** table = *reinterpret_cast<void***>(ctx);
@@ -77,6 +77,6 @@ namespace FC5::NativeUploads
       MH_ApplyQueued();
       for (auto& h : maps) { if (h.target) MH_RemoveHook(h.target); h = {}; }
       for (auto& h : unmaps) { if (h.target) MH_RemoveHook(h.target); h = {}; }
-      MH_Uninitialize(); initialized = false;
+      initialized = false;
    }
 }

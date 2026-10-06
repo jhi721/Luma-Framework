@@ -52,6 +52,8 @@
     <ClCompile>
       <!-- The unity build can exceed the default object file section limit (C1128), especially in Debug. -->
       <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <!-- MinHook is compiled below. UNICODE as in the feature blocks: this metadata overrides the CharacterSet-derived defines. -->
+      <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_MINHOOK=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Condition="'$(UseLumaDXP)'=='true'">
       <!-- PreprocessorDefinitions metadata overrides the CharacterSet-derived
@@ -94,6 +96,17 @@
       <AdditionalDependencies>$(LumaNVAPILibName);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+
+  <!-- MinHook, compiled once per addon: Core (Reflex's sleep hook) and the game share its state (see Core "includes/minhook.h").
+       hde32/hde64 compile to nothing on the other architecture. -->
+  <ItemGroup>
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\buffer.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\hook.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\trampoline.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\hde\hde32.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\hde\hde64.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ForcedIncludeFiles></ForcedIncludeFiles>
+    </ClCompile>
+  </ItemGroup>
 
   <Target Name="LumaCopyNgxRuntime" AfterTargets="Build" Condition="'$(UseLumaNGX)'=='true' and Exists('$(LumaNGXRuntimePath)') and Exists('$(TargetDir)')">
     <Copy SourceFiles="$(LumaNGXRuntimePath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />

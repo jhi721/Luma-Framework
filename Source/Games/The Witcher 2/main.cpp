@@ -321,16 +321,17 @@ namespace RenderArea
       frame_scene = at(executable->frame_scene);
       post_chain = at(executable->post_chain);
       current_viewport_size = reinterpret_cast<uint32_t*>(at(executable->current_viewport_size));
-      if (std::memcmp(post_chain, executable->post_chain_prologue.data(), executable->post_chain_prologue.size()) != 0 || MH_Initialize() != MH_OK)
+      if (std::memcmp(post_chain, executable->post_chain_prologue.data(), executable->post_chain_prologue.size()) != 0 || !InitializeMinHook())
          return;
       installed = MH_CreateHook(post_chain, reinterpret_cast<void*>(&PostChainDetour), reinterpret_cast<void**>(&post_chain_original)) == MH_OK;
       scale_installed = installed && std::memcmp(frame_scene, executable->frame_scene_prologue.data(), executable->frame_scene_prologue.size()) == 0 &&
                         MH_CreateHook(frame_scene, reinterpret_cast<void*>(&FrameSceneDetour), reinterpret_cast<void**>(&frame_scene_original)) == MH_OK;
-      installed = installed && MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
+      installed = installed && MH_EnableHook(post_chain) == MH_OK && (!scale_installed || MH_EnableHook(frame_scene) == MH_OK);
       if (!installed)
       {
          scale_installed = false;
-         MH_Uninitialize();
+         MH_RemoveHook(post_chain);
+         MH_RemoveHook(frame_scene);
       }
    }
 } // namespace RenderArea
@@ -3777,8 +3778,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       TheWitcher2Game::UnregisterEvents();
       if (RenderArea::installed)
       {
-         MH_DisableHook(MH_ALL_HOOKS);
-         MH_Uninitialize();
+         MH_RemoveHook(RenderArea::post_chain);
+         if (RenderArea::scale_installed)
+            MH_RemoveHook(RenderArea::frame_scene);
       }
    }
 

@@ -767,8 +767,7 @@ namespace NvapiHdr
       {
          return;
       }
-      const MH_STATUS initialized = MH_Initialize();
-      const bool installed = (initialized == MH_OK || initialized == MH_ERROR_ALREADY_INITIALIZED) &&
+      const bool installed = InitializeMinHook() &&
                              MH_CreateHook(reinterpret_cast<void*>(hdr_color_control), reinterpret_cast<void*>(&HdrColorControlDetour), reinterpret_cast<void**>(&hdr_color_control_original)) == MH_OK &&
                              MH_EnableHook(reinterpret_cast<void*>(hdr_color_control)) == MH_OK;
       reshade::log::message(installed ? reshade::log::level::info : reshade::log::level::warning, std::format("[MEA HDR] NvAPI_Disp_HdrColorControl hook installed: {}", installed).c_str());
@@ -783,7 +782,6 @@ namespace NvapiHdr
       if (hdr_color_control != nullptr)
       {
          MH_RemoveHook(reinterpret_cast<void*>(hdr_color_control));
-         MH_Uninitialize(); // Its private heap, as "Install" made it
          hdr_color_control = nullptr;
       }
    }

@@ -5,8 +5,10 @@
 // The markers are only an approximation of the game's frame (simulation and render submission span the whole CPU frame),
 // so they aren't used for driver optimizations ("bUseMarkersToOptimize").
 #if ENABLE_REFLEX
+#include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <random>
 #include <shared_mutex>
@@ -18,6 +20,8 @@
 #pragma comment(lib, "Advapi32.lib") // ETW, for PCLStats
 
 #include "nvapi.h"
+
+#include "minhook.h"
 
 namespace Reflex
 {
@@ -148,6 +152,72 @@ namespace Reflex
       }
    } // namespace PCL
 
+   // Another caller's "NvAPI_D3D_Sleep()": the game's or a tool's Reflex, found on its first call, also one without markers that
+   // starts after the detection presents (Reflex-Best-Practices RXL-G2), which the driver's status can't tell from Luma's own sleep.
+   // Hooked on the driver's function, the address "nvapi_QueryInterface()" gives every caller (Display Commander hooks the same
+   // one, chained either way). A tool that sleeps through its own hook's trampoline (Display Commander's own sleep, only done
+   // while nobody else sleeps) bypasses it.
+   namespace SleepHook
+   {
+      using SleepFunction = NvAPI_Status(__cdecl*)(IUnknown*);
+      constexpr NvU32 sleep_interface_id = 0x852CD1D2; // "NvAPI_D3D_Sleep" in "nvapi_interface.h"
+
+      std::shared_mutex mutex; // Install and remove
+      void* target = nullptr;
+      SleepFunction original = nullptr;
+      // The target's start right after Luma's hook went in: different later means another module hooked over Luma's
+      std::array<uint8_t, 8> hooked_prologue = {};
+      thread_local bool luma_sleeping = false;
+      std::atomic<bool> other_sleep = false;
+
+      NvAPI_Status __cdecl Detour(IUnknown* device)
+      {
+         if (!luma_sleeping)
+            other_sleep = true;
+         return original(device);
+      }
+
+      bool Install()
+      {
+         const std::lock_guard lock(mutex);
+         other_sleep = false;
+         if (target)
+            return true;
+         using QueryInterfaceFunction = void*(__cdecl*)(NvU32);
+         const HMODULE nvapi = GetModuleHandleW(sizeof(void*) == 8 ? L"nvapi64.dll" : L"nvapi.dll");
+         const auto query_interface = nvapi ? reinterpret_cast<QueryInterfaceFunction>(GetProcAddress(nvapi, "nvapi_QueryInterface")) : nullptr;
+         void* const sleep = query_interface ? query_interface(sleep_interface_id) : nullptr;
+         if (!sleep || !InitializeMinHook() || MH_CreateHook(sleep, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) != MH_OK)
+            return false;
+         if (MH_EnableHook(sleep) != MH_OK)
+         {
+            MH_RemoveHook(sleep);
+            return false;
+         }
+         std::memcpy(hooked_prologue.data(), sleep, hooked_prologue.size());
+         target = sleep;
+         return true;
+      }
+
+      // False if it had to stay: another module hooked over it, so its trampoline jumps to "Detour", and the addon is pinned to keep
+      // that code loaded. ponytail: a pinned addon isn't initialized again if ReShade reloads it in the same process.
+      bool Remove()
+      {
+         const std::lock_guard lock(mutex);
+         if (!target)
+            return true;
+         if (std::memcmp(target, hooked_prologue.data(), hooked_prologue.size()) != 0)
+         {
+            HMODULE module = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&Detour), &module);
+            return false;
+         }
+         MH_RemoveHook(target);
+         target = nullptr;
+         return true;
+      }
+   } // namespace SleepHook
+
 #if DEVELOPMENT
    // The driver's last frame reports (whoever set their markers), averaged for the DEV panel
    struct LatencyStats
@@ -173,6 +243,7 @@ namespace Reflex
       uint32_t mode_presents = 0;         // Since Luma last set the sleep mode, or since the driver last agreed with it
       const char* other_reason = nullptr; // Why the state became "Other"
       bool pcl = false;                   // This device started "PCL"
+      bool sleep_hook = false;            // This device installed "SleepHook"
       // The device's first swapchain, the only one followed (only compared)
       std::atomic<void*> swapchain = nullptr;
 #if DEVELOPMENT
@@ -284,6 +355,9 @@ namespace Reflex
       }
       if (data->presents < detection_presents)
       {
+         // First, as it also drops a foreign sleep seen before this device (on a previous one)
+         if (data->presents == 0)
+            data->sleep_hook = SleepHook::Install();
          NV_GET_SLEEP_STATUS_PARAMS status = {NV_GET_SLEEP_STATUS_PARAMS_VER};
          if (NvAPI_D3D_GetSleepStatus(device, &status) != NVAPI_OK) // Also when NVAPI didn't initialize
             data->state = State::Unsupported;
@@ -291,12 +365,19 @@ namespace Reflex
          else if (GetModuleHandleW(sizeof(void*) == 8 ? L"NvPresent64.dll" : L"NvPresent.dll"))
             data->state = State::SmoothMotion;
          // Not "bLowLatencyMode" alone: the control panel's "Low Latency Mode" can set it (Reflex-Best-Practices RXL-G1)
-         else if (status.bUseGameSleep)
+         else if (status.bUseGameSleep || SleepHook::other_sleep.exchange(false))
          {
             data->state = State::Other;
-            data->other_reason = "sleep status at start";
+            data->other_reason = status.bUseGameSleep ? "sleep status at start" : "other sleep call";
          }
          data->presents++;
+         return;
+      }
+
+      if (SleepHook::other_sleep.exchange(false))
+      {
+         data->state = State::Other;
+         data->other_reason = "other sleep call";
          return;
       }
 
@@ -351,7 +432,9 @@ namespace Reflex
 #if DEVELOPMENT
          const auto sleep_start = std::chrono::steady_clock::now();
 #endif
+         SleepHook::luma_sleeping = true;
          NvAPI_D3D_Sleep(device);
+         SleepHook::luma_sleeping = false;
 #if DEVELOPMENT
          data->sleep_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - sleep_start).count();
          data->sleeps++;
