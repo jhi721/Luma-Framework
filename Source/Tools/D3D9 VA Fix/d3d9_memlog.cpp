@@ -21,6 +21,15 @@
 //   UE3 games).
 // DEFAULT resources count against dgVoodoo's VRAM setting (MANAGED ones don't),
 // so with the fix dgVoodoo needs VRAM = 4096; the log warns near the limit.
+//
+// d3d9_nomt.on next to this dll (experiment): the device is created without
+// D3DCREATE_MULTITHREADED, so dgVoodoo skips its per-call critical section.
+// Only safe while one thread makes every D3D9 call.
+//
+// d3d9_csmt.on next to this dll: D3D9 calls run on a worker thread (csmt.h),
+// which also makes dropping D3DCREATE_MULTITHREADED safe. With d3d9_memlog.on
+// the report adds the layer's per-frame counters.
+#include "csmt.h"
 #include <algorithm>
 #include <atomic>
 #include <intrin.h>
@@ -32,6 +41,7 @@
 #include <mutex>
 #include <optional>
 #include <psapi.h>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <windows.h>
@@ -85,11 +95,13 @@ namespace
    constexpr int SLOT_UPDATE_TEXTURE = 31;
 
    wchar_t g_dir[MAX_PATH] = {};
-   FILE* g_log = nullptr;        // "NUL" without d3d9_memlog.on
-   bool g_log_enabled = false;   // d3d9_memlog.on present
-   bool g_fix_requested = false; // d3d9_vafix.on present
-   bool g_fix_active = false;    // the device really is D3D9Ex (one device assumed)
-   bool g_user_memory = false;   // the runtime takes user-memory SYSTEMMEM textures
+   FILE* g_log = nullptr;              // "NUL" without d3d9_memlog.on
+   bool g_log_enabled = false;         // d3d9_memlog.on present
+   bool g_fix_requested = false;       // d3d9_vafix.on present
+   bool g_strip_multithreaded = false; // d3d9_nomt.on present
+   bool g_csmt_requested = false;      // d3d9_csmt.on present
+   bool g_fix_active = false;          // the device really is D3D9Ex (one device assumed)
+   bool g_user_memory = false;         // the runtime takes user-memory SYSTEMMEM textures
    UINT g_available_texture_mb =
       0; // what the runtime reports (dgVoodoo: its VRAM cap)
 
@@ -107,6 +119,19 @@ namespace
       }();
       return chain;
    }
+   // The product name in the chained runtime's version resource.
+   bool ChainIsDgVoodoo()
+   {
+      static const bool dgvoodoo = []
+      {
+         HRSRC info = FindResourceW(Chain(), MAKEINTRESOURCEW(VS_VERSION_INFO), RT_VERSION);
+         const auto* data = (const wchar_t*)(info ? LockResource(LoadResource(Chain(), info)) : nullptr);
+         const std::wstring_view block(data, data ? SizeofResource(Chain(), info) / sizeof(wchar_t) : 0);
+         return block.find(L"dgVoodoo") != std::wstring_view::npos;
+      }();
+      return dgvoodoo;
+   }
+
    // The runtime validates calls such as UpdateSurface and StretchRect by calling
    // GetDesc through the vtable (Windows d3d9): reporting MANAGED to it makes it
    // reject our own uploads. Only callers outside the runtime get the game's view.
@@ -162,6 +187,19 @@ namespace
       const int count = g_hooked_count.load(std::memory_order_relaxed);
       if (*slot == hook || count == MAX_HOOKED_SLOTS)
          return;
+      for (int i = 0; i < count; i++)
+      {
+         if (g_hooked[i].slot == slot)
+            return; // patched before; the CSMT layer may sit above our hook now
+      }
+      // A slot the CSMT layer owns: our hook goes below it, so it runs in the
+      // layer's order (on the worker for deferred calls).
+      if (void* below = Csmt::InsertBelow(object, index, hook))
+      {
+         g_hooked[count] = {.slot = slot, .original = below};
+         g_hooked_count.store(count + 1, std::memory_order_release);
+         return;
+      }
       g_hooked[count] = {.slot = slot, .original = *slot};
       g_hooked_count.store(count + 1, std::memory_order_release);
       DWORD old_protect;
@@ -1704,6 +1742,17 @@ namespace
       D3DPRESENT_PARAMETERS* params,
       IDirect3DDevice9** device)
    {
+      // CSMT runs only on dgVoodoo: on a native runtime NVIDIA's D3D9 driver hung
+      // when work recorded on the worker was waited for from the game thread (a
+      // query's GetData, a managed texture's UnlockRect), with or without
+      // MULTITHREADED, and the driver already threads its own work there. Under
+      // MULTITHREADED dgVoodoo takes its own critical section in every call; with
+      // CSMT only one thread calls it at a time, so the flag only costs.
+      const bool csmt = g_csmt_requested && ChainIsDgVoodoo();
+      if (g_strip_multithreaded || csmt)
+      {
+         behavior &= ~D3DCREATE_MULTITHREADED;
+      }
       HRESULT hr = E_FAIL;
       bool ex_device = false;
       if (IDirect3D9Ex* ex = nullptr;
@@ -1764,6 +1813,15 @@ namespace
       Patch(dev, SLOT_CREATE_INDEX_BUFFER, (void*)&HookCreateIndexBuffer);
       Patch(dev, SLOT_UPDATE_SURFACE, (void*)&HookUpdateSurface);
       Patch(dev, SLOT_UPDATE_TEXTURE, (void*)&HookUpdateTexture);
+      if (csmt)
+      {
+         Csmt::Start(dev, g_log); // last: it patches above the hooks above
+      }
+      else if (g_csmt_requested)
+      {
+         fprintf(g_log, "CSMT: requested, but the runtime isn't dgVoodoo: off\n");
+      }
+      fflush(g_log);
       return hr;
    }
 
@@ -1778,6 +1836,8 @@ namespace
       {
          Sleep(interval_ms);
          Report("tick");
+         Csmt::Report(g_log, interval_ms / 1000.0);
+         fflush(g_log);
       }
    }
 
@@ -1838,8 +1898,14 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
       wchar_t flag_path[MAX_PATH];
       swprintf_s(flag_path, L"%sd3d9_vafix.on", g_dir);
       g_fix_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
-      fprintf(g_log, "---- d3d9_memlog attached, pid %lu, VA fix %s\n",
-         GetCurrentProcessId(), g_fix_requested ? "requested" : "off");
+      swprintf_s(flag_path, L"%sd3d9_nomt.on", g_dir);
+      g_strip_multithreaded = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
+      swprintf_s(flag_path, L"%sd3d9_csmt.on", g_dir);
+      g_csmt_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
+      fprintf(g_log, "---- d3d9_memlog attached, pid %lu, VA fix %s, multithreaded flag %s, CSMT %s\n",
+         GetCurrentProcessId(), g_fix_requested ? "requested" : "off",
+         g_strip_multithreaded ? "stripped" : (g_csmt_requested ? "stripped with CSMT" : "kept"),
+         g_csmt_requested ? "requested" : "off");
       fflush(g_log);
    }
    return TRUE;
