@@ -1497,6 +1497,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"The Witcher Enhanced Edition\" is developed by DristoforColumb and is open source and free.\n"
+         "It adds DLAA or FSR 3 native anti-aliasing and SMAA anti-aliasing.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
@@ -1533,6 +1534,7 @@ public:
                   "\n\nThird Party:"
                   "\nReShade"
                   "\nImGui"
+                  "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (FSR 3)"
                   "\nNVIDIA NGX (DLSS)"
                   "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");

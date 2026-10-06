@@ -1754,7 +1754,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Yakuza 3 Remastered\", \"Yakuza 4 Remastered\" and \"Yakuza 5 Remastered\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR and replaces the game's bloom with Luma Bloom, its CMAA2/FXAA with SMAA and its SSAO with XeGTAO.\n"
+         "It adds HDR and replaces the game's bloom with a wider HDR bloom, its CMAA2/FXAA with SMAA and its SSAO with XeGTAO.\n"
          "Enable Anti-Aliasing and Ambient Occlusion in the game's graphics settings for SMAA and XeGTAO to apply.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"

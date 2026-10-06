@@ -4165,7 +4165,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Mass Effect Legendary Edition\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds DLAA or FSR 3 native anti-aliasing, and replaces the game's FXAA with SMAA, its bloom with a wider HDR bloom, and its HBAO+ with XeGTAO, plus 16x anisotropic filtering.\n"
+         "It adds DLSS or FSR 3 upscaling, and replaces the game's FXAA with SMAA, its bloom with a wider HDR bloom, and its HBAO+ with XeGTAO, plus 16x anisotropic filtering.\n"
          "With the game's HDR enabled it also replaces the native HDR tonemap with a higher quality one.\n"
          "Enable Anti-Aliasing and Ambient Occlusion in the game's video settings for SMAA and XeGTAO to apply.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"

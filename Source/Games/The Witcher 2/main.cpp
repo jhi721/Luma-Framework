@@ -3677,7 +3677,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"The Witcher 2: Assassins of Kings Enhanced Edition\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, DLAA or FSR 3 native anti-aliasing, and replaces the game's FXAA with SMAA and its SSAO with XeGTAO, plus 16x anisotropic filtering.\n"
+         "It adds HDR, DLSS or FSR 3 upscaling, and replaces the game's FXAA with SMAA and its SSAO with XeGTAO, plus 16x anisotropic filtering.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Enable SSAO in the game's video settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
