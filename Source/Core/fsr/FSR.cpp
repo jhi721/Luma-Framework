@@ -305,8 +305,9 @@ namespace FidelityFX
 #endif
       dispatch_upscale.upscaleSize.width = custom_data->settings_data.output_width;
       dispatch_upscale.upscaleSize.height = custom_data->settings_data.output_height;
-      dispatch_upscale.renderSize.width = draw_data.render_width;
-      dispatch_upscale.renderSize.height = draw_data.render_height;
+      // 0: the settings' render size (like DLSS)
+      dispatch_upscale.renderSize.width = (draw_data.render_width ? draw_data.render_width : custom_data->settings_data.render_width);
+      dispatch_upscale.renderSize.height = (draw_data.render_height ? draw_data.render_height : custom_data->settings_data.render_height);
       dispatch_upscale.jitterOffset.x = draw_data.jitter_x;
       dispatch_upscale.jitterOffset.y = draw_data.jitter_y;
       dispatch_upscale.motionVectorScale.x = custom_data->settings_data.mvs_x_scale;
