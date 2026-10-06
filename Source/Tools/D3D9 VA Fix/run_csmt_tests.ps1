@@ -60,10 +60,10 @@ function Invoke-Test([string]$dir, [string[]]$arguments) {
     return Wait-Test (Start-Test $dir $arguments)
 }
 
-# Windows d3d9 without the VA fix: with it, a MANAGED texture created and drawn in the same frame samples empty
-# whether CSMT is on or not (a VA fix bug on the user-memory staging path, which dgVoodoo doesn't take). CSMT itself
-# refuses the Windows runtime; its runs check that the request is harmless there.
+# CSMT refuses the Windows runtime; its runs check that the request is harmless there, with and without the VA fix
+# (windows_vafix: the test's state block drops the VA fix's device hooks unless they are restored).
 $runtimes = @(@{ Name = "windows"; Chain = "$env:SystemRoot\SysWOW64\d3d9.dll"; VaFix = $false },
+    @{ Name = "windows_vafix"; Chain = "$env:SystemRoot\SysWOW64\d3d9.dll"; VaFix = $true },
     @{ Name = "dgvoodoo"; Chain = $dgvDll; VaFix = $true })
 $runs = @(
     @{ Name = "frames"; Args = @("frames=8") },
@@ -92,7 +92,10 @@ foreach ($test in $started) {
     $ok = ($a.Exit -eq 0) -and ($b.Exit -eq 0) -and -not $diff -and $crcA.Count -gt 0 -and
         ($b.Log | Select-String $expected)
     "=== $($test.Name): $(if ($ok) { 'ok' } else { 'FAILED' }) ($($crcA.Count) frames)"
-    if (-not $ok) {
+    if ($ok) {
+        Remove-Item $test.A.Dir, $test.B.Dir -Recurse -Force # failed runs keep their folders for diagnosis
+    }
+    else {
         $failed++
         "  off exit $($a.Exit), on exit $($b.Exit)"
         $diff | Select-Object -First 4 | ForEach-Object { "  crc differs: $($_.InputObject) ($($_.SideIndicator))" }
@@ -110,6 +113,7 @@ if ($Bench) {
             $ms = { param($r) ($r.Output | Select-String "ms per frame").Line }
             "=== $($runtime.Name) / $($benchArgs -join ' '): off: $(& $ms $a) | on: $(& $ms $b)"
         }
+        Remove-Item $off, $on -Recurse -Force
     }
 }
 if ($failed) { "FAILED ($failed)"; exit 1 } else { "PASSED" }

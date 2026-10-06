@@ -132,10 +132,11 @@ namespace
       return dgvoodoo;
    }
 
-   // The runtime validates calls such as UpdateSurface and StretchRect by calling
-   // GetDesc through the vtable (Windows d3d9): reporting MANAGED to it makes it
-   // reject our own uploads. Only callers outside the runtime get the game's view.
-   bool CalledByRuntime(void* return_address)
+   // Return addresses: the runtime validates calls such as UpdateSurface and
+   // StretchRect by calling GetDesc through the vtable (Windows d3d9), and
+   // reporting MANAGED to it makes it reject our own uploads, so only callers
+   // outside the runtime get the game's view.
+   bool InChainImage(const void* address)
    {
       static const auto [begin, end] = []
       {
@@ -144,7 +145,7 @@ namespace
          char* base = (char*)info.lpBaseOfDll;
          return std::pair{base, base + info.SizeOfImage};
       }();
-      return return_address >= begin && return_address < end;
+      return address >= begin && address < end;
    }
 
    // ---- vtable hooks ----------------------------------------------------------
@@ -156,6 +157,7 @@ namespace
    {
       void** slot;
       void* original;
+      void* hook;
    };
    constexpr int MAX_HOOKED_SLOTS = 128;
    HookedSlot g_hooked[MAX_HOOKED_SLOTS];
@@ -172,15 +174,32 @@ namespace
          if (g_hooked[i].slot == slot)
             return reinterpret_cast<T>(g_hooked[i].original);
       }
+      // A vtable copied from a table we patched (Windows d3d9's device vtable
+      // of a later device) holds our hook in an unrecorded slot.
+      void* const current = *slot;
+      for (int i = 0; i < count; i++)
+      {
+         if (g_hooked[i].hook == current)
+            return reinterpret_cast<T>(g_hooked[i].original);
+      }
       // Never patched (GetDesc with the fix off, read by the LockRect hook): the
       // slot still holds the runtime's method. A Patch racing this read can
       // return the hook, which then finds its recorded original.
-      return reinterpret_cast<T>(*slot);
+      return reinterpret_cast<T>(current);
+   }
+
+   void WriteSlot(void** slot, void* value)
+   {
+      DWORD old_protect;
+      VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect);
+      *slot = value;
+      VirtualProtect(slot, sizeof(void*), old_protect, &old_protect);
    }
 
    void Patch(void* object, int index, void* hook)
    {
-      void** slot = &(*(void***)object)[index];
+      void** vtable = *(void***)object;
+      void** slot = &vtable[index];
       if (*slot == hook) // unlocked read; a stale value just takes the locked path
          return;
       std::lock_guard lock(g_patch_mutex);
@@ -196,16 +215,38 @@ namespace
       // layer's order (on the worker for deferred calls).
       if (void* below = Csmt::InsertBelow(object, index, hook))
       {
-         g_hooked[count] = {.slot = slot, .original = below};
+         g_hooked[count] = {.slot = slot, .original = below, .hook = hook};
          g_hooked_count.store(count + 1, std::memory_order_release);
          return;
       }
-      g_hooked[count] = {.slot = slot, .original = *slot};
+      void* const original = *slot;
+      g_hooked[count] = {.slot = slot, .original = original, .hook = hook};
       g_hooked_count.store(count + 1, std::memory_order_release);
-      DWORD old_protect;
-      VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect);
-      *slot = hook;
-      VirtualProtect(slot, sizeof(void*), old_protect, &old_protect);
+      WriteSlot(slot, hook);
+      // Windows d3d9 keeps the device's vtable inside the device, right after a
+      // pointer to the static table it came from, and BeginStateBlock copies that
+      // table over it again: hook the static table too, or the copy drops our
+      // hooks (MANAGED creates then reach D3D9Ex, which rejects them) while other
+      // threads may already call in. Taken only if the pointer is a table in the
+      // runtime's image that matches most of this vtable: the copy differs in our
+      // hooks and in others' (apphelp.dll shims CreateAdditionalSwapChain on an
+      // exe's first run, overlays hook Present).
+      constexpr int DEVICE9_METHODS = 119; // what BeginStateBlock copies
+      if (InChainImage(vtable) || count + 1 == MAX_HOOKED_SLOTS)
+         return;
+      void** source = (void**)vtable[-1];
+      if (!InChainImage(source) || !InChainImage(source + DEVICE9_METHODS))
+         return;
+      int same = 0;
+      for (int i = 0; i < DEVICE9_METHODS; i++)
+      {
+         same += (vtable[i] == source[i]);
+      }
+      if (same < 90)
+         return;
+      g_hooked[count + 1] = {.slot = &source[index], .original = original, .hook = hook};
+      g_hooked_count.store(count + 2, std::memory_order_release);
+      WriteSlot(&source[index], hook);
    }
 
    // ---- counters and report
@@ -1302,7 +1343,7 @@ namespace
    {
       const HRESULT hr = Original<decltype(&HookSurfaceGetDesc)>(
          self, SLOT_SURFACE_GET_DESC)(self, desc);
-      if (SUCCEEDED(hr) && !CalledByRuntime(_ReturnAddress()))
+      if (SUCCEEDED(hr) && !InChainImage(_ReturnAddress()))
       {
          std::lock_guard lock(g_state.mutex);
          if (g_state.surfaces.contains(self))
@@ -1421,7 +1462,7 @@ namespace
    {
       const HRESULT hr = Original<decltype(&HookGetLevelDesc)>(
          self, SLOT_GET_LEVEL_DESC)(self, level, desc);
-      if (SUCCEEDED(hr) && !CalledByRuntime(_ReturnAddress()))
+      if (SUCCEEDED(hr) && !InChainImage(_ReturnAddress()))
       {
          std::lock_guard lock(g_state.mutex);
          if (Resource* resource = FindResource(self); resource && resource->shadow)
