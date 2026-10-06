@@ -6,6 +6,16 @@
 // so they aren't used for driver optimizations ("bUseMarkersToOptimize").
 #if ENABLE_REFLEX
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <random>
+#include <shared_mutex>
+#include <thread>
+
+#include <evntrace.h>
+#include <TraceLoggingProvider.h>
+
+#pragma comment(lib, "Advapi32.lib") // ETW, for PCLStats
 
 #include "nvapi.h"
 
@@ -43,6 +53,101 @@ namespace Reflex
    // (~340 presents without markers) plus Display Commander's 500 frame delay before it passes Luma's mode on
    constexpr uint32_t owner_presents = 600;
 
+   // PC Latency stats ("PCLStats"): Luma's markers again as ETW events, plus a ping message posted to the game's window that the
+   // frame handling it marks. FrameView and the NVIDIA App overlay need both to measure the PC latency, the driver doesn't pass
+   // the NVAPI markers on. Provider, event and field names and the ping as in NVIDIA's "pclstats.h" (Reflex SDK, Streamline).
+   // Running only while Luma owns Reflex: a game or tool with its own Reflex has its own PCLStats, two would mix their events.
+   namespace PCL
+   {
+      TRACELOGGING_DEFINE_PROVIDER(provider, "PCLStatsTraceLoggingProvider", (0x0d216f06, 0x82a6, 0x4d49, 0xbc, 0x4f, 0x8f, 0x38, 0xae, 0x56, 0xef, 0xab));
+
+      std::atomic<bool> listened = false; // An ETW session (FrameView, the NVIDIA App) enabled the provider
+      std::atomic<bool> ping = false;     // Taken from the game's message queue, marked on the frame's next present
+      UINT ping_message = 0;
+
+      struct Session
+      {
+         std::shared_mutex mutex;
+         bool running = false;
+         HHOOK message_hook = nullptr;
+         std::jthread ping_thread;
+      };
+      Session session;
+
+      void NTAPI OnProviderControl(LPCGUID, ULONG control_code, UCHAR, ULONGLONG, ULONGLONG, PEVENT_FILTER_DESCRIPTOR, PVOID)
+      {
+         switch (control_code)
+         {
+         case EVENT_CONTROL_CODE_ENABLE_PROVIDER:
+            listened = true;
+            break;
+         case EVENT_CONTROL_CODE_DISABLE_PROVIDER:
+            listened = false;
+            break;
+         // No "PCLSTATS_NO_PRESENT_MARKERS": Luma sets the present markers
+         case EVENT_CONTROL_CODE_CAPTURE_STATE:
+            TraceLoggingWrite(provider, "PCLStatsFlags", TraceLoggingUInt32(0u, "Flags"));
+            break;
+         default:
+            break;
+         }
+      }
+
+      // On the window's thread, for the messages its loop takes from the queue
+      LRESULT CALLBACK OnGetMessage(int code, WPARAM wparam, LPARAM lparam)
+      {
+         if (code == HC_ACTION && wparam == PM_REMOVE && reinterpret_cast<const MSG*>(lparam)->message == ping_message)
+            ping = true;
+         return CallNextHookEx(nullptr, code, wparam, lparam);
+      }
+
+      // Pings every 100 to 300 ms (random, as NVIDIA's) while listened to and the game is in the foreground
+      void PingLoop(std::stop_token stop, HWND window)
+      {
+         std::mutex mutex;
+         std::condition_variable_any wake;
+         std::minstd_rand random(GetCurrentThreadId());
+         std::unique_lock lock(mutex);
+         while (!wake.wait_for(lock, stop, std::chrono::milliseconds(100 + random() % 200), [&stop]
+            { return stop.stop_requested(); }))
+         {
+            DWORD foreground_process = 0;
+            if (!listened || !GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process) || foreground_process != GetCurrentProcessId())
+               continue;
+            TraceLoggingWrite(provider, "PCLStatsInput", TraceLoggingUInt32(ping_message, "MsgId"));
+            PostMessageW(window, ping_message, 0, 0);
+         }
+      }
+
+      void Start(HWND window)
+      {
+         const std::unique_lock lock(session.mutex);
+         if (session.running)
+            return;
+         session.running = true;
+         ping_message = RegisterWindowMessageW(L"PC_Latency_Stats_Ping");
+         ping = false;
+         TraceLoggingRegisterEx(provider, OnProviderControl, nullptr);
+         TraceLoggingWrite(provider, "PCLStatsInit");
+         session.message_hook = SetWindowsHookExW(WH_GETMESSAGE, OnGetMessage, nullptr, GetWindowThreadProcessId(window, nullptr));
+         session.ping_thread = std::jthread(PingLoop, window);
+      }
+
+      // Also before the addon unloads: the hook and the thread run its code
+      void Stop()
+      {
+         const std::unique_lock lock(session.mutex);
+         if (!session.running)
+            return;
+         session.running = false;
+         session.ping_thread = {}; // Stops and joins it
+         if (session.message_hook)
+            UnhookWindowsHookEx(std::exchange(session.message_hook, nullptr));
+         TraceLoggingWrite(provider, "PCLStatsShutdown");
+         TraceLoggingUnregister(provider);
+      }
+   } // namespace PCL
+
 #if DEVELOPMENT
    // The driver's last frame reports (whoever set their markers), averaged for the DEV panel
    struct LatencyStats
@@ -67,6 +172,7 @@ namespace Reflex
       bool markers = false;               // The frame "frame_id" has Luma's markers
       uint32_t mode_presents = 0;         // Since Luma last set the sleep mode, or since the driver last agreed with it
       const char* other_reason = nullptr; // Why the state became "Other"
+      bool pcl = false;                   // This device started "PCL"
       // The device's first swapchain, the only one followed (only compared)
       std::atomic<void*> swapchain = nullptr;
 #if DEVELOPMENT
@@ -144,6 +250,8 @@ namespace Reflex
       params.frameID = frame_id;
       params.markerType = type;
       NvAPI_D3D_SetLatencyMarker(device, &params);
+      // PCLStats' marker values are NVAPI's. Dropped while "PCL" isn't registered.
+      TraceLoggingWrite(PCL::provider, "PCLStatsEvent", TraceLoggingUInt32(uint32_t(type), "Marker"), TraceLoggingUInt64(frame_id, "FrameID"));
    }
 
    // Before the game's present
@@ -151,13 +259,16 @@ namespace Reflex
    {
       if (!data.markers)
          return;
+      // The ping arrived during this frame's simulation (the game's message loop)
+      if (PCL::ping.exchange(false))
+         SetMarker(device, data.frame_id, PC_LATENCY_PING);
       SetMarker(device, data.frame_id, SIMULATION_END);
       SetMarker(device, data.frame_id, RENDERSUBMIT_END);
       SetMarker(device, data.frame_id, PRESENT_START);
    }
 
    // After the game's present returned: the frame ends, and the next one starts after the sleep
-   void OnFinishPresent(IUnknown* device, DeviceData* data, Mode mode)
+   void OnFinishPresent(IUnknown* device, HWND window, DeviceData* data, Mode mode)
    {
 #if DEVELOPMENT
       if (data->state != State::Unsupported && ++data->latency_stats_presents % check_interval == 0)
@@ -166,7 +277,11 @@ namespace Reflex
       // Every return but the last leaves the next frame unmarked
       const bool had_markers = std::exchange(data->markers, false);
       if (data->state > State::Running)
+      {
+         if (std::exchange(data->pcl, false))
+            PCL::Stop();
          return;
+      }
       if (data->presents < detection_presents)
       {
          NV_GET_SLEEP_STATUS_PARAMS status = {NV_GET_SLEEP_STATUS_PARAMS_VER};
@@ -226,7 +341,11 @@ namespace Reflex
       data->state = mode == Mode::Off ? State::Inactive : State::Running;
       // DEV also marks the frames with Reflex off (no sleep), to compare their latency
       if (mode == Mode::Off && !DEVELOPMENT)
+      {
+         if (std::exchange(data->pcl, false))
+            PCL::Stop();
          return;
+      }
       if (mode != Mode::Off)
       {
 #if DEVELOPMENT
@@ -238,6 +357,8 @@ namespace Reflex
          data->sleeps++;
 #endif
       }
+      if (!std::exchange(data->pcl, true))
+         PCL::Start(window);
       data->frame_id++;
       data->markers = true;
       SetMarker(device, data->frame_id, SIMULATION_START);

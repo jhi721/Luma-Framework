@@ -2965,6 +2965,12 @@ namespace
 
       game->OnDestroyDeviceData(device_data);
 
+#if ENABLE_REFLEX
+      // Its ping thread and message hook run the addon's code
+      if (device_data.reflex.pcl)
+         Reflex::PCL::Stop();
+#endif
+
       // It can apparently happen that in DX11 the device destructor callback is sent before its pipelines, so make sure we empty the memory before.
       // Note: ReShade has fixed this bug now, but as of 6.6 it simply skips ever calling the destroy event for these.
       {
@@ -5723,11 +5729,11 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
-      // Final states only update the DEV stats. Only the device's first swapchain (the only one expected), so there's one sleep per frame.
-      if ((!DEVELOPMENT && device_data.reflex.state > Reflex::State::Running) || device_data.reflex.swapchain != swapchain)
+      // Final states only update the DEV stats (and stop PCLStats). Only the device's first swapchain (the only one expected), so there's one sleep per frame.
+      if ((!DEVELOPMENT && device_data.reflex.state > Reflex::State::Running && !device_data.reflex.pcl) || device_data.reflex.swapchain != swapchain)
          return;
       // The UI's setting, read without the lock like the other per frame settings
-      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), &device_data.reflex, reflex_mode);
+      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), (HWND)swapchain->get_hwnd(), &device_data.reflex, reflex_mode);
 #if DEVELOPMENT
       if (std::exchange(device_data.reflex.log_due, false))
       {
