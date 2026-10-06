@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <format>
 #include <span>
@@ -59,9 +60,11 @@ namespace Perf
       }
    };
 
-   // The median of "values" (0 without any)
+   // The median of "values" (0 without any); NaN is a window that couldn't measure a column and is left out
    inline double Median(std::vector<double> values)
    {
+      std::erase_if(values, [](double value)
+         { return std::isnan(value); });
       if (values.empty())
          return 0.0;
       std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
