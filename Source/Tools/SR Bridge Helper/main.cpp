@@ -12,6 +12,7 @@
 #include "FidelityFX/host/ffx_fsr3.h"
 
 #include <cstdio>
+#include <share.h>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -263,8 +264,8 @@ namespace
       }
    };
 
-   // "LUMA_UPSCALER_PROFILE=<csv path>" (offline, "_tools/sr_bridge_perf"): a row per frame of CPU times (QPC, the same in every
-   // process) and GPU timestamps
+   // "LUMA_UPSCALER_PROFILE=<csv path>" (offline, "_tools/sr_bridge_perf", and a game's Development "Performance Test"): a row
+   // per frame of CPU times (QPC, the same in every process) and GPU timestamps, readable while written
    struct Profile
    {
       struct Slot
@@ -295,7 +296,8 @@ namespace
             for (auto& query : slot.gpu)
                device->CreateQuery(&timestamp, &query);
          }
-         if (fopen_s(&csv, path, "w") == 0)
+         csv = _fsopen(path, "w", _SH_DENYNO);
+         if (csv)
             fprintf(csv, "n,line,evaluate_call,evaluate_return,flushed,gpu_queued,gpu_waited,gpu_evaluated,gpu_frequency,disjoint\n");
       }
 
@@ -310,6 +312,7 @@ namespace
                Sleep(0);
          fprintf(csv, "%llu,%lld,%lld,%lld,%lld,%llu,%llu,%llu,%llu,%d\n", (unsigned long long)slot.n, slot.cpu[0], slot.cpu[1], slot.cpu[2], slot.cpu[3],
             (unsigned long long)gpu[0], (unsigned long long)gpu[1], (unsigned long long)gpu[2], (unsigned long long)disjoint.Frequency, int(disjoint.Disjoint));
+         fflush(csv);
       }
 
       void Begin(ID3D11DeviceContext* context, uint64_t n)
