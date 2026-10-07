@@ -18,6 +18,7 @@ namespace SR
 		Auto,
 		DLSS,
 		FSR_3,
+		LumaTAA,
 	};
 
 	// Put these in order of preference (most preferred first). For automatic selection.
@@ -25,6 +26,7 @@ namespace SR
 	{
 		DLSS,
 		FSR,
+		LumaTAA,
 		None = -1
 	};
 
@@ -40,8 +42,26 @@ namespace SR
 			return type == Type::DLSS;
 		case SR::UserType::FSR_3:
 			return type == Type::FSR;
+		case SR::UserType::LumaTAA:
+			return type == Type::LumaTAA;
 		}
 		return false;
+	}
+
+	constexpr const char* GetTypeName(Type type)
+	{
+		switch (type)
+		{
+		case Type::DLSS:
+			return "DLSS";
+		case Type::FSR:
+			return "FSR";
+		case Type::LumaTAA:
+			return "Luma TAA";
+		case Type::None:
+			break;
+		}
+		return "None";
 	}
 	
 	// E.g. use base 2 for x and base 3 for y.

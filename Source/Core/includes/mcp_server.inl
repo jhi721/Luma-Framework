@@ -1677,13 +1677,13 @@ namespace Mcp
       const size_t history = size_t(job->IntArg("history", 32, 0, int64_t(sr_history_size))); // Read even without implementations
       for (const auto& [type, implementation] : sr_implementations)
       {
-         w.BeginObject().Field("type", type == SR::Type::DLSS ? "DLSS" : "FSR");
+         w.BeginObject().Field("type", SR::GetTypeName(type));
          if (const auto* tap = dynamic_cast<const SrTap*>(implementation.get()))
             tap->Write(&w, history);
          w.EndObject();
       }
       w.EndArray();
-      w.Field("sr_type", device_data.sr_type == SR::Type::DLSS ? "DLSS" : (device_data.sr_type == SR::Type::FSR ? "FSR" : "None"));
+      w.Field("sr_type", SR::GetTypeName(device_data.sr_type));
       w.Field("sr_suppressed", device_data.sr_suppressed.load()).Field("force_reset_sr", device_data.force_reset_sr.load());
       w.Field("sr_render_resolution_scale", device_data.sr_render_resolution_scale.load());
 #else
@@ -2329,9 +2329,9 @@ namespace Mcp
          {"core.enable_upgraded_texture_resource_copy_redirection", &enable_upgraded_texture_resource_copy_redirection}});
       RegisterInts({{"core.frame_sleep_ms", &frame_sleep_ms, 0, 100}, {"core.frame_sleep_interval", &frame_sleep_interval, 1, 30}});
 #if ENABLE_SR
-      // As the "Super Resolution" combo, not saved to the config: 0 None, 1 Auto, 2 DLSS, 3 FSR 3
+      // As the "Super Resolution" combo, not saved to the config: 0 None, 1 Auto, 2 DLSS, 3 FSR 3, 4 Luma TAA
       static_assert(sizeof(SR::UserType) == sizeof(int));
-      RegisterInts({{"core.sr_user_type", reinterpret_cast<int*>(&sr_user_type), 0, 3, [](DeviceData& device_data, double value)
+      RegisterInts({{"core.sr_user_type", reinterpret_cast<int*>(&sr_user_type), 0, 4, [](DeviceData& device_data, double value)
          {
             const SR::UserType user_type = SR::UserType(int(value));
             SR::Type type = SR::Type::None;
@@ -2341,6 +2341,7 @@ namespace Mcp
             case SR::UserType::Auto: type = GetSRAutoType(device_data); break;
             case SR::UserType::DLSS: type = SR::Type::DLSS; break;
             case SR::UserType::FSR_3: type = SR::Type::FSR; break;
+            case SR::UserType::LumaTAA: type = SR::Type::LumaTAA; break;
             }
             if (user_type != SR::UserType::None && !device_data.sr_implementations_instances.contains(type))
                return std::string("Not supported on this device");

@@ -99,11 +99,15 @@
 #ifndef ENABLE_SR_BRIDGE
 #define ENABLE_SR_BRIDGE 0
 #endif // ENABLE_SR_BRIDGE
+// Luma's own native resolution TAA, in process on any GPU and on 32-bit (see "taa/LumaTAA.hpp")
+#ifndef ENABLE_LUMA_TAA
+#define ENABLE_LUMA_TAA 0
+#endif // ENABLE_LUMA_TAA
 // Automatically define "ENABLE_SR" if any SR tech is enabled
 #ifdef ENABLE_SR
 #undef ENABLE_SR
 #endif // ENABLE_SR
-#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || (ENABLE_SR_BRIDGE && !defined(_WIN64))
+#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_LUMA_TAA
 #define ENABLE_SR 1
 #else
 #define ENABLE_SR 0
@@ -220,6 +224,7 @@
 #include "utils/resource.hpp"
 #include "utils/draw.hpp"
 #include "utils/system.h"
+#include "taa/LumaTAA.hpp" // see "ENABLE_LUMA_TAA"
 
 #define ICON_FK_CANCEL reinterpret_cast<const char*>(u8"\uf00d")
 #define ICON_FK_OK reinterpret_cast<const char*>(u8"\uf00c")
@@ -703,6 +708,14 @@ namespace
 #endif
 
       { CompileTimeStringHash("Karis Average CS"), { "Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader } },
+
+#if ENABLE_LUMA_TAA // See "LumaTAA::resolve_shader_hashes"
+      { CompileTimeStringHash("Luma TAA Low CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "0" } } } },
+      { CompileTimeStringHash("Luma TAA Medium CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "1" } } } },
+      { CompileTimeStringHash("Luma TAA High CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "2" } } } },
+      { CompileTimeStringHash("Luma TAA Ultra CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "3" } } } },
+      { CompileTimeStringHash("Luma TAA Reconstruct Depth CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "reconstruct_previous_depth_cs", { { "TAA_QUALITY", "3" } } } },
+#endif
    };
 
    // TODO: make the data in these a unique ptr for easier handling, and the shader binary data contained inside of "CachedShader" too.
@@ -2887,6 +2900,13 @@ namespace
             device_data.sr_implementations_instances[sr_implementation.first] = nullptr; // Create an empty element
             // We always do this, which will force the SR dll to load, but it should be fast enough to not bother users from other vendors
             sr_implementation.second->Init(device_data.sr_implementations_instances[sr_implementation.first], native_device, native_adapter.get());
+#if ENABLE_LUMA_TAA
+            // It draws with this device's Luma native shaders
+            if (sr_implementation.first == SR::Type::LumaTAA && device_data.sr_implementations_instances[sr_implementation.first])
+            {
+               static_cast<LumaTAA::TAAInstanceData*>(device_data.sr_implementations_instances[sr_implementation.first])->device_data = &device_data;
+            }
+#endif
 
             if (device_data.sr_implementations_instances[sr_implementation.first] && !device_data.sr_implementations_instances[sr_implementation.first]->is_supported)
             {
@@ -14521,6 +14541,8 @@ namespace
                selected_sr_user_type = "DLSS"; break;
             case SR::UserType::FSR_3:
                selected_sr_user_type = "FSR 3"; break;
+            case SR::UserType::LumaTAA:
+               selected_sr_user_type = "Luma TAA"; break;
             }
 
             SR::Type sr_type = device_data.sr_type;
@@ -14561,6 +14583,9 @@ namespace
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
                AddComboItem("FSR 3", SR::UserType::FSR_3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+#if ENABLE_LUMA_TAA // Only in games that enable it, rather than as an always disabled item
+               AddComboItem("Luma TAA", SR::UserType::LumaTAA, SR::Type::LumaTAA, device_data.sr_implementations_instances.contains(SR::Type::LumaTAA));
+#endif
                ImGui::EndCombo();
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -14655,6 +14680,21 @@ namespace
                }
             }
 
+#if ENABLE_LUMA_TAA
+            if (sr_type == SR::Type::LumaTAA)
+            {
+               int taa_quality = LumaTAA::quality.load();
+               if (ImGui::SliderInt("Luma TAA Quality", &taa_quality, 0, int(std::size(LumaTAA::quality_names)) - 1, LumaTAA::quality_names[taa_quality], ImGuiSliderFlags_NoInput))
+               {
+                  LumaTAA::quality = taa_quality;
+                  reshade::set_config_value(runtime, NAME, "LumaTAAQuality", taa_quality);
+               }
+               if (ImGui::IsItemHovered())
+               {
+                  ImGui::SetTooltip("Low is the cheapest, for weak GPUs.\nMedium is steadier on fine static detail (fences, grates), for ~1.5x Low's cost.\nHigh keeps far more texture detail and is steadier in motion, for ~2.5x Low's cost and 4x the history memory.\nUltra adds a depth test that removes ghosting behind moving objects, for ~15%% more than High.");
+               }
+            }
+#endif
             if (sr_type != device_data.sr_type)
             {
                device_data.sr_type_selected = sr_type;
@@ -16467,6 +16507,9 @@ void Init(bool async)
    sr_implementations[SR::Type::DLSS] = std::make_unique<SRBridge::Bridge>(SR::Type::DLSS);
    sr_implementations[SR::Type::FSR] = std::make_unique<SRBridge::Bridge>(SR::Type::FSR);
 #endif
+#if ENABLE_LUMA_TAA
+   sr_implementations[SR::Type::LumaTAA] = std::make_unique<LumaTAA::TAA>();
+#endif
 #if DEVELOPMENT
    Mcp::Start();
 #if ENABLE_SR
@@ -16528,6 +16571,11 @@ void Init(bool async)
       int dlss_render_preset_i = static_cast<int>(dlss_render_preset);
       reshade::get_config_value(runtime, NAME, "DLSSRenderPreset", dlss_render_preset_i);
       dlss_render_preset = static_cast<unsigned int>(dlss_render_preset_i);
+#endif
+#if ENABLE_LUMA_TAA
+      int taa_quality = LumaTAA::quality.load();
+      reshade::get_config_value(runtime, NAME, "LumaTAAQuality", taa_quality);
+      LumaTAA::quality = std::clamp(taa_quality, 0, int(std::size(LumaTAA::quality_names)) - 1);
 #endif
 #if ENABLE_REFLEX
       int reflex_mode_i = int(reflex_mode);
