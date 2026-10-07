@@ -19,8 +19,9 @@
 #define DISABLE_AUTO_DEBUGGER 1
 
 #define GEOMETRY_SHADER_SUPPORT 0
-#define ENABLE_SMAA 1  // SMAA ULTRA (+RCAS) injected post-tonemap; core auto-registers the 6 "SMAA ..." passes from Luma_SMAA_impl
-#define ENABLE_BLOOM 1 // core auto-registers the Bloom VS/Prefilter/Downsample/Upsample passes -> Luma_Bloom_impl
+#define ENABLE_SMAA 1     // SMAA ULTRA (+RCAS) injected post-tonemap; core auto-registers the 6 "SMAA ..." passes from Luma_SMAA_impl
+#define ENABLE_BLOOM 1    // core auto-registers the Bloom VS/Prefilter/Downsample/Upsample passes -> Luma_Bloom_impl
+#define ENABLE_LUMA_TAA 1 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU
 // SMAA runs POST-tonemap through the post-draw callback (see RunPostTonemapSMAA); needs original_draw_dispatch_func.
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -127,10 +128,11 @@ static bool g_sr_reactive_zero_test = false; // The mask cleared to 0 but still 
 struct PerfTestMode
 {
    const char* name;
-   bool set_aa = false; // Else the current anti-aliasing (the next two fields unused)
+   bool set_aa = false; // Else the current anti-aliasing ("sr_type", "smaa" and "luma_taa_quality" unused)
    SR::Type sr_type = SR::Type::None;
    bool smaa = false;
    int motion_vector_draws = 2; // 2 patched (motion vectors and jitter), 1 jitter only, 0 untouched (unjittered)
+   int luma_taa_quality = -1;   // With "sr_type" Luma TAA: its "TAA_QUALITY" (else the user's)
    // One CPU saving off, the others as the user set them
    bool vc4_filter_off = false;
    bool vc4_pool_off = false;
@@ -143,6 +145,8 @@ constexpr PerfTestMode perf_test_modes[] = {
    {.name = "DLSS Jitter Only", .set_aa = true, .sr_type = SR::Type::DLSS, .motion_vector_draws = 1},
    {.name = "DLSS Without Motion Vector Draws", .set_aa = true, .sr_type = SR::Type::DLSS, .motion_vector_draws = 0},
    {.name = "FSR 3", .set_aa = true, .sr_type = SR::Type::FSR},
+   {.name = "Luma TAA High", .set_aa = true, .sr_type = SR::Type::LumaTAA, .luma_taa_quality = 2},
+   {.name = "Luma TAA Ultra", .set_aa = true, .sr_type = SR::Type::LumaTAA, .luma_taa_quality = 3},
    {.name = "SMAA", .set_aa = true, .smaa = true},
    {.name = "No AA", .set_aa = true},
    {.name = "Without vc4 Filter", .vc4_filter_off = true},
@@ -150,10 +154,10 @@ constexpr PerfTestMode perf_test_modes[] = {
    {.name = "Without Blend Memo", .blend_memo_off = true},
 };
 // "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a
-// median per mode against the last one. "CPU Sweep": the CPU savings each off in turn under the current anti-aliasing (DLSS or FSR:
+// median per mode against the last one. "CPU Sweep": the CPU savings each off in turn under the current anti-aliasing (an upscaler:
 // without motion vectors the hooks return early), against "Current Settings".
-constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7};
-constexpr int perf_cpu_sweep_modes[] = {8, 9, 10, 1};
+constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7, 8, 9};
+constexpr int perf_cpu_sweep_modes[] = {10, 11, 12, 1};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
 static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[std::size(perf_cpu_sweep_modes) - 1]].name) == "Current Settings");
 constexpr Perf::SweepDef perf_sweeps[] = {{"Sweep", perf_sweep_modes}, {"CPU Sweep", perf_cpu_sweep_modes}};
@@ -541,6 +545,7 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    int64_t perf_helper_profile_read = 0;
    // The user's anti-aliasing and CPU savings while a mode that sets its own runs
    SR::Type perf_user_sr_type = SR::Type::None;
+   int perf_user_taa_quality = 2;
    bool perf_user_smaa = false;
    bool perf_user_vc4_filter = true;
    bool perf_user_vc4_pool = true;
@@ -901,6 +906,13 @@ class Borderlands2 final : public Game
       return GetGameDeviceData(device_data).sr_active;
    }
 
+   // The upscalers that read the reactive mask the alpha blended draws write: FSR and Luma TAA (DLSS's current presets ignore it,
+   // DLSS-Best-Practices TRN-2)
+   static bool IsReactiveMaskUsed(DeviceData& device_data)
+   {
+      return g_sr_reactive_enable && IsSRActive(device_data) && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA);
+   }
+
    static std::array<float, 3> GetPreViewTranslation(const std::vector<uint8_t>& constants)
    {
       std::array<float, 3> translation;
@@ -1007,11 +1019,13 @@ class Borderlands2 final : public Game
       if (!previous_mode.set_aa && mode.set_aa)
       {
          gd.perf_user_sr_type = device_data.sr_type;
+         gd.perf_user_taa_quality = LumaTAA::quality.load();
          gd.perf_user_smaa = g_smaa_enable;
       }
       if (mode.set_aa || previous_mode.set_aa)
       {
          SetSRType(device_data, (mode.set_aa ? mode.sr_type : gd.perf_user_sr_type));
+         LumaTAA::quality = ((mode.set_aa && mode.luma_taa_quality >= 0) ? mode.luma_taa_quality : gd.perf_user_taa_quality);
          device_data.sr_suppressed = false;
          g_smaa_enable = (mode.set_aa ? mode.smaa : gd.perf_user_smaa);
       }
@@ -1504,8 +1518,8 @@ class Borderlands2 final : public Game
          const FLOAT clear_value = (gd.mv_fill_pending ? 65504.f : 0.f);
          const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
          native_device_context->ClearRenderTargetView(gd.mv_rtv.get(), clear);
-         // FSR's masks: what the alpha blended draws write, from zero
-         if (g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && !gd.mv_reactive_target)
+         // The reactive masks: what the alpha blended draws write, from zero
+         if (IsReactiveMaskUsed(device_data) && !gd.mv_reactive_target)
          {
             D3D11_TEXTURE2D_DESC mv_desc;
             gd.mv_texture->GetDesc(&mv_desc);
@@ -1730,7 +1744,7 @@ class Borderlands2 final : public Game
       // An alpha blended draw into the scene writes its mask, reactive or transparency & composition (its pixel shader patched, the mask
       // target added past the motion vector one)
       ID3D11PixelShader* reactive_shader = nullptr;
-      if (g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
+      if (IsReactiveMaskUsed(device_data) && gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
       {
          ClassifyBoundBlend(native_device_context, &gd);
          if (const uint8_t blend = gd.mv_reactive_blend; blend != 0)
@@ -1855,7 +1869,7 @@ class Borderlands2 final : public Game
          gd.sr_near_plane = float(camera.near_plane);
          gd.sr_far_plane = float(camera.far_plane);
       }
-      // FSR's masks (DLSS ignores them)
+      // The reactive masks (FSR and Luma TAA; DLSS ignores them)
       ID3D11Resource* const bias_mask = ((reactive_mask && g_sr_reactive_pass) ? gd.mv_reactive.get() : nullptr);
       const SR::SuperResolutionImpl::DrawData draw_data = {
          .reset = device_data.force_reset_sr,
@@ -1965,9 +1979,8 @@ class Borderlands2 final : public Game
             gd.mv_scene_srv.reset();
          }
       }
-      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote. FSR only: DLSS's
-      // current presets ignore them (DLSS-Best-Practices TRN-2)
-      const bool reactive = IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable && gd.mv_reactive_target_srv && !g_sr_reactive_skip_fill;
+      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote
+      const bool reactive = IsReactiveMaskUsed(device_data) && gd.mv_reactive_target_srv && !g_sr_reactive_skip_fill;
       if (reactive)
       {
          D3D11_TEXTURE2D_DESC desc = {};
@@ -2166,7 +2179,7 @@ public:
 
       // DLSS/FSR: their depth and the camera motion from the scene's alpha, the CPU copies of vc4 (dgVoodoo maps it or updates it),
       // and the motion vector target written by every blend state
-      sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "DLSS and FSR 3 require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Motion Vector Fill CS"),
          ShaderDefinition("Luma_BL2TPS_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Copy Back PS"),
@@ -3392,7 +3405,7 @@ public:
       if (Perf::g_test != 0)
       {
          auto& window = gd.perf_window;
-         const char* const aa = (IsSRActive(device_data) ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : (g_smaa_enable ? "SMAA" : "none")));
+         const char* const aa = (IsSRActive(device_data) ? SR::GetTypeName(device_data.sr_type) : (g_mv_enable ? "MV only" : (g_smaa_enable ? "SMAA" : "none")));
          const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} vc4_filter={} vc4_pool={} blend_memo={} output={}x{}", perf_test_modes[Perf::g_test].name, Perf::g_hook_timers, aa,
             g_mv_buffer_filter, g_mv_constants_pool, g_blend_memo, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
          // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile), and
@@ -3532,7 +3545,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's Anti-aliasing setting on or off; not used with DLSS/FSR).");
+         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's Anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
       }
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
@@ -3543,7 +3556,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
+         ImGui::SetTooltip("Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off).");
       }
       if (DrawResetButton<float, false>(g_rcas_sharpness, 0.f, "RCASSharpness"))
       {
