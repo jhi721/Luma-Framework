@@ -89,13 +89,34 @@
 // pixels) only where its history is rejected. The mean of the 4 history texels is clipped, and the texels keep their
 // deviations from it (sub-pixel detail) scaled by the mean's clip factor. The history textures must match (Core's
 // "LumaTAA::history_2x_quality").
+// Temporal upscaling (TAAU): the inputs are at RenderResolution, the history, the per pixel states and the output at
+// OutputResolution, one thread per output pixel. Each output pixel takes this frame's sample only when it fell inside it
+// (the box splat of the 2x history, at the output pixel's size), else a jitter-aware Gaussian of the 3x3 render pixels
+// (TAA_UPSCALE_SIGMA output pixels) where its history is rejected; the history weight caps are scaled by the share of frames
+// in which an output pixel receives a sample (render / output pixel area).
+#ifndef TAA_UPSCALE
+#define TAA_UPSCALE 0
+#endif
+// An output pixel without a sample this frame still takes the Gaussian estimate, at this weight times its nearest sample's
+// Gaussian weight (lab, 1.6x, box / FLIP: train 11.18 / 7.98 -> 10.93 / 8.74, val 10.11 / 6.73 -> 8.96 / 7.00, with the
+// tolerance below): fewer frames without any current information in motion, at a little sharpness
+#ifndef TAA_UPSCALE_FALLBACK_WEIGHT
+#define TAA_UPSCALE_FALLBACK_WEIGHT 0.5
+#endif
+// The upscaled history's resampling blur tolerance, in output pixels (the 2x history's is 0.2)
+#ifndef TAA_UPSCALE_BLUR_TOLERANCE
+#define TAA_UPSCALE_BLUR_TOLERANCE 0.4
+#endif
+#ifndef TAA_UPSCALE_SIGMA
+#define TAA_UPSCALE_SIGMA 0.5
+#endif
 #ifndef TAA_HISTORY_2X
-#define TAA_HISTORY_2X (TAA_QUALITY >= 2)
+#define TAA_HISTORY_2X (TAA_QUALITY >= 2 && !TAA_UPSCALE)
 #endif
 // Bicubic history sharpness c (Catmull-Rom = 0.5). The 2x history is resampled at twice the frequency, where c = 0.4 rings
 // less (lab: 1080p detail FLIP 7.33 -> 6.91, Gaussian reference better, box +0.1-0.2, glints unchanged).
 #ifndef TAA_HISTORY_SHARPNESS
-#if TAA_HISTORY_2X
+#if TAA_HISTORY_2X || TAA_UPSCALE
 #define TAA_HISTORY_SHARPNESS 0.4
 #else
 #define TAA_HISTORY_SHARPNESS 0.5
@@ -172,6 +193,8 @@ cbuffer LumaTAAData : register(b0)
    uint Flags;
    float2 Jitter; // This frame's sample offset from the pixel center, in pixels
    float Padding;
+   float2 OutputResolution; // TAA_UPSCALE
+   float2 InvOutputResolution;
 }
 
 Texture2D<float3> SourceColor : register(t0);
@@ -355,9 +378,19 @@ groupshared uint reconstruct_tile[RECONSTRUCT_TILE * RECONSTRUCT_TILE];
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 // clang-format on
 {
+#if TAA_UPSCALE
+   const int2 output_pixel = dispatch_thread_id.xy;
+   if (any(output_pixel >= int2(OutputResolution)))
+      return;
+   const float2 render_scale = OutputResolution * InvRenderResolution; // Output pixels per render pixel
+   // The output pixel's center in render pixels, and the render pixel it falls in
+   const float2 sample_center = (output_pixel + 0.5) / render_scale;
+   const int2 pixel = min(int2(sample_center), int2(RenderResolution) - 1);
+#else
    const int2 pixel = dispatch_thread_id.xy;
    if (any(pixel >= int2(RenderResolution)))
       return;
+#endif
 
    const int2 max_pixel = int2(RenderResolution) - 1;
    const bool inverted_depth = (Flags & TAA_FLAG_INVERTED_DEPTH) != 0;
@@ -374,7 +407,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    float closest_depth = inverted_depth ? 0.0 : 1.0;
    int2 closest_pixel = pixel;
    float reactive = 0.0;
-#if TAA_HISTORY_2X
+#if TAA_HISTORY_2X || TAA_UPSCALE
    float3 neighborhood[9];
 #endif
    [unroll] for (int y = -1; y <= 1; y++)
@@ -405,7 +438,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
          {
             current = color;
          }
-#if TAA_HISTORY_2X
+#if TAA_HISTORY_2X || TAA_UPSCALE
          neighborhood[(y + 1) * 3 + (x + 1)] = color;
 #endif
 
@@ -430,11 +463,25 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 
    const float2 motion = MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
    const float speed = length(motion);
+#if TAA_UPSCALE
+   const float2 history_position = sample_center + motion;
+#else
    const float2 history_position = pixel + 0.5 + motion;
+#endif
    const bool offscreen = any(history_position < 0.0) || any(history_position >= RenderResolution);
-   // The per pixel states (lock, flickering analysis) are reprojected with the nearest texel
-   const bool has_previous_state = !offscreen && !(Flags & TAA_FLAG_RESET);
-   const int2 previous_pixel = int2(floor(history_position));
+   // The per pixel states (lock, flickering analysis) are reprojected with the nearest texel, at the output resolution
+   // when upscaling
+#if TAA_UPSCALE
+   const int2 state_pixel = output_pixel;
+   const float2 state_history_position = history_position * render_scale;
+   const bool state_offscreen = any(state_history_position < 0.0) || any(state_history_position >= OutputResolution);
+#else
+   const int2 state_pixel = pixel;
+   const float2 state_history_position = history_position;
+   const bool state_offscreen = offscreen;
+#endif
+   const bool has_previous_state = !state_offscreen && !(Flags & TAA_FLAG_RESET);
+   const int2 previous_pixel = int2(floor(state_history_position));
 
 #if TAA_FLICKER
    {
@@ -456,7 +503,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
          range_max = max(current_luminance, lerp(previous_state.y, current_luminance, TAA_FLICKER_ENVELOPE_DECAY));
       }
       const float min_luminance_average = max(has_state ? lerp(previous_state.z, min_luminance, TAA_FLICKER_RESET_SMOOTHING) : min_luminance, 6.103515625e-5);
-      OutputFlicker[pixel] = (speed > TAA_FLICKER_MOTION_RESET_SPEED) ? float3(65000.0, 0.0, min_luminance_average) : float3(max(range_min, 0.0), max(range_max, 0.0), min_luminance_average);
+      OutputFlicker[state_pixel] = (speed > TAA_FLICKER_MOTION_RESET_SPEED) ? float3(65000.0, 0.0, min_luminance_average) : float3(max(range_min, 0.0), max(range_max, 0.0), min_luminance_average);
       float widening = TAA_FLICKER_GAMMA * (range_max - range_min);
       if (TAA_FLICKER_MAX_SPEED > 0.0)
       {
@@ -513,7 +560,50 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    const float depth_clip = 1.0;
 #endif
 
-#if TAA_HISTORY_2X
+#if TAA_UPSCALE
+   const float2 output_motion = motion * render_scale;
+   const float cap_fraction = min(ResamplingBlurCap(output_motion, TAA_UPSCALE_BLUR_TOLERANCE), max_history_weight);
+   const float cap_samples = cap_fraction / (1.0 - cap_fraction) / (render_scale.x * render_scale.y);
+   const float4 history_sample = SampleHistory(state_history_position, InvOutputResolution);
+   float3 history = ClipToBox(history_sample.rgb, clip_target, box_min, box_max);
+#if TAA_LOCK
+   if (locked)
+   {
+      history = history_sample.rgb;
+   }
+#endif
+   float3 current_sum = 0.0;
+   float current_weight = 0.0;
+   float3 gauss_sum = 0.0;
+   float gauss_weight = 0.0;
+   float gauss_max = 0.0;
+   [unroll] for (int n = 0; n < 9; n++)
+   {
+      // This sample's offset from the output pixel's center, in output pixels
+      const float2 offset = (pixel + float2(n % 3 - 1, n / 3 - 1) + 0.5 + Jitter - sample_center) * render_scale;
+      const float box_weight = all(abs(offset) < 0.5) ? 1.0 : 0.0;
+      current_sum += neighborhood[n] * box_weight;
+      current_weight += box_weight;
+      const float g = exp(-0.5 * dot(offset, offset) / (TAA_UPSCALE_SIGMA * TAA_UPSCALE_SIGMA));
+      gauss_sum += neighborhood[n] * g;
+      gauss_weight += g;
+      gauss_max = max(gauss_max, g);
+   }
+   const float3 current_output = (current_weight > 0.0) ? (current_sum / current_weight) : (gauss_sum / gauss_weight);
+   const float sample_weight = (current_weight > 0.0) ? min(current_weight, 1.0) : (TAA_UPSCALE_FALLBACK_WEIGHT * gauss_max);
+   const float history_samples = min(history_sample.a / max(1.0 - history_sample.a, 1e-4), cap_samples);
+   const float history_validity = (state_offscreen || (Flags & TAA_FLAG_RESET)) ? 0.0 : depth_clip;
+   const float history_weight_output = history_samples * history_validity;
+   // Rejected history (depth clip, offscreen) is replaced even in pixels that got no sample this frame
+   const float blend = ((history_samples > 0.0) ? (history_samples / (history_samples + sample_weight)) : 0.0) * history_validity;
+   const float3 resolved = lerp(current_output, history, blend);
+   const float accumulated = history_weight_output + sample_weight;
+   OutputHistory[output_pixel] = float4(resolved, accumulated / (accumulated + 1.0));
+#if TAA_LOCK
+   OutputLock[output_pixel] = (history_weight_output > 0.0) ? lock_frames : 0;
+#endif
+   OutputColor[output_pixel] = float4(resolved, 1.0);
+#elif TAA_HISTORY_2X
    const float cap_fraction = min(ResamplingBlurCap(motion * 2.0, TAA_HISTORY_2X_BLUR_TOLERANCE), max_history_weight);
    const float cap_samples = cap_fraction / (1.0 - cap_fraction) * TAA_HISTORY_2X_RATE;
    float2 history_positions_2x[4];
