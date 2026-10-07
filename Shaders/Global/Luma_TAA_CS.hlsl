@@ -4,16 +4,24 @@
 // vendor-agnostic alternative to DLAA/FSR Native AA. Each component was picked by measurement against 64 spp ground
 // truth over moving, HDR, noisy and sub-pixel test scenes (see "docs/Luma-TAA.md"):
 // - 5-tap Catmull-Rom history (Jimenez, "Dynamic Temporal Antialiasing and Upsampling in Call of Duty"; Bevy)
-// - motion vector of the closest depth in the 3x3 neighborhood (Karis, "High Quality Temporal Supersampling")
+// - motion vector of the closest depth in the neighborhood (Karis, "High Quality Temporal Supersampling")
 // - "rounded" 3x3 + cross neighborhood box, history clipped toward the clamped box average (Playdead, INSIDE)
 // - per-channel Reinhard around the final blend only (Godot/Spartan)
 // - accumulated history weight w' = 1 / (2 - w) (MiniEngine, Intel), capped, attenuated by speed and reset by a
-//   depth disocclusion test (MiniEngine, Intel)
+//   depth disocclusion test at Ultra quality (MiniEngine, Intel)
 //
 // Inputs follow the "SR::SuperResolutionImpl::DrawData" contract: device depth, motion vectors in any unit that
 // "MotionVectorScale" converts to pixels such that previous position = current position + motion vector, and
 // colors in linear (HDR) space. The history is a Luma owned RGBA16F texture: rgb is linear color, alpha the weight.
 
+// Quality levels (texture fetches per pixel and composite score from docs/Luma-TAA.md; lower score is better):
+// 0 Low: 3x3 color box, motion vector of the closest depth in the cross, bilinear history (16, 8.98)
+// 1 Medium: + 5-tap Catmull-Rom history (20, 8.73)
+// 2 High: + closest depth over the full 3x3 (24, 8.59)
+// 3 Ultra: + depth disocclusion test, which needs the previous frame's depth (25, 8.57)
+#ifndef TAA_QUALITY
+#define TAA_QUALITY 2
+#endif
 // How much the history weight is reduced per pixel of motion; motion vectors resampled every frame blur the history,
 // so faster pixels converge to the current frame (8 pixels/frame and faster use no history).
 #ifndef TAA_SPEED_LIMIT
@@ -24,12 +32,8 @@
 #ifndef TAA_MAX_HISTORY_WEIGHT
 #define TAA_MAX_HISTORY_WEIGHT 0.94
 #endif
-// Rejects history where the closest depth is behind everything that was there last frame. It catches disocclusions
-// whose colors fall inside the neighborhood box; disabling it removes the previous depth input (and its copy).
-#ifndef TAA_DEPTH_DISOCCLUSION
-#define TAA_DEPTH_DISOCCLUSION 1
-#endif
-// Relative linear depth tolerance of the disocclusion test.
+// Relative linear depth tolerance of the Ultra quality disocclusion test, which rejects history where the closest
+// depth is behind everything that was there last frame (disocclusions whose colors fall inside the neighborhood box).
 #ifndef TAA_DEPTH_TOLERANCE
 #define TAA_DEPTH_TOLERANCE 0.01
 #endif
@@ -51,7 +55,7 @@ Texture2D<float3> SourceColor : register(t0);
 Texture2D<float> DeviceDepth : register(t1);
 Texture2D<float2> MotionVectors : register(t2);
 Texture2D<float4> History : register(t3);
-Texture2D<float> PreviousDeviceDepth : register(t4);
+Texture2D<float> PreviousDeviceDepth : register(t4); // Only read at Ultra quality
 
 RWTexture2D<float4> OutputHistory : register(u0);
 RWTexture2D<float4> OutputColor : register(u1);
@@ -80,10 +84,13 @@ float3 InverseReinhard(float3 color)
    return color / max(1.0 - abs(color), 1e-6);
 }
 
-// 5-tap Catmull-Rom (the 9-tap bilinear formulation without its 4 corner taps, weights not renormalized).
-// "position" is in pixels, with texel centers at integer + 0.5.
-float4 SampleHistoryCatmullRom(float2 position)
+// Bilinear at Low quality, otherwise 5-tap Catmull-Rom (the 9-tap bilinear formulation without its 4 corner taps,
+// weights not renormalized). "position" is in pixels, with texel centers at integer + 0.5.
+float4 SampleHistory(float2 position)
 {
+#if TAA_QUALITY == 0
+   return History.SampleLevel(LinearClampSampler, position * InvRenderResolution, 0);
+#else
    const float2 texel_center = floor(position - 0.5) + 0.5;
    const float2 f = position - texel_center;
    const float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
@@ -100,6 +107,7 @@ float4 SampleHistoryCatmullRom(float2 position)
    history += History.SampleLevel(LinearClampSampler, float2(uv3.x, uv12.y), 0) * (w3.x * w12.y);
    history += History.SampleLevel(LinearClampSampler, float2(uv12.x, uv3.y), 0) * (w12.x * w3.y);
    return history;
+#endif
 }
 
 // Moves "history" along the segment towards "target" until it is inside the box (Playdead "clip_aabb").
@@ -149,6 +157,11 @@ float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
             current = color;
          }
 
+         // Below High quality only the cross is searched for the closest depth.
+         if (TAA_QUALITY < 2 && x != 0 && y != 0)
+         {
+            continue;
+         }
          const float depth = DeviceDepth.Load(int3(sample_pixel, 0));
          const bool closer = inverted_depth ? (depth > closest_depth) : (depth < closest_depth);
          if (closer)
@@ -166,7 +179,7 @@ float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
    const float2 history_position = pixel + 0.5 + motion;
    const bool offscreen = any(history_position < 0.0) || any(history_position >= RenderResolution);
 
-#if TAA_DEPTH_DISOCCLUSION
+#if TAA_QUALITY >= 3
    // Disocclusion: the closest surface is farther than everything that was around the reprojected position.
    const float4 previous_depths = PreviousDeviceDepth.GatherRed(LinearClampSampler, history_position * InvRenderResolution);
    const float previous_farthest = inverted_depth ? min(min(previous_depths.x, previous_depths.y), min(previous_depths.z, previous_depths.w))
@@ -176,7 +189,7 @@ float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
    const bool disoccluded = false;
 #endif
 
-   const float4 history_sample = SampleHistoryCatmullRom(history_position);
+   const float4 history_sample = SampleHistory(history_position);
    // Clipping into the current neighborhood also removes the Catmull-Rom ringing.
    const float3 history = ClipToBox(history_sample.rgb, clamp(box_average, box_min, box_max), box_min, box_max);
 
