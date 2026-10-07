@@ -157,6 +157,9 @@ namespace SR
 		virtual bool Init(InstanceData*& data, ID3D11Device* device, IDXGIAdapter* adapter = nullptr) { return false; }
 		// Should be called before shutdown or on device destruction.
 		virtual void Deinit(InstanceData*& data, ID3D11Device* optional_device = nullptr) {}
+		// Frees what "UpdateSettings()" and "Draw()" created (the upscaler's own resources) but keeps the implementation loaded,
+		// for when it's not selected anymore. The next "UpdateSettings()" creates them again.
+		virtual void ReleaseResources(InstanceData* data) {}
 
 		// Note that this might expect the same command list all the times.
 		// Returns true if the settings changed or were up to date.

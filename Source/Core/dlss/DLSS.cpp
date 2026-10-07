@@ -70,6 +70,21 @@ namespace NGX
 			}
 		}
 
+		void ReleaseSuperSamplingFeature()
+		{
+			if (instance.super_sampling_feature != nullptr)
+			{
+				NVSDK_NGX_D3D11_ReleaseFeature(instance.super_sampling_feature);
+				unique_handles.erase(instance.super_sampling_feature);
+			}
+			if (instance.runtime_params != nullptr)
+			{
+				NVSDK_NGX_D3D11_DestroyParameters(instance.runtime_params);
+				unique_parameters.erase(instance.runtime_params);
+			}
+			instance = {};
+		}
+
 		// Based on "settings_data" 
 		DLSSInternalInstance CreateSuperSamplingFeature(ID3D11DeviceContext* command_list, int quality_value)
 		{
@@ -80,6 +95,13 @@ namespace NGX
 			if (NVSDK_NGX_FAILED(param_result))
 			{
 				return DLSSInternalInstance();
+			}
+
+			// Otherwise NGX keeps a released feature's memory until its shutdown (read from the creation parameters, as Unreal's DLSS plugin does by default).
+			// Not with dynamic resolution: the feature is recreated at every render size change, and the kept memory makes that cheap.
+			if (!settings_data.dynamic_resolution)
+			{
+				runtime_params->Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
 			}
 
 			NVSDK_NGX_Handle* feature = nullptr;
@@ -242,6 +264,15 @@ void NGX::DLSS::Deinit(SR::InstanceData*& data, ID3D11Device* optional_device)
 	}
 }
 
+// The feature and its memory, not the NGX runtime: shutting that down would unload the dll (a hitch)
+void NGX::DLSS::ReleaseResources(SR::InstanceData* data)
+{
+	if (data != nullptr)
+	{
+		static_cast<DLSSInstanceData*>(data)->ReleaseSuperSamplingFeature();
+	}
+}
+
 bool NGX::DLSS::HasInit(const SR::InstanceData* data) const
 {
 	return data != nullptr;
@@ -348,19 +379,9 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 	}
 
 	// Release old DLSS instance before creating a new one to prevent memory leaks
-	if (custom_data->instance.super_sampling_feature != nullptr)
-	{
-		NVSDK_NGX_D3D11_ReleaseFeature(custom_data->instance.super_sampling_feature);
-		custom_data->unique_handles.erase(custom_data->instance.super_sampling_feature);
-	}
-	if (custom_data->instance.runtime_params != nullptr)
-	{
-		NVSDK_NGX_D3D11_DestroyParameters(custom_data->instance.runtime_params);
-		custom_data->unique_parameters.erase(custom_data->instance.runtime_params);
-	}
+	custom_data->ReleaseSuperSamplingFeature();
 
 	custom_data->settings_data = settings_data;
-	custom_data->instance.command_list.Reset(); // Just to be explicit
 	custom_data->instance = custom_data->CreateSuperSamplingFeature(command_list, quality_mode);
 	custom_data->unique_handles.insert(custom_data->instance.super_sampling_feature);
 	custom_data->unique_parameters.insert(custom_data->instance.runtime_params);
@@ -374,7 +395,11 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
 	const auto& custom_data = reinterpret_cast<const DLSSInstanceData*&>(data);
 
 	assert(custom_data->is_supported);
-	assert(custom_data->instance.super_sampling_feature != nullptr && custom_data->instance.runtime_params != nullptr);
+	// No feature: "UpdateSettings()" failed or wasn't called since "ReleaseResources()"
+	if (custom_data->instance.super_sampling_feature == nullptr || custom_data->instance.runtime_params == nullptr)
+	{
+		return false;
+	}
 	assert(custom_data->instance.command_list.Get() == command_list);
 
 	NVSDK_NGX_D3D11_DLSS_Eval_Params eval_params;

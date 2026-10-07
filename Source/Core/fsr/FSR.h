@@ -24,6 +24,7 @@ namespace FidelityFX
 
 		virtual bool Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter* adapter = nullptr) override;
 		virtual void Deinit(SR::InstanceData*& data, ID3D11Device* optional_device = nullptr) override;
+		virtual void ReleaseResources(SR::InstanceData* data) override;
 
 		virtual bool UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* command_list, const SR::SettingsData& settings_data) override;
 
