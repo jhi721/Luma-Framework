@@ -17,6 +17,8 @@
 #define GEOMETRY_SHADER_SUPPORT 0
 
 #define ENABLE_SMAA 1 // replaces the final grade's built-in FXAA with SMAA ULTRA (+RCAS); core registers the 6 "SMAA ..." passes
+// A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
+#define ENABLE_LUMA_TAA 1
 // SMAA runs POST-final-grade via the post-draw callback, so it needs original_draw_dispatch_func non-null.
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -375,7 +377,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // An upscaler is picked and hasn't failed (it then gives way to SMAA until picked again). Latched at present for the whole frame:
    // Core's "Super Resolution" selection changes after it, mid frame for the draws, which would run the upscaler on mixed state
    bool sr_active = false;
-   bool fsr_masks_active = false; // FSR with the reactive masks on, latched with "sr_active" (DLSS ignores the masks)
+   bool reactive_masks_active = false; // FSR or Luma TAA with the reactive masks on, latched with "sr_active" (DLSS ignores the masks)
    // The upscaler's output goes back into the exposure's target without its alpha (the scene's, passed through), drawn from this
    // view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
@@ -1306,7 +1308,7 @@ class TheWitcher2Game final : public Game
       gd.mv_depth.reset();
       dsv->GetResource(&gd.mv_depth);
       // FSR's masks target, the draws' (made here, under FSR with the masks on only: DLSS ignores them)
-      if (gd.fsr_masks_active)
+      if (gd.reactive_masks_active)
       {
          D3D11_TEXTURE2D_DESC desc = {};
          if (gd.mv_reactive_target)
@@ -1768,7 +1770,7 @@ class TheWitcher2Game final : public Game
    {
       auto& gd = GetGameDeviceData(device_data);
       // Without jitter only for FSR's masks (their draws come through here)
-      if (!gd.mv_scene_open || (gd.mv_jitter == std::array<float, 2>{} && !gd.fsr_masks_active) || !gd.mv_jitter_buffer)
+      if (!gd.mv_scene_open || (gd.mv_jitter == std::array<float, 2>{} && !gd.reactive_masks_active) || !gd.mv_jitter_buffer)
          return false;
       // Meshes only (full screen passes have no vertex buffer or no depth test), into the scene depth (not shadows)
       if (!dsv)
@@ -1808,7 +1810,7 @@ class TheWitcher2Game final : public Game
       // An alpha blended draw into an output sized scene target (not the G-buffer's: decals) writes its mask, reactive or
       // transparency & composition (its pixel shader patched, the mask target added past the motion vector one)
       ID3D11PixelShader* reactive_shader = nullptr;
-      if (gd.fsr_masks_active && gd.mv_reactive_target_rtv && rtvs[0])
+      if (gd.reactive_masks_active && gd.mv_reactive_target_rtv && rtvs[0])
       {
          if (rtvs[0].get() != gd.mv_reactive_rtv)
          {
@@ -2077,7 +2079,7 @@ class TheWitcher2Game final : public Game
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 Motion Vector Fill CS"));
       // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote. FSR only:
       // DLSS's current presets ignore them (DLSS-Best-Practices TRN-2)
-      const bool reactive = gd.fsr_masks_active && gd.mv_reactive_target_srv;
+      const bool reactive = gd.reactive_masks_active && gd.mv_reactive_target_srv;
       if (reactive)
       {
          D3D11_TEXTURE2D_DESC desc = {};
@@ -3154,7 +3156,7 @@ public:
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
       // vector state are fixed here for the next frame (see "sr_active")
       game_device_data.sr_active = LatchSRFrame(device_data);
-      game_device_data.fsr_masks_active = game_device_data.sr_active && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable;
+      game_device_data.reactive_masks_active = game_device_data.sr_active && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA) && g_sr_reactive_enable;
       game_device_data.mv_active = game_device_data.sr_active || g_mv_enable;
       // Render scale: the next 3D frame's scene shrinks only with an upscaler ready to draw (not while the SR bridge's helper starts,
       // which passes the color through) and after a frame whose scene reached its end (menus and loading screens have no post chain,
@@ -3224,7 +3226,7 @@ public:
          if (Perf::g_test != 0)
          {
             auto& window = game_device_data.perf_window;
-            const char* const aa = (game_device_data.sr_active ? (device_data.sr_type == SR::Type::DLSS ? "DLSS" : "FSR") : (g_mv_enable ? "MV only" : (g_smaa_enable ? "SMAA" : "none")));
+            const char* const aa = (game_device_data.sr_active ? SR::GetTypeName(device_data.sr_type) : (g_mv_enable ? "MV only" : (g_smaa_enable ? "SMAA" : "none")));
             const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} render_scale={:.2f} vc4_filter={} vc4_pool={} vc4_slots={} output={}x{}", PERF_TEST_MODES[Perf::g_test].name,
                Perf::g_hook_timers, aa, RenderArea::next_scale, g_mv_buffer_filter, g_mv_constants_pool, g_mv_vc4_slots, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
             // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile), and
