@@ -714,6 +714,10 @@ namespace
       { CompileTimeStringHash("Luma TAA Medium CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "1" } } } },
       { CompileTimeStringHash("Luma TAA High CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "2" } } } },
       { CompileTimeStringHash("Luma TAA Ultra CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "3" } } } },
+      { CompileTimeStringHash("Luma TAA Low Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "0" }, { "TAA_UPSCALE", "1" } } } },
+      { CompileTimeStringHash("Luma TAA Medium Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "1" }, { "TAA_UPSCALE", "1" } } } },
+      { CompileTimeStringHash("Luma TAA High Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "2" }, { "TAA_UPSCALE", "1" } } } },
+      { CompileTimeStringHash("Luma TAA Ultra Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "3" }, { "TAA_UPSCALE", "1" } } } },
       { CompileTimeStringHash("Luma TAA Reconstruct Depth CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "reconstruct_previous_depth_cs", { { "TAA_QUALITY", "3" } } } },
 #endif
    };
