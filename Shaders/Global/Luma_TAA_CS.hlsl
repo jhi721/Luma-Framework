@@ -140,47 +140,81 @@ float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
    return target + delta * min3(scale);
 }
 
-[numthreads(8, 8, 1)] void reconstruct_previous_depth_cs(uint3 dispatch_thread_id : SV_DispatchThreadID) {
+#define RECONSTRUCT_TILE 16
+groupshared uint reconstruct_tile[RECONSTRUCT_TILE * RECONSTRUCT_TILE];
+
+[numthreads(8, 8, 1)] void reconstruct_previous_depth_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
    // Ultra quality first pass (AMD FSR 2 "reconstruct previous depth"): every pixel's closest 3x3 depth is scattered
    // along its motion vector into the previous frame's bilinear footprint (taps weighing more than 1%), keeping the
    // nearest. "OutputReconstructedPreviousDepth" must be cleared to asuint(FLT_MAX) (0x7F7FFFFF) before the dispatch;
    // positive floats order like their bits, so InterlockedMin keeps the nearest linear depth.
    const int2 pixel = dispatch_thread_id.xy;
-   if (any(pixel >= int2(RenderResolution)))
-      return;
-
    const int2 max_pixel = int2(RenderResolution) - 1;
-   const bool inverted_depth = (Flags & TAA_FLAG_INVERTED_DEPTH) != 0;
-   float closest_depth = inverted_depth ? 0.0 : 1.0;
-   int2 closest_pixel = pixel;
-   [unroll] for (int y = -1; y <= 1; y++)
+   const bool inside = all(pixel <= max_pixel);
+
+   // The group's taps usually land in one small area (neighbors share motion): reduce them in groupshared memory
+   // first, anchored around where the group's center pixel lands, and write one global atomic per touched texel.
+   const int2 group_center = min(int2(group_id.xy) * 8 + 4, max_pixel);
+   const float2 center_previous = group_center + 0.5 + MotionVectors.Load(int3(group_center, 0)) * MotionVectorScale;
+   const int2 tile_origin = int2(floor(center_previous)) - RECONSTRUCT_TILE / 2;
+   [unroll] for (uint i = group_index; i < RECONSTRUCT_TILE * RECONSTRUCT_TILE; i += 64)
    {
-      [unroll] for (int x = -1; x <= 1; x++)
+      reconstruct_tile[i] = 0x7F7FFFFFu;
+   }
+   GroupMemoryBarrierWithGroupSync();
+
+   if (inside)
+   {
+      const bool inverted_depth = (Flags & TAA_FLAG_INVERTED_DEPTH) != 0;
+      float closest_depth = inverted_depth ? 0.0 : 1.0;
+      int2 closest_pixel = pixel;
+      [unroll] for (int y = -1; y <= 1; y++)
       {
-         const int2 sample_pixel = clamp(pixel + int2(x, y), 0, max_pixel);
-         const float depth = DeviceDepth.Load(int3(sample_pixel, 0));
-         const bool closer = inverted_depth ? (depth > closest_depth) : (depth < closest_depth);
-         if (closer)
+         [unroll] for (int x = -1; x <= 1; x++)
          {
-            closest_depth = depth;
-            closest_pixel = sample_pixel;
+            const int2 sample_pixel = clamp(pixel + int2(x, y), 0, max_pixel);
+            const float depth = DeviceDepth.Load(int3(sample_pixel, 0));
+            const bool closer = inverted_depth ? (depth > closest_depth) : (depth < closest_depth);
+            if (closer)
+            {
+               closest_depth = depth;
+               closest_pixel = sample_pixel;
+            }
+         }
+      }
+
+      const uint linear_depth_bits = asuint(LinearizeDepth(closest_depth));
+      const float2 previous_position = pixel + 0.5 + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
+      int2 footprint_base;
+      float2 footprint_fraction;
+      BilinearFootprint(previous_position, footprint_base, footprint_fraction);
+      [unroll] for (uint tap = 0; tap < 4; tap++)
+      {
+         const int2 offset = int2(tap & 1, tap >> 1);
+         const float2 axis_weights = offset ? footprint_fraction : (1.0 - footprint_fraction);
+         const int2 tap_pixel = footprint_base + offset;
+         if (axis_weights.x * axis_weights.y > 0.01 && all(tap_pixel >= 0) && all(tap_pixel <= max_pixel))
+         {
+            const int2 tile_pixel = tap_pixel - tile_origin;
+            if (all(tile_pixel >= 0) && all(tile_pixel < RECONSTRUCT_TILE))
+            {
+               InterlockedMin(reconstruct_tile[tile_pixel.y * RECONSTRUCT_TILE + tile_pixel.x], linear_depth_bits);
+            }
+            else
+            {
+               InterlockedMin(OutputReconstructedPreviousDepth[tap_pixel], linear_depth_bits);
+            }
          }
       }
    }
+   GroupMemoryBarrierWithGroupSync();
 
-   const uint linear_depth_bits = asuint(LinearizeDepth(closest_depth));
-   const float2 previous_position = pixel + 0.5 + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
-   int2 footprint_base;
-   float2 footprint_fraction;
-   BilinearFootprint(previous_position, footprint_base, footprint_fraction);
-   [unroll] for (uint tap = 0; tap < 4; tap++)
+   [unroll] for (uint j = group_index; j < RECONSTRUCT_TILE * RECONSTRUCT_TILE; j += 64)
    {
-      const int2 offset = int2(tap & 1, tap >> 1);
-      const float2 axis_weights = offset ? footprint_fraction : (1.0 - footprint_fraction);
-      const int2 tap_pixel = footprint_base + offset;
-      if (axis_weights.x * axis_weights.y > 0.01 && all(tap_pixel >= 0) && all(tap_pixel <= max_pixel))
+      const uint value = reconstruct_tile[j];
+      if (value != 0x7F7FFFFFu)
       {
-         InterlockedMin(OutputReconstructedPreviousDepth[tap_pixel], linear_depth_bits);
+         InterlockedMin(OutputReconstructedPreviousDepth[tile_origin + int2(j % RECONSTRUCT_TILE, j / RECONSTRUCT_TILE)], value);
       }
    }
    // clang-format off
