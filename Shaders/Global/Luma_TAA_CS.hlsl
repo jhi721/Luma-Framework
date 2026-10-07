@@ -6,36 +6,46 @@
 // - 5-tap Catmull-Rom history (Jimenez, "Dynamic Temporal Antialiasing and Upsampling in Call of Duty"; Bevy)
 // - motion vector of the closest depth in the neighborhood (Karis, "High Quality Temporal Supersampling")
 // - "rounded" 3x3 + cross neighborhood box, history clipped toward the clamped box average (Playdead, INSIDE)
-// - per-channel Reinhard around the final blend only (Godot/Spartan)
-// - accumulated history weight w' = 1 / (2 - w) (MiniEngine, Intel), capped, attenuated by speed and reset by a
-//   depth disocclusion test at Ultra quality (MiniEngine, Intel)
+// - per-channel Reinhard around the final blend only (Godot/Spartan), scaled to compress HDR highlights only
+// - accumulated history weight w' = 1 / (2 - w) (MiniEngine, Intel), capped by the resampling blur of the fractional
+//   per frame displacement (Yang et al., "Amortized Supersampling")
+// - at Ultra quality, a depth clip against the previous depth reconstructed from this frame (AMD FSR 2)
 //
 // Inputs follow the "SR::SuperResolutionImpl::DrawData" contract: device depth, motion vectors in any unit that
 // "MotionVectorScale" converts to pixels such that previous position = current position + motion vector, and
 // colors in linear (HDR) space. The history is a Luma owned RGBA16F texture: rgb is linear color, alpha the weight.
 
-// Quality levels (texture fetches per pixel and composite score from docs/Luma-TAA.md; lower score is better):
-// 0 Low: 3x3 color box, motion vector of the closest depth in the cross, bilinear history (16, 8.98)
-// 1 Medium: + 5-tap Catmull-Rom history (20, 8.73)
-// 2 High: + closest depth over the full 3x3 (24, 8.59)
-// 3 Ultra: + depth disocclusion test, which needs the previous frame's depth (25, 8.57)
+// Quality levels (texture fetches per pixel and composite score train / stress from docs/Luma-TAA.md; lower is better):
+// 0 Low: 3x3 color box, motion vector of the closest depth in the cross, bilinear history (16, 8.79 / 17.02)
+// 1 Medium: + 5-tap Catmull-Rom history (20, 8.62 / 15.69)
+// 2 High: + closest depth over the full 3x3 (24, 8.38 / 15.69)
+// 3 Ultra: + depth clip, which needs "reconstruct_previous_depth_cs" dispatched first (28, 8.01 / 15.69)
 #ifndef TAA_QUALITY
 #define TAA_QUALITY 2
 #endif
-// How much the history weight is reduced per pixel of motion; motion vectors resampled every frame blur the history,
-// so faster pixels converge to the current frame (8 pixels/frame and faster use no history).
-#ifndef TAA_SPEED_LIMIT
-#define TAA_SPEED_LIMIT 8.0
-#endif
-// Upper bound of the history weight: at least 6% of every frame is kept (an effective window of ~16 frames, the
-// Halton 16 jitter period), which bounds lag on lighting and shading changes that the neighborhood box can't catch.
+// Upper bound of the history weight: at least 4% of every frame is kept (an effective window of ~25 frames), which
+// bounds lag on lighting and shading changes that the neighborhood box can't catch.
 #ifndef TAA_MAX_HISTORY_WEIGHT
-#define TAA_MAX_HISTORY_WEIGHT 0.94
+#define TAA_MAX_HISTORY_WEIGHT 0.96
 #endif
-// Relative linear depth tolerance of the Ultra quality disocclusion test, which rejects history where the closest
-// depth is behind everything that was there last frame (disocclusions whose colors fall inside the neighborhood box).
+// Resampling the history at a fractional position blurs it every frame, by an amount set by the fractional part of the
+// displacement (none at whole pixels, most at half pixels), not by the speed. The history weight is capped at
+// tolerance / (tolerance + blur) so that blur stays bounded (Yang et al. 2009). The cap applies to this frame only: the
+// accumulated weight keeps converging to it, so motion never compounds into the stored weight.
+#ifndef TAA_RESAMPLING_BLUR_TOLERANCE
+#define TAA_RESAMPLING_BLUR_TOLERANCE 0.4
+#endif
+// The blend runs on Reinhard(color * scale) / scale, so single bright samples (fireflies, sub-pixel HDR highlights) can't
+// dominate the average while values well below 1 / scale (in the input's linear units) blend almost linearly: an
+// unscaled Reinhard darkens every high contrast edge, as averaging in a compressed space loses energy.
+#ifndef TAA_TONEMAP_SCALE
+#define TAA_TONEMAP_SCALE 0.25
+#endif
+// Ultra quality depth clip: history is kept in proportion to tolerance * depth / separation when the current closest
+// surface is farther than the nearest surface that moved to the reprojected position (a disocclusion). Relative linear
+// depth, tuned on the lab's layered scenes; AMD FSR 2 derives a resolution-scaled one (~5% of depth at 1080p).
 #ifndef TAA_DEPTH_TOLERANCE
-#define TAA_DEPTH_TOLERANCE 0.01
+#define TAA_DEPTH_TOLERANCE 0.3
 #endif
 
 #define TAA_FLAG_RESET          (1u << 0)
@@ -55,10 +65,12 @@ Texture2D<float3> SourceColor : register(t0);
 Texture2D<float> DeviceDepth : register(t1);
 Texture2D<float2> MotionVectors : register(t2);
 Texture2D<float4> History : register(t3);
-Texture2D<float> PreviousDeviceDepth : register(t4); // Only read at Ultra quality
+// Linear depth bits (asuint), written by "reconstruct_previous_depth_cs" and read by the Ultra quality resolve.
+Texture2D<uint> ReconstructedPreviousDepth : register(t4);
 
 RWTexture2D<float4> OutputHistory : register(u0);
 RWTexture2D<float4> OutputColor : register(u1);
+RWTexture2D<uint> OutputReconstructedPreviousDepth : register(u2);
 
 SamplerState LinearClampSampler : register(s0);
 
@@ -71,6 +83,15 @@ float LinearizeDepth(float device_depth)
       return near * far / (near + device_depth * (far - near));
    }
    return near * far / (far - device_depth * (far - near));
+}
+
+// The 4 bilinear taps around "position" (pixels, texel centers at integer + 0.5): the top left texel and the
+// fractional weights. Taps are "base + int2(tap & 1, tap >> 1)" with weight lerp(1 - f, f, offset) per axis.
+void BilinearFootprint(float2 position, out int2 base, out float2 f)
+{
+   const float2 corner = position - 0.5;
+   base = int2(floor(corner));
+   f = corner - base;
 }
 
 // Sign preserving, so scRGB colors outside of BT.709 (negative channels) survive the round trip.
@@ -119,7 +140,57 @@ float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
    return target + delta * min3(scale);
 }
 
-[numthreads(8, 8, 1)] void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
+[numthreads(8, 8, 1)] void reconstruct_previous_depth_cs(uint3 dispatch_thread_id : SV_DispatchThreadID) {
+   // Ultra quality first pass (AMD FSR 2 "reconstruct previous depth"): every pixel's closest 3x3 depth is scattered
+   // along its motion vector into the previous frame's bilinear footprint (taps weighing more than 1%), keeping the
+   // nearest. "OutputReconstructedPreviousDepth" must be cleared to asuint(FLT_MAX) (0x7F7FFFFF) before the dispatch;
+   // positive floats order like their bits, so InterlockedMin keeps the nearest linear depth.
+   const int2 pixel = dispatch_thread_id.xy;
+   if (any(pixel >= int2(RenderResolution)))
+      return;
+
+   const int2 max_pixel = int2(RenderResolution) - 1;
+   const bool inverted_depth = (Flags & TAA_FLAG_INVERTED_DEPTH) != 0;
+   float closest_depth = inverted_depth ? 0.0 : 1.0;
+   int2 closest_pixel = pixel;
+   [unroll] for (int y = -1; y <= 1; y++)
+   {
+      [unroll] for (int x = -1; x <= 1; x++)
+      {
+         const int2 sample_pixel = clamp(pixel + int2(x, y), 0, max_pixel);
+         const float depth = DeviceDepth.Load(int3(sample_pixel, 0));
+         const bool closer = inverted_depth ? (depth > closest_depth) : (depth < closest_depth);
+         if (closer)
+         {
+            closest_depth = depth;
+            closest_pixel = sample_pixel;
+         }
+      }
+   }
+
+   const uint linear_depth_bits = asuint(LinearizeDepth(closest_depth));
+   const float2 previous_position = pixel + 0.5 + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
+   int2 footprint_base;
+   float2 footprint_fraction;
+   BilinearFootprint(previous_position, footprint_base, footprint_fraction);
+   [unroll] for (uint tap = 0; tap < 4; tap++)
+   {
+      const int2 offset = int2(tap & 1, tap >> 1);
+      const float2 axis_weights = offset ? footprint_fraction : (1.0 - footprint_fraction);
+      const int2 tap_pixel = footprint_base + offset;
+      if (axis_weights.x * axis_weights.y > 0.01 && all(tap_pixel >= 0) && all(tap_pixel <= max_pixel))
+      {
+         InterlockedMin(OutputReconstructedPreviousDepth[tap_pixel], linear_depth_bits);
+      }
+   }
+   // clang-format off
+}
+
+// clang-format parses a second "[numthreads] void f() {}" in a file as a lambda and indents it.
+[numthreads(8, 8, 1)]
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
+// clang-format on
+{
    const int2 pixel = dispatch_thread_id.xy;
    if (any(pixel >= int2(RenderResolution)))
       return;
@@ -179,28 +250,50 @@ float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
    const float2 history_position = pixel + 0.5 + motion;
    const bool offscreen = any(history_position < 0.0) || any(history_position >= RenderResolution);
 
-#if TAA_QUALITY >= 3
-   // Disocclusion: the closest surface is farther than everything that was around the reprojected position.
-   const float4 previous_depths = PreviousDeviceDepth.GatherRed(LinearClampSampler, history_position * InvRenderResolution);
-   const float previous_farthest = inverted_depth ? min(min(previous_depths.x, previous_depths.y), min(previous_depths.z, previous_depths.w))
-                                                  : max(max(previous_depths.x, previous_depths.y), max(previous_depths.z, previous_depths.w));
-   const bool disoccluded = LinearizeDepth(closest_depth) > LinearizeDepth(previous_farthest) * (1.0 + TAA_DEPTH_TOLERANCE);
-#else
-   const bool disoccluded = false;
-#endif
-
    const float4 history_sample = SampleHistory(history_position);
    // Clipping into the current neighborhood also removes the Catmull-Rom ringing.
    const float3 history = ClipToBox(history_sample.rgb, clamp(box_average, box_min, box_max), box_min, box_max);
 
-   float history_weight = min(history_sample.a * saturate(1.0 - length(motion) / TAA_SPEED_LIMIT), TAA_MAX_HISTORY_WEIGHT);
-   if (offscreen || disoccluded || (Flags & TAA_FLAG_RESET))
+#if TAA_QUALITY >= 3
+   // Depth clip (AMD FSR 2): both depths come from this frame, so a camera moving along its view axis, which changes
+   // every depth, can't make the test fail.
+   const float current_linear_depth = LinearizeDepth(closest_depth);
+   int2 footprint_base;
+   float2 footprint_fraction;
+   BilinearFootprint(history_position, footprint_base, footprint_fraction);
+   float depth_clip_kept = 0.0;
+   float depth_clip_weights = 0.0;
+   [unroll] for (uint tap = 0; tap < 4; tap++)
+   {
+      const int2 offset = int2(tap & 1, tap >> 1);
+      const float2 axis_weights = offset ? footprint_fraction : (1.0 - footprint_fraction);
+      const float weight = axis_weights.x * axis_weights.y;
+      const int2 tap_pixel = footprint_base + offset;
+      if (weight <= 0.01 || any(tap_pixel < 0) || any(tap_pixel > max_pixel))
+      {
+         continue;
+      }
+      const float separation = current_linear_depth - asfloat(ReconstructedPreviousDepth.Load(int3(tap_pixel, 0)));
+      depth_clip_kept += weight * ((separation > 0.0) ? saturate(TAA_DEPTH_TOLERANCE * current_linear_depth / separation) : 1.0);
+      depth_clip_weights += weight;
+   }
+   const float depth_clip = (depth_clip_weights > 0.0) ? (depth_clip_kept / depth_clip_weights) : 1.0;
+#else
+   const float depth_clip = 1.0;
+#endif
+
+   const float2 fraction = frac(abs(motion));
+   const float resampling_blur = 0.5 * (fraction.x * (1.0 - fraction.x) + fraction.y * (1.0 - fraction.y));
+   const float blur_cap = TAA_RESAMPLING_BLUR_TOLERANCE / (TAA_RESAMPLING_BLUR_TOLERANCE + resampling_blur);
+   float history_weight = min(history_sample.a, min(blur_cap, TAA_MAX_HISTORY_WEIGHT)) * depth_clip;
+   if (offscreen || (Flags & TAA_FLAG_RESET))
    {
       history_weight = 0.0;
    }
 
    // Blending in a compressed space keeps single bright samples from dominating (fireflies, HDR edges).
-   const float3 resolved = InverseReinhard(lerp(Reinhard(current), Reinhard(history), history_weight));
+   const float3 blended = lerp(Reinhard(current * TAA_TONEMAP_SCALE), Reinhard(history * TAA_TONEMAP_SCALE), history_weight);
+   const float3 resolved = InverseReinhard(blended) / TAA_TONEMAP_SCALE;
 
    OutputHistory[pixel] = float4(resolved, rcp(2.0 - history_weight));
    // Written separately so the output can be the game's own texture (any format), while the history stays RGBA16F.
