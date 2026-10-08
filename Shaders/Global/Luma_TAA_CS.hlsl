@@ -135,6 +135,12 @@
 #ifndef TAA_HISTORY_2X_SIGMA
 #define TAA_HISTORY_2X_SIGMA 0.3
 #endif
+// Under the reactive mask, a texel without this frame's sample also takes the Gaussian, weighted by this x mask x the
+// Gaussian's peak tap: the mask only lowers the history's cap, and such a texel would otherwise keep its history in full
+// (history / (history + 0) = 1) until a sample lands in it, every 4th frame on average
+#ifndef TAA_HISTORY_2X_REACTIVE_FALLBACK
+#define TAA_HISTORY_2X_REACTIVE_FALLBACK 0.25
+#endif
 // Flickering analysis (after UE TSR's): the 3x3 clip against a current frame that aliases (detail near the Nyquist
 // limit, sub-pixel shading, alpha tested cutouts) throws away the history that would average the aliasing out, and the
 // output flickers. Each pixel keeps the range (min/max) its current sample's luminance has been seen in, reprojected with
@@ -643,6 +649,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
       float current_weight = 0.0;
       float3 gauss_sum = 0.0;
       float gauss_weight = 0.0;
+      float gauss_max = 0.0;
       [unroll] for (int n = 0; n < 9; n++)
       {
          const float2 offset = pixel + float2(n % 3 - 1, n / 3 - 1) + 0.5 + Jitter - center;
@@ -652,9 +659,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
          const float g = exp(-0.5 * dot(offset, offset) / (TAA_HISTORY_2X_SIGMA * TAA_HISTORY_2X_SIGMA));
          gauss_sum += neighborhood[n] * g;
          gauss_weight += g;
+         gauss_max = max(gauss_max, g);
       }
       const float3 current_2x = (current_weight > 0.0) ? (current_sum / current_weight) : (gauss_sum / gauss_weight);
-      const float sample_weight = min(current_weight, 1.0);
+      const float sample_weight = (current_weight > 0.0) ? min(current_weight, 1.0) : (reactive * TAA_HISTORY_2X_REACTIVE_FALLBACK * gauss_max);
       const float history_samples = min(history_sample_2x.a / max(1.0 - history_sample_2x.a, 1e-4), cap_samples);
       const float history_validity = (offscreen_2x || (Flags & TAA_FLAG_RESET)) ? 0.0 : depth_clip;
       const float history_weight_2x = history_samples * history_validity;
