@@ -11,7 +11,8 @@
     needs (dxcompiler.dll for DXP, d3dcompiler_47.dll, ReShade as dxgi.dll,
     NGX DLSS when opted in). dgVoodoo games (UseDgVoodoo) also get dgVoodoo2,
     plus a "-Linux" zip with its Wine/Proton build (UseDgVoodooLinux),
-    optionally behind the D3D9 VA Fix proxy (UseD3D9VAFix).
+    optionally behind the D3D9 VA Fix proxy (UseD3D9VAFix), with its CSMT layer on in
+    the Windows zip (UseD3D9CSMT; untested under Wine).
 
 .EXAMPLE
     .\scripts\package.ps1 -Project "Final Fantasy XV" -Config "Development-Release" -Platform "x64"
@@ -93,9 +94,14 @@ $useLumaSRBridge = Test-PropEnabled $vcxproj "UseLumaSRBridge"
 $useDgVoodoo = Test-PropEnabled $vcxproj "UseDgVoodoo"
 $useDgVoodooLinux = Test-PropEnabled $vcxproj "UseDgVoodooLinux"
 $useD3D9VAFix = Test-PropEnabled $vcxproj "UseD3D9VAFix"
-Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix"
+$useD3D9CSMT = Test-PropEnabled $vcxproj "UseD3D9CSMT"
+Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT"
 if (($useDgVoodooLinux -or $useD3D9VAFix) -and -not $useDgVoodoo) {
     Write-Error "UseDgVoodooLinux and UseD3D9VAFix need UseDgVoodoo"
+    exit 1
+}
+if ($useD3D9CSMT -and -not $useD3D9VAFix) {
+    Write-Error "UseD3D9CSMT needs UseD3D9VAFix"
     exit 1
 }
 
@@ -190,6 +196,10 @@ try {
             }
             Copy-Item $vaFixSrc -Destination (Join-Path $tempDir "d3d9.dll") -Force
             New-Item -ItemType File -Path (Join-Path $tempDir "d3d9_vafix.on") -Force | Out-Null
+            # The proxy's CSMT layer (D3D9 calls replayed on a worker thread), enabled by its flag file too
+            if ($useD3D9CSMT) {
+                New-Item -ItemType File -Path (Join-Path $tempDir "d3d9_csmt.on") -Force | Out-Null
+            }
             $d3d9Path = Join-Path $tempDir "d3d9_chain.dll"
         }
         $cplPath = Join-Path $tempDir "dgVoodooCpl.exe"
@@ -224,6 +234,15 @@ try {
         $linuxZipPath = Join-Path $OutDir "$zipName-Linux.zip"
         Copy-Item $zipPath -Destination $linuxZipPath -Force
         Compress-Archive -Path $d3d9Path, $cplPath, $confPath -DestinationPath $linuxZipPath -Update
+        # CSMT stays off under Wine: untested with the older dgVoodoo there
+        if ($useD3D9CSMT) {
+            $linuxArchive = [IO.Compression.ZipFile]::Open($linuxZipPath, [IO.Compression.ZipArchiveMode]::Update)
+            try {
+                $linuxArchive.GetEntry("d3d9_csmt.on").Delete()
+            } finally {
+                $linuxArchive.Dispose()
+            }
+        }
         Write-Host "Packaged: $linuxZipPath"
     }
 } finally {
