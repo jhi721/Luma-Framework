@@ -235,8 +235,8 @@ namespace PatchedDraws
    // A development check of a frame's motion vector objects by draw key: those with another object's "transform" but other
    // constants. Their previous frame match is arbitrary (a tie-break transform that isn't per object, e.g. bone rows); 0 when the
    // tie-break works.
-   template <typename Object, typename SameConstants>
-   uint32_t CountTieBreakCollisions(const std::unordered_map<uint64_t, std::vector<Object>>& objects_by_key, SameConstants same_constants)
+   template <typename Object, typename Hash, typename SameConstants>
+   uint32_t CountTieBreakCollisions(const std::unordered_map<uint64_t, std::vector<Object>, Hash>& objects_by_key, SameConstants same_constants)
    {
       uint32_t collisions = 0;
       for (const auto& [key, objects] : objects_by_key)
