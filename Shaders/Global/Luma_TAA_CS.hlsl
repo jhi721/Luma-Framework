@@ -406,6 +406,9 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    float3 max_cross = -FLT_MAX;
    float3 sum_cross = 0.0;
    float max_neighbor_luminance = 0.0; // For the thin feature lock
+   // For the flickering analysis: the darkest sample, not the luminance of the per channel min (which is ~0 between
+   // saturated colors of different hues, so lighting changes there went undetected)
+   float min_luminance = FLT_MAX;
    float closest_depth = inverted_depth ? 0.0 : 1.0;
    int2 closest_pixel = pixel;
    float reactive = 0.0;
@@ -418,13 +421,15 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
       {
          const int2 sample_pixel = clamp(pixel + int2(x, y), 0, max_pixel);
          const float3 color = SourceColor.Load(int3(sample_pixel, 0));
+         const float luminance = dot(color, Rec709_Luminance);
+         min_luminance = min(min_luminance, luminance);
 #if TAA_REACTIVE
          reactive = max(reactive, ReactiveMask.Load(int3(sample_pixel, 0)));
 #endif
 #if TAA_LOCK
          if (x != 0 || y != 0)
          {
-            max_neighbor_luminance = max(max_neighbor_luminance, dot(color, Rec709_Luminance));
+            max_neighbor_luminance = max(max_neighbor_luminance, luminance);
          }
 #endif
          min_3x3 = min(min_3x3, color);
@@ -494,7 +499,6 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
       // "+ 1") would lose small values.
       const float3 previous_state = has_previous_state ? PreviousFlicker.Load(int3(previous_pixel, 0)) : 0.0;
       const bool has_state = previous_state.z > 0.0;
-      const float min_luminance = dot(min_3x3, Rec709_Luminance);
       const bool lighting_changed = TAA_FLICKER_RESET_CHANGE > 0.0 && abs(min_luminance - previous_state.z) > TAA_FLICKER_RESET_CHANGE * max(max(abs(min_luminance), abs(previous_state.z)), 1e-4);
       const bool moved = previous_state.x > previous_state.y;
       float range_min = current_luminance;
