@@ -14711,7 +14711,7 @@ namespace
                }
                if (ImGui::IsItemHovered())
                {
-                  ImGui::SetTooltip("Low is the cheapest, for weak GPUs.\nMedium is steadier on fine static detail (fences, grates), for ~1.5x Low's cost.\nHigh keeps far more texture detail and is steadier in motion, for ~2.5x Low's cost and 4x the history memory.\nUltra adds a depth test that removes ghosting behind moving objects, for ~15%% more than High.");
+                  ImGui::SetTooltip("Low: the fastest, for weaker GPUs.\nMedium: less flickering on fine detail (fences, grates), for almost the same cost as Low.\nHigh: sharper textures and steadier in motion, but over twice as heavy as Low and uses more video memory.\nUltra: like High, with less ghosting behind moving objects; slightly heavier than High.");
                }
             }
 #endif
