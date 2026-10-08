@@ -88,6 +88,10 @@
 #ifndef ENABLE_SMAA
 #define ENABLE_SMAA 0
 #endif // ENABLE_SMAA
+// 0: SMAA's area texture without the U-shape smoothing of short U patterns (see "texture_data/SMAA_AreaTex_SharpU.h")
+#ifndef SMAA_SMOOTH_U_SHAPES
+#define SMAA_SMOOTH_U_SHAPES 1
+#endif // SMAA_SMOOTH_U_SHAPES
 // 64x only
 #ifndef ENABLE_NGX
 #define ENABLE_NGX 0

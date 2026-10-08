@@ -2,6 +2,7 @@
 
 #include "../texture_data/SMAA_AreaTex.h"
 #include "../texture_data/SMAA_SearchTex.h"
+#include "../texture_data/SMAA_AreaTex_SharpU.h"
 
 #include "../includes/callbacks.h"
 #include "../includes/math.h"
@@ -1527,6 +1528,14 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
       D3D11_SUBRESOURCE_DATA subresource_data = {};
       subresource_data.pSysMem = areaTexBytes;
       subresource_data.SysMemPitch = AREATEX_PITCH;
+#if !SMAA_SMOOTH_U_SHAPES
+      std::vector<unsigned char> area_tex_bytes(std::begin(areaTexBytes), std::end(areaTexBytes));
+      for (const auto& [offset, value] : areaTexSharpUPatch)
+      {
+         area_tex_bytes[offset] = value;
+      }
+      subresource_data.pSysMem = area_tex_bytes.data();
+#endif
       ensure(device->CreateTexture2D(&tex_desc, &subresource_data, tex.put()), >= 0);
       ensure(device->CreateShaderResourceView(tex.get(), nullptr, managed_resources.shader_resource_views["smaa_area_tex"_h].put()), >= 0);
    }
