@@ -30,6 +30,7 @@
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
+#include "..\..\Tools\D3D9 VA Fix\vertex_constants.h"
 #include "..\..\Core\includes\patched_draws.h"
 #if DEVELOPMENT
 #include "..\..\Core\includes\perf_test.h"
@@ -108,10 +109,14 @@ static bool g_mv_match_objects = true; // Off: every motion vector draw takes th
 // One frame capture (Luma MCP "luma_trace_list") at the first upscaled frame with a near plane under 1 (the loading screen's spinning
 // weapon; the game camera's is 10); re-armed through MCP
 static bool g_mv_trace_loading = true;
-// A/B of the CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy", "FixImpossiblePerRTBlend")
+// A/B of the CPU savings (see "FindRegisteredBuffer", "NewConstantsCopy", "FixImpossiblePerRTBlend")
 static bool g_mv_buffer_filter = true;
 static bool g_mv_constants_pool = true;
 static bool g_blend_memo = true;
+static bool g_bound_state_tracking = true; // See "BoundState"
+static bool g_vc4_mirror = true;           // vc4 from the D3D9 proxy's constant mirror when it runs (see "vertex_constants")
+static bool g_vc4_mirror_check = false;    // The mirror against the copies of vc4's uploads ("vc4 mirror mismatches" in the "[BL2 MV]" log)
+static bool g_bound_state_check = false;   // The tracked states against the bound ones ("bound state mismatches" in the "[BL2 MV]" log)
 // FSR's reactive and transparency & composition masks from the scene's alpha blended draws (Mass Effect 2007's, see
 // "MotionVectorPatch::PatchPixelShaderReactive")
 static bool g_sr_reactive_enable = true;
@@ -204,6 +209,10 @@ static constexpr bool g_mv_match_objects = true;
 static constexpr bool g_mv_buffer_filter = true;
 static constexpr bool g_mv_constants_pool = true;
 static constexpr bool g_blend_memo = true;
+static constexpr bool g_bound_state_tracking = true;
+static constexpr bool g_vc4_mirror = true;
+static constexpr bool g_vc4_mirror_check = false;
+static constexpr bool g_bound_state_check = false;
 static constexpr bool g_sr_reactive_enable = true;
 static constexpr float g_sr_reactive_scale = 1.f;
 static constexpr float g_sr_reactive_threshold = 0.5f;
@@ -259,6 +268,10 @@ enum MotionVectorReject : int
    REJECT_COUNT
 };
 static constexpr const char* kMotionVectorRejectNames[REJECT_COUNT] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "shaders", "depth_test"};
+
+// The buffer hooks (map/unmap/update_buffer_region: copies of vc4's uploads) are registered, only while motion vectors need them
+// and the proxy's vertex constant mirror can't replace them (see "OnPresent")
+static bool g_buffer_hooks_registered = false;
 
 struct Borderlands2GameDeviceData final : public GameDeviceData
 {
@@ -460,6 +473,19 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
    ID3D11BlendState* mv_blend_state = nullptr; // See "ClassifyBoundBlend"
    bool mv_blend_opaque = true;
+   // The immediate context's blend and depth stencil states, vc4 (VS "MotionVectorPatches::object_slot"), vertex buffer 0 and index
+   // buffer as the game last bound them ("OnBindPipeline", "OnPushConstantBuffers", "OnBindVertexBuffers", "OnBindIndexBuffer"), so
+   // the draw hooks don't query them (an AddRef and a Release each, several per draw). Not referenced: an object lives while bound.
+   // Luma's own passes bind theirs natively and put the game's back. False after a bind this can't read (another add-on's combined
+   // pipeline): queried then.
+   ID3D11BlendState* bound_blend_state = nullptr;
+   ID3D11DepthStencilState* bound_depth_stencil_state = nullptr;
+   ID3D11Buffer* bound_object_buffer = nullptr;
+   ID3D11Buffer* bound_vertex_buffer = nullptr;
+   UINT bound_vertex_offset = 0;
+   ID3D11Buffer* bound_index_buffer = nullptr;
+   UINT bound_index_offset = 0;
+   bool bound_states_tracked = true;
    uint8_t mv_reactive_blend = 0;
    uint32_t mv_last_vertex_shader_hash = 0;
    PatchedShader<ID3D11VertexShader> mv_last_vertex_shader;
@@ -468,25 +494,37 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
    PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
 
-   // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, null until its first upload), from
-   // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest copy
+   // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, empty until its first upload), from
+   // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest upload. Unlocked: the buffer
+   // hooks, the draws and "OnPresent" all run on the immediate context's thread ("mv_constants_thread"; dgVoodoo has no deferred
+   // contexts). A lock here was ~9000 SRW acquires per frame on the render thread.
    using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
    struct RegisteredConstants
    {
-      ConstantsCopy copy;
-      void* mapped = nullptr; // Mapped now, until its Unmap (one entry for both: dgVoodoo maps a vc4 buffer for every draw)
+      // The last upload, rewritten in place: dgVoodoo maps a vc4 buffer for every draw, about 3 of 4 of them no motion vector draw
+      std::vector<uint8_t> latest;
+      ConstantsCopy copy;     // "latest" as the motion vector draws since that upload took it (made by the first)
+      void* mapped = nullptr; // Mapped now, until its Unmap
    };
-   std::mutex mv_constants_mutex;
    std::unordered_map<uint64_t, RegisteredConstants> mv_constants_copies;
-   // "g_mv_buffer_filter": the first registered buffers and their sizes, read by the buffer hooks without the lock (written under it,
-   // on the immediate context's thread as the hooks). With more registered, every buffer takes the lock as without the filter.
+#if DEVELOPMENT
+   DWORD mv_constants_thread = 0; // The thread of the last "OnPresent", checked by the buffer hooks
+#endif
+   // "g_mv_buffer_filter": the first registered buffers, their sizes and entries (a node's address stays while the map grows), so a
+   // buffer hook finds them without a lookup. With more registered, every buffer takes the map lookup as without the filter.
    static constexpr uint32_t kMaxFilteredBuffers = 8;
-   std::array<std::atomic<uint64_t>, kMaxFilteredBuffers> mv_filtered_buffers = {};
+   std::array<uint64_t, kMaxFilteredBuffers> mv_filtered_buffers = {};
    std::array<UINT, kMaxFilteredBuffers> mv_filtered_buffer_sizes = {};
-   std::atomic<uint32_t> mv_filtered_buffer_count = 0;
-   std::atomic<bool> mv_filter_overflow = false;
-   // "g_mv_constants_pool": every pooled copy, and those nobody held anymore at the last present (taken by the next copies). Under
-   // "mv_constants_mutex".
+   std::array<RegisteredConstants*, kMaxFilteredBuffers> mv_filtered_entries = {};
+   uint32_t mv_filtered_buffer_count = 0;
+   bool mv_filter_overflow = false;
+   // The D3D9 VA Fix proxy's vertex constant mirror while its CSMT layer runs (null otherwise, checked at every present): dgVoodoo's
+   // vc4 as uploaded for the draw being translated, on this same thread, so the buffer hooks aren't needed. Its snapshot for the
+   // motion vector draws since it last changed.
+   const VertexConstantMirror* vertex_constants = nullptr;
+   ConstantsCopy vertex_constants_copy;
+   uint32_t vertex_constants_copy_generation = 0;
+   // "g_mv_constants_pool": every pooled copy, and those nobody held anymore at the last present (taken by the next copies)
    std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
    std::vector<uint32_t> mv_constants_pool_free;
    size_t mv_constants_made = 0; // Copies asked for since the last present
@@ -502,8 +540,16 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
       uint32_t vertex_shader = 0, pixel_shader = 0; // For the tie-break collision log
 #endif
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
+   // The keys are "HashCombine" outputs already: one multiply spreads them over the buckets (std::hash runs FNV-1a on every byte)
+   struct DrawKeyHash
+   {
+      size_t operator()(uint64_t key) const noexcept
+      {
+         return size_t((key * 0x9E3779B97F4A7C15ull) >> 32);
+      }
+   };
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, DrawKeyHash> mv_objects;
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, DrawKeyHash> mv_previous_objects;
    // The frame's camera (vc4 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -516,6 +562,11 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    {
       uint32_t motion_vector_draws = 0, jitter_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, maps = 0, updates = 0, other_maps = 0, sr_draws = 0;
       uint32_t tiebreak_collisions = 0;                                                              // Objects sharing a key and a transform with other constants ("PatchedDraws::CountTieBreakCollisions")
+      uint32_t vc4_mirror_mismatches = 0;                                                            // "g_vc4_mirror_check": motion vector draws whose mirror rows weren't the copied upload
+      uint32_t vc4_mirror_used_mismatches = 0;                                                       // Of them, the ones in the rows read here (camera, LocalToWorld)
+      uint32_t vc4_mirror_mismatch_row = 0, vc4_mirror_mismatch_vs = 0;                              // The first row and the shader of the last one
+      uint32_t vc4_mirror_unknown = 0;                                                               // Motion vector draws with rows the mirror doesn't know (after a Reset or a state block's Apply)
+      uint32_t bound_state_mismatches = 0;                                                           // "g_bound_state_check": tracked states that weren't the bound ones
       uint32_t reactive_draws = 0;                                                                   // Alpha blended draws that wrote FSR's masks
       uint32_t ended_by = 0;                                                                         // The ending pass's PS hash
       int ended_by_scene_slot = -1;                                                                  // The PS slot it reads the scene's copy from, -1 if none
@@ -939,28 +990,30 @@ class Borderlands2 final : public Game
       return view_projection;
    }
 
-   // "g_mv_buffer_filter": false if the buffer surely isn't a registered vc4 one; "size" its size if known (else 0). Lock free.
-   static bool MayBeRegisteredBuffer(const Borderlands2GameDeviceData& gd, uint64_t handle, UINT* size)
+   // The registered vc4 buffer's entry in "mv_constants_copies", null if the buffer isn't one; "size" its size if known (else 0)
+   static Borderlands2GameDeviceData::RegisteredConstants* FindRegisteredBuffer(Borderlands2GameDeviceData* gd, uint64_t handle, UINT* size)
    {
       *size = 0;
-      if (!g_mv_buffer_filter || gd.mv_filter_overflow.load(std::memory_order_relaxed))
-         return true;
-      const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_acquire);
-      for (uint32_t i = 0; i < count; i++)
+      if (g_mv_buffer_filter && !gd->mv_filter_overflow)
       {
-         if (gd.mv_filtered_buffers[i].load(std::memory_order_relaxed) == handle)
+         for (uint32_t i = 0; i < gd->mv_filtered_buffer_count; i++)
          {
-            *size = gd.mv_filtered_buffer_sizes[i];
-            return true;
+            if (gd->mv_filtered_buffers[i] == handle)
+            {
+               *size = gd->mv_filtered_buffer_sizes[i];
+               return gd->mv_filtered_entries[i];
+            }
          }
+         return nullptr;
       }
-      return false;
+      const auto registered = gd->mv_constants_copies.find(handle);
+      return (registered != gd->mv_constants_copies.end() ? &registered->second : nullptr);
    }
 
-   // A buffer registered in "mv_constants_copies" joins the filter ("g_mv_buffer_filter"). Under "mv_constants_mutex".
-   static void AddFilteredBuffer(Borderlands2GameDeviceData* gd, ID3D11Buffer* buffer)
+   // A buffer registered in "mv_constants_copies" joins the filter ("g_mv_buffer_filter")
+   static void AddFilteredBuffer(Borderlands2GameDeviceData* gd, ID3D11Buffer* buffer, Borderlands2GameDeviceData::RegisteredConstants* entry)
    {
-      const uint32_t count = gd->mv_filtered_buffer_count.load(std::memory_order_relaxed);
+      const uint32_t count = gd->mv_filtered_buffer_count;
       if (count >= Borderlands2GameDeviceData::kMaxFilteredBuffers)
       {
          gd->mv_filter_overflow = true;
@@ -968,9 +1021,13 @@ class Borderlands2 final : public Game
       }
       D3D11_BUFFER_DESC desc;
       buffer->GetDesc(&desc);
+#if DEVELOPMENT
+      reshade::log::message(reshade::log::level::info, std::format("[BL2 MV] vc4 buffer {} registered: {} bytes, usage {}", count, desc.ByteWidth, int(desc.Usage)).c_str());
+#endif
       gd->mv_filtered_buffer_sizes[count] = desc.ByteWidth;
-      gd->mv_filtered_buffers[count].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_relaxed);
-      gd->mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
+      gd->mv_filtered_buffers[count] = reinterpret_cast<uint64_t>(buffer);
+      gd->mv_filtered_entries[count] = entry;
+      gd->mv_filtered_buffer_count = count + 1;
    }
 
    static UINT GetBufferSize(uint64_t handle, UINT known_size)
@@ -983,7 +1040,7 @@ class Borderlands2 final : public Game
    }
 
    // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the last present ("g_mv_constants_pool"),
-   // else a new one (dgVoodoo maps one vc4 buffer for every draw: a copy per Unmap). Under "mv_constants_mutex".
+   // else a new one (a copy per motion vector draw after an upload)
    static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(Borderlands2GameDeviceData& gd, const uint8_t* bytes, size_t size)
    {
       gd.mv_constants_made++;
@@ -1110,15 +1167,15 @@ class Borderlands2 final : public Game
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      Borderlands2GameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &buffer_size);
+      if (!registered)
          return;
-      const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto registered = gd.mv_constants_copies.find(resource.handle);
-      if (registered == gd.mv_constants_copies.end())
-         return;
+#if DEVELOPMENT
+      ASSERT_ONCE(gd.mv_constants_thread == 0 || gd.mv_constants_thread == GetCurrentThreadId());
+#endif
       if (access == reshade::api::map_access::write_discard && offset == 0)
       {
-         registered->second.mapped = *data;
+         registered->mapped = *data;
       }
 #if DEVELOPMENT
       else
@@ -1139,13 +1196,12 @@ class Borderlands2 final : public Game
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      Borderlands2GameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &buffer_size);
+      if (!registered || !registered->mapped)
          return;
-      const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto registered = gd.mv_constants_copies.find(resource.handle);
-      if (registered == gd.mv_constants_copies.end() || !registered->second.mapped)
-         return;
-      registered->second.copy = NewConstantsCopy(gd, static_cast<const uint8_t*>(std::exchange(registered->second.mapped, nullptr)), GetBufferSize(resource.handle, buffer_size));
+      const uint8_t* const mapped = static_cast<const uint8_t*>(std::exchange(registered->mapped, nullptr));
+      registered->latest.assign(mapped, mapped + GetBufferSize(resource.handle, buffer_size));
+      registered->copy.reset();
 #if DEVELOPMENT
       gd.mv_stats.maps++;
 #endif
@@ -1163,21 +1219,24 @@ class Borderlands2 final : public Game
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
       UINT known_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &known_size))
+      Borderlands2GameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &known_size);
+      if (!registered)
          return false;
-      const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto copy = gd.mv_constants_copies.find(resource.handle);
-      if (copy == gd.mv_constants_copies.end())
-         return false;
+#if DEVELOPMENT
+      ASSERT_ONCE(gd.mv_constants_thread == 0 || gd.mv_constants_thread == GetCurrentThreadId());
+#endif
       const UINT buffer_size = GetBufferSize(resource.handle, known_size);
       if (offset >= buffer_size)
          return false;
       const size_t updated_size = size_t((std::min)(size, uint64_t(buffer_size) - offset));
-      const auto& last = copy->second.copy;
-      const bool merge = last && last->size() == buffer_size;
-      auto updated = NewConstantsCopy(gd, merge ? last->data() : nullptr, buffer_size);
-      std::memcpy(updated->data() + offset, data, updated_size);
-      copy->second.copy = std::move(updated);
+      // Merged into the last upload of the same size, else into zeros
+      std::vector<uint8_t>& latest = registered->latest;
+      if (latest.size() != buffer_size)
+      {
+         latest.assign(buffer_size, 0);
+      }
+      std::memcpy(latest.data() + offset, data, updated_size);
+      registered->copy.reset();
 #if DEVELOPMENT
       gd.mv_stats.updates++;
 #endif
@@ -1320,6 +1379,95 @@ class Borderlands2 final : public Game
       }
    }
 
+   // "bound_blend_state" and "bound_depth_stencil_state", from the game's binds on the immediate context (ReShade raises one per state,
+   // and a reset binds none to every stage)
+   static void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
+   {
+      using reshade::api::pipeline_stage;
+      if ((stages & (pipeline_stage::output_merger | pipeline_stage::depth_stencil)) == 0)
+         return;
+      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
+      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
+      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
+         return;
+      auto& gd = GetGameDeviceData(*device_data);
+      if (stages == pipeline_stage::output_merger)
+      {
+         gd.bound_blend_state = reinterpret_cast<ID3D11BlendState*>(pipeline.handle);
+      }
+      else if (stages == pipeline_stage::depth_stencil)
+      {
+         gd.bound_depth_stencil_state = reinterpret_cast<ID3D11DepthStencilState*>(pipeline.handle);
+      }
+      else if (pipeline.handle == 0)
+      {
+         gd.bound_blend_state = nullptr;
+         gd.bound_depth_stencil_state = nullptr;
+      }
+      else
+      {
+         gd.bound_states_tracked = false;
+      }
+   }
+
+   // vc4's tracked binding (see "bound_object_buffer")
+   static void OnPushConstantBuffers(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
+   {
+      constexpr uint32_t slot = MotionVectorPatches::object_slot;
+      if ((stages & reshade::api::shader_stage::vertex) == 0 || update.type != reshade::api::descriptor_type::constant_buffer || slot < update.binding || slot >= update.binding + update.count)
+         return;
+      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
+      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
+      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
+         return;
+      const auto* const ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
+      GetGameDeviceData(*device_data).bound_object_buffer = reinterpret_cast<ID3D11Buffer*>(ranges[slot - update.binding].buffer.handle);
+   }
+
+   // Vertex buffer 0's tracked binding (see "bound_vertex_buffer")
+   static void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
+   {
+      if (first != 0 || count == 0)
+         return;
+      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
+      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
+      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
+         return;
+      auto& gd = GetGameDeviceData(*device_data);
+      gd.bound_vertex_buffer = reinterpret_cast<ID3D11Buffer*>(buffers[0].handle);
+      gd.bound_vertex_offset = UINT(offsets[0]);
+   }
+
+   // The index buffer's tracked binding (see "bound_index_buffer")
+   static void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   {
+      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
+      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
+      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
+         return;
+      auto& gd = GetGameDeviceData(*device_data);
+      gd.bound_index_buffer = reinterpret_cast<ID3D11Buffer*>(buffer.handle);
+      gd.bound_index_offset = UINT(offset);
+   }
+
+   // A bound object of the immediate context (not referenced: it lives while bound): "tracked" (see "bound_blend_state"), else what
+   // "query" writes to its argument (an object pointer to take over). "g_bound_state_check" counts the times they differ.
+   template <typename T, typename Query>
+   static T* BoundState(Borderlands2GameDeviceData* gd, T* tracked, const Query& query)
+   {
+      if (g_bound_state_tracking && gd->bound_states_tracked && !g_bound_state_check)
+         return tracked;
+      com_ptr<T> queried;
+      query(&queried);
+#if DEVELOPMENT
+      if (g_bound_state_check && gd->bound_states_tracked && queried.get() != tracked)
+      {
+         gd->mv_stats.bound_state_mismatches++;
+      }
+#endif
+      return queried.get();
+   }
+
    // Classifies the bound blend state (cached in "mv_blend_state"): "mv_blend_opaque" for the motion vectors (additive lights, decals
    // and translucents keep the motion vectors of what's behind them, and so do colorless draws: the occlusion query bounding boxes),
    // and "mv_reactive_blend" for FSR's masks: 0 not alpha blended (opaque, additive ONE/ONE lights, modulated shadows), 1 alpha
@@ -1327,9 +1475,9 @@ class Borderlands2 final : public Game
    // sparks, glows; reactive)
    static void ClassifyBoundBlend(ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData* gd)
    {
-      com_ptr<ID3D11BlendState> blend_state;
-      native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
-      if (blend_state.get() == gd->mv_blend_state)
+      ID3D11BlendState* const blend_state = BoundState(gd, gd->bound_blend_state, [&](ID3D11BlendState** state)
+         { native_device_context->OMGetBlendState(state, nullptr, nullptr); });
+      if (blend_state == gd->mv_blend_state)
       {
          return;
       }
@@ -1341,15 +1489,15 @@ class Borderlands2 final : public Game
       const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = blend_desc.RenderTarget[0];
       gd->mv_blend_opaque = rt0.RenderTargetWriteMask != 0 && (!rt0.BlendEnable || (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_ZERO && rt0.BlendOp == D3D11_BLEND_OP_ADD));
       gd->mv_reactive_blend = (!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? 0 : (rt0.DestBlend == D3D11_BLEND_ONE ? 2 : 1);
-      gd->mv_blend_state = blend_state.get();
+      gd->mv_blend_state = blend_state;
    }
 
    // The bound depth stencil state tests depth (meshes do; full screen passes and composites don't), cached by state
    static bool IsDepthTested(ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData* gd)
    {
-      com_ptr<ID3D11DepthStencilState> depth_stencil_state;
-      native_device_context->OMGetDepthStencilState(&depth_stencil_state, nullptr);
-      if (depth_stencil_state.get() != gd->jitter_depth_stencil_state)
+      ID3D11DepthStencilState* const depth_stencil_state = BoundState(gd, gd->bound_depth_stencil_state, [&](ID3D11DepthStencilState** state)
+         { native_device_context->OMGetDepthStencilState(state, nullptr); });
+      if (depth_stencil_state != gd->jitter_depth_stencil_state)
       {
          D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
          if (depth_stencil_state)
@@ -1357,7 +1505,7 @@ class Borderlands2 final : public Game
             depth_stencil_state->GetDesc(&depth_desc);
          }
          gd->jitter_depth_test = depth_desc.DepthEnable;
-         gd->jitter_depth_stencil_state = depth_stencil_state.get();
+         gd->jitter_depth_stencil_state = depth_stencil_state;
       }
       return gd->jitter_depth_test;
    }
@@ -1372,7 +1520,7 @@ class Borderlands2 final : public Game
 #if DEVELOPMENT
    // "mv.tiebreak_collisions" explained: the objects of one draw key with the same transform but other constants (their previous
    // frame match is arbitrary), and the vc4 rows that differ (c<N>: the D3D9 constant, see "MotionVectorPatches")
-   static void LogTieBreakCollisions(const std::unordered_map<uint64_t, std::vector<Borderlands2GameDeviceData::MotionVectorObject>>& objects_by_key)
+   static void LogTieBreakCollisions(const decltype(Borderlands2GameDeviceData::mv_objects)& objects_by_key)
    {
       uint32_t logged = 0;
       for (const auto& [key, objects] : objects_by_key)
@@ -1566,26 +1714,82 @@ class Borderlands2 final : public Game
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader reads
       // a constant buffer past b4.
-      com_ptr<ID3D11Buffer> current;
-      native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, &current);
+      ID3D11Buffer* const current = BoundState(&gd, gd.bound_object_buffer, [&](ID3D11Buffer** buffer)
+         { native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, buffer); });
+      // The buffer's CPU copy (null until its first upload); the lookup registers it for a copy at every upload. From the mirror instead
+      // when it runs: the rows read here must be known, the camera (c0-c5) and the LocalToWorld rows (zero motion otherwise, as without
+      // a copy). Not every row the shader may read: a skinned mesh sets only its own bones of c6-c230, the rest of vc4 holds older
+      // draws' values its vertices don't index (the mirror has zeros there).
+      const UINT read_size = gd.mv_last_vertex_shader.read_size;
       Borderlands2GameDeviceData::ConstantsCopy constants;
+      const VertexConstantMirror* const mirror = (g_vc4_mirror ? gd.vertex_constants : nullptr);
+      if (mirror)
       {
-         const std::lock_guard lock(gd.mv_constants_mutex);
-         // The buffer's CPU copy (null until its first upload); the lookup registers it for a copy at every upload
-         if (current)
+         const uint32_t transform_row = gd.mv_last_vertex_shader.translation_offset / 16 - 3;
+         const auto known = [&](uint32_t first_row, uint32_t row_count)
+         { return first_row + row_count <= VertexConstantMirror::ROWS && !std::memchr(mirror->known + first_row, 0, row_count); };
+         if (known(kViewProjectionOffset / 16, kCameraSize / 16) && known(transform_row, 4))
          {
-            const auto [copy, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current.get()));
-            constants = copy->second.copy;
-            if (registered)
+            if (!gd.vertex_constants_copy || gd.vertex_constants_copy_generation != mirror->generation)
             {
-               AddFilteredBuffer(&gd, current.get());
+               gd.vertex_constants_copy = NewConstantsCopy(gd, reinterpret_cast<const uint8_t*>(mirror->rows), sizeof(mirror->rows));
+               gd.vertex_constants_copy_generation = mirror->generation;
             }
+            constants = gd.vertex_constants_copy;
+         }
+#if DEVELOPMENT
+         else
+         {
+            gd.mv_stats.vc4_mirror_unknown++;
+         }
+#endif
+      }
+      if (current && (!mirror || g_vc4_mirror_check))
+      {
+         const auto [copy, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current));
+         Borderlands2GameDeviceData::RegisteredConstants& entry = copy->second;
+         if (registered)
+         {
+            AddFilteredBuffer(&gd, current, &entry);
+         }
+#if DEVELOPMENT
+         // The bytes the shader may read, of the rows the mirror knows (the rest it holds as zero). A row it doesn't read differs
+         // legitimately: dgVoodoo uploads only what it reads, so vc4 keeps an older draw's value there while the mirror has the game's
+         // own (the skinned VS 0x400DB863 doesn't read c5, ~45 draws a frame in BL2: they count as mismatches here, harmless)
+         if (mirror && constants && entry.latest.size() == sizeof(mirror->rows))
+         {
+            const uint32_t read_rows = (read_size != 0 ? (std::min)((read_size + 15) / 16, VertexConstantMirror::ROWS) : VertexConstantMirror::ROWS);
+            const uint32_t transform_row = gd.mv_last_vertex_shader.translation_offset / 16 - 3;
+            bool mismatch = false, used_mismatch = false;
+            for (uint32_t row = 0; row < read_rows; row++)
+            {
+               if (!mirror->known[row] || std::memcmp(mirror->rows[row], entry.latest.data() + row * 16, 16) == 0)
+                  continue;
+               if (!mismatch)
+               {
+                  gd.mv_stats.vc4_mirror_mismatch_row = row;
+                  gd.mv_stats.vc4_mirror_mismatch_vs = uint32_t(original_shader_hashes.vertex_shaders[0]);
+               }
+               mismatch = true;
+               // The rows read here: the camera and the LocalToWorld rows
+               used_mismatch |= (row >= kViewProjectionOffset / 16 && row < (kViewProjectionOffset + kCameraSize) / 16) || (row >= transform_row && row < transform_row + 4);
+            }
+            gd.mv_stats.vc4_mirror_mismatches += mismatch;
+            gd.mv_stats.vc4_mirror_used_mismatches += used_mismatch;
+         }
+#endif
+         if (!mirror)
+         {
+            if (!entry.copy && !entry.latest.empty())
+            {
+               entry.copy = NewConstantsCopy(gd, entry.latest.data(), entry.latest.size());
+            }
+            constants = entry.copy;
          }
       }
       // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
       // None (no CPU copy yet, another camera): the current one (zero motion).
       const std::vector<uint8_t>* upload = nullptr;
-      const UINT read_size = gd.mv_last_vertex_shader.read_size;
       if (constants && constants->size() >= kTranslationOffset + 16)
       {
          // The frame's camera: its first motion vector draw's
@@ -1596,17 +1800,27 @@ class Borderlands2 final : public Game
          const bool frame_camera = std::memcmp(constants->data() + kViewProjectionOffset, gd.mv_camera->data() + kViewProjectionOffset, kCameraSize) == 0;
 
          // Draw key: same mesh, same shaders, no instance count
-         com_ptr<ID3D11Buffer> vertex_buffer;
-         UINT vertex_stride = 0, vertex_offset = 0;
-         native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vertex_offset);
-         com_ptr<ID3D11Buffer> index_buffer;
-         DXGI_FORMAT index_format;
-         UINT index_offset = 0;
-         native_device_context->IAGetIndexBuffer(&index_buffer, &index_format, &index_offset);
+         // The offsets go with the buffers: queried with them, else tracked with them
+         UINT vertex_offset = gd.bound_vertex_offset;
+         ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
+            {
+               UINT stride;
+               native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &vertex_offset); });
+         UINT index_offset = gd.bound_index_offset;
+         ID3D11Buffer* const index_buffer = BoundState(&gd, gd.bound_index_buffer, [&](ID3D11Buffer** buffer)
+            {
+               DXGI_FORMAT format;
+               native_device_context->IAGetIndexBuffer(buffer, &format, &index_offset); });
+#if DEVELOPMENT
+         if (g_bound_state_check && gd.bound_states_tracked && (vertex_offset != gd.bound_vertex_offset || index_offset != gd.bound_index_offset))
+         {
+            gd.mv_stats.bound_state_mismatches++;
+         }
+#endif
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
          uint64_t key = 0;
-         for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer.get()), uint64_t(vertex_offset),
-                 reinterpret_cast<uint64_t>(index_buffer.get()), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)),
+         for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer), uint64_t(vertex_offset),
+                 reinterpret_cast<uint64_t>(index_buffer), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)),
                  uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
          {
             HashCombine(key, value);
@@ -1674,7 +1888,7 @@ class Borderlands2 final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         auto& object = gd.mv_objects[key].emplace_back(transform, constants);
+         auto& object = gd.mv_objects[key].emplace_back(transform, std::move(constants));
 #if DEVELOPMENT
          object.vertex_shader = uint32_t(original_shader_hashes.vertex_shaders[0]);
          object.pixel_shader = uint32_t(original_shader_hashes.pixel_shaders[0]);
@@ -1689,7 +1903,7 @@ class Borderlands2 final : public Game
       // "Performance Test" modes without motion vector draws: the draw goes to "DrawWithJitter" (jittered or, without jitter, untouched)
       if (GetPerfMotionVectorDraws() < 2)
          return false;
-      ID3D11Buffer* const previous_current[] = {current.get()};
+      ID3D11Buffer* const previous_current[] = {current};
       gd.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, {&upload, 1}, previous_current, "BL2", {&read_size, 1});
       ID3D11Buffer* const jitter = gd.mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
@@ -1732,9 +1946,10 @@ class Borderlands2 final : public Game
       }
       if (!gd.jitter_dsv_scene || !IsDepthTested(native_device_context, &gd))
          return false;
-      com_ptr<ID3D11Buffer> vertex_buffer;
-      UINT vertex_stride, vertex_offset;
-      native_device_context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vertex_offset);
+      const ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
+         {
+            UINT stride, offset;
+            native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &offset); });
       if (!vertex_buffer)
          return false;
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]).shader.get();
@@ -2101,6 +2316,10 @@ public:
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot>);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushConstantBuffers);
+      reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
+      reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
    }
 
    void OnInit(bool async) override
@@ -2110,7 +2329,7 @@ public:
       Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
          { "hide_ui",
             &g_hide_ui }});
-      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_match_objects", &g_mv_match_objects}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"blend_memo", &g_blend_memo}, {"mv_trace_loading", &g_mv_trace_loading}, { "perf_hook_timers",
+      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_match_objects", &g_mv_match_objects}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"blend_memo", &g_blend_memo}, {"bound_state_tracking", &g_bound_state_tracking}, {"bound_state_check", &g_bound_state_check}, {"vc4_mirror", &g_vc4_mirror}, {"vc4_mirror_check", &g_vc4_mirror_check}, {"mv_trace_loading", &g_mv_trace_loading}, { "perf_hook_timers",
                                &Perf::g_hook_timers }});
       // As the "Performance Test" combo: a mode cancels a running sweep; "perf_sweep" 1 starts the GPU "Sweep", 2 the "CPU Sweep", 0 stops it
       Mcp::RegisterInts({{"perf_test", &Perf::g_test, 0, int(std::size(perf_test_modes)) - 1, [](DeviceData& device_data, double value)
@@ -2184,10 +2403,11 @@ public:
          ShaderDefinition("Luma_BL2TPS_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Copy Back PS"),
          ShaderDefinition("Luma_BL2TPS_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
-      reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
-      reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
-      reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot>);
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushConstantBuffers);
+      reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
+      reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
 
       // The game's post passes use cb0..cb5 and no translated shader reads one past b4, so b9/b10 (the motion vector draws, see
       // "MotionVectorPatches"), b11 (core DrawBloom's own constants) and b12/b13 are free for Luma.
@@ -2243,17 +2463,26 @@ public:
    // symptom known here: preventive, and the DEVELOPMENT log reports whether it occurs. Repair = copy RT0's blend
    // fields onto the offenders, write masks kept. Not gated on is_immediate: blend state records fine into a deferred
    // list. Returns true iff it ran the original draw itself.
-   bool FixImpossiblePerRTBlend(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData* gd, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, std::function<void()>* original_draw_dispatch_func)
+   bool FixImpossiblePerRTBlend(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, bool is_immediate, Borderlands2GameDeviceData* gd, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, std::function<void()>* original_draw_dispatch_func)
    {
       // Our own injected passes set their blend state deliberately. Re-issuing the draw is the only way to
       // apply a different state, so without that callback there is nothing to do.
       if (is_custom_pass || (stages & reshade::api::shader_stage::pixel) == 0 || original_draw_dispatch_func == nullptr)
          return false;
 
-      ComPtr<ID3D11BlendState> blend_state;
-      FLOAT blend_factor[4];
-      UINT sample_mask = 0;
-      native_device_context->OMGetBlendState(blend_state.put(), blend_factor, &sample_mask);
+      // Tracked on the immediate context (see "bound_blend_state")
+      com_ptr<ID3D11BlendState> queried_blend_state;
+      ID3D11BlendState* blend_state = nullptr;
+      if (is_immediate)
+      {
+         blend_state = BoundState(gd, gd->bound_blend_state, [&](ID3D11BlendState** state)
+            { native_device_context->OMGetBlendState(state, nullptr, nullptr); });
+      }
+      else
+      {
+         native_device_context->OMGetBlendState(&queried_blend_state, nullptr, nullptr);
+         blend_state = queried_blend_state.get();
+      }
       if (!blend_state)
          return false; // no state object = default (blending off everywhere)
 
@@ -2272,7 +2501,7 @@ public:
          D3D11_BLEND_DESC desc;
       };
       thread_local BlendMemo memo;
-      const bool memoized = g_blend_memo && memo.state == blend_state.get() && memo.frame == cb_luma_global_settings.FrameIndex;
+      const bool memoized = g_blend_memo && memo.state == blend_state && memo.frame == cb_luma_global_settings.FrameIndex;
       if (memoized && !memo.candidate)
          return false;
       D3D11_BLEND_DESC queried;
@@ -2294,7 +2523,7 @@ public:
          candidate &= disagreement;
          if (g_blend_memo)
          {
-            memo.state = blend_state.get();
+            memo.state = blend_state;
             memo.frame = cb_luma_global_settings.FrameIndex;
             memo.candidate = candidate;
             if (candidate)
@@ -2377,9 +2606,13 @@ public:
          gd->fixed_blend_states[bd] = fixed_state;
       }
 
+      FLOAT blend_factor[4];
+      UINT sample_mask = 0;
+      com_ptr<ID3D11BlendState> bound_blend_state;
+      native_device_context->OMGetBlendState(&bound_blend_state, blend_factor, &sample_mask);
       native_device_context->OMSetBlendState(fixed_state.get(), blend_factor, sample_mask);
       (*original_draw_dispatch_func)();
-      native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask); // hand the game back its own state
+      native_device_context->OMSetBlendState(blend_state, blend_factor, sample_mask); // hand the game back its own state
       return true;
    }
 
@@ -2984,7 +3217,7 @@ public:
             // The draw with dgVoodoo's per-target blend repaired, as every other draw (see "FixImpossiblePerRTBlend")
             const std::function<void()> draw = [&]
             {
-               if (!FixImpossiblePerRTBlend(native_device, native_device_context, &gd, stages, original_shader_hashes, is_custom_pass, original_draw_dispatch_func))
+               if (!FixImpossiblePerRTBlend(native_device, native_device_context, true, &gd, stages, original_shader_hashes, is_custom_pass, original_draw_dispatch_func))
                {
                   (*original_draw_dispatch_func)();
                }
@@ -3287,7 +3520,7 @@ public:
 
       // LAST on purpose: this one re-issues the draw itself, so it must yield to every hook above, or it runs
       // vanilla a pass another hook meant to take over.
-      if (FixImpossiblePerRTBlend(native_device, native_device_context, &gd, stages, original_shader_hashes, is_custom_pass, original_draw_dispatch_func))
+      if (FixImpossiblePerRTBlend(native_device, native_device_context, is_immediate, &gd, stages, original_shader_hashes, is_custom_pass, original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
       return DrawOrDispatchOverrideType::None;
@@ -3311,6 +3544,34 @@ public:
       gd.mv_jitter_allowed = device_data.has_drawn_sr;
       gd.sr_active = LatchSRFrame(device_data);
       gd.mv_active = IsSRActive(device_data) || g_mv_enable;
+      // The proxy's vertex constant mirror, while its CSMT layer runs; the buffer hooks only where it can't replace them. Registered on
+      // this thread, the only one their events come from (ReShade changes its callback lists without a lock).
+      {
+         static const auto get_vertex_constants = reinterpret_cast<GetVertexConstantMirrorFn>(GetProcAddress(GetModuleHandleW(L"d3d9.dll"), kGetVertexConstantMirrorExport));
+         const VertexConstantMirror* const mirror = (get_vertex_constants ? get_vertex_constants() : nullptr);
+         gd.vertex_constants = ((mirror && mirror->version == VertexConstantMirror::VERSION && mirror->active) ? mirror : nullptr);
+         if (!gd.vertex_constants)
+         {
+            gd.vertex_constants_copy.reset();
+         }
+         const bool buffer_hooks = gd.mv_active && (!gd.vertex_constants || !g_vc4_mirror || g_vc4_mirror_check);
+         if (buffer_hooks != g_buffer_hooks_registered)
+         {
+            g_buffer_hooks_registered = buffer_hooks;
+            if (buffer_hooks)
+            {
+               reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
+               reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
+               reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
+            }
+            else
+            {
+               reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
+               reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
+               reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
+            }
+         }
+      }
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when an
       // upscaler is picked again (the helper takes seconds to start).
       if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
@@ -3335,7 +3596,6 @@ public:
             gd.mv_fill_buffer.reset();
             gd.mv_jitter_buffer.reset();
             gd.mv_previous_constants = {}; // Its 4 MiB dynamic ring is address space too
-            const std::lock_guard constants_lock(gd.mv_constants_mutex);
             gd.mv_constants_pool.clear();
             gd.mv_constants_pool_free.clear();
          }
@@ -3344,7 +3604,9 @@ public:
          // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many
          // as the last frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their
          // peak otherwise. Without motion vectors, none.
-         const std::lock_guard lock(gd.mv_constants_mutex);
+#if DEVELOPMENT
+         gd.mv_constants_thread = GetCurrentThreadId();
+#endif
          size_t kept_free = (gd.mv_active ? std::exchange(gd.mv_constants_made, 0) : 0);
          std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
             {
@@ -3472,7 +3734,7 @@ public:
       // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run
       if (const auto& stats = gd.mv_last_stats; gd.mv_active && Perf::g_test == 0 && cb_luma_global_settings.FrameIndex % 300 == 0)
       {
-         reshade::log::message(reshade::log::level::info, std::format("[BL2 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter, {} maps, {} updates, {} other maps, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}/{}/{}/{}/{}/{}/{}/{}/{}", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.maps, stats.updates, stats.other_maps, stats.sr_draws, int(device_data.sr_type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7], stats.rejected[8]).c_str());
+         reshade::log::message(reshade::log::level::info, std::format("[BL2 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter, {} maps, {} updates, {} other maps, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}/{}/{}/{}/{}/{}/{}/{}/{}, bound state mismatches {}, vc4 mirror {} (mismatches {}, in used rows {}, last at row {} of VS 0x{:08X}, unknown {})", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.maps, stats.updates, stats.other_maps, stats.sr_draws, int(device_data.sr_type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7], stats.rejected[8], stats.bound_state_mismatches, gd.vertex_constants ? "on" : "off", stats.vc4_mirror_mismatches, stats.vc4_mirror_used_mismatches, stats.vc4_mirror_mismatch_row, stats.vc4_mirror_mismatch_vs, stats.vc4_mirror_unknown).c_str());
       }
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels
       {
