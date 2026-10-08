@@ -3443,7 +3443,7 @@ public:
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
-            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR.");
+            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.");
          }
          DrawResetButton(g_render_scale, 1.f, "RenderScale");
          ImGui::EndDisabled();
@@ -3457,7 +3457,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR).");
+         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
       }
       ImGui::EndDisabled();
       // Canon deviation (docs/UI-Toggle-Standard.md), as Saints Row The Third Remastered: RCAS runs after any anti-aliasing, in place
