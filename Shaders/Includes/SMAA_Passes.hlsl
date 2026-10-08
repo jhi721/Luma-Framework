@@ -2,7 +2,7 @@
 // core.hpp), over fullscreen-triangle VSs. The game file configures SMAA (SMAA_RT_METRICS, the preset, predication, optionally
 // SMAAGather) and includes this instead of SMAA.hlsl.
 // Optional hook: SMAA_NEIGHBORHOOD_OUTPUT(color, position), a statement run on the blended float4 color before it is returned (e.g.
-// to re-encode a linear colorTex to the canvas' gamma).
+// to re-encode a linear colorTex to the canvas' gamma). With SMAA_REPROJECTION (T2x) it runs on the resolve's output instead.
 // Optional: SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR 1 lets the neighborhood blend read the gamma-encoded canvas (the edge detection's input)
 // and filter it in linear light, without a linear copy (needs "gamma_to_linear" included first; re-encode with the output hook).
 
@@ -154,10 +154,15 @@ void smaa_blending_weight_calculation_vs(uint id : SV_VertexID, out float4 posit
    SMAABlendingWeightCalculationVS(texcoord, pixcoord, offset);
 }
 
+// SMAA T2x: the area texture subsample matching this frame's jitter (SMAA.hlsl's @SUBSAMPLE_INDICES table), 0 for 1x
+#ifndef SMAA_SUBSAMPLE_INDICES
+#define SMAA_SUBSAMPLE_INDICES 0
+#endif
+
 float4 smaa_blending_weight_calculation_ps(float4 position : SV_Position, float2 texcoord : TEXCOORD0, float2 pixcoord : TEXCOORD1, float4 offset[3] : TEXCOORD2) : SV_Target
 {
    // tex0 = edgesTex, tex1 = areaTex, tex2 = searchTex
-   return SMAABlendingWeightCalculationPS(texcoord, pixcoord, offset, tex0, tex1, tex2, 0);
+   return SMAABlendingWeightCalculationPS(texcoord, pixcoord, offset, tex0, tex1, tex2, SMAA_SUBSAMPLE_INDICES);
 }
 
 // SMAANeighborhoodBlending
@@ -169,8 +174,27 @@ void smaa_neighborhood_blending_vs(uint id : SV_VertexID, out float4 position : 
 
 float4 smaa_neighborhood_blending_ps(float4 position : SV_Position, float2 texcoord : TEXCOORD0, float4 offset : TEXCOORD1) : SV_Target
 {
-   // tex0 = colorTex, tex1 = blendTex
-   float4 color = SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1);
+   // tex0 = colorTex, tex1 = blendTex, with SMAA_REPROJECTION tex2 = velocityTex (its length goes to the alpha)
+   float4 color = SMAANeighborhoodBlendingPS(texcoord, offset, tex0, tex1
+#if SMAA_REPROJECTION
+                                             ,
+                                             tex2
+#endif
+   );
+#if !SMAA_REPROJECTION
+   SMAA_NEIGHBORHOOD_OUTPUT(color, position)
+#endif
+   return color;
+}
+
+#if SMAA_REPROJECTION
+// SMAAResolve (T2x): this frame's antialiased color blended with the previous frame's, reprojected and weighted by the velocity
+// difference in alpha. tex0 = currentColorTex, tex1 = previousColorTex, tex2 = velocityTex. It reads only the position, so any
+// fullscreen VS works.
+float4 smaa_resolve_ps(float4 position : SV_Position) : SV_Target
+{
+   float4 color = SMAAResolvePS(position.xy * SMAA_RT_METRICS.xy, tex0, tex1, tex2);
    SMAA_NEIGHBORHOOD_OUTPUT(color, position)
    return color;
 }
+#endif

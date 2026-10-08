@@ -1343,7 +1343,9 @@ float4 SMAAResolvePS(float2 texcoord,
     float4 current = SMAASamplePoint(currentColorTex, texcoord);
 
     // Reproject current coordinates and fetch previous pixel:
-    float4 previous = SMAASamplePoint(previousColorTex, texcoord + velocity);
+    // Luma: bilinear. A point fetch misplaces the previous frame by up to half a pixel under sub-pixel motion, and a bicubic one
+    // measured worse.
+    float4 previous = SMAASampleLevelZero(previousColorTex, texcoord + velocity);
 
     // Attenuate the previous pixel if the velocity is different:
     float delta = abs(current.a * current.a - previous.a * previous.a) / 5.0;
