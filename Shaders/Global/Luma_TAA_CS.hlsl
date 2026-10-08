@@ -280,6 +280,8 @@ float4 SampleHistory(float2 position, float2 inv_resolution)
    history += History.SampleLevel(LinearClampSampler, uv12, 0) * (w12.x * w12.y);
    history += History.SampleLevel(LinearClampSampler, float2(uv3.x, uv12.y), 0) * (w3.x * w12.y);
    history += History.SampleLevel(LinearClampSampler, float2(uv12.x, uv3.y), 0) * (w12.x * w3.y);
+   // The negative lobes can take the weight below 0 next to texels without history (2x2 history and upscaling)
+   history.a = max(history.a, 0.0);
    return history;
 #endif
 }
