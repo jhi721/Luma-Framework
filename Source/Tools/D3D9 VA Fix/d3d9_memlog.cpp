@@ -49,6 +49,7 @@
 // Everything but Direct3DCreate9 goes straight to the real D3D9 (the loader
 // resolves d3d9_chain.dll from the exe's folder).
 #pragma comment(linker, "/EXPORT:Direct3DCreate9=_ProxyDirect3DCreate9@4")
+#pragma comment(linker, "/EXPORT:LumaGetVertexConstants=_LumaGetVertexConstants@0")
 #pragma comment(linker, \
    "/EXPORT:Direct3DCreate9Ex=d3d9_chain.Direct3DCreate9Ex")
 #pragma comment(linker, \
@@ -1915,6 +1916,12 @@ namespace
    }
 
 } // namespace
+
+// The vertex shader constants the CSMT layer passed down last (see "VertexConstantMirror"), for Luma
+extern "C" const VertexConstantMirror* WINAPI LumaGetVertexConstants()
+{
+   return &Csmt::g_vertex_constants;
+}
 
 extern "C" IDirect3D9* WINAPI ProxyDirect3DCreate9(UINT sdk_version)
 {

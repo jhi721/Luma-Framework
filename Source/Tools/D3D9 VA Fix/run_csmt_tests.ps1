@@ -69,7 +69,9 @@ $runs = @(
     @{ Name = "frames"; Args = @("frames=8") },
     @{ Name = "reset"; Args = @("frames=8", "reset") },
     @{ Name = "redevice"; Args = @("frames=4", "redevice") },
-    @{ Name = "thread"; Args = @("frames=12", "thread") }
+    @{ Name = "thread"; Args = @("frames=12", "thread") },
+    # dgVoodoo's uploaded vertex constants against the proxy's mirror at every D3D11 draw (Luma reads the mirror)
+    @{ Name = "constants"; Args = @("frames=8", "constants") }
 )
 # Every run gets its own off and on folder; the runs of one round start at once, rounds go one after another (all
 # rounds at once overload the GPU until the in-test watchdog fires).
@@ -91,6 +93,8 @@ foreach ($test in $started) {
     $expected = if ($test.Name -like "dgvoodoo*") { "CSMT: on" } else { "CSMT: requested, but" }
     $ok = ($a.Exit -eq 0) -and ($b.Exit -eq 0) -and -not $diff -and $crcA.Count -gt 0 -and
         ($b.Log | Select-String $expected)
+    # With CSMT on dgVoodoo's draws must have been compared (the mirror is live), not merely found equal by having none
+    if ($test.Name -eq "dgvoodoo / constants") { $ok = $ok -and ($b.Output | Select-String "constants: compared [1-9]") }
     "=== $($test.Name): $(if ($ok) { 'ok' } else { 'FAILED' }) ($($crcA.Count) frames)"
     if ($ok) {
         Remove-Item $test.A.Dir, $test.B.Dir -Recurse -Force # failed runs keep their folders for diagnosis

@@ -20,6 +20,7 @@
 #pragma once
 #include "csmt_methods.h"
 #include "csmt_queue.h"
+#include "vertex_constants.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -262,6 +263,68 @@ namespace Csmt
    inline Shared g;
    inline thread_local int t_producer_depth = 0;
    inline thread_local bool t_worker = false;
+
+   // "VertexConstantMirror" (exported for Luma), written by the thread that calls the layer below, after each call: the worker,
+   // or the game thread while the layer passes calls through
+   inline VertexConstantMirror g_vertex_constants;
+   inline uint16_t g_vertex_bools_known = 0;         // b0-b15: a bool row is known once its four are
+   inline bool g_vertex_constants_recording = false; // Between BeginStateBlock and EndStateBlock constants are recorded, not set
+
+   inline void ForgetVertexConstants()
+   {
+      std::memset(g_vertex_constants.rows, 0, sizeof(g_vertex_constants.rows));
+      std::memset(g_vertex_constants.known, 0, sizeof(g_vertex_constants.known));
+      g_vertex_constants.unknown_rows = VertexConstantMirror::ROWS;
+      g_vertex_constants.generation++;
+      g_vertex_bools_known = 0;
+   }
+
+   // A Set{Vertex,Pixel}ShaderConstant{F,I,B} the layer below accepted: the vertex shader ones go to the mirror
+   template <int SLOT, typename T>
+   void MirrorConstants(UINT start, const T* data, UINT count)
+   {
+      constexpr bool is_float = SLOT == CSMT_SLOT_DEVICE_SetVertexShaderConstantF;
+      constexpr bool is_int = SLOT == CSMT_SLOT_DEVICE_SetVertexShaderConstantI;
+      constexpr bool is_bool = SLOT == CSMT_SLOT_DEVICE_SetVertexShaderConstantB;
+      if constexpr (is_float || is_int || is_bool)
+      {
+         if (g_vertex_constants_recording)
+            return;
+         VertexConstantMirror& mirror = g_vertex_constants;
+         const auto mark_known = [&](uint32_t row)
+         {
+            if (!mirror.known[row])
+            {
+               mirror.known[row] = 1;
+               mirror.unknown_rows--;
+            }
+         };
+         if constexpr (is_bool)
+         {
+            for (UINT i = 0; i < count && start + i < 16; i++)
+            {
+               const UINT reg = start + i;
+               mirror.rows[VertexConstantMirror::BOOL_ROW + reg / 4][reg % 4] = uint32_t(data[i]);
+               g_vertex_bools_known |= uint16_t(1u << reg);
+               if (((g_vertex_bools_known >> (reg & ~3u)) & 0xF) == 0xF)
+               {
+                  mark_known(VertexConstantMirror::BOOL_ROW + reg / 4);
+               }
+            }
+         }
+         else
+         {
+            constexpr UINT first_row = (is_float ? VertexConstantMirror::FLOAT_ROW : VertexConstantMirror::INT_ROW);
+            constexpr UINT registers = (is_float ? 256 : 16);
+            for (UINT i = 0; i < count && start + i < registers; i++)
+            {
+               std::memcpy(mirror.rows[first_row + start + i], data + size_t(i) * 4, 16);
+               mark_known(first_row + start + i);
+            }
+         }
+         mirror.generation++;
+      }
+   }
 
    inline bool PassThrough()
    {
@@ -667,14 +730,23 @@ namespace Csmt
       using Fn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9Ex*, UINT, const T*, UINT);
       const auto original = (Fn)OriginalFor(self, SLOT);
       const size_t bytes = size_t(count) * REGISTER_BYTES;
+      const auto call = [=](const T* values)
+      {
+         const HRESULT hr = original(self, start, values, count);
+         if (SUCCEEDED(hr) && values)
+         {
+            MirrorConstants<SLOT>(start, values, count);
+         }
+         return hr;
+      };
       if (PassThrough() || !data)
-         return original(self, start, data, count);
+         return call(data);
       if (bytes > g.queue->MaxPayload())
          return OnWorker(DEVICE, SLOT, [&]
-            { return original(self, start, data, count); });
+            { return call(data); });
       ProducerScope scope;
       Push([=](char* payload)
-         { original(self, start, (const T*)payload, count); }, data, bytes);
+         { call((const T*)payload); }, data, bytes);
       return D3D_OK;
    }
 
@@ -1378,21 +1450,34 @@ namespace Csmt
       return D3D_OK;
    }
 
-   // Synchronous calls that change the device state behind the shadow.
+   // Synchronous calls that change the device state behind the shadow (and the vertex constant mirror, on the calling side of
+   // the layer below)
    template <int K, int SLOT, typename... A>
    HRESULT STDMETHODCALLTYPE ForgetState(IUnknown* self, A... args)
    {
       using Fn = HRESULT(STDMETHODCALLTYPE*)(IUnknown*, A...);
       const auto original = (Fn)OriginalFor(self, SLOT);
+      const auto call = [&]
+      {
+         const HRESULT hr = original(self, args...);
+         if constexpr (K == DEVICE && SLOT == CSMT_SLOT_DEVICE_BeginStateBlock)
+         {
+            g_vertex_constants_recording = SUCCEEDED(hr);
+         }
+         else
+         {
+            ForgetVertexConstants(); // Reset, ResetEx, a state block's Apply
+         }
+         return hr;
+      };
       if (PassThrough())
-         return original(self, args...);
+         return call();
       g.state.Forget();
       if constexpr (K == DEVICE && SLOT == CSMT_SLOT_DEVICE_BeginStateBlock)
       {
          g.state.recording = true;
       }
-      return OnWorker(K, SLOT, [&]
-         { return original(self, args...); });
+      return OnWorker(K, SLOT, call);
    }
 
    // UE3 asks every few draws. Answered from the last Present while it succeeded (a D3D9Ex device always gets S_OK
@@ -1414,11 +1499,15 @@ namespace Csmt
       using Fn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9Ex*, IDirect3DStateBlock9**);
       const auto original = (Fn)OriginalFor(self, CSMT_SLOT_DEVICE_EndStateBlock);
       if (PassThrough())
+      {
+         g_vertex_constants_recording = false;
          return original(self, block);
+      }
       g.state.Forget(); // recording off
       return OnWorker(DEVICE, CSMT_SLOT_DEVICE_EndStateBlock,
          [&]
          {
+            g_vertex_constants_recording = false;
             const HRESULT hr = original(self, block);
             if (SUCCEEDED(hr) && block && *block)
             {
@@ -1638,11 +1727,15 @@ namespace Csmt
       QueryPerformanceFrequency(&frequency);
       g.poll_interval.QuadPart = frequency.QuadPart / 4000; // 0.25 ms between idle polls
       g.last_present = S_OK;
+      ForgetVertexConstants();
+      g_vertex_constants_recording = false;
+      g_vertex_constants.active = 1;
       g.thread = CreateThread(nullptr, 0, WorkerMain, nullptr, 0, nullptr);
       if (!g.thread)
       {
          delete g.queue;
          g.queue = nullptr;
+         g_vertex_constants.active = 0;
          fprintf(log, "CSMT: CreateThread failed %lu\n", GetLastError());
          return false;
       }
@@ -1667,6 +1760,7 @@ namespace Csmt
       CloseHandle(g.thread);
       g.thread = nullptr;
       g.active = false;
+      g_vertex_constants.active = 0;
       delete g.queue;
       g.queue = nullptr;
       g.device = nullptr;

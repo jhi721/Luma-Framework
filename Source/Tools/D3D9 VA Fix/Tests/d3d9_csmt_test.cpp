@@ -9,19 +9,26 @@
 // released; thread: a second thread creates, fills, reads and releases textures while the scene renders;
 // bench=N: N extra draws per frame with a state change each (prints ms per frame); work=MS: busy CPU work per frame
 // on the rendering thread, as a game's own render thread has.
+// constants: every D3D11 draw dgVoodoo makes compares the vertex constants it uploaded (vc4) with the proxy's mirror
+// ("VertexConstantMirror", what Luma reads instead of copying vc4 back); prints "constants: compared N mismatched M".
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <d3d11.h>
 #include <d3d9.h>
 #include <d3dcommon.h>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <windows.h>
 
+#include "../vertex_constants.h"
 #include "crash_report.h"
 #include <tlhelp32.h> // after windows.h
 
 #pragma comment(lib, "d3d9.lib") // "import" mode
+#pragma comment(lib, "d3d11.lib")
 
 namespace
 {
@@ -672,6 +679,277 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
    }
 } // namespace
 
+namespace Vc4Check
+{
+   // dgVoodoo's translated vertex shaders read the D3D9 constants from a dynamic buffer at VS b4 of this size (2.87.3).
+   // The immediate context's vtable lives with its device, so dgVoodoo's own D3D11CreateDevice call is hooked (see
+   // "CreateDevice") and the context it creates is patched.
+   constexpr UINT VC4_BYTES = VertexConstantMirror::ROWS * 16;
+   constexpr int DRAW_INDEXED = 12, DRAW = 13, MAP = 14, UNMAP = 15, DRAW_INDEXED_INSTANCED = 20, DRAW_INSTANCED = 21;
+   struct Vtable
+   {
+      void** table = nullptr;
+      void* original[22] = {};
+   };
+   Vtable g_vtables[4];
+   GetVertexConstantMirrorFn g_get_mirror = nullptr;
+   std::mutex g_mutex; // texture maps of the "thread" mode's second thread come through these hooks too
+   struct Upload
+   {
+      std::vector<uint8_t> bytes;
+      uint64_t serial = 0;            // Uploads of this buffer so far
+      uint64_t compared_serial = 0;   // The one the last compared draw used
+      uint32_t mirror_generation = 0; // The mirror's at the upload
+   };
+   std::unordered_map<ID3D11Resource*, Upload> g_uploads;
+   std::pair<ID3D11Resource*, void*> g_mapped = {};
+   uint32_t g_compared = 0, g_mismatched = 0, g_without_mirror = 0;
+   std::atomic<uint32_t> g_maps{0}, g_draws{0};
+   uint32_t g_vc4_draws = 0, g_stale_draws = 0, g_uploaded = 0, g_unknown_draws = 0, g_internal_draws = 0;
+   std::unordered_map<UINT, uint32_t> g_mapped_sizes; // Constant buffers mapped with DISCARD, by size (diagnosis)
+
+   void** Original(void* self)
+   {
+      void** const table = *(void***)self;
+      for (Vtable& vtable : g_vtables)
+      {
+         if (vtable.table == table)
+            return vtable.original;
+      }
+      return nullptr;
+   }
+
+   void Compare(ID3D11DeviceContext* self)
+   {
+      g_draws++;
+      ID3D11Buffer* buffer = nullptr;
+      self->VSGetConstantBuffers(4, 1, &buffer);
+      if (!buffer)
+         return;
+      const std::lock_guard lock(g_mutex);
+      const auto upload = g_uploads.find(buffer);
+      buffer->Release();
+      if (upload == g_uploads.end())
+         return;
+      g_vc4_draws++;
+      const bool fresh = upload->second.serial != upload->second.compared_serial;
+      if (!fresh)
+      {
+         g_stale_draws++; // Still compared: dgVoodoo uploads only changed constants, so the last upload is this draw's too
+      }
+      upload->second.compared_serial = upload->second.serial;
+      const VertexConstantMirror* const mirror = (g_get_mirror ? g_get_mirror() : nullptr);
+      if (!mirror || !mirror->active)
+      {
+         g_without_mirror++;
+         return;
+      }
+      // Constants set since the last upload that dgVoodoo didn't upload: a draw of its own (ColorFill, StretchRect, a Clear with
+      // rects) that leaves vc4 bound without reading it. A translated game shader's draw uploads changed constants first.
+      if (!fresh && mirror->generation != upload->second.mirror_generation)
+      {
+         g_internal_draws++;
+         return;
+      }
+      g_compared++;
+      // Rows the mirror doesn't know (after a state block's Apply) can't be checked: such a draw is counted apart
+      bool mismatched = false, unknown = false;
+      for (uint32_t row = 0; row < VertexConstantMirror::ROWS; row++)
+      {
+         const uint32_t* const uploaded = (const uint32_t*)(upload->second.bytes.data() + row * 16);
+         if (!mirror->known[row])
+         {
+            unknown |= std::memcmp(mirror->rows[row], uploaded, 16) != 0;
+            continue;
+         }
+         if (std::memcmp(mirror->rows[row], uploaded, 16) == 0)
+            continue;
+         if (g_mismatched < 12)
+         {
+            printf("FAIL constants: draw %u (%s upload) row %u: mirror %08X %08X %08X %08X, vc4 %08X %08X %08X %08X\n", g_compared,
+               fresh ? "new" : "old", row, mirror->rows[row][0], mirror->rows[row][1], mirror->rows[row][2], mirror->rows[row][3], uploaded[0],
+               uploaded[1], uploaded[2], uploaded[3]);
+         }
+         mismatched = true;
+      }
+      if (mismatched)
+      {
+         g_mismatched++;
+      }
+      if (unknown)
+      {
+         g_unknown_draws++;
+      }
+   }
+
+   HRESULT STDMETHODCALLTYPE Map(ID3D11DeviceContext* self, ID3D11Resource* resource, UINT subresource, D3D11_MAP type, UINT flags,
+      D3D11_MAPPED_SUBRESOURCE* mapped)
+   {
+      const HRESULT hr = ((decltype(&Map))Original(self)[MAP])(self, resource, subresource, type, flags, mapped);
+      g_maps++;
+      D3D11_RESOURCE_DIMENSION dimension;
+      resource->GetType(&dimension);
+      if (SUCCEEDED(hr) && mapped && type == D3D11_MAP_WRITE_DISCARD && dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+      {
+         D3D11_BUFFER_DESC desc;
+         static_cast<ID3D11Buffer*>(resource)->GetDesc(&desc);
+         if (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
+         {
+            const std::lock_guard lock(g_mutex);
+            g_mapped_sizes[desc.ByteWidth]++;
+         }
+         if (desc.ByteWidth == VC4_BYTES && (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER))
+         {
+            const std::lock_guard lock(g_mutex);
+            g_mapped = {resource, mapped->pData};
+         }
+      }
+      return hr;
+   }
+
+   void STDMETHODCALLTYPE Unmap(ID3D11DeviceContext* self, ID3D11Resource* resource, UINT subresource)
+   {
+      {
+         const std::lock_guard lock(g_mutex);
+         if (g_mapped.first == resource)
+         {
+            Upload& upload = g_uploads[resource];
+            upload.bytes.assign((const uint8_t*)g_mapped.second, (const uint8_t*)g_mapped.second + VC4_BYTES);
+            upload.serial++;
+            g_uploaded++;
+            const VertexConstantMirror* const mirror = (g_get_mirror ? g_get_mirror() : nullptr);
+            upload.mirror_generation = (mirror ? mirror->generation : 0);
+            g_mapped = {};
+         }
+      }
+      ((decltype(&Unmap))Original(self)[UNMAP])(self, resource, subresource);
+   }
+
+   void STDMETHODCALLTYPE DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b, INT c)
+   {
+      Compare(self);
+      ((decltype(&DrawIndexed))Original(self)[DRAW_INDEXED])(self, a, b, c);
+   }
+
+   void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* self, UINT a, UINT b)
+   {
+      Compare(self);
+      ((decltype(&Draw))Original(self)[DRAW])(self, a, b);
+   }
+
+   void STDMETHODCALLTYPE DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, INT d, UINT e)
+   {
+      Compare(self);
+      ((decltype(&DrawIndexedInstanced))Original(self)[DRAW_INDEXED_INSTANCED])(self, a, b, c, d, e);
+   }
+
+   void STDMETHODCALLTYPE DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, UINT d)
+   {
+      Compare(self);
+      ((decltype(&DrawInstanced))Original(self)[DRAW_INSTANCED])(self, a, b, c, d);
+   }
+
+   // A device's immediate context vtable lives with the device (not in d3d11.dll): hooked when dgVoodoo creates its device
+   void HookContext(ID3D11DeviceContext* context)
+   {
+      if (Original(context))
+         return;
+      for (Vtable& vtable : g_vtables)
+      {
+         if (vtable.table)
+            continue;
+         void** const table = *(void***)context;
+         std::memcpy(vtable.original, table, sizeof(vtable.original));
+         DWORD protection;
+         VirtualProtect(table, sizeof(vtable.original), PAGE_READWRITE, &protection);
+         table[DRAW_INDEXED] = (void*)&DrawIndexed;
+         table[DRAW] = (void*)&Draw;
+         table[MAP] = (void*)&Map;
+         table[UNMAP] = (void*)&Unmap;
+         table[DRAW_INDEXED_INSTANCED] = (void*)&DrawIndexedInstanced;
+         table[DRAW_INSTANCED] = (void*)&DrawInstanced;
+         VirtualProtect(table, sizeof(vtable.original), protection, &protection);
+         vtable.table = table;
+         return;
+      }
+   }
+
+   // D3D11CreateDevice, which dgVoodoo finds with GetProcAddress: a jump to "CreateDevice", lifted while the real one runs
+   uint8_t* g_create_device = nullptr;
+   uint8_t g_create_device_bytes[5] = {};
+   std::mutex g_create_device_mutex;
+
+   void PatchCreateDevice(bool hooked);
+
+   HRESULT WINAPI CreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE software, UINT flags, const D3D_FEATURE_LEVEL* levels,
+      UINT level_count, UINT sdk_version, ID3D11Device** device, D3D_FEATURE_LEVEL* level, ID3D11DeviceContext** context)
+   {
+      const std::lock_guard lock(g_create_device_mutex);
+      PatchCreateDevice(false);
+      const HRESULT hr = ((decltype(&CreateDevice))g_create_device)(adapter, type, software, flags, levels, level_count, sdk_version, device, level, context);
+      PatchCreateDevice(true);
+      if (SUCCEEDED(hr) && device && *device)
+      {
+         ID3D11DeviceContext* immediate = nullptr;
+         (*device)->GetImmediateContext(&immediate);
+         if (immediate)
+         {
+            HookContext(immediate);
+            immediate->Release();
+         }
+      }
+      return hr;
+   }
+
+   void PatchCreateDevice(bool hooked)
+   {
+      DWORD protection;
+      VirtualProtect(g_create_device, 5, PAGE_EXECUTE_READWRITE, &protection);
+      if (hooked)
+      {
+         g_create_device[0] = 0xE9; // jmp rel32
+         const int32_t offset = int32_t((uint8_t*)&CreateDevice - (g_create_device + 5));
+         std::memcpy(g_create_device + 1, &offset, 4);
+      }
+      else
+      {
+         std::memcpy(g_create_device, g_create_device_bytes, 5);
+      }
+      VirtualProtect(g_create_device, 5, protection, &protection);
+      FlushInstructionCache(GetCurrentProcess(), g_create_device, 5);
+   }
+
+   // Before dgVoodoo creates its device
+   bool Install()
+   {
+      g_get_mirror = (GetVertexConstantMirrorFn)GetProcAddress(GetModuleHandleA("d3d9.dll"), kGetVertexConstantMirrorExport);
+      g_create_device = (uint8_t*)GetProcAddress(LoadLibraryA("d3d11.dll"), "D3D11CreateDevice");
+      if (!g_create_device)
+         return false;
+      std::memcpy(g_create_device_bytes, g_create_device, 5);
+      PatchCreateDevice(true);
+      return true;
+   }
+
+   void Report()
+   {
+      const std::lock_guard lock(g_mutex);
+      printf("constants: compared %u mismatched %u unknown %u internal %u without mirror %u (export %s)\n", g_compared, g_mismatched, g_unknown_draws, g_internal_draws, g_without_mirror,
+         g_get_mirror ? "found" : "missing");
+      printf("constants: vc4 uploads %u, draws with vc4 at b4 %u (%u without a new upload)\n", g_uploaded, g_vc4_draws, g_stale_draws);
+      printf("constants: hooked maps %u draws %u, vtables %p %p\n", g_maps.load(), g_draws.load(), (void*)g_vtables[0].table,
+         (void*)g_vtables[1].table);
+      for (const auto& [size, count] : g_mapped_sizes)
+      {
+         printf("constants: discarded constant buffer %u bytes x%u\n", size, count);
+      }
+      if (g_mismatched)
+      {
+         g_failures++;
+      }
+   }
+} // namespace Vc4Check
+
 int main(int argc, char** argv)
 {
    SetUnhandledExceptionFilter(&CrashReport);
@@ -680,9 +958,10 @@ int main(int argc, char** argv)
       return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [bench=N] [work=MS]\n"), 2;
    UINT frames = 6, bench_draws = 0;
    double work_ms = 0;
-   bool reset = false, redevice = false, thread = false;
+   bool reset = false, redevice = false, thread = false, constants = false;
    for (int i = 2; i < argc; i++)
    {
+      constants |= !strcmp(argv[i], "constants");
       sscanf_s(argv[i], "frames=%u", &frames);
       sscanf_s(argv[i], "bench=%u", &bench_draws);
       sscanf_s(argv[i], "work=%lf", &work_ms);
@@ -696,6 +975,8 @@ int main(int argc, char** argv)
    auto create9 = (!strcmp(argv[1], "import") ? &Direct3DCreate9
                    : d3d9                     ? (IDirect3D9 * (WINAPI*)(UINT)) GetProcAddress(d3d9, "Direct3DCreate9")
                                               : nullptr);
+   if (constants && !Vc4Check::Install())
+      return printf("FAIL constants: no D3D11CreateDevice to hook\n"), 1;
    IDirect3D9* d3d = create9 ? create9(D3D_SDK_VERSION) : nullptr;
    if (!d3d)
       return printf("FAIL Direct3DCreate9 (%s)\n", argv[1]), 1;
@@ -800,6 +1081,10 @@ int main(int argc, char** argv)
       scene.Release();
       const ULONG refs = device->Release();
       printf("device released, refs %lu\n", refs);
+   }
+   if (constants)
+   {
+      Vc4Check::Report();
    }
    d3d->Release();
    printf("%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
