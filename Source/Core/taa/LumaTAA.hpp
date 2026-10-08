@@ -40,6 +40,7 @@ namespace LumaTAA
    static_assert(sizeof(CBData) == 64);
    constexpr uint32_t flag_reset = 1u << 0;
    constexpr uint32_t flag_inverted_depth = 1u << 1;
+   constexpr uint32_t flag_reactive_mask = 1u << 2;
    constexpr UINT reconstructed_depth_clear_value = 0x7F7FFFFF; // asuint(FLT_MAX): nothing reconstructed
 
    inline bool IsUpscaling(const SR::SettingsData& settings_data)
@@ -63,7 +64,7 @@ namespace LumaTAA
       com_ptr<ID3D11Texture2D> locks[2];
       com_ptr<ID3D11ShaderResourceView> lock_srvs[2];
       com_ptr<ID3D11UnorderedAccessView> lock_uavs[2];
-      // Flickering analysis state from Medium (R11G11B10_FLOAT at the render resolution), alternating with the history; cleared to 0 = no state
+      // Flickering analysis state from Medium (R11G11B10_FLOAT at the output resolution), alternating with the history; cleared to 0 = no state
       com_ptr<ID3D11Texture2D> flicker[2];
       com_ptr<ID3D11ShaderResourceView> flicker_srvs[2];
       com_ptr<ID3D11UnorderedAccessView> flicker_uavs[2];
@@ -281,7 +282,7 @@ namespace LumaTAA
             return SUCCEEDED(device->CreateShaderResourceView(resource, &srv_desc, &*srv));
          };
          bool views = update_srv(draw_data.source_color, std::addressof(taa_data->source_color_srv)) && update_srv(draw_data.depth_buffer, std::addressof(taa_data->depth_srv)) && update_srv(draw_data.motion_vectors, std::addressof(taa_data->motion_vectors_srv));
-         // The reactive mask (AMD FSR 2 semantics) is optional: the shader reads 0 where none is bound
+         // The reactive mask (AMD FSR 2 semantics) is optional: "flag_reactive_mask" tells the shader one is bound
          if (!draw_data.bias_mask || !update_srv(draw_data.bias_mask, std::addressof(taa_data->reactive_mask_srv)))
          {
             taa_data->reactive_mask_srv.reset();
@@ -313,7 +314,8 @@ namespace LumaTAA
             .inv_render_resolution = {1.f / render_width, 1.f / render_height},
             .motion_vector_scale = {settings_data.mvs_x_scale, settings_data.mvs_y_scale},
             .depth_near_far = {draw_data.near_plane, draw_data.far_plane},
-            .flags = (reset ? flag_reset : 0u) | (settings_data.inverted_depth ? flag_inverted_depth : 0u),
+            .flags = (reset ? flag_reset : 0u) | (settings_data.inverted_depth ? flag_inverted_depth : 0u) |
+                     (taa_data->reactive_mask_srv ? flag_reactive_mask : 0u),
             // "DrawData" jitter offsets the projection, so the pixel center samples the scene at minus that offset
             .jitter = {-draw_data.jitter_x, -draw_data.jitter_y},
             .output_resolution = {output_width, output_height},

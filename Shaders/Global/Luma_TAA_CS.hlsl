@@ -179,7 +179,8 @@
 #endif
 // Reactive mask input (AMD FSR 2 semantics, t7, e.g. drawn by a game's alpha blended particles): where it is set, the
 // history weight cap is scaled by 1 - mask (capped at TAA_REACTIVE_MAX), the flickering range starts over and nothing
-// locks. Unbound, it reads 0.
+// locks. Read only under TAA_FLAG_REACTIVE_MASK (one is bound): loads from an unbound slot return 0 but aren't free
+// (~0.15-0.2 ms at 4K on an RTX 4080 SUPER, against ~0.02 ms for a bound mask).
 #ifndef TAA_REACTIVE
 #define TAA_REACTIVE (TAA_QUALITY >= 1)
 #endif
@@ -189,6 +190,7 @@
 
 #define TAA_FLAG_RESET          (1u << 0)
 #define TAA_FLAG_INVERTED_DEPTH (1u << 1)
+#define TAA_FLAG_REACTIVE_MASK  (1u << 2)
 
 cbuffer LumaTAAData : register(b0)
 {
@@ -430,7 +432,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
          const float luminance = dot(color, Rec709_Luminance);
          min_luminance = min(min_luminance, luminance);
 #if TAA_REACTIVE
-         reactive = max(reactive, ReactiveMask.Load(int3(sample_pixel, 0)));
+         if (Flags & TAA_FLAG_REACTIVE_MASK)
+         {
+            reactive = max(reactive, ReactiveMask.Load(int3(sample_pixel, 0)));
+         }
 #endif
 #if TAA_LOCK
          if (x != 0 || y != 0)
