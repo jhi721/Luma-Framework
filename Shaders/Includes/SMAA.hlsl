@@ -615,9 +615,16 @@ float3 SMAAGatherNeighbours(float2 texcoord,
 float2 SMAACalculatePredicatedThreshold(float2 texcoord,
                                         float4 offset[3],
                                         SMAATexture2D(predicationTex)) {
+    #if SMAA_PREDICATION_EDGENESS
+    // Luma: the predication texture is already an edge-ness of the pixel's left and top edges (the games' one-sided depth
+    // extract passes), so its value is the test: differencing it against the neighbors cancels along staircases, where the
+    // neighbor is marked too (for its other axis)
+    float2 edges = step(SMAA_PREDICATION_THRESHOLD, SMAASamplePoint(predicationTex, texcoord).rr);
+    #else
     float3 neighbours = SMAAGatherNeighbours(texcoord, offset, SMAATexturePass2D(predicationTex));
     float2 delta = abs(neighbours.xx - neighbours.yz);
     float2 edges = step(SMAA_PREDICATION_THRESHOLD, delta);
+    #endif
     return SMAA_PREDICATION_SCALE * SMAA_THRESHOLD * (1.0 - SMAA_PREDICATION_STRENGTH * edges);
 }
 
@@ -803,8 +810,13 @@ float2 SMAAColorEdgeDetectionPS(float2 texcoord,
     maxDelta = max(maxDelta.xy, delta.zw);
     float finalDelta = max(maxDelta.x, maxDelta.y);
 
+    #if SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION
+    // Luma: Filmic SMAA's morphological edge suppression in place of the local contrast adaptation (see SMAA_Passes.hlsl)
+    edges.xy *= SMAAMorphologicalEdgeSuppression(texcoord, SMAATexturePass2D(colorTex), C, Cleft, Ctop, Cright, Cbottom, Cleftleft, Ctoptop, delta.xy, threshold);
+    #else
     // Local contrast adaptation:
     edges.xy *= step(finalDelta, SMAA_LOCAL_CONTRAST_ADAPTATION_FACTOR * delta.xy);
+    #endif
 
     return edges;
 }

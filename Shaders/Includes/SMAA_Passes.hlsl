@@ -58,6 +58,61 @@ float4 SampleGammaInLinear(Texture2D tex, float2 coord)
 #define SMAA_NEIGHBORHOOD_SAMPLE(tex, coord) SampleGammaInLinear(tex, coord)
 #endif
 
+#if SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION
+// Filmic SMAA's morphological edge suppression (Jimenez, "Filmic SMAA", SIGGRAPH 2016 Advances, slides 26-31), which SMAA.hlsl's
+// color edge detection runs in place of the local contrast adaptation: an edge survives when the strongest line pattern through
+// it scores above twice the threshold, and no pattern that bypasses it beats that by the edge's own contrast. A pattern scores
+// its edges' contrasts minus those of the edges that would break it; U and L patterns weigh 1 (the talk gives no weights).
+float SMAAColorDelta(float3 a, float3 b)
+{
+   const float3 t = abs(a - b);
+   return max(max(t.r, t.g), t.b);
+}
+
+// v.y: the edge; v.x and v.z: the edges continuing it before and after. h.xy: the crossing edges at its start, on the outer
+// and inner side; h.zw: the same at its end. outer and inner: the parallel edges one pixel out and in.
+bool SMAAMorphologicalEdgeSurvives(float3 v, float4 h, float outer, float inner, float threshold)
+{
+   float through = v.x + v.y + v.z - (h.x + h.y + h.z + h.w);                         // Line
+   through = max(through, h.x + v.y + h.z - (v.x + h.y + v.z + h.w));                 // U, outer side
+   through = max(through, h.y + v.y + h.w - (v.x + h.x + v.z + h.z));                 // U, inner side
+   through = max(through, h.x + v.y + h.w - (v.x + h.y + h.z + v.z + inner + outer)); // Z
+   through = max(through, h.z + v.y + h.y - (h.x + v.x + v.z + h.w + inner + outer)); // Z
+   through = max(through, h.x + v.y + v.z - (v.x + h.y + h.z + h.w + outer));         // L
+   through = max(through, h.y + v.y + v.z - (h.x + v.x + h.z + h.w + inner));         // L
+   through = max(through, h.z + v.y + v.x - (h.x + h.y + v.z + h.w + outer));         // L
+   through = max(through, h.w + v.y + v.x - (h.x + h.y + v.z + h.z + inner));         // L
+   float bypass = max(0.0, h.x + h.y - (v.x + v.y));                                  // Crossing line at the start
+   bypass = max(bypass, h.z + h.w - (v.y + v.z));                                     // Crossing line at the end
+   bypass = max(bypass, h.x + v.x - (h.y + v.y));                                     // L turning off it
+   bypass = max(bypass, h.y + v.x - (h.x + v.y));
+   bypass = max(bypass, h.z + v.z - (h.w + v.y));
+   bypass = max(bypass, h.w + v.z - (h.z + v.y));
+   return 2.0 * threshold < through && bypass - through < v.y;
+}
+
+// Which of the left (x) and top (y) edges survive, from the colors the color edge detection fetched, its left and top deltas, and
+// three more diagonal neighbors. The left edge's outer side is the left pixel, the top edge's the top one.
+float2 SMAAMorphologicalEdgeSuppression(float2 texcoord, SMAATexture2D(colorTex), float3 c, float3 left, float3 top, float3 right, float3 bottom,
+                                        float3 left_left, float3 top_top, float2 delta, float2 threshold)
+{
+   const float3 top_left = SMAASamplePoint(colorTex, texcoord - SMAA_RT_METRICS.xy).rgb;
+   const float3 bottom_left = SMAASamplePoint(colorTex, texcoord + SMAA_RT_METRICS.xy * float2(-1.0, 1.0)).rgb;
+   const float3 top_right = SMAASamplePoint(colorTex, texcoord + SMAA_RT_METRICS.xy * float2(1.0, -1.0)).rgb;
+   const float d_bottom = SMAAColorDelta(c, bottom);
+   const float d_right = SMAAColorDelta(c, right);
+   // Left edge: along it the edges above and below; crossing it the top and bottom edges of the left pixel (outer) and of this one
+   const bool left_survives = SMAAMorphologicalEdgeSurvives(float3(SMAAColorDelta(top, top_left), delta.x, SMAAColorDelta(bottom, bottom_left)),
+                                                            float4(SMAAColorDelta(left, top_left), delta.y, SMAAColorDelta(left, bottom_left), d_bottom),
+                                                            SMAAColorDelta(left, left_left), d_right, threshold.x);
+   // Top edge: the same, transposed
+   const bool top_survives = SMAAMorphologicalEdgeSurvives(float3(SMAAColorDelta(left, top_left), delta.y, SMAAColorDelta(right, top_right)),
+                                                           float4(SMAAColorDelta(top, top_left), delta.x, SMAAColorDelta(top, top_right), d_right),
+                                                           SMAAColorDelta(top, top_top), d_bottom, threshold.y);
+   return float2(left_survives, top_survives);
+}
+#endif
+
 #include "SMAA.hlsl"
 
 #ifndef SMAA_NEIGHBORHOOD_OUTPUT
