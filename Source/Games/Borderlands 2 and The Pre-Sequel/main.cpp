@@ -229,6 +229,7 @@ static constexpr int GetPerfMotionVectorDraws()
 
 // User settings (persisted via ReShade config under the shared NAME section; loaded in LoadConfigs).
 static bool g_smaa_enable = true;
+static bool g_smaa_t2x = false;             // SMAA T2x: a two phase jitter and the previous frame, through the upscalers' motion vectors
 static float g_rcas_sharpness = 0.f;        // RCAS sharpen on SMAA output (0 = off)
 static bool g_hide_ui = false;              // hide the game's HUD (for clean screenshots)
 static bool g_smaa_predication = true;      // SMAA predication on geometry (depth from scene-color .a)
@@ -329,9 +330,9 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    std::unordered_set<uint64_t> bloom_cb_logged;
 #endif
 
-   // SMAA metrics CB (b1) = (1/w,1/h,w,h) + (predication scale,0,0,0); scale 2.0 when predication on, else 1.0.
-   ComPtr<ID3D11Buffer> cb_smaa_metrics;
-   uint32_t smaa_metrics_w = 0, smaa_metrics_h = 0;
+   // SMAA metrics CB (b1) = (1/w,1/h,w,h) + (predication scale,0,0,0) + T2x's subsample indices; scale 2.0 when predication on, else
+   // 1.0. Written every frame.
+   com_ptr<ID3D11Buffer> cb_smaa_metrics;
 
    // SMAA and RCAS input: a snapshot of the LDR as the tonemap wrote it (gamma 2.2). SMAA's edge detection reads it as stored, its
    // neighborhood blend filters it in linear light (Luma_SMAA_impl.hlsl).
@@ -349,6 +350,17 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11RenderTargetView> tex_smaa_out_rtv;
    ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
    uint32_t smaa_out_w = 0, smaa_out_h = 0;
+
+   // SMAA T2x (see "RunPostTonemapSMAA"), set at present for the whole frame like "sr_active". The scene jitters only after a frame
+   // the resolve ran, as with "mv_jitter_allowed". The phase is chosen when the scene opens, -1 if it didn't jitter.
+   bool t2x_active = false;
+   int t2x_phase = -1;
+   // SMAA's output of this frame and of the previous one, alternating: linear RGB with the velocity length in alpha. The previous one
+   // is the history only if "t2x_frame", the last frame the resolve ran, was the frame before.
+   ComPtr<ID3D11Texture2D> t2x_frames[2];
+   ComPtr<ID3D11RenderTargetView> t2x_frame_rtvs[2];
+   ComPtr<ID3D11ShaderResourceView> t2x_frame_srvs[2];
+   uint32_t t2x_frame = 0;
 
    // RCAS sharpen CB (b0) = (w,h,sharpness,0). RCAS writes the LDR RTV, so it needs no output temp.
    ComPtr<ID3D11Buffer> cb_sharpen;
@@ -370,7 +382,6 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    uint32_t pred_w = 0, pred_h = 0;
    ComPtr<ID3D11Buffer> cb_pred;
    float pred_tolerance = -1.f;
-   float smaa_metrics_pred_scale = -1.f; // recreate the metrics CB when predication turns on/off
 
    // Luma HDR pyramidal bloom output (linear fp16), generated at the tonemap from the scene SRV, bound to PS t5 (BL2) / t8 (TPS).
    ComPtr<ID3D11ShaderResourceView> srv_luma_bloom;
@@ -421,6 +432,8 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no upscaler)
+   com_ptr<ID3D11ShaderResourceView> mv_srv;  // SMAA T2x's view of it
+   bool mv_filled = false;                    // The fill wrote this frame's motion vectors (reset at present)
    // The upscaler's depth, built from the scene's alpha by the fill (the game's depth has no shader resource view)
    com_ptr<ID3D11Texture2D> mv_device_depth;
    com_ptr<ID3D11UnorderedAccessView> mv_device_depth_uav;
@@ -623,12 +636,23 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
       smaa_out_w = smaa_out_h = 0;
    }
 
+   void ReleaseT2xFrames()
+   {
+      for (int i = 0; i < 2; i++)
+      {
+         t2x_frames[i].reset();
+         t2x_frame_rtvs[i].reset();
+         t2x_frame_srvs[i].reset();
+      }
+   }
+
    // The motion vector target and the device depth the fill writes, recreated at their next use
    void ReleaseMotionVectorTargets()
    {
       mv_texture.reset();
       mv_rtv.reset();
       mv_uav.reset();
+      mv_srv.reset();
       mv_device_depth.reset();
       mv_device_depth_uav.reset();
       ReleaseReactiveMasks();
@@ -829,21 +853,6 @@ class Borderlands2 final : public Game
          pred_ok = gd->cb_pred && gd->uav_pred && gd->srv_pred;
       }
 
-      // Recreated on a resolution or predication change
-      const float pred_scale = (pred_ok ? 2.0f : 1.0f);
-      if (!gd->cb_smaa_metrics || gd->smaa_metrics_w != w || gd->smaa_metrics_h != h || gd->smaa_metrics_pred_scale != pred_scale)
-      {
-         const float metrics[8] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, pred_scale, 0.f, 0.f, 0.f};
-         if (CreateImmutableCB(native_device, metrics, sizeof(metrics), std::addressof(gd->cb_smaa_metrics)))
-         {
-            gd->smaa_metrics_w = w;
-            gd->smaa_metrics_h = h;
-            gd->smaa_metrics_pred_scale = pred_scale;
-         }
-      }
-      if (!gd->cb_smaa_metrics)
-         return;
-
       if (do_sharpen)
       {
          gd->smaa_out_frame = cb_luma_global_settings.FrameIndex;
@@ -911,6 +920,39 @@ class Borderlands2 final : public Game
       }
 #endif
 
+      // SMAA T2x: SMAA into this frame's linear target with the velocity, then the resolve with the previous frame into the chain's
+      // output. It needs this frame's motion vectors from the fill, at the LDR's size. Without them this frame is 1x and the next one
+      // doesn't jitter.
+      auto* const t2x_weight_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS SMAA T2x Blending Weight Calculation PS"));
+      auto* const t2x_blend_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS SMAA T2x Neighborhood Blending PS"));
+      auto* const t2x_resolve_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS SMAA T2x Resolve PS"));
+      bool t2x = gd->t2x_active && gd->mv_filled && gd->mv_srv && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps && copy_vs && GetViewTextureSize(gd->mv_srv.get()) == uint2{w, h};
+      const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
+      const int t2x_current = int(frame_index & 1);
+      bool t2x_history = gd->t2x_frames[0] && gd->t2x_frame + 1 == frame_index;
+      if (t2x && GetViewTextureSize(gd->t2x_frame_srvs[0].get()) != uint2{w, h})
+      {
+         t2x_history = false;
+         gd->ReleaseT2xFrames();
+         for (int i = 0; i < 2; i++)
+         {
+            if (!CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, std::addressof(gd->t2x_frames[i]), DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+                FAILED(native_device->CreateRenderTargetView(gd->t2x_frames[i].get(), nullptr, gd->t2x_frame_rtvs[i].put())) ||
+                FAILED(native_device->CreateShaderResourceView(gd->t2x_frames[i].get(), nullptr, gd->t2x_frame_srvs[i].put())))
+            {
+               gd->ReleaseT2xFrames();
+               break;
+            }
+         }
+         t2x = gd->t2x_frames[0].get() != nullptr;
+      }
+
+      // b1: the metrics, the predication threshold scale and T2x's subsample indices for the jitter phase (see "OpenScene"), 0 for 1x
+      const float subsample_indices = ((t2x && gd->t2x_phase >= 0) ? float(gd->t2x_phase + 1) : 0.f);
+      const float metrics[12] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, (pred_ok ? 2.0f : 1.0f), 0.f, 0.f, 0.f, subsample_indices, subsample_indices, subsample_indices, 0.f};
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_smaa_metrics), metrics, sizeof(metrics)))
+         return;
+
       // SMAA (3 passes). Metrics CB at VS+PS b1 (DrawSMAA restores VS/PS/SRVs/RTs, not cbuffers).
       ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
       native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
@@ -921,11 +963,32 @@ class Borderlands2 final : public Game
 
       // The last pass of the chain renders straight into the LDR RTV, which is safe because SMAA and RCAS sample
       // the snapshot copies, never the LDR itself.
+      ID3D11RenderTargetView* const output_rtv = (do_sharpen ? gd->tex_smaa_out_rtv.get() : ldr_rtv);
+      const SMAAT2xPasses t2x_passes = {.blending_weight_calculation_ps = t2x_weight_ps, .neighborhood_blending_ps = t2x_blend_ps, .velocity = gd->mv_srv.get()};
       DrawSMAA(native_device, native_device_context, device_data,
-         do_sharpen ? gd->tex_smaa_out_rtv.get() : ldr_rtv,
+         t2x ? gd->t2x_frame_rtvs[t2x_current].get() : output_rtv,
          gd->srv_input_encoded.get() /*neighborhood blend (filtered in linear light)*/,
          gd->srv_input_encoded.get() /*edge detection (gamma 2.2)*/,
-         pred_ok ? gd->srv_pred.get() : nullptr /*predication signal*/);
+         pred_ok ? gd->srv_pred.get() : nullptr /*predication signal*/,
+         t2x ? &t2x_passes : nullptr);
+
+      if (t2x)
+      {
+         // The resolve: t0 this frame, t1 the previous one or this one again without a history, t2 the motion vectors, s0 linear and
+         // s1 point
+         DrawStateStack<DrawStateStackType::FullGraphics> resolve_state;
+         resolve_state.Cache(native_device_context, device_data.uav_max_count);
+         // The patched draws may leave the motion vector target bound, and its view would then read as null
+         native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
+         ID3D11ShaderResourceView* const resolve_srvs[2] = {gd->t2x_frame_srvs[t2x_history ? (t2x_current ^ 1) : t2x_current].get(), gd->mv_srv.get()};
+         native_device_context->PSSetShaderResources(1, 2, resolve_srvs);
+         ID3D11SamplerState* const resolve_samplers[2] = {device_data.sampler_state_linear.get(), device_data.sampler_state_point.get()};
+         native_device_context->PSSetSamplers(0, 2, resolve_samplers);
+         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
+            copy_vs, t2x_resolve_ps, gd->t2x_frame_srvs[t2x_current].get(), output_rtv, w, h, false);
+         resolve_state.Restore(native_device_context);
+         gd->t2x_frame = frame_index;
+      }
 
       if (do_sharpen)
       {
@@ -1370,6 +1433,14 @@ class Borderlands2 final : public Game
       }
       const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
       gd.mv_jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) && GetPerfMotionVectorDraws() != 0) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+      // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
+      // 2. That is its table read with y up, which measured better (docs/SMAA-Lab.md). The projection moves the other way.
+      gd.t2x_phase = ((gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex && GetPerfMotionVectorDraws() != 0) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
+      if (gd.t2x_phase >= 0)
+      {
+         const float shift = (gd.t2x_phase == 0 ? -0.25f : 0.25f);
+         gd.mv_jitter = {shift, shift};
+      }
       gd.mv_jitter_ndc = {gd.mv_jitter[0] * 2.f / device_data.output_resolution.x, gd.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -1378,6 +1449,7 @@ class Borderlands2 final : public Game
          gd.mv_jitter = {};
          gd.mv_jitter_ndc = {};
          gd.mv_jitter_buffer.reset();
+         gd.t2x_phase = -1;
       }
    }
 
@@ -1640,6 +1712,7 @@ class Borderlands2 final : public Game
             {
                native_device->CreateUnorderedAccessView(gd.mv_texture.get(), nullptr, &gd.mv_uav);
             }
+            native_device->CreateShaderResourceView(gd.mv_texture.get(), nullptr, &gd.mv_srv);
             const CD3D11_TEXTURE2D_DESC depth_desc(DXGI_FORMAT_R32_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
             if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, depth_desc, &gd.mv_device_depth)))
             {
@@ -2273,6 +2346,7 @@ class Borderlands2 final : public Game
             native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(null_uavs)), null_uavs, nullptr);
             native_device_context->CSSetShaderResources(0, UINT(std::size(null_srvs)), null_srvs);
             filled = true;
+            gd.mv_filled = true;
             if (write_reactive)
             {
                gd.sr_reactive_frame = cb_luma_global_settings.FrameIndex;
@@ -2328,7 +2402,7 @@ public:
    {
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
-      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_t2x", &g_smaa_t2x}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
          { "hide_ui",
             &g_hide_ui }});
       Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_match_objects", &g_mv_match_objects}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"blend_memo", &g_blend_memo}, {"bound_state_tracking", &g_bound_state_tracking}, {"bound_state_check", &g_bound_state_check}, {"vc4_mirror", &g_vc4_mirror}, {"vc4_mirror_check", &g_vc4_mirror_check}, {"mv_trace_loading", &g_mv_trace_loading}, { "perf_hook_timers",
@@ -2394,6 +2468,13 @@ public:
       // DrawCustomPixelShader after SMAA).
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Sharpen PS"),
          ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+      // SMAA T2x's own passes ("SMAA_T2X" in Luma_SMAA_impl.hlsl). The edge detection and the vertex shaders are 1x's.
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS SMAA T2x Blending Weight Calculation PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS SMAA T2x Neighborhood Blending PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS SMAA T2x Resolve PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
       // Depth-extract CS for SMAA predication: scene-color .a (Gearbox EncodeFloatW view depth) -> R16F plane-deviation edge-ness.
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Depth Extract CS"),
          ShaderDefinition("Luma_BL2TPS_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
@@ -3545,7 +3626,18 @@ public:
       // vector state are fixed here for the next frame (see "IsSRActive")
       gd.mv_jitter_allowed = device_data.has_drawn_sr;
       gd.sr_active = LatchSRFrame(device_data);
-      gd.mv_active = IsSRActive(device_data) || g_mv_enable;
+      // SMAA T2x runs on the upscalers' motion vectors and gives way to an upscaler. Turned off, its frames go, and the motion vectors
+      // go as when no upscaler is picked.
+      gd.t2x_phase = -1;
+      gd.mv_filled = false;
+      const bool t2x_was_active = gd.t2x_active;
+      gd.t2x_active = g_smaa_enable && g_smaa_t2x && !gd.sr_active;
+      if (t2x_was_active && !gd.t2x_active)
+      {
+         gd.ReleaseT2xFrames();
+         gd.release_sr_resources = true;
+      }
+      gd.mv_active = IsSRActive(device_data) || g_mv_enable || gd.t2x_active;
       // The proxy's vertex constant mirror, while its CSMT layer runs; the buffer hooks only where it can't replace them. Registered on
       // this thread, the only one their events come from (ReShade changes its callback lists without a lock).
       {
@@ -3579,7 +3671,7 @@ public:
       if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
-         if (!g_mv_enable)
+         if (!g_mv_enable && !gd.t2x_active)
          {
             const std::unique_lock lock(gd.mv_mutex);
             gd.ReleaseMotionVectorTargets();
@@ -3649,6 +3741,10 @@ public:
       if (gd.tex_smaa_out && cb_luma_global_settings.FrameIndex - gd.smaa_out_frame > smaa_idle_release_frames)
       {
          gd.ReleaseSMAAOutput();
+      }
+      if (gd.t2x_frames[0] && cb_luma_global_settings.FrameIndex - gd.t2x_frame > smaa_idle_release_frames)
+      {
+         gd.ReleaseT2xFrames();
       }
 #endif
 #if ENABLE_BLOOM
@@ -3771,6 +3867,7 @@ public:
    void LoadConfigs() override
    {
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
+      reshade::get_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       // Predication has no shipping UI (see DrawImGuiSettings), but stays overridable from the ini.
       reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
@@ -3810,6 +3907,17 @@ public:
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's Anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
+      }
+      ImGui::EndDisabled();
+      ImGui::BeginDisabled(!g_smaa_enable || sr_active);
+      bool t2x_shown = g_smaa_t2x && !sr_active;
+      if (ImGui::Checkbox("SMAA T2x", sr_active ? &t2x_shown : &g_smaa_t2x))
+      {
+         reshade::set_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Adds the previous frame to SMAA: the image shifts by a quarter pixel every other frame and the two frames are blended\nalong the motion. Smoother edges and fine detail, less shimmer; a little softer in motion. Not used with DLSS/FSR or Luma TAA.");
       }
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
