@@ -2,35 +2,43 @@
 #include "../Includes/Math.hlsl"
 #include "../Includes/Reinhard.hlsl"
 
-// Luma TAA: temporal anti-aliasing resolve, at native resolution or upscaling ("TAA_UPSCALE"), for games without (usable)
-// TAA or as a vendor-agnostic alternative to DLAA/FSR Native AA. Each component was picked by measurement against 64 spp
-// ground truth over moving, HDR, noisy and sub-pixel test scenes (see "docs/Luma-TAA.md"):
-// - 5-tap bicubic history: Catmull-Rom (sharpness c = 0.5), c = 0.4 for the 2x history and TAAU (Jimenez, "Dynamic
-//   Temporal Antialiasing and Upsampling in Call of Duty"; Bevy)
-// - motion vector of the closest depth in the neighborhood (Karis, "High Quality Temporal Supersampling")
-// - "rounded" 3x3 + cross neighborhood box, history clipped toward the clamped box average (Playdead, INSIDE)
-// - a linear blend, which keeps the energy of HDR highlights (optionally per-channel Reinhard around it, Godot/Spartan)
-// - accumulated history weight w' = 1 / (2 - w) (MiniEngine, Intel), capped by the resampling blur of the fractional
-//   per frame displacement (Yang et al., "Amortized Supersampling")
-// - a thin feature lock (AMD FSR 2 "locks"): history isn't clipped where a sub-pixel highlight was seen recently
-// - from Medium quality, a flickering analysis that widens the clip where the current frame aliases (UE TSR), and an
-//   optional reactive mask (AMD FSR 2)
-// - from High quality, the history at 2x2 the render resolution (UE TSR's history screen percentage 200)
-// - at Ultra quality, a depth clip against the previous depth reconstructed from this frame (AMD FSR 2)
+// Luma TAA: temporal anti-aliasing resolve, native or upscaling ("TAA_UPSCALE"), for games without usable TAA or as a
+// vendor-agnostic alternative to DLAA and FSR Native AA. Components and the sources of their ideas:
+// - 5-tap bicubic history (MJP's Catmull-Rom with the 5 taps of Jimenez, SIGGRAPH 2016)
+// - motion vector of the closest 3x3 depth (Karis, SIGGRAPH 2014)
+// - rounded 3x3 + cross box, history clipped toward its clamped average (Playdead's INSIDE)
+// - linear blend, which keeps the energy of HDR highlights, optionally with Reinhard around it (Godot 4)
+// - accumulated weight 1 / (2 - w) (MiniEngine), capped by the resampling blur (Yang et al., SIGGRAPH Asia 2009)
+// - thin feature lock, reactive mask, and at Ultra a depth clip against the reconstructed previous depth (AMD FSR 2)
+// - flickering analysis and the 2x2 history (Unreal Engine's TSR, ideas only, no Unreal Engine code)
 //
-// Inputs follow the "SR::SuperResolutionImpl::DrawData" contract: device depth, motion vectors in any unit that
-// "MotionVectorScale" converts to pixels such that previous position = current position + motion vector, and
-// colors in linear BT.709 (scRGB: HDR values and negative channels are fine; the relative luminance below uses BT.709
-// coefficients). The history is a Luma owned RGBA16F texture (2x2 the render resolution from High
-// quality): rgb is linear color, alpha the accumulated weight.
+// Inputs follow "SR::SuperResolutionImpl::DrawData": device depth, motion vectors that "MotionVectorScale" turns into
+// pixels (previous = current + mv), linear BT.709 color (scRGB is fine). The history is a Luma owned RGBA16F texture:
+// rgb is linear color, alpha the accumulated weight; 2x2 the render resolution from High quality.
+//
+// MIT License. Copyright (c) 2026 Hlib Omelchenko. Parts are derived from third party code, also under the MIT License:
+// - "SampleHistory": MJP's "SampleTextureCatmullRom". Copyright (c) 2019 MJP
+// - "ClipToBox" and the rounded box: Playdead's "temporal". Copyright (c) 2015 Playdead
+// - the weight rcp(2 - w): Microsoft MiniEngine's "TemporalBlendCS.hlsl". Copyright (c) 2015 Microsoft
+// - "reconstruct_previous_depth_cs" and the depth clip: AMD FidelityFX FSR 2. Copyright (c) 2022-2023 Advanced Micro
+//   Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+// documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+// Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-// Quality levels (HDR-FLIP train / stress from docs/Luma-TAA.md, lower is better; GPU ms at 1080p / 4K on an RTX 4080
-// SUPER, "taaperf" with coherent inputs and no reactive mask):
-// 0 Low: 3x3 color box, motion vector of the closest depth in the cross, bilinear history (7.19 / 9.60; 0.12 / 0.52)
-// 1 Medium: + 5-tap bicubic history, closest depth over the full 3x3, flickering analysis, reactive mask
-//   (6.13 / 8.16; 0.14 / 0.59)
-// 2 High: + history at 2x2 the render resolution (5.04 / 6.84; 0.29 / 1.19)
-// 3 Ultra: + depth clip, which needs "reconstruct_previous_depth_cs" dispatched first (4.56 / 6.82; 0.34 / 1.40)
+// Quality levels: 0 Low: 3x3 box, closest depth of the cross, bilinear history. 1 Medium: + 5-tap bicubic history,
+// closest depth of the full 3x3, flickering analysis, reactive mask. 2 High: + 2x2 history. 3 Ultra: + depth clip
+// ("reconstruct_previous_depth_cs" dispatched first).
 #ifndef TAA_QUALITY
 #define TAA_QUALITY 2
 #endif
@@ -97,7 +105,7 @@
 #endif
 // An output pixel without a sample this frame still takes the Gaussian estimate, at this weight times its nearest
 // sample's Gaussian weight. This leaves fewer frames without any current information in motion, at the cost of a little
-// sharpness (see "Temporal upscaling" in "docs/Luma-TAA.md").
+// sharpness.
 #ifndef TAA_UPSCALE_FALLBACK_WEIGHT
 #define TAA_UPSCALE_FALLBACK_WEIGHT 0.5
 #endif
@@ -119,7 +127,7 @@
 #define TAA_HISTORY_2X (TAA_QUALITY >= 2 && !TAA_UPSCALE)
 #endif
 // Bicubic history sharpness c (Catmull-Rom is 0.5). The 2x history and TAAU resample at a higher frequency, where 0.4
-// rings less and measured better in the lab (see "docs/Luma-TAA.md").
+// rings less and measured better in the lab.
 #ifndef TAA_HISTORY_SHARPNESS
 #if TAA_HISTORY_2X || TAA_UPSCALE
 #define TAA_HISTORY_SHARPNESS 0.4
@@ -260,8 +268,9 @@ float ResamplingBlurCap(float2 displacement, float tolerance)
    return tolerance / (tolerance + resampling_blur);
 }
 
-// Bilinear at Low quality, otherwise the 5-tap bicubic (the 9-tap bilinear formulation without its 4 corner taps,
-// weights not renormalized). "position" is in pixels, with texel centers at integer + 0.5.
+// Bilinear at Low quality, otherwise the 5-tap bicubic: MJP's 9-tap bilinear formulation without its 4 corner taps,
+// weights not renormalized (see the license notice at the top). "position" is in pixels, with texel centers at
+// integer + 0.5.
 float4 SampleHistory(float2 position, float2 inv_resolution)
 {
 #if TAA_QUALITY == 0
