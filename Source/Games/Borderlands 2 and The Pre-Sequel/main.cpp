@@ -3917,7 +3917,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Adds the previous frame to SMAA: the image shifts by a quarter pixel every other frame and the two frames are blended\nalong the motion. Smoother edges and fine detail, less shimmer; a little softer in motion. Not used with DLSS/FSR or Luma TAA.");
+         ImGui::SetTooltip("Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR or Luma TAA.");
       }
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
