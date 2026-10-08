@@ -28,6 +28,8 @@
 // a resolve. SMAA replaces it (the tonemap gates RunEdgeAA on GameSettings.SMAAEnable). Core auto-registers the
 // 6 "SMAA ..." passes from Luma_SMAA_impl.hlsl.
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 
 #include "..\..\Core\core.hpp"
 

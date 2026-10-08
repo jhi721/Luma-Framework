@@ -12,6 +12,8 @@
 
 #define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1 // replaces the game's FXAA pass (FXAA AA mode) with SMAA
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 // Every pass Luma reissues itself (the DOF-variant resolve run natively first, the output-sized post passes, the upscaled
 // tonemap and the draws after it, the tonemap's RCAS) calls the game's draw through "original_draw_dispatch_func": Core only
 // provides it outside DEVELOPMENT with this set (without it they all silently fall back to native in Test/Publishing).

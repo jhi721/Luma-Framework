@@ -3,6 +3,8 @@
 #define DISABLE_AUTO_DEBUGGER 1
 // SMAA replaces the game's CMAA2 or FXAA (see "RunSMAA").
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 // Luma Bloom replaces the glow pyramid (see "RunLumaBloom").
 #define ENABLE_BLOOM 1
 // XeGTAO and Luma Bloom re-issue the game's ASSAO apply and glow_pass2 draws with their own pixel shaders, so they need

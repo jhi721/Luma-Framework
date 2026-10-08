@@ -17,6 +17,8 @@
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
 // The game ships no shader AA (MSAA only), so SMAA adds rather than replaces
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 // Every game pixel shader gets the output clamp of its vanilla UNORM targets (see "OutputClamp.h")
 #define LUMA_PATCH_BYTECODE_SYNC 1
 

@@ -11,6 +11,8 @@
 #define GEOMETRY_SHADER_SUPPORT 0
 // SMAA replaces the game's FXAA pass. Core auto-registers the 6 "SMAA ..." passes from Luma_SMAA_impl.hlsl.
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 // The Luma HDR bloom pyramid replaces the game's bloom. Core auto-registers the "Bloom ..." passes from Luma_Bloom_impl.hlsl.
 #define ENABLE_BLOOM 1
 // FixImpossiblePerRTBlend re-issues draws: outside DEVELOPMENT only this define makes original_draw_dispatch_func non-null.

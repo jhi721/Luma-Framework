@@ -44,4 +44,8 @@ cbuffer SmaaMetricsCB : register(b1)
 // Neighborhood blending: tex0 = colorTex (gamma copy), tex1 = blendTex. Blend in gamma (the buffer's space): keeps the bright HDR sky
 // compressed so 1px-thin dark features survive the average (a linear blend erodes them). No HDR tail and no re-encode: the output stays
 // in the gamma canvas' space, mid-pipeline before the HUD and the composition.
+// The predication signal above is a one-sided edge-ness; morphological edge suppression in place of the local contrast
+// adaptation (both in SMAA_Passes.hlsl / SMAA.hlsl). main.cpp also sets SMAA_SMOOTH_U_SHAPES 0.
+#define SMAA_PREDICATION_EDGENESS           1
+#define SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION 1
 #include "../Includes/SMAA_Passes.hlsl"

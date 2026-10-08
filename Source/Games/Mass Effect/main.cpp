@@ -10,6 +10,8 @@
 #define GEOMETRY_SHADER_SUPPORT 0
 // The game ships no AA at all (no option, no post AA pass, sampleCount 1), so SMAA adds rather than replaces.
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 // Replaces the game's quarter-res bright-pass glow, which the replaced gather then stops writing.
 #define ENABLE_BLOOM 1
 // Outside DEVELOPMENT only this define makes original_draw_dispatch_func non-null; without it the callback never fires.

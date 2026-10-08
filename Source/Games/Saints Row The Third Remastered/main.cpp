@@ -4,6 +4,8 @@
 #define DISABLE_AUTO_DEBUGGER 1
 // SMAA replaces the game's FXAA (see DrawSMAAInPlaceOfFXAA)
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 
 #include "..\..\Core\core.hpp"
 #if DEVELOPMENT

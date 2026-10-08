@@ -8,6 +8,8 @@
 // SMAA runs right after the composite, through "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 // Appends a saturate to the UI shaders (see "PatchShaderBytecodeSync")
 #define LUMA_PATCH_BYTECODE_SYNC 1
 // The motion vector draw key reads "last_draw_dispatch_data"

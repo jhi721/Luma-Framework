@@ -29,6 +29,10 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PREDICATION_STRENGTH  0.5
 #define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)
+// The predication signal above is a one-sided edge-ness; morphological edge suppression in place of the local contrast
+// adaptation (both in SMAA_Passes.hlsl / SMAA.hlsl). main.cpp also sets SMAA_SMOOTH_U_SHAPES 0.
+#define SMAA_PREDICATION_EDGENESS           1
+#define SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION 1
 // Color.hlsl only for the decode and re-encode helpers. Neither it (it includes only Math.hlsl) nor the self-contained SMAA.hlsl
 // has a DEVELOPMENT/TEST conditional, so every entry point stays byte-identical across the two define sets.
 #include "../Includes/Color.hlsl"

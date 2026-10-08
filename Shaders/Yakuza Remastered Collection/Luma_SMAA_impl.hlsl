@@ -18,4 +18,8 @@
 // Edge detection: tex0 = colorTexGamma (gamma canvas snapshot), tex1 = predication edge-ness (may be null)
 // Neighborhood blending: tex0 = colorTex (linear copy), tex1 = blendTex. Re-encode to the canvas' gamma.
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
+// The predication signal above is a one-sided edge-ness; morphological edge suppression in place of the local contrast
+// adaptation (both in SMAA_Passes.hlsl / SMAA.hlsl). main.cpp also sets SMAA_SMOOTH_U_SHAPES 0.
+#define SMAA_PREDICATION_EDGENESS           1
+#define SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION 1
 #include "../Includes/SMAA_Passes.hlsl"

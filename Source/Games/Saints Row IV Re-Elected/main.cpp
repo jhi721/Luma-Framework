@@ -8,6 +8,8 @@
 #define LUMA_PATCH_SYNC_MODE_CLONE 1
 // SMAA runs right after the rl_hdr final composite.
 #define ENABLE_SMAA 1
+// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+#define SMAA_SMOOTH_U_SHAPES 0
 #define ENABLE_BLOOM 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
