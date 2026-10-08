@@ -1024,13 +1024,13 @@ public:
 
       ImGui::SeparatorText("Anti-Aliasing");
 
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
+      if (SettingsUI::Checkbox("SMAA Enable", &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's CMAA2/FXAA with SMAA and its CAS with RCAS (requires Anti-Aliasing enabled in the game's graphics settings).");
 
       ImGui::BeginDisabled(!g_smaa_enable);
-      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
+      SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1039,13 +1039,13 @@ public:
 #if DEVELOPMENT
       // Predication only relaxes the edge threshold back to base ULTRA on geometry, never below, so off is strictly worse:
       // a bisect switch and calibration tools for devs (session-only), shipped on at 0.02.
-      ImGui::Checkbox("SMAA Predication", &g_smaa_predication);
+      SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.");
-      ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
+      SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
-      ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+      SettingsUI::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
       if (ImGui::Button("Measure Predication"))
@@ -1060,7 +1060,7 @@ public:
       {
          ImGui::SeparatorText("Grade");
 
-         if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
             device_data.cb_luma_global_settings_dirty = true;
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
@@ -1069,7 +1069,7 @@ public:
          if (DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure"))
             device_data.cb_luma_global_settings_dirty = true;
 
-         if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
             device_data.cb_luma_global_settings_dirty = true;
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
@@ -1078,7 +1078,7 @@ public:
          if (DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast"))
             device_data.cb_luma_global_settings_dirty = true;
 
-         if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
             device_data.cb_luma_global_settings_dirty = true;
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
@@ -1087,7 +1087,7 @@ public:
          if (DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation"))
             device_data.cb_luma_global_settings_dirty = true;
 
-         if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
             device_data.cb_luma_global_settings_dirty = true;
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "HighlightDechroma", gs.HighlightDechroma);
@@ -1099,14 +1099,14 @@ public:
 
       ImGui::SeparatorText("Bloom");
 
-      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+      if (SettingsUI::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
          reshade::set_config_value(nullptr, NAME, "BloomEnable", g_luma_bloom_enable);
       if (ImGui::IsItemHovered())
          // Off the canon "wider, softer HDR bloom": its width is fitted to the vanilla glow and it stays within 1 per channel.
          ImGui::SetTooltip("Replaces the game's bloom with a smoother version of the same glow.");
 
       ImGui::BeginDisabled(!g_luma_bloom_enable);
-      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
@@ -1118,27 +1118,27 @@ public:
 
       ImGui::SeparatorText("Ambient Occlusion");
 
-      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
+      if (SettingsUI::Checkbox("XeGTAO Enable", &g_gtao_enable))
          reshade::set_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's graphics settings).");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      SettingsUI::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Primary darkness dial (higher = darker AO).");
-      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
+      SettingsUI::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("0 = the game's own SSAO radius (0.8); > 0 overrides it, in the same view units.");
 #if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
-      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      SettingsUI::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Draws diagnostics through the game's SSAO apply (multiplied onto the scene). Depth gradient flat or blocky = wrong input;\nNormals: camera-facing surfaces bright; AO x8 = spot broad over-occlusion.");
 #endif
       ImGui::EndDisabled();
 #endif
 #if DEVELOPMENT
-      ImGui::Checkbox("Skip AO Apply", &g_gtao_skip_apply);
+      SettingsUI::Checkbox("Skip AO Apply", &g_gtao_skip_apply);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Calibration reference: the frame without any AO, whether XeGTAO or the game's SSAO is active.");
 #endif
@@ -1146,7 +1146,7 @@ public:
       ImGui::SeparatorText("Effects");
 
       bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
+      if (SettingsUI::Checkbox("Video AutoHDR", &video_auto_hdr))
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
@@ -1156,7 +1156,7 @@ public:
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
 
       ImGui::BeginDisabled(!video_auto_hdr);
-      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
+      if (SettingsUI::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
@@ -1167,7 +1167,7 @@ public:
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
+      if (SettingsUI::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
@@ -1177,7 +1177,7 @@ public:
          ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
-      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
+      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
    }

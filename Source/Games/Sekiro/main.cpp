@@ -111,7 +111,7 @@ namespace
          bool def = GetB(d);
          
          ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-         bool c = ImGui::Checkbox(label, &def);
+         bool c = SettingsUI::Checkbox(label, &def);
          ImGui::PopID();
 
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -125,7 +125,7 @@ namespace
       int UIDropDown(uint32_t d, const char* label, const char* const items[], const char* tooltip)
       {
          int def = Get(d);
-         bool c = ImGui::Combo(label, &def, items, IM_ARRAYSIZE(items));
+         bool c = SettingsUI::Combo(label, &def, items, IM_ARRAYSIZE(items));
          if (c) Set(d, def);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
          UIResetButton(d);
@@ -137,7 +137,7 @@ namespace
       {
          std::vector<const char*> items(items_list);
          int def = Get(d);
-         bool c = ImGui::Combo(label, &def, items.data(), static_cast<int>(items.size()));
+         bool c = SettingsUI::Combo(label, &def, items.data(), static_cast<int>(items.size()));
          if (c) Set(d, def);
          if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
          UIResetButton(d);
@@ -530,7 +530,7 @@ public:
       ShaderDefineInfo::UIToggleCheckmark(ShaderDefineInfo::TONEMAP_BT2020, "Tonemap BT2020", "Do per-channel tonemap in BT2020 instead of BT709.");
 
       if (bool is_need_clamp_1 = cb_luma_global_settings.GameSettings.UIBrightnessRatio > 1.0f && cb_luma_global_settings.DisplayMode == DisplayModeType::SDR;
-         ImGui::SliderFloat("UI Brightness Ratio", &cb_luma_global_settings.GameSettings.UIBrightnessRatio, 0.0f, cb_luma_global_settings.DisplayMode == DisplayModeType::HDR ? 2.0f : 1.0f, "%.2f") || is_need_clamp_1)
+         SettingsUI::SliderFloat("UI Brightness Ratio", &cb_luma_global_settings.GameSettings.UIBrightnessRatio, 0.0f, cb_luma_global_settings.DisplayMode == DisplayModeType::HDR ? 2.0f : 1.0f, "%.2f") || is_need_clamp_1)
       {
          if (is_need_clamp_1) cb_luma_global_settings.GameSettings.UIBrightnessRatio = 1.0f;
          reshade::set_config_value(nullptr, NAME, "UIBrightnessRatio", cb_luma_global_settings.GameSettings.UIBrightnessRatio);
@@ -543,25 +543,25 @@ public:
       auto sr_id = device_data.GetSRInstanceData();
       if (sr_id)
       {
-         ImGui::Checkbox("MVS Jittered", &sr_id->settings_data.mvs_jittered);
-         ImGui::SliderFloat("MVS X Scale", &sr_id->settings_data.mvs_x_scale, 0.0f, 2.0f, "%.2f");
-         ImGui::SliderFloat("MVS Y Scale", &sr_id->settings_data.mvs_y_scale, 0.0f, 2.0f, "%.2f");
-         ImGui::Checkbox("Depth Inverted", &sr_id->settings_data.inverted_depth);
+         SettingsUI::Checkbox("MVS Jittered", &sr_id->settings_data.mvs_jittered);
+         SettingsUI::SliderFloat("MVS X Scale", &sr_id->settings_data.mvs_x_scale, 0.0f, 2.0f, "%.2f");
+         SettingsUI::SliderFloat("MVS Y Scale", &sr_id->settings_data.mvs_y_scale, 0.0f, 2.0f, "%.2f");
+         SettingsUI::Checkbox("Depth Inverted", &sr_id->settings_data.inverted_depth);
       }
 
       ImGui::NewLine();
       
-      ImGui::SliderFloat("Jitter 0 X", &SRImp::Jitter::jitters[0].x, -1.0f, 1.0f, "%.2f"); 
-      ImGui::SliderFloat("Jitter 0 Y", &SRImp::Jitter::jitters[0].y, -1.0f, 1.0f, "%.2f");
+      SettingsUI::SliderFloat("Jitter 0 X", &SRImp::Jitter::jitters[0].x, -1.0f, 1.0f, "%.2f"); 
+      SettingsUI::SliderFloat("Jitter 0 Y", &SRImp::Jitter::jitters[0].y, -1.0f, 1.0f, "%.2f");
       ImGui::Spacing();
-      ImGui::SliderFloat("Jitter 1 X", &SRImp::Jitter::jitters[1].x, -1.0f, 1.0f, "%.2f");
-      ImGui::SliderFloat("Jitter 1 Y", &SRImp::Jitter::jitters[1].y, -1.0f, 1.0f, "%.2f");
+      SettingsUI::SliderFloat("Jitter 1 X", &SRImp::Jitter::jitters[1].x, -1.0f, 1.0f, "%.2f");
+      SettingsUI::SliderFloat("Jitter 1 Y", &SRImp::Jitter::jitters[1].y, -1.0f, 1.0f, "%.2f");
       ImGui::Spacing();
-      ImGui::SliderFloat("Jitter 2 X", &SRImp::Jitter::jitters[2].x, -1.0f, 1.0f, "%.2f");
-      ImGui::SliderFloat("Jitter 2 Y", &SRImp::Jitter::jitters[2].y, -1.0f, 1.0f, "%.2f");
+      SettingsUI::SliderFloat("Jitter 2 X", &SRImp::Jitter::jitters[2].x, -1.0f, 1.0f, "%.2f");
+      SettingsUI::SliderFloat("Jitter 2 Y", &SRImp::Jitter::jitters[2].y, -1.0f, 1.0f, "%.2f");
       ImGui::Spacing();
-      ImGui::SliderFloat("Jitter 3 X", &SRImp::Jitter::jitters[3].x, -1.0f, 1.0f, "%.2f");
-      ImGui::SliderFloat("Jitter 3 Y", &SRImp::Jitter::jitters[3].y, -1.0f, 1.0f, "%.2f");   
+      SettingsUI::SliderFloat("Jitter 3 X", &SRImp::Jitter::jitters[3].x, -1.0f, 1.0f, "%.2f");
+      SettingsUI::SliderFloat("Jitter 3 Y", &SRImp::Jitter::jitters[3].y, -1.0f, 1.0f, "%.2f");   
       
       if (ImGui::Button("Increment")) SRImp::Jitter::IncrementJitterIndex();
       ImGui::SameLine(); ImGui::Text("i: %u", SRImp::Jitter::i);

@@ -1353,7 +1353,7 @@ public:
       {
          previewString = "None";
       }
-      if (ImGui::BeginCombo("Shadow map size override", previewString))
+      if (SettingsUI::BeginCombo("Shadow map size override", previewString))
       {
          auto AddComboItem = [&](const char* name, uint32_t size, bool enabled)
          {

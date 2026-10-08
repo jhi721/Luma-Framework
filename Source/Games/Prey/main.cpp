@@ -2083,7 +2083,7 @@ public:
    {
       reshade::api::effect_runtime* runtime = nullptr;
 
-      if (ImGui::Checkbox("Tonemap UI Background", &tonemap_ui_background))
+      if (SettingsUI::Checkbox("Tonemap UI Background", &tonemap_ui_background))
       {
          reshade::set_config_value(runtime, NAME, "TonemapUIBackground", tonemap_ui_background);
       }
@@ -2112,7 +2112,7 @@ public:
       }
 
       bool lens_distortion = cb_luma_global_settings.GameSettings.LensDistortion;
-      if (ImGui::Checkbox("Perspective Correction", &lens_distortion))
+      if (SettingsUI::Checkbox("Perspective Correction", &lens_distortion))
       {
          cb_luma_global_settings.GameSettings.LensDistortion = lens_distortion;
          device_data.cb_luma_global_settings_dirty = true;
@@ -2158,7 +2158,7 @@ public:
       bool textures_upgrade_format_changed = false;
       bool textures_upgrade_format_pending_change = false;
       int HDR_textures_upgrade_requested_format_int = (HDR_textures_upgrade_requested_format == RE::ETEX_Format::eTF_R11G11B10F) ? 0 : 1;
-      if (ImGui::SliderInt("HDR Post Process Quality", &HDR_textures_upgrade_requested_format_int, 0, 1, hdr_formats[(uint32_t)HDR_textures_upgrade_requested_format_int], ImGuiSliderFlags_NoInput))
+      if (SettingsUI::SliderInt("HDR Post Process Quality", &HDR_textures_upgrade_requested_format_int, 0, 1, hdr_formats[(uint32_t)HDR_textures_upgrade_requested_format_int], ImGuiSliderFlags_NoInput))
       {
          HDR_textures_upgrade_requested_format = HDR_textures_upgrade_requested_format_int == 0 ? RE::ETEX_Format::eTF_R11G11B10F : RE::ETEX_Format::eTF_R16G16B16A16F;
          textures_upgrade_format_changed = true;

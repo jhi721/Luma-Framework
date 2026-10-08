@@ -140,7 +140,7 @@ namespace ShaderDefines
       bool def = GetBool(d);
       
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Checkbox(label, &def);
+      bool c = SettingsUI::Checkbox(label, &def);
       ImGui::PopID();
 
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -154,7 +154,7 @@ namespace ShaderDefines
    static int UIDropDown(uint32_t d, const char* label, const char* const items[], const char* tooltip)
    {
       int def = Get(d);
-      bool c = ImGui::Combo(label, &def, items, IM_ARRAYSIZE(items));
+      bool c = SettingsUI::Combo(label, &def, items, IM_ARRAYSIZE(items));
       if (c) Set(d, def);
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
       UIResetButton(d);
@@ -166,7 +166,7 @@ namespace ShaderDefines
       std::vector<const char*> items(items_list);
       int def = Get(d);
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Combo(label, &def, items.data(), static_cast<int>(items.size()));
+      bool c = SettingsUI::Combo(label, &def, items.data(), static_cast<int>(items.size()));
       ImGui::PopID();
       if (c) Set(d, def);
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -325,7 +325,7 @@ public:
             else if (custom_sdr_gamma == 2.4f) custom_sdr_gamma_index = 2;
          }
          ImGui::PushID("GammaCorrection custom_sdr_gamma");
-         if (ImGui::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) //user set & save
+         if (SettingsUI::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) //user set & save
          {
             switch (custom_sdr_gamma_index)
             {
@@ -355,12 +355,12 @@ public:
 
          ImGui::Separator();
 
-         if (ImGui::SliderFloat("White Clip", &cb_luma_global_settings.GameSettings.WhiteClip, 0.f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("White Clip", &cb_luma_global_settings.GameSettings.WhiteClip, 0.f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "WhiteClip", cb_luma_global_settings.GameSettings.WhiteClip);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Increase to straighten the rolloff, causing more clipping.");
          DrawResetButton(cb_luma_global_settings.GameSettings.WhiteClip, default_luma_global_game_settings.WhiteClip, "WhiteClip", runtime);
 
-         if (ImGui::SliderFloat("Highlights Saturation", &cb_luma_global_settings.GameSettings.HighlightSat, 0.f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Highlights Saturation", &cb_luma_global_settings.GameSettings.HighlightSat, 0.f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "HighlightSat", cb_luma_global_settings.GameSettings.HighlightSat);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("How much of raw punch through the blown out color grade?\n0 is most like intended SDR, but makes HDR highlights too white.");
          DrawResetButton(cb_luma_global_settings.GameSettings.HighlightSat, default_luma_global_game_settings.HighlightSat, "HighlightSat", runtime);
@@ -369,7 +369,7 @@ public:
       // Misc.
       if (ImGui::CollapsingHeader("Miscellaneous"))
       {
-         if (ImGui::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "Bloom", cb_luma_global_settings.GameSettings.Bloom);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Bloom multiplier.");
          DrawResetButton(cb_luma_global_settings.GameSettings.Bloom, default_luma_global_game_settings.Bloom, "Bloom", runtime);
@@ -381,12 +381,12 @@ public:
          ShaderDefines::UIToggleCheckmark(ShaderDefines::TONEMAP_FILMGRAIN, "Film Grain", "Enables Film Grain.");
          ShaderDefines::UIDropDown(ShaderDefines::TONEMAP_FXAA, "FXAA", {"Off", "On", "Extreme"}, "Enables FXAA pass.");
 
-         if (ImGui::SliderFloat("Mip LOD Bias", &UserSettings::miplodbias.curr, 0.f, -1.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Mip LOD Bias", &UserSettings::miplodbias.curr, 0.f, -1.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "u_miplodbias", UserSettings::miplodbias.curr);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Negative bias boosts texture sharpness at a distance,\nthough too much and this game becomes coarse.");
          DrawResetButton(UserSettings::miplodbias.curr, UserSettings::miplodbias.def, "u_miplodbias", runtime);
 
-         ImGui::Checkbox("Draw UI", &UserSettings::ui.curr);
+         SettingsUI::Checkbox("Draw UI", &UserSettings::ui.curr);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Enable/Disable the UI rendering.");
       }
 

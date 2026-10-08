@@ -62,7 +62,7 @@ public:
 
       if (ImGui::TreeNode("Advanced Settings"))
 		{
-         if (ImGui::SliderFloat("HDR Highlights", &cb_luma_global_settings.GameSettings.HDRHighlights, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("HDR Highlights", &cb_luma_global_settings.GameSettings.HDRHighlights, 0.f, 1.f))
          {
             device_data.cb_luma_global_settings_dirty = true;
          }
@@ -86,7 +86,7 @@ public:
             ImGui::InvisibleButton("", ImVec2(size.x, size.y));
          }
 
-         if (ImGui::SliderFloat("HDR Desaturation", &cb_luma_global_settings.GameSettings.HDRDesaturation, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("HDR Desaturation", &cb_luma_global_settings.GameSettings.HDRDesaturation, 0.f, 1.f))
          {
             device_data.cb_luma_global_settings_dirty = true;
          }

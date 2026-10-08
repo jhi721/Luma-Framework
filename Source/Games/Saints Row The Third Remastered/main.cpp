@@ -1266,7 +1266,7 @@ public:
       const auto& defaults = default_luma_global_game_settings;
       const auto slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
+         if (SettingsUI::SliderFloat(label, value, 0.f, max_value))
          {
             device_data.cb_luma_global_settings_dirty = true;
          }
@@ -1288,7 +1288,7 @@ public:
       const auto toggle = [&](const char* label, const char* key, float* value, float default_value, const char* tooltip)
       {
          bool enabled = *value > 0.5f;
-         if (ImGui::Checkbox(label, &enabled))
+         if (SettingsUI::Checkbox(label, &enabled))
          {
             *value = (enabled ? 1.f : 0.f);
             device_data.cb_luma_global_settings_dirty = true;
@@ -1308,7 +1308,7 @@ public:
       // A bool setting's checkbox, saved on change
       const auto bool_toggle = [&](const char* label, const char* key, bool* value, bool default_value, const char* tooltip)
       {
-         if (ImGui::Checkbox(label, value))
+         if (SettingsUI::Checkbox(label, value))
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
          }
@@ -1345,7 +1345,7 @@ public:
       ImGui::SeparatorText("UI");
       // Session only, so a restart never comes back without a HUD
       bool hide_gameplay_ui = settings.HideGameplayUI > 0.5f;
-      if (ImGui::Checkbox("Hide Gameplay UI", &hide_gameplay_ui))
+      if (SettingsUI::Checkbox("Hide Gameplay UI", &hide_gameplay_ui))
       {
          settings.HideGameplayUI = (hide_gameplay_ui ? 1.f : 0.f);
          device_data.cb_luma_global_settings_dirty = true;
@@ -1364,7 +1364,7 @@ public:
 #endif
       ImGui::BeginDisabled(sr_active);
       bool fix_native_taa_jitter = g_fix_native_taa_jitter || sr_active;
-      if (ImGui::Checkbox("Fix Native TAA Jitter", &fix_native_taa_jitter))
+      if (SettingsUI::Checkbox("Fix Native TAA Jitter", &fix_native_taa_jitter))
       {
          reshade::set_config_value(nullptr, NAME, "FixNativeTAAJitter", fix_native_taa_jitter);
       }

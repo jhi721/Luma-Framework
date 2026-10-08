@@ -893,7 +893,7 @@ public:
       // Render scale slider
       {
          int scale = static_cast<int>(render_scale * 100.0f);
-         if (ImGui::SliderInt("Render Scale (%)", &scale, 50, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderInt("Render Scale (%)", &scale, 50, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp))
          {
             scale = (scale / 5) * 5;
             render_scale = scale / 100.0f;
@@ -917,7 +917,7 @@ public:
          int bloom_type = cb_luma_global_settings.GameSettings.BloomType;
          float blooom_strength = cb_luma_global_settings.GameSettings.BloomStrength * 50.0f;
 
-         if (ImGui::SliderFloat("Exposure", &cb_luma_global_settings.GameSettings.Exposure, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Exposure", &cb_luma_global_settings.GameSettings.Exposure, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
          {
             reshade::set_config_value(runtime, NAME, "Exposure", cb_luma_global_settings.GameSettings.Exposure);
          }
@@ -927,7 +927,7 @@ public:
             reshade::set_config_value(runtime, NAME, "Exposure", cb_luma_global_settings.GameSettings.Exposure);
          }
 
-         if (ImGui::SliderFloat("Gamma", &cb_luma_global_settings.GameSettings.Gamma, 0.75f, 1.25f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Gamma", &cb_luma_global_settings.GameSettings.Gamma, 0.75f, 1.25f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
          {
             reshade::set_config_value(runtime, NAME, "Gamma", cb_luma_global_settings.GameSettings.Gamma);
          }
@@ -937,7 +937,7 @@ public:
             reshade::set_config_value(runtime, NAME, "Gamma", cb_luma_global_settings.GameSettings.Gamma);
          }
 
-         if (ImGui::SliderFloat("Highlights", &highlights, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Highlights", &highlights, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.Highlights = highlights * 0.02f;
             reshade::set_config_value(runtime, NAME, "Highlights", cb_luma_global_settings.GameSettings.Highlights);
@@ -949,7 +949,7 @@ public:
             reshade::set_config_value(runtime, NAME, "Highlights", cb_luma_global_settings.GameSettings.Highlights);
          }
 
-         if (ImGui::SliderFloat("Highlight Contrast", &highlight_contrast, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Highlight Contrast", &highlight_contrast, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.HighlightContrast = highlight_contrast * 0.02f;
             reshade::set_config_value(runtime, NAME, "HighlightContrast", cb_luma_global_settings.GameSettings.HighlightContrast);
@@ -961,7 +961,7 @@ public:
             reshade::set_config_value(runtime, NAME, "HighlightContrast", cb_luma_global_settings.GameSettings.HighlightContrast);
          }
 
-         if (ImGui::SliderFloat("Shadows", &shadows, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Shadows", &shadows, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.Shadows = shadows * 0.02f;
             reshade::set_config_value(runtime, NAME, "Shadows", cb_luma_global_settings.GameSettings.Shadows);
@@ -973,7 +973,7 @@ public:
             reshade::set_config_value(runtime, NAME, "Shadows", cb_luma_global_settings.GameSettings.Shadows);
          }
 
-         if (ImGui::SliderFloat("Shadow Contrast", &shadow_contrast, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Shadow Contrast", &shadow_contrast, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.ShadowContrast = shadow_contrast * 0.02f;
             reshade::set_config_value(runtime, NAME, "ShadowContrast", cb_luma_global_settings.GameSettings.ShadowContrast);
@@ -985,7 +985,7 @@ public:
             reshade::set_config_value(runtime, NAME, "ShadowContrast", cb_luma_global_settings.GameSettings.ShadowContrast);
          }
 
-         if (ImGui::SliderFloat("Contrast", &contrast, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Contrast", &contrast, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.Contrast = contrast * 0.02f;
             reshade::set_config_value(runtime, NAME, "Contrast", cb_luma_global_settings.GameSettings.Contrast);
@@ -997,7 +997,7 @@ public:
             reshade::set_config_value(runtime, NAME, "Contrast", cb_luma_global_settings.GameSettings.Contrast);
          }
 
-         if (ImGui::SliderFloat("Saturation", &saturation, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Saturation", &saturation, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.Saturation = saturation * 0.02f;
             reshade::set_config_value(runtime, NAME, "Saturation", cb_luma_global_settings.GameSettings.Saturation);
@@ -1009,7 +1009,7 @@ public:
             reshade::set_config_value(runtime, NAME, "Saturation", cb_luma_global_settings.GameSettings.Saturation);
          }
 
-         if (ImGui::SliderFloat("Highlight Saturation", &highlight_saturation, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Highlight Saturation", &highlight_saturation, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.HighlightSaturation = highlight_saturation * 0.02f;
             reshade::set_config_value(runtime, NAME, "HighlightSaturation", cb_luma_global_settings.GameSettings.HighlightSaturation);
@@ -1021,7 +1021,7 @@ public:
             reshade::set_config_value(runtime, NAME, "HighlightSaturation", cb_luma_global_settings.GameSettings.HighlightSaturation);
          }
 
-         if (ImGui::SliderFloat("Dechroma", &dechroma, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Dechroma", &dechroma, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.Dechroma = dechroma * 0.01f;
             reshade::set_config_value(runtime, NAME, "Dechroma", cb_luma_global_settings.GameSettings.Dechroma);
@@ -1033,7 +1033,7 @@ public:
             reshade::set_config_value(runtime, NAME, "Dechroma", cb_luma_global_settings.GameSettings.Dechroma);
          }
 
-         if (ImGui::SliderFloat("Flare", &flare, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Flare", &flare, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.Flare = flare * 0.01f;
             reshade::set_config_value(runtime, NAME, "Flare", cb_luma_global_settings.GameSettings.Flare);
@@ -1047,7 +1047,7 @@ public:
 
          // // Bloom settings
          // const char* bloom_type_names[] = {"Vanilla", "HDR"};
-         // if (ImGui::SliderInt("Bloom Type", &bloom_type, 0, 1, bloom_type_names[bloom_type], ImGuiSliderFlags_AlwaysClamp))
+         // if (SettingsUI::SliderInt("Bloom Type", &bloom_type, 0, 1, bloom_type_names[bloom_type], ImGuiSliderFlags_AlwaysClamp))
          // {
          //    cb_luma_global_settings.GameSettings.BloomType = bloom_type;
          //    reshade::set_config_value(runtime, NAME, "BloomType", cb_luma_global_settings.GameSettings.BloomType);
@@ -1059,7 +1059,7 @@ public:
          //    reshade::set_config_value(runtime, NAME, "BloomType", cb_luma_global_settings.GameSettings.BloomType);
          // }
 
-         if (ImGui::SliderFloat("Bloom Strength", &blooom_strength, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
+         if (SettingsUI::SliderFloat("Bloom Strength", &blooom_strength, 0.0f, 100.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
          {
             cb_luma_global_settings.GameSettings.BloomStrength = blooom_strength * 0.02f;
             reshade::set_config_value(runtime, NAME, "BloomStrength", cb_luma_global_settings.GameSettings.BloomStrength);

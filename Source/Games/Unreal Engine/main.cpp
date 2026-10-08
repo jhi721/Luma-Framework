@@ -1246,7 +1246,7 @@ public:
 
       ImGui::NewLine();
 
-      if (ImGui::Checkbox("Enable Luma HDR", &next_enable_hdr))
+      if (SettingsUI::Checkbox("Enable Luma HDR", &next_enable_hdr))
       {
          reshade::set_config_value(runtime, NAME, "EnableHDR", next_enable_hdr);
       }
@@ -1269,7 +1269,7 @@ public:
       {
          if (GetShaderDefineCompiledNumericalValue(char_ptr_crc32("TONEMAP_TYPE")) == 2)
          {
-            if (ImGui::SliderFloat("Highlights Hue Preservation", &cb_luma_global_settings.GameSettings.HDRHighlightsHuePreservation, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Highlights Hue Preservation", &cb_luma_global_settings.GameSettings.HDRHighlightsHuePreservation, 0.f, 1.f))
             {
                reshade::set_config_value(runtime, NAME, "HDRHighlightsHuePreservation", cb_luma_global_settings.GameSettings.HDRHighlightsHuePreservation);
             }
@@ -1279,7 +1279,7 @@ public:
             }
             DrawResetButton(cb_luma_global_settings.GameSettings.HDRHighlightsHuePreservation, cb_default_game_settings.HDRHighlightsHuePreservation, "HDRHighlightsHuePreservation", runtime);
 
-            if (ImGui::SliderFloat("Highlights Chrominance Preservation", &cb_luma_global_settings.GameSettings.HDRHighlightsChrominancePreservation, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Highlights Chrominance Preservation", &cb_luma_global_settings.GameSettings.HDRHighlightsChrominancePreservation, 0.f, 1.f))
             {
                reshade::set_config_value(runtime, NAME, "HDRHighlightsChrominancePreservation", cb_luma_global_settings.GameSettings.HDRHighlightsChrominancePreservation);
             }
@@ -1290,7 +1290,7 @@ public:
             DrawResetButton(cb_luma_global_settings.GameSettings.HDRHighlightsChrominancePreservation, cb_default_game_settings.HDRHighlightsChrominancePreservation, "HDRHighlightsChrominancePreservation", runtime);
          }
 
-         if (ImGui::SliderFloat("Saturation", &cb_luma_global_settings.GameSettings.HDRChrominance, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Saturation", &cb_luma_global_settings.GameSettings.HDRChrominance, 0.f, 2.f))
          {
             reshade::set_config_value(runtime, NAME, "HDRChrominance", cb_luma_global_settings.GameSettings.HDRChrominance);
          }
@@ -1311,7 +1311,7 @@ public:
 
       if (!sr_enabled || sr_forces_auto_exposure)
          ImGui::BeginDisabled();
-      ImGui::Checkbox("Super Resolution Auto Exposure", sr_forces_auto_exposure ? &sr_forces_auto_exposure : &sr_auto_exposure); // Force show it as enabled if it's always on
+      SettingsUI::Checkbox("Super Resolution Auto Exposure", sr_forces_auto_exposure ? &sr_forces_auto_exposure : &sr_auto_exposure); // Force show it as enabled if it's always on
       if (!sr_enabled || sr_forces_auto_exposure)
          ImGui::EndDisabled();
 
@@ -1322,7 +1322,7 @@ public:
 
       if (ImGui::TreeNode("Experimental Features"))
       {
-         ImGui::Checkbox("Dithering Fix", &enable_dithering_fix); // TODO: this isn't serialized? Nor auto exposure is?
+         SettingsUI::Checkbox("Dithering Fix", &enable_dithering_fix); // TODO: this isn't serialized? Nor auto exposure is?
 
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {

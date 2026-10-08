@@ -116,7 +116,7 @@ public:
     {
         ImGui::NewLine();
 
-        if (ImGui::Checkbox("Enable XeGTAO", &g_xegtao_enable))
+        if (SettingsUI::Checkbox("Enable XeGTAO", &g_xegtao_enable))
         {
             reshade::set_config_value(nullptr, NAME, "XeGTAOEnable", g_xegtao_enable);
         }
@@ -124,7 +124,7 @@ public:
         {
             ImGui::SetTooltip("Replaces SSAO. SSAO has to be enabled in game's settings for it (XeGTAO) to work.");
         }
-        if (ImGui::Checkbox("Enable Luma Bloom", &g_luma_bloom_enable))
+        if (SettingsUI::Checkbox("Enable Luma Bloom", &g_luma_bloom_enable))
         {
            reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
         }

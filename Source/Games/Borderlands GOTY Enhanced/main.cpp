@@ -2693,13 +2693,13 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      if (SettingsUI::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR).");
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
-      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f); // updates live; persist on release
+      SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f); // updates live; persist on release
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -2707,15 +2707,15 @@ public:
 #if DEVELOPMENT
       // Predication is not a preference: it only relaxes the edge threshold back to base ULTRA on geometry and
       // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight.
-      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
+      if (SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication))
          reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps texture noise from being antialiased while still catching real silhouettes.");
-      if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
+      if (SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
          reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
-      ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+      SettingsUI::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
       if (ImGui::Button("Measure Predication"))
@@ -2729,7 +2729,7 @@ public:
       auto& gs = cb_luma_global_settings.GameSettings;
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
+         if (SettingsUI::SliderFloat(label, value, 0.f, max_value))
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
             device_data.cb_luma_global_settings_dirty = true;
@@ -2749,19 +2749,19 @@ public:
       slider("Bloom Intensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity", 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
+      if (SettingsUI::Checkbox("XeGTAO Enable", &g_gtao_enable))
          reshade::set_config_value(nullptr, NAME, "XeGTAOEnable", g_gtao_enable);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
 #if DEVELOPMENT || TEST
       // DEVELOPMENT/TEST calibration only (drive cb_gtao, written at the deinterleave hook). Not persisted.
       ImGui::BeginDisabled(!g_gtao_enable);
-      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f);                 // midtone-shadow contrast dial
-      ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 1.f, 200.f);                             // UE3 units -> ~meters; the anti-over-occlusion dial
-      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f);                       // 0 = use EFFECT_RADIUS
+      SettingsUI::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f);                 // midtone-shadow contrast dial
+      SettingsUI::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 1.f, 200.f);                             // UE3 units -> ~meters; the anti-over-occlusion dial
+      SettingsUI::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f);                       // 0 = use EFFECT_RADIUS
 #if DEVELOPMENT                                                                                            // Both knobs are constexpr outside it (the shader's DebugViewRT is DEVELOPMENT only)
-      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0"); // diagnostics through the AO apply
-      ImGui::Combo("GTAO Temporal Noise", &g_gtao_temporal, "Auto (DLSS/FSR)\0Off (frozen, 2 denoise passes)\0On (frame % 64, 1 denoise pass)\0");
+      SettingsUI::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0"); // diagnostics through the AO apply
+      SettingsUI::Combo("GTAO Temporal Noise", &g_gtao_temporal, "Auto (DLSS/FSR)\0Off (frozen, 2 denoise passes)\0On (frame % 64, 1 denoise pass)\0");
 #endif
       ImGui::EndDisabled();
 #endif
@@ -2771,7 +2771,7 @@ public:
       slider("Lens Flare Intensity", &gs.FlareOut, default_luma_global_game_settings.FlareOut, "FlareOut", 1.f, "Lens-flare / glare strength (1 = vanilla, 0 = off).");
 
       bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
+      if (SettingsUI::Checkbox("Video AutoHDR", &video_auto_hdr))
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
@@ -2781,7 +2781,7 @@ public:
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
 
       ImGui::BeginDisabled(!video_auto_hdr);
-      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
+      if (SettingsUI::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
@@ -2792,7 +2792,7 @@ public:
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
+      if (SettingsUI::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
@@ -2802,13 +2802,13 @@ public:
          ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
-      if (ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui))
+      if (SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui))
          reshade::set_config_value(nullptr, NAME, "HideUI", g_hide_ui);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
 
       ImGui::SeparatorText("Fixes");
-      if (ImGui::Checkbox("Fix Movie Memory Leak", &g_fix_movie_leak))
+      if (SettingsUI::Checkbox("Fix Movie Memory Leak", &g_fix_movie_leak))
          reshade::set_config_value(nullptr, NAME, "FixMovieLeak", g_fix_movie_leak);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Frees the loading/cutscene movie memory the game leaks on each transition (fixes the RAM-growth crash). Movies still play.");

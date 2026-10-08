@@ -271,7 +271,7 @@ namespace ShaderDefineInfo
       bool def = GetBool(d);
 
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Checkbox(label, &def);
+      bool c = SettingsUI::Checkbox(label, &def);
       ImGui::PopID();
 
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -287,7 +287,7 @@ namespace ShaderDefineInfo
    static int UIDropDown(uint32_t d, const char* label, const char* const items[], const char* tooltip)
    {
       int def = Get(d);
-      bool c = ImGui::Combo(label, &def, items, IM_ARRAYSIZE(items));
+      bool c = SettingsUI::Combo(label, &def, items, IM_ARRAYSIZE(items));
       if (c)
          Set(d, def);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -301,7 +301,7 @@ namespace ShaderDefineInfo
       std::vector<const char*> items(items_list);
       int def = Get(d);
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Combo(label, &def, items.data(), static_cast<int>(items.size()));
+      bool c = SettingsUI::Combo(label, &def, items.data(), static_cast<int>(items.size()));
       ImGui::PopID();
       if (c)
          Set(d, def);
@@ -996,7 +996,7 @@ namespace SectionedImGui
                custom_sdr_gamma_index = 2;
          }
          ImGui::PushID("GammaCorrection custom_sdr_gamma");
-         if (ImGui::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) // user set & save
+         if (SettingsUI::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) // user set & save
          {
             switch (custom_sdr_gamma_index)
             {
@@ -1033,7 +1033,7 @@ namespace SectionedImGui
          if (GameIdentity::game != GameIdentity::IW7)
             ImGui::Separator();
 
-         ImGui::Checkbox("Safe Mode (Read Tooltip)", &Globals::pipeline_is_skipondrawordispatch);
+         SettingsUI::Checkbox("Safe Mode (Read Tooltip)", &Globals::pipeline_is_skipondrawordispatch);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Use this as a last resort to change settings, though it probably won't work.\n(This will skip this mod's custom pipeline scanning, breaking HDR handling.)");
 
@@ -1098,7 +1098,7 @@ namespace SectionedImGui
          ImGui::Separator();
 
          ImGui::PushID("HDRBrightness: ExposurePost");
-         if (ImGui::SliderFloat("Post Exposure", &cb_luma_global_settings.GameSettings.ExposurePost, 0.f, 3.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Post Exposure", &cb_luma_global_settings.GameSettings.ExposurePost, 0.f, 3.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "ExposurePost", cb_luma_global_settings.GameSettings.ExposurePost);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1106,14 +1106,14 @@ namespace SectionedImGui
          DrawResetButton(cb_luma_global_settings.GameSettings.ExposurePost, default_luma_global_game_settings.ExposurePost, "ExposurePost", runtime);
 
          ImGui::PushID("HDRBrightness: ExpectedMax");
-         if (ImGui::SliderFloat("Expected Max", &cb_luma_global_settings.GameSettings.ExpectedMax, 0.f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Expected Max", &cb_luma_global_settings.GameSettings.ExpectedMax, 0.f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "ExpectedMax", cb_luma_global_settings.GameSettings.ExpectedMax);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("The expected maximum luminance of the scene.\nDecrease means more clipping.");
          DrawResetButton(cb_luma_global_settings.GameSettings.ExpectedMax, default_luma_global_game_settings.ExpectedMax, "ExpectedMax", runtime);
 
-         if (ImGui::SliderFloat("FMV Paper White", &cb_luma_global_settings.GameSettings.FMVPaperWhite, 1.f, 500.f, "%.0f"))
+         if (SettingsUI::SliderFloat("FMV Paper White", &cb_luma_global_settings.GameSettings.FMVPaperWhite, 1.f, 500.f, "%.0f"))
             reshade::set_config_value(runtime, NAME, "FMVPaperWhite", cb_luma_global_settings.GameSettings.FMVPaperWhite);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1139,7 +1139,7 @@ namespace SectionedImGui
          ImGui::Separator();
 
          ImGui::PushID("HDRBrightness: Exposure Pre");
-         if (ImGui::SliderFloat("Pre Exposure", &cb_luma_global_settings.GameSettings.ExposurePre, 0.f, 3.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Pre Exposure", &cb_luma_global_settings.GameSettings.ExposurePre, 0.f, 3.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "ExposurePre", cb_luma_global_settings.GameSettings.ExposurePre);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1151,7 +1151,7 @@ namespace SectionedImGui
             "The replacement rolloff curve that is substituted for the SDR one.");
 
          ImGui::PushID("PCC: Peak");
-         if (ImGui::SliderFloat("Peak", &cb_luma_global_settings.GameSettings.PCCPeak, 1.f, 10.f, "%.4f", ImGuiSliderFlags_Logarithmic))
+         if (SettingsUI::SliderFloat("Peak", &cb_luma_global_settings.GameSettings.PCCPeak, 1.f, 10.f, "%.4f", ImGuiSliderFlags_Logarithmic))
             reshade::set_config_value(runtime, NAME, "PCCPeak", cb_luma_global_settings.GameSettings.PCCPeak);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1169,14 +1169,14 @@ namespace SectionedImGui
          // if (is_show_pcc_ucs)
          // {
          //    ImGui::PushID("PCC: Hue");
-         //    if (ImGui::SliderFloat("Hue Strength", &cb_luma_global_settings.GameSettings.PCCHue, 0.f, 1.f, "%.3f"))
+         //    if (SettingsUI::SliderFloat("Hue Strength", &cb_luma_global_settings.GameSettings.PCCHue, 0.f, 1.f, "%.3f"))
          //       reshade::set_config_value(runtime, NAME, "PCCHue", cb_luma_global_settings.GameSettings.PCCHue);
          //    ImGui::PopID();
          //    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("(With Uniform/Perceptual Color Space) The amount of new straighten blowout hue to blend onto the original.");
          //    DrawResetButton(cb_luma_global_settings.GameSettings.PCCHue, default_luma_global_game_settings.PCCHue, "PCCHue", runtime);
          //
          //    ImGui::PushID("PCC: Chrom");
-         //    if (ImGui::SliderFloat("Saturation Strength", &cb_luma_global_settings.GameSettings.PCCChrom, 0.f, 1.f, "%.3f"))
+         //    if (SettingsUI::SliderFloat("Saturation Strength", &cb_luma_global_settings.GameSettings.PCCChrom, 0.f, 1.f, "%.3f"))
          //       reshade::set_config_value(runtime, NAME, "PCCChrom", cb_luma_global_settings.GameSettings.PCCChrom);
          //    ImGui::PopID();
          //    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("(With Uniform/Perceptual Color Space) The amount of new recovered chrominance to blend onto the original.");
@@ -1273,7 +1273,7 @@ namespace SectionedImGui
             auto colors = float3(1.f, 0.75f, 0.0f);
             auto colord = ImVec4(colors.x * pulse, colors.y * pulse, colors.z * pulse, 1.f);
             ImGui::PushStyleColor(ImGuiCol_Text, colord);
-            ImGui::Checkbox("Calibration Mode (Read Tooltip)", &SR::Jitter::is_desynctest);
+            SettingsUI::Checkbox("Calibration Mode (Read Tooltip)", &SR::Jitter::is_desynctest);
             ImGui::PopStyleColor();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                ImGui::SetTooltip("(Shouldn't be needed unless graphics settings are changed after boot.)\n\nCalibration:\nEnabling will make jitter extreme!\nIf the whole world is shaking, toggle Flip Sync below to fix it.");
@@ -1281,7 +1281,7 @@ namespace SectionedImGui
             if (!SR::Jitter::is_desynctest)
                ImGui::BeginDisabled();
             {
-               ImGui::Checkbox("Flip Sync", &SR::Jitter::is_flipsync);
+               SettingsUI::Checkbox("Flip Sync", &SR::Jitter::is_flipsync);
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                   ImGui::SetTooltip("(Shouldn't be needed unless graphics settings are changed after boot.)\n(Paired with above.)\n\n%s", jitter_desync_explanation);
             }
@@ -1293,19 +1293,19 @@ namespace SectionedImGui
                ImGui::Spacing();
                ImGui::Spacing();
 
-               ImGui::SliderInt("Phases", reinterpret_cast<int*>(&SR::Jitter::phases_user), 0, 32);
+               SettingsUI::SliderInt("Phases", reinterpret_cast<int*>(&SR::Jitter::phases_user), 0, 32);
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                   ImGui::SetTooltip("Higher is not better, since it will take longer for the subpixel position to repeat.");
 
-               ImGui::Checkbox("Negative X", &SR::Jitter::is_neg_x);
-               ImGui::Checkbox("Negative Y", &SR::Jitter::is_neg_y);
-               ImGui::Checkbox("Use Previous Frame", &SR::Jitter::is_prev);
-               ImGui::Checkbox("Set Both", &SR::Jitter::is_setboth);
-               ImGui::Checkbox("Motion Vector Jittered", &SR::Jitter::is_mvjittered);
-               ImGui::Checkbox("Forced T2X Jitter Mode", &SR::Jitter::is_t2xjitter);
+               SettingsUI::Checkbox("Negative X", &SR::Jitter::is_neg_x);
+               SettingsUI::Checkbox("Negative Y", &SR::Jitter::is_neg_y);
+               SettingsUI::Checkbox("Use Previous Frame", &SR::Jitter::is_prev);
+               SettingsUI::Checkbox("Set Both", &SR::Jitter::is_setboth);
+               SettingsUI::Checkbox("Motion Vector Jittered", &SR::Jitter::is_mvjittered);
+               SettingsUI::Checkbox("Forced T2X Jitter Mode", &SR::Jitter::is_t2xjitter);
 
-               // ImGui::SliderFloat("Near Plane", &SR::draw_data.near_plane, 0.f, 1.f, "%.5f");
-               // ImGui::SliderFloat("Far Plane", &SR::draw_data.far_plane, 0.f, 1.f, "%.5f");
+               // SettingsUI::SliderFloat("Near Plane", &SR::draw_data.near_plane, 0.f, 1.f, "%.5f");
+               // SettingsUI::SliderFloat("Far Plane", &SR::draw_data.far_plane, 0.f, 1.f, "%.5f");
             }
          }
          else
@@ -1314,7 +1314,7 @@ namespace SectionedImGui
             auto colors = float3(1.f, 0.75f, 0.0f);
             auto colord = ImVec4(colors.x * pulse, colors.y * pulse, colors.z * pulse, 1.f);
             ImGui::PushStyleColor(ImGuiCol_Text, colord);
-            ImGui::Checkbox("Flip Sync (Calibration / Read Tooltip)", &SR::Jitter::is_flipsync);
+            SettingsUI::Checkbox("Flip Sync (Calibration / Read Tooltip)", &SR::Jitter::is_flipsync);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                ImGui::SetTooltip("(Shouldn't be needed unless graphics settings are changed after boot.)\n\nCalibration:\nStand still, then toggle this on/off.\nThe sharper result is the correct one, since the other is desynced.\n\n%s", jitter_desync_explanation);
             ImGui::PopStyleColor();
@@ -1350,7 +1350,7 @@ namespace SectionedImGui
          ImGui::TextWrapped("However, this will unintentionally bump up cubemap reflection sharpness, and causes other differences.");
 
          ImGui::PushID("SR Sampler Upgrade Bypass");
-         if (ImGui::Checkbox("Bypass", &SR::ignore_upgraded_samplers_user))
+         if (SettingsUI::Checkbox("Bypass", &SR::ignore_upgraded_samplers_user))
             reshade::set_config_value(runtime, NAME, "ignore_upgraded_samplers_user", SR::ignore_upgraded_samplers_user);
          ImGui::PopID();
       }
@@ -1363,7 +1363,7 @@ namespace SectionedImGui
 
          // Bloom cb
          ImGui::PushID("PP Bloom");
-         if (ImGui::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "Bloom", cb_luma_global_settings.GameSettings.Bloom);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1378,21 +1378,21 @@ namespace SectionedImGui
          // AllowVanillaColorGrade
          {
             bool b = cb_luma_global_settings.GameSettings.AllowVanillaColorGrade > 0;
-            if (ImGui::Checkbox("(Debug) Vanilla Color Grade", &b))
+            if (SettingsUI::Checkbox("(Debug) Vanilla Color Grade", &b))
                cb_luma_global_settings.GameSettings.AllowVanillaColorGrade = b ? 1.f : 0.f;
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Allow the game's color grading effects like LUT, saturation, tint, etc.\nDisabling results in the raw per-channel blown out color without alterations.");
 
          // pipeline_is_ui checkbox
-         ImGui::Checkbox("(Photo Mode) UI", &Globals::pipeline_is_ui);
+         SettingsUI::Checkbox("(Photo Mode) UI", &Globals::pipeline_is_ui);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Can disable all draw calls after the scene image is drawn.");
 
          // AllowFullscreenBlur
          {
             bool b = cb_luma_global_settings.GameSettings.AllowFullscreenBlur > 0;
-            if (ImGui::Checkbox("(Photo Mode) Fullscreen Blur", &b))
+            if (SettingsUI::Checkbox("(Photo Mode) Fullscreen Blur", &b))
                cb_luma_global_settings.GameSettings.AllowFullscreenBlur = b ? 1.f : 0.f;
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))

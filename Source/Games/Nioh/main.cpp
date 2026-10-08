@@ -364,7 +364,7 @@ public:
 
       ImGui::NewLine();
 
-      if (ImGui::Checkbox("Force Anisotropic Filtering", &upgrade_materials_samplers))
+      if (SettingsUI::Checkbox("Force Anisotropic Filtering", &upgrade_materials_samplers))
          reshade::set_config_value(runtime, NAME, "UpgradeMaterialsSamplers", upgrade_materials_samplers);
    }
 

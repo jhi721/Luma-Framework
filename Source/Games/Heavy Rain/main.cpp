@@ -382,7 +382,7 @@ public:
          ImGui::PopStyleColor();
       }
 
-      if (ImGui::SliderFloat("Bloom and Lens Flare Intensity", &cb_luma_global_settings.GameSettings.BloomAndLensFlareIntensity, 0.f, 1.f))
+      if (SettingsUI::SliderFloat("Bloom and Lens Flare Intensity", &cb_luma_global_settings.GameSettings.BloomAndLensFlareIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "BloomAndLensFlareIntensity", cb_luma_global_settings.GameSettings.BloomAndLensFlareIntensity);
       }
@@ -392,7 +392,7 @@ public:
       }
       DrawResetButton(cb_luma_global_settings.GameSettings.BloomAndLensFlareIntensity, 1.f, "BloomAndLensFlareIntensity", runtime);
 
-      if (ImGui::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.f, 1.f))
+      if (SettingsUI::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
       }
@@ -400,7 +400,7 @@ public:
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR && GetShaderDefineCompiledNumericalValue(char_ptr_crc32("ENABLE_FAKE_HDR")) > 0)
       {
-         if (ImGui::SliderFloat("HDR Boost", &cb_luma_global_settings.GameSettings.HDRBoostAmount, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("HDR Boost", &cb_luma_global_settings.GameSettings.HDRBoostAmount, 0.f, 1.f))
          {
             reshade::set_config_value(runtime, NAME, "HDRBoostAmount", cb_luma_global_settings.GameSettings.HDRBoostAmount);
          }
@@ -415,7 +415,7 @@ public:
       // This happens doing presentation so it should be safe as the render thread is waiting.
       // It requires a windowed/fullscreen toggle to fully apply.
       static float aspect_ratio = 1920.f;
-      if (ImGui::SliderFloat("Aspect Ratio", &aspect_ratio, 960.f, 5760.f, "%.0f"))
+      if (SettingsUI::SliderFloat("Aspect Ratio", &aspect_ratio, 960.f, 5760.f, "%.0f"))
       {
          Patches::SetOutputResolution(aspect_ratio + 0.5f, 1080.f + 0.5);
       }

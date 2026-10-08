@@ -158,7 +158,7 @@ public:
    {
       reshade::api::effect_runtime* runtime = nullptr;
 
-      if (ImGui::Checkbox("Remove Black Bars", &remove_black_bars))
+      if (SettingsUI::Checkbox("Remove Black Bars", &remove_black_bars))
       {
          reshade::set_config_value(runtime, NAME, "RemoveBlackBars", remove_black_bars);
       }

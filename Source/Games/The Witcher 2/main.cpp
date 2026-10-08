@@ -3434,7 +3434,7 @@ public:
          // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
          static int held_render_scale = 0; // The slider's value while it's held, else 0
          int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(g_render_scale * 100.f)));
-         ImGui::SliderInt("Render Scale (%)", &render_scale, int(MIN_RENDER_SCALE * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+         SettingsUI::SliderInt("Render Scale (%)", &render_scale, int(MIN_RENDER_SCALE * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
          held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
@@ -3451,7 +3451,7 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      if (SettingsUI::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       }
@@ -3462,7 +3462,7 @@ public:
       ImGui::EndDisabled();
       // Canon deviation (docs/UI-Toggle-Standard.md), as Saints Row The Third Remastered: RCAS runs after any anti-aliasing, in place
       // of the game's sharpen (cut from its scene pass)
-      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
+      SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
@@ -3474,7 +3474,7 @@ public:
       DrawResetButton(g_rcas_sharpness, 0.f, "RCASSharpness");
       ImGui::BeginDisabled(!g_smaa_enable || sr_active);
 #if DEVELOPMENT || TEST
-      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
+      if (SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
       }
@@ -3482,7 +3482,7 @@ public:
       {
          ImGui::SetTooltip("Relaxes the edge threshold back to base ULTRA on geometric silhouettes only. Off = plain ULTRA everywhere (threshold scale 1.0).");
       }
-      ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.1f, "%.3f", ImGuiSliderFlags_Logarithmic);
+      SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.1f, "%.3f", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Plane deviation counted as a full edge, as a fraction of view depth. The ONLY predication dial — the shader threshold stays 0.5 by design (see Luma_TW2_DepthExtract.hlsl). AO precedents: 0.011 (XeGTAO) .. 0.040 (ASSAO).");
@@ -3500,7 +3500,7 @@ public:
       // writes the config itself). AllowWhenDisabled so the tooltip still shows inside a BeginDisabled block.
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
+         if (SettingsUI::SliderFloat(label, value, 0.f, max_value))
          {
             device_data.cb_luma_global_settings_dirty = true;
          }
@@ -3537,7 +3537,7 @@ public:
       slider("Bloom Intensity", &gs.BloomIntensity, gs_def.BloomIntensity, "BloomIntensity", 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
+      if (SettingsUI::Checkbox("XeGTAO Enable", &g_gtao_enable))
       {
          reshade::set_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       }
@@ -3547,23 +3547,23 @@ public:
       }
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      SettingsUI::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Primary darkness dial (higher = darker AO). Shipped at 2.2 by preference; 1.0 is the value that matches the native HBAO histogram, mean 0.89 against XeGTAO's 0.90.");
       }
-      ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 0.01f, 200.f, "%.2f", ImGuiSliderFlags_Logarithmic);
+      SettingsUI::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 0.01f, 200.f, "%.2f", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("viewZ divisor (game depth units -> meters). Stays 1.0 in this game: its depth buffer is already LINEAR view-space metres (measured p50 7.3, max 686).");
       }
-      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
+      SettingsUI::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("0 = shader EFFECT_RADIUS define (0.81, anchored to the native 1.18 m radius from cb4[11]); > 0 overrides it, in metres.");
       }
 #if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
-      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      SettingsUI::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Draws diagnostics through the game's AO apply (multiplied into the scene; DEVELOPMENT shader only). Depth gradient dead/flat or normals blocky = wrong input; AO x8 = spot broad over-occlusion.");
@@ -3581,7 +3581,7 @@ public:
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
          bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-         if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
+         if (SettingsUI::Checkbox("Video AutoHDR", &video_auto_hdr))
          {
             gs.VideoAutoHDREnable = (video_auto_hdr ? 1.f : 0.f);
             device_data.cb_luma_global_settings_dirty = true;
@@ -3598,7 +3598,7 @@ public:
 
       // The final grade dithers in SDR and HDR alike, so this stays outside the HDR gate above.
       bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
+      if (SettingsUI::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = (dithering ? 1.f : 0.f);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3610,7 +3610,7 @@ public:
       }
 
       ImGui::SeparatorText("UI");
-      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.
+      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Disables the in-game UI.");
@@ -3619,42 +3619,42 @@ public:
       // Diagnostics below the user-facing sections (docs/UI-Toggle-Standard.md)
 #if DEVELOPMENT
       ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
-      ImGui::Checkbox("MV Enable", &g_mv_enable);
+      SettingsUI::Checkbox("MV Enable", &g_mv_enable);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Draws the scene with the motion vector shaders without an upscaler: camera and object motion (each draw finds its own\nprevious frame vc4). The image must not change; the debug view is black with a static camera and lights up only\nwhat moves. ReShade.log: patched/refused shaders, \"[TW2 MV]\" counts every 300 frames. Not saved.");
       }
-      ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
+      SettingsUI::Checkbox("MV Debug View", &g_mv_debug_view);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Shows the motion vector target (absolute value, in pixels) instead of the frame. Not saved.");
       }
-      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
+      SettingsUI::Checkbox("MV Force Jitter", &g_mv_force_jitter);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without an upscaler, with MV Enable. The image shakes by a subpixel; nothing\nmay flicker or lose pixels, and the debug view stays black with a static camera. Not saved.");
       }
-      ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
+      SettingsUI::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("No projection jitter under the upscaler (it gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
       }
-      ImGui::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
+      SettingsUI::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("FSR's reactive and transparency & composition masks from the alpha blended draws (smoke, glass, water, sparks). Not saved.");
       }
-      ImGui::Checkbox("FSR Reactive Mask Debug View", &g_sr_reactive_debug_view);
+      SettingsUI::Checkbox("FSR Reactive Mask Debug View", &g_sr_reactive_debug_view);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Shows FSR's reactive mask instead of the frame. Not saved.");
       }
-      ImGui::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
+      SettingsUI::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("The alpha blended draws' reactivity, scaled before the threshold (AMD's default 1). Not saved.");
       }
-      ImGui::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
+      SettingsUI::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Reactivity under it 0, over it 0.9 (AMD's 0.2, Mass Effect's 0.5); 0 = the scaled reactivity, capped at 0.9. Not saved.");
@@ -3667,7 +3667,7 @@ public:
       {
          ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([TW2 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill, the upscaler, copy back) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still. \"Sweep\" runs the anti-aliasing modes, 3 rounds, then logs medians against No AA; \"CPU Sweep\"\nthe CPU savings each off in turn under the current DLSS/FSR, against Current Settings. Not saved.");
       }
-      ImGui::Checkbox("Hook Timers", &Perf::g_hook_timers);
+      SettingsUI::Checkbox("Hook Timers", &Perf::g_hook_timers);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. Not saved.");

@@ -1084,7 +1084,7 @@ public:
       // Persisted controls with their tooltip. The GameSettings ones (toggle, slider) also mark the Luma cbuffer for upload.
       const auto config_checkbox = [](const char* label, const char* key, bool* value, const char* tooltip)
       {
-         if (ImGui::Checkbox(label, value))
+         if (SettingsUI::Checkbox(label, value))
             reshade::set_config_value(nullptr, NAME, key, *value);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", tooltip);
@@ -1092,7 +1092,7 @@ public:
       const auto settings_toggle = [&](const char* label, const char* key, float* value, const char* tooltip)
       {
          bool enabled = *value > 0.5f;
-         if (ImGui::Checkbox(label, &enabled))
+         if (SettingsUI::Checkbox(label, &enabled))
          {
             *value = enabled ? 1.f : 0.f;
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -1104,7 +1104,7 @@ public:
       };
       const auto slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
+         if (SettingsUI::SliderFloat(label, value, 0.f, max_value))
             device_data.cb_luma_global_settings_dirty = true;
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -1122,10 +1122,10 @@ public:
       ImGui::BeginDisabled(!g_smaa_enable);
       slider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 1.f, "Sharpening applied on top of SMAA (0 = off).");
 #if DEVELOPMENT
-      ImGui::Checkbox("SMAA Predication", &g_smaa_predication);
+      SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Finds edges by geometry (the game's scene depth) as well as by brightness.\nKeeps textures sharp while still antialiasing real silhouettes.");
-      ImGui::Checkbox("SMAA Edges Debug View", &g_smaa_edges_debug);
+      SettingsUI::Checkbox("SMAA Edges Debug View", &g_smaa_edges_debug);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Show the edges SMAA smooths (red = horizontal, green = vertical) instead of the frame.\nToggle SMAA Predication to compare: texture detail should lose edges, silhouettes keep them.");
 #endif
@@ -1149,14 +1149,14 @@ public:
       config_checkbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion set to Medium or High in the game's display settings).");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      SettingsUI::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Primary darkness dial (higher = darker AO). 2.2 matches the native SSAO's coverage and mean darkening.");
-      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
+      SettingsUI::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("0 = the shader's EFFECT_RADIUS (0.5 m); > 0 overrides it, in metres.");
 #if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
-      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      SettingsUI::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Draws diagnostics through the game's SSAO apply (multiplied into the lighting). Depth gradient flat or blocky = wrong input;\nNormals: camera-facing surfaces bright, black everywhere = NORMAL_Z_SIGN inverted; AO x8 = spot broad over-occlusion.");
 #endif
@@ -1173,7 +1173,7 @@ public:
 
       ImGui::SeparatorText("UI");
 
-      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
+      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
    }

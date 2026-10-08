@@ -385,7 +385,7 @@ public:
       {
          if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
          {
-            if (ImGui::SliderFloat("HDR Boost", &fake_hdr_effect, 0.f, 1.f)) // Call it "HDR Boost" instead of "Fake HDR" to make it more appealing (it's cool, it's just a highlights curve)
+            if (SettingsUI::SliderFloat("HDR Boost", &fake_hdr_effect, 0.f, 1.f)) // Call it "HDR Boost" instead of "Fake HDR" to make it more appealing (it's cool, it's just a highlights curve)
             {
                reshade::set_config_value(runtime, NAME, "FakeHDREffect", fake_hdr_effect);
             }
@@ -395,7 +395,7 @@ public:
             }
             DrawResetButton(fake_hdr_effect, 0.667f, "FakeHDREffect", runtime);
 
-            if (ImGui::SliderFloat("Expand Color Gamut", &expand_hdr_gamut, 0.f, 1.f)) // Call it "HDR Boost" instead of "Fake HDR" to make it more appealing (it's cool, it's just a highlights curve)
+            if (SettingsUI::SliderFloat("Expand Color Gamut", &expand_hdr_gamut, 0.f, 1.f)) // Call it "HDR Boost" instead of "Fake HDR" to make it more appealing (it's cool, it's just a highlights curve)
             {
                reshade::set_config_value(runtime, NAME, "ExpandHDRGamut", expand_hdr_gamut);
             }
@@ -409,7 +409,7 @@ public:
          ImGui::SetNextItemOpen(true, ImGuiCond_Once);
          if (ImGui::TreeNode("Advanced Settings"))
          {
-            if (ImGui::SliderFloat("Character Light Intensity", &character_light_intensity, 0.f, 2.f))
+            if (SettingsUI::SliderFloat("Character Light Intensity", &character_light_intensity, 0.f, 2.f))
             {
                reshade::set_config_value(runtime, NAME, "CharacterLightIntensity", character_light_intensity);
             }
@@ -419,7 +419,7 @@ public:
             }
             DrawResetButton(character_light_intensity, 1.f, "CharacterLightIntensity", runtime);
 
-            if (ImGui::SliderFloat("Character Light Radius", &character_light_radius, 0.f, 2.f))
+            if (SettingsUI::SliderFloat("Character Light Radius", &character_light_radius, 0.f, 2.f))
             {
                reshade::set_config_value(runtime, NAME, "CharacterLightRadius", character_light_radius);
             }
@@ -429,7 +429,7 @@ public:
             }
             DrawResetButton(character_light_radius, 1.f, "CharacterLightRadius", runtime);
 
-            if (ImGui::SliderFloat("Character Light Smoothness", &character_light_smoothness, 0.f, 2.f))
+            if (SettingsUI::SliderFloat("Character Light Smoothness", &character_light_smoothness, 0.f, 2.f))
             {
                reshade::set_config_value(runtime, NAME, "CharacterLightSmoothness", character_light_smoothness);
             }

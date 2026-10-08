@@ -181,7 +181,7 @@ namespace ShaderDefineInfo
       bool def = GetB(d);
       
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Checkbox(label, &def);
+      bool c = SettingsUI::Checkbox(label, &def);
       ImGui::PopID();
 
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -195,7 +195,7 @@ namespace ShaderDefineInfo
    int UIDropDown(uint32_t d, const char* label, const char* const items[], const char* tooltip)
    {
       int def = Get(d);
-      bool c = ImGui::Combo(label, &def, items, IM_ARRAYSIZE(items));
+      bool c = SettingsUI::Combo(label, &def, items, IM_ARRAYSIZE(items));
       if (c) Set(d, def);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
       UIResetButton(d);
@@ -208,7 +208,7 @@ namespace ShaderDefineInfo
       std::vector<const char*> items(items_list);
       int def = Get(d);
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Combo(label, &def, items.data(), static_cast<int>(items.size()));
+      bool c = SettingsUI::Combo(label, &def, items.data(), static_cast<int>(items.size()));
       ImGui::PopID();
       if (c) Set(d, def);
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -816,7 +816,7 @@ namespace DLSSJitter
       {
          // checkmark enabled
          ImGui::PushID("DLSSJitterEnabled");
-         if (ImGui::Checkbox("Enable", &enabled))
+         if (SettingsUI::Checkbox("Enable", &enabled))
          {
             SetSyncNeeded();
             reshade::set_config_value(runtime, NAME, "DLSSJitterEnabled", enabled);
@@ -835,7 +835,7 @@ namespace DLSSJitter
             ImGui::NewLine(); ///////////////////////
       
             // DLSSJitter::jitter_sel
-            if (ImGui::SliderInt("Jitter Phases (Debug)", &phases_sel, 0, 32)) // TODO save
+            if (SettingsUI::SliderInt("Jitter Phases (Debug)", &phases_sel, 0, 32)) // TODO save
             {
                device_data.force_reset_sr = true; // soft reset for new jitters
                // CallOfDutyBlackOps3GameDeviceData::HardResetSR(device_data, game_device_data);
@@ -860,7 +860,7 @@ namespace DLSSJitter
             if (ImGui::IsItemHovered())
                ImGui::SetTooltip("(SHOULDN'T BE NEEDED! Please report if otherwise.)\nIf Test Sync causes an \"earthquake\", this should fix it.\n\nExplanation: There are 2 jitter offset;\nThe one used or will be used.\nWe can only override the one that will be used.");
          }
-         ImGui::Checkbox("Test Sync", &test_sync);
+         SettingsUI::Checkbox("Test Sync", &test_sync);
          if (ImGui::IsItemHovered()) ImGui::SetTooltip("(SHOULDN'T BE NEEDED! Please report if otherwise.)\nScales jitter 4x!\nIf desynced, it'll look like an earthquake.");
 
          ImGui::BulletText("Sync Tokens: %d", is_sync_needed);
@@ -868,7 +868,7 @@ namespace DLSSJitter
       }
       
       // ImGui::NewLine();
-      // ImGui::Checkbox("is_flip_use", &is_flip_use);
+      // SettingsUI::Checkbox("is_flip_use", &is_flip_use);
    }
 
    static void OnUIForced() {
@@ -1083,16 +1083,16 @@ namespace ForcedLODBias //TODO: other executables besides BO3Enhanced
          return;
       }
       
-      if (ImGui::SliderFloat("r_lodBiasRigid", &r_lodBiasRigid, 0.f, -1000.f)) SetLodBiasRigid(runtime, r_lodBiasRigid);
+      if (SettingsUI::SliderFloat("r_lodBiasRigid", &r_lodBiasRigid, 0.f, -1000.f)) SetLodBiasRigid(runtime, r_lodBiasRigid);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Negative bias increases LOD of static meshes at a distance.");
       DrawResetButton(r_lodBiasRigid, 0.f, "r_lodBiasRigid", runtime);
       
-      if (ImGui::SliderFloat("r_modelLodBias", &r_modelLodBias, 1.f, 10.f)) SetModelLodBias(runtime, r_modelLodBias);
+      if (SettingsUI::SliderFloat("r_modelLodBias", &r_modelLodBias, 1.f, 10.f)) SetModelLodBias(runtime, r_modelLodBias);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("(Unverified, can't tell difference.)\nBias multiplier for model LOD. Higher values increase LOD of models at a distance.");
       DrawResetButton(r_modelLodBias, 1.f, "r_modelLodBias", runtime);
 
 #if DEVELOPMENT
-      if (ImGui::SliderInt("r_lightingShadowFilter", &r_lightingShadowFilter, -1, 1)) SetLightingShadowFilter(runtime, r_lightingShadowFilter);
+      if (SettingsUI::SliderInt("r_lightingShadowFilter", &r_lightingShadowFilter, -1, 1)) SetLightingShadowFilter(runtime, r_lightingShadowFilter);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Shadow Dither/Filtering. (The game heavily relies on this!)");
       DrawResetButton(r_lightingShadowFilter, -1, "r_lightingShadowFilter", runtime);
 #endif
@@ -1270,7 +1270,7 @@ namespace SectionedImGui
             else if (custom_sdr_gamma == 2.4f) custom_sdr_gamma_index = 2;
          }
          ImGui::PushID("GammaCorrection custom_sdr_gamma");
-         if (ImGui::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) //user set & save
+         if (SettingsUI::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) //user set & save
          {
             switch (custom_sdr_gamma_index)
             {
@@ -1302,7 +1302,7 @@ namespace SectionedImGui
             ImGui::PopStyleColor();
             
             //Gamma Influence
-            if (ImGui::SliderFloat("Gamma Brightness", &cb_luma_global_settings.GameSettings.GammaInfluence, 0.f, 2.f))
+            if (SettingsUI::SliderFloat("Gamma Brightness", &cb_luma_global_settings.GameSettings.GammaInfluence, 0.f, 2.f))
                reshade::set_config_value(runtime, NAME, "GammaInfluence", cb_luma_global_settings.GameSettings.GammaInfluence);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Lower to let the gamma correction influence more of the image, and decreasing overall brightness.");
             DrawResetButton(cb_luma_global_settings.GameSettings.GammaInfluence, default_luma_global_game_settings.GammaInfluence, "GammaInfluence", runtime);
@@ -1331,7 +1331,7 @@ namespace SectionedImGui
                bool is_disabled_perceptual = ShaderDefineInfo::Get(ShaderDefineInfo::CUSTOM_GAMMA_CORRECTION_MODE) != 1 || ShaderDefineInfo::Get(ShaderDefineInfo::CUSTOM_LUTBUILDER_COLORSPACE) == 0;
                if (is_disabled_perceptual) ImGui::BeginDisabled();
                {
-                  if (ImGui::SliderFloat("Perceptual Chrominance Gain Reduction", &cb_luma_global_settings.GameSettings.GammaPerceptualChrominanceCorrect, 0.f, 1.f, "%.4f"))
+                  if (SettingsUI::SliderFloat("Perceptual Chrominance Gain Reduction", &cb_luma_global_settings.GameSettings.GammaPerceptualChrominanceCorrect, 0.f, 1.f, "%.4f"))
                      reshade::set_config_value(runtime, NAME, "GammaPerceptualChrominanceCorrect", cb_luma_global_settings.GameSettings.GammaPerceptualChrominanceCorrect);
                   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Reduce chrominance/saturation increase from Gamma Correction in the Perceptual mode, preventing it from becoming too artificial.");
                   DrawResetButton(cb_luma_global_settings.GameSettings.GammaPerceptualChrominanceCorrect, default_luma_global_game_settings.GammaPerceptualChrominanceCorrect, "GammaPerceptualChrominanceCorrect", runtime);
@@ -1350,7 +1350,7 @@ namespace SectionedImGui
          {
             bool b = ShaderDefineInfo::Get(ShaderDefineInfo::CUSTOM_HDTVREC709) == 1;
             std::string label = "HDTV Rec.709 Gamma";
-            if (ImGui::Checkbox(label.c_str(), &b)) ShaderDefineInfo::ToggleBool(ShaderDefineInfo::CUSTOM_HDTVREC709);
+            if (SettingsUI::Checkbox(label.c_str(), &b)) ShaderDefineInfo::ToggleBool(ShaderDefineInfo::CUSTOM_HDTVREC709);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("This is the gamma mode seen on PS4.\nBEWARE: Rather insane, so maybe turn off Gamma Correction above first.");
          }
       }
@@ -1398,7 +1398,7 @@ namespace SectionedImGui
                "Do inverse tonemap for FMVs.");
          }
          
-         if (ImGui::SliderFloat("Brightness Ratio", &cb_luma_global_settings.GameSettings.MovPeakRatio, 0.f, 2.f, "%.4f"))
+         if (SettingsUI::SliderFloat("Brightness Ratio", &cb_luma_global_settings.GameSettings.MovPeakRatio, 0.f, 2.f, "%.4f"))
             reshade::set_config_value(runtime, NAME, "MovPeakRatio", cb_luma_global_settings.GameSettings.MovPeakRatio);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Multiplier for peak output.\n(Useful for AAE users at main menu.)");
          DrawResetButton(cb_luma_global_settings.GameSettings.MovPeakRatio, default_luma_global_game_settings.MovPeakRatio, "MovPeakRatio", runtime);
@@ -1408,7 +1408,7 @@ namespace SectionedImGui
             is_disabled = ShaderDefineInfo::Get(ShaderDefineInfo::CUSTOM_UPSCALE_MOV) == 0;
             if (is_disabled) ImGui::BeginDisabled();
             {
-               if (ImGui::SliderFloat("Shoulder Power", &cb_luma_global_settings.GameSettings.MovShoulderPow, 1.f, 10.f, "%.4f"))
+               if (SettingsUI::SliderFloat("Shoulder Power", &cb_luma_global_settings.GameSettings.MovShoulderPow, 1.f, 10.f, "%.4f"))
                   reshade::set_config_value(runtime, NAME, "MovShoulderPow", cb_luma_global_settings.GameSettings.MovShoulderPow);
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Highlights contrast of PumboAutoHDR on movies.");
                DrawResetButton(cb_luma_global_settings.GameSettings.MovShoulderPow, default_luma_global_game_settings.MovShoulderPow, "MovShoulderPow", runtime);
@@ -1423,7 +1423,7 @@ namespace SectionedImGui
          ImGui::TextWrapped("[Various multipliers and whatnot.]");
          ImGui::PopStyleColor();
 
-         if (ImGui::SliderFloat("Ambient Occlusion", &cb_luma_global_settings.GameSettings.AmbientOcclusion, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Ambient Occlusion", &cb_luma_global_settings.GameSettings.AmbientOcclusion, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "AmbientOcclusion", cb_luma_global_settings.GameSettings.AmbientOcclusion);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Ambient Occlusion final power.");
          DrawResetButton(cb_luma_global_settings.GameSettings.AmbientOcclusion, default_luma_global_game_settings.AmbientOcclusion, "AmbientOcclusion", runtime);
@@ -1444,32 +1444,32 @@ namespace SectionedImGui
             if (cb_luma_global_settings.DisplayMode == DisplayModeType::SDR) ImGui::EndDisabled();
          }
          
-         if (ImGui::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "Bloom", cb_luma_global_settings.GameSettings.Bloom);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Bloom multiplier.\n(The game's hues are crucially basked in bloom, e.g. zombies menu campfire.)");
          DrawResetButton(cb_luma_global_settings.GameSettings.Bloom, default_luma_global_game_settings.Bloom, "Bloom", runtime);
          
-         if (ImGui::SliderFloat("Lens Dirt / Flare", &cb_luma_global_settings.GameSettings.LensFlare, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Lens Dirt / Flare", &cb_luma_global_settings.GameSettings.LensFlare, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "LensFlare", cb_luma_global_settings.GameSettings.LensFlare);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Lens Dirt / Flare billboards and overlays strength.\n(Don't expect great results when map uses lens flare for the sun.)");
          DrawResetButton(cb_luma_global_settings.GameSettings.LensFlare, default_luma_global_game_settings.LensFlare, "LensFlare", runtime);
 
-         if (ImGui::SliderFloat("Slide Lens Dirt", &cb_luma_global_settings.GameSettings.SlideLensDirt, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Slide Lens Dirt", &cb_luma_global_settings.GameSettings.SlideLensDirt, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "SlideLensDirt", cb_luma_global_settings.GameSettings.SlideLensDirt);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Bottom-of-screen lens dirt from slide.");
          DrawResetButton(cb_luma_global_settings.GameSettings.SlideLensDirt, default_luma_global_game_settings.SlideLensDirt, "SlideLensDirt", runtime);
 
-         if (ImGui::SliderFloat("ADS Sights", &cb_luma_global_settings.GameSettings.ADSSights, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("ADS Sights", &cb_luma_global_settings.GameSettings.ADSSights, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "ADSSights", cb_luma_global_settings.GameSettings.ADSSights);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("ADS holographic overlay sights.");
          DrawResetButton(cb_luma_global_settings.GameSettings.ADSSights, default_luma_global_game_settings.ADSSights, "ADSSights", runtime);
 
-         if (ImGui::SliderFloat("Xray Outline", &cb_luma_global_settings.GameSettings.XrayOutline, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Xray Outline", &cb_luma_global_settings.GameSettings.XrayOutline, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "XrayOutline", cb_luma_global_settings.GameSettings.XrayOutline);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Xray outline for objectives and players.");
          DrawResetButton(cb_luma_global_settings.GameSettings.XrayOutline, default_luma_global_game_settings.XrayOutline, "XrayOutline", runtime);
 
-         if (ImGui::SliderFloat("Motion Blur", &cb_luma_global_settings.GameSettings.MotionBlur, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Motion Blur", &cb_luma_global_settings.GameSettings.MotionBlur, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "MotionBlur", cb_luma_global_settings.GameSettings.MotionBlur);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Motion blur length multiplier.");
          DrawResetButton(cb_luma_global_settings.GameSettings.MotionBlur, default_luma_global_game_settings.MotionBlur, "MotionBlur", runtime);
@@ -1481,12 +1481,12 @@ namespace SectionedImGui
                "Motion blur quality; The amount of samples for its trails. Increase to try and reduce fireflies at a performance cost.");
          }
 
-         if (ImGui::SliderFloat("Volumetric Fog", &cb_luma_global_settings.GameSettings.VolumetricFog, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Volumetric Fog", &cb_luma_global_settings.GameSettings.VolumetricFog, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "VolumetricFog", cb_luma_global_settings.GameSettings.VolumetricFog);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Volumetric fog multiplier.");
          DrawResetButton(cb_luma_global_settings.GameSettings.VolumetricFog, default_luma_global_game_settings.VolumetricFog, "VolumetricFog", runtime);
          
-         if (ImGui::SliderFloat("RCAS Sharpening", &cb_luma_global_settings.GameSettings.RCAS, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("RCAS Sharpening", &cb_luma_global_settings.GameSettings.RCAS, 0.f, 1.f))
             reshade::set_config_value(runtime, NAME, "RCAS", cb_luma_global_settings.GameSettings.RCAS);
          {
             bool isOn = ShaderDefineInfo::Get(ShaderDefineInfo::CUSTOM_RCAS) == 1;
@@ -1507,12 +1507,12 @@ namespace SectionedImGui
          ImGui::TextWrapped("[UI Toggles]");
          ImGui::PopStyleColor();
          
-         if (ImGui::Checkbox("Fullscreen Blur (Cheats)", &Globals::IsFullscreenBlur))
+         if (SettingsUI::Checkbox("Fullscreen Blur (Cheats)", &Globals::IsFullscreenBlur))
             reshade::set_config_value(runtime, NAME, "IsFullscreenBlur", Globals::IsFullscreenBlur);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Toggle fullscreen blurring.\nSeen in pause menu and Nova 6 Crawler fart gas.");
          DrawResetButton(Globals::IsFullscreenBlur, true, "IsFullscreenBlur", runtime);
                
-         if (ImGui::Checkbox("Draw UI", &Globals::IsUi))
+         if (SettingsUI::Checkbox("Draw UI", &Globals::IsUi))
             reshade::set_config_value(runtime, NAME, "IsUi", Globals::IsUi);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Toggle UI drawing.\nWill discard all shaders after final composition shader.");
@@ -1527,7 +1527,7 @@ namespace SectionedImGui
          ImGui::PopStyleColor();
          
          float ratio = BlackFloorSDRTonemap::ToRatio(cb_luma_global_settings.GameSettings.BlackFloorSDRTonemap);
-         if (ImGui::SliderFloat("SDR Rolloff Lowering", &ratio, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("SDR Rolloff Lowering", &ratio, 0.f, 1.f))
          {
             cb_luma_global_settings.GameSettings.BlackFloorSDRTonemap = BlackFloorSDRTonemap::ToReal(ratio);
             reshade::set_config_value(runtime, NAME, "BlackFloorSDRTonemap", cb_luma_global_settings.GameSettings.BlackFloorSDRTonemap);
@@ -1552,7 +1552,7 @@ namespace SectionedImGui
             is_disabled = def == 0;
             if (is_disabled) ImGui::BeginDisabled();
             {
-               if (ImGui::SliderFloat("LUT Correction", &cb_luma_global_settings.GameSettings.BlackFloorLUT, 0.f, 1.f))
+               if (SettingsUI::SliderFloat("LUT Correction", &cb_luma_global_settings.GameSettings.BlackFloorLUT, 0.f, 1.f))
                   reshade::set_config_value(runtime, NAME, "BlackFloorLUT", cb_luma_global_settings.GameSettings.BlackFloorLUT);
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The amount to rescale the raised black floor from LUT down.\nUseful for maps like The Giant, though probably unintended.");
                DrawResetButton(cb_luma_global_settings.GameSettings.BlackFloorLUT, default_luma_global_game_settings.BlackFloorLUT, "BlackFloorLUT", runtime);
@@ -1613,7 +1613,7 @@ namespace SectionedImGui
          ImGui::PopStyleColor();
          
          ImGui::PushID("SR: Auto Exposure");
-         if (ImGui::Checkbox("Auto Exposure", &Globals::SRAutoExposure))
+         if (SettingsUI::Checkbox("Auto Exposure", &Globals::SRAutoExposure))
             reshade::set_config_value(runtime, NAME, "SRAutoExposure", Globals::SRAutoExposure);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1623,7 +1623,7 @@ namespace SectionedImGui
          if (Globals::UIIsAdvanced)
          {
             ImGui::PushID("SR: Pre Exposure");
-            if (ImGui::SliderFloat("Pre Exposure", &Globals::SRPreExposure, 0.f, 3.f, "%.4f"))
+            if (SettingsUI::SliderFloat("Pre Exposure", &Globals::SRPreExposure, 0.f, 3.f, "%.4f"))
                reshade::set_config_value(runtime, NAME, "SRPreExposure", Globals::SRPreExposure);
             ImGui::PopID();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1640,14 +1640,14 @@ namespace SectionedImGui
          //    ImGui::PopStyleColor();
          //
          //    ImGui::PushID("SR Sampler Upgrade Bypass");
-         //    if (ImGui::Checkbox("Bypass", &Globals::SRIgnoreSamplerUpgrade))
+         //    if (SettingsUI::Checkbox("Bypass", &Globals::SRIgnoreSamplerUpgrade))
          //       reshade::set_config_value(runtime, NAME, "SRIgnoreSamplerUpgrade", Globals::SRIgnoreSamplerUpgrade);
          //    ImGui::PopID();
          //
          //    if (!Globals::SRIgnoreSamplerUpgrade)
          //    {
          //       ImGui::PushID("SR: Set Mipmaps LOD Bias");
-         //       ImGui::Checkbox("Set Mipmaps LOD Bias", &Globals::SRSetMipLodBias);
+         //       SettingsUI::Checkbox("Set Mipmaps LOD Bias", &Globals::SRSetMipLodBias);
          //       reshade::set_config_value(runtime, NAME, "SRSetMipLodBias", Globals::SRSetMipLodBias);
          //       ImGui::PopID();
          //       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1655,7 +1655,7 @@ namespace SectionedImGui
          //       DrawResetButton(Globals::SRSetMipLodBias, true, "SRSetMipLodBias", runtime);
          //
          //       ImGui::PushID("SR: Mipmaps LOD Bias Manual Override");
-         //       if (ImGui::SliderFloat("Mipmaps LOD Bias Manual", &Globals::SRSetMipLodBiasManual, -4.f, 0.f, "%.2f"))
+         //       if (SettingsUI::SliderFloat("Mipmaps LOD Bias Manual", &Globals::SRSetMipLodBiasManual, -4.f, 0.f, "%.2f"))
          //          reshade::set_config_value(runtime, NAME, "SRSetMipLodBiasManual", Globals::SRSetMipLodBiasManual);
          //       ImGui::PopID();
          //       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1850,7 +1850,7 @@ namespace SectionedImGui
          is_disabled = cb_luma_global_settings.DisplayMode == DisplayModeType::SDR;
          if (is_disabled) { ImGui::BeginDisabled(); cb_luma_global_settings.GameSettings.Exposure = 1.f; }
          {
-            if (ImGui::SliderFloat("Exposure", &cb_luma_global_settings.GameSettings.Exposure, 0.f, 3.f))
+            if (SettingsUI::SliderFloat("Exposure", &cb_luma_global_settings.GameSettings.Exposure, 0.f, 3.f))
                reshade::set_config_value(runtime, NAME, "Exposure", cb_luma_global_settings.GameSettings.Exposure);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Exposure before HDR tonemap.\nAlternative to Scene Paper White without shifting Gamma Correction influence range.");
             DrawResetButton(cb_luma_global_settings.GameSettings.Exposure, default_luma_global_game_settings.Exposure, "Exposure", runtime);
@@ -1866,7 +1866,7 @@ namespace SectionedImGui
          is_disabled = !(tonemap_def == 1);
          if (!is_disabled)
          {
-            if (ImGui::SliderFloat("HDR Tonemapper Rolloff Start", &cb_luma_global_settings.GameSettings.TonemapperRolloffStart, 20.f, 500.f, "%.0f"))
+            if (SettingsUI::SliderFloat("HDR Tonemapper Rolloff Start", &cb_luma_global_settings.GameSettings.TonemapperRolloffStart, 20.f, 500.f, "%.0f"))
                reshade::set_config_value(runtime, NAME, "TonemapperRolloffStart", cb_luma_global_settings.GameSettings.TonemapperRolloffStart);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("HDR tonemapper's rolloff/shoulder start in nits.");
             if (!is_disabled && cb_luma_global_settings.GameSettings.TonemapperRolloffStart > cb_luma_global_settings.ScenePeakWhite)
@@ -1881,7 +1881,7 @@ namespace SectionedImGui
          is_disabled = !(tonemap_def > 0);
          if (!is_disabled)
          {
-            if (ImGui::SliderFloat("HDR Tonemapper Expected Max", &cb_luma_global_settings.GameSettings.TonemapperMaxExpected, 20000, tonemap_def == 1 ? 100000.f : 200000.f, "%.0f"))
+            if (SettingsUI::SliderFloat("HDR Tonemapper Expected Max", &cb_luma_global_settings.GameSettings.TonemapperMaxExpected, 20000, tonemap_def == 1 ? 100000.f : 200000.f, "%.0f"))
                reshade::set_config_value(runtime, NAME, "TonemapperMaxExpected", cb_luma_global_settings.GameSettings.TonemapperMaxExpected);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("HDR tonemapper's expected max nits. Reduce to cause clipping.");
             if (!is_disabled && cb_luma_global_settings.GameSettings.TonemapperMaxExpected < cb_luma_global_settings.ScenePeakWhite)
@@ -1949,49 +1949,49 @@ namespace SectionedImGui
          if (is_disabled) ImGui::BeginDisabled();
 
          ImGui::PushID("CG: Contrast");
-         if (ImGui::SliderFloat("Contrast", &cb_luma_global_settings.GameSettings.CGContrast, 0.f, 2.f, "%.4f"))
+         if (SettingsUI::SliderFloat("Contrast", &cb_luma_global_settings.GameSettings.CGContrast, 0.f, 2.f, "%.4f"))
             reshade::set_config_value(runtime, NAME, "CGContrast", cb_luma_global_settings.GameSettings.CGContrast);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("RenoDX power based contrast before HDR tonemap.");
          DrawResetButton(cb_luma_global_settings.GameSettings.CGContrast, default_luma_global_game_settings.CGContrast, "CGContrast", runtime);
 
          ImGui::PushID("CG: Contrast Mid Gray");
-         if (ImGui::SliderFloat("Contrast Mid Gray", &cb_luma_global_settings.GameSettings.CGContrastMidGray, 0.f, 500.f))
+         if (SettingsUI::SliderFloat("Contrast Mid Gray", &cb_luma_global_settings.GameSettings.CGContrastMidGray, 0.f, 500.f))
             reshade::set_config_value(runtime, NAME, "CGContrastMidGray", cb_luma_global_settings.GameSettings.CGContrastMidGray);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Contrast's mid gray value to stretch in/out luminance.");
          DrawResetButton(cb_luma_global_settings.GameSettings.CGContrastMidGray, default_luma_global_game_settings.CGContrastMidGray, "CGContrastMidGray", runtime);
 
          ImGui::PushID("CG: Highlights");
-         if (ImGui::SliderFloat(" Highlights", &cb_luma_global_settings.GameSettings.CGHighlightsStrength, 0.f, 2.f))
+         if (SettingsUI::SliderFloat(" Highlights", &cb_luma_global_settings.GameSettings.CGHighlightsStrength, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "CGHighlightsStrength", cb_luma_global_settings.GameSettings.CGHighlightsStrength);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("RenoDX highlights boost/compress.");
          DrawResetButton(cb_luma_global_settings.GameSettings.CGHighlightsStrength, default_luma_global_game_settings.CGHighlightsStrength, "CGHighlightsStrength", runtime);
 
          ImGui::PushID("CG: Highlights Mid Gray");
-         if (ImGui::SliderFloat("Highlights Mid Gray", &cb_luma_global_settings.GameSettings.CGHighlightsMidGray, 0.f, 500.f))
+         if (SettingsUI::SliderFloat("Highlights Mid Gray", &cb_luma_global_settings.GameSettings.CGHighlightsMidGray, 0.f, 500.f))
             reshade::set_config_value(runtime, NAME, "CGHighlightsMidGray", cb_luma_global_settings.GameSettings.CGHighlightsMidGray);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Highlights mid gray / threshold value to manipulate luminance around.");
          DrawResetButton(cb_luma_global_settings.GameSettings.CGHighlightsMidGray, default_luma_global_game_settings.CGHighlightsMidGray, "CGHighlightsMidGray", runtime);
 
          ImGui::PushID("CG: Shadows");
-         if (ImGui::SliderFloat("Shadows", &cb_luma_global_settings.GameSettings.CGShadowsStrength, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Shadows", &cb_luma_global_settings.GameSettings.CGShadowsStrength, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "CGShadowsStrength", cb_luma_global_settings.GameSettings.CGShadowsStrength);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("RenoDX shadows boost/compress.");
          DrawResetButton(cb_luma_global_settings.GameSettings.CGShadowsStrength, default_luma_global_game_settings.CGShadowsStrength, "CGShadowsStrength", runtime);
 
          ImGui::PushID("CG: Shadows Mid Gray");
-         if (ImGui::SliderFloat("Shadows Mid Gray", &cb_luma_global_settings.GameSettings.CGShadowsMidGray, 0.f, 500.f))
+         if (SettingsUI::SliderFloat("Shadows Mid Gray", &cb_luma_global_settings.GameSettings.CGShadowsMidGray, 0.f, 500.f))
             reshade::set_config_value(runtime, NAME, "CGShadowsMidGray", cb_luma_global_settings.GameSettings.CGShadowsMidGray);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Shadows mid gray / threshold value to manipulate luminance around.");
          DrawResetButton(cb_luma_global_settings.GameSettings.CGShadowsMidGray, default_luma_global_game_settings.CGShadowsMidGray, "CGShadowsMidGray", runtime);
 
          ImGui::PushID("CG: Saturation");
-         if (ImGui::SliderFloat("Saturation", &cb_luma_global_settings.GameSettings.CGSaturation, 0.f, 2.f, "%.4f"))
+         if (SettingsUI::SliderFloat("Saturation", &cb_luma_global_settings.GameSettings.CGSaturation, 0.f, 2.f, "%.4f"))
             reshade::set_config_value(runtime, NAME, "CGSaturation", cb_luma_global_settings.GameSettings.CGSaturation);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Final saturation before HDR tonemap.");
@@ -2019,12 +2019,12 @@ namespace SectionedImGui
          is_disabled = def == 0;
          if (is_disabled) ImGui::BeginDisabled();
          {
-            if (ImGui::SliderFloat("Neutral Hue", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralHue, 0.01f, 1.f))
+            if (SettingsUI::SliderFloat("Neutral Hue", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralHue, 0.01f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderNeutralHue", cb_luma_global_settings.GameSettings.LUTBuilderNeutralHue);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The strength of blending back hue to neutral color from a custom LUT.\nRaising it will remove embedded color grading tint.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderNeutralHue, default_luma_global_game_settings.LUTBuilderNeutralHue, "LUTBuilderNeutralHue", runtime);
          
-            if (ImGui::SliderFloat("Neutral Chrominance", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralChrominance, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Neutral Chrominance", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralChrominance, 0.f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderNeutralChrominance", cb_luma_global_settings.GameSettings.LUTBuilderNeutralChrominance);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The strength of blending back chrominance to neutral color from a custom LUT.\nRaising it will reduce embedded saturation change.\n\nProbably the most controversial settings for custom maps, since some uses heavy blown out LUTs!\nWithout reducing blowout, HDR luminance will be mapped on white, which looks dumb.\nWith reducing blowout, it will peel back the curtains, though it should look better in HDR.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderNeutralChrominance, default_luma_global_game_settings.LUTBuilderNeutralChrominance, "LUTBuilderNeutralChrominance", runtime);
@@ -2033,7 +2033,7 @@ namespace SectionedImGui
                {"High Passed (Only Blown Out)", "Forced"},
                "How should we blend back to neutral luminance from a custom LUT?\n\nVanilla maps are neutral, but many modded maps loves to add boosted to sometimes clipping highlights.");
             
-            if (ImGui::SliderFloat("Neutral Luminance", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralLuma, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Neutral Luminance", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralLuma, 0.f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderNeutralLuma", cb_luma_global_settings.GameSettings.LUTBuilderNeutralLuma);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The strength of blending back luminance to neutral color from a custom LUT.\n\nRaising it will reduce embedded contrast curves.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderNeutralLuma, default_luma_global_game_settings.LUTBuilderNeutralLuma, "LUTBuilderNeutralLuma", runtime);
@@ -2041,7 +2041,7 @@ namespace SectionedImGui
             // is_disabled = ShaderDefineInfo::Get(ShaderDefineInfo::CUSTOM_LUTBUILDER_NEUTRAL) == 0 || ShaderDefineInfo::Get(ShaderDefineInfo::CUSTOM_LUTBUILDER_NEUTRAL_LUMA) != 0;
             // if (is_disabled) ImGui::BeginDisabled();
             // {
-            //    if (ImGui::SliderFloat("Neutral Luminance Start", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralLumaHPStart, 0.f, 1.f))
+            //    if (SettingsUI::SliderFloat("Neutral Luminance Start", &cb_luma_global_settings.GameSettings.LUTBuilderNeutralLumaHPStart, 0.f, 1.f))
             //       reshade::set_config_value(runtime, NAME, "LUTBuilderNeutralLumaHPStart", cb_luma_global_settings.GameSettings.LUTBuilderNeutralLumaHPStart);
             //    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Luminance lower than this will be ignored by neutralization.");
             //    DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderNeutralLumaHPStart, default_luma_global_game_settings.LUTBuilderNeutralLumaHPStart, "LUTBuilderNeutralLumaHPStart", runtime);
@@ -2074,17 +2074,17 @@ namespace SectionedImGui
          is_disabled = def == 0;
          if (is_disabled) ImGui::BeginDisabled();
          {
-            if (ImGui::SliderFloat("Vanilla Shadows/Midtones/Highlights", &cb_luma_global_settings.GameSettings.LUTBuilderGradeSMH, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Vanilla Shadows/Midtones/Highlights", &cb_luma_global_settings.GameSettings.LUTBuilderGradeSMH, 0.f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderGradeSMH", cb_luma_global_settings.GameSettings.LUTBuilderGradeSMH);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Strength of vanilla shadows/midtones/highlights grading in LUT builder.\nSome maps like Shangri-La can benefit with this reduced a bit.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderGradeSMH, default_luma_global_game_settings.LUTBuilderGradeSMH, "LUTBuilderGradeSMH", runtime);
       
-            if (ImGui::SliderFloat("Vanilla Tint", &cb_luma_global_settings.GameSettings.LUTBuilderGradeTint, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Vanilla Tint", &cb_luma_global_settings.GameSettings.LUTBuilderGradeTint, 0.f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderGradeTint", cb_luma_global_settings.GameSettings.LUTBuilderGradeTint);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Strength of vanilla luma based tint.\ne.g. SoE Beast Mode's green tint and Ascension no power desaturation.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderGradeTint, default_luma_global_game_settings.LUTBuilderGradeTint, "LUTBuilderGradeTint", runtime);
       
-            if (ImGui::SliderFloat("Vanilla Saturation", &cb_luma_global_settings.GameSettings.LUTBuilderGradeSat, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Vanilla Saturation", &cb_luma_global_settings.GameSettings.LUTBuilderGradeSat, 0.f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderGradeSat", cb_luma_global_settings.GameSettings.LUTBuilderGradeSat);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Strength of vanilla de/saturation.\nSeldom usage, idk.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderGradeSat, default_luma_global_game_settings.LUTBuilderGradeSat, "LUTBuilderGradeSat", runtime);
@@ -2116,22 +2116,22 @@ namespace SectionedImGui
          is_disabled = !is_on;
          if (is_disabled) ImGui::BeginDisabled();
          {
-            if (ImGui::SliderFloat("Expansion Chrominance", &cb_luma_global_settings.GameSettings.LUTBuilderExpansionChrominance, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Expansion Chrominance", &cb_luma_global_settings.GameSettings.LUTBuilderExpansionChrominance, 0.f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderExpansionChrominance", cb_luma_global_settings.GameSettings.LUTBuilderExpansionChrominance);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Already saturated colors will be boosted more.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderExpansionChrominance, default_luma_global_game_settings.LUTBuilderExpansionChrominance, "LUTBuilderExpansionChrominance", runtime);
 
-            if (ImGui::SliderFloat("Expansion Luminance", &cb_luma_global_settings.GameSettings.LUTBuilderExpansionLuminance, 0.f, 1.f))
+            if (SettingsUI::SliderFloat("Expansion Luminance", &cb_luma_global_settings.GameSettings.LUTBuilderExpansionLuminance, 0.f, 1.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderExpansionLuminance", cb_luma_global_settings.GameSettings.LUTBuilderExpansionLuminance);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Gamut expansion will deepen colors.\nDecrease if too metallic feeling.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderExpansionLuminance, default_luma_global_game_settings.LUTBuilderExpansionLuminance, "LUTBuilderExpansionLuminance", runtime);
          
-            if (ImGui::SliderFloat("Expansion Highlight Saturation", &cb_luma_global_settings.GameSettings.LUTBuilderHighlightSat, 0.f, 0.5f, "%.4f"))
+            if (SettingsUI::SliderFloat("Expansion Highlight Saturation", &cb_luma_global_settings.GameSettings.LUTBuilderHighlightSat, 0.f, 0.5f, "%.4f"))
                reshade::set_config_value(runtime, NAME, "LUTBuilderHighlightSat", cb_luma_global_settings.GameSettings.LUTBuilderHighlightSat);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Boost saturation for LUT highlights.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderHighlightSat, default_luma_global_game_settings.LUTBuilderHighlightSat, "LUTBuilderHighlightSat", runtime);
 
-            if (ImGui::SliderFloat("Expansion Highlight Saturation High Pass", &cb_luma_global_settings.GameSettings.LUTBuilderHighlightSatHighlightsOnly, 1.f, 5.f))
+            if (SettingsUI::SliderFloat("Expansion Highlight Saturation High Pass", &cb_luma_global_settings.GameSettings.LUTBuilderHighlightSatHighlightsOnly, 1.f, 5.f))
                reshade::set_config_value(runtime, NAME, "LUTBuilderHighlightSatHighlightsOnly", cb_luma_global_settings.GameSettings.LUTBuilderHighlightSatHighlightsOnly);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Increase to target highlights only.");
             DrawResetButton(cb_luma_global_settings.GameSettings.LUTBuilderHighlightSatHighlightsOnly, default_luma_global_game_settings.LUTBuilderHighlightSatHighlightsOnly, "LUTBuilderHighlightSatHighlightsOnly", runtime);
@@ -2160,7 +2160,7 @@ namespace SectionedImGui
          if (is_disabled) ImGui::BeginDisabled();
          {
             // ImGui::PushID("PCC: Peak");    
-            // if (ImGui::SliderFloat("Peak", &cb_luma_global_settings.GameSettings.PCCPeak, 1.f, 8.f, "%.4f"))
+            // if (SettingsUI::SliderFloat("Peak", &cb_luma_global_settings.GameSettings.PCCPeak, 1.f, 8.f, "%.4f"))
             //    reshade::set_config_value(runtime, NAME, "PCCPeak", cb_luma_global_settings.GameSettings.PCCPeak);
             // ImGui::PopID();
             // if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The peak of the internal per-channel tonemap.\nIncrease to allow even more chrominance in highlights, though it may look unintended/unnatural.");
@@ -2175,14 +2175,14 @@ namespace SectionedImGui
             ImGui::PopID();
             
             ImGui::PushID("PCC: Hue Influence");
-            if (ImGui::SliderFloat("Hue Influence", &cb_luma_global_settings.GameSettings.PCCHue, 0.f, 1.f, "%.4f"))
+            if (SettingsUI::SliderFloat("Hue Influence", &cb_luma_global_settings.GameSettings.PCCHue, 0.f, 1.f, "%.4f"))
                reshade::set_config_value(runtime, NAME, "PCCHue", cb_luma_global_settings.GameSettings.PCCHue);
             ImGui::PopID();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Effect on of less blown out color on hue.\nSetting it too high will make stuff like fire red/orange.");
             DrawResetButton(cb_luma_global_settings.GameSettings.PCCHue, default_luma_global_game_settings.PCCHue, "PCCHue", runtime);
 
             ImGui::PushID("PCC: Chrominance Influence");
-            if (ImGui::SliderFloat("Chrominance Influence", &cb_luma_global_settings.GameSettings.PCCChrominance, 0.f, 1.f, "%.4f"))
+            if (SettingsUI::SliderFloat("Chrominance Influence", &cb_luma_global_settings.GameSettings.PCCChrominance, 0.f, 1.f, "%.4f"))
                reshade::set_config_value(runtime, NAME, "PCCChrominance", cb_luma_global_settings.GameSettings.PCCChrominance);
             ImGui::PopID();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Effect on of less blown out color on chrominance/saturation.\nSetting it too may color things that's supposed to be blown out (though it should be fine in this game).");
@@ -2370,7 +2370,7 @@ namespace SectionedImGui
       if (index_prev != index) IndexSaveConfig(runtime);
 
       // Advanced Settings Toggle
-      if (ImGui::Checkbox("Advanced Settings", &Globals::UIIsAdvanced))
+      if (SettingsUI::Checkbox("Advanced Settings", &Globals::UIIsAdvanced))
          reshade::set_config_value(runtime, NAME, "UIIsAdvanced", Globals::UIIsAdvanced);
    }
 }
@@ -3408,23 +3408,23 @@ public:
          const std::string s8 = "Is DLAA: " + std::to_string(game_device_data.IsDLAA());
          ImGui::BulletText(s8.c_str());
 
-         if (ImGui::Checkbox("Skip OnDrawOrDispatch()", &Globals::IsSkipOnDrawOrDispatch))
+         if (SettingsUI::Checkbox("Skip OnDrawOrDispatch()", &Globals::IsSkipOnDrawOrDispatch))
             reshade::set_config_value(runtime, NAME, "IsSkipOnDrawOrDispatch", Globals::IsSkipOnDrawOrDispatch);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Debug to skip all custom scanning to grab info for DLSS, UI toggle, and other misc stuff.");
 
-         if (ImGui::Checkbox("Skip DLSS Draw", &Globals::IsSkipDLSSDraw))
+         if (SettingsUI::Checkbox("Skip DLSS Draw", &Globals::IsSkipDLSSDraw))
             reshade::set_config_value(runtime, NAME, "IsSkipDLSSDraw", Globals::IsSkipDLSSDraw);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("When we ever reach the DLSS draw call. Should it be skipped, even though all info is gathered?");
 
-         if (ImGui::Checkbox("Skip DLSS Final Linearize", &Globals::IsSkipDLSSFinalLinearize))
+         if (SettingsUI::Checkbox("Skip DLSS Final Linearize", &Globals::IsSkipDLSSFinalLinearize))
             reshade::set_config_value(runtime, NAME, "IsSkipDLSSFinalLinearize", Globals::IsSkipDLSSFinalLinearize);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Skip the custom linearize pass at final when DLSS.");
 
-         ImGui::Checkbox("TiledDeferredCSTracking", &TiledDeferredCSTracking::enabled);
-         ImGui::Checkbox("FSFXTracking", &FSFXTracking::enabled);
+         SettingsUI::Checkbox("TiledDeferredCSTracking", &TiledDeferredCSTracking::enabled);
+         SettingsUI::Checkbox("FSFXTracking", &FSFXTracking::enabled);
       }
 
       ImGui::Separator(); ////////////////////////////////////////////////////////////////////////////////////

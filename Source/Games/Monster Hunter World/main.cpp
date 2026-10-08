@@ -169,7 +169,7 @@ public:
         ImGui::NewLine();
 
 #if DEVELOPMENT
-        if (ImGui::SliderInt("Luma Bloom nmips", &g_bloom_nmips, 1.0, 10.0))
+        if (SettingsUI::SliderInt("Luma Bloom nmips", &g_bloom_nmips, 1.0, 10.0))
         {
             ResetCOMArray(g_rtv_bloom_mips_y);
             ResetCOMArray(g_srv_bloom_mips_y);
@@ -186,16 +186,16 @@ public:
         for (int i = 0; i < g_bloom_nmips; ++i)
         {
             const std::string name = "Luma Bloom Sigma" + std::to_string(i);
-            ImGui::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+            SettingsUI::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         }
 #endif
 
-        if (ImGui::Checkbox("Luma Bloom Enable", &g_enable_luma_bloom))
+        if (SettingsUI::Checkbox("Luma Bloom Enable", &g_enable_luma_bloom))
         {
             reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_enable_luma_bloom);
         }
 
-        if (ImGui::SliderFloat("Bloom Intensity", &g_bloom_intensity, 0.0f, 3.0f))
+        if (SettingsUI::SliderFloat("Bloom Intensity", &g_bloom_intensity, 0.0f, 3.0f))
         {
             reshade::set_config_value(nullptr, NAME, "BloomIntensity", g_bloom_intensity);
         }

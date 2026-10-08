@@ -282,13 +282,13 @@ public:
 
       auto& game_device_data = GetGameDeviceData(device_data);
       ImGui::BeginDisabled(!game_device_data.drawn_fxaa);
-      if (ImGui::Checkbox("Enable SMAA", &enable_smaa))
+      if (SettingsUI::Checkbox("Enable SMAA", &enable_smaa))
          reshade::set_config_value(runtime, NAME, "EnableSMAA", enable_smaa);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Replaces the game's FXAA with SMAA, which is sharper and more temporally stable.");
       ImGui::EndDisabled();
 
-      if (ImGui::Checkbox("Enable GTAO", &enable_gtao))
+      if (SettingsUI::Checkbox("Enable GTAO", &enable_gtao))
       {
          // Reset all data
          if (!enable_gtao)
@@ -302,7 +302,7 @@ public:
 
 #if DEVELOPMENT // TODO1: test with night vision etc. This is probably not safe enough to propose to the final player atm as night vision draws through it.
       if (!shader_hashes_UI.Empty())
-         ImGui::Checkbox("Hide UI", &hide_ui);
+         SettingsUI::Checkbox("Hide UI", &hide_ui);
 #endif
    }
 

@@ -149,7 +149,7 @@ namespace
             slider_format = setting.labels[static_cast<size_t>(slider_value - min_value_i)].c_str();
          }
 
-         if (ImGui::SliderInt(setting.label, &slider_value, min_value_i, max_value_i, slider_format))
+         if (SettingsUI::SliderInt(setting.label, &slider_value, min_value_i, max_value_i, slider_format))
          {
             value = static_cast<float>(slider_value);
             SaveSettingValue(runtime, setting, value);
@@ -158,7 +158,7 @@ namespace
 
       void DrawFloatSetting(const Descriptor& setting, float& value, reshade::api::effect_runtime* runtime)
       {
-         if (ImGui::SliderFloat(setting.label, &value, setting.min_value, setting.max_value, setting.format))
+         if (SettingsUI::SliderFloat(setting.label, &value, setting.min_value, setting.max_value, setting.format))
          {
             SaveSettingValue(runtime, setting, value);
          }

@@ -1136,7 +1136,7 @@ public:
       ImGui::SeparatorText("Effects");
       auto& game_settings = cb_luma_global_settings.GameSettings;
 
-      if (ImGui::SliderFloat("Bloom Strength", &game_settings.BloomStrength, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Bloom Strength", &game_settings.BloomStrength, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(runtime, NAME, "BloomStrength", game_settings.BloomStrength);
@@ -1145,7 +1145,7 @@ public:
       if (DrawResetButton(game_settings.BloomStrength, default_luma_global_game_settings.BloomStrength, "BloomStrength"))
          device_data.cb_luma_global_settings_dirty = true;
 
-      if (ImGui::SliderFloat("Lens Dirt Strength", &game_settings.LensDirtStrength, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Lens Dirt Strength", &game_settings.LensDirtStrength, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(runtime, NAME, "LensDirtStrength", game_settings.LensDirtStrength);
@@ -1154,7 +1154,7 @@ public:
       if (DrawResetButton(game_settings.LensDirtStrength, default_luma_global_game_settings.LensDirtStrength, "LensDirtStrength"))
          device_data.cb_luma_global_settings_dirty = true;
 
-      if (ImGui::SliderFloat("Lens Flare Strength", &game_settings.LensFlareStrength, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Lens Flare Strength", &game_settings.LensFlareStrength, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(runtime, NAME, "LensFlareStrength", game_settings.LensFlareStrength);
@@ -1163,7 +1163,7 @@ public:
       if (DrawResetButton(game_settings.LensFlareStrength, default_luma_global_game_settings.LensFlareStrength, "LensFlareStrength"))
          device_data.cb_luma_global_settings_dirty = true;
 
-      if (ImGui::SliderFloat("Vignette Strength", &game_settings.VignetteStrength, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Vignette Strength", &game_settings.VignetteStrength, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(runtime, NAME, "VignetteStrength", game_settings.VignetteStrength);
@@ -1174,7 +1174,7 @@ public:
 
       ImGui::SeparatorText("Ambient Occlusion");
 
-      if (ImGui::Checkbox("XeGTAO Enable", &g_xegtao_enable))
+      if (SettingsUI::Checkbox("XeGTAO Enable", &g_xegtao_enable))
       {
          reshade::set_config_value(runtime, NAME, "XeGTAOEnable", g_xegtao_enable);
       }

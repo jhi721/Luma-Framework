@@ -1287,7 +1287,7 @@ public:
       // DC Only path
       if (!pattern_og_post_process_addresses.empty())
       {
-         if (ImGui::Checkbox("Enable Original Post Process", &force_og_post_process))
+         if (SettingsUI::Checkbox("Enable Original Post Process", &force_og_post_process))
          {
             reshade::set_config_value(runtime, NAME, "ForceOriginalPostProcess", force_og_post_process);
             PatchPostProcess(force_og_post_process);
@@ -1314,7 +1314,7 @@ public:
          ImGui::TextUnformatted("Warning: for the mod to apply tonemapping properly, FXAA High or MLAA need to be selected as Anti Aliasing modes.\nEdge Anti Aliasing is also not tested with this mod and might not work (due to it using a higher quality depth buffer).\nNote that this message might accidentally show in menus.");
          ImGui::PopStyleColor();
       }
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
+      if (SettingsUI::Checkbox("SMAA Enable", &g_smaa_enable))
       {
          reshade::set_config_value(runtime, NAME, "SMAAEnable", g_smaa_enable);
       }
@@ -1322,7 +1322,7 @@ public:
       {
          ImGui::SetTooltip("Replaces FXAA High or MLAA if enabled, FXAA High or MLAA have to be enabled in game.");
       }
-      if (ImGui::Checkbox("XeGTAO Enable", &g_xegtao_enable))
+      if (SettingsUI::Checkbox("XeGTAO Enable", &g_xegtao_enable))
       {
          reshade::set_config_value(runtime, NAME, "XeGTAOEnable", g_xegtao_enable);
       }
@@ -1330,7 +1330,7 @@ public:
       {
          ImGui::SetTooltip("Replaces SSAO if enabled, SSAO have to be enabled in game.");
       }
-      if (ImGui::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 2.f))
       {
          reshade::set_config_value(runtime, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
       }
@@ -1340,7 +1340,7 @@ public:
       }
       DrawResetButton(cb_luma_global_settings.GameSettings.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity", runtime);
 
-      if (ImGui::SliderFloat("Emissive Intensity", &cb_luma_global_settings.GameSettings.EmissiveIntensity, 0.f, 1.f))
+      if (SettingsUI::SliderFloat("Emissive Intensity", &cb_luma_global_settings.GameSettings.EmissiveIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "EmissiveIntensity", cb_luma_global_settings.GameSettings.EmissiveIntensity);
       }
@@ -1352,7 +1352,7 @@ public:
 
       if (is_dc)
       {
-         if (ImGui::SliderFloat("Fog Intensity", &cb_luma_global_settings.GameSettings.FogIntensity, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("Fog Intensity", &cb_luma_global_settings.GameSettings.FogIntensity, 0.f, 1.f))
          {
             reshade::set_config_value(runtime, NAME, "FogIntensity", cb_luma_global_settings.GameSettings.FogIntensity);
          }
@@ -1371,13 +1371,13 @@ public:
       // It won't do anything if the gold filter isn't enabled
       if (has_gold_filter)
       {
-         if (ImGui::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.0f, 1.f))
+         if (SettingsUI::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.0f, 1.f))
          {
             reshade::set_config_value(runtime, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
          }
          DrawResetButton(cb_luma_global_settings.GameSettings.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, "ColorGradingIntensity", runtime);
 
-         if (ImGui::SliderFloat("Desaturation Intensity", &cb_luma_global_settings.GameSettings.DesaturationIntensity, 0.0f, 1.f))
+         if (SettingsUI::SliderFloat("Desaturation Intensity", &cb_luma_global_settings.GameSettings.DesaturationIntensity, 0.0f, 1.f))
          {
             reshade::set_config_value(runtime, NAME, "DesaturationIntensity", cb_luma_global_settings.GameSettings.DesaturationIntensity);
          }
@@ -1388,7 +1388,7 @@ public:
          DrawResetButton(cb_luma_global_settings.GameSettings.DesaturationIntensity, default_luma_global_game_settings.DesaturationIntensity, "DesaturationIntensity", runtime);
       }
 
-      if (ImGui::SliderFloat("Ambient Lighting Intensity", &cb_luma_global_settings.GameSettings.AmbientLightingIntensity, 0.f, 1.f))
+      if (SettingsUI::SliderFloat("Ambient Lighting Intensity", &cb_luma_global_settings.GameSettings.AmbientLightingIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "AmbientLightingIntensity", cb_luma_global_settings.GameSettings.AmbientLightingIntensity);
       }
@@ -1400,7 +1400,7 @@ public:
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         if (ImGui::SliderFloat("HDR Boost Intensity", &cb_luma_global_settings.GameSettings.HDRBoostIntensity, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("HDR Boost Intensity", &cb_luma_global_settings.GameSettings.HDRBoostIntensity, 0.f, 2.f))
          {
             reshade::set_config_value(runtime, NAME, "HDRBoostIntensity", cb_luma_global_settings.GameSettings.HDRBoostIntensity);
          }
@@ -1416,7 +1416,7 @@ public:
 #endif
       if (ImGui::TreeNode("Advanced Settings"))
       {
-         if (ImGui::SliderFloat("UI Scale", &ui_scale, 0.25f, 4.f))
+         if (SettingsUI::SliderFloat("UI Scale", &ui_scale, 0.25f, 4.f))
          {
             reshade::set_config_value(runtime, NAME, "UIScale", ui_scale);
             PatchUIScale(ui_scale); // Won't likely do anything unless the game internally re-initialized the UI (it doesn't seem to do so)

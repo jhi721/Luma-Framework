@@ -343,13 +343,13 @@ public:
          }
 
          // TODO: re-implement Fog fixes in BS1 after fixing the fog shader errors
-         if (ImGui::SliderFloat("Fog Correction Intensity", &cb_luma_global_settings.GameSettings.FogCorrectionIntensity, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("Fog Correction Intensity", &cb_luma_global_settings.GameSettings.FogCorrectionIntensity, 0.f, 1.f))
             reshade::set_config_value(runtime, NAME, "FogCorrectionIntensity", cb_luma_global_settings.GameSettings.FogCorrectionIntensity);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Fog was \"additive\" in this game, which caused severely raised blacks, this preserves the feel of the fog without destroying contrast, making the game more atmospheric.\nNote that this also applies to underwater sections.\nSet it to 0 for the a Vanilla experience, however it will not look good on OLED.");
          DrawResetButton(cb_luma_global_settings.GameSettings.FogCorrectionIntensity, default_luma_global_game_settings.FogCorrectionIntensity, "FogCorrectionIntensity", runtime);
 
-         if (ImGui::SliderFloat("Fog Intensity", &cb_luma_global_settings.GameSettings.FogIntensity, 0.f, 2.f))
+         if (SettingsUI::SliderFloat("Fog Intensity", &cb_luma_global_settings.GameSettings.FogIntensity, 0.f, 2.f))
             reshade::set_config_value(runtime, NAME, "FogIntensity", cb_luma_global_settings.GameSettings.FogIntensity);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("You can decrease or increase fog to your liking.");
@@ -358,21 +358,21 @@ public:
 
       if (bioshock_game == BioShockGame::BioShock_Infinite)
       {
-         if (ImGui::Checkbox("XeGTAO Enable", &g_xegtao_enable))
+         if (SettingsUI::Checkbox("XeGTAO Enable", &g_xegtao_enable))
            reshade::set_config_value(runtime, NAME, "XeGTAOEnable", g_xegtao_enable);
 
-         if (ImGui::Checkbox("Lens Flare Enable", &g_lens_flare_enable))
+         if (SettingsUI::Checkbox("Lens Flare Enable", &g_lens_flare_enable))
            reshade::set_config_value(runtime, NAME, "LensFlareEnable", g_lens_flare_enable);
       }
 
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
+      if (SettingsUI::Checkbox("SMAA Enable", &g_smaa_enable))
          reshade::set_config_value(runtime, NAME, "SMAAEnable", g_smaa_enable);
 
-      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+      if (SettingsUI::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
          reshade::set_config_value(runtime, NAME, "LumaBloomEnable", g_luma_bloom_enable);
 
 #if DEVELOPMENT
-      if (ImGui::SliderInt("Luma Bloom nmips", &g_bloom_nmips, 1.0, 10.0))
+      if (SettingsUI::SliderInt("Luma Bloom nmips", &g_bloom_nmips, 1.0, 10.0))
       {
 		 g_bloom_sigmas.resize(g_bloom_nmips);
 	  }
@@ -380,17 +380,17 @@ public:
 	  for (int i = 0; i < g_bloom_nmips; ++i)
       {
 		 const std::string name = "Luma Bloom Sigma" + std::to_string(i);
-		 ImGui::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+		 SettingsUI::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 	  }
 #endif
       
-      if (ImGui::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 2.f))
          reshade::set_config_value(runtime, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
       DrawResetButton(cb_luma_global_settings.GameSettings.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity", runtime);
 
       if (bioshock_game == BioShockGame::BioShock_2_Remastered && !g_luma_bloom_enable)
       {
-         if (ImGui::SliderFloat("Bloom Radius", &cb_luma_global_settings.GameSettings.BloomRadius, 0.f, 1.f))
+         if (SettingsUI::SliderFloat("Bloom Radius", &cb_luma_global_settings.GameSettings.BloomRadius, 0.f, 1.f))
             reshade::set_config_value(runtime, NAME, "BloomRadius", cb_luma_global_settings.GameSettings.BloomRadius);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("The bloom radius is arguably too wide for modern resolutions, customize it to your liking. 1 is the Vanilla value.");
@@ -401,7 +401,7 @@ public:
       ImGui::NewLine();
 
       // This isn't serialized because it could cause issues/confusion if it's enabled on boot
-      ImGui::Checkbox("Hide Gameplay UI", &hide_gameplay_ui);
+      SettingsUI::Checkbox("Hide Gameplay UI", &hide_gameplay_ui);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Hides the whole UI outside of the main menu\nWARNING: this can cause confusion and isn't perfect (everything is hidden, even some non gameplay UI and Menus)");
@@ -412,7 +412,7 @@ public:
 
       if (ImGui::TreeNode("Camera Mode"))
       {
-         ImGui::Checkbox("Enable", &enable_camera_mode);
+         SettingsUI::Checkbox("Enable", &enable_camera_mode);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
             ImGui::SetTooltip("Basic Camera Mode. Pause the game and enable it to be able to move the camera around and take screenshots. Works during in engine cutscenes too.\nWARNING: if you rotate the camera backwards, some geometry might not render");
@@ -425,7 +425,7 @@ public:
          DrawResetButton<decltype(camera_mode_translation), false>(camera_mode_translation, {}, "Translation", runtime);
          ImGui::SliderFloat3("Rotation", &camera_mode_rotation.x, -M_PI, M_PI);
          DrawResetButton<decltype(camera_mode_rotation), false>(camera_mode_rotation, {}, "Rotation", runtime);
-         ImGui::SliderFloat("FoV Scale", &camera_mode_fov_scale, 0.1f, 10.f);
+         SettingsUI::SliderFloat("FoV Scale", &camera_mode_fov_scale, 0.1f, 10.f);
          DrawResetButton<decltype(camera_mode_fov_scale), false>(camera_mode_fov_scale, 1.f, "FoV Scale", runtime);
 
          ImGui::EndDisabled();

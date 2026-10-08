@@ -880,19 +880,19 @@ public:
       reshade::api::effect_runtime* runtime = nullptr;
       const char* labels[] = { "2x", "4x", "8x" };
 
-      if (ImGui::SliderInt("MSAA", &msaa_index, 0, 2, labels[msaa_index]))
+      if (SettingsUI::SliderInt("MSAA", &msaa_index, 0, 2, labels[msaa_index]))
       {
          reshade::set_config_value(runtime, NAME, "MSAA", msaa_index);
       }
       
       const char* labels_toggle[] = { "Off", "On" };
       
-      if (ImGui::SliderInt("Alpha To Coverage", &enable_alpha_to_coverage, 0, 1, labels_toggle[enable_alpha_to_coverage]))
+      if (SettingsUI::SliderInt("Alpha To Coverage", &enable_alpha_to_coverage, 0, 1, labels_toggle[enable_alpha_to_coverage]))
       {
          reshade::set_config_value(runtime, NAME, "AlphaToCoverage", enable_alpha_to_coverage);
       }
       
-      if (ImGui::SliderInt("Character Supersampling", &enable_character_supersampling, 0, 1, labels_toggle[enable_character_supersampling]))
+      if (SettingsUI::SliderInt("Character Supersampling", &enable_character_supersampling, 0, 1, labels_toggle[enable_character_supersampling]))
       {
          reshade::set_config_value(runtime, NAME, "SuperSampling", enable_character_supersampling);
       }

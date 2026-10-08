@@ -4071,7 +4071,7 @@ public:
 #endif
 #if DEVELOPMENT
       // Always on outside of development builds
-      if (ImGui::Checkbox("HDR Fix", &g_hdr_fix))
+      if (SettingsUI::Checkbox("HDR Fix", &g_hdr_fix))
       {
          reshade::set_config_value(nullptr, NAME, "HDRFix", g_hdr_fix);
       }
@@ -4081,7 +4081,7 @@ public:
       }
       DrawResetButton(g_hdr_fix, kDefaultHDRFix, "HDRFix");
       ImGui::BeginDisabled(!g_hdr_fix);
-      if (ImGui::Checkbox("Gamma Correction", &g_hdr_gamma_correction))
+      if (SettingsUI::Checkbox("Gamma Correction", &g_hdr_gamma_correction))
       {
          reshade::set_config_value(nullptr, NAME, "HDRGammaCorrection", g_hdr_gamma_correction);
       }
@@ -4099,7 +4099,7 @@ public:
       // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
       static int held_render_scale = 0; // The slider's value while it's held, else 0
       int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(g_render_scale * 100.f)));
-      ImGui::SliderInt("Render Scale (%)", &render_scale, int(kMinRenderScale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+      SettingsUI::SliderInt("Render Scale (%)", &render_scale, int(kMinRenderScale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
       held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
@@ -4116,7 +4116,7 @@ public:
       }
       ImGui::EndDisabled();
 #endif
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
+      if (SettingsUI::Checkbox("SMAA Enable", &g_smaa_enable))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       }
@@ -4126,7 +4126,7 @@ public:
       }
       DrawResetButton(g_smaa_enable, kDefaultSmaaEnable, "SMAAEnable");
       ImGui::BeginDisabled(!g_smaa_enable && !sr_selected);
-      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
+      SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
@@ -4139,7 +4139,7 @@ public:
       ImGui::EndDisabled();
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_smaa_enable);
-      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
+      if (SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
       }
@@ -4148,7 +4148,7 @@ public:
          ImGui::SetTooltip("Finds edges by geometry (scene depth) as well as by brightness.\nKeeps textures sharp while still antialiasing real silhouettes.");
       }
       DrawResetButton(g_smaa_predication, kDefaultSmaaPredication, "SMAAPredication");
-      if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
+      if (SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       }
@@ -4163,7 +4163,7 @@ public:
       // A [0, max] float slider, saved on release
       const auto slider = [](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
-         ImGui::SliderFloat(label, value, 0.f, max);
+         SettingsUI::SliderFloat(label, value, 0.f, max);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -4193,7 +4193,7 @@ public:
       slider("Film Grain Intensity", &g_film_grain_intensity, kDefaultFilmGrainIntensity, "FilmGrainIntensity", 2.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
       slider("Chromatic Aberration Intensity", &g_chromatic_aberration_intensity, kDefaultChromaticAberrationIntensity, "ChromaticAberrationIntensity", 2.f,
          "Scales the game's color fringing toward the screen edges (1 = vanilla, 0 = none).");
-      if (ImGui::Checkbox("Video AutoHDR", &g_video_auto_hdr))
+      if (SettingsUI::Checkbox("Video AutoHDR", &g_video_auto_hdr))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", g_video_auto_hdr);
       }
@@ -4203,7 +4203,7 @@ public:
       }
       DrawResetButton(g_video_auto_hdr, kDefaultVideoAutoHDR, "VideoAutoHDREnable");
       ImGui::BeginDisabled(!g_video_auto_hdr);
-      ImGui::SliderFloat("Video HDR Boost", &g_video_auto_hdr_boost, 0.f, 1.f);
+      SettingsUI::SliderFloat("Video HDR Boost", &g_video_auto_hdr_boost, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", g_video_auto_hdr_boost);
@@ -4214,7 +4214,7 @@ public:
       }
       DrawResetButton(g_video_auto_hdr_boost, kDefaultVideoAutoHDRBoost, "VideoAutoHDRBoost");
       ImGui::EndDisabled();
-      if (ImGui::Checkbox("Dithering", &g_dithering))
+      if (SettingsUI::Checkbox("Dithering", &g_dithering))
       {
          reshade::set_config_value(nullptr, NAME, "Dithering", g_dithering);
       }
@@ -4225,7 +4225,7 @@ public:
       DrawResetButton(g_dithering, kDefaultDithering, "Dithering");
 
       ImGui::SeparatorText("UI");
-      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Never saved, see "g_hide_ui"
+      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui); // Never saved, see "g_hide_ui"
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Disables the in-game UI.");
@@ -4235,7 +4235,7 @@ public:
       // SR replaces the TAA resolve (no built-in sharpening) and uses its own Halton jitter: both fixes are shown as always on
       ImGui::BeginDisabled(sr_selected);
       bool disable_taa_sharpening = g_disable_taa_sharpening || sr_selected;
-      if (ImGui::Checkbox("Disable Native TAA Sharpening", &disable_taa_sharpening))
+      if (SettingsUI::Checkbox("Disable Native TAA Sharpening", &disable_taa_sharpening))
       {
          reshade::set_config_value(nullptr, NAME, "DisableTAASharpening", disable_taa_sharpening);
       }
@@ -4248,7 +4248,7 @@ public:
          DrawResetButton(disable_taa_sharpening, kDefaultDisableTaaSharpening, "DisableTAASharpening");
       }
       bool improve_taa_jitter = g_improve_taa_jitter || sr_selected;
-      if (ImGui::Checkbox("Fix Native TAA Jitter", &improve_taa_jitter))
+      if (SettingsUI::Checkbox("Fix Native TAA Jitter", &improve_taa_jitter))
       {
          reshade::set_config_value(nullptr, NAME, "ImproveTAAJitter", improve_taa_jitter);
       }

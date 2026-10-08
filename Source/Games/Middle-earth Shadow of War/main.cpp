@@ -210,7 +210,7 @@ namespace ShaderDefines
       bool def = GetBool(d);
       
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Checkbox(label, &def);
+      bool c = SettingsUI::Checkbox(label, &def);
       ImGui::PopID();
 
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -224,7 +224,7 @@ namespace ShaderDefines
    static int UIDropDown(uint32_t d, const char* label, const char* const items[], const char* tooltip)
    {
       int def = Get(d);
-      bool c = ImGui::Combo(label, &def, items, IM_ARRAYSIZE(items));
+      bool c = SettingsUI::Combo(label, &def, items, IM_ARRAYSIZE(items));
       if (c) Set(d, def);
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
       UIResetButton(d);
@@ -236,7 +236,7 @@ namespace ShaderDefines
       std::vector<const char*> items(items_list);
       int def = Get(d);
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = ImGui::Combo(label, &def, items.data(), static_cast<int>(items.size()));
+      bool c = SettingsUI::Combo(label, &def, items.data(), static_cast<int>(items.size()));
       ImGui::PopID();
       if (c) Set(d, def);
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -288,7 +288,7 @@ namespace JitterHistory
    {
       // toggle
       ImGui::PushID("JitterHistory: Scan");
-      auto a = ImGui::Checkbox("Scan", &is_scan);
+      auto a = SettingsUI::Checkbox("Scan", &is_scan);
       ImGui::PopID();
       if (a)
          if (is_scan)
@@ -620,7 +620,7 @@ public:
          ImGui::PopStyleColor();
          
          ImGui::PushID("Peak Brightness: WhiteClip");
-         if (ImGui::SliderFloat("White Clip", &cb_luma_global_settings.GameSettings.WhiteClip, 0.f, 4.f, "%.3f"))
+         if (SettingsUI::SliderFloat("White Clip", &cb_luma_global_settings.GameSettings.WhiteClip, 0.f, 4.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "WhiteClip", cb_luma_global_settings.GameSettings.WhiteClip);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -628,7 +628,7 @@ public:
          DrawResetButton(cb_luma_global_settings.GameSettings.WhiteClip, default_luma_global_game_settings.WhiteClip, "WhiteClip", runtime);
 
          ImGui::PushID("Peak Brightness: BlowoutCorrection");
-         if (ImGui::SliderFloat("Blowout Correction", &cb_luma_global_settings.GameSettings.BlowoutCorrection, 0.f, 0.8f, "%.3f"))
+         if (SettingsUI::SliderFloat("Blowout Correction", &cb_luma_global_settings.GameSettings.BlowoutCorrection, 0.f, 0.8f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "BlowoutCorrection", cb_luma_global_settings.GameSettings.BlowoutCorrection);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -671,7 +671,7 @@ public:
             ImGui::PopStyleColor();
 
             ImGui::PushID("SR: copy_resource"); 
-            if (ImGui::Checkbox("Enable Fix (Read Tooltip)", &sr_copy_resource))
+            if (SettingsUI::Checkbox("Enable Fix (Read Tooltip)", &sr_copy_resource))
                reshade::set_config_value(runtime, NAME, "sr_copy_resource", sr_copy_resource);
             ImGui::PopID();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -686,7 +686,7 @@ public:
          ImGui::PopStyleColor();
 
          ImGui::PushID("SR: sr_user_allow_upgraded_samplers"); 
-         if (ImGui::Checkbox("Enable Upgrade (Read Tooltip)", &sr_user_allow_upgraded_samplers))
+         if (SettingsUI::Checkbox("Enable Upgrade (Read Tooltip)", &sr_user_allow_upgraded_samplers))
             reshade::set_config_value(runtime, NAME, "sr_user_allow_upgraded_samplers", sr_user_allow_upgraded_samplers);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -697,7 +697,7 @@ public:
          //sr_user_mip_bias_offset slider
          if (ignore_upgraded_samplers) ImGui::BeginDisabled();
          ImGui::PushID("SR: sr_user_mip_bias_offset");
-         if (ImGui::SliderFloat("Mip LOD Bias Offset", &sr_user_mip_bias_offset, 0.f, -10.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Mip LOD Bias Offset", &sr_user_mip_bias_offset, 0.f, -10.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "sr_user_mip_bias_offset", sr_user_mip_bias_offset);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -714,7 +714,7 @@ public:
          ImGui::PopStyleColor();
 
          ImGui::PushID("Miscellaneous: RCAS");
-         if (ImGui::SliderFloat("Sharpening", &cb_luma_global_settings.GameSettings.RCAS, 0.f, 1.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Sharpening", &cb_luma_global_settings.GameSettings.RCAS, 0.f, 1.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "RCAS", cb_luma_global_settings.GameSettings.RCAS);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -723,7 +723,7 @@ public:
          ShaderDefines::Set(RCAS_ENABLED, cb_luma_global_settings.GameSettings.RCAS > 0.f); //bruh
 
          ImGui::PushID("Miscellaneous: GodRays");
-         if (ImGui::SliderFloat("God Rays Strength", &cb_luma_global_settings.GameSettings.GodRays, 0.f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("God Rays Strength", &cb_luma_global_settings.GameSettings.GodRays, 0.f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "GodRays", cb_luma_global_settings.GameSettings.GodRays);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -731,7 +731,7 @@ public:
          DrawResetButton(cb_luma_global_settings.GameSettings.GodRays, default_luma_global_game_settings.GodRays, "GodRays", runtime);
          
          ImGui::PushID("Miscellaneous: Bloom");
-         if (ImGui::SliderFloat("Bloom Strength", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Bloom Strength", &cb_luma_global_settings.GameSettings.Bloom, 0.f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "Bloom", cb_luma_global_settings.GameSettings.Bloom);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -741,7 +741,7 @@ public:
          // TODO: AO
          
          ImGui::PushID("Miscellaneous: UIToggle is_allowed");
-         ImGui::Checkbox("Draw UI", &is_ui);
+         SettingsUI::Checkbox("Draw UI", &is_ui);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("If off all shaders after scene color gets tonemapped (UI shaders) are discarded.");
          ImGui::PopID();
@@ -761,7 +761,7 @@ public:
          if (!is_on) ImGui::BeginDisabled();
 
          ImGui::PushID("Retuned Fire: RetunedFirePeak");
-         if (ImGui::SliderFloat("Reduction Strength", &cb_luma_global_settings.GameSettings.RetunedFirePeak, 1.01f, 2.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Reduction Strength", &cb_luma_global_settings.GameSettings.RetunedFirePeak, 1.01f, 2.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "RetunedFirePeak", cb_luma_global_settings.GameSettings.RetunedFirePeak);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -769,7 +769,7 @@ public:
          DrawResetButton(cb_luma_global_settings.GameSettings.RetunedFirePeak, default_luma_global_game_settings.RetunedFirePeak, "RetunedFirePeak", runtime);
 
          ImGui::PushID("Retuned Fire: RetunedFireBoost");
-         if (ImGui::SliderFloat("Brightness Makeup", &cb_luma_global_settings.GameSettings.RetunedFireBoost, 1.f, 4.f, "%.3f"))
+         if (SettingsUI::SliderFloat("Brightness Makeup", &cb_luma_global_settings.GameSettings.RetunedFireBoost, 1.f, 4.f, "%.3f"))
             reshade::set_config_value(runtime, NAME, "RetunedFireBoost", cb_luma_global_settings.GameSettings.RetunedFireBoost);
          ImGui::PopID();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))

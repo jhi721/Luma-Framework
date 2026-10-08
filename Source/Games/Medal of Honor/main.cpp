@@ -1120,7 +1120,7 @@ public:
 #if ENABLE_SMAA
       ImGui::SeparatorText("Anti-Aliasing");
 
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
+      if (SettingsUI::Checkbox("SMAA Enable", &g_smaa_enable))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
          gs.SMAAEnable = g_smaa_enable ? 1.f : 0.f;
@@ -1136,16 +1136,16 @@ public:
       // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight
       // (Airborne ships it the same way). The motion-blur precondition needs no user-facing warning either: the
       // fallback to plain SMAA is silent and harmless.
-      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
+      if (SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication))
          reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.\nNeeds the game's Motion Blur ON - cb4[10] is only declared by those permutations; otherwise plain SMAA.");
 
-      if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.001f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
+      if (SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.001f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
          reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Plane deviation counted as a full edge, as a fraction of view depth.\nThis is the ONLY lever - never touch SMAA_PREDICATION_THRESHOLD, which is unitless by construction.\nToo low: a grazing floor lights up. Too high: silhouettes go missing.");
-      ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+      SettingsUI::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Show the predication mask (red) instead of the frame. Black on flat surfaces, white along silhouettes.");
       {
@@ -1155,7 +1155,7 @@ public:
       }
 #endif
 
-      if (ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f, "%.2f"))
+      if (SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f, "%.2f"))
          reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Sharpening applied on top of SMAA (0 = off).");
@@ -1165,7 +1165,7 @@ public:
 
       ImGui::SeparatorText("Grade");
 
-      if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
@@ -1177,7 +1177,7 @@ public:
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
       }
 
-      if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.5f, 1.5f))
+      if (SettingsUI::SliderFloat("Contrast", &gs.Contrast, 0.5f, 1.5f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
@@ -1189,7 +1189,7 @@ public:
          reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
       }
 
-      if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
@@ -1201,7 +1201,7 @@ public:
          reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
       }
 
-      if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
+      if (SettingsUI::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
@@ -1217,11 +1217,11 @@ public:
       // LEGACY A/B ONLY, and guarded to match the shader: the only code that reads these is the DevSetting04
       // branch in Luma_MOH_Tonemap.hlsl, which is #if DEVELOPMENT. The shipped max-channel path needs no hue
       // restoration. Both go when that A/B is settled.
-      if (ImGui::SliderFloat("Vanilla Clip Hue", &gs.HighlightsHueStrength, 0.f, 1.f, "%.2f"))
+      if (SettingsUI::SliderFloat("Vanilla Clip Hue", &gs.HighlightsHueStrength, 0.f, 1.f, "%.2f"))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("hueStrength of the vanilla highlight emulation: how much of the vanilla clip's hue angle the recovered highlight adopts (0.8 default). Never changes saturation by itself. Keep it below 1.0 — the hue runs away as the helper's chrominance ratio goes singular and white-hot pixels turn cyan.");
-      if (ImGui::SliderFloat("Vanilla Clip Whitening", &gs.HighlightsHueChroma, 0.f, 1.f, "%.2f"))
+      if (SettingsUI::SliderFloat("Vanilla Clip Whitening", &gs.HighlightsHueChroma, 0.f, 1.f, "%.2f"))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("chrominanceStrength of the same call: the fraction of the vanilla clip's own chroma loss that gets reproduced (0 = vanilla hue but our saturation). The only one of the two knobs that can whiten; DICE and Highlights Desaturation already whiten at peak, so raise this only against a measured A/B.");
@@ -1230,7 +1230,7 @@ public:
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");
 
-      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+      if (SettingsUI::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
       {
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
@@ -1243,7 +1243,7 @@ public:
       // can reach the game's own glow.
       ImGui::BeginDisabled(!g_luma_bloom_enable);
 
-      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
+      if (SettingsUI::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
@@ -1256,7 +1256,7 @@ public:
       }
 
 #if DEVELOPMENT || TEST
-      if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
+      if (SettingsUI::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
@@ -1292,7 +1292,7 @@ public:
       ImGui::SeparatorText("Effects");
 
       bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
+      if (SettingsUI::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          device_data.cb_luma_global_settings_dirty = true;
@@ -1303,7 +1303,7 @@ public:
 
       ImGui::SeparatorText("UI");
 
-      if (ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui)) // Session-only: a stuck "on" would look like a broken HUD.
+      if (SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui)) // Session-only: a stuck "on" would look like a broken HUD.
       {
 #if DEVELOPMENT || TEST
          if (g_hide_ui)
