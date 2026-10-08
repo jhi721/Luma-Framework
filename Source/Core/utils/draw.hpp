@@ -1392,7 +1392,17 @@ inline bool HasSMAAShaders(const DeviceData& device_data)
           HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h);
 }
 
-void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11RenderTargetView* rtv, ID3D11ShaderResourceView* srv_color_tex, ID3D11ShaderResourceView* srv_color_tex_gamma, ID3D11ShaderResourceView* srv_predication_tex = nullptr)
+// SMAA T2x: the game's blending weight and neighborhood blending pixel shaders built with "SMAA_SUBSAMPLE_INDICES" and
+// "SMAA_REPROJECTION" (SMAA_Passes.hlsl), and the velocity the neighborhood blend reads at t2. Its target then holds the velocity
+// length in alpha, for the game's temporal resolve ("SMAAResolvePS").
+struct SMAAT2xPasses
+{
+   ID3D11PixelShader* blending_weight_calculation_ps = nullptr;
+   ID3D11PixelShader* neighborhood_blending_ps = nullptr;
+   ID3D11ShaderResourceView* velocity = nullptr;
+};
+
+void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11RenderTargetView* rtv, ID3D11ShaderResourceView* srv_color_tex, ID3D11ShaderResourceView* srv_color_tex_gamma, ID3D11ShaderResourceView* srv_predication_tex = nullptr, const SMAAT2xPasses* t2x = nullptr)
 {
    auto& managed_resources = device_data.managed_resources;
 
@@ -1583,7 +1593,7 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    device_context->OMSetDepthStencilState(managed_resources.depth_stencils["smaa_disable_depth_use_stencil"_h].get(), 1);
    device_context->OMSetRenderTargets(1, &managed_resources.render_target_views["smaa_blending_weight_calculation"_h], managed_resources.depth_stencil_views["smaa_dsv"_h].get());
    device_context->VSSetShader(device_data.native_vertex_shaders.at("SMAA Blending Weight Calculation VS"_h).get(), nullptr, 0);
-   device_context->PSSetShader(device_data.native_pixel_shaders.at("SMAA Blending Weight Calculation PS"_h).get(), nullptr, 0);
+   device_context->PSSetShader(t2x ? t2x->blending_weight_calculation_ps : device_data.native_pixel_shaders.at("SMAA Blending Weight Calculation PS"_h).get(), nullptr, 0);
    const std::array ps_srvs_blending_weight_calculation = { managed_resources.shader_resource_views["smaa_edge_detection"_h].get(), managed_resources.shader_resource_views["smaa_area_tex"_h].get(), managed_resources.shader_resource_views["smaa_search_tex"_h].get() };
    device_context->PSSetShaderResources(0, ps_srvs_blending_weight_calculation.size(), ps_srvs_blending_weight_calculation.data());
 
@@ -1598,8 +1608,8 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    // Bindings.
    device_context->OMSetRenderTargets(1, &rtv, nullptr);
    device_context->VSSetShader(device_data.native_vertex_shaders.at("SMAA Neighborhood Blending VS"_h).get(), nullptr, 0);
-   device_context->PSSetShader(device_data.native_pixel_shaders.at("SMAA Neighborhood Blending PS"_h).get(), nullptr, 0);
-   const std::array ps_srvs_neighborhood_blending = { srv_color_tex, managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].get() };
+   device_context->PSSetShader(t2x ? t2x->neighborhood_blending_ps : device_data.native_pixel_shaders.at("SMAA Neighborhood Blending PS"_h).get(), nullptr, 0);
+   const std::array ps_srvs_neighborhood_blending = { srv_color_tex, managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].get(), t2x ? t2x->velocity : nullptr };
    device_context->PSSetShaderResources(0, ps_srvs_neighborhood_blending.size(), ps_srvs_neighborhood_blending.data());
 
    device_context->Draw(3, 0);
