@@ -63,6 +63,7 @@
     <UseDgVoodoo>true</UseDgVoodoo>
     <UseDgVoodooLinux>true</UseDgVoodooLinux>
     <UseD3D9VAFix>true</UseD3D9VAFix>
+    <UseD3D9CSMT>true</UseD3D9CSMT>
   </PropertyGroup>
   <ItemGroup>
     <!-- Luma per-game feature toggles shown in Project Properties -> Configuration
