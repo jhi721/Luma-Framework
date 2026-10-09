@@ -681,7 +681,7 @@ public:
 #endif
       // Game-specific toggle consumed by the replaced pass (Luma_MOH_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: recover highlights + DICE display map"},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: recover highlights + DICE display map", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
