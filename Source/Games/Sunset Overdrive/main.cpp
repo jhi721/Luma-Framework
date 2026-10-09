@@ -334,7 +334,9 @@ public:
       GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('0');
       GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).SetDefaultValue('1');
-      GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('0');
+      // The scene copy and videos onto the swapchain pre-scale by GamePaperWhite/UIPaperWhite, so the Scaleform UI drawn raw on top
+      // gets its own paper white (Includes/Common.hlsl)
+      GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');
       // 0 stays selectable as the vanilla reference every HDR change gets compared against (Includes/ToneMap.hlsl)
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", 1},
@@ -346,6 +348,9 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
       luma_ui_cbuffer_index = -1;
+
+      // Manual paper white sliders, not the OS reference level. Core shows the UI one on UI_DRAW_TYPE >= 1.
+      use_os_reference_white_level = false;
 
       default_luma_global_game_settings = {
          .Dithering = 1.f,
