@@ -705,8 +705,9 @@ namespace Mcp
       WriteViews(w, "samplers", D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, [&](size_t i)
          { return entry.samplers_filter[i] != static_cast<D3D11_FILTER>(-1); }, [&](size_t i)
          {
-         w->Field("filter", GetFilterName(entry.samplers_filter[i]));
+         w->Field("filter", GetFilterName(entry.samplers_filter[i])).Field("filter_id", uint32_t(entry.samplers_filter[i]));
          w->Field("address", std::format("{} {} {}", GetTextureAddressModeName(entry.samplers_address_u[i]), GetTextureAddressModeName(entry.samplers_address_v[i]), GetTextureAddressModeName(entry.samplers_address_w[i])));
+         w->Key("address_ids").BeginArray().Value(uint32_t(entry.samplers_address_u[i])).Value(uint32_t(entry.samplers_address_v[i])).Value(uint32_t(entry.samplers_address_w[i])).EndArray();
          w->Field("mip_lod_bias", entry.samplers_mip_lod_bias[i]); });
 
       if (!entry.input_layout_hash.empty())
@@ -1912,6 +1913,14 @@ namespace Mcp
       // Define values are a single character
       const auto value_of = [](const auto& define)
       { return std::string_view(define.GetValue(), strnlen(define.GetValue(), 1)); };
+      {
+         // Everything the custom shaders were compiled with, Core's own defines included ("GAME_*", "LUMA_*_CB_INDEX"...)
+         const std::shared_lock lock_loading(s_mutex_loading);
+         w.Key("compile_defines").BeginObject();
+         for (size_t i = 0; i + 1 < custom_shaders_compile_defines.size(); i += 2)
+            w.Field(custom_shaders_compile_defines[i].c_str(), custom_shaders_compile_defines[i + 1]);
+         w.EndObject();
+      }
       w.Key("defines").BeginArray();
       for (const auto& define : shader_defines_data)
       {

@@ -777,6 +777,9 @@ namespace
    }
 
    std::string shaders_compilation_errors; // errors and warning log
+#if DEVELOPMENT
+   std::vector<std::string> custom_shaders_compile_defines; // Name/value pairs of the last "CompileCustomShaders()", for "luma_get_settings" (offline replays)
+#endif
 
    // List of define values read by our settings shaders
    std::unordered_map<std::string, uint8_t> code_shaders_defines;
@@ -1691,6 +1694,9 @@ namespace
       {
          const std::unique_lock lock(s_mutex_loading);
          shaders_compilation_errors.clear();
+#if DEVELOPMENT
+         custom_shaders_compile_defines = shader_defines;
+#endif
       }
 
       auto directory = shaders_path;
