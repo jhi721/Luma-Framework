@@ -1424,7 +1424,7 @@ public:
       const bool sr_active = IsSRActive(device_data);
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (SettingsUI::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Adds SMAA anti-aliasing (the game has none of its own; not used with DLSS/FSR).");
@@ -1433,13 +1433,13 @@ public:
       if (g_smaa_enable && !sr_active)
       {
          // Not a preference: on geometry it relaxes the threshold back to base ULTRA, never below. A bisect switch.
-         SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication);
+         ImGui::Checkbox("SMAA Predication", &g_smaa_predication);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.");
-         SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
+         ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges.");
-         SettingsUI::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+         ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show the predication mask (red) instead of the scene.\nWant: black on flat surfaces, red across silhouettes.");
       }
@@ -1449,7 +1449,7 @@ public:
       ImGui::SeparatorText("Effects");
       // Read in Video_0x72C37F0F.ps_5_0.hlsl. Inert in SDR: peak == paper white makes PumboAutoHDR an identity.
       bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-      if (SettingsUI::Checkbox("Video AutoHDR", &video_auto_hdr))
+      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
@@ -1459,7 +1459,7 @@ public:
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
 
       ImGui::BeginDisabled(!video_auto_hdr);
-      if (SettingsUI::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
+      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
          device_data.cb_luma_global_settings_dirty = true;
@@ -1471,7 +1471,7 @@ public:
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
-      if (SettingsUI::Checkbox("Dithering", &dithering))
+      if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);

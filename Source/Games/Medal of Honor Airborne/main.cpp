@@ -2661,7 +2661,7 @@ public:
       const bool sr_active = IsSRActive(device_data);
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (SettingsUI::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       }
@@ -2676,21 +2676,21 @@ public:
          // Predication is not a preference: it only relaxes the edge threshold back to base ULTRA on geometry and
          // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight.
          ImGui::BeginDisabled(sr_active);
-         if (SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication))
+         if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
             reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.");
-         if (SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
+         if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
             reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
-         SettingsUI::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+         ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
          ImGui::EndDisabled();
 #endif
 
-         if (SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f))
+         if (ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f))
             reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
          if (ImGui::IsItemHovered())
          {
@@ -2708,7 +2708,7 @@ public:
 
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max_value, const char* tooltip)
       {
-         if (SettingsUI::SliderFloat(label, value, 0.f, max_value))
+         if (ImGui::SliderFloat(label, value, 0.f, max_value))
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
             device_data.cb_luma_global_settings_dirty = true;
@@ -2727,7 +2727,7 @@ public:
 
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");
-      if (SettingsUI::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
       {
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
@@ -2741,14 +2741,14 @@ public:
       ImGui::BeginDisabled(!g_luma_bloom_enable);
 
       // Raw slider only — the effective value is derived in OnPresent, which is its sole writer.
-      if (SettingsUI::SliderFloat("Bloom Intensity", &g_bloom_intensity, 0.f, 2.f))
+      if (ImGui::SliderFloat("Bloom Intensity", &g_bloom_intensity, 0.f, 2.f))
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", g_bloom_intensity);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
       DrawResetButton(g_bloom_intensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity"); // writes the config itself (Serialize defaults true)
 
 #if DEVELOPMENT
-      if (SettingsUI::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
+      if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
       {
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
          device_data.cb_luma_global_settings_dirty = true;
@@ -2773,7 +2773,7 @@ public:
       // Read in Video_0x1AAC12AD.ps_5_0.hlsl. Inert in SDR by construction (peak == paper white there makes
       // PumboAutoHDR an identity), so no display-mode gate is needed on either side.
       bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-      if (SettingsUI::Checkbox("Video AutoHDR", &video_auto_hdr))
+      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
@@ -2783,7 +2783,7 @@ public:
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
 
       ImGui::BeginDisabled(!video_auto_hdr);
-      if (SettingsUI::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
+      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
          device_data.cb_luma_global_settings_dirty = true;
@@ -2795,7 +2795,7 @@ public:
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
-      if (SettingsUI::Checkbox("Dithering", &dithering))
+      if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
@@ -2805,7 +2805,7 @@ public:
          ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
-      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only: a stuck "on" would look like a broken HUD.
+      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only: a stuck "on" would look like a broken HUD.
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
    }

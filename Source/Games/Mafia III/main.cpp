@@ -1245,7 +1245,7 @@ public:
 
       ImGui::NewLine();
 
-      if (SettingsUI::Checkbox("Enable Color Grading LUTs Range Normalization", &enable_luts_normalization))
+      if (ImGui::Checkbox("Enable Color Grading LUTs Range Normalization", &enable_luts_normalization))
       {
          reshade::set_config_value(runtime, NAME, "EnableLUTsNormalization", enable_luts_normalization);
       }
@@ -1255,7 +1255,7 @@ public:
       }
       DrawResetButton(enable_luts_normalization, true, "EnableLUTsNormalization", runtime); // Default to true even if it's not the way the original game was
 
-      if (SettingsUI::SliderFloat("Color Grading LUTs Strength", &luts_strength, 0.f, 1.f))
+      if (ImGui::SliderFloat("Color Grading LUTs Strength", &luts_strength, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "LUTsStrength", luts_strength);
       }
@@ -1265,7 +1265,7 @@ public:
       }
       DrawResetButton(luts_strength, 1.f, "LUTsStrength", runtime);
 
-      if (SettingsUI::SliderFloat("Color Grading LUTs Yellow Filter Correction", &luts_yellow_filter_removal, 0.f, 1.f))
+      if (ImGui::SliderFloat("Color Grading LUTs Yellow Filter Correction", &luts_yellow_filter_removal, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "LUTsYellowFilterCorrection", luts_yellow_filter_removal);
       }
@@ -1275,7 +1275,7 @@ public:
       }
       DrawResetButton(luts_yellow_filter_removal, 0.f, "LUTsYellowFilterCorrection", runtime);
 
-      if (SettingsUI::SliderFloat("Sharpening", &sharpening, 0.f, 1.f))
+      if (ImGui::SliderFloat("Sharpening", &sharpening, 0.f, 1.f))
       {
          cb_luma_global_settings.GameSettings.Sharpening = sharpening;
          device_data.cb_luma_global_settings_dirty = true;
@@ -1287,7 +1287,7 @@ public:
       }
       DrawResetButton(sharpening, 0.f, "Sharpening", runtime);
 
-      if (SettingsUI::Checkbox("Allow Motion Blur", &allow_motion_blur)) // Called "Allow" and not "Enable" because there's already a toggle in the game settings, this is an override
+      if (ImGui::Checkbox("Allow Motion Blur", &allow_motion_blur)) // Called "Allow" and not "Enable" because there's already a toggle in the game settings, this is an override
       {
          reshade::set_config_value(runtime, NAME, "MotionBlur", allow_motion_blur);
       }
@@ -1297,7 +1297,7 @@ public:
       }
       DrawResetButton(allow_motion_blur, true, "MotionBlur", runtime);
 
-      if (SettingsUI::Checkbox("Vignette", &enable_vignette))
+      if (ImGui::Checkbox("Vignette", &enable_vignette))
       {
          reshade::set_config_value(runtime, NAME, "Vignette", enable_vignette);
       }
@@ -1310,7 +1310,7 @@ public:
       ImGui::NewLine();
 
       // This isn't serialized because it could cause issues/confusion if it's enabled on boot
-      SettingsUI::Checkbox("Hide Gameplay UI", &hide_gameplay_ui);
+      ImGui::Checkbox("Hide Gameplay UI", &hide_gameplay_ui);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Hides the whole UI outside of the main menu\nWARNING: this can cause confusion and isn't perfect (everything is hidden, even some non gameplay UI and Menus)");
@@ -1321,7 +1321,7 @@ public:
 
       if (ImGui::TreeNode("Camera Mode"))
       {
-         SettingsUI::Checkbox("Enable", &enable_camera_mode);
+         ImGui::Checkbox("Enable", &enable_camera_mode);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
             ImGui::SetTooltip("Basic Camera Mode. Pause the game and enable it to be able to move the camera around and take screenshots. Works during in engine cutscenes too.\nWARNING: if you rotate the camera backwards, some geometry might not render");
@@ -1334,7 +1334,7 @@ public:
          DrawResetButton<decltype(camera_mode_translation), false>(camera_mode_translation, {}, "Translation", runtime);
          ImGui::SliderFloat3("Rotation", &camera_mode_rotation.x, -M_PI, M_PI);
          DrawResetButton<decltype(camera_mode_rotation), false>(camera_mode_rotation, {}, "Rotation", runtime);
-         SettingsUI::SliderFloat("FoV Scale", &camera_mode_fov_scale, 0.1f, 10.f);
+         ImGui::SliderFloat("FoV Scale", &camera_mode_fov_scale, 0.1f, 10.f);
          DrawResetButton<decltype(camera_mode_fov_scale), false>(camera_mode_fov_scale, 1.f, "FoV Scale", runtime); // TODO: why doesn't reset work!? Or does it now?
 
          ImGui::EndDisabled();

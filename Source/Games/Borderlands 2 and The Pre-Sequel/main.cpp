@@ -3900,7 +3900,7 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (SettingsUI::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       }
@@ -3911,7 +3911,7 @@ public:
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable || sr_active);
       bool t2x_shown = g_smaa_t2x && !sr_active;
-      if (SettingsUI::Checkbox("SMAA T2x", sr_active ? &t2x_shown : &g_smaa_t2x))
+      if (ImGui::Checkbox("SMAA T2x", sr_active ? &t2x_shown : &g_smaa_t2x))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
       }
@@ -3921,7 +3921,7 @@ public:
       }
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
-      SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
+      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
@@ -3939,7 +3939,7 @@ public:
 #if DEVELOPMENT
       // Predication is not a preference: it only relaxes the edge threshold back to base ULTRA on geometry and
       // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight.
-      if (SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication))
+      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
       }
@@ -3947,7 +3947,7 @@ public:
       {
          ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps cel-shade texture noise from being antialiased while still catching real silhouettes.");
       }
-      if (SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
+      if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
       {
          reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       }
@@ -3955,7 +3955,7 @@ public:
       {
          ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
       }
-      SettingsUI::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+      ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
@@ -3973,33 +3973,33 @@ public:
 
 #if DEVELOPMENT
       ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
-      SettingsUI::Checkbox("MV Enable", &g_mv_enable);
+      ImGui::Checkbox("MV Enable", &g_mv_enable);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Draws the scene with the motion vector shaders without an upscaler. The image must not change; the debug view is\nblack with a static camera and lights up only what moves. ReShade.log: patched/refused shaders. Not saved.");
       }
-      SettingsUI::Checkbox("MV Debug View", &g_mv_debug_view);
-      SettingsUI::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
+      ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
+      ImGui::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Marks the pixels alpha blended draws drew, so FSR trusts their history less: all of them as reactive (over the\nthreshold), the non-additive ones (smoke, glass, water) also as transparency & composition. Not saved.");
       }
-      SettingsUI::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
-      SettingsUI::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
+      ImGui::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
+      ImGui::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Scaled reactivity under it is 0, over it 0.9 (AMD's binary mask; AMD 0.2, default 0.5: lower makes static glows shake). 0: the scaled reactivity itself.");
       }
-      SettingsUI::Checkbox("FSR Reactive Debug View", &g_sr_reactive_debug_view);
-      SettingsUI::Checkbox("FSR T&C From Mask", &g_sr_tc_from_mask);
+      ImGui::Checkbox("FSR Reactive Debug View", &g_sr_reactive_debug_view);
+      ImGui::Checkbox("FSR T&C From Mask", &g_sr_tc_from_mask);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Passes the reactive mask as FSR's transparency & composition mask too, instead of the alpha blended draws' own. Not saved.");
       }
-      SettingsUI::Checkbox("FSR Reactive Zero Test", &g_sr_reactive_zero_test);
-      SettingsUI::Checkbox("FSR Reactive Pass", &g_sr_reactive_pass);
-      SettingsUI::Checkbox("FSR Reactive Skip Fill", &g_sr_reactive_skip_fill);
-      SettingsUI::Checkbox("MV Force Jitter", &g_mv_force_jitter);
+      ImGui::Checkbox("FSR Reactive Zero Test", &g_sr_reactive_zero_test);
+      ImGui::Checkbox("FSR Reactive Pass", &g_sr_reactive_pass);
+      ImGui::Checkbox("FSR Reactive Skip Fill", &g_sr_reactive_skip_fill);
+      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Jitters the scene without an upscaler, with MV Enable. The image shakes by a subpixel; nothing may flicker or lose\npixels, and the debug view stays black with a static camera. Not saved.");
@@ -4013,7 +4013,7 @@ public:
       {
          ImGui::SetTooltip("Logs GPU and CPU times every 120 frames ([BL2 Perf] in ReShade.log): the frame, the scene, the end of the scene\n(fill, the upscaler, copies) and the scene hooks' CPU time. The first 30 frames after a settings change are skipped.\nKeep the camera still. \"Sweep\" runs the anti-aliasing modes, 3 rounds, then logs medians against No AA; \"CPU Sweep\"\nthe CPU savings each off in turn under the current DLSS/FSR, against Current Settings. Not saved.");
       }
-      SettingsUI::Checkbox("Hook Timers", &Perf::g_hook_timers);
+      ImGui::Checkbox("Hook Timers", &Perf::g_hook_timers);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. The test also turns off the per draw diagnostics.");
@@ -4029,7 +4029,7 @@ public:
       // A [0, max] float setting: slider, saved when the edit ends, reset button (saved too)
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
-         if (SettingsUI::SliderFloat(label, value, 0.f, max))
+         if (ImGui::SliderFloat(label, value, 0.f, max))
          {
             device_data.cb_luma_global_settings_dirty = true;
          }
@@ -4056,7 +4056,7 @@ public:
       // A switch the shaders read as a float: checkbox, mirrored, saved
       const auto toggle = [&](const char* label, bool* value, float* shader_value, const char* key, const char* tooltip)
       {
-         if (SettingsUI::Checkbox(label, value))
+         if (ImGui::Checkbox(label, value))
          {
             *shader_value = *value ? 1.f : 0.f;
             device_data.cb_luma_global_settings_dirty = true;
@@ -4088,7 +4088,7 @@ public:
 
       // Luma_BL2TPS_Tonemap.hlsl dithers in HDR and SDR alike, so this checkbox has no display-mode gate.
       bool dithering = gs.Dithering > 0.5f;
-      if (SettingsUI::Checkbox("Dithering", &dithering))
+      if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          device_data.cb_luma_global_settings_dirty = true;
@@ -4100,7 +4100,7 @@ public:
       }
 
       ImGui::SeparatorText("UI");
-      if (SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui))
+      if (ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui))
       {
          reshade::set_config_value(nullptr, NAME, "HideUI", g_hide_ui);
       }

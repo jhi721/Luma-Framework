@@ -3334,7 +3334,7 @@ public:
       const auto settings_toggle = [&](const char* label, const char* key, float* value, float default_value, const char* tooltip)
       {
          bool enabled = *value > 0.5f;
-         if (SettingsUI::Checkbox(label, &enabled))
+         if (ImGui::Checkbox(label, &enabled))
          {
             *value = (enabled ? 1.f : 0.f);
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -3353,7 +3353,7 @@ public:
       // Persisted GameSettings slider, saved once the edit ends
       const auto settings_slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
-         if (SettingsUI::SliderFloat(label, value, 0.f, max_value))
+         if (ImGui::SliderFloat(label, value, 0.f, max_value))
          {
             device_data.cb_luma_global_settings_dirty = true;
          }
@@ -3375,7 +3375,7 @@ public:
       {
          // The game's render scale (its option steps by 10%), forced live (see "UpdateRenderScale")
          ImGui::BeginDisabled(!GetGameDeviceData(device_data).render_scale_setting);
-         if (SettingsUI::SliderInt("Render Scale", &g_render_scale, 5, 10, "%d0%%", ImGuiSliderFlags_AlwaysClamp))
+         if (ImGui::SliderInt("Render Scale", &g_render_scale, 5, 10, "%d0%%", ImGuiSliderFlags_AlwaysClamp))
          {
             reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
          }
@@ -3392,7 +3392,7 @@ public:
       if (IsSRActive(device_data))
       {
          ImGui::BeginDisabled();
-         SettingsUI::Checkbox("SMAA Enable", &smaa);
+         ImGui::Checkbox("SMAA Enable", &smaa);
          ImGui::EndDisabled();
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
@@ -3417,7 +3417,7 @@ public:
       settings_slider("Bloom Intensity", "BloomIntensity", &settings.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (SettingsUI::Checkbox("XeGTAO Enable", &g_gtao_enable))
+      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
       {
          reshade::set_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       }
@@ -3428,18 +3428,18 @@ public:
       DrawResetButton(g_gtao_enable, true, "GTAOEnable");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      SettingsUI::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Primary darkness dial (higher = darker AO). Not saved.");
       }
-      SettingsUI::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 200.f, "%.1f");
+      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 200.f, "%.1f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("0 = the game's SSAO radius (40 cm, capped at 108 half res pixels up close); > 0 overrides it, in centimetres, uncapped. Not saved.");
       }
 #if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
-      SettingsUI::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Draws diagnostics through the game's SSAO blurs into the G-buffer AO (darkens the ambient lighting only).\nDepth gradient flat or blocky = wrong input; Normals: camera-facing surfaces bright, black everywhere = NORMAL_Z_SIGN inverted;\nAO x8 = spot broad over-occlusion.");
@@ -3454,7 +3454,7 @@ public:
       settings_toggle("Dithering", "Dithering", &settings.Dithering, default_luma_global_game_settings.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
-      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui);
+      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Disables the in-game UI.");

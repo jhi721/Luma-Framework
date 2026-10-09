@@ -110,7 +110,7 @@ namespace ShaderDefines
       bool def = GetBool(d);
       
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = SettingsUI::Checkbox(label, &def);
+      bool c = ImGui::Checkbox(label, &def);
       ImGui::PopID();
 
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -124,7 +124,7 @@ namespace ShaderDefines
    static int UIDropDown(uint32_t d, const char* label, const char* const items[], const char* tooltip)
    {
       int def = Get(d);
-      bool c = SettingsUI::Combo(label, &def, items, IM_ARRAYSIZE(items));
+      bool c = ImGui::Combo(label, &def, items, IM_ARRAYSIZE(items));
       if (c) Set(d, def);
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
       UIResetButton(d);
@@ -136,7 +136,7 @@ namespace ShaderDefines
       std::vector<const char*> items(items_list);
       int def = Get(d);
       ImGui::PushID(std::string(label).append("_").append(std::to_string(d)).c_str());
-      bool c = SettingsUI::Combo(label, &def, items.data(), static_cast<int>(items.size()));
+      bool c = ImGui::Combo(label, &def, items.data(), static_cast<int>(items.size()));
       ImGui::PopID();
       if (c) Set(d, def);
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(tooltip);
@@ -792,7 +792,7 @@ namespace
       constexpr const char* reshade_config_section = "SubGameUserSettingsHandler";
       void OnImGui(SubGame curr_game)
       {
-         if (SettingsUI::Checkbox("Enable Per Game Settings", &enabled))
+         if (ImGui::Checkbox("Enable Per Game Settings", &enabled))
          {
             reshade::set_config_value(nullptr, reshade_config_section, "EnablePerGameSettings", enabled);
             OnSubGameChange(curr_game);
@@ -820,9 +820,9 @@ namespace
                ImGui::SameLine(); if (ImGui::Button("Set: Disable")) { s->peak = 0; s->paper_scene = 0; s->paper_ui = 0; }
 
                auto GetFormat = [](int v) { return v > 0 ? "%d" : "%d (Inactive)"; };
-               SettingsUI::SliderInt("Display Peak", &s->peak, 0, 4000, GetFormat(s->peak));
-               SettingsUI::SliderInt("Scene Paper White", &s->paper_scene, 0, 500, GetFormat(s->paper_scene));
-               SettingsUI::SliderInt("UI Paper White", &s->paper_ui, 0, 500, GetFormat(s->paper_ui));
+               ImGui::SliderInt("Display Peak", &s->peak, 0, 4000, GetFormat(s->peak));
+               ImGui::SliderInt("Scene Paper White", &s->paper_scene, 0, 500, GetFormat(s->paper_scene));
+               ImGui::SliderInt("UI Paper White", &s->paper_ui, 0, 500, GetFormat(s->paper_ui));
                
                if (peak != s->peak) reshade::set_config_value(nullptr, reshade_config_section, GetSubGameSaveKey(sg.subgame, "Peak"), s->peak);
                if (paper_scene != s->paper_scene) reshade::set_config_value(nullptr, reshade_config_section, GetSubGameSaveKey(sg.subgame, "Scene"), s->paper_scene);
@@ -1401,7 +1401,7 @@ public:
          ImGui::Bullet(); ImGui::SameLine(); ImGui::TextWrapped("If allowed, any value besides 6.0 will shift Peak (just like SDR)!");
          ImGui::PopStyleColor();
 
-         if (SettingsUI::Checkbox("Allow In-Game Gamma Sliders", &allow_gamma_slider))
+         if (ImGui::Checkbox("Allow In-Game Gamma Sliders", &allow_gamma_slider))
             reshade::set_config_value(nullptr, NAME, "allow_gamma_slider", allow_gamma_slider);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Leaving this disabled will let main color be unaltered sRGB.");
@@ -1420,7 +1420,7 @@ public:
             else if (custom_sdr_gamma == 2.4f) custom_sdr_gamma_index = 2;
          }
          ImGui::PushID("GammaCorrection custom_sdr_gamma");
-         if (SettingsUI::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) //user set & save
+         if (ImGui::Combo("Correction", &custom_sdr_gamma_index, items, IM_ARRAYSIZE(items))) //user set & save
          {
             switch (custom_sdr_gamma_index)
             {
@@ -1447,7 +1447,7 @@ public:
       {
          DrawColoredSubHeader("Increase Texture Sharpness at a Distance");
          
-         if (SettingsUI::SliderFloat("Mip LOD Bias Offset", &mip_lod_bias_offset, 0.f, -10.f, "%.2f"))
+         if (ImGui::SliderFloat("Mip LOD Bias Offset", &mip_lod_bias_offset, 0.f, -10.f, "%.2f"))
             SetMipLodBiasOffset(mip_lod_bias_offset, true);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Negative offset bias sharpens.\nMight make the game too coarse");
@@ -1469,7 +1469,7 @@ public:
                default: return 2.f;
             }
          };
-         if (SettingsUI::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, GetMaxBloomBySubGame(SubGameHandler::curr), "%.2f"))
+         if (ImGui::SliderFloat("Bloom", &cb_luma_global_settings.GameSettings.Bloom, 0.f, GetMaxBloomBySubGame(SubGameHandler::curr), "%.2f"))
             reshade::set_config_value(nullptr, NAME, "Bloom", cb_luma_global_settings.GameSettings.Bloom);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Multiplier on Bloom strength when applicable.");
@@ -1477,7 +1477,7 @@ public:
 
          ShaderDefines::UIDropDown(ShaderDefines::HALO1_BLOOM, "Halo 1 Classic: Bloom", { "Off", "On", "Bloom Only (Debug)" }, "Add a subtle bloom pass for Halo 1 Classic to aid the original sprites trying to convey the effect.");
 
-         if (SettingsUI::SliderFloat("Halo 1 Classic: Bloom Sigma", &BloomHandler::H1C::sigma, 0.5f, 3.f, "%.2f"))
+         if (ImGui::SliderFloat("Halo 1 Classic: Bloom Sigma", &BloomHandler::H1C::sigma, 0.5f, 3.f, "%.2f"))
             reshade::set_config_value(nullptr, NAME, BloomHandler::H1C::sigma_reshadesave, BloomHandler::H1C::sigma);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Higher means more spread.");
@@ -1490,7 +1490,7 @@ public:
          DrawColoredSubHeader("Ambient Occlusion");
 
          // AmbientOcclusion
-         if (SettingsUI::SliderFloat("Ambient Occlusion", &cb_luma_global_settings.GameSettings.AmbientOcclusion, 0.f, 2.f, "%.2f"))
+         if (ImGui::SliderFloat("Ambient Occlusion", &cb_luma_global_settings.GameSettings.AmbientOcclusion, 0.f, 2.f, "%.2f"))
             reshade::set_config_value(nullptr, NAME, "AmbientOcclusion", cb_luma_global_settings.GameSettings.AmbientOcclusion);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Multiplier on AO strength when applicable.");
@@ -1511,7 +1511,7 @@ public:
             if (gtao_fullres_enabled.second) XeGTAOHandler::H2A::Reset();
 
             // Denoise count
-            if (SettingsUI::SliderInt("Halo 2 Anniversary: GTAO Denoise", &XeGTAOHandler::H2A::denoise, 0, 4, "%d", ImGuiSliderFlags_AlwaysClamp))
+            if (ImGui::SliderInt("Halo 2 Anniversary: GTAO Denoise", &XeGTAOHandler::H2A::denoise, 0, 4, "%d", ImGuiSliderFlags_AlwaysClamp))
                reshade::set_config_value(nullptr, NAME, XeGTAOHandler::H2A::denoise_reshadesave, XeGTAOHandler::H2A::denoise);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                ImGui::SetTooltip("The number of denoise passes to apply to GTAO.\nMore passes = smoother noise at a performance cost.");
@@ -1535,7 +1535,7 @@ public:
 
          // WhiteClip
          if (SubGameHandler::curr == Halo4) ImGui::BeginDisabled();
-         if (SettingsUI::SliderFloat("White Clip", &cb_luma_global_settings.GameSettings.WhiteClip, 0.f, 2.f, "%.2f"))
+         if (ImGui::SliderFloat("White Clip", &cb_luma_global_settings.GameSettings.WhiteClip, 0.f, 2.f, "%.2f"))
             reshade::set_config_value(nullptr, NAME, "WhiteClip", cb_luma_global_settings.GameSettings.WhiteClip);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Increase to straighten tonemap rolloff,\nmaking highlights more aggressive/clipped.\n(Not available for Halo 4.)");
@@ -1543,7 +1543,7 @@ public:
          if (SubGameHandler::curr == Halo4) ImGui::EndDisabled();
 
          // FilmGrain
-         if (SettingsUI::SliderFloat("Film Grain", &cb_luma_global_settings.GameSettings.FilmGrain, 0.f, 1.f, "%.2f"))
+         if (ImGui::SliderFloat("Film Grain", &cb_luma_global_settings.GameSettings.FilmGrain, 0.f, 1.f, "%.2f"))
             reshade::set_config_value(nullptr, NAME, "FilmGrain", cb_luma_global_settings.GameSettings.FilmGrain);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Multiplier on Film Grain strength when applicable.");
@@ -1553,7 +1553,7 @@ public:
          ShaderDefines::UIDropDown(ShaderDefines::HALOR_FILMGRAIN_SCALE, "Halo Reach: Film Grain Scale", { "Native (Vanilla)", "720p (Xbox 360)", "1080p", "1440p" }, "Scales Halo Reach's film grain size by target resolution.\nThe lower the target, the bigger the grain.");
 
          // MotionBlur
-         if (SettingsUI::SliderFloat("Motion Blur", &cb_luma_global_settings.GameSettings.MotionBlur, 0.f, 1.f, "%.2f"))
+         if (ImGui::SliderFloat("Motion Blur", &cb_luma_global_settings.GameSettings.MotionBlur, 0.f, 1.f, "%.2f"))
             reshade::set_config_value(nullptr, NAME, "MotionBlur", cb_luma_global_settings.GameSettings.MotionBlur);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Multiplier on Motion Blur strength when applicable.");
@@ -1563,7 +1563,7 @@ public:
          ShaderDefines::UIToggleCheckmark(ShaderDefines::ALLOW_COLORGRADE, "Color Grading (Debug)", "Disable to skip color grading,\nexposing the raw HDR input.");
 
          // UIToggle
-         SettingsUI::Checkbox("Pause Screen (Read Tooltip)", &allow_pause_screen);
+         ImGui::Checkbox("Pause Screen (Read Tooltip)", &allow_pause_screen);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Useful for screenshots.\nThis seems to only work for Settings screen?");
          DrawResetButton(allow_pause_screen, true, nullptr, nullptr);
@@ -1595,7 +1595,7 @@ public:
             SubGameToString(Halo4),
          };
          int subgame_index = SubGameHandler::over;
-         if (SettingsUI::Combo("Override Sub Game", &subgame_index, subgame_items.data(), static_cast<int>(subgame_items.size())))
+         if (ImGui::Combo("Override Sub Game", &subgame_index, subgame_items.data(), static_cast<int>(subgame_items.size())))
          {
             SubGameHandler::over = static_cast<SubGame>(subgame_index);
             SubGameHandler::SetSubGame(static_cast<SubGame>(subgame_index), device_data);

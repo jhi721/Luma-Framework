@@ -85,7 +85,7 @@ public:
 
             int mode = enabled ? 1 : 0;
             const char* settings_name_strings[2] = { "Off", "On" };
-            if (SettingsUI::SliderInt(toggleable_texture_upgrade_format_name.c_str(), &mode, 0, 1, settings_name_strings[mode], ImGuiSliderFlags_NoInput))
+            if (ImGui::SliderInt(toggleable_texture_upgrade_format_name.c_str(), &mode, 0, 1, settings_name_strings[mode], ImGuiSliderFlags_NoInput))
             {
                if (mode >= 1)
                {

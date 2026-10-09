@@ -693,8 +693,8 @@ public:
       auto& fc = Data(data);
       ImGui::SeparatorText("Far Cry 5 DLSS / DLAA");
       ImGui::TextWrapped("Keep TAA enabled in the game and select Auto or DLSS above. Resolution scale controls quality: 100% = DLAA, lower values = DLSS upscaling.");
-      bool changed = SettingsUI::Checkbox("Enable DLSS / DLAA", &fc.enable_dlss);
-      changed |= SettingsUI::Checkbox("Match display resolution (DLAA at 100% game scale)", &fc.upscale);
+      bool changed = ImGui::Checkbox("Enable DLSS / DLAA", &fc.enable_dlss);
+      changed |= ImGui::Checkbox("Match display resolution (DLAA at 100% game scale)", &fc.upscale);
       if (changed)
       {
          FC5::configured_enable = fc.enable_dlss; FC5::configured_upscale = fc.upscale;
@@ -702,7 +702,7 @@ public:
          reshade::set_config_value(nullptr, NAME, "FC5MatchDisplay", fc.upscale);
       }
       ImGui::SeparatorText("Borderless HDR / RenoDX");
-      if (SettingsUI::Checkbox("Enable borderless HDR (restart required)", &FC5::BorderlessHDR::configured))
+      if (ImGui::Checkbox("Enable borderless HDR (restart required)", &FC5::BorderlessHDR::configured))
          reshade::set_config_value(nullptr, NAME, "FC5BorderlessHDR", FC5::BorderlessHDR::configured);
       ImGui::TextWrapped("Enable Windows HDR and native game scRGB HDR. Keep RenoDX installed for HDR color processing. This option keeps native HDR in a borderless window; it does not convert SDR to HDR.");
       if (FC5::BorderlessHDR::configured != FC5::BorderlessHDR::Enabled() && !FC5::BorderlessHDR::test_override)
@@ -713,7 +713,7 @@ public:
          fc.native_output_format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "FP16 / scRGB candidate" :
          fc.native_output_format == DXGI_FORMAT_R10G10B10A2_UNORM ? "HDR10/PQ (DLSS unsupported)" : "SDR / other");
       ImGui::SeparatorText("Optional FC5 reporting thread");
-      if (SettingsUI::Checkbox("Suspend FC5 reporting thread (remember choice)", &FC5::configured_suspend_reporter))
+      if (ImGui::Checkbox("Suspend FC5 reporting thread (remember choice)", &FC5::configured_suspend_reporter))
       {
          reshade::set_config_value(nullptr, NAME, "FC5SuspendReporter", FC5::configured_suspend_reporter);
          fc.reporter_startup_attempted = true;
@@ -734,10 +734,10 @@ public:
       if (ImGui::TreeNode("Developer diagnostics (not saved)"))
       {
       ImGui::TextWrapped("Testing only: leave these defaults unchanged for normal play. Wrong depth, jitter or motion-vector settings can cause ghosting. Native scRGB HDR is detected automatically; the HDR override below is NOT an HDR enable switch.");
-      changed |= SettingsUI::Checkbox("Inverted depth", &fc.inverted_depth);
-      changed |= SettingsUI::Checkbox("Force linear HDR input (diagnostic override)", &fc.linear_hdr_input);
-      changed |= SettingsUI::Checkbox("Auto exposure", &fc.auto_exposure);
-      changed |= SettingsUI::Checkbox("Motion vectors include jitter", &fc.mvs_jittered);
+      changed |= ImGui::Checkbox("Inverted depth", &fc.inverted_depth);
+      changed |= ImGui::Checkbox("Force linear HDR input (diagnostic override)", &fc.linear_hdr_input);
+      changed |= ImGui::Checkbox("Auto exposure", &fc.auto_exposure);
+      changed |= ImGui::Checkbox("Motion vectors include jitter", &fc.mvs_jittered);
       changed |= ImGui::DragFloat2("Jitter scale", &fc.jitter_scale.x, 0.05f, -10.f, 10.f);
       changed |= ImGui::DragFloat2("Motion vector scale", &fc.mv_scale.x, 0.05f, -10.f, 10.f);
          ImGui::TreePop();

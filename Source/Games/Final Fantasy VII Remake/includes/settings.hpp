@@ -6,7 +6,6 @@
 #include <include/reshade.hpp>
 
 #define ICON_FK_UNDO reinterpret_cast<const char*>(u8"\uf0e2")
-#include "../../../Core/includes/settings_ui.h"
 
 namespace Luma {
 namespace Settings
@@ -96,7 +95,7 @@ namespace Settings
             switch (this->type) {
                 case SettingValueType::BOOLEAN: {
                     int v = this->GetValue() != 0.f;
-                    if (SettingsUI::SliderInt(this->label.c_str(), reinterpret_cast<int*>(&v), 0, 1, v ? "On" : "Off")) {
+                    if (ImGui::SliderInt(this->label.c_str(), reinterpret_cast<int*>(&v), 0, 1, v ? "On" : "Off")) {
                         this->Set(v ? 1.f : 0.f)->Write()->Save();
                     }
                     break;
@@ -104,14 +103,14 @@ namespace Settings
                 case SettingValueType::INTEGER: {
                     std::string format = this->labels.empty() ? this->format : this->labels[this->value_as_int];
                     int v = static_cast<int>(this->GetValue());
-                    if (SettingsUI::SliderInt(this->label.c_str(), &v, static_cast<int>(this->min), static_cast<int>(this->max), format.c_str())) {
+                    if (ImGui::SliderInt(this->label.c_str(), &v, static_cast<int>(this->min), static_cast<int>(this->max), format.c_str())) {
                         this->Set(static_cast<float>(v))->Write()->Save();
                     }
                     break;
                 }
                 case SettingValueType::FLOAT: {
                     float v = this->GetValue();
-                    if (SettingsUI::SliderFloat(this->label.c_str(), &v, this->min, this->max, this->format.c_str())) {
+                    if (ImGui::SliderFloat(this->label.c_str(), &v, this->min, this->max, this->format.c_str())) {
                         this->Set(v)->Write()->Save();
                     }
                     break;

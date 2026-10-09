@@ -3871,7 +3871,7 @@ public:
          // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
          static int held_render_scale = 0; // The slider's value while it's held, else 0
          int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(EngineScale::g_render_scale * 100.f)));
-         SettingsUI::SliderInt("Render Scale (%)", &render_scale, int(EngineScale::MIN_RENDER_SCALE * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+         ImGui::SliderInt("Render Scale (%)", &render_scale, int(EngineScale::MIN_RENDER_SCALE * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
          held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
@@ -3891,7 +3891,7 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (SettingsUI::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "SMAAEnable", g_smaa_enable);
       }
@@ -3901,7 +3901,7 @@ public:
       }
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
-      SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
+      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "RCASSharpness", g_rcas_sharpness);
@@ -3919,7 +3919,7 @@ public:
       // NAME, but LoadConfigs reads PROJECT_NAME)
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
-         if (SettingsUI::SliderFloat(label, value, 0.f, max))
+         if (ImGui::SliderFloat(label, value, 0.f, max))
          {
             device_data.cb_luma_global_settings_dirty = true;
          }
@@ -3950,7 +3950,7 @@ public:
       }
 
       ImGui::SeparatorText("Bloom");
-      if (SettingsUI::Checkbox("Luma Bloom Enable", &g_bloom_enable))
+      if (ImGui::Checkbox("Luma Bloom Enable", &g_bloom_enable))
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "BloomEnable", g_bloom_enable);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3964,7 +3964,7 @@ public:
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (SettingsUI::Checkbox("XeGTAO Enable", &g_gtao_enable))
+      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAOEnable", g_gtao_enable);
       }
@@ -3974,7 +3974,7 @@ public:
       }
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      SettingsUI::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAOFinalValuePower", g_gtao_final_value_power);
@@ -3983,7 +3983,7 @@ public:
       {
          ImGui::SetTooltip("Primary darkness dial (higher = darker AO). Calibrate to match vanilla's overall darkening.");
       }
-      SettingsUI::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 10.f, 200.f, "%.0f", ImGuiSliderFlags_Logarithmic);
+      ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 10.f, 200.f, "%.0f", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAODepthScale", g_gtao_depth_scale);
@@ -3992,7 +3992,7 @@ public:
       {
          ImGui::SetTooltip("viewZ divisor (UE3 units -> ~meters). FIRST dial if AO shows broad depth-correlated over-occlusion.");
       }
-      SettingsUI::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 3.f, "%.3f");
+      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 3.f, "%.3f");
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "GTAORadiusOverride", g_gtao_radius_override);
@@ -4001,13 +4001,13 @@ public:
       {
          ImGui::SetTooltip("0 = shader EFFECT_RADIUS define; > 0 overrides it to match the vanilla HBAO+ radius (uu / DepthScale).");
       }
-      SettingsUI::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("Draws diagnostics through the game's AO apply (multiplied into the scene). Depth gradient dead/flat or normals blocky = wrong input; AO x8 = spot broad over-occlusion.");
       }
 #if DEVELOPMENT
-      SettingsUI::Combo("GTAO Temporal Noise", &g_gtao_temporal, "Auto (DLSS/FSR)\0Off (frozen, 2 denoise passes)\0On (frame % 64, 1 denoise pass)\0");
+      ImGui::Combo("GTAO Temporal Noise", &g_gtao_temporal, "Auto (DLSS/FSR)\0Off (frozen, 2 denoise passes)\0On (frame % 64, 1 denoise pass)\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("A/B of the XeGTAO noise: per frame with one denoise pass (DLSS/FSR accumulate it), or frozen with two. Not saved.");
@@ -4023,7 +4023,7 @@ public:
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         if (SettingsUI::Checkbox("Video AutoHDR", &g_video_auto_hdr_enable))
+         if (ImGui::Checkbox("Video AutoHDR", &g_video_auto_hdr_enable))
          {
             reshade::set_config_value(nullptr, PROJECT_NAME, "VideoAutoHDREnable", g_video_auto_hdr_enable);
             gs.VideoAutoHDREnable = (g_video_auto_hdr_enable ? 1.f : 0.f);
@@ -4039,7 +4039,7 @@ public:
       }
 
       bool dithering = gs.Dithering > 0.5f;
-      if (SettingsUI::Checkbox("Dithering", &dithering))
+      if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = (dithering ? 1.f : 0.f);
          device_data.cb_luma_global_settings_dirty = true;
@@ -4051,7 +4051,7 @@ public:
       }
 
       ImGui::SeparatorText("UI");
-      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.
+      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Disables the in-game UI.");

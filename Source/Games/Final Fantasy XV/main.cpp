@@ -264,7 +264,7 @@ public:
          if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
          {
             bool use_sdr_over_hdr = cb_luma_global_settings.GameSettings.UseSDROverHDR == 1;
-            if (SettingsUI::Checkbox("Use SDR Tonemap Curve", &use_sdr_over_hdr))
+            if (ImGui::Checkbox("Use SDR Tonemap Curve", &use_sdr_over_hdr))
             {
                cb_luma_global_settings.GameSettings.UseSDROverHDR = use_sdr_over_hdr ? 1 : 0;
                reshade::set_config_value(runtime, NAME, "UseSDROverHDR", use_sdr_over_hdr);
@@ -276,7 +276,7 @@ public:
             }
 
             bool use_vanilla_gamut_ratio = cb_luma_global_settings.GameSettings.UseVanillaGamutRatio == 1;
-            if (SettingsUI::Checkbox("Use Vanilla Gamut Ratio", &use_vanilla_gamut_ratio))
+            if (ImGui::Checkbox("Use Vanilla Gamut Ratio", &use_vanilla_gamut_ratio))
             {
                cb_luma_global_settings.GameSettings.UseVanillaGamutRatio = use_vanilla_gamut_ratio ? 1 : 0;
                reshade::set_config_value(runtime, NAME, "UseVanillaGamutRatio", use_vanilla_gamut_ratio);
@@ -287,7 +287,7 @@ public:
                reshade::set_config_value(runtime, NAME, "UseVanillaGamutRatio", use_vanilla_gamut_ratio);
             }
          }
-         if (SettingsUI::Checkbox("Directional Shadows", &enable_directional_shadows))
+         if (ImGui::Checkbox("Directional Shadows", &enable_directional_shadows))
          {
             reshade::set_config_value(runtime, NAME, "DirectionalShadows", enable_directional_shadows);
          }
@@ -299,7 +299,7 @@ public:
 
 #if LUMA_HAS_RECIPE_PROVIDERS
          bool dithering_patch_enabled = this->dithering_patch_enabled.load(std::memory_order_relaxed);
-         if (SettingsUI::Checkbox("Dithering Fix", &dithering_patch_enabled))
+         if (ImGui::Checkbox("Dithering Fix", &dithering_patch_enabled))
          {
             this->dithering_patch_enabled.store(dithering_patch_enabled, std::memory_order_relaxed);
             reshade::set_config_value(runtime, NAME, "DitheringFix", dithering_patch_enabled);
@@ -315,7 +315,7 @@ public:
 #endif
 
 #if ENABLE_BLOOM
-         if (SettingsUI::Checkbox("Enable Luma Bloom", &g_luma_bloom_enable))
+         if (ImGui::Checkbox("Enable Luma Bloom", &g_luma_bloom_enable))
          {
             reshade::set_config_value(runtime, NAME, "UseLumaBloom", g_luma_bloom_enable);
          }
@@ -326,7 +326,7 @@ public:
          {
             reshade::set_config_value(runtime, NAME, "UseLumaBloom", g_luma_bloom_enable);
          }
-         if (SettingsUI::SliderFloat("Bloom Strength", &cb_luma_global_settings.GameSettings.BloomStrength, 0.f, 2.f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+         if (ImGui::SliderFloat("Bloom Strength", &cb_luma_global_settings.GameSettings.BloomStrength, 0.f, 2.f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
          {
             reshade::set_config_value(runtime, NAME, "BloomStrenght", cb_luma_global_settings.GameSettings.BloomStrength);
          }
@@ -337,7 +337,7 @@ public:
          }
 #endif
 
-         if (SettingsUI::SliderFloat("Sharpness", &cb_luma_global_settings.GameSettings.Sharpness, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+         if (ImGui::SliderFloat("Sharpness", &cb_luma_global_settings.GameSettings.Sharpness, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
          {
             reshade::set_config_value(runtime, NAME, "Sharpness", cb_luma_global_settings.GameSettings.Sharpness);
          }
@@ -355,13 +355,13 @@ public:
 
       ImGui::NewLine();
 
-      if (SettingsUI::SliderInt("Luma Bloom Mips", &g_bloom_nmips, 1, 10))
+      if (ImGui::SliderInt("Luma Bloom Mips", &g_bloom_nmips, 1, 10))
          g_bloom_sigmas.resize(g_bloom_nmips, 2.0f);
       for (int i = 0; i < g_bloom_nmips; ++i)
       {
          ImGui::PushID(i); // Unique ID per slider, otherwise ImGui flags the loop items as conflicting IDs
          const std::string name = "Luma Bloom Sigma " + std::to_string(i);
-         SettingsUI::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f");
+         ImGui::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f");
          ImGui::PopID();
       }
 #endif

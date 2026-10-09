@@ -983,7 +983,7 @@ public:
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         if (SettingsUI::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.f, 1.f))
+         if (ImGui::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.f, 1.f))
          {
             reshade::set_config_value(runtime, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
          }
@@ -991,7 +991,7 @@ public:
 
          if (GetShaderDefineCompiledNumericalValue(char_ptr_crc32("ENABLE_HDR_BOOST")) > 0)
          {
-            if (SettingsUI::SliderFloat("HDR Saturation Boost", &cb_luma_global_settings.GameSettings.HDRBoostSaturationAmount, 0.f, 1.f))
+            if (ImGui::SliderFloat("HDR Saturation Boost", &cb_luma_global_settings.GameSettings.HDRBoostSaturationAmount, 0.f, 1.f))
             {
                reshade::set_config_value(runtime, NAME, "HDRBoostSaturationAmount", cb_luma_global_settings.GameSettings.HDRBoostSaturationAmount);
             }
@@ -999,7 +999,7 @@ public:
          }
       }
 
-      if (SettingsUI::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 1.f))
+      if (ImGui::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
       }

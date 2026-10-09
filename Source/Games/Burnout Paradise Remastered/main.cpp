@@ -724,7 +724,7 @@ public:
 
       ImGui::NewLine();
 
-      if (SettingsUI::Checkbox("XeGTAO Enable", &g_xegtao_enable))
+      if (ImGui::Checkbox("XeGTAO Enable", &g_xegtao_enable))
       {
          reshade::set_config_value(runtime, NAME, "XeGTAOEnable", g_xegtao_enable);
       }
@@ -734,13 +734,13 @@ public:
          ImGui::SetTooltip("Replaces SSAO, SSAO have to be enabled in game.");
       }
 
-      if (SettingsUI::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
       {
          reshade::set_config_value(runtime, NAME, "LumaBloomEnable", g_luma_bloom_enable);
       }
 
 #if DEVELOPMENT
-      if (SettingsUI::SliderInt("Luma Bloom nmips", &g_bloom_nmips, 1.0, 10.0))
+      if (ImGui::SliderInt("Luma Bloom nmips", &g_bloom_nmips, 1.0, 10.0))
       {
 		 g_bloom_sigmas.resize(g_bloom_nmips);
 	  }
@@ -748,26 +748,22 @@ public:
 	  for (int i = 0; i < g_bloom_nmips; ++i)
       {
 		 const std::string name = "Luma Bloom Sigma" + std::to_string(i);
-		 SettingsUI::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+		 ImGui::SliderFloat(name.c_str(), &g_bloom_sigmas[i], 0.0f, 15.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 	  }
 #endif
 
-      if (SettingsUI::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 2.f))
+      if (ImGui::SliderFloat("Bloom Intensity", &cb_luma_global_settings.GameSettings.BloomIntensity, 0.f, 2.f))
       {
          reshade::set_config_value(runtime, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
       }
       DrawResetButton(cb_luma_global_settings.GameSettings.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity", runtime);
 
-      if (SettingsUI::SliderFloat("Motion Blur Intensity", &cb_luma_global_settings.GameSettings.MotionBlurIntensity, ps2_style_motion_blur ? 10.f : 0.f, ps2_style_motion_blur ? 50.f : 2.f))
+      if (ImGui::SliderFloat("Motion Blur Intensity", &cb_luma_global_settings.GameSettings.MotionBlurIntensity, ps2_style_motion_blur ? 10.f : 0.f, ps2_style_motion_blur ? 50.f : 2.f))
       {
          reshade::set_config_value(runtime, NAME, "MotionBlurIntensity", cb_luma_global_settings.GameSettings.MotionBlurIntensity);
       }
-      if (DrawResetButton(cb_luma_global_settings.GameSettings.MotionBlurIntensity, default_luma_global_game_settings.MotionBlurIntensity, "MotionBlurIntensity", runtime))
-      {
-         ps2_style_motion_blur = false;
-         reshade::set_config_value(runtime, NAME, "PS2StyleMotionBlur", ps2_style_motion_blur);
-      }
-      if (SettingsUI::Checkbox("PS2 Style Motion Blur", &ps2_style_motion_blur))
+      ImGui::SameLine();
+      if (ImGui::Checkbox("PS2 Style Motion Blur", &ps2_style_motion_blur))
       {
          if (ps2_style_motion_blur)
          {
@@ -780,14 +776,19 @@ public:
          reshade::set_config_value(runtime, NAME, "MotionBlurIntensity", cb_luma_global_settings.GameSettings.MotionBlurIntensity);
          reshade::set_config_value(runtime, NAME, "PS2StyleMotionBlur", ps2_style_motion_blur);
       }
+      if (DrawResetButton(cb_luma_global_settings.GameSettings.MotionBlurIntensity, default_luma_global_game_settings.MotionBlurIntensity, "MotionBlurIntensity", runtime))
+      {
+         ps2_style_motion_blur = false;
+         reshade::set_config_value(runtime, NAME, "PS2StyleMotionBlur", ps2_style_motion_blur);
+      }
 
-      if (SettingsUI::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.f, 1.f))
+      if (ImGui::SliderFloat("Color Grading Intensity", &cb_luma_global_settings.GameSettings.ColorGradingIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
       }
       DrawResetButton(cb_luma_global_settings.GameSettings.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, "ColorGradingIntensity", runtime);
 
-      if (SettingsUI::SliderFloat("Color Grading Filter Reduction Intensity", &cb_luma_global_settings.GameSettings.ColorGradingFilterReductionIntensity, 0.f, 1.f))
+      if (ImGui::SliderFloat("Color Grading Filter Reduction Intensity", &cb_luma_global_settings.GameSettings.ColorGradingFilterReductionIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "ColorGradingFilterReductionIntensity", cb_luma_global_settings.GameSettings.ColorGradingFilterReductionIntensity);
       }
@@ -799,7 +800,7 @@ public:
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         if (SettingsUI::SliderFloat("HDR Boost Intensity", &cb_luma_global_settings.GameSettings.HDRBoostIntensity, 0.f, 2.f))
+         if (ImGui::SliderFloat("HDR Boost Intensity", &cb_luma_global_settings.GameSettings.HDRBoostIntensity, 0.f, 2.f))
          {
             reshade::set_config_value(runtime, NAME, "HDRBoostIntensity", cb_luma_global_settings.GameSettings.HDRBoostIntensity);
          }
@@ -810,7 +811,7 @@ public:
          DrawResetButton(cb_luma_global_settings.GameSettings.HDRBoostIntensity, default_luma_global_game_settings.HDRBoostIntensity, "HDRBoostIntensity", runtime);
       }
 
-      if (SettingsUI::SliderFloat("Original Tonemapper Color Intensity", &cb_luma_global_settings.GameSettings.OriginalTonemapperColorIntensity, 0.f, 1.f))
+      if (ImGui::SliderFloat("Original Tonemapper Color Intensity", &cb_luma_global_settings.GameSettings.OriginalTonemapperColorIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(runtime, NAME, "OriginalTonemapperColorIntensity", cb_luma_global_settings.GameSettings.OriginalTonemapperColorIntensity);
       }

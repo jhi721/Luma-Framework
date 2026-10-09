@@ -3017,7 +3017,7 @@ public:
 
       ImGui::NewLine();
 
-      if (SettingsUI::Checkbox("Enable HDR", &next_enable_hdr))
+      if (ImGui::Checkbox("Enable HDR", &next_enable_hdr))
       {
          reshade::set_config_value(runtime, NAME, "EnableHDR", next_enable_hdr);
       }
@@ -3030,7 +3030,7 @@ public:
          "Auto",
          "Yes",
          "No"};
-      if (SettingsUI::BeginCombo("Use Super Resolution for upscaling", upscaling_mode_names[(uint32_t)upscaling_mode]))
+      if (ImGui::BeginCombo("Use Super Resolution for upscaling", upscaling_mode_names[(uint32_t)upscaling_mode]))
       {
          auto AddComboItem = [&](const char* name, uint32_t size, bool enabled)
          {
@@ -3078,7 +3078,7 @@ public:
          previewString = "8x";
       }
       ImGui::BeginDisabled(UseSRForUpscaling(device_data) && device_data.render_resolution != device_data.output_resolution);
-      if (SettingsUI::BeginCombo("3D UI MSAA Sample Count", previewString))
+      if (ImGui::BeginCombo("3D UI MSAA Sample Count", previewString))
       {
          auto AddComboItem = [&](const char* name, uint32_t size, bool enabled)
          {

@@ -835,13 +835,13 @@ public:
       {
          if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
          {
-            if (SettingsUI::SliderFloat("HDR Intensity", &cb_luma_global_settings.GameSettings.HDRIntensity, 0.f, 2.f))
+            if (ImGui::SliderFloat("HDR Intensity", &cb_luma_global_settings.GameSettings.HDRIntensity, 0.f, 2.f))
             {
                reshade::set_config_value(runtime, NAME, "HDRIntensity", cb_luma_global_settings.GameSettings.HDRIntensity);
             }
             DrawResetButton(cb_luma_global_settings.GameSettings.HDRIntensity, 1.f, "HDRIntensity", runtime);
 
-            if (SettingsUI::SliderFloat("Highlights Desaturation", &cb_luma_global_settings.GameSettings.HighlightsDesaturation, 0.f, 1.f))
+            if (ImGui::SliderFloat("Highlights Desaturation", &cb_luma_global_settings.GameSettings.HighlightsDesaturation, 0.f, 1.f))
             {
                reshade::set_config_value(runtime, NAME, "HighlightsDesaturation", cb_luma_global_settings.GameSettings.HighlightsDesaturation);
             }
@@ -856,7 +856,7 @@ public:
 
          bool custom_aspect_ratio_enabled = max_aspect_ratio > 0.f;
          const float output_aspect_ratio = device_data.output_resolution.x / device_data.output_resolution.y;
-         if (SettingsUI::Checkbox("Custom Aspect Ratio", &custom_aspect_ratio_enabled))
+         if (ImGui::Checkbox("Custom Aspect Ratio", &custom_aspect_ratio_enabled))
          {
             if (custom_aspect_ratio_enabled)
                max_aspect_ratio = output_aspect_ratio; // Start from the output AR (it's probably already patched in)
@@ -877,7 +877,7 @@ public:
          {
             // Going beyond the window aspect ratio won't work,
             // nor going below 16:9 (the game never allows rendering below that).
-            if (SettingsUI::SliderFloat("Custom Aspect Ratio", &max_aspect_ratio, default_aspect_ratio, output_aspect_ratio))
+            if (ImGui::SliderFloat("Custom Aspect Ratio", &max_aspect_ratio, default_aspect_ratio, output_aspect_ratio))
             {
                reshade::set_config_value(runtime, NAME, "CustomAspectRatio", max_aspect_ratio);
                PatchAspectRatio(max_aspect_ratio);
@@ -892,7 +892,7 @@ public:
          }
 
          ImGui::NewLine();
-         if (SettingsUI::Checkbox("Disable Dithering", &disable_dither))
+         if (ImGui::Checkbox("Disable Dithering", &disable_dither))
          {
             reshade::set_config_value(runtime, NAME, "DisableDither", disable_dither);
 

@@ -94,7 +94,7 @@ public:
     {
         ImGui::NewLine();
 
-        if (SettingsUI::Checkbox("Disable last known location", &g_disable_last_known_location))
+        if (ImGui::Checkbox("Disable last known location", &g_disable_last_known_location))
         {
             reshade::set_config_value(nullptr, NAME, "DisableLastKnownLocation", g_disable_last_known_location);
         }

@@ -3383,7 +3383,7 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (SettingsUI::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
+      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Adds SMAA anti-aliasing (the game has none of its own; not used with DLSS/FSR).");
@@ -3392,15 +3392,15 @@ public:
       {
 #if DEVELOPMENT
          // Not a preference: on geometry it relaxes the threshold back to base ULTRA, never below. A bisect switch.
-         if (SettingsUI::Checkbox("SMAA Predication", &g_smaa_predication))
+         if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
             reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.");
-         if (SettingsUI::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
+         if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
             reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
-         SettingsUI::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
+         ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
          if (ImGui::Button("Measure Predication Mask"))
@@ -3411,7 +3411,7 @@ public:
       }
       if (g_smaa_enable || sr_active)
       {
-         if (SettingsUI::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f))
+         if (ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f))
             reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
@@ -3422,13 +3422,13 @@ public:
 #if DEVELOPMENT
       ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;
-      SettingsUI::Checkbox("MV Enable", &g_mv_enable);
+      ImGui::Checkbox("MV Enable", &g_mv_enable);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Draws the scene with the motion vector shaders without an upscaler: camera and object motion (each draw finds its own\nprevious frame vc4). The image must not change; the debug view is black with a static camera and lights up only\nwhat moves. ReShade.log: patched/refused shaders. Not saved.");
-      SettingsUI::Checkbox("MV Force Jitter", &g_mv_force_jitter);
+      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without an upscaler, with MV Enable. The image shakes by a subpixel; nothing\nmay flicker or lose pixels, and the debug view stays black with a static camera. Not saved.");
-      SettingsUI::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
+      ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("No projection jitter under the upscaler (it gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
       Perf::DrawCombo(perf_test_modes, &g_perf_sweep, [&](int mode_index)
@@ -3444,7 +3444,7 @@ public:
             ImGui::SetTooltip("The hooks' CPU optimizations (always on in Publishing); a \"Performance Test\" mode can turn some off on top. Not saved.");
          ImGui::TreePop();
       }
-      SettingsUI::Checkbox("Hook Timers", &Perf::g_hook_timers);
+      ImGui::Checkbox("Hook Timers", &Perf::g_hook_timers);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Times the motion vector draw and buffer hooks for \"cpu hooks\" (two clock reads each, thousands a frame).\nRun a Sweep with it off to see their own cost in the frame times. The test also turns off the per draw diagnostics.");
       const std::string memory_sweep_label = g_memory_sweep_step >= 0 ? std::format("Memory Sweep ({}/{})", g_memory_sweep_step + 1, std::size(memory_sweep_modes)) : std::string("Memory Sweep");
@@ -3477,10 +3477,10 @@ public:
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Profiles DLSS and FSR 3, %d rounds interleaved\n(~10 s a run), into \"LumaBridgeProfile\\sweep-<time>\", then logs \"[ME1 Bridge] sweep\" lines (medians) and restores\nthe upscaler. Keep the camera still and the overlay closed.", kSweepRounds);
       }
-      SettingsUI::Checkbox("SR Bridge Flush Before", &g_bridge_flush_before);
+      ImGui::Checkbox("SR Bridge Flush Before", &g_bridge_flush_before);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Flushes the game's commands right before the SR bridge's frame, so its input copies and signal to the helper go on\ntheir own. An experiment on the handoff's latency (profile with and without). Not saved.");
-      SettingsUI::SliderInt("GPU Thread Priority", &g_gpu_thread_priority, -7, 7);
+      ImGui::SliderInt("GPU Thread Priority", &g_gpu_thread_priority, -7, 7);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("IDXGIDevice::SetGPUThreadPriority on the game's device (0 = default). An experiment on the SR bridge's handoff. Not saved.");
 #endif
@@ -3488,21 +3488,21 @@ public:
          g_mv_dump_scene = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Logs one frame of the scene's draws ([ME1 DUMP] in ReShade.log): route, target, blend and depth state.");
-      SettingsUI::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
+      ImGui::Checkbox("FSR Reactive Mask", &g_sr_reactive_enable);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Marks the pixels alpha blended draws drew, so FSR trusts their history less: all of them as reactive (over the\nthreshold), the non-additive ones (smoke, glass, water) also as transparency & composition. Not saved.");
-      SettingsUI::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
-      SettingsUI::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
+      ImGui::SliderFloat("FSR Reactive Scale", &g_sr_reactive_scale, 0.f, 4.f);
+      ImGui::SliderFloat("FSR Reactive Threshold", &g_sr_reactive_threshold, 0.f, 1.f);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Scaled reactivity under it is 0, over it 0.9 (AMD's binary mask; AMD 0.2, default 0.5: lower makes static glows shake). 0: the scaled reactivity itself.");
-      SettingsUI::Checkbox("FSR Reactive Debug View", &g_sr_reactive_debug_view);
-      SettingsUI::Checkbox("FSR T&C From Mask", &g_sr_tc_from_mask);
+      ImGui::Checkbox("FSR Reactive Debug View", &g_sr_reactive_debug_view);
+      ImGui::Checkbox("FSR T&C From Mask", &g_sr_tc_from_mask);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Passes the reactive mask as FSR's transparency & composition mask too, instead of the alpha blended draws' own. Not saved.");
-      SettingsUI::Checkbox("FSR Reactive Zero Test", &g_sr_reactive_zero_test);
-      SettingsUI::Checkbox("FSR Reactive Pass", &g_sr_reactive_pass);
-      SettingsUI::Checkbox("FSR Reactive Skip Fill", &g_sr_reactive_skip_fill);
-      SettingsUI::Checkbox("MV Debug View", &g_mv_debug_view);
+      ImGui::Checkbox("FSR Reactive Zero Test", &g_sr_reactive_zero_test);
+      ImGui::Checkbox("FSR Reactive Pass", &g_sr_reactive_pass);
+      ImGui::Checkbox("FSR Reactive Skip Fill", &g_sr_reactive_skip_fill);
+      ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Shows the motion vector target (absolute, in pixels) through Core's debug draw.");
       ImGui::Text("Last frame: %u motion vector draws (%u matched, %u camera only, %u other camera, %u uncopied), %u jitter draws", stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws);
@@ -3515,7 +3515,7 @@ public:
       auto& gs = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
 
-      if (SettingsUI::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
+      if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3525,7 +3525,7 @@ public:
       if (DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure"))
          device_data.cb_luma_global_settings_dirty = true;
 
-      if (SettingsUI::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
+      if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3535,7 +3535,7 @@ public:
       if (DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast"))
          device_data.cb_luma_global_settings_dirty = true;
 
-      if (SettingsUI::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
+      if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3545,7 +3545,7 @@ public:
       if (DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation"))
          device_data.cb_luma_global_settings_dirty = true;
 
-      if (SettingsUI::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
+      if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3565,7 +3565,7 @@ public:
 
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");
-      if (SettingsUI::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
       {
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
@@ -3577,7 +3577,7 @@ public:
       // Everything below drives the Luma pyramid and greys out with it: nothing here reaches the game's own glow.
       ImGui::BeginDisabled(!g_luma_bloom_enable);
 
-      if (SettingsUI::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
+      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3588,7 +3588,7 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
 
 #if DEVELOPMENT
-      if (SettingsUI::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
+      if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
       {
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3605,7 +3605,7 @@ public:
       ImGui::SeparatorText("Effects");
       // Read in Video_0x1A82565B.ps_5_0.hlsl. Inert in SDR: peak == paper white makes PumboAutoHDR an identity.
       bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-      if (SettingsUI::Checkbox("Video AutoHDR", &video_auto_hdr))
+      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
@@ -3615,7 +3615,7 @@ public:
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
 
       ImGui::BeginDisabled(!video_auto_hdr);
-      if (SettingsUI::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
+      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
          device_data.cb_luma_global_settings_dirty = true;
@@ -3627,7 +3627,7 @@ public:
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
-      if (SettingsUI::Checkbox("Dithering", &dithering))
+      if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
@@ -3637,7 +3637,7 @@ public:
          ImGui::SetTooltip("Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
-      SettingsUI::Checkbox("Hide Gameplay UI", &g_hide_ui);
+      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Disables the in-game UI.");
 #if DEVELOPMENT
