@@ -8,6 +8,8 @@
 
 #include "../includes/debug.h"
 
+#include <include/reshade.hpp>
+
 #include <cstring>
 #include <cassert>
 #include <unordered_set>
@@ -228,17 +230,14 @@ namespace FidelityFX
             {
                return;
             }
+            // The checker runs at every dispatch, log each message once
+            static std::unordered_set<std::string> logged_messages;
+            if (!logged_messages.emplace(buffer).second)
+               return;
 
-            switch (type)
-            {
-            case FFX_MESSAGE_TYPE_ERROR:
-               printf_s("FSR3 Error: %s\n", buffer); // TODO: use "OutputDebugStringA", this doesn't work in a dll
-               ASSERT_MSGF(false, "FSR3 Error: %s\n", buffer);
-               break;
-            case FFX_MESSAGE_TYPE_WARNING:
-               printf_s("FSR3 Warning: %s\n", buffer);
-               break;
-            }
+            const bool error = type == FFX_MESSAGE_TYPE_ERROR;
+            reshade::log::message(error ? reshade::log::level::error : reshade::log::level::warning, (std::string("FSR3: ") + buffer).c_str());
+            ASSERT_MSGF(!error, "FSR3 Error: %s\n", buffer);
          };
          context_desc.fpMessage = LogCallback;
          context_desc.flags |= FFX_FSR3UPSCALER_ENABLE_DEBUG_CHECKING;

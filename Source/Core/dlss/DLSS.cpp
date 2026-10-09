@@ -6,6 +6,8 @@
 
 #include "../includes/debug.h"
 
+#include <include/reshade.hpp>
+
 #include <cstring>
 #include <cassert>
 #include <unordered_set>
@@ -195,7 +197,16 @@ bool NGX::DLSS::Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter
 	if (!custom_data && device)
 	{
 		const wchar_t* data_path = L"."; // The DLSS DLL should be distributed with Luma and be in the same folder as the mod
-		NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, data_path, device);
+		NVSDK_NGX_FeatureCommonInfo feature_info = {};
+#if DEVELOPMENT
+		// NGX's own log (feature creation, rejected parameters) in the ReShade log, so "luma_log" sees it
+		feature_info.LoggingInfo.LoggingCallback = [](const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature)
+		{
+			reshade::log::message(reshade::log::level::info, (std::string("NGX: ") + message).c_str());
+		};
+		feature_info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
+#endif
+		NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, data_path, device, &feature_info);
 
 		if (NVSDK_NGX_SUCCEED(result))
 		{
