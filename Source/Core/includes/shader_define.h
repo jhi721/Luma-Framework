@@ -14,7 +14,7 @@ namespace Shader
    // Hacky list to make words nicer. Add any here if needed.
 	// A few cases would be better handled with a redirection, like "SRGB" to "sRGB", but whatever.
    static const std::unordered_set<std::string> upper_case_names = {
-		"HDR", "HDR10","SDR", "AA", "SSAO", "GTAO", "LUT", "UI", "HUD", "FXAA", "SMAA", "DLSS", "FSR", "TAA", "SRGB", "SCRGB", "RGB", "RGBA"
+		"HDR", "HDR10","SDR", "AA", "SSAO", "LUT", "UI", "HUD", "FXAA", "SMAA", "DLSS", "FSR", "TAA", "SRGB", "SCRGB", "RGB", "RGBA"
    };
 
    std::string NameToTitleCase(const std::string& input)
@@ -255,29 +255,6 @@ namespace Shader
 
       bool HasTooltip() const { return tooltip != nullptr && tooltip[0] != '\0'; }
       const char* GetTooltip() const { return tooltip; }
-
-      // The value names the tooltip lists as "<value> - <name>" lines, counting up from 0 (empty if it lists none)
-      std::vector<std::string_view> GetValueNames() const
-      {
-         std::vector<std::string_view> value_names;
-         if (!HasTooltip())
-            return value_names;
-         std::string_view lines = tooltip;
-         while (!lines.empty())
-         {
-            const size_t line_end = lines.find('\n');
-            const std::string_view line = lines.substr(0, line_end);
-            const std::string prefix = std::to_string(value_names.size()) + " - ";
-            if (line.starts_with(prefix))
-            {
-               value_names.push_back(line.substr(prefix.size()));
-            }
-            if (line_end == std::string_view::npos)
-               break;
-            lines.remove_prefix(line_end + 1);
-         }
-         return value_names;
-      }
 
       static void Reset(std::vector<ShaderDefineData>& shader_defines_data)
       {

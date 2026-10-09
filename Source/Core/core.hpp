@@ -217,7 +217,6 @@
 #include "includes/instance_data.h"
 #include "includes/game.h"
 #include "includes/com_ptr.h"
-#include "includes/settings_ui.h"
 #if DEVELOPMENT
 #include "includes/perf_test.h" // Also "luma_perf" in "includes/mcp_server.inl"
 #endif // DEVELOPMENT
@@ -11416,14 +11415,6 @@ namespace
 
       DeviceData& device_data = *runtime->get_device()->get_private_data<DeviceData>();
 
-      // Luma's accent on its own overlay only, the rest of ReShade keeps the user's theme
-      const ImVec4 accent_color = {0.616f, 0.525f, 1.f, 1.f}; // #9D86FF
-      ImGui::PushStyleColor(ImGuiCol_CheckMark, accent_color);
-      ImGui::PushStyleColor(ImGuiCol_SliderGrab, accent_color);
-      ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.737f, 0.671f, 1.f, 1.f)); // #BCABFF
-      ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(accent_color.x, accent_color.y, accent_color.z, 0.6f));
-      ImGui::PushStyleVar(ImGuiStyleVar_SeparatorTextBorderSize, 2.f);
-
       // Always do this in case a user changed the settings through ImGUI, so we don't have to write it in a billion places
       device_data.cb_luma_global_settings_dirty = true;
 
@@ -14567,7 +14558,7 @@ namespace
             const SR::Type sr_auto_type = GetSRAutoType(device_data);
 
             // Note: if we reached here, it's guaranteed that the selected SR type is supported
-            if (SettingsUI::BeginCombo("Super Resolution", selected_sr_user_type))
+            if (ImGui::BeginCombo("Super Resolution", selected_sr_user_type))
             {
                auto AddComboItem = [&](const char* name, SR::UserType local_sr_user_type, SR::Type local_sr_type, bool enabled)
                   {
@@ -14630,9 +14621,11 @@ namespace
                // If SR currently can't run due to the user settings/state, or failed, show a warning.
                if (device_data.has_drawn_main_post_processing_previous && sr_type != SR::Type::None /*&& IsModActive(device_data)*/)
                {
-                  const bool sr_engaged = device_data.taa_detected && device_data.has_drawn_sr_imgui && !device_data.sr_suppressed;
-                  ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetStyle().FramePadding.x);
-                  ImGui::TextColored((sr_engaged ? ImVec4(0.36f, 0.79f, 0.54f, 1.f) : ImVec4(1.f, 0.55f, 0.2f, 1.f)), "%s", (sr_engaged ? ICON_FK_OK : ICON_FK_WARNING));
+                  ImGui::PushID("Super Resolution Active");
+                  ImGui::BeginDisabled();
+                  ImGui::SmallButton((device_data.taa_detected && device_data.has_drawn_sr_imgui && !device_data.sr_suppressed) ? ICON_FK_OK : ICON_FK_WARNING);
+                  ImGui::EndDisabled();
+                  ImGui::PopID();
                }
                else
                {
@@ -14664,50 +14657,45 @@ namespace
                   selected_dlss_preset = "Default"; break;
                }
 
-               if (sr_type == SR::Type::DLSS)
+               if (sr_type == SR::Type::DLSS && ImGui::BeginCombo("DLSS Preset", selected_dlss_preset))
                {
-                  if (SettingsUI::BeginCombo("DLSS Preset", selected_dlss_preset))
+                  auto AddPresetItem = [&](const char* name, unsigned int value, const char* tooltip = "")
                   {
-                     auto AddPresetItem = [&](const char* name, unsigned int value, const char* tooltip = "")
+                     const bool is_selected = (dlss_render_preset == value);
+                     if (ImGui::Selectable(name, is_selected))
                      {
-                        const bool is_selected = (dlss_render_preset == value);
-                        if (ImGui::Selectable(name, is_selected))
-                        {
-                           dlss_render_preset = value;
-                           reshade::set_config_value(runtime, NAME, "DLSSRenderPreset", static_cast<int>(dlss_render_preset));
-                        }
-                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        {
-                           ImGui::SetTooltip(tooltip);
-                        }
+                        dlss_render_preset = value;
+                        reshade::set_config_value(runtime, NAME, "DLSSRenderPreset", static_cast<int>(dlss_render_preset));
+                     }
+                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                     {
+                        ImGui::SetTooltip(tooltip);
+                     }
 
-                        if (is_selected)
-                        {
-                           ImGui::SetItemDefaultFocus();
-                        }
-                     };
+                     if (is_selected)
+                        ImGui::SetItemDefaultFocus();
+                  };
 
-                     AddPresetItem("Default", 0, "Uses NVIDIA suggested preset."); // NVSDK_NGX_DLSS_Hint_Render_Preset_Default
-                     AddPresetItem("E (CNN)", 5, "Deprecated CNN model. It is more performant, but blurrier than the newer models. Sharper than F but slightly more aliased."); // NVSDK_NGX_DLSS_Hint_Render_Preset_E
-                     AddPresetItem("F (CNN)", 6, "Deprecated CNN model. It is more performant, but blurrier than the newer models. It might offer less ghosting than J/K."); // NVSDK_NGX_DLSS_Hint_Render_Preset_F
-                     AddPresetItem("J", 10, "Very similar to K. Has issues with reflections and transparent effects / volumetrics."); // NVSDK_NGX_DLSS_Hint_Render_Preset_J
-                     AddPresetItem("K", 11, "Very similar to J. Has issues with reflections and transparent effects / volumetrics."); // NVSDK_NGX_DLSS_Hint_Render_Preset_K
-                     AddPresetItem("L", 12, "Highest quality, but very performance intensive. Suggested when upscaling from very low resolution (Ultra Performance)."); // NVSDK_NGX_DLSS_Hint_Render_Preset_L
-                     AddPresetItem("M", 13, "Best quality to performance ratio."); // NVSDK_NGX_DLSS_Hint_Render_Preset_M
+                  AddPresetItem("Default", 0, "Uses NVIDIA suggested preset."); // NVSDK_NGX_DLSS_Hint_Render_Preset_Default
+                  AddPresetItem("E (CNN)", 5, "Deprecated CNN model. It is more performant, but blurrier than the newer models. Sharper than F but slightly more aliased."); // NVSDK_NGX_DLSS_Hint_Render_Preset_E
+                  AddPresetItem("F (CNN)", 6, "Deprecated CNN model. It is more performant, but blurrier than the newer models. It might offer less ghosting than J/K."); // NVSDK_NGX_DLSS_Hint_Render_Preset_F
+                  AddPresetItem("J", 10, "Very similar to K. Has issues with reflections and transparent effects / volumetrics."); // NVSDK_NGX_DLSS_Hint_Render_Preset_J
+                  AddPresetItem("K", 11, "Very similar to J. Has issues with reflections and transparent effects / volumetrics."); // NVSDK_NGX_DLSS_Hint_Render_Preset_K
+                  AddPresetItem("L", 12, "Highest quality, but very performance intensive. Suggested when upscaling from very low resolution (Ultra Performance)."); // NVSDK_NGX_DLSS_Hint_Render_Preset_L
+                  AddPresetItem("M", 13, "Best quality to performance ratio."); // NVSDK_NGX_DLSS_Hint_Render_Preset_M
 
-                     ImGui::EndCombo();
-                  }
+                  ImGui::EndCombo();
                }
             }
 
 #if ENABLE_LUMA_TAA
             if (sr_type == SR::Type::LumaTAA)
             {
-               const int clicked_taa_quality = SettingsUI::SegmentedButtons("Luma TAA Quality", LumaTAA::quality_names, LumaTAA::quality.load());
-               if (clicked_taa_quality >= 0)
+               int taa_quality = LumaTAA::quality.load();
+               if (ImGui::SliderInt("Luma TAA Quality", &taa_quality, 0, int(std::size(LumaTAA::quality_names)) - 1, LumaTAA::quality_names[taa_quality], ImGuiSliderFlags_NoInput))
                {
-                  LumaTAA::quality = clicked_taa_quality;
-                  reshade::set_config_value(runtime, NAME, "LumaTAAQuality", clicked_taa_quality);
+                  LumaTAA::quality = taa_quality;
+                  reshade::set_config_value(runtime, NAME, "LumaTAAQuality", taa_quality);
                }
                if (ImGui::IsItemHovered())
                {
@@ -14746,7 +14734,7 @@ namespace
                default: break;
                }
                ImGui::BeginDisabled(reflex_state > Reflex::State::Running);
-               if (SettingsUI::BeginCombo("NVIDIA Reflex Low Latency", reflex_preview))
+               if (ImGui::BeginCombo("NVIDIA Reflex Low Latency", reflex_preview))
                {
                   for (int i = 0; i < IM_ARRAYSIZE(reflex_modes); i++)
                   {
@@ -14788,7 +14776,7 @@ namespace
                   static const char* paper_white_name = "Paper White";
 
                   assert(!use_os_reference_white_level || !has_separate_ui_paper_white); // "use_os_reference_white_level" mode only uses one slider (scene paper white)!
-                  if (SettingsUI::Checkbox("Link to OS Reference White Level", &use_os_reference_white_level))
+                  if (ImGui::Checkbox("Link to OS Reference White Level", &use_os_reference_white_level))
                   {
                      if (use_os_reference_white_level)
                      {
@@ -14809,7 +14797,7 @@ namespace
 
                   const float max_white_level = use_os_reference_white_level ? 480.f : 500.f; // Windows SDR Reference White Level max is 480 nits! We use 500 otherwise (both are hardcoded elsewhere too!)
 
-                  if (SettingsUI::SliderFloat((has_separate_ui_paper_white ? scene_paper_white_name : paper_white_name), &cb_luma_global_settings.ScenePaperWhite, srgb_white_level, max_white_level, "%.f"))
+                  if (ImGui::SliderFloat(has_separate_ui_paper_white ? scene_paper_white_name : paper_white_name, &cb_luma_global_settings.ScenePaperWhite, srgb_white_level, max_white_level, "%.f"))
                   {
                      cb_luma_global_settings.ScenePaperWhite = max(cb_luma_global_settings.ScenePaperWhite, 0.0);
                      reshade::set_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite);
@@ -14886,10 +14874,9 @@ namespace
 #endif
                }
                ImGui::BeginDisabled(!hdr_supported_display);
-               const int clicked_display_mode = SettingsUI::SegmentedButtons("Display Mode", std::span(display_mode_preset_strings).first(display_mode_max + 1), int(display_mode));
-               if (clicked_display_mode >= 0)
+               static_assert(sizeof(display_mode) == sizeof(int));
+               if (ImGui::SliderInt("Display Mode", reinterpret_cast<int*>(&display_mode), 0, display_mode_max, display_mode_preset_strings[(size_t)display_mode], ImGuiSliderFlags_NoInput))
                {
-                  display_mode = DisplayModeType(clicked_display_mode);
                   ChangeDisplayMode(device_data, display_mode, true, device_data.GetMainNativeSwapchain().get(), runtime);
                }
                ImGui::EndDisabled();
@@ -14925,7 +14912,7 @@ namespace
                {
                   ImGui::BeginDisabled(!mod_active);
                   // We should this even if "IsModActive()" is false
-                  if (SettingsUI::SliderFloat("Scene Peak White", &cb_luma_global_settings.ScenePeakWhite, 400.0, 10000.f, "%.f"))
+                  if (ImGui::SliderFloat("Scene Peak White", &cb_luma_global_settings.ScenePeakWhite, 400.0, 10000.f, "%.f"))
                   {
                      if (cb_luma_global_settings.ScenePeakWhite == device_data.default_user_peak_white)
                      {
@@ -14965,7 +14952,7 @@ namespace
                   if (has_separate_ui_paper_white)
                   {
                      ImGui::BeginDisabled(!supports_custom_ui_paper_white_scaling || !mod_active);
-                     if (SettingsUI::SliderFloat("UI Paper White", supports_custom_ui_paper_white_scaling ? &cb_luma_global_settings.UIPaperWhite : &cb_luma_global_settings.ScenePaperWhite, srgb_white_level, 500.f, "%.f"))
+                     if (ImGui::SliderFloat("UI Paper White", supports_custom_ui_paper_white_scaling ? &cb_luma_global_settings.UIPaperWhite : &cb_luma_global_settings.ScenePaperWhite, srgb_white_level, 500.f, "%.f"))
                      {
                         cb_luma_global_settings.UIPaperWhite = max(cb_luma_global_settings.UIPaperWhite, 0.0);
                         reshade::set_config_value(runtime, NAME, "UIPaperWhite", cb_luma_global_settings.UIPaperWhite);
@@ -16055,10 +16042,6 @@ namespace
 
             bool shader_defines_changed = false;
 
-#if !DEVELOPMENT
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled(auto_recompile_defines ? "Changes apply immediately (shaders recompile)" : "Reload shaders to apply changes");
-#endif
             // Show reset button
             {
                bool is_default = true;
@@ -16068,13 +16051,7 @@ namespace
                }
                ImGui::BeginDisabled(is_default);
                ImGui::PushID("Advanced Settings: Reset Defines");
-#if DEVELOPMENT || TEST
                static const std::string reset_button_title = std::string(ICON_FK_UNDO) + std::string(" Reset");
-#else
-               static const std::string reset_button_title = std::string(ICON_FK_UNDO) + std::string(" Reset All");
-               ImGui::SameLine();
-               ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - (ImGui::CalcTextSize(reset_button_title.c_str()).x + (ImGui::GetStyle().FramePadding.x * 2.f)));
-#endif
                if (ImGui::Button(reset_button_title.c_str()))
                {
                   // Remove all newly added settings
@@ -16151,7 +16128,6 @@ namespace
             // Auto Compile Button
             {
                ImGui::SameLine();
-               ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize("Auto Compile").x));
                ImGui::PushID("Advanced Settings: Auto Compile");
                ImGui::Checkbox("Auto Compile", &auto_recompile_defines);
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -16201,159 +16177,153 @@ namespace
 #else
             uint8_t longest_shader_define_name_length = SHADER_DEFINES_MAX_NAME_LENGTH - 1; // Remove the null termination
 #endif
-            // The value control: a checkbox for 0/1, the value names the tooltip lists, a number combo up to "max_value", else the raw character
-            const auto DrawValueControl = [](ShaderDefineData& define_data, bool show_value_numbers)
+            for (uint32_t i = 0; i < shader_defines_data.size(); i++)
+            {
+               // Don't render empty text fields that couldn't be filled due to them not being editable
+               bool disabled = false;
+               if (!shader_defines_data[i].IsNameEditable() && !shader_defines_data[i].IsValueEditable())
                {
-                  bool value_edited = false;
-                  const int value = define_data.editable_data.GetNumericalValue();
-                  if (const std::vector<std::string_view> value_names = define_data.GetValueNames(); !value_names.empty())
+#if !DEVELOPMENT && !TEST
+                  if (shader_defines_data[i].IsCustom())
                   {
-                     // Values past the named ones (up to "max_value") show as numbers
-                     const int value_count = (std::max)(int(value_names.size()), define_data.max_value + 1);
-                     const auto ValueName = [&](int value_index)
-                        {
-                           if (value_index >= int(value_names.size()))
-                           {
-                              return std::to_string(value_index);
-                           }
-                           return (show_value_numbers ? std::format("{} - {}", value_index, value_names[value_index]) : std::string(value_names[value_index]));
-                        };
-                     const std::string preview = ((value >= 0 && value < value_count) ? ValueName(value) : std::string(define_data.editable_data.GetValue()));
-                     if (ImGui::BeginCombo("##Value", preview.c_str()))
-                     {
-                        for (int value_index = 0; value_index < value_count; value_index++)
-                        {
-                           if (ImGui::Selectable(ValueName(value_index).c_str(), value_index == value) && value_index != value)
-                           {
-                              define_data.editable_data.value[0] = static_cast<char>('0' + value_index);
-                              value_edited = true;
-                           }
-                        }
-                        ImGui::EndCombo();
-                     }
+                     continue;
                   }
-                  else if (define_data.max_value == 1)
-                  {
-                     bool enabled = (value != 0);
-                     if (ImGui::Checkbox("##Value", &enabled))
-                     {
-                        define_data.editable_data.value[0] = static_cast<char>('0' + (enabled ? 1 : 0));
-                        value_edited = true;
-                     }
-                  }
-                  else if (define_data.max_value > 1)
-                  {
-                     // 0-255 as it's char/uint8
-                     static char items[256][4]; // enough for "255\0"
-                     static const char* items_ptrs[256];
-                     static bool items_initialized = false;
-                     if (!items_initialized)
-                     {
-                        items_initialized = true;
-                        for (int i = 0; i < 256; i++)
-                        {
-                           snprintf(items[i], sizeof(items[i]), "%d", i);
-                           items_ptrs[i] = items[i];
-                        }
-                     }
+#endif
+                  disabled = true;
+                  ImGui::BeginDisabled();
+               }
 
-                     int combo_value = value;
-                     if (ImGui::Combo("##Value", &combo_value, items_ptrs, define_data.max_value + 1))
+               bool show_tooltip = false;
+
+               ImGui::PushID(shader_defines_data[i].name_hint.data());
+               ImGuiInputTextFlags flags = ImGuiInputTextFlags_CharsNoBlank;
+               if (!shader_defines_data[i].IsNameEditable())
+               {
+                  flags |= ImGuiInputTextFlags_ReadOnly;
+               }
+               // All characters should (roughly) have the same length
+               ImGui::SetNextItemWidth(ImGui::CalcTextSize("0").x * longest_shader_define_name_length);
+               // ImGUI doesn't work with std::string data, it seems to need c style char arrays.
+               bool name_edited = false;
+               if (force_dev_name || shader_defines_data[i].IsNameEditable())
+               {
+                  name_edited = ImGui::InputTextWithHint("", shader_defines_data[i].name_hint.data(), shader_defines_data[i].editable_data.GetName(), std::size(shader_defines_data[i].editable_data.name) /*SHADER_DEFINES_MAX_NAME_LENGTH*/, flags);
+               }
+               else
+               {
+                  std::string user_facing_name = Shader::NameToTitleCase(shader_defines_data[i].editable_data.GetName());
+
+                  // Read only InputText with temporary buffer, to make sure the alignment is right and matches the branch above
+                  char user_facing_name_buffer[SHADER_DEFINES_MAX_NAME_LENGTH]{};
+                  strncpy(user_facing_name_buffer, user_facing_name.c_str(), sizeof(user_facing_name_buffer) - 1);
+
+                  ImGui::InputText("", user_facing_name_buffer, sizeof(user_facing_name_buffer), ImGuiInputTextFlags_ReadOnly );
+               }
+               show_tooltip |= ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+               ImGui::PopID();
+
+               // TODO: fix this, it doesn't seem to work
+               auto ModulateValueText = [](ImGuiInputTextCallbackData* data) -> int
+                  {
+#if 0
+                     if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit)
                      {
-                        define_data.editable_data.value[0] = static_cast<char>('0' + combo_value);
+                        if (data->Buf[0] == '\0')
+                        {
+                           // SHADER_DEFINES_MAX_VALUE_LENGTH
+#if 0 // Better implementation (actually resets to default when the text was cleaned (invalid value)) (space and - can also be currently written to in the value text field)
+                           data->Buf[0] = shader_defines_data[i].default_data.value[0];
+                           data->Buf[1] = shader_defines_data[i].default_data.value[1];
+#else
+                           data->Buf[0] == '0';
+                           data->Buf[1] == '\0';
+#endif
+                           data->BufDirty = true;
+                        };
+                     };
+#endif
+                     return 0;
+                  };
+
+               ImGui::SameLine();
+               ImGui::PushID(shader_defines_data[i].value_hint.data());
+               flags = ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_AlwaysOverwrite | ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_NoUndoRedo | ImGuiInputTextFlags_CallbackEdit;
+               if (!shader_defines_data[i].IsValueEditable())
+               {
+                  flags |= ImGuiInputTextFlags_ReadOnly;
+               }
+               ImGui::SetNextItemWidth(ImGui::CalcTextSize("00").x);
+               bool value_edited = false;
+               if (shader_defines_data[i].max_value == 0)
+               {
+                  value_edited = ImGui::InputTextWithHint("", shader_defines_data[i].value_hint.data(), shader_defines_data[i].editable_data.GetValue(), std::size(shader_defines_data[i].editable_data.value) /*SHADER_DEFINES_MAX_VALUE_LENGTH*/, flags, ModulateValueText);
+               }
+               else
+               {
+                  // 0-255 as it's char/uint8
+                  static char items[256][4]; // enough for "255\0"
+                  static const char* items_ptrs[256];
+                  static bool items_initialized = false;
+                  if (!items_initialized)
+                  {
+                     items_initialized = true;
+                     for (int i = 0; i < 256; i++)
+                     {
+                        snprintf(items[i], sizeof(items[i]), "%d", i);
+                        items_ptrs[i] = items[i];
+                     }
+                  }
+
+                  // Draw it as a checkbox if the only possible values are 0 and 1
+                  // TODO: some defines might still prefer a drop down list? Maybe we could fix that by defining their values names as a char array
+                  if (shader_defines_data[i].max_value == 1)
+                  {
+                     bool value = shader_defines_data[i].editable_data.GetNumericalValue() != 0;
+                     if (ImGui::Checkbox("", &value))
+                     {
+                        shader_defines_data[i].editable_data.value[0] = static_cast<char>('0' + (value ? 1 : 0));
                         value_edited = true;
                      }
                   }
                   else
-                  {
-                     ImGuiInputTextFlags flags = ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_AlwaysOverwrite | ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_NoUndoRedo;
-                     if (!define_data.IsValueEditable())
+                  {  // Compute enough width for one number plus the dropdown arrow and padding
+                     float text_width = ImGui::CalcTextSize("00").x;
+                     float arrow_width = ImGui::GetFrameHeight(); // Roughly the width of the arrow button
+                     float padding = ImGui::GetStyle().ItemInnerSpacing.x; // Some padding
+
+                     ImGui::SetNextItemWidth(text_width + arrow_width + padding); // Should be enough for a combo with a 0-9 range
+                     int value = shader_defines_data[i].editable_data.GetNumericalValue();
+                     if (ImGui::Combo("", &value, items_ptrs, shader_defines_data[i].max_value + 1))
                      {
-                        flags |= ImGuiInputTextFlags_ReadOnly;
+                        shader_defines_data[i].editable_data.value[0] = static_cast<char>('0' + value);
+                        value_edited = true;
                      }
-                     value_edited = ImGui::InputTextWithHint("##Value", define_data.value_hint.data(), define_data.editable_data.GetValue(), std::size(define_data.editable_data.value) /*SHADER_DEFINES_MAX_VALUE_LENGTH*/, flags);
                   }
-                  return value_edited;
-               };
-
-            std::vector<uint32_t> fixed_define_indices; // Listed read only below the editable ones, on user rows
-            for (uint32_t i = 0; i < shader_defines_data.size(); i++)
-            {
-               ShaderDefineData& define_data = shader_defines_data[i];
-               const bool fully_fixed = !define_data.IsNameEditable() && !define_data.IsValueEditable();
-#if !DEVELOPMENT && !TEST
-               // Don't render empty text fields that couldn't be filled due to them not being editable
-               if (fully_fixed && define_data.IsCustom())
-               {
-                  continue;
                }
-#endif
-               // Users get setting rows, development (and the custom defines of TEST builds) the editable define names
-               const bool user_row = !force_dev_name && !define_data.IsNameEditable() && !define_data.IsCustom();
-               if (user_row && fully_fixed)
-               {
-                  fixed_define_indices.push_back(i);
-                  continue;
-               }
-
-               bool show_tooltip = false;
-               bool name_edited = false;
-               const bool disabled = !user_row && fully_fixed;
-               if (disabled)
-               {
-                  ImGui::BeginDisabled();
-               }
-
-               if (user_row)
-               {
-                  SettingsUI::DrawLabel(Shader::NameToTitleCase(define_data.editable_data.GetName()).c_str());
-                  show_tooltip |= ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
-               }
-               else
-               {
-                  ImGui::PushID(define_data.name_hint.data());
-                  ImGuiInputTextFlags flags = ImGuiInputTextFlags_CharsNoBlank;
-                  if (!define_data.IsNameEditable())
-                  {
-                     flags |= ImGuiInputTextFlags_ReadOnly;
-                  }
-                  // All characters should (roughly) have the same length
-                  ImGui::SetNextItemWidth(ImGui::CalcTextSize("0").x * longest_shader_define_name_length);
-                  // ImGUI doesn't work with std::string data, it seems to need c style char arrays.
-                  name_edited = ImGui::InputTextWithHint("", define_data.name_hint.data(), define_data.editable_data.GetName(), std::size(define_data.editable_data.name) /*SHADER_DEFINES_MAX_NAME_LENGTH*/, flags);
-                  show_tooltip |= ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
-                  // Marks the defines changed from their defaults
-                  if (!define_data.IsDefault())
-                  {
-                     const ImVec2 name_min = ImGui::GetItemRectMin();
-                     ImGui::GetWindowDrawList()->AddRectFilled(name_min, ImVec2(name_min.x + 3.f, ImGui::GetItemRectMax().y), ImGui::GetColorU32(accent_color));
-                  }
-                  ImGui::PopID();
-                  ImGui::SameLine();
-                  SettingsUI::SetControlWidth();
-               }
-
-               ImGui::PushID(define_data.value_hint.data());
-               bool value_edited = DrawValueControl(define_data, !user_row);
                show_tooltip |= ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
-               ImGui::PopID();
-               value_edited |= DrawResetButton<char, false>(define_data.editable_data.value[0], define_data.default_data.value[0], define_data.value_hint.data());
-
-               // Avoid having empty values unless the default value also was empty.
+               // Avoid having empty values unless the default value also was empty. This is a worse implementation of the "ImGuiInputTextFlags_CallbackEdit" above, which we can't get to work.
                // If the value was empty to begin with, we leave it, to avoid confusion.
-               if (value_edited && define_data.IsValueEmpty())
+               if (value_edited && shader_defines_data[i].IsValueEmpty())
                {
                   // SHADER_DEFINES_MAX_VALUE_LENGTH
-                  define_data.editable_data.value[0] = define_data.default_data.value[0];
-                  define_data.editable_data.value[1] = define_data.default_data.value[1];
+                  shader_defines_data[i].editable_data.value[0] = shader_defines_data[i].default_data.value[0];
+                  shader_defines_data[i].editable_data.value[1] = shader_defines_data[i].default_data.value[1];
+#if 0 // This would only appear for 1 frame at the moment
+                  if (show_tooltip)
+                  {
+                     ImGui::SetTooltip(shader_defines_data[i].value_hint.c_str());
+                     show_tooltip = false;
+                  }
+#endif
                }
 #if 0 // Disabled for now as this is not very user friendly and could accidentally happen if two defines start with the same name.
                // Reset the define name if it matches another one
-               if (name_edited && ShaderDefineData::ContainsName(shader_defines_data, define_data.editable_data.GetName(), i))
+               if (name_edited && ShaderDefineData::ContainsName(shader_defines_data, shader_defines_data[i].editable_data.GetName(), i))
                {
-                  define_data.Clear();
+                  shader_defines_data[i].Clear();
                }
 #endif
+               ImGui::PopID();
 
                if (disabled)
                {
@@ -16365,30 +16335,10 @@ namespace
                   shader_defines_changed = true;
                }
 
-               if (show_tooltip && define_data.IsNameDefault() && define_data.HasTooltip())
+               if (show_tooltip && shader_defines_data[i].IsNameDefault() && shader_defines_data[i].HasTooltip())
                {
-                  ImGui::SetTooltip("%s", define_data.GetTooltip());
+                  ImGui::SetTooltip(shader_defines_data[i].GetTooltip());
                }
-            }
-
-            // What the mod fixed, for reference
-            if (!fixed_define_indices.empty() && ImGui::TreeNode("Set by this mod", "Set by this mod (%u)", uint32_t(fixed_define_indices.size())))
-            {
-               ImGui::BeginDisabled();
-               for (const uint32_t i : fixed_define_indices)
-               {
-                  ShaderDefineData& define_data = shader_defines_data[i];
-                  SettingsUI::DrawLabel(Shader::NameToTitleCase(define_data.editable_data.GetName()).c_str());
-                  ImGui::PushID(define_data.value_hint.data());
-                  DrawValueControl(define_data, false);
-                  ImGui::PopID();
-                  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && define_data.HasTooltip())
-                  {
-                     ImGui::SetTooltip("%s", define_data.GetTooltip());
-                  }
-               }
-               ImGui::EndDisabled();
-               ImGui::TreePop();
             }
 
             if (shader_defines_changed)
@@ -16516,9 +16466,6 @@ namespace
 
          ImGui::EndTabBar(); // TabBar
       }
-
-      ImGui::PopStyleVar();
-      ImGui::PopStyleColor(4);
    }
 #pragma optimize("", on) // Restore the previous state
 } // namespace
