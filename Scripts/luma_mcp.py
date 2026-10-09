@@ -14,6 +14,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -63,7 +64,8 @@ COMPARE_OPTIONS = {
     "rect_b": {"type": "array", "items": {"type": "integer"}, "description": "[x, y, w, h] of b to compare"},
     "metrics": {"type": "array", "items": {"type": "string"},
                 "description": "Per image on the plain mean of the first 3 channels (stored encoding, not luminance): mean, below:<t> (fraction "
-                               "under t, e.g. deep AO), detail (mean |x - 2x2 box average|); and correlation (Pearson, a vs b)"},
+                               "under t, e.g. deep AO), detail (mean |x - 2x2 box average|); correlation (Pearson, a vs b); and flip "
+                               "(NVIDIA FLIP of b against reference a, x100: HDR-FLIP for float readbacks, LDR-FLIP otherwise, + error map png)"},
 }
 OUT_DIR = {"out_dir": {"type": "string", "description": "%TEMP%\\luma-mcp (default) or a subfolder of it"}}  # The backend refuses anything else
 BRIDGE_ONLY_ARGS = set(ANALYSIS) | {"rows", "save_as"}
@@ -145,6 +147,31 @@ TOOLS = [
         "Per-pixel difference of two readbacks (.bin paths from luma_read_resource / luma_sr_capture, e.g. an A/B with a dev toggle): abs diff stats, the max's position, diff.png. "
         "rect_a/rect_b crop first; if the sizes still differ the smaller is stretched bilinearly to the bigger (e.g. a render scale sub-rect vs a 100% readback).",
         {"a": {"type": "string"}, "b": {"type": "string"}, **COMPARE_OPTIONS}, ["a", "b"],
+    ),
+    tool(
+        "luma_capture_pass",
+        "Save a replaced full screen pixel shader pass (trace entry index) as an offline replay case: its SRVs, cbuffers, samplers and render "
+        "targets at full size (zlib), the shader path and the exact compile defines. An offline replayer can then run the CURRENT "
+        "HLSL on WARP and FLIP-compares it to the captured output, without the game. Each read is its own frame: pause the game first "
+        "(static_scene=false means it moved). Refused: blending, depth/stencil tests, scissor, UAVs.",
+        {"index": {"type": "integer"}, "case": {"type": "string", "description": "<game>/<scene>, e.g. tw2/tonemap_day"},
+         "max_flip": {"type": "number", "description": "Pass threshold, FLIP mean x100 (default 1.0; replay.py --accept recalibrates)"},
+         "overwrite": {"type": "boolean", "description": "Replace an existing case of that name (refused otherwise)"}},
+        ["index", "case"],
+    ),
+    tool(
+        "luma_golden",
+        "Golden image check of a readback (.bin from luma_read_resource view=swapchain etc.) against the accepted baseline of a case on one backend "
+        "(native, dgvoodoo-2.87.3, dxvk...: each draws differently, so each has its own baseline). Passes when FLIP mean x100 <= the case's max_flip; "
+        "error images are kept only on failure. accept=true makes the readback the baseline (only after looking at it: never to silence a failure). "
+        "Baselines: %LUMA_BASELINES% or _tools/baselines, as <case>/<backend>.bin/.json/.golden.json.",
+        {"path": {"type": "string", "description": "The .bin to check"},
+         "case": {"type": "string", "description": "<game>/<scene>, e.g. mele/me2_normandy_menu"},
+         "backend": {"type": "string"},
+         "accept": {"type": "boolean"},
+         "max_flip": {"type": "number", "description": "On accept: the case's threshold, FLIP mean x100 (default: kept, else 1.0; calibrate on the scene's "
+                                                       "luma_ab noise floor)"}},
+        ["path", "case", "backend"],
     ),
     tool(
         "luma_ab",
@@ -400,10 +427,12 @@ def analyze(values, opts):
 
 
 def load_readback(path):
+    """(values, kind) of a .bin readback, see decode()"""
     with open(os.path.splitext(path)[0] + ".json") as f:
         meta = json.load(f)
     with open(path, "rb") as f:
-        return decode(f.read(), meta)[0]
+        values, _, kind = decode(f.read(), meta)
+    return values, kind
 
 
 def postprocess_resource(result, opts):
@@ -469,12 +498,37 @@ def image_metrics(values, metrics):
     return out
 
 
-def compare(a, b, region=None, rect_a=None, rect_b=None, metrics=None):
+FLIP_PPD = 67.0  # FLIP's default pixels per degree (~0.7 m from a 24" 4K monitor); fixed so scores stay comparable
+
+
+def flip_metric(va, vb, hdr, png=None):
+    """FLIP of b against the reference a on the first plane's RGB, NVIDIA's perceptual difference: HDR-FLIP on linear values (negatives
+    clipped) for float formats, LDR-FLIP on [0, 1] values taken as sRGB encoded otherwise. Writes the error map to png if given."""
+    try:
+        import flip_evaluator as F
+    except ImportError:
+        return {"error": f"flip-evaluator missing: {sys.executable} -m pip install flip-evaluator"}
+    if va.shape[-1] < 3:
+        return {"error": "FLIP needs 3 channels"}
+    upper = np.inf if hdr else 1.0
+    error_map, mean, _ = F.evaluate(np.ascontiguousarray(np.clip(np.nan_to_num(va[0, ..., :3]), 0.0, upper), np.float32),
+                                    np.ascontiguousarray(np.clip(np.nan_to_num(vb[0, ..., :3]), 0.0, upper), np.float32), "HDR" if hdr else "LDR",
+                                    applyMagma=False, parameters={"ppd": FLIP_PPD})
+    error_map = np.asarray(error_map).reshape(va.shape[1], va.shape[2])
+    result = {"mean_x100": 100.0 * float(mean), "p99_x100": 100.0 * float(np.percentile(error_map, 99)), "mode": "HDR" if hdr else "LDR", "ppd": FLIP_PPD}
+    if png:
+        write_png(png, np.repeat((np.clip(error_map, 0, 1) * 255 + 0.5).astype(np.uint8)[..., None], 3, -1))
+        result.update(map_png=png, map_png_mapping="FLIP error 0..1 -> black..white")
+    return result
+
+
+def compare(a, b, region=None, rect_a=None, rect_b=None, metrics=None, png_dir=None, pngs=True):
     metrics = list(metrics or [])
-    unknown = [m for m in metrics if m not in ("mean", "detail", "correlation") and not re.fullmatch(r"below:-?[0-9.eE+-]+", m)]
+    unknown = [m for m in metrics if m not in ("mean", "detail", "correlation", "flip") and not re.fullmatch(r"below:-?[0-9.eE+-]+", m)]
     if unknown:
-        return {"ok": False, "error": f"Unknown metrics {unknown}, use mean, below:<t>, detail, correlation"}
-    va, vb = crop(load_readback(a), rect_a), crop(load_readback(b), rect_b)
+        return {"ok": False, "error": f"Unknown metrics {unknown}, use mean, below:<t>, detail, correlation, flip"}
+    (va, kind_a), (vb, kind_b) = load_readback(a), load_readback(b)
+    va, vb = crop(va, rect_a), crop(vb, rect_b)
     resampled = None
     if va.shape[:3] != vb.shape[:3]:
         if not (rect_a or rect_b) or va.shape[0] != vb.shape[0] or 0 in va.shape[1:3] or 0 in vb.shape[1:3]:
@@ -498,21 +552,160 @@ def compare(a, b, region=None, rect_a=None, rect_b=None, metrics=None):
         result["size"] = list(va.shape[1:3])
     if region:
         result.update(analyze(diff, {"region": region}))
+    png_dir = png_dir or os.path.dirname(a)
+    png_name = f"{os.path.splitext(os.path.basename(a))[0]}_vs_{os.path.splitext(os.path.basename(b))[0]}.png"
     if metrics:
-        image_metric_names = [m for m in metrics if m != "correlation"]
+        image_metric_names = [m for m in metrics if m not in ("correlation", "flip")]
         result["metrics"] = {"a": image_metrics(va, image_metric_names), "b": image_metrics(vb, image_metric_names)}
         if "correlation" in metrics:
             ma, mb = plain_mean(va), plain_mean(vb)
             finite = np.isfinite(ma) & np.isfinite(mb)
             ma, mb = ma[finite], mb[finite]
             result["metrics"]["correlation"] = float(np.corrcoef(ma, mb)[0, 1]) if ma.size > 1 and ma.std() > 0 and mb.std() > 0 else None
-    peak = float(pixel_diff[0].max())
-    gray = (np.clip(pixel_diff[0] / peak, 0, 1) * 255 + 0.5).astype(np.uint8) if peak > 0 else np.zeros(pixel_diff.shape[1:], np.uint8)
-    png = os.path.join(os.path.dirname(a), f"diff_{os.path.splitext(os.path.basename(a))[0]}_vs_{os.path.splitext(os.path.basename(b))[0]}.png")
-    write_png(png, np.repeat(gray[..., None], 3, -1))
-    result["diff_png"] = png
-    result["diff_png_mapping"] = f"max channel abs diff, 0..{peak:.6g} -> black..white"
+        if "flip" in metrics:
+            result["metrics"]["flip"] = flip_metric(va, vb, kind_a == kind_b == "float", os.path.join(png_dir, "flip_" + png_name) if pngs else None)
+    if pngs:
+        peak = float(pixel_diff[0].max())
+        gray = (np.clip(pixel_diff[0] / peak, 0, 1) * 255 + 0.5).astype(np.uint8) if peak > 0 else np.zeros(pixel_diff.shape[1:], np.uint8)
+        result["diff_png"] = os.path.join(png_dir, "diff_" + png_name)
+        write_png(result["diff_png"], np.repeat(gray[..., None], 3, -1))
+        result["diff_png_mapping"] = f"max channel abs diff, 0..{peak:.6g} -> black..white"
     return result
+
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASELINE_ROOT = os.environ.get("LUMA_BASELINES") or os.path.join(REPO, "_tools", "baselines")
+REPLAY_ROOT = os.environ.get("LUMA_REPLAY_CASES") or os.path.join(REPO, "_tools", "replay", "cases")
+NAME_RE = r"\w[\w.-]*"  # Starts with a letter or digit, so "." and ".." can't climb out of the roots below
+CASE_RE = NAME_RE + r"(/" + NAME_RE + r")*"  # <game>/<scene>: a folder path under the roots above
+
+
+def golden(path, case, backend, accept=False, max_flip=None):
+    if not re.fullmatch(CASE_RE, case) or not re.fullmatch(NAME_RE, backend):
+        return {"ok": False, "error": "case is <game>/<scene> and backend one name, letters, digits, . _ -"}
+    base = os.path.join(BASELINE_ROOT, *case.split("/"), backend)
+    golden_json = base + ".golden.json"
+    settings = {}
+    if os.path.exists(golden_json):
+        with open(golden_json) as f:
+            settings = json.load(f)
+    if accept:
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        shutil.copyfile(path, base + ".bin")
+        shutil.copyfile(os.path.splitext(path)[0] + ".json", base + ".json")
+        settings = {"max_flip": float(max_flip if max_flip is not None else settings.get("max_flip", 1.0)), "source": os.path.abspath(path),
+                    "accepted": time.strftime("%Y-%m-%d %H:%M:%S")}
+        with open(golden_json, "w") as f:
+            json.dump(settings, f, indent=1)
+        return {"ok": True, "accepted": base + ".bin", **settings}
+    if not os.path.exists(base + ".bin"):
+        return {"ok": False, "error": f"No baseline {base}.bin: look at the readback, then accept=true"}
+    out_dir = os.path.join(tempfile.gettempdir(), "luma-mcp", "golden")
+    os.makedirs(out_dir, exist_ok=True)
+    result = compare(base + ".bin", path, metrics=["flip"], png_dir=out_dir)
+    if not result.get("ok"):
+        return result
+    flip = result["metrics"]["flip"]
+    if "error" in flip:
+        return {"ok": False, "error": flip["error"]}
+    max_flip = settings.get("max_flip", 1.0)
+    passed = flip["mean_x100"] <= max_flip
+    if passed:  # Images only on a mismatch
+        for png in (flip["map_png"], result["diff_png"]):
+            os.remove(png)
+    return {"ok": True, "pass": passed, "flip": {k: flip[k] for k in ("mean_x100", "p99_x100", "mode")}, "max_flip": max_flip,
+            "baseline": base + ".bin", "max_diff": result["max"], **({} if passed else {"flip_png": flip["map_png"], "diff_png": result["diff_png"]})}
+
+
+def replay_refusals(entry):
+    """Why a trace entry's pass can't be replayed offline (empty: it can)"""
+    blended = [rt["slot"] for rt in entry.get("rtvs", []) if "blend" in rt]
+    depth = entry.get("depth_stencil", {})
+    # Without a DSV bound nothing is tested, whatever the (default when unbound) state says
+    depth_tested = "dsv" in entry and (depth.get("depth_enable") or depth.get("stencil_enable"))
+    return ([f"blending on rt {blended} (the target's previous content isn't captured)"] if blended else []) + \
+           (["depth/stencil test"] if depth_tested else []) + \
+           (["scissor"] if entry.get("rasterizer", {}).get("scissor_enable") else []) + \
+           (["UAVs"] if entry.get("uavs") else [])
+
+
+def capture_pass(index, case, max_flip=None, overwrite=False):
+    """Saves what one full screen PS pass read and wrote (SRVs, cbuffers, samplers, render targets, the compile defines) as an offline
+    replay case (an offline replayer runs the current HLSL on it). Each read is a separate frame: hold the scene still."""
+    if not re.fullmatch(CASE_RE, case):
+        return {"ok": False, "error": "case is <game>/<scene>, letters, digits, . _ -"}
+    entry = backend.call("trace_get", {"index": index})
+    if not entry.get("ok"):
+        return entry
+    shader = entry.get("custom_shader", {})
+    if entry.get("stage") != "PS" or not shader.get("is_hlsl"):
+        return {"ok": False, "error": "Only replaced pixel shader passes with an .hlsl replacement replay"}
+    unsupported = replay_refusals(entry)
+    if unsupported:
+        return {"ok": False, "error": "Not replayable: " + ", ".join(unsupported)}
+    shader_path = os.path.abspath(shader["file"])
+    if not shader_path.lower().startswith(REPO.lower() + os.sep):
+        return {"ok": False, "error": f"{shader_path} isn't in this checkout (a Development build loads the repo's Shaders folder)"}
+    settings = backend.call("get_settings", {})
+    if "compile_defines" not in settings:
+        return {"ok": False, "error": "This build doesn't report compile_defines: rebuild the addon (Development)"}
+    if any("filter_id" not in s for s in entry.get("samplers", [])):
+        return {"ok": False, "error": "This build doesn't report sampler ids: rebuild the addon (Development)"}
+
+    out = os.path.join(REPLAY_ROOT, *case.split("/"))
+    os.makedirs(out, exist_ok=True)
+    if os.listdir(out) and not overwrite:
+        return {"ok": False, "error": f"{out} already holds a case: pick another name, or overwrite=true to replace it"}
+    for name in os.listdir(out):
+        os.remove(os.path.join(out, name))
+
+    def read(view, slot):
+        result = backend.call("read_resource", {"index": index, "view": view, "slot": slot})
+        if not result.get("ok"):
+            raise RuntimeError(f"{view} {slot}: {result.get('error')}")
+        path = result["path"]
+        with open(path, "rb") as f:
+            data = f.read()
+        for leftover in (path, os.path.splitext(path)[0] + ".json", os.path.splitext(path)[0] + ".png"):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        return data, {k: result[k] for k in ("format_id", "view_format_id", "width", "rows", "row_pitch", "slices", "depth", "height") if k in result}
+
+    record = {"game": backend.call("status", {}).get("game"), "hash": entry.get("hash"), "shader": os.path.relpath(shader_path, REPO).replace("\\", "/"),
+              "defines": settings["compile_defines"], "viewport": entry["viewport0"], "max_flip": float(max_flip if max_flip is not None else 1.0),
+              "captured": time.strftime("%Y-%m-%d %H:%M:%S"), "srvs": [], "cbs": [], "samplers": [], "rts": []}
+    try:
+        first_rt = None
+        for view, views, prefix in (("rtv", "rtvs", "rt"), ("srv", "srvs", "srv")):
+            for bound in entry.get(views, []):
+                data, meta = read(view, bound["slot"])
+                first_rt = first_rt or (data if view == "rtv" else None)
+                name = f"{prefix}{bound['slot']}.bin.z"
+                with open(os.path.join(out, name), "wb") as f:
+                    f.write(zlib.compress(data, 1))  # Level 1: several times faster than 6 on 66 MB 4K targets, a little bigger
+                record[prefix + "s"].append({"slot": bound["slot"], "file": name, **meta})
+        for cb in entry.get("cbs", []):
+            result = backend.call("read_cbuffer", {"index": index, "slot": cb["slot"]})
+            if not result.get("ok"):
+                raise RuntimeError(f"cb {cb['slot']}: {result.get('error')}")
+            uints = dword_views(result["hex_dwords"])[1]
+            with open(os.path.join(out, f"cb{cb['slot']}.bin"), "wb") as f:
+                f.write(struct.pack(f"<{len(uints)}I", *uints))
+            record["cbs"].append({"slot": cb["slot"], "file": f"cb{cb['slot']}.bin", "first_constant": result.get("first_constant", 0),
+                                  "num_constants": result.get("num_constants", 0)})
+        record["samplers"] = [{"slot": s["slot"], "filter": s["filter_id"], "address": s["address_ids"], "mip_lod_bias": s["mip_lod_bias"]}
+                              for s in entry.get("samplers", [])]
+        # The reads span several frames: a second read of the first target shows whether the scene held still meanwhile
+        if record["rts"]:
+            record["static_scene"] = read("rtv", record["rts"][0]["slot"])[0] == first_rt
+    except RuntimeError as e:
+        return {"ok": False, "error": f"capture failed: {e}"}
+    with open(os.path.join(out, "case.json"), "w") as f:
+        json.dump(record, f, indent=1)
+    size = sum(os.path.getsize(os.path.join(out, n)) for n in os.listdir(out))
+    return {"ok": True, "case": out, "bytes": size, "srvs": len(record["srvs"]), "cbs": len(record["cbs"]), "rts": len(record["rts"]),
+            "static_scene": record.get("static_scene"),
+            **({} if record.get("static_scene", True) else {"warning": "the target changed between reads: pause the game and capture again"})}
 
 
 def parse_rows(spec):
@@ -858,6 +1051,10 @@ def call_tool(name, args):
         return tail_log(args)
     if name == "luma_compare":
         return compare(args["a"], args["b"], **{k: args.get(k) for k in COMPARE_OPTIONS})
+    if name == "luma_capture_pass":
+        return capture_pass(int(args["index"]), args["case"], args.get("max_flip"), bool(args.get("overwrite")))
+    if name == "luma_golden":
+        return golden(args["path"], args["case"], args["backend"], bool(args.get("accept")), args.get("max_flip"))
     if name == "luma_ab":
         return ab_test(args)
     if name == "luma_perf":
@@ -890,7 +1087,7 @@ INSTRUCTIONS = (
     "context work, which shader variant/replacement ran, the game mod's dev knobs and counters.\n"
     "Flow: luma_status -> luma_trace_capture (trigger=<hash> for a pass that doesn't draw every frame) -> luma_trace_list -> luma_trace_get / "
     "luma_read_resource / luma_read_cbuffer by entry index.\n"
-    "Readbacks are files in %TEMP%\\luma-mcp (.bin + .json + a .png preview to open with Read) plus channel stats in the result; luma_compare diffs two .bin.\n"
+    "Readbacks are files in %TEMP%\\luma-mcp (.bin + .json + a .png preview to open with Read) plus channel stats in the result; luma_compare diffs two .bin (metrics=[\"flip\"]: perceptual score), luma_golden checks one against a per-backend baseline.\n"
     "A/B: luma_ab name=<dev value> a=.. b=.. (one call, restores the value, gives the noise floor); manual: luma_dev_values -> luma_set_dev_value "
     "(live, not saved) -> read back; one-shot knobs report in luma_log. Frame times: luma_perf (name + values sweeps a dev value).\n"
     "'ignored_args' in a result means a misspelt or unknown argument. A timeout usually means the game isn't presenting (minimized, paused, "
@@ -952,13 +1149,14 @@ def self_test():
     """python Scripts/luma_mcp.py --self-test: the bridge-side math on synthetic R32_FLOAT readbacks, no game needed."""
     root = tempfile.mkdtemp(prefix="luma-mcp-selftest-")
 
-    def readback(name, image):
+    def readback(name, image, format_id=41):
+        """R32_FLOAT from [h, w], or R32G32B32A32_FLOAT (format_id 2) from [h, w, 4]"""
         image = np.ascontiguousarray(image, np.float32)
         path = os.path.join(root, name + ".bin")
         image.tofile(path)
         with open(os.path.join(root, name + ".json"), "w") as f:
-            json.dump({"format_id": 41, "view_format_id": 41, "width": image.shape[1], "rows": image.shape[0], "row_pitch": image.shape[1] * 4,
-                       "slices": 1, "depth": 1}, f)
+            json.dump({"format_id": format_id, "view_format_id": format_id, "width": image.shape[1], "rows": image.shape[0],
+                       "row_pitch": image[0].nbytes, "slices": 1, "depth": 1}, f)
         return path
 
     ramp = np.tile((np.arange(16) + 0.5) / 16, (16, 1))
@@ -981,7 +1179,61 @@ def self_test():
     assert result["metrics"]["b"]["detail"] == 0.5, result
     assert compare(halves, checker, metrics=["bogus"])["ok"] is False
 
-    assert {"luma_ab", "luma_perf"} <= TOOL_NAMES and len(INSTRUCTIONS) <= 2048, len(INSTRUCTIONS)
+    # Golden: accept, the same image passes without leaving images, a changed one fails and keeps them
+    global BASELINE_ROOT
+    BASELINE_ROOT = os.path.join(root, "baselines")
+
+    def rgba(name, image):
+        return readback(name, image, 2)
+
+    scene = np.ones((32, 32, 4)) * np.linspace(0.05, 4.0, 32)[None, :, None]
+    shifted = scene.copy()
+    shifted[8:24, 8:24, :3] *= [2.0, 0.5, 0.5]
+    assert golden(rgba("scene", scene), "game/menu", "native")["ok"] is False  # No baseline yet
+    assert golden(rgba("scene", scene), "game/menu", "native", accept=True)["max_flip"] == 1.0
+    for case, backend_name in (("game/../x", "native"), ("..", "native"), ("game/menu", ".."), ("game/./x", "native")):
+        assert "letters, digits" in golden(rgba("scene", scene), case, backend_name).get("error", ""), (case, backend_name)
+    same_result = golden(rgba("scene2", scene), "game/menu", "native")
+    try:
+        import flip_evaluator  # noqa: F401
+    except ImportError:
+        assert same_result["ok"] is False and "flip-evaluator" in same_result["error"], same_result
+        print("flip-evaluator missing: FLIP checks skipped")
+    else:
+        assert same_result["pass"] and same_result["flip"]["mode"] == "HDR" and "flip_png" not in same_result, same_result
+        changed = golden(rgba("shifted", shifted), "game/menu", "native")
+        assert not changed["pass"] and os.path.exists(changed["flip_png"]), changed
+        assert golden(rgba("shifted", shifted), "game/menu", "native", accept=True, max_flip=100)["max_flip"] == 100
+        assert golden(rgba("shifted2", shifted), "game/menu", "native")["pass"]
+        os.remove(changed["flip_png"])
+        os.remove(changed["diff_png"])
+        os.remove(os.path.join(BASELINE_ROOT, "game", "menu", "native.golden.json"))  # A baseline without its settings: default 1.0
+        assert golden(rgba("scene3", shifted), "game/menu", "native")["max_flip"] == 1.0
+
+    # Replay refusals: an unbound depth state reports D3D11_DEFAULT (depth on), which only matters with a DSV bound
+    default_depth = {"depth_stencil": {"state_bound": False, "depth_enable": True, "stencil_enable": False}}
+    assert replay_refusals(default_depth) == []
+    assert replay_refusals({**default_depth, "dsv": {}}) == ["depth/stencil test"]
+    assert replay_refusals({"dsv": {}, "depth_stencil": {"state_bound": True, "depth_enable": False, "stencil_enable": False}}) == []
+
+    # capture_pass keeps an existing case unless told to overwrite it (backend stubbed, refused before any readback)
+    global backend, REPLAY_ROOT
+    real_backend, REPLAY_ROOT = backend, os.path.join(root, "cases")
+
+    class StubBackend:
+        def call(self, name, args):
+            return {"trace_get": {"ok": True, "stage": "PS", "custom_shader": {"is_hlsl": True, "file": os.path.abspath(__file__)}},
+                    "get_settings": {"ok": True, "compile_defines": {}}}[name]
+
+    backend = StubBackend()
+    os.makedirs(os.path.join(REPLAY_ROOT, "game", "pass"))
+    open(os.path.join(REPLAY_ROOT, "game", "pass", "case.json"), "w").close()
+    assert "already holds" in capture_pass(0, "game/pass")["error"]
+    assert "letters, digits" in capture_pass(0, "game/../pass")["error"]
+    backend = real_backend
+    shutil.rmtree(root)
+
+    assert {"luma_ab", "luma_perf", "luma_golden"} <= TOOL_NAMES and len(INSTRUCTIONS) <= 2048, len(INSTRUCTIONS)
     print("self test passed")
 
 
