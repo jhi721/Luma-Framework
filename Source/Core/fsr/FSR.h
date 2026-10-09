@@ -15,6 +15,10 @@
 
 namespace FidelityFX
 {
+#if DEVELOPMENT && !defined(NDEBUG)
+   inline bool draw_debug_view = true; // "core.fsr_debug_view"
+#endif
+
 	// FSR 3 SR
 	class FSR : public SR::SuperResolutionImpl
 	{

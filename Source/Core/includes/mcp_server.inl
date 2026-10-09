@@ -2328,6 +2328,9 @@ namespace Mcp
       RegisterToggles({{"core.hide_ui", &hide_ui}, {"core.force_disable_display_composition", &force_disable_display_composition}, {"core.ignore_upgraded_samplers", &ignore_upgraded_samplers},
          {"core.enable_upgraded_texture_resource_copy_redirection", &enable_upgraded_texture_resource_copy_redirection}});
       RegisterInts({{"core.frame_sleep_ms", &frame_sleep_ms, 0, 100}, {"core.frame_sleep_interval", &frame_sleep_interval, 1, 30}});
+#if ENABLE_FIDELITY_SK && DEVELOPMENT && !defined(NDEBUG) // As "FidelityFX::draw_debug_view"
+      RegisterToggles({{"core.fsr_debug_view", &FidelityFX::draw_debug_view}});
+#endif
 #if ENABLE_SR
       // As the "Super Resolution" combo, not saved to the config: 0 None, 1 Auto, 2 DLSS, 3 FSR 3, 4 Luma TAA
       static_assert(sizeof(SR::UserType) == sizeof(int));

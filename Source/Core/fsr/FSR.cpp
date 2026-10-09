@@ -344,7 +344,7 @@ namespace FidelityFX
 
       dispatch_upscale.flags = 0;
 #if DEVELOPMENT && !defined(NDEBUG)
-      if (true) // For now we always do this in development // TODO: expose a toggle
+      if (draw_debug_view) // The view's shaders only exist in the debug FFX libs
       {
          dispatch_upscale.flags |= FFX_FSR3_UPSCALER_FLAG_DRAW_DEBUG_VIEW;
       }
