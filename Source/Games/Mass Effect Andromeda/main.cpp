@@ -12,6 +12,7 @@
 
 #define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1 // replaces the game's FXAA pass (FXAA AA mode) with SMAA
+#define ENABLE_RCAS 1 // optional sharpening of the SMAA or DLSS/FSR output (Core's "RCAS PS")
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 // Every pass Luma reissues itself (the DOF-variant resolve run natively first, the output-sized post passes, the upscaled
@@ -690,16 +691,13 @@ struct MassEffectAndromedaGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_rcas_input;
    ComPtr<ID3D11RenderTargetView> tex_rcas_input_rtv;
    ComPtr<ID3D11ShaderResourceView> tex_rcas_input_srv;
-   ComPtr<ID3D11Buffer> cb_sharpen; // (W, H, sharpness, 0)
    uint2 rcas_input_size = {};
-   float sharpen_amount = -1.f; // cache key for cb_sharpen
 
    void ReleaseRCAS()
    {
       tex_rcas_input_rtv.reset();
       tex_rcas_input_srv.reset();
       tex_rcas_input.reset();
-      cb_sharpen.reset();
    }
    // The frames SMAA and RCAS last ran, for "smaa_idle_release_frames"
    uint32_t smaa_frame = 0;
@@ -854,46 +852,26 @@ class MassEffectAndromeda final : public Game
    }
 
 #if ENABLE_SMAA
-   // RCAS on a display-encoded pass (SMAA, or the tonemap under DLSS/FSR): the pass draws into "tex_rcas_input" and RCAS
-   // writes the pass' own target. False when a piece is missing (shaders still compiling, a failed creation): the pass then
-   // draws straight to its target, or the image would be lost.
-   static bool PrepareRCAS(ID3D11Device* native_device, DeviceData& device_data, MassEffectAndromedaGameDeviceData* gd, uint2 size)
+   // RCAS on a display-encoded pass (SMAA, or the tonemap under DLSS/FSR): the pass draws into "tex_rcas_input" and Core's
+   // "DrawRCAS()" writes the pass' own target. False when a piece is missing (shaders still compiling, a failed creation): the pass
+   // then draws straight to its target, or the image would be lost. True counts as an RCAS use for "smaa_idle_release_frames".
+   static bool PrepareRCASInput(ID3D11Device* native_device, DeviceData& device_data, MassEffectAndromedaGameDeviceData* gd, uint2 size)
    {
-      if (g_rcas_sharpness <= 0.f || FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS")) == nullptr ||
-          FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("MEA Sharpen PS")) == nullptr)
+      if (g_rcas_sharpness <= 0.f || !PrepareRCAS(native_device, device_data))
          return false;
       if (!gd->tex_rcas_input || gd->rcas_input_size != size)
       {
-         gd->ReleaseRCAS(); // the CB holds the size too
+         gd->ReleaseRCAS();
          if (CreateTexture(native_device, DXGI_FORMAT_R16G16B16A16_FLOAT, size, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, gd->tex_rcas_input.put(),
                 gd->tex_rcas_input_srv.put(), gd->tex_rcas_input_rtv.put()))
          {
             gd->rcas_input_size = size;
          }
       }
-      if (!gd->cb_sharpen || gd->sharpen_amount != g_rcas_sharpness)
-      {
-         const float sp[4] = {(float)size.x, (float)size.y, g_rcas_sharpness, 0.f};
-         if (CreateImmutableCB(native_device, sp, sizeof(sp), std::addressof(gd->cb_sharpen)))
-         {
-            gd->sharpen_amount = g_rcas_sharpness;
-         }
-      }
-      return gd->tex_rcas_input_rtv && gd->tex_rcas_input_srv && gd->cb_sharpen;
-   }
-
-   static void DrawRCAS(ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectAndromedaGameDeviceData* gd, ID3D11RenderTargetView* target, uint2 size)
-   {
+      if (!gd->tex_rcas_input_rtv || !gd->tex_rcas_input_srv)
+         return false;
       gd->sharpen_frame = cb_luma_global_settings.FrameIndex;
-      // DrawCustomPixelShader does NOT restore state
-      DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
-      sharpen_state.Cache(native_device_context, device_data.uav_max_count);
-      ID3D11Buffer* scb = gd->cb_sharpen.get();
-      native_device_context->PSSetConstantBuffers(0, 1, &scb);
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-         FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS")), FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("MEA Sharpen PS")),
-         gd->tex_rcas_input_srv.get(), target, size.x, size.y, false);
-      sharpen_state.Restore(native_device_context);
+      return true;
    }
 #endif
 
@@ -1398,16 +1376,8 @@ class MassEffectAndromeda final : public Game
       if (!gd->cb_smaa_metrics)
          return DrawOrDispatchOverrideType::None;
 
-      // Bind the metrics CB at VS+PS b1 (DrawSMAA restores VS/PS/SRVs/RTs but NOT cbuffer slots).
-      ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
-      native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
-      native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-      ID3D11Buffer* mcb = gd->cb_smaa_metrics.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &mcb);
-      native_device_context->PSSetConstantBuffers(1, 1, &mcb);
-
       // With sharpening on, SMAA renders into "tex_rcas_input" and RCAS writes the final RTV
-      const bool do_sharpen = PrepareRCAS(native_device, device_data, gd, size);
+      const bool do_sharpen = PrepareRCASInput(native_device, device_data, gd, size);
 
       // Linear view depth -> plane-deviation edge-ness (R16F); see Luma_MEA_DepthExtract.hlsl
       if (pred_ok)
@@ -1427,19 +1397,14 @@ class MassEffectAndromeda final : public Game
 
       // MEA's FXAA input is already display-encoded → use it as both color and gamma
       ID3D11RenderTargetView* smaa_target = (do_sharpen ? gd->tex_rcas_input_rtv.get() : rtv.get());
-      DrawSMAA(native_device, native_device_context, device_data, smaa_target, srv_color.get(), srv_color.get(), (pred_ok ? gd->srv_pred.get() : nullptr));
+      DrawSMAA(native_device, native_device_context, device_data, smaa_target, srv_color.get(), srv_color.get(), (pred_ok ? gd->srv_pred.get() : nullptr), gd->cb_smaa_metrics.get());
       MEA_COUNT(smaa_draws);
 
       if (do_sharpen)
       {
          MEA_COUNT(rcas_draws);
-         DrawRCAS(native_device_context, device_data, gd, rtv.get(), size);
+         DrawRCAS(native_device_context, device_data, gd->tex_rcas_input_srv.get(), rtv.get(), g_rcas_sharpness);
       }
-
-      ID3D11Buffer* vcb = vs_cb1_orig.get();
-      ID3D11Buffer* pcb = ps_cb1_orig.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &vcb);
-      native_device_context->PSSetConstantBuffers(1, 1, &pcb);
 
       device_data.has_drawn_main_post_processing = true;
       return DrawOrDispatchOverrideType::Replaced; // cancel native FXAA
@@ -1456,7 +1421,7 @@ class MassEffectAndromeda final : public Game
       com_ptr<ID3D11DepthStencilView> dsv;
       native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
       const uint2 size = (rtvs[0] ? GetViewTextureSize(rtvs[0].get()) : uint2{});
-      if (size.x == 0 || size.y == 0 || !PrepareRCAS(native_device, device_data, gd, size))
+      if (size.x == 0 || size.y == 0 || !PrepareRCASInput(native_device, device_data, gd, size))
          return DrawOrDispatchOverrideType::None;
       ID3D11RenderTargetView* tonemap_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
       for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
@@ -1468,7 +1433,7 @@ class MassEffectAndromeda final : public Game
       original_draw();
       native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], dsv.get());
       MEA_COUNT(rcas_draws);
-      DrawRCAS(native_device_context, device_data, gd, rtvs[0].get(), size);
+      DrawRCAS(native_device_context, device_data, gd->tex_rcas_input_srv.get(), rtvs[0].get(), g_rcas_sharpness);
       return DrawOrDispatchOverrideType::Replaced;
    }
 #endif
@@ -2848,7 +2813,7 @@ class MassEffectAndromeda final : public Game
          return false;
       }
 #if ENABLE_SMAA
-      const bool rcas = PrepareRCAS(native_device, device_data, gd, size);
+      const bool rcas = PrepareRCASInput(native_device, device_data, gd, size);
 #else
       constexpr bool rcas = false;
 #endif
@@ -2880,7 +2845,7 @@ class MassEffectAndromeda final : public Game
       if (rcas)
       {
          MEA_COUNT(rcas_draws);
-         DrawRCAS(native_device_context, device_data, gd, gd->upscaled_scene_rtv.get(), size);
+         DrawRCAS(native_device_context, device_data, gd->tex_rcas_input_srv.get(), gd->upscaled_scene_rtv.get(), g_rcas_sharpness);
       }
 #endif
       gd->tonemap_upscaled = true;
@@ -3642,9 +3607,6 @@ public:
       luma_data_cbuffer_index = -1;
       luma_ui_cbuffer_index = -1;
 #if ENABLE_SMAA
-      // RCAS PS, after SMAA or on the tonemap under DLSS/FSR (with Core's "Copy VS")
-      native_shaders_definitions.emplace(CompileTimeStringHash("MEA Sharpen PS"),
-         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
       native_shaders_definitions.emplace(CompileTimeStringHash("MEA Depth Extract CS"),
          ShaderDefinition{"Luma_MEA_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader});
 #endif
@@ -3982,7 +3944,7 @@ public:
       {
          gd.cb_smaa_metrics.reset();
          gd.ReleasePredication();
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       else if (!g_smaa_predication && gd.tex_pred)
       {

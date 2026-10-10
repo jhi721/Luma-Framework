@@ -21,6 +21,7 @@
 #define ENABLE_SMAA 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
+#define ENABLE_RCAS 1
 // The motion vector and jitter draws wrap the game's own draws, so they need "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -405,8 +406,6 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11RenderTargetView> tex_smaa_out_rtv;
    ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
 
-   // RCAS sharpen CB (b0) = (w, h, sharpness, 0)
-   com_ptr<ID3D11Buffer> cb_sharpen;
    // RCAS output temp (fp16, RTV), copied into the swapchain target, only if that has no RTV
    ComPtr<ID3D11Texture2D> tex_rcas_out;
    ComPtr<ID3D11RenderTargetView> tex_rcas_out_rtv;
@@ -611,7 +610,7 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
       gtao_w = gtao_h = 0;
    }
 
-   // SMAA's own resources (predication, output temp), apart from Core's ("ReleaseSMAA")
+   // SMAA's own resources (predication, output temp), apart from Core's ("ReleaseSMAAIntermediates")
    void ReleaseSMAAScratch()
    {
       tex_pred.reset();
@@ -1780,9 +1779,6 @@ public:
       // Depth-extract CS for SMAA predication: hardware d24 -> R16F plane-deviation edge-ness.
       native_shaders_definitions.emplace(CompileTimeStringHash("BL Depth Extract CS"),
          ShaderDefinition("Luma_BL_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
-      // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA or DLSS / FSR).
-      native_shaders_definitions.emplace(CompileTimeStringHash("BL Sharpen PS"),
-         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
 
       // XeGTAO (replaces the game's native HBAO+; see the AO hash block above). 4 compute passes out of one
       // file; the two denoise variants differ only by XE_GTAO_FINAL_APPLY (the final one writes the game's
@@ -2295,14 +2291,7 @@ public:
          if (smaa && !PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_smaa_metrics), metrics, sizeof(metrics)))
             return fallback;
 
-         auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-         auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL Sharpen PS"));
-         bool do_sharpen = g_rcas_sharpness > 0.f && copy_vs != nullptr && sharpen_ps != nullptr;
-         if (do_sharpen)
-         {
-            const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-            do_sharpen = PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.cb_sharpen), sp, sizeof(sp));
-         }
+         const bool do_sharpen = g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data);
          // After DLSS / FSR with RCAS not ready: the upscaled image stays as it is
          if (!smaa && !do_sharpen)
             return DrawOrDispatchOverrideType::Replaced;
@@ -2360,6 +2349,7 @@ public:
 
          if (pred_ok && g_smaa_pred_debug)
          {
+            auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
             auto* debug_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
             if (copy_vs != nullptr && debug_ps != nullptr && create_smaa_out())
             {
@@ -2392,24 +2382,11 @@ public:
             if (smaa_into_temp && !create_smaa_out())
                return fallback;
 
-            // The metrics at VS and PS b1, put back after (DrawSMAA restores shaders, SRVs and targets, not constant buffers)
-            ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
-            native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
-            native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-            ID3D11Buffer* mcb = gd.cb_smaa_metrics.get();
-            native_device_context->VSSetConstantBuffers(1, 1, &mcb);
-            native_device_context->PSSetConstantBuffers(1, 1, &mcb);
-
             // The snapshot for both the edge detection and the blend (filtered in linear light, Luma_SMAA_impl.hlsl). Null predication
             // when invalid ("pred_ok"): with pred_scale 1.0 in the metrics, plain ULTRA.
             DrawSMAA(native_device, native_device_context, device_data,
                smaa_into_temp ? gd.tex_smaa_out_rtv.get() : color_rtv.get(), gd.srv_input.get(), gd.srv_input.get(),
-               pred_ok ? gd.srv_pred.get() : nullptr /*predication (plane-deviation edge-ness)*/);
-
-            ID3D11Buffer* vcb = vs_cb1_orig.get();
-            ID3D11Buffer* pcb = ps_cb1_orig.get();
-            native_device_context->VSSetConstantBuffers(1, 1, &vcb);
-            native_device_context->PSSetConstantBuffers(1, 1, &pcb);
+               pred_ok ? gd.srv_pred.get() : nullptr /*predication (plane-deviation edge-ness)*/, gd.cb_smaa_metrics.get());
             sharpen_source = gd.tex_smaa_out_srv.get();
          }
 
@@ -2425,16 +2402,7 @@ public:
          }
          if (do_sharpen && sharpen_target)
          {
-            // DrawCustomPixelShader doesn't restore state
-            DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
-            sharpen_state.Cache(native_device_context, device_data.uav_max_count);
-
-            ID3D11Buffer* scb = gd.cb_sharpen.get();
-            native_device_context->PSSetConstantBuffers(0, 1, &scb);
-            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-               copy_vs, sharpen_ps, sharpen_source, sharpen_target, w, h, false);
-
-            sharpen_state.Restore(native_device_context);
+            DrawRCAS(native_device_context, device_data, sharpen_source, sharpen_target, g_rcas_sharpness);
             if (!color_rtv)
             {
                native_device_context->CopyResource(color_res.get(), gd.tex_rcas_out.get());
@@ -2525,7 +2493,7 @@ public:
       if (cb_luma_global_settings.FrameIndex - gd.smaa_frame > smaa_idle_release_frames)
       {
          gd.ReleaseSMAAScratch();
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       if (cb_luma_global_settings.FrameIndex - gd.snapshot_frame > smaa_idle_release_frames)
       {

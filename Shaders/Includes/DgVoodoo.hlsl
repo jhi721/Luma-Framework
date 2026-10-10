@@ -1,10 +1,6 @@
 #ifndef SRC_DGVOODOO_HLSL
 #define SRC_DGVOODOO_HLSL
 
-// dgVoodoo's D3D9 -> D3D11 translation, as its translated shaders compute it. Replacements must match it bit for bit.
-
-// Every texture fetch is followed by an and/or pair against the per-sampler (mask, fill) constants in b3: dgVoodoo's D3D9 format
-// emulation. Dropping it shifts color.
 float4 ApplyDgvMask(float4 value, float4 mask, float4 fill)
 {
    return asfloat((asuint(value) & asuint(mask)) | asuint(fill));

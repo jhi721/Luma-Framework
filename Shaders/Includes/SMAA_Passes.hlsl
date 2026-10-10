@@ -1,10 +1,9 @@
-// The six SMAA pass entry points Core registers from a game's "Luma_SMAA_impl.hlsl" (see "SMAA Edge Detection VS" and siblings in
-// core.hpp), over fullscreen-triangle VSs. The game file configures SMAA (SMAA_RT_METRICS, the preset, predication, optionally
-// SMAAGather) and includes this instead of SMAA.hlsl.
-// Optional hook: SMAA_NEIGHBORHOOD_OUTPUT(color, position), a statement run on the blended float4 color before it is returned (e.g.
-// to re-encode a linear colorTex to the canvas' gamma). With SMAA_REPROJECTION (T2x) it runs on the resolve's output instead.
-// Optional: SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR 1 lets the neighborhood blend read the gamma-encoded canvas (the edge detection's input)
-// and filter it in linear light, without a linear copy (needs "gamma_to_linear" included first; re-encode with the output hook).
+// The SMAA passes Core draws for the games with a "Luma_SMAA_impl.hlsl" (see "SMAA Edge Detection VS" etc in core.hpp).
+// The game file sets up SMAA (metrics, preset, predication, "SMAAGather" if needed), then includes this instead of
+// "SMAA.hlsl". Define "SMAA_NEIGHBORHOOD_OUTPUT(color, position)" to change the blended color before it's written,
+// e.g. to go back to gamma space. With "SMAA_REPROJECTION" (T2x) it runs on the resolve's output instead.
+// Define "SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR" 1 to let the neighborhood blend read the gamma encoded canvas (the edge
+// detection's input) and filter it in linear light, without a linear copy ("gamma_to_linear" must be included first).
 
 #ifndef SMAA_CUSTOM_SL
 #define SMAA_CUSTOM_SL

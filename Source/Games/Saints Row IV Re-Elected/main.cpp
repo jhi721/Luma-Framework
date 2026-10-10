@@ -3059,7 +3059,7 @@ public:
       {
          game_device_data.smaa_predication_uav.reset();
          game_device_data.smaa_predication_srv.reset();
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       if (cb_luma_global_settings.FrameIndex - game_device_data.snapshot_frame > smaa_idle_release_frames)
       {

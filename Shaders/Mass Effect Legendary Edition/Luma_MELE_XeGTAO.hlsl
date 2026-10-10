@@ -58,14 +58,24 @@ cbuffer LumaGTAO : register(b11)
 
 #include "Includes/Common.hlsl"
 
-#define EFFECT_RADIUS             0.6   // ME1LE's native 30 uu / DepthScale 50; ME2LE/ME3LE's 48 uu arrives as RadiusOverrideRT, which wins.
-#define EFFECT_FALLOFF_RANGE      0.005 // Hard falloff matches native contact AO; Intel default 0.615 is softer.
-#define SAMPLE_DISTRIBUTION_POWER 1.5
-// Intel's floor: disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible)
-#define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility);
+// Compile-time defaults; runtime b11 overrides the exposed controls.
+
+#ifndef EFFECT_RADIUS
+#define EFFECT_RADIUS 0.6 // Native ME1LE radius: 30 UE3 units / DepthScale 50; ME2LE/ME3LE's 48 units arrive as RadiusOverrideRT, which wins.
+#endif
+
+#ifndef EFFECT_FALLOFF_RANGE
+#define EFFECT_FALLOFF_RANGE 0.005 // Hard falloff matches native contact AO; Intel default 0.615 is softer.
+#endif
+
+#ifndef SAMPLE_DISTRIBUTION_POWER
+#define SAMPLE_DISTRIBUTION_POWER 1.5 // Default 2.0
+#endif
 
 // Packed normals' z sign; view-space normals face the camera.
+#ifndef NORMAL_Z_SIGN
 #define NORMAL_Z_SIGN (-1.0)
+#endif
 
 // The AO target spans the rendered area at any render scale (its depth is loaded from the rendered share of the scene depth), so its
 // UVs are the rendered area's. InvFullResolution is the AO allocation's, as the untouched HBAO+ fills only its rendered share.
@@ -73,11 +83,8 @@ cbuffer LumaGTAO : register(b11)
 #define XE_GTAO_DEPTH_LOAD_COORD(pixCoord) uint2(((pixCoord) + 0.5) * DepthLoadScaleRT)
 
 // GFSDK ProjInfo contains the live NDC-to-view multiply/add pair, including dialogue zoom, for UVs of the rendered area.
-#define NDC_TO_VIEW_MUL           ProjInfo.xy
-#define NDC_TO_VIEW_ADD           ProjInfo.zw
-
-#define XE_GTAO_FINAL_OUTPUT_TYPE unorm float
-#define XE_GTAO_ENCODE_FINAL(v)   (v)
+#define NDC_TO_VIEW_MUL ProjInfo.xy
+#define NDC_TO_VIEW_ADD ProjInfo.zw
 
 // Convert non-reverse D24 through native MinZ_MaxZRatioCS, then scale UE3 units into XeGTAO's expected range.
 // Without scaling, its mip and falloff assumptions cause broad over-occlusion.
@@ -87,11 +94,16 @@ float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
    return max(0.0, viewZ) / max(1e-3, DepthScaleRT);
 }
 
-Texture2D tex1 : register(t1); // the scene's packed view-space normals (xy)
+#define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility); // A visible surface cannot be fully occluded.
+#define XE_GTAO_FINAL_OUTPUT_TYPE                         unorm float                         // Native final R8_UNORM AO.
+#define XE_GTAO_ENCODE_FINAL(v)                           (v)
 
-// Unit z from the packed view-space xy (see NORMAL_Z_SIGN).
+Texture2D tex1 : register(t1);
+
 float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 {
+   // Decode packed view-space xy (the scene's normals, read at the depth's scale) and reconstruct unit z. Camera-facing normals use
+   // negative z.
    float2 nxy = tex1.Load(int3(XE_GTAO_DEPTH_LOAD_COORD(pixCoord), 0)).xy * 2.0 - 1.0;
    float3 viewspaceNormal;
    viewspaceNormal.xy = nxy;

@@ -20,6 +20,7 @@
 
 #define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1     // SMAA ULTRA (+RCAS) injected post-tonemap; core auto-registers the 6 "SMAA ..." passes from Luma_SMAA_impl
+#define ENABLE_RCAS 1     // core registers the "RCAS PS" pass, drawn by DrawRCAS after SMAA or the upscaler
 #define ENABLE_BLOOM 1    // core auto-registers the Bloom VS/Prefilter/Downsample/Upsample passes -> Luma_Bloom_impl
 #define ENABLE_LUMA_TAA 1 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU
 // SMAA runs POST-tonemap through the post-draw callback (see RunPostTonemapSMAA); needs original_draw_dispatch_func.
@@ -361,12 +362,6 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11RenderTargetView> t2x_frame_rtvs[2];
    ComPtr<ID3D11ShaderResourceView> t2x_frame_srvs[2];
    uint32_t t2x_frame = 0;
-
-   // RCAS sharpen CB (b0) = (w,h,sharpness,0). RCAS writes the LDR RTV, so it needs no output temp.
-   ComPtr<ID3D11Buffer> cb_sharpen;
-   uint32_t sharpen_w = 0, sharpen_h = 0;
-   float sharpen_amount = -1.f;
-
    // Resource the tonemap renders to; on BL2 the HUD draws onto it afterwards. Used by Hide UI and the FXAA override.
    uint64_t ldr_buffer_handle = 0;
    // Set when the tonemap runs, cleared every Present: scopes Hide UI's alpha-blend skip to the post-tonemap
@@ -618,7 +613,7 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    bool perf_user_blend_memo = true;
 #endif
 
-   // SMAA's own resources (predication, output temp), apart from Core's ("ReleaseSMAA"); recreated at their next use
+   // SMAA's own resources (predication, output temp), apart from Core's ("ReleaseSMAAIntermediates"); recreated at their next use
    void ReleaseSMAAScratch()
    {
       tex_pred.reset();
@@ -741,32 +736,7 @@ class Borderlands2 final : public Game
       }
 
       // RCAS decides the chain's shape: SMAA renders into the LDR RTV directly or into the intermediate RCAS reads.
-      auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-      auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS Sharpen PS"));
-      bool do_sharpen = g_rcas_sharpness > 0.f && copy_vs != nullptr && sharpen_ps != nullptr;
-      if (do_sharpen && (!gd->cb_sharpen || gd->sharpen_w != w || gd->sharpen_h != h || gd->sharpen_amount != g_rcas_sharpness))
-      {
-         const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-         if (CreateImmutableCB(native_device, sp, sizeof(sp), std::addressof(gd->cb_sharpen)))
-         {
-            gd->sharpen_w = w;
-            gd->sharpen_h = h;
-            gd->sharpen_amount = g_rcas_sharpness;
-         }
-      }
-      do_sharpen = do_sharpen && gd->cb_sharpen;
-      const auto sharpen = [&](ID3D11ShaderResourceView* source)
-      {
-         DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
-         sharpen_state.Cache(native_device_context, device_data.uav_max_count);
-
-         ID3D11Buffer* scb = gd->cb_sharpen.get();
-         native_device_context->PSSetConstantBuffers(0, 1, &scb);
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-            copy_vs, sharpen_ps, source, ldr_rtv, w, h, false);
-
-         sharpen_state.Restore(native_device_context);
-      };
+      bool do_sharpen = g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data);
 
       // Copies the LDR into the snapshot both passes read (LDR format, so CopyResource matches): the LDR is also the chain's output
       const auto snapshot = [&]
@@ -798,7 +768,7 @@ class Borderlands2 final : public Game
          gd->snapshot_frame = cb_luma_global_settings.FrameIndex;
          if (snapshot())
          {
-            sharpen(gd->srv_input_encoded.get());
+            DrawRCAS(native_device_context, device_data, gd->srv_input_encoded.get(), ldr_rtv, g_rcas_sharpness);
          }
          return;
       }
@@ -904,6 +874,7 @@ class Borderlands2 final : public Game
 
       if (pred_ok && g_smaa_pred_debug)
       {
+         auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
          auto* copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
          if (copy_vs != nullptr && copy_ps != nullptr)
          {
@@ -923,6 +894,7 @@ class Borderlands2 final : public Game
       // SMAA T2x: SMAA into this frame's linear target with the velocity, then the resolve with the previous frame into the chain's
       // output. It needs this frame's motion vectors from the fill, at the LDR's size. Without them this frame is 1x and the next one
       // doesn't jitter.
+      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       auto* const t2x_weight_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS SMAA T2x Blending Weight Calculation PS"));
       auto* const t2x_blend_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS SMAA T2x Neighborhood Blending PS"));
       auto* const t2x_resolve_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("BL2TPS SMAA T2x Resolve PS"));
@@ -952,15 +924,6 @@ class Borderlands2 final : public Game
       const float metrics[12] = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h, (pred_ok ? 2.0f : 1.0f), 0.f, 0.f, 0.f, subsample_indices, subsample_indices, subsample_indices, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_smaa_metrics), metrics, sizeof(metrics)))
          return;
-
-      // SMAA (3 passes). Metrics CB at VS+PS b1 (DrawSMAA restores VS/PS/SRVs/RTs, not cbuffers).
-      ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
-      native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
-      native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-      ID3D11Buffer* metrics_cb = gd->cb_smaa_metrics.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &metrics_cb);
-      native_device_context->PSSetConstantBuffers(1, 1, &metrics_cb);
-
       // The last pass of the chain renders straight into the LDR RTV, which is safe because SMAA and RCAS sample
       // the snapshot copies, never the LDR itself.
       ID3D11RenderTargetView* const output_rtv = (do_sharpen ? gd->tex_smaa_out_rtv.get() : ldr_rtv);
@@ -970,6 +933,7 @@ class Borderlands2 final : public Game
          gd->srv_input_encoded.get() /*neighborhood blend (filtered in linear light)*/,
          gd->srv_input_encoded.get() /*edge detection (gamma 2.2)*/,
          pred_ok ? gd->srv_pred.get() : nullptr /*predication signal*/,
+         gd->cb_smaa_metrics.get(),
          t2x ? &t2x_passes : nullptr);
 
       if (t2x)
@@ -992,13 +956,8 @@ class Borderlands2 final : public Game
 
       if (do_sharpen)
       {
-         sharpen(gd->tex_smaa_out_srv.get());
+         DrawRCAS(native_device_context, device_data, gd->tex_smaa_out_srv.get(), ldr_rtv, g_rcas_sharpness);
       }
-
-      ID3D11Buffer* vs_cb1 = vs_cb1_orig.get();
-      ID3D11Buffer* ps_cb1 = ps_cb1_orig.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &vs_cb1);
-      native_device_context->PSSetConstantBuffers(1, 1, &ps_cb1);
    }
 #endif // ENABLE_SMAA
 
@@ -2464,10 +2423,7 @@ public:
       // "UI Paper White" slider on UI_DRAW_TYPE >= 1 && !use_os_reference_white_level. UI default 203 nits (BT.2408).
       use_os_reference_white_level = false;
 
-      // Core auto-registers the 6 SMAA passes; these are this game's own. RCAS sharpen PS (drawn via core "Copy VS" +
-      // DrawCustomPixelShader after SMAA).
-      native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Sharpen PS"),
-         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+      // Core auto-registers the 6 SMAA passes and the RCAS sharpen PS; these are this game's own.
       // SMAA T2x's own passes ("SMAA_T2X" in Luma_SMAA_impl.hlsl). The edge detection and the vertex shaders are 1x's.
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS SMAA T2x Blending Weight Calculation PS"),
          ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
@@ -3731,7 +3687,7 @@ public:
       if (cb_luma_global_settings.FrameIndex - gd.smaa_frame > smaa_idle_release_frames)
       {
          gd.ReleaseSMAAScratch();
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       if (cb_luma_global_settings.FrameIndex - gd.snapshot_frame > smaa_idle_release_frames)
       {

@@ -5,8 +5,10 @@
 //   src/games/borderlandsgotyenhanced/macleod_boynton.hlsli  constants, MB transforms, the gamut-ray purity solver
 //   src/games/borderlandsgotyenhanced/common.hlsli            ApplyHueAndPurityGrading, its hue/purity emulation
 //   src/shaders/math.hlsl, deprecated.hlsl, color/rgb.hlsl    Invert3x3, DivideSafe, SafeDivision, matrices, xyY
-// The constants, the expressions and their order are RenoDX's (fxc listings held byte-identical to it); the organisation
-// and the API are Luma's. The purity modes no caller uses yet are kept from it.
+// The constants, the expressions and their order are RenoDX's; the organisation and the API are Luma's, and the
+// unused purity modes are kept until the specialised entry points have proven what they need.
+// _tools/bl1_bridge/mb_equiv compiles this file, the RenoDX source and the previous BL1 port side by side under
+// fxc and holds their listings byte-identical.
 //
 // The model: RGB -> XYZ -> LMS (CIE 2006), hue as MacLeod–Boynton ratios r = L/(L+M), b = S/(L+M) around an
 // adapted white, intensity anchored on T = L + M, purity as the fraction of the distance from white to the RGB
@@ -93,8 +95,8 @@ float3 XYZ_From_xyY(float3 xyY)
    return XYZ;
 }
 
-// The RGB working space the solver runs in: its matrices to and from XYZ. Passed by value: callers pass
-// compile-time constants, which fxc folds.
+// The RGB working space the solver runs in: its matrices to and from XYZ. Passed by value; every current
+// caller passes a compile-time constant and fxc folds it, so the abstraction costs nothing at runtime.
 struct RGBColorSpace
 {
    float3x3 rgbToXYZ;
@@ -543,8 +545,9 @@ float3 HueAndPurityEmulationBT2020(float3 ungraded_bt2020, float3 reference_bt20
 }
 
 // Reference hue direction on the target's own purity and T; nothing of the reference's purity is taken.
-// Deliberately a plain call: fxc already eliminates the reference purity solve and the chrominance branch, so a
-// hand-specialised copy compiles to byte-identical DXBC and would only duplicate the hue block.
+// Deliberately a plain call: a hand-specialised copy (reference purity solve and chrominance branch removed)
+// compiles to byte-identical DXBC, since fxc already eliminates that dead work, so it would only duplicate
+// the hue block. Measured on both BL1 wrappers and held bit-exact over random pairs before being dropped.
 float3 HueOnlyBT2020(float3 ungraded_bt2020, float3 reference_bt2020)
 {
    return HueAndPurityEmulationBT2020(ungraded_bt2020, reference_bt2020, 1.f, 0.f);

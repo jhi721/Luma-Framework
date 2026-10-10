@@ -92,6 +92,10 @@
 #ifndef SMAA_SMOOTH_U_SHAPES
 #define SMAA_SMOOTH_U_SHAPES 1
 #endif // SMAA_SMOOTH_U_SHAPES
+// RCAS sharpening pass drawn by "DrawRCAS()" (e.g. after SMAA or super resolution)
+#ifndef ENABLE_RCAS
+#define ENABLE_RCAS 0
+#endif // ENABLE_RCAS
 // 64x only
 #ifndef ENABLE_NGX
 #define ENABLE_NGX 0
@@ -702,6 +706,10 @@ namespace
       { CompileTimeStringHash("SMAA Blending Weight Calculation PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps" } },
       { CompileTimeStringHash("SMAA Neighborhood Blending VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_neighborhood_blending_vs" } },
       { CompileTimeStringHash("SMAA Neighborhood Blending PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps" } },
+#endif
+
+#if ENABLE_RCAS
+      { CompileTimeStringHash("RCAS PS"), { "Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps" } },
 #endif
 
 #if ENABLE_BLOOM

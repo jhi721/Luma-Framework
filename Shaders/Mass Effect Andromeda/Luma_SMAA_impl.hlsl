@@ -24,4 +24,8 @@ cbuffer SmaaMetricsCB : register(b1)
 // adaptation (both in SMAA_Passes.hlsl / SMAA.hlsl). main.cpp also sets SMAA_SMOOTH_U_SHAPES 0.
 #define SMAA_PREDICATION_EDGENESS           1
 #define SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION 1
+
+// SMAAEdgeDetection
+// tex0 = colorTexGamma, tex1 = predicationTex (the predication mask)
+
 #include "../Includes/SMAA_Passes.hlsl"

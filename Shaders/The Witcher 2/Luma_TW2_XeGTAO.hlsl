@@ -41,16 +41,26 @@ cbuffer LumaGTAO : register(b9)
 #define DebugViewRT         gtao_knobs.debug_view
 #define ViewportPixelSizeRT gtao_knobs.viewport_pixel_size
 
-// TW2: no normal buffer captured at this point of the frame; derive from depth (a real normal source exists later in the frame, see
-// 0x53AB3429, but not here).
-#define XE_GTAO_GENERATE_NORMALS 1
+// User configurable
+//
 
-// Anchored to the game's own HBAO radius: probed cb4[11] = (R, R^2) = (1.1835, 1.4008) view units (meters, depth p50 ~7.3);
-// 0.81 * RADIUS_MULTIPLIER 1.457 = 1.18 matches native R. RadiusOverrideRT > 0 wins.
-#define EFFECT_RADIUS 0.81
-// Hard-edge falloff (full sample weight up to the radius edge) = crisp contact AO, repo-standard for HBAO-native games.
-#define EFFECT_FALLOFF_RANGE      0.005
-#define SAMPLE_DISTRIBUTION_POWER 1.5
+#ifndef XE_GTAO_GENERATE_NORMALS
+#define XE_GTAO_GENERATE_NORMALS 1 // TW2: no normal buffer captured at this point of the frame; derive from depth (a real normal source exists later in the frame — see 0x53AB3429 — but not here)
+#endif
+
+#ifndef EFFECT_RADIUS
+#define EFFECT_RADIUS 0.81 // anchored to the game's own HBAO radius: probed cb4[11] = (R, R^2) = (1.1835, 1.4008) view units (meters — depth p50 ~7.3); 0.81 * RADIUS_MULTIPLIER 1.457 = 1.18 matches native R. RadiusOverrideRT > 0 wins.
+#endif
+
+#ifndef EFFECT_FALLOFF_RANGE
+#define EFFECT_FALLOFF_RANGE 0.005 // hard-edge falloff (full sample weight up to the radius edge) = crisp contact AO, repo-standard for HBAO-native games; Intel default 0.615 is softer
+#endif
+
+#ifndef SAMPLE_DISTRIBUTION_POWER
+#define SAMPLE_DISTRIBUTION_POWER 1.5 // Default 2.0
+#endif
+
+//
 
 // Capped at the native HBAO kernel, cb4[16].y pixels of the full size AO target: when XeGTAO works on the scene's share alone (work_share
 // < 1, see GameCBuffers.hlsl), its fewer pixels each cover more of the view and would let the radius grow by 1 / work_share (larger halos
@@ -66,22 +76,26 @@ cbuffer LumaGTAO : register(b9)
 // Transcribed from the native HBAO PS (0x3FEEC0F7): ndc = (uv.x*2-1, 1-2*uv.y), viewRay = ndc * cb4[9].zw.
 // Expressed as the XeGTAO mul/add pair over raw uv: viewPos.xy = (uv * MUL + ADD) * viewZ.
 // XeGTAO's working textures span the rendered area at any render scale (the scene's share of the AO target, or the whole target
-// from the full size depth; main.cpp), so cb4[9] (the full view's) applies as is
+// from the full size depth; main.cpp), so cb4[9] (the full view's) applies as is.
 #define NDC_TO_VIEW_MUL (float2(2.0, -2.0) * cb4[9].zw)
 #define NDC_TO_VIEW_ADD (float2(-1.0, 1.0) * cb4[9].zw)
 
-// Plain float4 (not unorm): the copy-source texture matches the game AO RT's ACTUAL format, which is rgba16_float whenever Luma's
-// swapchain-aspect r8g8b8a8 upgrade catches it (and unorm8 otherwise); float4 UAV writes are valid against both.
-#define XE_GTAO_FINAL_OUTPUT_TYPE float4
-#define XE_GTAO_ENCODE_FINAL(v)   float4(v, 0.0, 0.0, 0.0)
-
-// TW2's depth texture is ALREADY linear view-space depth (the native HBAO scales its NDC ray by the raw sample), no projection
-// unpack. DepthScaleRT only rescales the game units into the ~meter range XeGTAO's Intel-tuned constants (radius/falloff/mip
-// offsets) expect.
+// TW2's depth texture is ALREADY linear view-space depth (the native HBAO scales its NDC ray by the raw
+// sample) — no projection unpack. DepthScaleRT only rescales the game units into the ~meter range XeGTAO's
+// Intel-tuned constants (radius/falloff/mip offsets) expect.
 float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
 {
    return max(0.0, screenDepth) / max(1e-3, DepthScaleRT);
 }
 
-// tex0 = the generator's own t0 (prefilter)
+// Plain float4 (not unorm): the copy-source texture matches the game AO RT's ACTUAL format, which is
+// rgba16_float whenever Luma's swapchain-aspect r8g8b8a8 upgrade catches it (and unorm8 otherwise) —
+// float4 UAV writes are valid against both.
+#define XE_GTAO_FINAL_OUTPUT_TYPE float4
+// Vanilla generator writes (AO, viewZ, 0, 0); the downstream pack pass 0x953119B5 reads only .x from
+// this target (it re-reads depth from the depth texture), so .yzw can stay 0.
+#define XE_GTAO_ENCODE_FINAL(v) float4(v, 0.0, 0.0, 0.0)
+
+// tex0 = the hooked HBAO draw's t0, the game's half-res r32_float linear view-space depth (below native render scale the G-buffer's
+// full size linear depth instead, see the header)
 #include "../Includes/XeGTAO.hlsl"

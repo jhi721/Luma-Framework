@@ -56,12 +56,16 @@ cbuffer SmaaMetricsCB : register(b1)
 // has a DEVELOPMENT/TEST conditional, so every entry point stays byte-identical across the two define sets.
 #include "../Includes/Color.hlsl"
 
-// Edge detection: tex0 = colorTexGamma (the gamma-encoded LDR snapshot)
+// SMAAEdgeDetection
+// tex0 = colorTexGamma (the gamma-encoded LDR snapshot)
 // tex1 = predicationTex (plane-deviation edge-ness; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
-// Neighborhood blending: tex0 = colorTex, the same snapshot, decoded before its bilinear weights (the blend averages, which must
-// happen in linear light); tex1 = blendTex. Re-encode with the tonemap's own linear_to_gamma, so both sides move together if
-// DefaultGamma ever does; GCT_MIRROR brings the dither's negative half at black back out unclamped. One encode only: the RTV is
-// never an SRGB view. Alpha is 0, as the tonemap writes it, never T2x's velocity length. No HDR tail.
+
+// SMAANeighborhoodBlending
+// tex0 = colorTex, the same snapshot, decoded before its bilinear weights (the blend averages, which must happen in linear light);
+// tex1 = blendTex. Re-encode with the tonemap's own linear_to_gamma, so both sides move together if DefaultGamma ever does;
+// GCT_MIRROR brings the dither's negative half at black back out unclamped. One encode only: the RTV is never an SRGB view. Alpha
+// is 0, as the tonemap writes it, never T2x's velocity length. No HDR tail.
 #define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color = float4(linear_to_gamma(color.rgb, GCT_MIRROR), 0.0);
+
 #include "../Includes/SMAA_Passes.hlsl"

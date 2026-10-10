@@ -59,43 +59,59 @@ cbuffer LumaGTAO : register(b11)
 #include "Includes/Common.hlsl" // Game-local, before any shared include (see Includes/Common.hlsl)
 // clang-format on
 
-// The game's HBAO+ radius: NegInvR2 probed 0.000463 -> R = 46.5 UE3 units, and EFFECT_RADIUS * RADIUS_MULTIPLIER * DepthScale =
-// 0.64 * 1.457 * 50 = 46.6. RadiusOverrideRT > 0 wins.
-#define EFFECT_RADIUS 0.64
-// Hard-edged: full sample weight up to the radius edge, crisp contact AO like the native HBAO+ (0.615 / 0.95 fade softly). Pairs
-// with FinalValuePowerRT ~1.
-#define EFFECT_FALLOFF_RANGE      0.005
-#define SAMPLE_DISTRIBUTION_POWER 1.5
-// Intel's floor: disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible)
-#define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility);
+// User configurable
+//
 
-// The game's HBAO+ constants as XeGTAO's
+#ifndef EFFECT_RADIUS
+#define EFFECT_RADIUS 0.64 // anchored to the game's own HBAO+ radius: probed NegInvR2=0.000463 -> R=sqrt(1/NegInvR2)=46.5 UE3-units; chosen so the effective search (EFFECT_RADIUS * RADIUS_MULTIPLIER * DepthScale) = 0.64*1.457*50 = 46.6uu matches native R. RadiusOverrideRT > 0 wins.
+#endif
+
+#ifndef EFFECT_FALLOFF_RANGE
+#define EFFECT_FALLOFF_RANGE 0.005 // punchy hard-edge falloff: full sample weight up to the radius edge = crisp contact AO matching BL's punchy native HBAO+ (vs the soft 0.615/0.95 gradual fade). Pairs with power ~1.0
+#endif
+
+#ifndef SAMPLE_DISTRIBUTION_POWER
+#define SAMPLE_DISTRIBUTION_POWER 1.5 // Default 2.0
+#endif
+
+// BL packs the full xyz view-space normal (v*0.5+0.5) — decoded directly, no reconstruction. NORMAL_Z_SIGN
+// flips only the decoded z if the view-space handedness needs it (verify via DebugViewRT=2: smooth
+// per-surface shading = correct; flip to -1.0 if the shading looks inverted).
+#ifndef NORMAL_Z_SIGN
+#define NORMAL_Z_SIGN (1.0)
+#endif
+
 #define VIEWPORT_PIXEL_SIZE InvFullResolution
 
 // GFSDK ProjInfo is exactly the NDC->view mul/add pair (live FOV, dialogue zoom included).
-#define NDC_TO_VIEW_MUL           ProjInfo.xy
-#define NDC_TO_VIEW_ADD           ProjInfo.zw
+#define NDC_TO_VIEW_MUL ProjInfo.xy
+#define NDC_TO_VIEW_ADD ProjInfo.zw
 
-#define XE_GTAO_FINAL_OUTPUT_TYPE float2 // the game's r16g16_float final AO (apply blit reads .x)
-#define XE_GTAO_ENCODE_FINAL(v)   float2(v, 0.0)
-
-// Hardware D24 (not reversed) to view z through the game's own MinZ_MaxZRatioCS, divided by DepthScaleRT so Intel's radius and
-// falloff (~metre scale) apply: with UE3's near plane at ~10 units and far at infinity, the raw range over-occludes broadly (the mip
-// and falloff assumptions break).
+// Hardware d24 (non-reverse-Z) -> view Z via the game's own MinZ_MaxZRatioCS, then rescaled by
+// DepthScaleRT so the tuned XeGTAO constants (radius/falloff, ~meter scale) apply. UE3 near plane ~10
+// units and far -> infinity; without the rescale the huge Z range causes broad over-occlusion
+// (mips/falloff assumptions break).
 float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
 {
    float viewZ = 1.0 / max(1e-7, screenDepth * MinZ_MaxZRatioCS.z - MinZ_MaxZRatioCS.w);
    return max(0.0, viewZ) / max(1e-3, DepthScaleRT);
 }
 
-Texture2D tex1 : register(t1); // the game's ViewNormalTex (r11g11b10_float, captured at the coarse-AO dispatch)
+#define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility); // disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible but also helps with packing bent normals)
+#define XE_GTAO_FINAL_OUTPUT_TYPE                         float2                              // the game's r16g16_float final AO (apply blit reads .x)
+#define XE_GTAO_ENCODE_FINAL(v)                           float2(v, 0.0)
 
-// Decode the game's packed view-space normals: xyz in [0,1] -> [-1,1], all three channels (checked with DebugViewRT 2: smooth
-// per-surface shading, no z flip needed).
+Texture2D tex1 : register(t1);
+
 float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 {
-   return normalize(tex1.Load(int3(pixCoord, 0)).xyz * 2.0 - 1.0);
+   // tex1 = the game's ViewNormalTex (r11g11b10_float, captured at the coarse-AO dispatch)
+
+   // Decode the game's packed view-space normals: xyz in [0,1] -> [-1,1], all three channels (see NORMAL_Z_SIGN).
+   float3 n = tex1.Load(int3(pixCoord, 0)).xyz * 2.0 - 1.0;
+   n.z *= NORMAL_Z_SIGN;
+   return normalize(n);
 }
 
-// tex0 = the game's full-res scene depth for the prefilter (r24_g8, viewed r24_unorm_x8, captured at the deinterleave dispatch)
+// tex0 = the game's full-res scene depth (r24_g8, viewed r24_unorm_x8), captured at the deinterleave dispatch
 #include "../Includes/XeGTAO.hlsl"

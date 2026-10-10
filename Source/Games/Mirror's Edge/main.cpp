@@ -6,6 +6,7 @@
 #define LUMA_PATCH_BYTECODE_SYNC 1
 // SMAA ULTRA (+ RCAS) right after TdToneMapping (see "RunPostTonemapSMAA"); Core registers its 6 passes from Luma_SMAA_impl.hlsl
 #define ENABLE_SMAA 1
+#define ENABLE_RCAS 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 // Makes "original_draw_dispatch_func" non-null: the tonemap draw runs first, then SMAA on its output; the scene's draws run with the
@@ -131,9 +132,6 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_smaa_out;
    ComPtr<ID3D11RenderTargetView> tex_smaa_out_rtv;
    ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
-
-   // RCAS CB (b0) = (w, h, sharpness, 0)
-   com_ptr<ID3D11Buffer> cb_sharpen;
 
    // Predication: the tonemap's scene SRV (linear depth in .a), captured at its draw, and the R16F edge-ness built from it
    ComPtr<ID3D11ShaderResourceView> srv_scene_depth;
@@ -377,7 +375,7 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
       mv_reactive_target_srv.reset();
    }
 
-   // SMAA's own resources (predication, output temp), apart from Core's ("ReleaseSMAA"); recreated at their next use
+   // SMAA's own resources (predication, output temp), apart from Core's ("ReleaseSMAAIntermediates"); recreated at their next use
    void ReleaseSMAAScratch()
    {
       tex_pred.reset();
@@ -438,20 +436,7 @@ class MirrorsEdge final : public Game
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
 
       auto* copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-      auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("ME Sharpen PS"));
-      bool do_sharpen = g_rcas_sharpness > 0.f && copy_vs != nullptr && sharpen_ps != nullptr;
-      if (do_sharpen)
-      {
-         const float sp[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-         do_sharpen = PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_sharpen), sp, sizeof(sp));
-      }
-      const auto sharpen = [&](ID3D11ShaderResourceView* source)
-      {
-         ID3D11Buffer* scb = gd->cb_sharpen.get();
-         native_device_context->PSSetConstantBuffers(0, 1, &scb);
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-            copy_vs, sharpen_ps, source, ldr_rtv, w, h, false);
-      };
+      bool do_sharpen = g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data);
 
       const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
       const auto snapshot = [&]
@@ -477,7 +462,7 @@ class MirrorsEdge final : public Game
             return;
          if (snapshot())
          {
-            sharpen(gd->srv_input_encoded.get());
+            DrawRCAS(native_device_context, device_data, gd->srv_input_encoded.get(), ldr_rtv, g_rcas_sharpness);
          }
          return;
       }
@@ -585,7 +570,7 @@ class MirrorsEdge final : public Game
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_smaa_metrics), &metrics, sizeof(metrics)))
          return;
 
-      // Metrics at VS+PS b1
+      // Metrics at VS+PS b1, bound here rather than through "DrawSMAA()" (which restores the slot): the T2x resolve reads them too
       ID3D11Buffer* metrics_cb = gd->cb_smaa_metrics.get();
       native_device_context->VSSetConstantBuffers(1, 1, &metrics_cb);
       native_device_context->PSSetConstantBuffers(1, 1, &metrics_cb);
@@ -598,6 +583,7 @@ class MirrorsEdge final : public Game
          gd->srv_input_encoded.get() /*neighborhood blend (filtered in linear light)*/,
          gd->srv_input_encoded.get() /*edge detection (gamma)*/,
          pred_ok ? gd->srv_pred.get() : nullptr,
+         nullptr /*metrics, bound above*/,
          t2x ? &t2x_passes : nullptr);
 
       if (t2x)
@@ -617,7 +603,7 @@ class MirrorsEdge final : public Game
 
       if (do_sharpen)
       {
-         sharpen(gd->tex_smaa_out_srv.get());
+         DrawRCAS(native_device_context, device_data, gd->tex_smaa_out_srv.get(), ldr_rtv, g_rcas_sharpness);
       }
    }
 
@@ -2211,9 +2197,7 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
-      // Core registers the 6 SMAA passes; these are this game's own. RCAS after SMAA (Core "Copy VS" + DrawCustomPixelShader).
-      native_shaders_definitions.emplace(CompileTimeStringHash("ME Sharpen PS"),
-         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+      // Core registers the 6 SMAA passes and RCAS (ENABLE_RCAS); these are this game's own.
       // SMAA predication: the scene alpha's linear depth -> R16F plane-deviation edge-ness
       native_shaders_definitions.emplace(CompileTimeStringHash("ME Depth Extract CS"),
          ShaderDefinition("Luma_ME_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
@@ -2318,7 +2302,7 @@ public:
       if (cb_luma_global_settings.FrameIndex - gd.smaa_frame > IDLE_RELEASE_FRAMES)
       {
          gd.ReleaseSMAAScratch();
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       if (cb_luma_global_settings.FrameIndex - gd.snapshot_frame > IDLE_RELEASE_FRAMES)
       {

@@ -21,6 +21,7 @@
 #define SMAA_SMOOTH_U_SHAPES 0
 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
 #define ENABLE_LUMA_TAA 1
+#define ENABLE_RCAS 1
 // SMAA runs POST-final-grade via the post-draw callback, so it needs original_draw_dispatch_func non-null.
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -598,8 +599,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
 #endif
 
    // ---- SMAA (see RunPostFinalGradeSMAA) ----
-   // The one resolution every surface below is sized to, core's own DrawSMAA intermediates included: they all come
-   // from the same canvas, so a change drops the lot and the per-pointer checks rebuild it.
+   // The one resolution every surface below is sized to: they all come from the same canvas, so a change drops the
+   // lot and the per-pointer checks rebuild it.
    uint32_t scratch_w = 0, scratch_h = 0;
    // The Luma frame index the SMAA chain last ran at, and the snapshot was last used at (SMAA, or RCAS alone after the upscaler): their
    // resources go after a while without (see "OnPresent")
@@ -616,9 +617,6 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_smaa_out;
    ComPtr<ID3D11RenderTargetView> tex_smaa_out_rtv;
    ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
-   // RCAS sharpen CB (b0) = (w,h,sharpness,0) + output temp (canvas format, RTV).
-   ComPtr<ID3D11Buffer> cb_sharpen;
-   float sharpen_amount = 0.f; // the value cb_sharpen was built with; meaningful only while cb_sharpen exists
    // Full-res r32_float depth, captured at whichever comes first: the BRIGHT-PASS tonemap draw (t1) or the AO
    // pack pass (t0). tex_pred is the R16F edge-ness from the Depth Extract CS, not a depth.
    ComPtr<ID3D11ShaderResourceView> srv_scene_depth;
@@ -729,7 +727,6 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       tex_smaa_out_rtv.reset();
       tex_smaa_out_srv.reset();
       tex_smaa_out.reset();
-      cb_sharpen.reset();
    }
 
    void ReleasePredicationScratch()
@@ -2310,31 +2307,9 @@ class TheWitcher2Game final : public Game
          gd->scratch_h = h;
       }
 
-      // RCAS (Copy VS + RCAS PS, see "sharpen"), resolved first: it decides whether the last SMAA pass writes the canvas RTV
-      // directly, which removes both the copy back and the intermediate.
-      auto* sharpen_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-      auto* sharpen_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Sharpen PS"));
-      bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs != nullptr && sharpen_ps != nullptr;
-      if (do_sharpen && (!gd->cb_sharpen || gd->sharpen_amount != g_rcas_sharpness))
-      {
-         const float sharpen_params[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-         if (CreateImmutableCB(native_device, sharpen_params, sizeof(sharpen_params), std::addressof(gd->cb_sharpen)))
-         {
-            gd->sharpen_amount = g_rcas_sharpness;
-         }
-      }
-      do_sharpen = do_sharpen && gd->cb_sharpen;
-      const auto sharpen = [&](ID3D11ShaderResourceView* source)
-      {
-         DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
-         sharpen_state.Cache(native_device_context, device_data.uav_max_count);
-
-         native_device_context->PSSetConstantBuffers(0, 1, gd->cb_sharpen.get_addressof());
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-            sharpen_vs, sharpen_ps, source, canvas_rtv, w, h, false);
-
-         sharpen_state.Restore(native_device_context);
-      };
+      // RCAS, resolved first: it decides whether the last SMAA pass writes the canvas RTV directly, which removes both the copy
+      // back and the intermediate.
+      bool do_sharpen = g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data);
 
       if (!smaa && !do_sharpen)
          return;
@@ -2349,7 +2324,7 @@ class TheWitcher2Game final : public Game
       gd->snapshot_frame = cb_luma_global_settings.FrameIndex;
       if (!smaa)
       {
-         sharpen(gd->srv_input.get());
+         DrawRCAS(native_device_context, device_data, gd->srv_input.get(), canvas_rtv, g_rcas_sharpness);
          return;
       }
 
@@ -2430,26 +2405,16 @@ class TheWitcher2Game final : public Game
          pred_cs_state.Restore(native_device_context);
       }
 
-      // SMAA (3 passes). Metrics CB at VS+PS b1 (DrawSMAA restores VS/PS/SRVs/RTs, not cbuffers).
-      ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
-      native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
-      native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-      native_device_context->VSSetConstantBuffers(1, 1, gd->cb_smaa_metrics.get_addressof());
-      native_device_context->PSSetConstantBuffers(1, 1, gd->cb_smaa_metrics.get_addressof());
-
       // The last pass of the chain renders straight into the canvas RTV — no write-back copy. Reading the
       // canvas is safe because SMAA/RCAS sample the snapshot (tex_input), never the canvas itself.
       DrawSMAA(native_device, native_device_context, device_data,
          do_sharpen ? gd->tex_smaa_out_rtv.get() : canvas_rtv, gd->srv_input.get(), gd->srv_input.get(),
-         pred_ok ? gd->srv_pred.get() : nullptr /*predication signal*/);
+         pred_ok ? gd->srv_pred.get() : nullptr /*predication signal*/, gd->cb_smaa_metrics.get());
 
       if (do_sharpen)
       {
-         sharpen(gd->tex_smaa_out_srv.get());
+         DrawRCAS(native_device_context, device_data, gd->tex_smaa_out_srv.get(), canvas_rtv, g_rcas_sharpness);
       }
-
-      native_device_context->VSSetConstantBuffers(1, 1, vs_cb1_orig.get_addressof());
-      native_device_context->PSSetConstantBuffers(1, 1, ps_cb1_orig.get_addressof());
    }
 #endif // ENABLE_SMAA
 
@@ -2826,10 +2791,7 @@ public:
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
 #if ENABLE_SMAA
-      // Core auto-registers the 6 SMAA passes. Both read the GAMMA canvas snapshot; the blend decodes it to linear itself.
-      // RCAS sharpen PS (drawn via core "Copy VS" + DrawCustomPixelShader after SMAA).
-      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Sharpen PS"),
-         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+      // Core auto-registers the 6 SMAA passes (and RCAS, ENABLE_RCAS). Both read the GAMMA canvas snapshot; the blend decodes it to linear itself.
       // Depth-extract CS for SMAA predication: game r32f LINEAR view-space depth -> R16F edge-ness in [0,1].
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Depth Extract CS"),
          ShaderDefinition("Luma_TW2_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
@@ -3364,7 +3326,7 @@ public:
       // also serves RCAS alone after the upscaler, and goes once neither ran (Memory-Optimization-Checklist MEM-11).
       if (game_device_data.cb_smaa_metrics && cb_luma_global_settings.FrameIndex - game_device_data.smaa_frame > IDLE_RELEASE_FRAMES)
       {
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
          game_device_data.ReleasePredicationScratch();
          game_device_data.ReleaseSharpenScratch();
          game_device_data.cb_smaa_metrics.reset(); // the marker of this release

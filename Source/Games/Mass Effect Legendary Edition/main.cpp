@@ -16,6 +16,7 @@
 #define DISABLE_AUTO_DEBUGGER 1 // The DEVELOPMENT attach prompt is hidden by fullscreen and blocks the loader.
 
 #define ENABLE_SMAA 1  // replaces the game's compute FXAA
+#define ENABLE_RCAS 1  // optional sharpening of the SMAA output
 #define ENABLE_BLOOM 1 // fp16 pyramidal bloom replaces the game's clamped bloom
 // A third "Super Resolution" choice next to DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
 #define ENABLE_LUMA_TAA 1
@@ -687,8 +688,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // fp16 SMAA output when RCAS follows it or the post buffer has no RTV (else SMAA writes the buffer itself).
    RGBA16FTarget smaa_out;
 
-   // RCAS b0 = (width, height, sharpness, 0).
-   com_ptr<ID3D11Buffer> cb_sharpen;
    // RCAS output when the post buffer has no RTV.
    RGBA16FTarget rcas_out;
    // Luma frame index of the last SMAA, "smaa_out" and snapshot use (see "smaa_idle_release_frames")
@@ -1001,8 +1000,6 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameGTAOMainPassCS = CompileTimeStringHash("MELE XeGTAO Main Pass CS");
    static constexpr uint32_t kNameGTAODenoise1CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 1 CS");
    static constexpr uint32_t kNameGTAODenoise2CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 2 CS");
-   static constexpr uint32_t kNameCopyVS = CompileTimeStringHash("Copy VS");
-   static constexpr uint32_t kNameSharpenPS = CompileTimeStringHash("MELE Sharpen PS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
    static constexpr uint32_t kNameRenderShareStretchCS = CompileTimeStringHash("MELE Render Share Stretch CS");
    static constexpr uint32_t kNameConstantsPatchCS = CompileTimeStringHash("MELE Constants Patch CS");
@@ -2543,9 +2540,7 @@ public:
       luma_data_cbuffer_index = 12;
 
       // Core registers SMAA through ENABLE_SMAA; its neighborhood blend filters the gamma post buffer in linear light.
-      // RCAS runs afterwards through Copy VS and DrawCustomPixelShader.
-      native_shaders_definitions.emplace(kNameSharpenPS,
-         ShaderDefinition{"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
+      // Core registers RCAS through ENABLE_RCAS, and DrawRCAS draws it afterwards.
 
       // Four XeGTAO compute entries share one source; XE_GTAO_FINAL_APPLY selects the game's R8_UNORM target.
       native_shaders_definitions.emplace(kNameGTAOPrefilterCS,
@@ -3173,10 +3168,7 @@ public:
       if (w == 0 || h == 0 || color_format != DXGI_FORMAT_R16G16B16A16_FLOAT)
          return fallback;
 
-      auto* const sharpen_vs = FindShader(device_data.native_vertex_shaders, kNameCopyVS);
-      auto* const sharpen_ps = FindShader(device_data.native_pixel_shaders, kNameSharpenPS);
-      const float sharpen_constants[4] = {(float)w, (float)h, g_rcas_sharpness, 0.f};
-      const bool do_sharpen = g_rcas_sharpness > 0.f && sharpen_vs && sharpen_ps && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_sharpen), sharpen_constants, sizeof(sharpen_constants));
+      const bool do_sharpen = g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data);
       // After DLSS / FSR without RCAS: the upscaled image stays as it is
       if (!smaa && !do_sharpen)
       {
@@ -3236,38 +3228,16 @@ public:
       if (smaa)
       {
          gd->smaa_frame = cb_luma_global_settings.FrameIndex;
-         // DrawSMAA restores shaders, resources, and targets, but not cbuffer slots; save VS/PS b1 explicitly.
-         ComPtr<ID3D11Buffer> vs_cb1_orig, ps_cb1_orig;
-         native_device_context->VSGetConstantBuffers(1, 1, vs_cb1_orig.put());
-         native_device_context->PSGetConstantBuffers(1, 1, ps_cb1_orig.put());
-         ID3D11Buffer* metrics_cb = gd->cb_smaa_metrics.get();
-         native_device_context->VSSetConstantBuffers(1, 1, &metrics_cb);
-         native_device_context->PSSetConstantBuffers(1, 1, &metrics_cb);
-
          // The snapshot for both the edge detection (gamma) and the blend (filtered in linear light, Luma_SMAA_impl.hlsl)
          DrawSMAA(native_device, native_device_context, device_data,
             smaa_into_temp ? gd->smaa_out.rtv.get() : color_rtv.get(), gd->smaa_input.srv.get(), gd->smaa_input.srv.get(),
-            depth_ok ? gd->srv_depth.get() : nullptr /*predication*/);
-
-         ID3D11Buffer* vs_cb1 = vs_cb1_orig.get();
-         ID3D11Buffer* ps_cb1 = ps_cb1_orig.get();
-         native_device_context->VSSetConstantBuffers(1, 1, &vs_cb1);
-         native_device_context->PSSetConstantBuffers(1, 1, &ps_cb1);
+            depth_ok ? gd->srv_depth.get() : nullptr /*predication*/, gd->cb_smaa_metrics.get());
       }
 
       // Optional RCAS on the SMAA (or upscaled) output, into the post buffer (or a temp copied into it)
       if (do_sharpen && sharpen_target)
       {
-         // DrawCustomPixelShader does not restore state; FullGraphics also prevents RCAS b0 leaking into HUD draws.
-         DrawStateStack<DrawStateStackType::FullGraphics> sharpen_state;
-         sharpen_state.Cache(native_device_context, device_data.uav_max_count);
-
-         ID3D11Buffer* sharpen_cb = gd->cb_sharpen.get();
-         native_device_context->PSSetConstantBuffers(0, 1, &sharpen_cb);
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
-            sharpen_vs, sharpen_ps, smaa ? gd->smaa_out.srv.get() : gd->smaa_input.srv.get(), sharpen_target, w, h, false);
-
-         sharpen_state.Restore(native_device_context);
+         DrawRCAS(native_device_context, device_data, smaa ? gd->smaa_out.srv.get() : gd->smaa_input.srv.get(), sharpen_target, g_rcas_sharpness);
          if (!color_rtv)
          {
             native_device_context->CopyResource(color_res.get(), gd->rcas_out.tex.get());
@@ -3616,7 +3586,7 @@ public:
       // once RCAS stopped as well; on the render thread, between frames
       if (cb_luma_global_settings.FrameIndex - gd.smaa_frame > smaa_idle_release_frames)
       {
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       if (gd.smaa_out.tex && cb_luma_global_settings.FrameIndex - gd.smaa_out_frame > smaa_idle_release_frames)
       {

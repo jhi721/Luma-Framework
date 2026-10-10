@@ -26,12 +26,18 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)
 
-// Edge detection: tex0 = the gamma canvas snapshot, tex1 = the predication edge-ness in [0,1] (null: reads 0, with scale
-// 1.0 the plain ULTRA threshold). Neighborhood blending: tex0 = the same snapshot (see the header), tex1 = blend weights.
-#define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
-#define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 // The predication signal above is a one-sided edge-ness; morphological edge suppression in place of the local contrast
 // adaptation (both in SMAA_Passes.hlsl / SMAA.hlsl). main.cpp also sets SMAA_SMOOTH_U_SHAPES 0.
 #define SMAA_PREDICATION_EDGENESS           1
 #define SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION 1
+
+// SMAAEdgeDetection
+// tex0 = colorTexGamma (gamma-encoded graded canvas)
+// tex1 = predicationTex (edge-ness in [0,1]; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
+
+// SMAANeighborhoodBlending
+// tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex. Re-encode to the canvas' gamma.
+#define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
+#define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
+
 #include "../Includes/SMAA_Passes.hlsl"

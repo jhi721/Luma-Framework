@@ -22,8 +22,12 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PREDICATION_STRENGTH  SmaaPredication.z
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)
 
-// Edge detection: tex0 = gamma post color, tex1 = scene depth for predication. Neighborhood blending: tex0 = the same
-// color (see the header), tex1 = blend weights.
+// SMAAEdgeDetection
+// tex0 = gamma post color; tex1 = scene depth for predication.
+
+// SMAANeighborhoodBlending
+// tex0 = the same gamma post color, filtered in linear light; tex1 = blend weights. Re-encode to the buffer's gamma.
 #define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
+
 #include "../Includes/SMAA_Passes.hlsl"

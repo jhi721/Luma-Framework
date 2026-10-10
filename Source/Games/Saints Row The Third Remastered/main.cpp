@@ -1141,7 +1141,7 @@ public:
       if (game_device_data.smaa_scratch.width != 0 && cb_luma_global_settings.FrameIndex - game_device_data.smaa_scratch.last_frame > idle_release_frames)
       {
          game_device_data.smaa_scratch = {};
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       if (game_device_data.gtao_scratch.width != 0 && (!g_gtao_enable || cb_luma_global_settings.FrameIndex - game_device_data.gtao_scratch.last_frame > idle_release_frames))
       {

@@ -224,7 +224,10 @@ try {
     $OutDir = $OutDir.TrimEnd('\')
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $zipPath = Join-Path $OutDir "$zipName.zip"
-    Compress-Archive -Path "$tempDir\*" -DestinationPath $zipPath -Force
+    # Same archive as "Compress-Archive", just faster
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    [IO.Compression.ZipFile]::CreateFromDirectory($tempDir, $zipPath)
     Write-Host "Packaged: $zipPath"
 
     # The Linux zip only swaps the dgVoodoo files, so it updates a copy instead of compressing everything (DLSS's

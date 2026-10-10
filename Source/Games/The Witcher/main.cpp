@@ -978,19 +978,8 @@ class TheWitcherGame final : public Game
       }
 #endif
 
-      // Metrics at VS and PS b1 (DrawSMAA restores the shaders, views and targets, not the constant buffers)
-      com_ptr<ID3D11Buffer> vs_buffer, ps_buffer;
-      native_device_context->VSGetConstantBuffers(1, 1, &vs_buffer);
-      native_device_context->PSGetConstantBuffers(1, 1, &ps_buffer);
-      ID3D11Buffer* const metrics_buffer = gd.smaa_metrics_buffer.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &metrics_buffer);
-      native_device_context->PSSetConstantBuffers(1, 1, &metrics_buffer);
       // Writing the scene is safe: the chain samples the snapshot, never the scene itself
-      DrawSMAA(native_device, native_device_context, device_data, gd.mv_scene_rtv.get(), gd.smaa_input_srv.get(), gd.smaa_input_srv.get(), predication ? gd.smaa_predication_srv.get() : nullptr);
-      ID3D11Buffer* const vs_restore = vs_buffer.get();
-      ID3D11Buffer* const ps_restore = ps_buffer.get();
-      native_device_context->VSSetConstantBuffers(1, 1, &vs_restore);
-      native_device_context->PSSetConstantBuffers(1, 1, &ps_restore);
+      DrawSMAA(native_device, native_device_context, device_data, gd.mv_scene_rtv.get(), gd.smaa_input_srv.get(), gd.smaa_input_srv.get(), predication ? gd.smaa_predication_srv.get() : nullptr, gd.smaa_metrics_buffer.get());
       return true;
    }
 
@@ -1340,7 +1329,7 @@ public:
       if (gd.smaa_idle_frames++ == smaa_idle_release_frames)
       {
          gd.ReleaseSMAAScratch();
-         ReleaseSMAA(device_data);
+         ReleaseSMAAIntermediates(device_data);
       }
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when
       // an upscaler is picked again (the helper takes seconds to start).
