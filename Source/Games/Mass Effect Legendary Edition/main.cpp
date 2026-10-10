@@ -8,7 +8,7 @@
 // Sub-native borderless is best-effort: the game allocates desktop-sized targets but renders a top-left
 // sub-rectangle through cb2 DynamicScale, so injected in-place passes process the full allocation.
 //
-// DLSS / FSR 3: the engine's velocity target is unusable (RGBA8, one velocity per object, the player only), so motion
+// DLSS / FSR 3 / Luma TAA: the engine's velocity target is unusable (RGBA8, one velocity per object, the player only), so motion
 // vectors and jitter come from patched shaders (MotionVectorPatches.h, Borderlands GOTY Enhanced's method): every scene draw's
 // vertex shader runs a second time on its previous frame constants. The upscaler runs at the scene's first post pass; SMAA
 // then steps aside (RCAS stays).
@@ -17,6 +17,8 @@
 
 #define ENABLE_SMAA 1  // replaces the game's compute FXAA
 #define ENABLE_BLOOM 1 // fp16 pyramidal bloom replaces the game's clamped bloom
+// A third "Super Resolution" choice next to DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
+#define ENABLE_LUMA_TAA 1
 // The motion vector and jitter draws wrap the game's own draws, so they need "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -3699,7 +3701,7 @@ public:
                std::string aa = g_smaa_enable ? "SMAA" : "None";
                if (IsSRActive(device_data))
                {
-                  aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
+                  aa = device_data.sr_type != SR::Type::DLSS ? SR::GetTypeName(device_data.sr_type) : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
                }
                // In "PerfColumn" order
                const Perf::Sweep<PERF_COLUMN_COUNT>::Row row = {stats.frame.Average(), stats.scene.Average(), stats.sr.Average(), window.HookMs(), stats.fill.Average()};
@@ -3880,7 +3882,7 @@ public:
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
-            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR.");
+            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.");
          }
          if (DrawResetButton<float, false>(EngineScale::g_render_scale, 1.f, "RenderScale"))
          {
@@ -3897,7 +3899,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR).");
+         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR or Luma TAA).");
       }
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
@@ -3908,7 +3910,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Sharpening applied on top of SMAA or DLSS/FSR (0 = off; requires AA enabled in the game's video settings).");
+         ImGui::SetTooltip("Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off; requires AA enabled in the game's video settings).");
       }
       ImGui::EndDisabled();
 
