@@ -1244,7 +1244,6 @@ public:
                   "\n\nThird Party:"
                   "\nReShade"
                   "\nImGui"
-                  "\nRenoDX (HDR tonemap method)"
                   "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
