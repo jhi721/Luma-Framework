@@ -75,13 +75,15 @@ namespace PatchedDraws
       bound->game.reset();
    }
 
-   // A dynamic constant buffer holding "data", (re)created at its size
-   inline bool WriteDynamicConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, com_ptr<ID3D11Buffer>* buffer, const void* data, UINT size)
+   // A dynamic constant buffer holding "data", (re)created at its size; "copy_size" (non zero): only that much of it is written, the
+   // buffer only grows (uploads of varying size to one slot)
+   inline bool WriteDynamicConstants(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, com_ptr<ID3D11Buffer>* buffer, const void* data, UINT size, UINT copy_size = 0)
    {
       D3D11_BUFFER_DESC desc = {};
       if (*buffer)
          (*buffer)->GetDesc(&desc);
-      if (desc.ByteWidth != size)
+      // A trimmed upload ("copy_size") reuses any buffer big enough
+      if (desc.ByteWidth < size || (copy_size == 0 && desc.ByteWidth != size))
       {
          buffer->reset();
          desc = {size, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE};
@@ -90,7 +92,7 @@ namespace PatchedDraws
       D3D11_MAPPED_SUBRESOURCE mapped;
       if (!*buffer || FAILED(native_device_context->Map(buffer->get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
          return false;
-      std::memcpy(mapped.pData, data, size);
+      std::memcpy(mapped.pData, data, copy_size == 0 ? size : copy_size);
       native_device_context->Unmap(buffer->get(), 0);
       return true;
    }
@@ -175,11 +177,14 @@ namespace PatchedDraws
                return;
             }
          }
+         // Uploads of one slot vary in size (a whole copy, a trimmed one): its buffer only grows, and takes only what the shader reads
          buffers.resize(count);
          for (size_t i = 0; i < count; i++)
          {
-            if (uploads[i] && WriteDynamicConstants(native_device, native_device_context, std::addressof(buffers[i]), uploads[i]->data(), UINT(uploads[i]->size())))
+            if (uploads[i] && bytes[i] != 0 && WriteDynamicConstants(native_device, native_device_context, std::addressof(buffers[i]), uploads[i]->data(), sizes[i], bytes[i]))
+            {
                buffers_to_bind[i] = buffers[i].get();
+            }
             native_device_context->VSSetConstantBuffers(slots[i].second, 1, &buffers_to_bind[i]);
          }
       }
@@ -270,7 +275,10 @@ namespace PatchedDraws
    // global blend state and only per-target write masks (D3DRS_COLORWRITEENABLE1/2/3), so the game never asked for it and that target
    // is corrupted. RT0's blend goes to the game's other targets, their write masks stay (legal per target in D3D9). An unbound
    // target's blend does nothing, so repairing every state equals repairing the bound targets of each draw.
-   template <uint32_t target_slot, uint32_t reactive_slot = UINT32_MAX, bool repair_per_target_blend = false>
+   // "blend_alpha_blended_target": a state alpha blending RT0 (SRC_ALPHA / INV_SRC_ALPHA, add) blends the motion vector target the same
+   // way, by the alpha the patched pixel shader writes there ("PatchPixelShaderReactive"'s "motion_vectors"); every draw with such a
+   // state and that target bound must then write it.
+   template <uint32_t target_slot, uint32_t reactive_slot = UINT32_MAX, bool repair_per_target_blend = false, bool blend_alpha_blended_target = false>
    bool OnCreateBlendState(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
    {
       for (uint32_t i = 0; i < subobject_count; i++)
@@ -295,8 +303,17 @@ namespace PatchedDraws
                desc.logic_op[rt] = desc.logic_op[0];
             }
          }
-         desc.blend_enable[target_slot] = false;
+         using reshade::api::blend_factor;
+         const bool alpha_blended = blend_alpha_blended_target && desc.blend_enable[0] && desc.source_color_blend_factor[0] == blend_factor::source_alpha &&
+                                    desc.dest_color_blend_factor[0] == blend_factor::one_minus_source_alpha && desc.color_blend_op[0] == reshade::api::blend_op::add;
+         desc.blend_enable[target_slot] = alpha_blended;
          desc.render_target_write_mask[target_slot] = 0xF;
+         if (alpha_blended)
+         {
+            desc.source_color_blend_factor[target_slot] = desc.source_alpha_blend_factor[target_slot] = blend_factor::source_alpha;
+            desc.dest_color_blend_factor[target_slot] = desc.dest_alpha_blend_factor[target_slot] = blend_factor::one_minus_source_alpha;
+            desc.color_blend_op[target_slot] = desc.alpha_blend_op[target_slot] = reshade::api::blend_op::add;
+         }
          if constexpr (reactive_slot != UINT32_MAX)
          {
             desc.blend_enable[reactive_slot] = true;

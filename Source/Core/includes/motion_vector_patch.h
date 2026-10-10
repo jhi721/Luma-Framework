@@ -331,6 +331,75 @@ namespace MotionVectorPatch
       return true;
    }
 
+   // The pixel shader motion vector pieces both patches below add: the two position inputs (declared after the last input, or before
+   // the first output), the delta written to "target_slot".xy and their signature entries.
+
+   // The declaration the position inputs go after, "first_body" (refused) without an output declaration, or one that comes first
+   inline size_t FindMotionVectorInputsPosition(const std::vector<Instruction>& instructions, size_t first_body)
+   {
+      const size_t first_output = size_t(std::ranges::find_if(instructions.begin(), instructions.begin() + first_body, [](const Instruction& instruction)
+                                            { return instruction.opcode == D3D10_SB_OPCODE_DCL_OUTPUT; }) -
+                                         instructions.begin());
+      if (first_output == first_body || first_output == 0)
+         return first_body;
+      const size_t last_input = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_INPUT_PS, D3D10_SB_OPCODE_DCL_INPUT_PS_SGV, D3D10_SB_OPCODE_DCL_INPUT_PS_SIV});
+      return (last_input != first_body ? last_input : (first_output - 1));
+   }
+
+   inline void AppendMotionVectorInputDeclarations(std::vector<uint32_t>* tokens, const Layout& layout)
+   {
+      for (const uint32_t reg : {layout.current_position_register, layout.previous_position_register})
+         tokens->insert(tokens->end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_INPUT_PS) | ENCODE_D3D10_SB_INPUT_INTERPOLATION_MODE(D3D10_SB_INTERPOLATION_LINEAR) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_INPUT, mask_xyw), reg});
+   }
+
+   // In UV space, into "target_slot".xy: (previous.xy / previous.w - current.xy / current.w) * (0.5, -0.5), through two temps
+   inline void AppendMotionVector(std::vector<uint32_t>* tokens, const Layout& layout, uint32_t current, uint32_t previous)
+   {
+      constexpr uint32_t div = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DIV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7);
+      tokens->insert(tokens->end(), {
+                                       div,
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy),
+                                       current,
+                                       Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 1, 0, 0),
+                                       layout.current_position_register,
+                                       Source(D3D10_SB_OPERAND_TYPE_INPUT, 3, 3, 3, 3),
+                                       layout.current_position_register,
+                                       div,
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy),
+                                       previous,
+                                       Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 1, 0, 0),
+                                       layout.previous_position_register,
+                                       Source(D3D10_SB_OPERAND_TYPE_INPUT, 3, 3, 3, 3),
+                                       layout.previous_position_register,
+                                       ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_ADD) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8),
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy),
+                                       current,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0),
+                                       previous,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0) | ENCODE_D3D10_SB_OPERAND_EXTENDED(true),
+                                       ENCODE_D3D10_SB_EXTENDED_OPERAND_MODIFIER(D3D10_SB_OPERAND_MODIFIER_NEG),
+                                       current,
+                                       ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(10),
+                                       Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy),
+                                       layout.target_slot,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0),
+                                       current,
+                                       ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32),
+                                       std::bit_cast<uint32_t>(0.5f),
+                                       std::bit_cast<uint32_t>(-0.5f),
+                                       0,
+                                       0,
+                                    });
+   }
+
+   // Signature masks are plain component bits (x = 1), unlike the operand token masks
+   inline void AddMotionVectorInputSignature(PixelShader* shader, const Layout& layout)
+   {
+      shader->inputs.push_back({.name = semantic_name, .semantic_index = 0, .system_value = 0, .component_type = 3, .reg = layout.current_position_register, .mask = 0xF, .rw_mask = 0xB});
+      shader->inputs.push_back({.name = semantic_name, .semantic_index = 1, .system_value = 0, .component_type = 3, .reg = layout.previous_position_register, .mask = 0xF, .rw_mask = 0xB});
+      shader->input_signature->data = WriteSignature(shader->inputs);
+   }
+
    // The pixel shader with the motion vector target, or empty if unpatchable. "targets_only": see "ReadPixelShader" (a target
    // declared after oDepth stays after it otherwise).
    inline std::vector<uint8_t> PatchPixelShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error, bool targets_only = false)
@@ -343,14 +412,9 @@ namespace MotionVectorPatch
       const size_t first_body = shader.first_body;
 
       // The two inputs after the last input (or before the outputs), the target after the last output
-      const size_t first_output = size_t(std::ranges::find_if(instructions.begin(), instructions.begin() + first_body, [](const Instruction& instruction)
-                                            { return instruction.opcode == D3D10_SB_OPCODE_DCL_OUTPUT; }) -
-                                         instructions.begin());
-      if (first_output == first_body || first_output == 0)
-         return (*error = "no outputs", std::vector<uint8_t>());
-      size_t last_input = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_INPUT_PS, D3D10_SB_OPCODE_DCL_INPUT_PS_SGV, D3D10_SB_OPCODE_DCL_INPUT_PS_SIV});
+      const size_t last_input = FindMotionVectorInputsPosition(instructions, first_body);
       if (last_input == first_body)
-         last_input = first_output - 1;
+         return (*error = "no outputs", std::vector<uint8_t>());
       // After the last color target (a depth output, oDepth, stays after it)
       size_t last_output = first_body;
       for (size_t i = 0; i < first_body; i++)
@@ -364,33 +428,22 @@ namespace MotionVectorPatch
             std::vector<uint32_t> added;
             if (i == last_input)
             {
-               for (const uint32_t reg : {layout.current_position_register, layout.previous_position_register})
-                  added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_INPUT_PS) | ENCODE_D3D10_SB_INPUT_INTERPOLATION_MODE(D3D10_SB_INTERPOLATION_LINEAR) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_INPUT, mask_xyw), reg});
+               AppendMotionVectorInputDeclarations(&added, layout);
             }
             if (i == last_output)
+            {
                added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), layout.target_slot});
+            }
             return added; });
 
-      // Before the final ret, in UV space: (previous.xy / previous.w - current.xy / current.w) * (0.5, -0.5)
-      const uint32_t current = temp;
-      const uint32_t previous = temp + 1;
-      constexpr uint32_t div = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DIV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7);
-      const std::vector<uint32_t> motion_vector = {
-         div, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), current, Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 1, 0, 0), layout.current_position_register, Source(D3D10_SB_OPERAND_TYPE_INPUT, 3, 3, 3, 3), layout.current_position_register,
-         div, Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), previous, Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 1, 0, 0), layout.previous_position_register, Source(D3D10_SB_OPERAND_TYPE_INPUT, 3, 3, 3, 3), layout.previous_position_register,
-         ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_ADD) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8), Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy), current, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0), previous, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0) | ENCODE_D3D10_SB_OPERAND_EXTENDED(true), ENCODE_D3D10_SB_EXTENDED_OPERAND_MODIFIER(D3D10_SB_OPERAND_MODIFIER_NEG), current,
-         ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(10), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), layout.target_slot, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0), current,
-         ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32), std::bit_cast<uint32_t>(0.5f), std::bit_cast<uint32_t>(-0.5f), 0, 0};
+      // Before the final ret
       const size_t last = instructions.back().begin;
       declarations.insert(declarations.end(), tokens.begin() + instructions[first_body].begin, tokens.begin() + last);
-      declarations.insert(declarations.end(), motion_vector.begin(), motion_vector.end());
+      AppendMotionVector(&declarations, layout, temp, temp + 1);
       declarations.insert(declarations.end(), tokens.begin() + last, tokens.end());
       WriteProgram(&declarations, shader.program);
 
-      // Signature masks are plain component bits (x = 1), unlike the operand token masks above
-      shader.inputs.push_back({semantic_name, 0, 0, 3, layout.current_position_register, 0xF, 0xB});
-      shader.inputs.push_back({semantic_name, 1, 0, 3, layout.previous_position_register, 0xF, 0xB});
-      shader.input_signature->data = WriteSignature(shader.inputs);
+      AddMotionVectorInputSignature(&shader, layout);
       SignatureElement output = shader.target;
       output.semantic_index = layout.target_slot;
       output.reg = layout.target_slot;
@@ -407,28 +460,60 @@ namespace MotionVectorPatch
    // x / (1 + x) so HDR stays within 0-1) and y = 0 (an unwritten component is undefined; the max blend keeps what another draw
    // wrote), else (blended INV_SRC_ALPHA) x and y = a, reactivity (thresholded by the fill: water, fountains) and transparency &
    // composition (faint glass and haze). Empty if unpatchable.
-   inline std::vector<uint8_t> PatchPixelShaderReactive(const uint8_t* code, size_t size, const Layout& layout, uint32_t reactive_slot, bool additive, std::string* error)
+   // "ALPHA_MOTION_VECTORS" (blended INV_SRC_ALPHA, the vertex shader patched too): the draw also writes its motion vector to
+   // "target_slot" with its alpha in w, for a blend state that blends that target like the color ("OnCreateBlendState"'s
+   // "blend_alpha_blended_target"): opaque texels (a chain link fence's wires, Mirror's Edge) move with the draw and keep their history,
+   // empty ones keep what's behind. No mask ("reactive_slot" ignored): FSR's masks are for content without motion vectors.
+   enum class ReactiveMode : uint8_t
+   {
+      ALPHA,
+      ADDITIVE,
+      ALPHA_MOTION_VECTORS,
+   };
+
+   inline std::vector<uint8_t> PatchPixelShaderReactive(const uint8_t* code, size_t size, const Layout& layout, uint32_t reactive_slot, ReactiveMode mode, std::string* error)
    {
       PixelShader shader;
       if (!ReadPixelShader(code, size, layout, &shader, error, /* targets_only */ true))
          return {};
       auto& [chunks, program, input_signature, output_signature, inputs, outputs, target, tokens, instructions, first_body] = shader;
-      if (outputs.size() != 1)
+      const bool additive = mode == ReactiveMode::ADDITIVE;
+      const bool motion_vectors = mode == ReactiveMode::ALPHA_MOTION_VECTORS;
+      const bool mask = !motion_vectors && reactive_slot != UINT32_MAX;
+      if (outputs.size() != 1 || (!mask && !motion_vectors))
          return (*error = "targets", std::vector<uint8_t>());
       const size_t last_output = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_OUTPUT});
       if (last_output == first_body)
          return (*error = "no outputs", std::vector<uint8_t>());
+      const size_t last_input = FindMotionVectorInputsPosition(instructions, first_body);
+      if (motion_vectors && last_input == first_body)
+         return (*error = "no input position", std::vector<uint8_t>());
       uint32_t temp;
-      std::vector<uint32_t> declarations = CopyDeclarations(tokens, instructions, first_body, 2, &temp, [&](size_t i)
+      // The motion vectors take a third temp: Mass Effect 2007's and Borderlands 2's masks stay as they were
+      std::vector<uint32_t> declarations = CopyDeclarations(tokens, instructions, first_body, motion_vectors ? 3 : 2, &temp, [&](size_t i)
          {
             std::vector<uint32_t> added;
+            if (motion_vectors && i == last_input)
+            {
+               AppendMotionVectorInputDeclarations(&added, layout);
+            }
             if (i == last_output)
-               added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), reactive_slot});
+            {
+               if (motion_vectors)
+               {
+                  added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL), layout.target_slot});
+               }
+               if (mask)
+               {
+                  added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), reactive_slot});
+               }
+            }
             return added; });
 
       // The body with the target retyped to the color temp (outputs are only ever destinations)
       const uint32_t color = temp;
       const uint32_t scratch = temp + 1;
+      const uint32_t previous_position_temp = temp + 2; // The motion vector's second temp ("AppendMotionVector")
       for (size_t i = first_body; i + 1 < instructions.size(); i++)
       {
          const Instruction& instruction = instructions[i];
@@ -511,6 +596,27 @@ namespace MotionVectorPatch
                                             color,
                                          });
       }
+      else if (motion_vectors)
+      {
+         // The motion vector (as "PatchPixelShader"), then w = saturate(a) for the target's blend (z = 0: an unwritten component is
+         // undefined)
+         AppendMotionVector(&reactive, layout, scratch, previous_position_temp);
+         reactive.insert(reactive.end(), {
+                                            ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8),
+                                            Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_Z),
+                                            layout.target_slot,
+                                            immediate,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            mov | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true),
+                                            Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_W),
+                                            layout.target_slot,
+                                            Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3),
+                                            color,
+                                         });
+      }
       else
       {
          reactive.insert(reactive.end(), {mov | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), reactive_slot, Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3), color});
@@ -519,13 +625,24 @@ namespace MotionVectorPatch
       declarations.insert(declarations.end(), tokens.begin() + instructions.back().begin, tokens.end());
       WriteProgram(&declarations, program);
 
-      // A target like the game's (signature masks are plain component bits, x = 1, unlike operand token masks)
+      // Targets like the game's (signature masks are plain component bits, x = 1, unlike operand token masks)
       SignatureElement output = target;
-      output.semantic_index = reactive_slot;
-      output.reg = reactive_slot;
-      output.mask = 0x3;
       output.rw_mask = 0;
-      outputs.push_back(output);
+      if (motion_vectors)
+      {
+         AddMotionVectorInputSignature(&shader, layout);
+         output.semantic_index = layout.target_slot;
+         output.reg = layout.target_slot;
+         output.mask = 0xF;
+         outputs.push_back(output);
+      }
+      if (mask)
+      {
+         output.semantic_index = reactive_slot;
+         output.reg = reactive_slot;
+         output.mask = 0x3;
+         outputs.push_back(output);
+      }
       output_signature->data = WriteSignature(outputs);
       return WriteChunks(chunks);
    }

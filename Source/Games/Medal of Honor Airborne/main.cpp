@@ -817,7 +817,7 @@ class MedalOfHonorAirborne final : public Game
             }
             else if (reactive != 0)
             {
-               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot, reactive == 2, &error);
+               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot, reactive == 2 ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA, &error);
             }
             else
             {

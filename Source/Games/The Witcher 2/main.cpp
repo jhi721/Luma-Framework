@@ -1211,7 +1211,7 @@ class TheWitcher2Game final : public Game
             }
             else if (reactive != ReactiveBlend::NONE)
             {
-               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot, reactive == ReactiveBlend::ADDITIVE, &error);
+               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot, reactive == ReactiveBlend::ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA, &error);
             }
             else
             {

@@ -1270,7 +1270,7 @@ class MassEffect final : public Game
             }
             else if (reactive != 0)
                patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout,
-                  MotionVectorPatches::reactive_slot, reactive == 2, &error);
+                  MotionVectorPatches::reactive_slot, reactive == 2 ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA, &error);
             else
                patched = MotionVectorPatch::PatchPixelShader(code, desc->code_size, MotionVectorPatches::layout, &error, /* targets_only */ true);
          }
