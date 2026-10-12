@@ -116,6 +116,35 @@
 #ifndef TAA_UPSCALE_SIGMA
 #define TAA_UPSCALE_SIGMA 0.5
 #endif
+// Sparse sampling (AMD FSR 2/3 upscaler ideas): from an upscale ratio of "TAA_UPSCALE_SPARSE_FULL" (faded in from
+// "TAA_UPSCALE_SPARSE_START"), an output pixel gets its own sample too rarely for the box splat and the per sample cap:
+// - each render sample of the 3x3 is weighted by a Lanczos 2 of its distance in output pixels (times
+//   "TAA_UPSCALE_LANCZOS_SCALE", narrower below 2x), normalized by the kernel's integral (0.74) so a frame weighs as much
+//   as the box splat on average, and clamped to the neighborhood box (deringing);
+// - static pixels keep a history cap per output pixel instead of per sample, and their clip box is scaled by
+//   "TAA_UPSCALE_STATIC_BOX" around its center (not where the flickering analysis saw the lighting change), both
+//   returning to the moving behavior at "TAA_UPSCALE_STATIC_SPEED" output pixels per frame.
+// Lab: 2x and 3x better box and FLIP scores on the training and validation scenes, 1-2% worse on stress; at 1.5x the box
+// score got worse (more flicker), so it's left out there. Low quality keeps the box splat (worse FLIP without the
+// flickering analysis and lock).
+#ifndef TAA_UPSCALE_SPARSE
+#define TAA_UPSCALE_SPARSE (TAA_QUALITY >= 1)
+#endif
+#ifndef TAA_UPSCALE_SPARSE_START
+#define TAA_UPSCALE_SPARSE_START 1.5
+#endif
+#ifndef TAA_UPSCALE_SPARSE_FULL
+#define TAA_UPSCALE_SPARSE_FULL 2.0
+#endif
+#ifndef TAA_UPSCALE_LANCZOS_SCALE
+#define TAA_UPSCALE_LANCZOS_SCALE 1.25
+#endif
+#ifndef TAA_UPSCALE_STATIC_BOX
+#define TAA_UPSCALE_STATIC_BOX 3.0
+#endif
+#ifndef TAA_UPSCALE_STATIC_SPEED
+#define TAA_UPSCALE_STATIC_SPEED 1.0
+#endif
 // History at 2x2 the render resolution (UE TSR's "r.TSR.History.ScreenPercentage" 200), from High quality: repeated
 // reprojection blurs it far less. Each thread resolves its pixel's 4 history texels and outputs their mean. A texel
 // takes this frame's sample only when it fell in its quarter pixel. This is a box splat, so the mean of the 4 texels
@@ -126,10 +155,10 @@
 #ifndef TAA_HISTORY_2X
 #define TAA_HISTORY_2X (TAA_QUALITY >= 2 && !TAA_UPSCALE)
 #endif
-// Bicubic history sharpness c (Catmull-Rom is 0.5). The 2x history and TAAU resample at a higher frequency, where 0.4
-// rings less and measured better in the lab.
+// Bicubic history sharpness c (Catmull-Rom is 0.5). The 2x history resamples at a higher frequency, where 0.4 rings less
+// and measured better in the lab; TAAU measured better at 0.5.
 #ifndef TAA_HISTORY_SHARPNESS
-#if TAA_HISTORY_2X || TAA_UPSCALE
+#if TAA_HISTORY_2X
 #define TAA_HISTORY_SHARPNESS 0.4
 #else
 #define TAA_HISTORY_SHARPNESS 0.5
@@ -514,6 +543,8 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    const bool has_previous_state = !state_offscreen && !(Flags & TAA_FLAG_RESET);
    const int2 previous_pixel = int2(floor(state_history_position));
 
+   // Without the flickering analysis there's no lighting change test, so TAAU doesn't widen the static clip box
+   bool lighting_changed_or_new = !TAA_FLICKER;
 #if TAA_FLICKER
    {
       // The state is R11G11B10_FLOAT, half the bytes of RGBA16F. It's unsigned with ~1.5% precision, which the range and
@@ -526,6 +557,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
       const bool has_state = previous_state.z > 0.0;
       const float lighting_tolerance = TAA_FLICKER_RESET_CHANGE * max(max(abs(min_luminance), abs(previous_state.z)), 1e-4);
       const bool lighting_changed = TAA_FLICKER_RESET_CHANGE > 0.0 && abs(min_luminance - previous_state.z) > lighting_tolerance;
+      lighting_changed_or_new = lighting_changed || !has_state;
       const bool moved = previous_state.x > previous_state.y;
       float range_min = current_luminance;
       float range_max = current_luminance;
@@ -599,9 +631,20 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 
 #if TAA_UPSCALE
    const float cap_fraction = min(ResamplingBlurCap(motion * render_scale, TAA_UPSCALE_BLUR_TOLERANCE), max_history_weight);
-   const float cap_samples = cap_fraction / (1.0 - cap_fraction) / (render_scale.x * render_scale.y);
+   const float sparse = TAA_UPSCALE_SPARSE * saturate((render_scale.x - TAA_UPSCALE_SPARSE_START) / (TAA_UPSCALE_SPARSE_FULL - TAA_UPSCALE_SPARSE_START));
+   const float moving = saturate(length(motion * render_scale) / TAA_UPSCALE_STATIC_SPEED);
+   const float sample_rate = render_scale.x * render_scale.y;
+   const float cap_samples = cap_fraction / (1.0 - cap_fraction) / pow(abs(sample_rate), lerp(1.0, moving, sparse));
    const float4 history_sample = SampleHistory(state_history_position, InvOutputResolution);
-   const float3 history = (locked ? history_sample.rgb : ClipToBox(history_sample.rgb, clip_target, box_min, box_max));
+   const bool keep_box = lighting_changed_or_new || reactive > 0.0;
+   const float static_box_scale = (keep_box ? 1.0 : lerp(lerp(1.0, TAA_UPSCALE_STATIC_BOX, sparse), 1.0, moving));
+   const float3 box_center = 0.5 * (box_min + box_max);
+   const float3 history_box_min = box_center - (box_center - box_min) * static_box_scale;
+   const float3 history_box_max = box_center + (box_max - box_center) * static_box_scale;
+   const float3 history = (locked ? history_sample.rgb : ClipToBox(history_sample.rgb, clip_target, history_box_min, history_box_max));
+   const float lanczos_scale = TAA_UPSCALE_LANCZOS_SCALE * max(2.0 / render_scale.x, 1.0);
+   float3 lanczos_sum = 0.0;
+   float lanczos_weight = 0.0;
    float3 current_sum = 0.0;
    float current_weight = 0.0;
    float3 gauss_sum = 0.0;
@@ -614,13 +657,24 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
       const float box_weight = (all(abs(offset) < 0.5) ? 1.0 : 0.0);
       current_sum += neighborhood[n] * box_weight;
       current_weight += box_weight;
+      const float pi_x = PI * max(length(offset) * lanczos_scale, 1e-4);
+      const float lanczos = ((pi_x < 2.0 * PI) ? (sin(pi_x) * sin(0.5 * pi_x) / (0.5 * pi_x * pi_x)) : 0.0);
+      lanczos_sum += neighborhood[n] * lanczos;
+      lanczos_weight += lanczos;
       const float gauss = exp(-0.5 * dot(offset, offset) / (TAA_UPSCALE_SIGMA * TAA_UPSCALE_SIGMA));
       gauss_sum += neighborhood[n] * gauss;
       gauss_weight += gauss;
       gauss_max = max(gauss_max, gauss);
    }
-   const float3 current_output = ((current_weight > 0.0) ? (current_sum / current_weight) : (gauss_sum / gauss_weight));
-   const float sample_weight = ((current_weight > 0.0) ? min(current_weight, 1.0) : (TAA_UPSCALE_FALLBACK_WEIGHT * gauss_max));
+   const float3 fallback_output = gauss_sum / gauss_weight;
+   const float fallback_weight = TAA_UPSCALE_FALLBACK_WEIGHT * gauss_max;
+   const float3 box_output = ((current_weight > 0.0) ? (current_sum / current_weight) : fallback_output);
+   const float box_sample_weight = ((current_weight > 0.0) ? min(current_weight, 1.0) : fallback_weight);
+   const bool has_lanczos = lanczos_weight > 1e-3;
+   const float3 lanczos_output = (has_lanczos ? clamp(lanczos_sum / lanczos_weight, box_min, box_max) : fallback_output);
+   const float lanczos_sample_weight = (has_lanczos ? (lanczos_weight * lanczos_scale * lanczos_scale / 0.7395) : fallback_weight);
+   const float3 current_output = lerp(box_output, lanczos_output, sparse);
+   const float sample_weight = lerp(box_sample_weight, lanczos_sample_weight, sparse);
    const float history_samples = min(history_sample.a / max(1.0 - history_sample.a, 1e-4), cap_samples);
    const float history_validity = (has_previous_state ? depth_clip : 0.0);
    const float history_weight_output = history_samples * history_validity;
