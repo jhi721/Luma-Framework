@@ -1004,6 +1004,15 @@ public:
             install(addresses.jitter, reinterpret_cast<void*>(&JitterDetour), reinterpret_cast<void**>(&jitter_original));
             install(addresses.frame_params, reinterpret_cast<void*>(&FrameParamsDetour), reinterpret_cast<void**>(&frame_params_original));
             install(addresses.save_entry_is_file, reinterpret_cast<void*>(&SaveEntryIsFileDetour), reinterpret_cast<void**>(&save_entry_is_file_original));
+
+            // The object velocity pass skips far, small or slow objects (its per object score, 0x190AD20, fades them out for the motion
+            // blur), so they have no motion vectors: zero the two distance terms of the score (mulss xmm1, 0.004 and mulss xmm0, 0.1
+            // -> xorps, nop), which keeps every moving object at full weight
+            auto* const base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+            constexpr uint8_t zero_xmm1[] = {0x0F, 0x57, 0xC9, 0x0F, 0x1F, 0x44, 0x00, 0x00};
+            constexpr uint8_t zero_xmm0[] = {0x0F, 0x57, 0xC0, 0x0F, 0x1F, 0x44, 0x00, 0x00};
+            System::PatchMemory(base + 0x190BA30, zero_xmm1, sizeof(zero_xmm1));
+            System::PatchMemory(base + 0x190BA63, zero_xmm0, sizeof(zero_xmm0));
          }
          if (!jitter_original || !frame_params_original)
          {
