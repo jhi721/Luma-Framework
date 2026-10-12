@@ -20,7 +20,7 @@ struct LumaGameSettings
    float Exposure;               // Scene multiplier, 1 = vanilla
    float Contrast;               // HDR, 1 = vanilla
    float Saturation;             // HDR, 1 = vanilla
-   float HighlightsDesaturation; // HDR (DICE), 0 = off
+   float HighlightsDesaturation; // HDR (PsychoV "dechroma"), 0 = off
    float VideoAutoHDREnable;     // 0/1
    float VideoAutoHDRBoost;      // 0 = SDR peak, 1 = full AutoHDR peak
 };

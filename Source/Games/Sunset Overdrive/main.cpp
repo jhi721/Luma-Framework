@@ -1240,7 +1240,7 @@ public:
                   "\n\nThird Party:"
                   "\nReShade"
                   "\nImGui"
-                  "\nDICE (HDR tonemapper)"
+                  "\nRenoDX (HDR tonemap method)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)");

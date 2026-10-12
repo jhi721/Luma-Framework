@@ -8,8 +8,8 @@
 // Luma HDR runs that chain a second time with its two clips lifted: the tone curve is continued past its inflection with a
 // secant read from the bound curve (it reaches 1 at scene ~16.7 and stays flat), and the LUT is extrapolated. Only the luminance
 // of that working value is kept: the colour (hue, saturation and the whitening of the per-channel curve) stays the vanilla
-// grade's, as in Mass Effect Legendary Edition, Mass Effect 2, Borderlands 2 and Saints Row The Third Remastered. DICE then
-// contains the scene to the display peak.
+// grade's, as in Mass Effect Legendary Edition, Mass Effect 2, Borderlands 2 and Saints Row The Third Remastered. RenoDX's
+// PsychoV31 then maps the scene to the display peak.
 
 #define LUT_3D 1
 
@@ -22,7 +22,7 @@
 // clang-format off
 #include "Common.hlsl"
 #include "../../Includes/ColorGradingLUT.hlsl"
-#include "../../Includes/DICE.hlsl"
+#include "PsychoV31.hlsl"
 // clang-format on
 
 #define TONEMAP_BLOOM            (_7880CCF1 || _C291251A || _6619803F || _EE7FB6CC || _633A5894 || _E3E7DD84 || _2F20FD47 || _B2BBC089)
@@ -139,26 +139,12 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
       // The vanilla grade's colour at the working value's BT.709 luminance. Below the curve's pivot and inside the LUT both chains
       // match, so the gain is 1 there. A (near) black vanilla grade stays black.
       float3 gradedLinear = RestoreLuminance(gamma_sRGB_to_linear(color), workingLinear, true, CS_BT709);
-      // Contrast goes before the display map, so DICE contains whatever it pushes up. It's a power around mid-gray (display referred,
-      // 1 = paper white), the repo's form as in Borderlands GOTY, and a bit-exact no-op at 1. The floored log2 keeps 0 * log2(0) out of
-      // black pixels and, as in Borderlands GOTY, drops the GCT_MIRROR negatives when it applies.
-      [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-      {
-         gradedLinear = exp2(LumaSettings.GameSettings.Contrast * log2(max(gradedLinear / MidGray, 1e-30))) * MidGray;
-      }
-      const float paperWhite = GamePaperWhiteNits / sRGB_WhiteLevelNits;
-      DICESettings diceSettings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-#if DEVELOPMENT
-      // "DevSetting01" >= 0.5 A/B tests per channel DICE
-      if (LumaSettings.DevSetting01 >= 0.5)
-      {
-         diceSettings = DefaultDICESettings(DICE_TYPE_BY_CHANNEL_PQ);
-      }
-#endif
-      diceSettings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightsDesaturation;
-      gradedLinear = DICETonemap(gradedLinear * paperWhite, PeakWhiteNits / sRGB_WhiteLevelNits, diceSettings) / paperWhite;
-      // User saturation goes last, after the display map, as in other Luma mods
-      gradedLinear = Saturation(gradedLinear, LumaSettings.GameSettings.Saturation);
+      // PsychoV31 maps the vanilla grade to the display peak, with RenoDX's mods' gamut compression, which keeps the channels within the
+      // peak (it slightly desaturates the grade's most saturated colors). Its own grading only takes the user's contrast (its cone
+      // response power), saturation (its purity) and highlights desaturation (its "dechroma"), which are all no-ops at their defaults.
+      gradedLinear = renodx::tonemap::psychov::custom_psychotm_test31(gradedLinear, PeakWhiteNits / GamePaperWhiteNits, 1.0, 1.0, 1.0, LumaSettings.GameSettings.Contrast, 0.0, 1.0, 1.0,
+                                                                      LumaSettings.GameSettings.Saturation, 1.0, LumaSettings.GameSettings.HighlightsDesaturation, 0.18, 0.18, 0.0, 1.0,
+                                                                      renodx::tonemap::psychov::CUSTOM_PSYCHO31_TARGET_GAMUT_BT2020, 1.5, 1.0, 0.5, 0.0, renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT709);
       color = linear_to_sRGB_gamma(gradedLinear, GCT_MIRROR);
    }
 
