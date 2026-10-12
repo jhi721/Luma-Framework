@@ -148,6 +148,13 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
       }
       const float paperWhite = GamePaperWhiteNits / sRGB_WhiteLevelNits;
       DICESettings diceSettings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
+#if DEVELOPMENT
+      // "DevSetting01" >= 0.5 A/B tests per channel DICE
+      if (LumaSettings.DevSetting01 >= 0.5)
+      {
+         diceSettings = DefaultDICESettings(DICE_TYPE_BY_CHANNEL_PQ);
+      }
+#endif
       diceSettings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightsDesaturation;
       gradedLinear = DICETonemap(gradedLinear * paperWhite, PeakWhiteNits / sRGB_WhiteLevelNits, diceSettings) / paperWhite;
       // User saturation goes last, after the display map, as in other Luma mods
