@@ -1,7 +1,7 @@
 // Borderlands GOTY Enhanced — Luma HDR + SMAA mod (Unreal Engine 3.5, D3D11).
 // - HDR: swapchain -> scRGB fp16; replaced UE3 final-color PS (0xB030BAA6 / 0xFE88487E) runs the game's own grade
 //   as an extended HDR function, takes its hue from a soft ReinhardPiecewise reference through MacLeod-Boynton
-//   emulation, then DICE-maps to the display. The video (0x0E97A4A0) and lens-flare (0x010371F2) passes are
+//   emulation, then PsychoV31 maps it to the display. The video (0x0E97A4A0) and lens-flare (0x010371F2) passes are
 //   replaced too. Core Display Composition does the paper-white scale + encode.
 //   Only one HDR mod can own the swapchain: any other must be removed from the game folder.
 // - AA: compute FXAA (3.11 work-queue) -> SMAA (ULTRA + color edge + depth predication) + optional RCAS. Edge
@@ -1761,7 +1761,7 @@ public:
 #endif
       // Game-specific defines: TONEMAP_TYPE drives Luma_BL_Tonemap.hlsl, XE_GTAO_QUALITY drives Luma_BL_XeGTAO.hlsl.
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla clamped reference\n1 - HDR: Extended UE3 grade + DICE", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla clamped reference\n1 - HDR: Extended UE3 grade + PsychoV31", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "Ambient Occlusion (XeGTAO) quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
       };
       shader_defines_data.append_range(game_shader_defines_data);
@@ -1816,7 +1816,7 @@ public:
       // User controls (LumaSettings.GameSettings, see GameCBuffers.hlsl); the grade is vanilla by default.
       default_luma_global_game_settings.Exposure = 1.f; // multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;
-      default_luma_global_game_settings.HighlightDechroma = 0.f; // Off: only the DICE and gamut mapping desaturation applies
+      default_luma_global_game_settings.HighlightDechroma = 0.f; // Off: only PsychoV31's gamut compression desaturates
       default_luma_global_game_settings.BloomIntensity = 1.f;
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;          // subtle anti-banding on by default
@@ -2866,7 +2866,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"

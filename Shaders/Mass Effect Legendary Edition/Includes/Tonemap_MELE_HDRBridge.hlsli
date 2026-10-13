@@ -98,7 +98,7 @@ bool MELE_TryRestoreGradeRange(float3 gradedLinear, float q, out float3 workHDR)
 // per-channel shift and the whitening the native chain produced are kept, not undone. A coloured
 // reference stays coloured, equal channels stay equal, and a channel the grade zeroed is not refilled.
 //
-// The guarantee ends here, before the shared output tail. The vignette, DICE, the user controls, grain
+// The guarantee ends here, before the shared output tail. The vignette, PsychoV31, the user controls, grain
 // and dither all run after it.
 //
 // Guard contract, deliberately not one blanket fallback:

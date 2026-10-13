@@ -16,10 +16,10 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;           // 1 = vanilla. Scene exposure multiplier, scene-referred / pre-grade.
-   float Saturation;         // 1 = vanilla. BT.709-luminance saturation multiplier on the final HDR color.
-   float HighlightDechroma;  // 0 = off (default). DICE highlight desaturation: sources above a third of peak fade toward white, mid-tones untouched.
+   float Saturation;         // 1 = vanilla. PsychoV31 saturation (its purity) in the HDR display map.
+   float HighlightDechroma;  // 0 = off (default). PsychoV31 highlights desaturation (its "dechroma") in the HDR display map.
    float BloomIntensity;     // 1 = vanilla strength. Scales the Luma pyramid only (the game's own bloom is never scaled); C++ pre-folds the pyramid energy gain.
-   float Contrast;           // 1 = vanilla. Multiplicative contrast around 18% mid-gray, applied before the display map.
+   float Contrast;           // 1 = vanilla. PsychoV31 contrast (its cone response power) in the HDR display map.
    float VignetteIntensity;  // 1 = vanilla. Scales the game's vignette darkening (0 = no vignette).
    float LumaBloomEnable;    // 0/1. 1 = composite Luma HDR pyramidal bloom (t5 BL2 / t8 TPS, additive); 0 = vanilla game bloom (t1 BL2 / t2 TPS).
    float Dithering;          // 0/1 toggle. Animated triangular dither at output (HDR and SDR) to break gradient banding.

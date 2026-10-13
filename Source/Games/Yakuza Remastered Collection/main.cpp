@@ -1795,7 +1795,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"

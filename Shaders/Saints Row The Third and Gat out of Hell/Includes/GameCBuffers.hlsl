@@ -19,8 +19,8 @@ struct LumaGameSettings
    float Exposure;              // 1 = vanilla. Scales the finals' tinted scene and bloom.
    float Saturation;            // 1 = vanilla. HDR path only.
    float ColorGradingIntensity; // 1 = vanilla LUT, 0 = its identity (the plain shoulder).
-   float Contrast;              // 1 = vanilla. Multiplicative contrast around 18% mid-gray before the display map. HDR path only.
-   float HighlightDechroma;     // 0 = off. DICE highlight desaturation: sources above a third of peak fade toward white. HDR path only.
+   float Contrast;              // 1 = vanilla. PsychoV31's contrast (its cone response power). HDR path only.
+   float HighlightDechroma;     // 0 = off. PsychoV31 highlights desaturation (its "dechroma"). HDR path only.
 };
 
 // Game specific cbuffer (instance/pass) data.

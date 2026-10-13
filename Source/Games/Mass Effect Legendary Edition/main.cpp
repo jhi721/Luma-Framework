@@ -1,7 +1,7 @@
 // Mass Effect Legendary Edition trilogy Luma mod (Unreal Engine 3, native DX11, x64). One addon, three games:
 // stage-1 hashes, bloom slots and the GTAO radius are per game, the FXAA/HBAO+/DoF/bloom/present chains are shared.
 //
-// Stage 1 replaces the SDR-clamping uber-post tonemap with an HDR reconstruction and DICE rolloff; on the native HDR
+// Stage 1 replaces the SDR-clamping uber-post tonemap with an HDR reconstruction and PsychoV31 rolloff; on the native HDR
 // topology stage 2 (0x0765601C) decodes the gamma intermediate and applies Game Paper White. SMAA replaces compute
 // FXAA, fp16 pyramidal bloom replaces the UNORM bloom, XeGTAO writes the native AO target; native fp16 DoF is unchanged.
 //
@@ -4180,7 +4180,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"

@@ -16,7 +16,7 @@
 //   2. Run the vanilla chain UNCHANGED on it: saturate -> filmic -> pow(x, 0.4) -> 3D LUT.     -> graded SDR (the look)
 //   3. Uncompress by the MAX CHANNEL: one scalar from max3(untonemapped), multiplied into the graded SDR. The
 //      vanilla chain is the compressor, so the clip's own hue skew and white blowout survive by construction.
-//   4. DICE display rolloff to the user's peak/paper-white nits.
+//   4. PsychoV31 display map to the user's peak/paper-white nits.
 //
 // A DEVELOPMENT-only A/B against the additive recovery this replaced lives behind DevSetting04; it and everything
 // it reaches (NeutralSDR, UpgradeToneMap, ENABLE_HUE_RESTORATION) are temporary and marked for deletion.
@@ -39,23 +39,17 @@
 #include "Includes/DgVoodoo.hlsl"           // game-local: b3/b4 + ApplyDgvMask, the wrapper contract
 #include "Includes/Common.hlsl"             // game-local: defines LumaGameSettings (grade sliders)
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // RestoreHueAndChrominance, SimpleGamutClip
-#include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // ReinhardPiecewise (the max-channel wrap), ReinhardTonemap (legacy A/B)
 #if DEVELOPMENT
+#include "../Includes/ColorGradingLUT.hlsl" // RestoreHueAndChrominance
 #include "../Includes/Tonemap.hlsl" // UpgradeToneMap - legacy A/B path only, see FinishMOH
 #endif
+#include "../Includes/PsychoV31.hlsl" // PsychoVDisplayMap
 // clang-format on
 
-// HDR / vanilla. 1 = recover real highlights + DICE display map (default). 0 = vanilla clamped SDR reference.
+// HDR / vanilla. 1 = recover real highlights + PsychoV31 display map (default). 0 = vanilla clamped SDR reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
-#endif
-
-// Run the display map in a BT.2020 working space (round-tripped back to BT.709). Gamut-correct handling of
-// highly saturated highlights — NOT a display-gamut expansion.
-#ifndef TONEMAP_IN_WIDER_GAMUT
-#define TONEMAP_IN_WIDER_GAMUT 1
 #endif
 
 #if DEVELOPMENT
@@ -368,7 +362,7 @@ float3 FinishMOH(float3 untonemapped, float3 graded_sdr, float3 vanilla_sdr, flo
       // the display map instead — neither is constructible here: the filmic curve is only valid on [0,1] and the LUT
       // is a [0,1] lookup, so no un-blown grade exists).
       //
-      // Placement is therefore the clipped-reference one: BEFORE the display map, so DICE rolls off a colour that
+      // Placement is therefore the clipped-reference one: BEFORE the display map, so PsychoV31 maps a colour that
       // already carries the vanilla skew, rather than being pulled back afterwards.
       //
       // The gate is exact, not conservative: below 1.0 nothing clipped, `recovered` is `ungraded_sdr` and the restore
@@ -388,45 +382,14 @@ float3 FinishMOH(float3 untonemapped, float3 graded_sdr, float3 vanilla_sdr, flo
    }
 #endif // DEVELOPMENT
 
-   // Display rolloff to the user's peak/paper-white nits (DICE, hue-preserving by luminance). Both are floored:
-   // DICE divides by them, so an unset (zero) value would emit NaN over the whole frame, and a NaN in a unorm
-   // target reads back black — a failure mode that looks exactly like "the 3D disappeared".
-   const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
-   const float peakWhite = max(LumaSettings.PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
-#if TONEMAP_IN_WIDER_GAMUT
-   recovered = BT709_To_BT2020(recovered);
-#endif
-   DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, ds) / paperWhite;
-#if TONEMAP_IN_WIDER_GAMUT
-   hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
-#endif
-
-   // Perceptual highlight dechroma: bright sources fade toward white as luminance approaches peak.
-   const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
-   // Uniform, and OFF by default: without [branch] fxc flattens this to a movc and pays the div/log/exp on every
-   // pixel of every frame for a result it then discards (verified on the disassembly).
-   [branch] if (highlightDechroma > 0.0)
-   {
-      // Exponent in [1, 0.05], never 0: pow(x,0) is 1 everywhere, i.e. a full-frame greyscale rather than a
-      // highlight dechroma.
-      float dcExp = lerp(1.0, 0.05, highlightDechroma);
-      float dcWeight = saturate(pow(saturate(GetLuminance(hdr) / peakWhite), dcExp));
-      hdr = Saturation(hdr, 1.0 - dcWeight);
-   }
-
-   // User saturation (shared helper: a lerp against BT.709 luminance). 1.0 = vanilla.
-   hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
-
-   // User contrast: slope around 18% mid-gray (linear, 1.0 = paper white). 1.0 = vanilla.
-   const float midGray = 0.18;
-   hdr = (hdr - midGray) * LumaSettings.GameSettings.Contrast + midGray;
+   // See "PsychoVDisplayMap".
+   float3 hdr = PsychoVDisplayMap(recovered, LumaSettings.GameSettings.Contrast,
+                                  LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightDechroma);
 
    // Engine fade (level start, cutscene transitions), re-applied LAST and in the GAME'S OWN encoding, because that
    // is where the original applies it: `out = (lut * .z + .w) * .x` runs on the pow(x, 0.4) result, so doing it in
    // linear would bend the fade curve and mistint the frame whenever the offset is non-zero. It also has to come
-   // after the creative sliders: the contrast slider pivots around mid-gray, so a fade folded in earlier would
-   // resolve to (0 - 0.18) * C + 0.18 at full fade and never reach black.
+   // after the display map and the user's contrast inside it, which would otherwise bend the fade.
    // Uniform branch — at rest (.z = 1, .w = 0, .x = 1) this is a no-op and the two pows are skipped entirely.
    [branch] if (GradeParams.z != 1.0 || GradeParams.w != 0.0 || GradeParams.x != 1.0)
    {

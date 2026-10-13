@@ -626,7 +626,7 @@ public:
       default_luma_global_game_settings.Exposure = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
       default_luma_global_game_settings.Contrast = 1.f;
-      default_luma_global_game_settings.HighlightDechroma = 0.f; // off; only the mandatory DICE/gamut desaturation applies
+      default_luma_global_game_settings.HighlightDechroma = 0.f; // off; only PsychoV31's gamut compression desaturates
       default_luma_global_game_settings.Dithering = 1.f;
       default_luma_global_game_settings.VignetteIntensity = 1.f;
       default_luma_global_game_settings.FilmGrainIntensity = 1.f;
@@ -1494,7 +1494,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS)"

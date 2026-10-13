@@ -13,12 +13,12 @@
 // rl_hdr_08 (PostProcess 0): lerp(weightedRGB, scene, sat) * tint -> pow(1/2.2), clipped only by the UNORM swapchain.
 // rl_hdr_14 0x8ED48FDF ("convert_to_ldr") is left alone: the exe registers the technique but never selects it.
 //
-// Scene peak and gamut containment are DICE's; nothing after it re-clamps.
+// Scene peak and gamut containment are PsychoV31's; nothing after it re-clamps.
 
 // clang-format off
 // ORDER IS LOAD-BEARING - the game-local Common defines the settings struct before the shared includes.
 #include "Includes/Common.hlsl"
-#include "../Includes/DICE.hlsl"
+#include "../Includes/PsychoV31.hlsl"
 // clang-format on
 
 #ifndef TONEMAP_TYPE

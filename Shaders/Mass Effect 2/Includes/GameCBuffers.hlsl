@@ -14,10 +14,9 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;          // scene-referred multiplier applied pre-grade (uber, or gamma pass on a raw scene). 1 = vanilla.
-   float Saturation;        // 1 = vanilla. Lerp against BT.709 luminance, applied LAST, after the display map.
-   float Contrast;          // 1 = vanilla. Multiplicative contrast around 18% mid-gray, applied before the display map.
-   float HighlightDechroma; // 0 = off (default). DICE highlight desaturation: sources above a third of peak fade toward
-                            // white, mid-tones untouched.
+   float Saturation;        // 1 = vanilla. PsychoV31 saturation (its purity) in the HDR display map.
+   float Contrast;          // 1 = vanilla. PsychoV31 contrast (its cone response power) in the HDR display map.
+   float HighlightDechroma; // 0 = off (default). PsychoV31 highlights desaturation (its "dechroma") in the HDR display map.
    float Dithering;         // 0/1. Animated triangular dither where a canvas is finished, to break gradient banding.
    // Native look controls. Both scale ONLY the radial/temporal part of a native effect, never its white point: the
    // vignette's centre value (1.010363, 1.000006, 1.163092) is part of the vanilla grade, not a darkening.

@@ -8,15 +8,15 @@
 // ORDER IS LOAD-BEARING, do not sort: game-local Common.hlsl first, or GameSettings resolves to the empty dummy.
 #include "Includes/Common.hlsl"             // game-local: defines LumaGameSettings before the LumaSettings cbuffer
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
-#include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
+#include "../Includes/DICE.hlsl"            // DefaultDICESettings (ME2_ContainToPeak)
 #include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise (hue-shift reference)
 #include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
+#include "../Includes/PsychoV31.hlsl"      // PsychoVDisplayMap
 // clang-format on
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
 
-// HDR / vanilla. 1 = recover real highlights + DICE display map (the default, as in main.cpp). 0 = vanilla clamped
+// HDR / vanilla. 1 = recover real highlights + PsychoV31 display map (the default, as in main.cpp). 0 = vanilla clamped
 // SDR reference, the one every HDR change gets compared against.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
@@ -47,65 +47,27 @@ float3 Sanitize(float3 c)
 }
 
 #if TONEMAP_TYPE >= 1
-// Paper and peak white in DICE's units. Through the Settings.hlsl accessors, not LumaSettings directly: they carry the
-// HDR_TONEMAP_* overrides and the devkit white level. Floors stay - outside DEVELOPMENT there is no unset fallback,
-// and DICE divides by both.
-void ME2_DisplayWhites(out float paperWhite, out float peakWhite)
-{
-   paperWhite = max(GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
-   peakWhite = max(PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
-}
-
-// The display map's DICE settings, shared with ME2_ContainToPeak so both contain to the same peak the same way.
-DICESettings ME2_DisplayDICESettings()
-{
-   // Luminance in PQ (hue-preserving), then CORRECT_CHANNELS_BEYOND_PEAK_WHITE fades over-peak channels to white.
-   // Identity below the shoulder (a third of peak), so diffuse content and the upstream sliders are untouched.
-   DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
-   // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
-   // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
-   // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
-   // flattens it for every pixel above the shoulder.
-   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The callers convert to BT.2020
-   // themselves and undo it after, so leaving the default CS_BT709 in makes it convert a SECOND time and run its
-   // compression, its average()-based source luminance and its channel containment on doubly-narrowed primaries.
-   ds.InOutColorSpace = CS_BT2020;
-   return ds;
-}
-
-// The display map plus the user saturation. Called by the uber (so the canvas after it is display-referred, as
-// vanilla's was) and by the gamma pass on a raw-scene frame. Takes/returns LINEAR light, 1.0 = paper white; reads
-// only LumaSettings and NO cb4 row, so either can call it.
+// The display map, with the user's contrast, saturation and highlights desaturation (see "PsychoVDisplayMap"). Called
+// by the uber (so the canvas after it is display-referred, as vanilla's was) and by the gamma pass on a raw-scene frame.
+// Takes/returns LINEAR light, 1.0 = paper white; reads only LumaSettings and NO cb4 row, so either can call it.
 float3 MapME2ToDisplay(float3 sceneHDR)
 {
-   float paperWhite, peakWhite;
-   ME2_DisplayWhites(paperWhite, peakWhite);
-   // The map runs in a BT.2020 working space and is round-tripped back below: gamut-correct handling of highly
-   // saturated highlights, NOT a display-gamut expansion. Validated offline.
-   float3 hdr = DICETonemap(BT709_To_BT2020(sceneHDR) * paperWhite, peakWhite, ME2_DisplayDICESettings()) / paperWhite;
-   // The clip is a guard, not a working step: nothing upstream can leave BT.2020 here. Every caller hands in
-   // non-negative BT.709 (the uber's Sanitize, the gamma pass's max(0)), which sits strictly inside BT.2020, and every
-   // DICE step either preserves chromaticity or pulls inward - the luminance scale, the desaturation toward luminance,
-   // CorrectOutOfRangeColor. MEASURED: it moved 0 of 867k samples, over paper white 80/203/250, peak 400/1000/4000 and
-   // HighlightDechroma 0 and 1. Kept anyway: it carries its own branch, so an in-gamut pixel pays ~5 instructions, and
-   // the three sibling MacLeod-Boynton ports all call it the same way.
-   hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
-
-   // User saturation LAST, after the display map: the repo's convention. Lerp against BT.709 luminance, not
-   // hue-preserving; 1.0 is a no-op. Scale-linear, so it needs no view of the engine fade the uber re-applies.
-   return Saturation(hdr, LumaSettings.GameSettings.Saturation);
+   return PsychoVDisplayMap(sceneHDR,
+                            LumaSettings.GameSettings.Contrast,
+                            LumaSettings.GameSettings.Saturation,
+                            LumaSettings.GameSettings.HighlightDechroma);
 }
 
-// The beyond-peak step DICE ends with, run alone: for a gain applied AFTER the map (the material's vignette, whose
-// white point lifts blue x1.39 in linear). Desaturates over-peak channels toward white as the map would have; no hue
-// restore follows it, so nothing can undo that (the magenta rim of the old hoisted vignette). LINEAR in and out.
+// DICE's beyond-peak step, run alone: for a gain applied AFTER the map (the material's vignette, whose white point
+// lifts blue x1.39 in linear). Desaturates over-peak channels toward white; no hue restore follows it, so nothing can
+// undo that (the magenta rim of the old hoisted vignette). LINEAR in and out.
 float3 ME2_ContainToPeak(float3 mapped)
 {
-   float paperWhite, peakWhite;
-   ME2_DisplayWhites(paperWhite, peakWhite);
-   const DICESettings ds = ME2_DisplayDICESettings();
+   // Paper and peak white, 1 = 80 nits, through the Settings.hlsl accessors (they carry the HDR_TONEMAP_* overrides and the
+   // devkit white level). Floored, as there is no unset fallback outside DEVELOPMENT and this divides by paper white.
+   const float paperWhite = max(GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
+   const float peakWhite = max(PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
+   const DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
    const float smoothing = ds.GamutMappingSmoothing >= 0.0 ? ds.GamutMappingSmoothing : 1.0 - ds.ShoulderStart; // as DICE
    return BT2020_To_BT709(CorrectOutOfRangeColor(BT709_To_BT2020(mapped) * paperWhite, ds.Mirrored, true, ds.DesaturationVsDarkeningRatio, peakWhite, smoothing, ds.ProcessingColorSpace) / paperWhite);
 }
@@ -173,20 +135,6 @@ float3 FinishME2Canvas(float3 encoded, float2 ditherUV, bool dither)
 #endif
 
    return Sanitize(encoded);
-}
-
-// User contrast, multiplicative around mid-gray (0.18, 1.0 = paper white), the repo's form (RenoDX_Contrast). Callers
-// run it BEFORE the display map so DICE contains whatever it pushes up, and before the engine fade, which would
-// otherwise land at k^C. [branch] on a cbuffer uniform: at the 1.0 default this is a bit-exact no-op. The pow is spelled
-// out with a floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN; black
-// stays black at every setting (0^C = 0).
-float3 ME2_ApplyContrast(float3 color)
-{
-   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-   {
-      color = exp2(LumaSettings.GameSettings.Contrast * log2(max(color / MidGray, 1e-30))) * MidGray;
-   }
-   return color;
 }
 #endif // TONEMAP_TYPE >= 1
 
@@ -331,7 +279,7 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // running the stage anyway costs up to 2.8e-3 relative on saturated near-gamut colours - pure round-off from the
    // RGB->LMS->MB round trip and the 1/t_max solve, for a result that should be the input. Raising it further is NOT
    // free: past the shoulder the donor starts bending real hue. Tuned constants, not user controls; path-to-white
-   // stays with DICE at the display peak.
+   // stays with PsychoV31 at the display peak.
    const float hueReferenceShoulder = 1.5;
    [branch] if (max3(recovered) > hueReferenceShoulder)
    {
@@ -356,11 +304,8 @@ float3 RunME2Uber(float2 blurUV, float2 sceneUV)
    // brightness by a SCALAR ratio, so the vanilla chromaticity survives it untouched, and the hard-clip one has just
    // set its own hue above. The display map owns path-to-white.
 
-   // User contrast stays in THIS pass because the engine fade below is a cb4 row only the uber can read, and contrast
-   // must precede it. User saturation runs inside MapME2ToDisplay, after the display map.
-   recovered = ME2_ApplyContrast(recovered);
-
-   // Re-apply the engine fade linearly, after contrast (a no-op at rest), then map and encode: the canvas carries
+   // Re-apply the engine fade linearly (a no-op at rest), then map and encode (the user's contrast is part of the map, so it
+   // acts on the faded value): the canvas carries
    // vanilla's domain to the feedback materials drawn before the BioSceneEffect material, as MELE's stage 1 does.
    float3 outColor = EncodeME2Canvas(MapME2ToDisplay(Sanitize(recovered * outputScale)));
 #else
@@ -438,7 +383,7 @@ float4 RunME2DofBloomBlend(float2 blurUV, float2 sceneUV)
    // sits, since the replaced gather has already stopped writing that one, and the display map and the canvas
    // encode happen here because nothing downstream will do them. The sample stays inside this branch: on a merged
    // frame the pyramid is not this pass's to add.
-   const float3 mixed = ME2_ApplyContrast(Sanitize((vanillaMix + LumaBloom(sceneUV)) * rcpWeightSum) * LumaSettings.GameSettings.Exposure);
+   const float3 mixed = Sanitize((vanillaMix + LumaBloom(sceneUV)) * rcpWeightSum) * LumaSettings.GameSettings.Exposure;
    return float4(EncodeME2Canvas(MapME2ToDisplay(mixed)), depth);
 #else
    return float4(vanillaMix * rcpWeightSum, depth);
@@ -505,14 +450,14 @@ float3 RunME2Material(float2 grainUV, float3 screenPosition)
    [branch] if (LumaData.GameData.UberRanThisFrame > 0.5)
    {
       // The uber left the display-mapped, encoded scene here. Its vignette white point lifts blue past peak
-      // (vanilla's 8-bit canvas clipped it), so the map's own beyond-peak step contains it.
+      // (vanilla's 8-bit canvas clipped it). PsychoV31 ran before that gain, so DICE's beyond-peak step contains it.
       outColor = EncodeME2Canvas(ME2_ContainToPeak(DecodeME2Canvas(scene) * vignette));
    }
    else
    {
       // Neither the uber nor the standalone DOFAndBloom blend ran: t0 is RAW linear scene, so decoding it as gamma
-      // would crush the frame. Map it here instead - with the map LAST, DICE contains the vignette's white point
-      // itself, which is what ME2_ContainToPeak redoes on the other branch. No Luma bloom: the pyramid is built at
+      // would crush the frame. Map it here instead - with the map LAST, PsychoV31 contains the vignette's white point
+      // itself, as ME2_ContainToPeak does on the other branch, where the map ran before the vignette. No Luma bloom: the pyramid is built at
       // the uber draw, which by definition did not happen. Exposure as the gamma pass applies it on a raw scene.
       // Only these two producers are covered, and none of the 384 cooked chains pairs the blend with this material:
       // the blend leaves an ENCODED canvas, which would take this branch, and the flag it would have to set cannot
@@ -591,8 +536,6 @@ float3 RunME2GammaCorrection(float2 sceneUV)
    // Vanilla's grade with the saturate() as a lower-only max(0), so highlights keep their real channel ratio, and the
    // overlay (this pass's fade) held OUT until after the creative sliders.
    float3 outColor = VanillaToLinear(PowUE3(max(input * GcColorScale.xyz, 0.0), GcInverseGamma.xxx));
-   if (rawScene)
-      outColor = ME2_ApplyContrast(outColor); // the uber already applied it on every other input
 
    // Vanilla lerps toward the overlay BEFORE its inverse-gamma pow and the display decode, so the fade is taken in that
    // domain: re-encoded through the inverse of both exponents, blended, decoded again. Below 1.0 this is the vanilla

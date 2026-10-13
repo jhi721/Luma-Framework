@@ -26,7 +26,7 @@
 // the correction - a whole-triple rejection there would produce a visible switching boundary. The only
 // fallback here is for arithmetic that actually broke.
 //
-// DICE, further down the shared output tail, stays the one and only display mapper.
+// PsychoV31, further down the shared output tail, stays the one and only display mapper.
 //
 // The OKLab locals stay snake_case where the rest of this game's HDR code is camelCase: this is a line-by-line port,
 // and keeping the source's snake_case keeps the two diffable, as Shaders/Includes/ACES.hlsl and Reinhard.hlsl do.

@@ -2188,7 +2188,7 @@ public:
 #endif
       // Game-specific toggles consumed by the uber and gamma replacements (Luma_ME1_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + PsychoV31 display map", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -2249,7 +2249,7 @@ public:
 
       default_luma_global_game_settings.Exposure = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
-      default_luma_global_game_settings.HighlightDechroma = 0.f; // off by default; only the mandatory DICE/gamut desaturation applies
+      default_luma_global_game_settings.HighlightDechroma = 0.f; // off by default; only PsychoV31's gamut compression desaturates
       default_luma_global_game_settings.BloomIntensity = 1.f;
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;
@@ -3517,7 +3517,6 @@ public:
          device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
-         // "How far", not "how soon": DICE's ramp starts at a third of peak, so the slider sets depth, not onset.
          ImGui::SetTooltip("How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation"))
          device_data.cb_luma_global_settings_dirty = true;
@@ -3660,7 +3659,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"

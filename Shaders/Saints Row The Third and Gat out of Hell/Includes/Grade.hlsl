@@ -40,23 +40,16 @@ float3 SR_SampleLUT(float3 index)
    return lerp(lut0, lut1, index.b * 31.0 - slice);
 }
 
-// Linear HDR (1.0 = paper white) -> the gamma-encoded post-process space, via DICE to the user's peak.
+// Linear HDR (1.0 = paper white) -> the gamma-encoded post-process space, via PsychoV31 to the user's peak.
 float3 SR_DisplayMap(float3 hdrLinear, float2 uv)
 {
    hdrLinear = IsNaN_Strict(hdrLinear) ? 0.0 : hdrLinear; // NaN -> 0; "x != x" can be compiled away
    hdrLinear = max(hdrLinear, 0.0);
-   const float paperWhite = GamePaperWhiteNits / sRGB_WhiteLevelNits;
-   const float peakWhite = PeakWhiteNits / sRGB_WhiteLevelNits;
-   // User contrast before the display map, so DICE contains whatever it pushes up. Multiplicative around mid-gray (TW2's
-   // form); the floored log2 keeps black at 0 for Contrast 0 instead of pow(0, 0) = NaN. Gated so 1 stays bit-exact.
-   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-   {
-      hdrLinear = exp2(LumaSettings.GameSettings.Contrast * log2(max(hdrLinear / MidGray, 1e-30))) * MidGray;
-   }
-   DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   // Ramps on the max channel between a third of peak and peak, inside DICE's containment: mid-tones stay untouched.
-   settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   float3 encoded = SR_EncodeOutput(DICETonemap(hdrLinear * paperWhite, peakWhite, settings) / paperWhite);
+   // See "PsychoVDisplayMap".
+   float3 encoded = SR_EncodeOutput(PsychoVDisplayMap(hdrLinear,
+                                                      LumaSettings.GameSettings.Contrast,
+                                                      LumaSettings.GameSettings.Saturation,
+                                                      LumaSettings.GameSettings.HighlightDechroma));
    // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR. The
    // composition scales this image by UIPaperWhite, so that is the PQ scale.
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
@@ -74,13 +67,13 @@ float3 SR_DisplayMap(float3 hdrLinear, float2 uv)
    return encoded;
 }
 
-// The pass result: the vanilla SDR reference (TONEMAP_TYPE 0), or the HDR recovery of it through DICE.
+// The pass result: the vanilla SDR reference (TONEMAP_TYPE 0), or the HDR recovery of it through PsychoV31.
 float4 SR_Output(float3 vanillaLinear, float recoveryGain, float2 uv, float alpha)
 {
 #if TONEMAP_TYPE <= 0
    return float4(SR_EncodeOutput(vanillaLinear), alpha);
 #else
-   return float4(SR_DisplayMap(Saturation(vanillaLinear, LumaSettings.GameSettings.Saturation) * recoveryGain, uv), alpha);
+   return float4(SR_DisplayMap(vanillaLinear * recoveryGain, uv), alpha);
 #endif
 }
 
@@ -89,7 +82,7 @@ float4 SR_Output(float3 vanillaLinear, float recoveryGain, float2 uv, float alph
 // while F'' = -3u < 0, so every pivot in (0, 1) extends above the curve and the gain is >= 1. With no inflection the
 // pivot only sets brightness, lower is brighter up to the u -> 0 limit (SDR white 1.5x). Scene mid-gray 0.18, u 0.121,
 // as Mass Effect 2 and RenoDX Zelda: Echoes of Wisdom: SDR white recovers 1.48x and a scene value of 10 reaches ~9.9x
-// paper white before DICE (0.35 gave 1.36x and 8.9x).
+// paper white before the display map (0.35 gave 1.36x and 8.9x).
 float SR_RecoveryGain(float3 u)
 {
    const float pivot = 0.18 / 1.49;

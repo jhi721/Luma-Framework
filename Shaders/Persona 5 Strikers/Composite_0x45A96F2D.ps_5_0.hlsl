@@ -5,12 +5,12 @@
 // Luma: in HDR, the vanilla LUT output is scaled by E(Y) / G(Y) of the pre-LUT relative luminance Y, where G is the LUT's gray tone
 // curve and E is G continued by its tangent past the pivot where G reaches mid gray. Only luminance crosses into the output (as in
 // BL2/TPS); a scalar can't rotate hue, so the grade and its path to white stay vanilla, and output below the pivot is exactly vanilla.
-// DICE then maps it to the peak. The LUT is a per area asset, so the tangent is found per pixel.
+// PsychoV31 then maps it to the peak. The LUT is a per area asset, so the tangent is found per pixel.
 // clang-format off
 #include "Includes/Common.hlsl"
-#include "../Includes/DICE.hlsl"
 #include "../Includes/ColorGradingLUT.hlsl"
 #include "Includes/cbComposite.hlsl"
+#include "../Includes/PsychoV31.hlsl"
 // clang-format on
 
 SamplerState sampleLinear_s : register(s7);
@@ -229,14 +229,9 @@ void main(
             r0.xyz *= max(1.0, (pivotOutput + slope * (luminance - pivot)) / grayOutput);
       }
 
-      const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
-      const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
-      DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-      settings.DesaturationVsDarkeningRatio = 0.5;
-      settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightsDesaturation;
-      r0.xyz = DICETonemap(r0.xyz * paperWhite, peakWhite, settings) / paperWhite;
-      // User saturation last, after the display map (repository convention)
-      r0.xyz = Saturation(r0.xyz, LumaSettings.GameSettings.Saturation);
+      // See "PsychoVDisplayMap".
+      r0.xyz = PsychoVDisplayMap(r0.xyz, 1.0, LumaSettings.GameSettings.Saturation,
+                                 LumaSettings.GameSettings.HighlightsDesaturation);
    }
 
    o0.xyz = g_vRadialBlurCenter.zzz * r0.xyz;

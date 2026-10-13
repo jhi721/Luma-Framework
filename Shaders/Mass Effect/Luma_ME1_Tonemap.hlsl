@@ -8,10 +8,10 @@
 // and sanitize.
 // HDR pipeline (analytic in-shader, no LUT; the Borderlands GOTY / MoH Airborne production pipeline): reconstruct the
 // scene mix exactly as the game does -> untonemapped; keep the game's own clamped grade as the exact SDR reference;
-// run that same grade with its upper saturate()s as max(0), decoded to display-linear -> the HDR signal; user
-// contrast; in BT.2020 a soft per-channel ReinhardPiecewise(5, 1.5) hue reference, whose hue direction
-// MacLeodBoynton::HueOnlyBT2020 rebuilds on the signal's own purity; DICE rolloff to the user's peak/paper white;
-// SimpleGamutClip and back to BT.709; user saturation; the engine fade last, through the vanilla curve.
+// run that same grade with its upper saturate()s as max(0), decoded to display-linear -> the HDR signal; in BT.2020 a
+// soft per-channel ReinhardPiecewise(5, 1.5) hue reference, whose hue direction MacLeodBoynton::HueOnlyBT2020 rebuilds
+// on the signal's own purity; PsychoV31 maps it to the user's peak/paper white (see "PsychoVDisplayMap"); the engine
+// fade last, through the vanilla curve.
 // The engine SKIPS the uber in elevators and some loading scenes; main.cpp reports that through
 // LumaData.GameData.UberRanThisFrame and the gamma replacement then runs the HDR block itself off the ungraded scene
 // (DoF and the Luma glow composited by the standalone DOFAndBloom blend 0x218D4AE2 when that chain has one).
@@ -25,15 +25,14 @@
 // LUMA_GAME_CB_STRUCTS before any shared header pulls Settings.hlsl, or GameSettings resolves to the empty dummy.
 #include "Includes/Common.hlsl"             // game-local: defines LumaGameSettings (grade sliders) before the LumaSettings cbuffer
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
-#include "../Includes/DICE.hlsl"            // DICETonemap / DefaultDICESettings
 #include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise, the soft hue reference
 #include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
+#include "../Includes/PsychoV31.hlsl"      // PsychoVDisplayMap
 // clang-format on
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3, DoFBlurAmount
 
-// HDR / vanilla. 1 = extended native grade + MacLeod-Boynton hue + DICE display map (default). 0 = vanilla clamped SDR
+// HDR / vanilla. 1 = extended native grade + MacLeod-Boynton hue + PsychoV31 display map (default). 0 = vanilla clamped SDR
 // reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
@@ -108,27 +107,15 @@ float3 Sanitize(float3 c)
 }
 
 #if TONEMAP_TYPE >= 1
-// Shared HDR back half: extended grade -> contrast -> BT.2020 -> soft hue reference -> MacLeod-Boynton hue -> display
-// rolloff -> gamut clip -> BT.709 -> saturation. Contrast sits ahead of the rolloff on purpose (see 3), saturation
-// behind it, as in the repo. Takes and returns LINEAR light, 1.0 = paper white, NO engine fade (the caller re-applies
-// it: contrast pivots on mid-gray, so a fade before it would never reach black). `color` is the pass's own grade with
-// its upper saturate()s as max(0), decoded to display-linear: vanilla-exact below the clip and its own analytic
-// continuation above it, so range, luminance and chromaticity all come from the game's math.
+// Shared HDR back half: extended grade -> BT.2020 -> soft hue reference -> MacLeod-Boynton hue -> BT.709 -> PsychoV31
+// display map, which takes the user's contrast, saturation and highlights desaturation. Takes and returns LINEAR light,
+// 1.0 = paper white, NO engine fade (the caller re-applies it: contrast pivots on mid-gray, so a fade before it would
+// never reach black). `color` is the pass's own grade with its upper saturate()s as max(0), decoded to display-linear:
+// vanilla-exact below the clip and its own analytic continuation above it, so range, luminance and chromaticity all
+// come from the game's math.
 float3 FinishME1HDR(float3 color)
 {
-   // 3. Contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the slider would
-   // escape the peak it just established, and nothing downstream re-contains it. A power around mid-gray, the repo's
-   // form (RenoDX_Contrast in the Call of Duty includes); 0.18 is mid-gray here too, display-referred with 1.0 = paper
-   // white (code ~0.46).
-   // [branch] on a cbuffer uniform: at the 1.0 default this must be a BIT-EXACT no-op. The max() cannot go either -
-   // PowUE3 floors with abs(), which would MIRROR a small negative rather than crush it.
-   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-   {
-      const float midGray = 0.18;
-      color = PowUE3(max(0.0, color / midGray), LumaSettings.GameSettings.Contrast.xxx) * midGray;
-   }
-
-   // 4. Colour stage, in a BT.2020 working space (round-tripped back to BT.709 after the display map: gamut-correct
+   // 3. Colour stage, in a BT.2020 working space (round-tripped back to BT.709 before the display map: gamut-correct
    // handling of saturated highlights, not a display-gamut expansion). Soft hue reference: ReinhardPiecewise(x, 5, 1.5)
    // per channel, where the RenoDX BL1 port builds it. Linear below 1.5 and rolling toward 5 above, it compresses a
    // saturated highlight's strong channel before its weak ones, so the hue leans the way the vanilla clip leaned it,
@@ -136,30 +123,15 @@ float3 FinishME1HDR(float3 color)
    // purity and T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it.
    const float3 extendedBT2020 = BT709_To_BT2020(color);
    const float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
-   const float3 diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
+   const float3 hueTransferredBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
 
-   // 5. Display rolloff to the user's peak/paper white (DICE, hue-preserving). Both floored: DICE divides by them.
-   const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
-   const float peakWhite = max(LumaSettings.PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
-   // CORRECT_CHANNELS_BEYOND_PEAK_WHITE desaturates any channel still over peak: panels clip per channel, so an
-   // uncorrected saturated highlight would clip with a hue shift.
-   DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
-   // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
-   // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
-   // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
-   // flattens it for every pixel above the shoulder.
-   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   // DICE converts InOutColorSpace -> ProcessingColorSpace on entry and back on exit. The colour is already BT.2020 and
-   // is converted back below, so the default CS_BT709 would convert a SECOND time and compress on doubly-narrowed
-   // primaries. Neutrals cancel out; saturated highlights do not.
-   ds.InOutColorSpace = CS_BT2020;
-   float3 hdr = DICETonemap(diceInBT2020 * paperWhite, peakWhite, ds) / paperWhite;
-   hdr = BT2020_To_BT709(SimpleGamutClip(hdr, true));
-
-   // 6. User saturation LAST, after the display map: the repo's convention. Lerp against BT.709 luminance, not
-   // hue-preserving.
-   return Saturation(hdr, LumaSettings.GameSettings.Saturation);
+   // 4. The display map (see "PsychoVDisplayMap"). The hue transfer can leave BT.709, so its source boundary is
+   // BT.2020.
+   return PsychoVDisplayMap(BT2020_To_BT709(hueTransferredBT2020),
+                            LumaSettings.GameSettings.Contrast,
+                            LumaSettings.GameSettings.Saturation,
+                            LumaSettings.GameSettings.HighlightDechroma,
+                            renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
 }
 #endif
 

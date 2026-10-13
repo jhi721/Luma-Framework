@@ -1,8 +1,8 @@
 // clang-format off
 // The game-local Common.hlsl must come first: it defines LumaGameSettings before the shared Settings.hlsl
-// (reached through DICE.hlsl) declares the LumaSettings cbuffer.
+// declares the LumaSettings cbuffer, which PsychoV31.hlsl reads.
 #include "Includes/Common.hlsl"
-#include "../Includes/DICE.hlsl"
+#include "../Includes/PsychoV31.hlsl"
 #include "../Includes/Reinhard.hlsl"
 // clang-format on
 
@@ -17,7 +17,7 @@
 // HDR follows Mass Effect Legendary Edition family 01 (Shaders/Mass Effect Legendary Edition/Includes/
 // Tonemap_MELE_HDRBridge.hlsli) as ported to Borderlands 2 (Luma_BL2TPS_Tonemap.hlsl): the native SDR grade is the
 // complete colour reference, a continuation of the native curve passes through a reversible bounded copy of the
-// real LUT to give HDR luminance, only that luminance is projected onto the native graded RGB ratios, and DICE
+// real LUT to give HDR luminance, only that luminance is projected onto the native graded RGB ratios, and PsychoV31
 // is the only display rolloff. No path takes RGB ratios from the working value.
 //
 // The continuation is the tangent of the LINEAR-LIGHT curve G(x) = F(x)^2.2 over the curve's own input x, the
@@ -254,19 +254,11 @@ groupshared float3 gContinuation;
          recovered = SRTTR_NativeColorAtLuminance(sdrLinear, workLuminance);
       }
 
-      // Contrast before DICE so the rolloff contains what it pushes up; [branch] keeps 1.0 bit-exact, and the floored
-      // log2 makes Contrast 0 on black 0 rather than pow(0, 0) = NaN (as Luma_BL2TPS_Tonemap.hlsl).
-      [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-      {
-         recovered = exp2(LumaSettings.GameSettings.Contrast * log2(max(recovered / MidGray, 1e-30))) * MidGray;
-      }
-
-      const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
-      const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
-      DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-      settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightsDesaturation;
-      float3 hdr = DICETonemap(recovered * paperWhite, peakWhite, settings) / paperWhite;
-      hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
+      // See "PsychoVDisplayMap".
+      float3 hdr = PsychoVDisplayMap(recovered,
+                                     LumaSettings.GameSettings.Contrast,
+                                     LumaSettings.GameSettings.Saturation,
+                                     LumaSettings.GameSettings.HighlightsDesaturation);
 
 #if UI_DRAW_TYPE >= 2
       // The GUI layer is blended over this in gamma space by compose; the composition rescales by UI paper white.

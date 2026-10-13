@@ -14,9 +14,9 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;          // exposure multiplier (1 = vanilla). Applied scene-referred, before the vanilla grade.
-   float Saturation;        // 1 = vanilla. Saturation multiplier on the final HDR color (lerp against luminance).
-   float HighlightDechroma; // 0 = off (default; keep color, only mandatory gamut desat applies); higher = bright sources fade to white sooner.
-   float Contrast;          // 1 = vanilla. Slope contrast around 18% mid-gray on the final HDR color.
+   float Saturation;        // 1 = vanilla. PsychoV31's purity.
+   float HighlightDechroma; // 0 = off (default). PsychoV31 highlights desaturation (its "dechroma").
+   float Contrast;          // 1 = vanilla. PsychoV31's contrast (its cone response power).
    float Dithering;         // 0/1 toggle. Animated triangular dither at output to break gradient banding.
    // hueStrength / chrominanceStrength of the vanilla highlight emulation (RestoreHueAndChrominance). Read ONLY
    // by the legacy DevSetting04 A/B in Luma_MOH_Tonemap.hlsl; the shipped max-channel path preserves the vanilla

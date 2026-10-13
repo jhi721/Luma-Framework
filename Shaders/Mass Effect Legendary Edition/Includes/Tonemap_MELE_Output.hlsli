@@ -17,15 +17,9 @@
 #define TM_ALPHA_LUMA 0
 #endif
 
-// A unit conversion, not an application of Game Paper White: the HDR branch below multiplies into
-// absolute-nit ratios for DICE and divides straight back out. The two passes that actually apply this
-// scale to an outgoing frame are Output_0x0765601C and Video_0x7B5C59DF, and this is not a third.
-const float gamePaperWhiteScale = MELE_GetGamePaperWhiteScale();
-const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
-
 float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
-// Native vignette, hoisted ahead of the tonemap and expressed in linear so DICE absorbs its blue-tinted white
+// Native vignette, hoisted ahead of the tonemap and expressed in linear so PsychoV31 absorbs its blue-tinted white
 // point instead of the frame leaving stage 1 above Scene Peak. linear_to_gamma is a signed pure pow, so this is
 // exactly the vanilla multiply in the encoded domain. Grain and dither stay in gamma below, where hoisting would
 // amplify shadow noise.
@@ -65,33 +59,14 @@ float3 vigGamma = 1.0; // The native gamma-domain multiplier, for the exposure m
 float3 postProcessedColor;
 if (LumaSettings.DisplayMode == 1) // HDR
 {
-   // gradedHDR arrives as Game-Paper-White-relative linear HDR; DICE owns peak rolloff and gamut from here.
-   float3 vignettedHDR = gradedHDR * vigLinear;
-
-   // User contrast BEFORE the display map so DICE contains whatever it pushes up; after the rolloff it would escape
-   // Scene Peak and nothing downstream re-contains it. Multiplicative around mid-gray (0.18, Game-Paper-White-
-   // relative), the repo's RenoDX_Contrast form. [branch] on a cbuffer uniform keeps the 1.0 default a bit-exact
-   // no-op. The floored log2 makes Contrast 0 on black 0 * log2(1e-30) = 0 rather than pow(0, 0) = NaN.
-   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-   {
-      const float midGray = 0.18;
-      vignettedHDR = exp2(LumaSettings.GameSettings.Contrast * log2(max(vignettedHDR / midGray, 1e-30))) * midGray;
-   }
-
-   // DICE works in absolute-nit ratios, so its cap lands at Scene Peak White (PeakWhiteNits). Type 2 also runs
-   // CorrectOutOfRangeColor. Grain, dither, and RCAS can still push the result ~2% past Scene Peak; accepted.
-   DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   // Highlight dechroma is DICE's own, so it runs INSIDE the containment in the processing primaries: a lerp toward
-   // relative luminance, ramped on the compressed MAX CHANNEL from ShoulderStart * PeakWhite (1/3 of peak for this
-   // type, so mid-tones cannot be touched) to peak, entered only once the channel AVERAGE passes the same shoulder.
-   // A saturated highlight below it is not desaturated, and a non-zero setting switches on with a step where the
-   // average crosses; that gate is shared DICE.hlsl code. 0 is off for the OUTPUT but not the cost: DICE's guard
-   // carries no [branch], so fxc flattens it for every pixel above the shoulder.
-   settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   postProcessedColor = DICETonemap(vignettedHDR * gamePaperWhiteScale, peakWhite, settings) / gamePaperWhiteScale; // Game-Paper-White-relative.
-
-   // User saturation LAST, after the display map, in Game-Paper-White-relative linear RGB; 1.0 is a no-op.
-   postProcessedColor = Saturation(postProcessedColor, LumaSettings.GameSettings.Saturation);
+   // gradedHDR arrives as Game-Paper-White-relative linear HDR. See "PsychoVDisplayMap". Its peak is Scene Peak over
+   // Game Paper White, a unit conversion, not an application of Game Paper White: the two passes that apply that scale
+   // to an outgoing frame are Output_0x0765601C and Video_0x7B5C59DF. Grain, dither, and RCAS can still push the result
+   // ~2% past Scene Peak; accepted.
+   postProcessedColor = PsychoVDisplayMap(gradedHDR * vigLinear,
+                                          LumaSettings.GameSettings.Contrast,
+                                          LumaSettings.GameSettings.Saturation,
+                                          LumaSettings.GameSettings.HighlightDechroma); // Game-Paper-White-relative.
 }
 else // SDR still uses the scRGB swapchain; sdrLinear is the exact native grade.
 {
@@ -128,7 +103,7 @@ const float rEncoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
 
 // Native eye adaptation meters the vanilla final gamma scene: the native SDR grade times the gamma vignette, plus
 // grain, clamped as vanilla's mov_sat did, HUD not yet present. Built from the native result, not from o0, so the HDR
-// reconstruction, DICE and both Paper White controls stay out of exposure in every Display Mode.
+// reconstruction, the display map and both Paper White controls stay out of exposure in every Display Mode.
 {
    float3 metered = saturate(sdrGamma * vigGamma + grain);
    float adaptLuma = dot(metered, float3(0.212670997, 0.715160012, 0.0721689984));

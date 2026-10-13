@@ -1889,7 +1889,7 @@ public:
 #endif
       // Game-specific toggles consumed by both replaced final passes (Luma_MOHA_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + PsychoV31 display map", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -1942,7 +1942,7 @@ public:
       // User grade controls (read in Luma_MOHA_Tonemap.hlsl via LumaSettings.GameSettings). All vanilla by default.
       default_luma_global_game_settings.Exposure = 1.f; // multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;
-      default_luma_global_game_settings.HighlightsDesaturation = 0.f; // off by default; only the mandatory DICE/gamut desaturation applies
+      default_luma_global_game_settings.HighlightsDesaturation = 0.f; // off by default; only PsychoV31's gamut compression desaturates
       default_luma_global_game_settings.BloomIntensity = 1.f;
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Dithering = 1.f; // subtle anti-banding on by default
@@ -2832,7 +2832,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"

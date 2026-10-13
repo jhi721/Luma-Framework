@@ -2751,7 +2751,7 @@ public:
 #endif
       // Game-specific HDR toggle, read by the tonemap, glow/shaft blend and final grade replacements.
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + DICE display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + PsychoV31 display map", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
       };
       shader_defines_data.append_range(game_shader_defines_data);
@@ -2780,7 +2780,7 @@ public:
       // overshoot already reaches ~2-6x.
       default_luma_global_game_settings.Exposure = 1.f;              // scene multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;            // saturation around luminance
-      default_luma_global_game_settings.HighlightDechroma = 0.f;     // off; only mandatory DICE/gamut desat applies
+      default_luma_global_game_settings.HighlightDechroma = 0.f;     // off; only PsychoV31's gamut compression desaturates
       default_luma_global_game_settings.Dithering = 1.f;             // animated triangular dither at output (HDR and SDR), anti-banding on
       default_luma_global_game_settings.VideoAutoHDREnable = 1.f;    // light AutoHDR on pre-rendered videos (HDR only)
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;    // highlight-expansion strength (peak ~165 nits at 0.5)
@@ -3686,7 +3686,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"

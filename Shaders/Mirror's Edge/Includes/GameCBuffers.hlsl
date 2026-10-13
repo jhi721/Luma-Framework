@@ -14,9 +14,9 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;               // 1 = vanilla. Multiplier on the scene, before the grade.
-   float Contrast;               // 1 = vanilla. Around 18% mid-gray, before the display map.
-   float Saturation;             // 1 = vanilla. After the display map.
-   float HighlightsDesaturation; // 0 = off. DICE highlight desaturation above a third of peak.
+   float Contrast;               // 1 = vanilla. PsychoV31 contrast (its cone response power) in the HDR display map.
+   float Saturation;             // 1 = vanilla. PsychoV31 saturation (its purity) in the HDR display map.
+   float HighlightsDesaturation; // 0 = off. PsychoV31 highlights desaturation (its "dechroma") in the HDR display map.
    float ColorGradingIntensity;  // 1 = vanilla, 0 = neutral. Strength of the per-channel color curves.
    float Dithering;              // 0/1. Output dither against banding (8 bit SDR, 10 bit PQ HDR).
    float VideoAutoHDREnable;     // 0/1. PumboAutoHDR on the Bink passes (Video_0xE41621CF.ps_5_0.hlsl).

@@ -3,13 +3,12 @@
 // then encodes with the brightness slider's gamma (c13.w, 0.5 at default) and applies per-channel curves: 16 point
 // sampled (slope, offset) segments, R/G in t1, B in t2, picked at saturate(x * 15/16). Above 1 the saturate keeps the
 // last segment, so the curve continues linearly there. HDR: the same grade with both upper clips as max(0) is the
-// signal; the hue follows a soft ReinhardPiecewise reference (MacLeod-Boynton), DICE maps to the display (the
-// Medal of Honor Airborne scheme, same UE3 grade family).
+// signal; the hue follows a soft ReinhardPiecewise reference (MacLeod-Boynton), RenoDX's PsychoV31 maps to the
+// display (the Medal of Honor Airborne scheme, same UE3 grade family).
 #include "Includes/Common.hlsl"
 // clang-format off
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
-#include "../Includes/DICE.hlsl"
+#include "../Includes/PsychoV31.hlsl"
 #include "../Includes/Reinhard.hlsl"
 #include "../Includes/MacLeodBoynton.hlsl"
 #include "../Includes/DgVoodoo.hlsl"
@@ -93,26 +92,18 @@ void main(
    const float3 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorSampler, v5.xy), DgvConstants[44], DgvConstants[45]).xyz * LumaSettings.GameSettings.Exposure;
 
 #if TONEMAP_TYPE >= 1
-   float3 extendedLinear = gamma_to_linear(GradeTd(scene, exposure, false));
-
-   // Before the display map, so DICE contains it. Bit exact no-op at 1.
-   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-   {
-      extendedLinear = PowTd(max(0.0, extendedLinear / MidGray), LumaSettings.GameSettings.Contrast.xxx) * MidGray;
-   }
-
-   const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
-   const float peakWhite = max(LumaSettings.PeakWhiteNits, paperWhite * sRGB_WhiteLevelNits) / sRGB_WhiteLevelNits;
+   const float3 extendedLinear = gamma_to_linear(GradeTd(scene, exposure, false));
 
    // The per-channel curves lean saturated highlights; the soft per-channel reference keeps that lean without the
    // clip's whitening, MacLeod-Boynton puts its hue on the extended grade's own purity.
    const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-   DICESettings ds = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   ds.HighlightsDesaturation = LumaSettings.GameSettings.HighlightsDesaturation;
-   ds.InOutColorSpace = CS_BT2020; // already BT.2020: the default would convert a second time
-   float3 outColor = DICETonemap(MacLeodBoynton::HueOnlyBT2020(extendedBT2020, Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5)) * paperWhite, peakWhite, ds) / paperWhite;
-   outColor = BT2020_To_BT709(SimpleGamutClip(outColor, true));
-   outColor = Saturation(outColor, LumaSettings.GameSettings.Saturation);
+   const float3 hueTransferredBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5));
+   // See "PsychoVDisplayMap". The hue transfer can leave BT.709, so its source boundary is BT.2020.
+   float3 outColor = PsychoVDisplayMap(BT2020_To_BT709(hueTransferredBT2020),
+                                       LumaSettings.GameSettings.Contrast,
+                                       LumaSettings.GameSettings.Saturation,
+                                       LumaSettings.GameSettings.HighlightsDesaturation,
+                                       renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
 #else
    float3 outColor = gamma_to_linear(GradeTd(scene, exposure, true));
 #endif

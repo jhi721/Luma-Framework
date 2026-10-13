@@ -681,7 +681,7 @@ public:
 #endif
       // Game-specific toggle consumed by the replaced pass (Luma_MOH_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: recover highlights + DICE display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (bit-exact reference)\n1 - HDR: recover highlights + PsychoV31 display map", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -716,7 +716,7 @@ public:
       // User grade controls (read in Luma_MOH_Tonemap.hlsl via LumaSettings.GameSettings). All vanilla by default.
       default_luma_global_game_settings.Exposure = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
-      default_luma_global_game_settings.HighlightDechroma = 0.f; // off; only the mandatory DICE/gamut desaturation applies
+      default_luma_global_game_settings.HighlightDechroma = 0.f; // off; only PsychoV31's gamut compression desaturates
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Dithering = 1.f; // subtle anti-banding on by default
       // Read only by the legacy DevSetting04 A/B in the tonemap; no shipped path touches them (see NOTES section 20).
@@ -1224,7 +1224,7 @@ public:
       if (ImGui::SliderFloat("Vanilla Clip Whitening", &gs.HighlightsHueChroma, 0.f, 1.f, "%.2f"))
          device_data.cb_luma_global_settings_dirty = true;
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("chrominanceStrength of the same call: the fraction of the vanilla clip's own chroma loss that gets reproduced (0 = vanilla hue but our saturation). The only one of the two knobs that can whiten; DICE and Highlights Desaturation already whiten at peak, so raise this only against a measured A/B.");
+         ImGui::SetTooltip("chrominanceStrength of the same call: the fraction of the vanilla clip's own chroma loss that gets reproduced (0 = vanilla hue but our saturation). The only one of the two knobs that can whiten; PsychoV31 and Highlights Desaturation already whiten at peak, so raise this only against a measured A/B.");
 #endif
 
 #if ENABLE_BLOOM
@@ -1358,7 +1358,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
    }

@@ -13,9 +13,9 @@ struct LumaGameSettings
 {
    float RCASSharpness;          // 0 = off. RCAS on the scene in compose, before grain and GUI.
    float Exposure;               // 1 = vanilla. Multiplies the scene before the tone curve.
-   float Contrast;               // 1 = vanilla. Power contrast around mid-gray (0.18), before the display map.
-   float Saturation;             // 1 = vanilla. Scales linear RGB away from its BT.709 relative luminance, after the display map.
-   float HighlightsDesaturation; // 0 = off. DICE highlight desaturation.
+   float Contrast;               // 1 = vanilla. PsychoV31's contrast (its cone response power).
+   float Saturation;             // 1 = vanilla. PsychoV31's purity.
+   float HighlightsDesaturation; // 0 = off. PsychoV31 highlights desaturation (its "dechroma").
    float ColorGradingIntensity;  // 1 = vanilla. Blends the grade (TintColor.w saturation + LUT) with its input code.
    float VignetteIntensity;      // 1 = vanilla, 0 = none. Scales the tonemap's VignetteAmount.
    float FilmGrainIntensity;     // 1 = vanilla, 0 = off. Scales the compose's NoiseLevel.

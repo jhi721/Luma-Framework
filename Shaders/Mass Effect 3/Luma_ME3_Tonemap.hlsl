@@ -10,7 +10,7 @@
 //    bounded proxy, divide the scale back out, keep the native result's RGB ratios at the new luminance.
 //  - ALU (menus, squad, 3D previews): the classic UE3 formula grade with a hard clip and no tone curve. HDR is the UE3
 //    hard-clip canon shipped on ME1 2007 / BL GOTY: the same grade with its upper saturates lifted, a
-//    ReinhardPiecewise(5, ME3_HUE_REFERENCE_SHOULDER) hue reference and MacLeod-Boynton hue in BT.2020, then DICE.
+//    ReinhardPiecewise(5, ME3_HUE_REFERENCE_SHOULDER) hue reference and MacLeod-Boynton hue in BT.2020, then PsychoV31.
 // The HDR paths run only in the HDR Display Mode; SDR and TONEMAP_TYPE 0 output the exact vanilla grade.
 // Two dgVoodoo rules hold throughout: every fetch is followed by the b3 mask pair, and the entry points declare all 13
 // interpolators, because VS->PS linkage is by register.
@@ -20,10 +20,9 @@
 // LUMA_GAME_CB_STRUCTS before any shared header pulls Settings.hlsl, or GameSettings resolves to the empty dummy.
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
-#include "../Includes/ColorGradingLUT.hlsl" // SimpleGamutClip
-#include "../Includes/DICE.hlsl"
 #include "../Includes/Reinhard.hlsl"        // ReinhardRange (grade proxy), ReinhardPiecewise (ALU hue reference)
 #include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
+#include "../Includes/PsychoV31.hlsl"      // PsychoVDisplayMap
 #include "Includes/GameBindings.hlsl"
 // clang-format on
 
@@ -169,37 +168,8 @@ float3 ME3_SceneMix(float2 blurUV, float4 sceneUV)
 // Shared HDR tail pieces.
 // ---------------------------------------------------------------------------------------------------------------------
 
-// User contrast BEFORE the display map so DICE contains whatever it pushes up. Multiplicative around mid-gray
-// (Game-Paper-White-relative), the repo's form. [branch] keeps the 1.0 default bit-exact; the floored log2 keeps
-// Contrast 0 on black at 0 rather than pow(0, 0) = NaN.
-float3 ApplyUserContrast(float3 color)
-{
-   [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-   {
-      color = exp2(LumaSettings.GameSettings.Contrast * log2(max(max(color, 0.0) / MidGray, 1e-30))) * MidGray;
-   }
-   return color;
-}
-
-DICESettings ME3_DICESettings()
-{
-   DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   return settings;
-}
-
-float ME3_PaperWhite()
-{
-   return max(LumaSettings.GamePaperWhiteNits, 1.0) / sRGB_WhiteLevelNits;
-}
-
-float ME3_PeakWhite()
-{
-   return max(LumaSettings.PeakWhiteNits, LumaSettings.GamePaperWhiteNits) / sRGB_WhiteLevelNits;
-}
-
 // Shoulder of the ALU family's hue reference: the Reinhard donor's own, and the gate that skips the whole colour
-// stage below it. Tuned constant, not a user control; path-to-white stays with DICE at the display peak.
+// stage below it. Tuned constant, not a user control; path-to-white stays with PsychoV31 at the display peak.
 #define ME3_HUE_REFERENCE_SHOULDER      1.5
 #define MELE_HDR_BRIDGE_SHOULDER        0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
 #define MELE_HDR_PIVOT                  0.18 // p, scene mid-gray, where the tone-curve continuation starts.
@@ -292,32 +262,33 @@ float3 ME3_Grade(float3 untonemapped, bool hdr, float3 vignette)
       if (!MELE_TryEvaluateME3LEFilmicExtended(untonemapped, gradeIn, extendedIn))
          extendedIn = gradeIn;
 #endif
-      const float3 extendedLinear = ApplyUserContrast(gamma_to_linear(GradeUE3(extendedIn, false, 1.0), GCT_POSITIVE) * vignette);
+      const float3 extendedLinear = gamma_to_linear(GradeUE3(extendedIn, false, 1.0), GCT_POSITIVE) * vignette;
 
       // Colour stage in BT.2020: the soft per-channel reference bends a saturated highlight the way the vanilla clip
-      // did, without its whitening; MacLeod-Boynton rebuilds that hue on the signal's own purity. Then DICE, with
-      // InOutColorSpace BT.2020 so it does not convert a second time.
+      // did, without its whitening; MacLeod-Boynton rebuilds that hue on the signal's own purity. Then the
+      // display map (see "PsychoVDisplayMap"): its source boundary is BT.2020 on every pixel, as the hue stage can leave
+      // BT.709, so the map does not change at the gate below.
       //
       // The hue stage is gated on the donor's own shoulder, ONE constant for both so they cannot drift: below it
       // ReinhardPiecewise returns its input exactly, so the reference equals the target and the transfer is a
       // no-op. The test is taken in BT.709, before the conversion, because every BT.2020 channel is a convex
       // combination of the BT.709 ones (the matrix rows sum to 1) and so can never exceed their max. Worth a real
       // branch: the model runs purity solves, some 300 instructions that most of the frame does not need.
-      const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-      float3 diceInBT2020 = extendedBT2020;
+      float3 hueTransferred = extendedLinear;
       [branch] if (max3(extendedLinear) > ME3_HUE_REFERENCE_SHOULDER)
       {
+         const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
          const float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, ME3_HUE_REFERENCE_SHOULDER);
-         diceInBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
+         hueTransferred = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020));
       }
-      DICESettings settings = ME3_DICESettings();
-      settings.InOutColorSpace = CS_BT2020;
-      float3 hdrColor = DICETonemap(diceInBT2020 * ME3_PaperWhite(), ME3_PeakWhite(), settings) / ME3_PaperWhite();
-      hdrColor = BT2020_To_BT709(SimpleGamutClip(hdrColor, true));
-      hdrColor = Saturation(hdrColor, LumaSettings.GameSettings.Saturation);
+      const float3 hdrColor = PsychoVDisplayMap(hueTransferred,
+                                                LumaSettings.GameSettings.Contrast,
+                                                LumaSettings.GameSettings.Saturation,
+                                                LumaSettings.GameSettings.HighlightDechroma,
+                                                renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
 
       // The output scale is also the engine fade: re-applied last, as the gain the vanilla chain gives it (before the
-      // gamma exponent and the display decode), so a fade matches vanilla instead of biasing the hue stage or DICE.
+      // gamma exponent and the display decode), so a fade matches vanilla instead of biasing the hue stage or the map.
       color = hdrColor * gamma_to_linear(PowUE3(GammaColorScaleAndInverse.xyz, GammaColorScaleAndInverse.www), GCT_POSITIVE);
    }
    else
@@ -504,7 +475,7 @@ float4 RunME3Uber(float2 blurUV, float4 sceneUV)
    const float2 screenUV = sceneUV.zw;
 #endif
    const float2 vignetteUV = screenUV * ScreenUVScaleBias.xy + ScreenUVScaleBias.zw;
-   // Vignette hoisted ahead of the display map (MELE), so DICE absorbs its >1 blue white point.
+   // Vignette hoisted ahead of the display map (MELE), so PsychoV31 absorbs its >1 blue white point.
 #if ME3_UBER_VIGNETTE
    const float3 vignette = ME3_VignetteLinear(vignetteUV);
 #else
@@ -518,8 +489,11 @@ float4 RunME3Uber(float2 blurUV, float4 sceneUV)
 #if TONEMAP_TYPE >= 1
    if (hdr)
    {
-      color = DICETonemap(ApplyUserContrast(color) * ME3_PaperWhite(), ME3_PeakWhite(), ME3_DICESettings()) / ME3_PaperWhite();
-      color = Saturation(color, LumaSettings.GameSettings.Saturation);
+      // See "PsychoVDisplayMap".
+      color = PsychoVDisplayMap(color,
+                                LumaSettings.GameSettings.Contrast,
+                                LumaSettings.GameSettings.Saturation,
+                                LumaSettings.GameSettings.HighlightDechroma);
    }
 #endif
 #endif

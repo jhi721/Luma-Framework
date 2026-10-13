@@ -20,12 +20,12 @@
 // Left vanilla: rl_hdr_07 0xFEE7D6DC (no technique name, not seen; its Debug_bloom_buffer / Debug_lummap switches mark a
 // debug view) and the whole rl_hdr_prince family (never loaded by either exe).
 //
-// Scene peak and gamut containment are DICE's; nothing after it re-clamps.
+// Scene peak and gamut containment are PsychoV31's; nothing after it re-clamps.
 
 // clang-format off
 // ORDER IS LOAD-BEARING - the game-local Common defines the settings struct before the shared includes.
 #include "Includes/Common.hlsl"
-#include "../Includes/DICE.hlsl"
+#include "../Includes/PsychoV31.hlsl"
 // clang-format on
 
 #ifndef TONEMAP_TYPE

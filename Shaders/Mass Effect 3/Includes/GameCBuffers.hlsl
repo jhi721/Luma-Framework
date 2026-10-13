@@ -12,9 +12,9 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;           // 1 = vanilla. Scene-referred multiplier, pre-grade.
-   float Saturation;         // 1 = vanilla. Luminance-relative lerp on the final HDR colour, after the display map.
-   float HighlightDechroma;  // 0 = off (default). DICE HighlightsDesaturation: max channel ramps toward white from a third of peak.
-   float Contrast;           // 1 = vanilla. Multiplicative contrast around 18% mid-gray, before the display map.
+   float Saturation;         // 1 = vanilla. PsychoV31 saturation (its purity) in the HDR display map.
+   float HighlightDechroma;  // 0 = off (default). PsychoV31 highlights desaturation (its "dechroma") in the HDR display map.
+   float Contrast;           // 1 = vanilla. PsychoV31 contrast (its cone response power) in the HDR display map.
    float VignetteIntensity;  // 1 = vanilla radial darkening, 0 = flat. The blue-tinted white point stays either way.
    float FilmGrainIntensity; // 1 = vanilla grain amplitude, 0 = off. Only the grain perms read it.
    float Dithering;          // 0/1. Animated triangular output dither.

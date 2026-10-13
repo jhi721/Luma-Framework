@@ -2405,7 +2405,7 @@ public:
 #endif
       // Game-specific toggle consumed by the tonemap replacement (Luma_BL2TPS_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla grade (reference)\n1 - HDR: native grade + reconstructed luminance + DICE display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla grade (reference)\n1 - HDR: native grade + reconstructed luminance + PsychoV31 display map", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -2456,9 +2456,9 @@ public:
       // User settings mirrored into LumaSettings.GameSettings; GameCBuffers.hlsl says which act in SDR too.
       default_luma_global_game_settings.Exposure = 1.f;           // scene multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;         // BT.709-luminance lerp (Color.hlsl Saturation)
-      default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only mandatory DICE/gamut desat applies
+      default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only PsychoV31's gamut compression desaturates
       default_luma_global_game_settings.BloomIntensity = 1.f;     // seed only; OnDrawOrDispatch owns the effective value
-      default_luma_global_game_settings.Contrast = 1.f;           // multiplicative around 18% mid-gray, pre-DICE
+      default_luma_global_game_settings.Contrast = 1.f;           // PsychoV31's contrast (its cone response power)
       default_luma_global_game_settings.VignetteIntensity = 1.f;  // game vignette darkening scale
       default_luma_global_game_settings.LumaBloomEnable = 1.f;    // 1 = Luma HDR pyramidal bloom, 0 = vanilla game bloom
       default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR and SDR), anti-banding on
@@ -4114,7 +4114,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)"

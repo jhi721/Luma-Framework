@@ -3271,7 +3271,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"

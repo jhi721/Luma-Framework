@@ -12,7 +12,7 @@
 #endif
 
 // Whether the composite and ApplyFxaa take the Luma HDR path (HDR display mode only). TONEMAP_TYPE 0 keeps the vanilla SDR output on
-// HDR displays too: no extension, DICE or dither (scene sliders still apply).
+// HDR displays too: no extension, display map or dither (scene sliders still apply).
 #define P5S_HDR_SCENE (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
 
 // The display's peak relative to UI paper white, in swapchain units (1 outside HDR): what the UI's additive blends and RCAS may reach

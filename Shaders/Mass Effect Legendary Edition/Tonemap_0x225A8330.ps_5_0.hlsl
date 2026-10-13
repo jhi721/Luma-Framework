@@ -9,7 +9,6 @@
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
-#include "../Includes/DICE.hlsl"
 #include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
 #include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
@@ -82,6 +81,9 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
 #include "Includes/Tonemap_MELE_HueReference.hlsli"
+// PsychoVDisplayMap, for the shared output tail. After the hue reference, whose "ColorGradingLUT.hlsl" (through
+// "ACES.hlsl") turns back on the X4000 warning PsychoV31 turns off.
+#include "../Includes/PsychoV31.hlsl"
 
 void main(
     float4 v0 : TEXCOORD0,

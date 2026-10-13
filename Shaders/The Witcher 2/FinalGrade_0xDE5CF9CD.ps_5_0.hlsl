@@ -2,17 +2,17 @@
 // ORDER MATTERS — see Luma_TW2_Tonemap.hlsl (game-local Common.hlsl defines LumaGameSettings first).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings — keep FIRST
 #include "../Includes/Color.hlsl"
-#include "../Includes/DICE.hlsl"
 #include "../Includes/Reinhard.hlsl"    // Reinhard::ReinhardPiecewise, the soft hue reference
 #include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
 #include "Includes/GameBindings.hlsl"   // b3/b4, the dgVoodoo masks, ApplyDgvMask, DgVoodooRcp, DgVoodooLog2
+#include "../Includes/PsychoV31.hlsl"     // PsychoVDisplayMap
 // clang-format on
 
 // The Witcher 2 FINAL GRADE pass (dgVoodoo -> ps_5_0, hash 0xDE5CF9CD), the engine's
 // CEnvFinalColorBalanceParameters: FXAA + shadow offset, midtone power and highlight gain + luma-keyed split
 // toning + vignette, on the full-res fp16 canvas right before the UI draws.
 // Vanilla body transcribed VERBATIM (register-level, constants cb4[N] = DX9 c(N-8)). This is also where the
-// Luma HDR output block lives (highlight hue + DICE + UI paper-white pre-scale): the highlight split tone lerps
+// Luma HDR output block lives (highlight hue + PsychoV31 + UI paper-white pre-scale): the highlight split tone lerps
 // toward a SATURATED luma target and soft-clips everything above 1.0, so the HDR range dies here unless it is
 // rebuilt after it. The tonemap replacements stay vanilla-only.
 //
@@ -256,16 +256,13 @@ void main(
       float3 postProcessedColor;
       if (LumaSettings.DisplayMode == 1) // HDR
       {
-         const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
-         const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
-
          // Highlight hue: the colour stage of the other hard-clip ports (Borderlands GOTY, Medal of Honor Airborne,
          // Mass Effect 2007 and 2010) and of RenoDX's BL1 template. Vanilla clipped per channel twice, in the glow blend
          // before this grade and in the 8-bit present blit after it, which bends a bright saturated source toward
          // yellow-white; Luma removes both clips. This stage bends the hue the same way, partway and without the
          // whitening: a per-channel ReinhardPiecewise(5, 1.5) of the colour itself in BT.2020 supplies a hue DIRECTION,
-         // and MacLeod-Boynton rebuilds it on the colour's own purity and T = L + M, before the display map so DICE rolls
-         // off the bent colour. Full hue strength and no purity transfer (the RenoDX ports' Hue Shift 100% and Blowout 0),
+         // and MacLeod-Boynton rebuilds it on the colour's own purity and T = L + M, before the display map so PsychoV31 maps
+         // the bent colour. Full hue strength and no purity transfer (the RenoDX ports' Hue Shift 100% and Blowout 0),
          // fixed rather than exposed. The clip colour itself is no reference: a fully clipped one is achromatic, with no
          // MacLeod-Boynton direction at all.
          // The gate sits at the reference's shoulder: below it ReinhardPiecewise returns its input exactly, and the
@@ -279,31 +276,12 @@ void main(
             lin = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(target2020, Reinhard::ReinhardPiecewise(target2020, 5.0, hueReferenceShoulder)));
          }
 
-         // User contrast BEFORE the display map so DICE contains whatever it pushes up: after the rolloff the
-         // slider would escape the peak it just established, and nothing downstream re-contains it.
-         // Multiplicative around mid-gray, the repo's form (RenoDX_Contrast); 0.18 is mid-gray here too,
-         // display-referred with 1.0 = paper white (code 0.5). Gated so the shipped 1.0 stays bit-exact. The pow
-         // is spelled out with a floored log2 so Contrast 0 on a black pixel is 0 * log2(1e-30) = 0 rather than
-         // pow(0, 0) = NaN. Black stays black at every setting (0^C = 0).
-         [branch] if (LumaSettings.GameSettings.Contrast != 1.0)
-         {
-            const float midGray = 0.18;
-            lin = exp2(LumaSettings.GameSettings.Contrast * log2(max(lin / midGray, 1e-30))) * midGray;
-         }
-
-         DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-         // Highlight dechroma handed to DICE rather than run as our own pass afterwards. Core's is better placed: it ramps
-         // on the MAX CHANNEL (by luminance a bright blue never triggers), exists only between ShoulderStart * PeakWhite
-         // and peak (1/3 of peak for this type, so mid-tones cannot be touched), and runs INSIDE the containment in the
-         // processing primaries. 0 = off for the OUTPUT but not the cost: DICE's guard carries no [branch], so fxc
-         // flattens it for every pixel above the shoulder.
-         settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-         float3 hdr = DICETonemap(lin * paperWhite, peakWhite, settings) / paperWhite;
-
-         // User saturation LAST, after the display map: the repo's convention.
-         hdr = Saturation(hdr, LumaSettings.GameSettings.Saturation);
-
-         postProcessedColor = hdr;
+         // See "PsychoVDisplayMap". The hue stage above works in BT.2020, so its colours can leave BT.709.
+         postProcessedColor = PsychoVDisplayMap(lin,
+                                                LumaSettings.GameSettings.Contrast,
+                                                LumaSettings.GameSettings.Saturation,
+                                                LumaSettings.GameSettings.HighlightDechroma,
+                                                renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
       }
       else // SDR (still presented through the scRGB swapchain)
       {
