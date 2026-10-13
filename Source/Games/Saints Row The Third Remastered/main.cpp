@@ -6,6 +6,8 @@
 #define ENABLE_SMAA 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
+// A third "Super Resolution" choice next to DLAA and FSR 3, drawn in process on any GPU, on the same inputs
+#define ENABLE_LUMA_TAA 1
 
 #include "..\..\Core\core.hpp"
 #if DEVELOPMENT
@@ -884,7 +886,7 @@ public:
    }
 
 #if ENABLE_SR
-   // DLAA / FSR 3 in place of the game's TAA dispatch, on its inputs (t0 color, t1 depth, t3 motion vectors, u0 output) converted to what SR takes.
+   // DLAA / FSR 3 / Luma TAA in place of the game's TAA dispatch, on its inputs (t0 color, t1 depth, t3 motion vectors, u0 output) converted to what SR takes.
    // Returns None, and the game's TAA runs, when SR is off or an input, the shader or the scratch is missing.
    DrawOrDispatchOverrideType DrawSRInPlaceOfTAA(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
@@ -1217,7 +1219,7 @@ public:
       PROCESS_MEMORY_COUNTERS_EX pmc = {sizeof(pmc)};
       GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
       const auto& game_device_data = GetGameDeviceData(device_data);
-      const char* const sr_name = (device_data.sr_type == SR::Type::DLSS ? "DLSS" : (device_data.sr_type == SR::Type::FSR ? "FSR 3" : "None"));
+      const char* const sr_name = SR::GetTypeName(device_data.sr_type);
       const bool core_smaa = device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h] != nullptr;
       constexpr double MiB = 1024.0 * 1024.0;
       reshade::log::message(reshade::log::level::info, std::format("[SRTTR Mem] \"{}\" vram local={:.1f} non-local={:.1f} MiB private={:.1f} MiB sr={} game_taa={} smaa={}x{} core_smaa={} xegtao={}x{} sr_mvs={} sr_depth_copy={} output={}x{}",
@@ -1370,7 +1372,7 @@ public:
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("The game's TAA only uses half of the detail it was designed to gather over frames. This fixes it, for a sharper, steadier image.\nDLAA / FSR 3 always use their own fix.");
+         ImGui::SetTooltip("The game's TAA only uses half of the detail it was designed to gather over frames. This fixes it, for a sharper, steadier image.\nDLAA, FSR 3 and Luma TAA always use their own fix.");
       }
       DrawResetButton(fix_native_taa_jitter, true, "FixNativeTAAJitter"); // Hidden while forced on
       if (!sr_active)
@@ -1479,8 +1481,8 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Saints Row: The Third Remastered\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, replaces the game's TAA with DLAA or FSR 3 native anti-aliasing, its FXAA with SMAA and its SSAO with XeGTAO, plus 16x anisotropic filtering and a fix for the game's TAA jitter.\n"
-         "Set Anti-Aliasing in the game's display settings to TAA for DLAA and FSR 3, or to FXAA for SMAA, and enable Ambient Occlusion for XeGTAO.\n"
+         "It adds HDR, replaces the game's TAA with DLAA, FSR 3 native anti-aliasing or Luma TAA, its FXAA with SMAA and its SSAO with XeGTAO, plus 16x anisotropic filtering and a fix for the game's TAA jitter.\n"
+         "Set Anti-Aliasing in the game's display settings to TAA for DLAA, FSR 3 and Luma TAA, or to FXAA for SMAA, and enable Ambient Occlusion for XeGTAO.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
