@@ -8,6 +8,8 @@ using namespace Shader;
 // Make sure all variables are default initialized.
 struct GameDeviceData
 {
+   virtual ~GameDeviceData() = default; // Games derive from this and own resources; Core deletes through the base pointer
+
    ManagedResources managed_resources;
 };
 

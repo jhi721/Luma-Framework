@@ -15236,6 +15236,7 @@ namespace
             }
 
             game->DrawImGuiSettings(device_data);
+            device_data.cb_luma_global_settings_dirty = true; // Again after the game's settings, so their edits are never missed by an upload that ran in between
 
 #if DEVELOPMENT || TEST
             ImGui::SetNextItemOpen(true, ImGuiCond_Once);
