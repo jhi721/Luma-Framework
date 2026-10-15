@@ -737,8 +737,6 @@ public:
       device_data.game = new MedalOfHonorGameDeviceData;
    }
 
-   // Core never frees "device_data.game" itself, and GameDeviceData has no virtual destructor, so delete through
-   // the concrete type.
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
       // Core's own device teardown asserts this map is already empty (core.hpp, OnDestroyDevice), because it expects
@@ -756,8 +754,7 @@ public:
          device_data.custom_sampler_by_original_sampler.clear();
       }
 
-      delete static_cast<MedalOfHonorGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -1124,7 +1121,6 @@ public:
       {
          reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
          gs.SMAAEnable = g_smaa_enable ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's EdgeAA with SMAA (sharper edges instead of a blur).");
@@ -1165,51 +1161,43 @@ public:
 
       ImGui::SeparatorText("Grade");
 
-      if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Overall image brightness (1 = vanilla).");
       if (DrawResetButton<float, false>(gs.Exposure, gs_def.Exposure, "Exposure"))
       {
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
       }
 
-      if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.5f, 1.5f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Contrast", &gs.Contrast, 0.5f, 1.5f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Overall image contrast, HDR only (1 = vanilla).");
       if (DrawResetButton<float, false>(gs.Contrast, gs_def.Contrast, "Contrast"))
       {
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
       }
 
-      if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Color saturation, HDR only (1 = vanilla).");
       if (DrawResetButton<float, false>(gs.Saturation, gs_def.Saturation, "Saturation"))
       {
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
       }
 
-      if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("How soon bright sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       if (DrawResetButton<float, false>(gs.HighlightDechroma, gs_def.HighlightDechroma, "HighlightsDesaturation"))
       {
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
       }
 
@@ -1217,12 +1205,10 @@ public:
       // LEGACY A/B ONLY, and guarded to match the shader: the only code that reads these is the DevSetting04
       // branch in Luma_MOH_Tonemap.hlsl, which is #if DEVELOPMENT. The shipped max-channel path needs no hue
       // restoration. Both go when that A/B is settled.
-      if (ImGui::SliderFloat("Vanilla Clip Hue", &gs.HighlightsHueStrength, 0.f, 1.f, "%.2f"))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Vanilla Clip Hue", &gs.HighlightsHueStrength, 0.f, 1.f, "%.2f");
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("hueStrength of the vanilla highlight emulation: how much of the vanilla clip's hue angle the recovered highlight adopts (0.8 default). Never changes saturation by itself. Keep it below 1.0 — the hue runs away as the helper's chrominance ratio goes singular and white-hot pixels turn cyan.");
-      if (ImGui::SliderFloat("Vanilla Clip Whitening", &gs.HighlightsHueChroma, 0.f, 1.f, "%.2f"))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Vanilla Clip Whitening", &gs.HighlightsHueChroma, 0.f, 1.f, "%.2f");
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("chrominanceStrength of the same call: the fraction of the vanilla clip's own chroma loss that gets reproduced (0 = vanilla hue but our saturation). The only one of the two knobs that can whiten; PsychoV31 and Highlights Desaturation already whiten at peak, so raise this only against a measured A/B.");
 #endif
@@ -1234,7 +1220,6 @@ public:
       {
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
@@ -1243,28 +1228,24 @@ public:
       // can reach the game's own glow.
       ImGui::BeginDisabled(!g_luma_bloom_enable);
 
-      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
       if (DrawResetButton<float, false>(gs.BloomIntensity, gs_def.BloomIntensity, "BloomIntensity"))
       {
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
       }
 
 #if DEVELOPMENT || TEST
-      if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f");
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Where the glow starts, as a FRACTION OF SDR WHITE.\n1.0 = exactly what the game's own tonemap clips. The prefilter resolves it from the live SceneExposure.z,\nso it follows the engine per-area exposure on its own. Near 0 the whole scene glows.");
       if (DrawResetButton<float, false>(gs.BloomThreshold, gs_def.BloomThreshold, "BloomThreshold"))
       {
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
       }
 
@@ -1295,7 +1276,6 @@ public:
       if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
       }
       if (ImGui::IsItemHovered())

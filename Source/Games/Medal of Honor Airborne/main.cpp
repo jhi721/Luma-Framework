@@ -1976,15 +1976,12 @@ public:
 #endif
    }
 
-   // Core calls this at device destruction but never frees "device_data.game", so the allocation is ours (TW2/BL2).
-   // GameDeviceData has no virtual destructor: delete through the concrete type or members leak.
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      delete static_cast<MedalOfHonorAirborneGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
 #if ENABLE_SMAA
@@ -2673,12 +2670,10 @@ public:
          if (ImGui::SliderFloat(label, value, 0.f, max_value))
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
-            device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", tooltip);
-         if (DrawResetButton(*value, default_value, key))
-            device_data.cb_luma_global_settings_dirty = true;
+         DrawResetButton(*value, default_value, key);
       };
 
       slider("Exposure", &gs.Exposure, gs_def.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
@@ -2693,7 +2688,6 @@ public:
       {
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
@@ -2713,12 +2707,10 @@ public:
       if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
       {
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Linear scene brightness where bloom starts. 1.0 is where the game's own bright-pass sits,\nand the scene peaks around 3.9, so only real light sources glow.\nNear 0 the whole scene glows — that is the failure mode, not a setting.");
-      if (DrawResetButton(gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, "BloomThreshold"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, "BloomThreshold");
 
       {
          // Says at a glance whether the capture ever succeeded, and whether the engine actually authors this per
@@ -2739,7 +2731,6 @@ public:
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
@@ -2748,12 +2739,10 @@ public:
       if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Video highlight strength (0 = off).");
-      if (DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
@@ -2761,7 +2750,6 @@ public:
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");

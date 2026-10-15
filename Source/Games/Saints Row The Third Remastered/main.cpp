@@ -1038,13 +1038,6 @@ public:
       device_data.game = new SaintsRowTheThirdRemasteredGameDeviceData;
    }
 
-   void OnDestroyDeviceData(DeviceData& device_data) override
-   {
-      // GameDeviceData has no virtual destructor
-      delete static_cast<SaintsRowTheThirdRemasteredGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
-   }
-
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1268,10 +1261,7 @@ public:
       const auto& defaults = default_luma_global_game_settings;
       const auto slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         ImGui::SliderFloat(label, value, 0.f, max_value);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -1280,10 +1270,7 @@ public:
          {
             ImGui::SetTooltip("%s", tooltip);
          }
-         if (DrawResetButton(*value, default_value, key))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         DrawResetButton(*value, default_value, key);
       };
 
       // A float setting shown as a checkbox; returns whether it's on
@@ -1293,17 +1280,13 @@ public:
          if (ImGui::Checkbox(label, &enabled))
          {
             *value = (enabled ? 1.f : 0.f);
-            device_data.cb_luma_global_settings_dirty = true;
             reshade::set_config_value(nullptr, NAME, key, *value);
          }
          if (ImGui::IsItemHovered())
          {
             ImGui::SetTooltip("%s", tooltip);
          }
-         if (DrawResetButton(*value, default_value, key))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         DrawResetButton(*value, default_value, key);
          return *value > 0.5f;
       };
 
@@ -1350,7 +1333,6 @@ public:
       if (ImGui::Checkbox("Hide Gameplay UI", &hide_gameplay_ui))
       {
          settings.HideGameplayUI = (hide_gameplay_ui ? 1.f : 0.f);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
       {

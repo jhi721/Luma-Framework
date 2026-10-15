@@ -2492,9 +2492,7 @@ public:
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
-      delete static_cast<Borderlands2GameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    // dgVoodoo sometimes leaves blending ENABLED on a secondary RT while RT0 has it off; D3D9 has one global blend
@@ -3985,10 +3983,7 @@ public:
       // A [0, max] float setting: slider, saved when the edit ends, reset button (saved too)
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         ImGui::SliderFloat(label, value, 0.f, max);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -3999,7 +3994,6 @@ public:
          }
          if (DrawResetButton<float, false>(*value, default_value, key))
          {
-            device_data.cb_luma_global_settings_dirty = true;
             reshade::set_config_value(nullptr, NAME, key, *value);
          }
       };
@@ -4015,7 +4009,6 @@ public:
          if (ImGui::Checkbox(label, value))
          {
             *shader_value = *value ? 1.f : 0.f;
-            device_data.cb_luma_global_settings_dirty = true;
             reshade::set_config_value(nullptr, NAME, key, *value);
          }
          if (ImGui::IsItemHovered())
@@ -4047,7 +4040,6 @@ public:
       if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = dithering ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
       }
       if (ImGui::IsItemHovered())

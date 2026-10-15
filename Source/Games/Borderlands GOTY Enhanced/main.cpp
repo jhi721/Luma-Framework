@@ -1848,9 +1848,7 @@ public:
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
-      delete static_cast<BorderlandsGotyGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -2700,12 +2698,10 @@ public:
          if (ImGui::SliderFloat(label, value, 0.f, max_value))
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
-            device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", tooltip);
-         if (DrawResetButton(*value, default_value, key))
-            device_data.cb_luma_global_settings_dirty = true;
+         DrawResetButton(*value, default_value, key);
       };
       ImGui::SeparatorText("Grade");
       slider("Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
@@ -2743,20 +2739,17 @@ public:
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
 
       ImGui::BeginDisabled(!video_auto_hdr);
-      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Video highlight strength (0 = off).");
-      if (DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
@@ -2764,7 +2757,6 @@ public:
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");

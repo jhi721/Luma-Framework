@@ -1060,41 +1060,33 @@ public:
       {
          ImGui::SeparatorText("Grade");
 
-         if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
-            device_data.cb_luma_global_settings_dirty = true;
+         ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f);
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Overall image brightness (1 = vanilla).");
-         if (DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure"))
-            device_data.cb_luma_global_settings_dirty = true;
+         DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure");
 
-         if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
-            device_data.cb_luma_global_settings_dirty = true;
+         ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f);
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Overall image contrast (1 = vanilla).");
-         if (DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast"))
-            device_data.cb_luma_global_settings_dirty = true;
+         DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast");
 
-         if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
-            device_data.cb_luma_global_settings_dirty = true;
+         ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f);
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Color saturation (1 = vanilla).");
-         if (DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation"))
-            device_data.cb_luma_global_settings_dirty = true;
+         DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation");
 
-         if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
-            device_data.cb_luma_global_settings_dirty = true;
+         ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f);
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, "HighlightDechroma", gs.HighlightDechroma);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("How far the brightest sources fade to neutral white (0 = keep color at any brightness).");
-         if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightDechroma"))
-            device_data.cb_luma_global_settings_dirty = true;
+         DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightDechroma");
       }
 
       ImGui::SeparatorText("Bloom");
@@ -1106,14 +1098,12 @@ public:
          ImGui::SetTooltip("Replaces the game's bloom with a smoother version of the same glow.");
 
       ImGui::BeginDisabled(!g_luma_bloom_enable);
-      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
-      if (DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity");
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Ambient Occlusion");
@@ -1150,20 +1140,17 @@ public:
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
 
       ImGui::BeginDisabled(!video_auto_hdr);
-      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
-         device_data.cb_luma_global_settings_dirty = true;
+      ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f);
       if (ImGui::IsItemDeactivatedAfterEdit())
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Video highlight strength (0 = off).");
-      if (DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
@@ -1171,7 +1158,6 @@ public:
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");
@@ -1186,13 +1172,6 @@ public:
    {
       device_data.game = new YakuzaRCDeviceData;
       reshade::log::message(reshade::log::level::info, (std::string("[YRC] game profile: ") + g_game_profile.name).c_str());
-   }
-
-   void OnDestroyDeviceData(DeviceData& device_data) override
-   {
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
-      delete static_cast<YakuzaRCDeviceData*>(device_data.game);
-      device_data.game = nullptr;
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override

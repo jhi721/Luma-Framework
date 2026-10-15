@@ -1208,14 +1208,12 @@ public:
 #endif
    }
 
-   // Core's default deletes through GameDeviceData*, which has no virtual destructor: delete the concrete type.
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      delete static_cast<TheWitcherGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -1442,7 +1440,6 @@ public:
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
@@ -1451,12 +1448,10 @@ public:
       if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Video highlight strength (0 = off).");
-      if (DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
@@ -1464,7 +1459,6 @@ public:
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");

@@ -868,7 +868,6 @@ public:
       {
          gs.LumaBloomEnable = luma_bloom ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", gs.LumaBloomEnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
@@ -890,7 +889,6 @@ public:
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
@@ -903,7 +901,6 @@ public:
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");

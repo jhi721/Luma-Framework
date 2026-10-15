@@ -2639,9 +2639,7 @@ public:
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
-      delete static_cast<MassEffectGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    // Capture bright-pass cb0 into a staging ring and map the oldest entry with DO_NOT_WAIT, so the readback
@@ -3891,10 +3889,7 @@ public:
       // NAME, but LoadConfigs reads PROJECT_NAME)
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         ImGui::SliderFloat(label, value, 0.f, max);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
             reshade::set_config_value(nullptr, PROJECT_NAME, key, *value);
@@ -3905,7 +3900,6 @@ public:
          }
          if (DrawResetButton<float, false>(*value, default_value, key))
          {
-            device_data.cb_luma_global_settings_dirty = true;
             reshade::set_config_value(nullptr, PROJECT_NAME, key, *value);
          }
       };
@@ -3925,7 +3919,6 @@ public:
       if (ImGui::Checkbox("Luma Bloom Enable", &g_bloom_enable))
       {
          reshade::set_config_value(nullptr, PROJECT_NAME, "BloomEnable", g_bloom_enable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
       {
@@ -3999,7 +3992,6 @@ public:
          {
             reshade::set_config_value(nullptr, PROJECT_NAME, "VideoAutoHDREnable", g_video_auto_hdr_enable);
             gs.VideoAutoHDREnable = (g_video_auto_hdr_enable ? 1.f : 0.f);
-            device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered())
          {
@@ -4014,7 +4006,6 @@ public:
       if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = (dithering ? 1.f : 0.f);
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, PROJECT_NAME, "Dithering", gs.Dithering);
       }
       if (ImGui::IsItemHovered())

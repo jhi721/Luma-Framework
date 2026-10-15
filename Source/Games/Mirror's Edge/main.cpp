@@ -2290,9 +2290,7 @@ public:
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members
-      delete static_cast<MirrorsEdgeGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
@@ -2555,16 +2553,12 @@ public:
          if (ImGui::SliderFloat(label, value, 0.f, max_value))
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
-            device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered())
          {
             ImGui::SetTooltip("%s", tooltip);
          }
-         if (DrawResetButton(*value, default_value, key))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         DrawResetButton(*value, default_value, key);
       };
 
       slider("Exposure", &gs.Exposure, gs_def.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
@@ -2583,16 +2577,12 @@ public:
          {
             *value = (enabled ? 1.f : 0.f);
             reshade::set_config_value(nullptr, NAME, key, *value);
-            device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered())
          {
             ImGui::SetTooltip("%s", tooltip);
          }
-         if (DrawResetButton(*value, default_value, key))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         DrawResetButton(*value, default_value, key);
       };
 
       ImGui::SeparatorText("Effects");

@@ -1352,9 +1352,8 @@ public:
 
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members. Cleared first: those
-      // releases can fire "destroy_resource", whose hook reads it.
-      delete static_cast<Persona5StrikersGameDeviceData*>(std::exchange(device_data.game, nullptr));
+      // Cleared before the delete: releasing its members can fire "destroy_resource", whose hook reads it.
+      delete std::exchange(device_data.game, nullptr);
    }
 
    void OnInit(bool async) override
@@ -3338,25 +3337,18 @@ public:
          {
             *value = (enabled ? 1.f : 0.f);
             reshade::set_config_value(nullptr, NAME, key, *value);
-            device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
             ImGui::SetTooltip("%s", tooltip);
          }
-         if (DrawResetButton(*value, default_value, key))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         DrawResetButton(*value, default_value, key);
          return *value > 0.5f;
       };
       // Persisted GameSettings slider, saved once the edit ends
       const auto settings_slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         ImGui::SliderFloat(label, value, 0.f, max_value);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -3365,10 +3357,7 @@ public:
          {
             ImGui::SetTooltip("%s", tooltip);
          }
-         if (DrawResetButton(*value, default_value, key))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         DrawResetButton(*value, default_value, key);
       };
 
       ImGui::SeparatorText("Anti-Aliasing");

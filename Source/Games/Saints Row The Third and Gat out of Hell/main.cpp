@@ -389,13 +389,6 @@ public:
       device_data.game = new SaintsRowTheThirdGameDeviceData;
    }
 
-   void OnDestroyDeviceData(DeviceData& device_data) override
-   {
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
-      delete static_cast<SaintsRowTheThirdGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
-   }
-
    // Sharpened alpha (Golus) for alpha to coverage: "o0.a" becomes saturate((a - Alpha_Threshold) / fwidth(a) + 0.5), so
    // coverage is full inside a cut-out and only ramps across its edge pixel; the plain alpha would thin foliage out, since
    // vanilla draws everything above the threshold opaque. In every listed shader rX.w is the tested alpha (the one compared
@@ -1096,7 +1089,6 @@ public:
          {
             *value = enabled ? 1.f : 0.f;
             reshade::set_config_value(nullptr, NAME, key, *value);
-            device_data.cb_luma_global_settings_dirty = true;
          }
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", tooltip);
@@ -1104,14 +1096,12 @@ public:
       };
       const auto slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
-            device_data.cb_luma_global_settings_dirty = true;
+         ImGui::SliderFloat(label, value, 0.f, max_value);
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(nullptr, NAME, key, *value);
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("%s", tooltip);
-         if (DrawResetButton(*value, default_value, key))
-            device_data.cb_luma_global_settings_dirty = true;
+         DrawResetButton(*value, default_value, key);
       };
 
       ImGui::SeparatorText("Anti-Aliasing");

@@ -2286,14 +2286,12 @@ public:
 #endif
    }
 
-   // Core's default deletes through GameDeviceData*, which has no virtual destructor: delete the concrete type.
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      delete static_cast<MassEffectGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    // b12 at the gamma seam: whether the uber ran (skipped in elevators), which the gamma replacement branches on.
@@ -3484,42 +3482,34 @@ public:
       if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Overall image brightness (1 = vanilla).");
-      if (DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure");
 
       if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Overall image contrast, HDR only (1 = vanilla).");
-      if (DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast");
 
       if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Color saturation, HDR only (1 = vanilla).");
-      if (DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation");
 
       if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
-      if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation");
 
 #if DEVELOPMENT
       if (ImGui::Button("Dump Pass Constants"))
@@ -3534,7 +3524,6 @@ public:
       {
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
@@ -3545,23 +3534,19 @@ public:
       if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
-      if (DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity");
 
 #if DEVELOPMENT
       if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
       {
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Linear scene brightness where bloom starts. 1.0 is where the game's own bright-pass sits.\nNear 0 the whole scene glows — that is the failure mode, not a setting.");
-      if (DrawResetButton(gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, "BloomThreshold"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, "BloomThreshold");
 
 #endif // DEVELOPMENT
       ImGui::EndDisabled();
@@ -3574,7 +3559,6 @@ public:
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
@@ -3583,12 +3567,10 @@ public:
       if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Video highlight strength (0 = off).");
-      if (DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
@@ -3596,7 +3578,6 @@ public:
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");

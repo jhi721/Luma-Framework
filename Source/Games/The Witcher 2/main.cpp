@@ -2859,9 +2859,7 @@ public:
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
-      // GameDeviceData lacks a virtual destructor; delete through the concrete type to release derived members.
-      delete static_cast<TheWitcher2GameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
+      Game::OnDestroyDeviceData(device_data);
    }
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -3462,10 +3460,7 @@ public:
       // writes the config itself). AllowWhenDisabled so the tooltip still shows inside a BeginDisabled block.
       const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max_value, const char* tooltip)
       {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         ImGui::SliderFloat(label, value, 0.f, max_value);
          if (ImGui::IsItemDeactivatedAfterEdit())
          {
             reshade::set_config_value(nullptr, NAME, key, *value);
@@ -3474,10 +3469,7 @@ public:
          {
             ImGui::SetTooltip("%s", tooltip);
          }
-         if (DrawResetButton(*value, default_value, key))
-         {
-            device_data.cb_luma_global_settings_dirty = true;
-         }
+         DrawResetButton(*value, default_value, key);
       };
 
       slider("Exposure", &gs.Exposure, gs_def.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
@@ -3546,7 +3538,6 @@ public:
          if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
          {
             gs.VideoAutoHDREnable = (video_auto_hdr ? 1.f : 0.f);
-            device_data.cb_luma_global_settings_dirty = true;
             reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", video_auto_hdr);
          }
          if (ImGui::IsItemHovered())
@@ -3563,7 +3554,6 @@ public:
       if (ImGui::Checkbox("Dithering", &dithering))
       {
          gs.Dithering = (dithering ? 1.f : 0.f);
-         device_data.cb_luma_global_settings_dirty = true;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
       }
       if (ImGui::IsItemHovered())

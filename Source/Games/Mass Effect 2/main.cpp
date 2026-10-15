@@ -723,42 +723,34 @@ public:
       if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Overall image brightness (1 = vanilla).");
-      if (DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure");
 
       if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Overall image contrast, HDR only (1 = vanilla).");
-      if (DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast");
 
       if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Color saturation, HDR only (1 = vanilla).");
-      if (DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation");
 
       if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
-      if (DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation");
 
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");
@@ -766,7 +758,6 @@ public:
       {
          reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f; // mirrored: the uber and the gather both read it
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
@@ -778,23 +769,19 @@ public:
       if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
       {
          reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
-      if (DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity");
 
 #if DEVELOPMENT
       if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
       {
          reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Linear scene brightness where bloom starts. 1.0 is where the game's own bright-pass sits.\nNear 0 the whole scene glows - that is the failure mode, not a setting.");
-      if (DrawResetButton(gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, "BloomThreshold"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, "BloomThreshold");
 
       // The engine gain the intensity slider multiplies. Read-only: it comes from the gather, not from the user.
       ImGui::Text("Engine BloomScale: %.5f", gs.BloomScaleLive);
@@ -809,22 +796,18 @@ public:
       if (ImGui::SliderFloat("Vignette Intensity", &gs.VignetteIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VignetteIntensity", gs.VignetteIntensity);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Scales the game's vignette darkening (1 = vanilla, 0 = none).");
-      if (DrawResetButton(gs.VignetteIntensity, default_luma_global_game_settings.VignetteIntensity, "VignetteIntensity"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.VignetteIntensity, default_luma_global_game_settings.VignetteIntensity, "VignetteIntensity");
 
       if (ImGui::SliderFloat("Film Grain Intensity", &gs.FilmGrainIntensity, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "FilmGrainIntensity", gs.FilmGrainIntensity);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Scales the game's film grain (1 = vanilla, 0 = off).");
-      if (DrawResetButton(gs.FilmGrainIntensity, default_luma_global_game_settings.FilmGrainIntensity, "FilmGrainIntensity"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.FilmGrainIntensity, default_luma_global_game_settings.FilmGrainIntensity, "FilmGrainIntensity");
 
       // Read in Video_0xE41621CF.ps_5_0.hlsl, gated on TONEMAP_TYPE, not on display mode. The config key stays
       // "VideoAutoHDRBoost" under the canon "Video HDR Boost" label, so the rename does not reset existing users.
@@ -833,7 +816,6 @@ public:
       {
          gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
@@ -842,12 +824,10 @@ public:
       if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
       {
          reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Video highlight strength (0 = off).");
-      if (DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost"))
-         device_data.cb_luma_global_settings_dirty = true;
+      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
       ImGui::EndDisabled();
 
       bool dithering = gs.Dithering > 0.5f;
@@ -855,7 +835,6 @@ public:
       {
          gs.Dithering = dithering ? 1.f : 0.f;
          reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-         device_data.cb_luma_global_settings_dirty = true;
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Reduces gradient banding.");
@@ -900,14 +879,6 @@ public:
       const auto& game_device_data = GetGameDeviceData(device_data);
       data.GameData.UberRanThisFrame = game_device_data.has_drawn_uber ? 1.f : 0.f;
       data.GameData.CanvasFinishedThisFrame = game_device_data.has_finished_canvas ? 1.f : 0.f;
-   }
-
-   // Mandatory once this data owns ComPtrs: GameDeviceData has no virtual destructor, so core's delete through the
-   // base pointer never runs ours - a 4K fp16 texture would leak on every dgVoodoo device teardown.
-   void OnDestroyDeviceData(DeviceData& device_data) override
-   {
-      delete static_cast<MassEffect2GameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
    }
 
 #if ENABLE_SMAA

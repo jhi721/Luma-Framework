@@ -395,13 +395,6 @@ public:
       device_data.taa_detected = true; // No TAA to replace, but Core's upscaler status checks for it
    }
 
-   void OnDestroyDeviceData(DeviceData& device_data) override
-   {
-      // GameDeviceData has no virtual destructor
-      delete static_cast<SunsetOverdriveGameDeviceData*>(device_data.game);
-      device_data.game = nullptr;
-   }
-
    // Draws a velocity pass with the motion vectors added at "slot" (the shaders' extra output), then restores the game's targets
    static DrawOrDispatchOverrideType DrawVelocityWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, SunsetOverdriveGameDeviceData* game_device_data, std::function<void()>* original_draw_dispatch_func, UINT slot)
    {
