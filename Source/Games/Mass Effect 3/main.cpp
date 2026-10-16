@@ -807,14 +807,13 @@ public:
       const auto& def = default_luma_global_game_settings;
 
 #if ENABLE_SMAA
-      // Nothing here touches cb_luma_global_settings, so no dirty flag: these drive Luma's own passes.
       ImGui::SeparatorText("Anti-Aliasing");
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (requires Anti-Aliasing enabled in the game's graphics settings).");
       if (g_smaa_enable)
       {
 #if DEVELOPMENT
          DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, "Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.");
-         DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges.", "%.3f", NAME, ImGuiSliderFlags_Logarithmic);
+         DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges.", "%.3f", ImGuiSliderFlags_Logarithmic);
          ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.");

@@ -27,6 +27,7 @@
 // Scales the offset screen position reads of material pixel shaders below native (see "SceneOffsetPatch.h")
 #define LUMA_PATCH_BYTECODE_SYNC 1
 
+#define LUMA_SETTINGS_SECTION PROJECT_NAME // This mod's settings were always saved under the project name
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
@@ -3829,45 +3830,44 @@ public:
       if (EngineScale::installed)
       {
          ImGui::BeginDisabled(!sr_active);
-         DrawRenderScaleSlider(&EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, "The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.", PROJECT_NAME);
+         DrawRenderScaleSlider(&EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, "The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.");
          ImGui::EndDisabled();
       }
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
-      bool smaa_shown = g_smaa_enable && !sr_active;
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR or Luma TAA).", PROJECT_NAME);
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR or Luma TAA).", sr_active);
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
-      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off; requires AA enabled in the game's video settings).", "%.3f", PROJECT_NAME);
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off; requires AA enabled in the game's video settings).");
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& default_game_settings = default_luma_global_game_settings;
-      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).", "%.3f", PROJECT_NAME);
+      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).", "%.3f", PROJECT_NAME);
+         DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
 
-         DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).", "%.3f", PROJECT_NAME);
+         DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
 
-         DrawSettingSlider("Highlights Desaturation", "HighlightDechroma", &gs.HighlightDechroma, default_game_settings.HighlightDechroma, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).", "%.3f", PROJECT_NAME);
+         DrawSettingSlider("Highlights Desaturation", "HighlightDechroma", &gs.HighlightDechroma, default_game_settings.HighlightDechroma, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       }
 
       ImGui::SeparatorText("Bloom");
-      DrawSettingCheckbox("Luma Bloom Enable", "BloomEnable", &g_bloom_enable, true, "Replaces the game's bloom with a wider, softer HDR bloom.", PROJECT_NAME);
+      DrawSettingCheckbox("Luma Bloom Enable", "BloomEnable", &g_bloom_enable, true, "Replaces the game's bloom with a wider, softer HDR bloom.");
       ImGui::BeginDisabled(!g_bloom_enable);
-      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &g_bloom_intensity, default_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).", "%.3f", PROJECT_NAME);
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &g_bloom_intensity, default_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Ambient Occlusion");
-      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).", PROJECT_NAME);
+      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      DrawSettingSlider("GTAO Final Value Power", "GTAOFinalValuePower", &g_gtao_final_value_power, 1.f, 0.3f, 4.5f, "Primary darkness dial (higher = darker AO). Calibrate to match vanilla's overall darkening.", "%.2f", PROJECT_NAME);
-      DrawSettingSlider("GTAO Depth Scale", "GTAODepthScale", &g_gtao_depth_scale, 50.f, 10.f, 200.f, "viewZ divisor (UE3 units -> ~meters). FIRST dial if AO shows broad depth-correlated over-occlusion.", "%.0f", PROJECT_NAME, ImGuiSliderFlags_Logarithmic);
-      DrawSettingSlider("GTAO Radius Override", "GTAORadiusOverride", &g_gtao_radius_override, 0.f, 0.f, 3.f, "0 = shader EFFECT_RADIUS define; > 0 overrides it to match the vanilla HBAO+ radius (uu / DepthScale).", "%.3f", PROJECT_NAME);
+      DrawSettingSlider("GTAO Final Value Power", "GTAOFinalValuePower", &g_gtao_final_value_power, 1.f, 0.3f, 4.5f, "Primary darkness dial (higher = darker AO). Calibrate to match vanilla's overall darkening.", "%.2f");
+      DrawSettingSlider("GTAO Depth Scale", "GTAODepthScale", &g_gtao_depth_scale, 50.f, 10.f, 200.f, "viewZ divisor (UE3 units -> ~meters). FIRST dial if AO shows broad depth-correlated over-occlusion.", "%.0f", ImGuiSliderFlags_Logarithmic);
+      DrawSettingSlider("GTAO Radius Override", "GTAORadiusOverride", &g_gtao_radius_override, 0.f, 0.f, 3.f, "0 = shader EFFECT_RADIUS define; > 0 overrides it to match the vanilla HBAO+ radius (uu / DepthScale).");
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
@@ -3884,22 +3884,22 @@ public:
 #endif
 
       ImGui::SeparatorText("Effects");
-      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &gs.VignetteIntensity, default_game_settings.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).", "%.3f", PROJECT_NAME);
+      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &gs.VignetteIntensity, default_game_settings.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
 
-      DrawSettingSlider("Film Grain Intensity", "FilmGrainIntensity", &gs.FilmGrainIntensity, default_game_settings.FilmGrainIntensity, 0.f, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).", "%.3f", PROJECT_NAME);
+      DrawSettingSlider("Film Grain Intensity", "FilmGrainIntensity", &gs.FilmGrainIntensity, default_game_settings.FilmGrainIntensity, 0.f, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         if (DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &g_video_auto_hdr_enable, true, "Adds HDR highlights to pre-rendered videos (HDR only).", PROJECT_NAME))
+         if (DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &g_video_auto_hdr_enable, true, "Adds HDR highlights to pre-rendered videos (HDR only)."))
          {
             gs.VideoAutoHDREnable = (g_video_auto_hdr_enable ? 1.f : 0.f);
          }
          ImGui::BeginDisabled(!g_video_auto_hdr_enable);
-         DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_game_settings.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).", "%.3f", PROJECT_NAME);
+         DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_game_settings.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
          ImGui::EndDisabled();
       }
 
-      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_game_settings.Dithering, "Reduces gradient banding.", PROJECT_NAME);
+      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_game_settings.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.

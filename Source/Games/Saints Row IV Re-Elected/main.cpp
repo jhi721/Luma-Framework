@@ -2863,10 +2863,8 @@ public:
 
       // The upscaler (Super Resolution, in the Settings tab) replaces MSAA and SMAA: shown off, the saved choices are kept
       ImGui::BeginDisabled(sr_active);
-      bool msaa_shown = g_luma_msaa_enable && !sr_active;
-      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", sr_active ? &msaa_shown : &g_luma_msaa_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR).");
-      bool smaa_shown = g_smaa_enable && !sr_active;
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off or low in the game's display settings; not used with DLSS/FSR).");
+      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_luma_msaa_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR).", sr_active);
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off or low in the game's display settings; not used with DLSS/FSR).", sr_active);
       ImGui::EndDisabled();
       if (device_data.sr_type != SR::Type::None && GetGameDeviceData(device_data).msaa_scene)
          ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "DLSS/FSR inactive: turn Anti-Aliasing off in the game's display settings.");

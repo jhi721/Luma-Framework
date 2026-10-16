@@ -1100,11 +1100,9 @@ public:
       ImGui::SeparatorText("Anti-Aliasing");
       // Super Resolution replaces SMAA only where it can engage (the game hooks are in)
       const bool sr_engaged = device_data.sr_type != SR::Type::None && !device_data.sr_suppressed && jitter_original && frame_params_original;
-      ImGui::BeginDisabled(sr_engaged);
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's SMAA with Luma's (sharper, more complete edges; works with the game's Anti-Aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's SMAA with Luma's (sharper, more complete edges; works with the game's Anti-Aliasing setting on or off; not used with DLSS/FSR or Luma TAA).", sr_engaged);
       ImGui::BeginDisabled(!g_smaa_enable);
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR or Luma TAA.");
-      ImGui::EndDisabled();
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR or Luma TAA.", sr_engaged);
       ImGui::EndDisabled();
       // RCAS runs after our SMAA or Super Resolution only
       ImGui::BeginDisabled(!g_smaa_enable && !sr_engaged);

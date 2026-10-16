@@ -3387,8 +3387,7 @@ public:
       }
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
-      bool smaa_shown = g_smaa_enable && !sr_active;
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).", sr_active);
       ImGui::EndDisabled();
       // Canon deviation (docs/UI-Toggle-Standard.md), as Saints Row The Third Remastered: RCAS runs after any anti-aliasing, in place
       // of the game's sharpen (cut from its scene pass)

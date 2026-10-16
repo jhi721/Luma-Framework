@@ -1131,7 +1131,7 @@ public:
       // fallback to plain SMAA is silent and harmless.
       DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, "Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.\nNeeds the game's Motion Blur ON - cb4[10] is only declared by those permutations; otherwise plain SMAA.");
 
-      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.001f, 0.2f, "Plane deviation counted as a full edge, as a fraction of view depth.\nThis is the ONLY lever - never touch SMAA_PREDICATION_THRESHOLD, which is unitless by construction.\nToo low: a grazing floor lights up. Too high: silhouettes go missing.", "%.3f", NAME, ImGuiSliderFlags_Logarithmic);
+      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.001f, 0.2f, "Plane deviation counted as a full edge, as a fraction of view depth.\nThis is the ONLY lever - never touch SMAA_PREDICATION_THRESHOLD, which is unitless by construction.\nToo low: a grazing floor lights up. Too high: silhouettes go missing.", "%.3f", ImGuiSliderFlags_Logarithmic);
       ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("Show the predication mask (red) instead of the frame. Black on flat surfaces, white along silhouettes.");

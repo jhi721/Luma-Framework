@@ -3340,24 +3340,9 @@ public:
          ImGui::EndDisabled();
       }
       constexpr const char* smaa_tooltip = "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR).";
-      bool smaa = false;
       // DLSS/FSR replace SMAA: shown off, the saved choice kept for when they're turned off
-      if (IsSRActive(device_data))
-      {
-         ImGui::BeginDisabled();
-         ImGui::Checkbox("SMAA Enable", &smaa);
-         ImGui::EndDisabled();
-         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         {
-            ImGui::SetTooltip("%s", smaa_tooltip);
-         }
-      }
-      else
-      {
-         DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, smaa_tooltip);
-         smaa = settings.SMAAEnable > 0.5f;
-      }
-      ImGui::BeginDisabled(!smaa && !IsSRActive(device_data));
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, smaa_tooltip, IsSRActive(device_data));
+      ImGui::BeginDisabled(settings.SMAAEnable <= 0.5f && !IsSRActive(device_data));
       DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, default_luma_global_game_settings.RCASSharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
       ImGui::EndDisabled();
 

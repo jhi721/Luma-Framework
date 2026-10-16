@@ -2465,27 +2465,25 @@ public:
       {
          ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR, Luma TAA and SMAA T2x need Anti-Aliasing off in the game's display settings.");
       }
-      // A disabled checkbox shows "off" through this, the saved choice kept
-      bool off = false;
       // Only does something with the game's MSAA
       ImGui::BeginDisabled(!gd.msaa_active);
-      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", gd.msaa_active ? &g_msaa_resolve_enable : &off, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR or Luma TAA).");
+      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR or Luma TAA).", !gd.msaa_active);
       ImGui::EndDisabled();
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA. Not with MSAA ("sr_active"): SMAA runs then
       ImGui::BeginDisabled(gd.sr_active);
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", gd.sr_active ? &off : &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off in the game's display settings; not used with DLSS/FSR or Luma TAA).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off in the game's display settings; not used with DLSS/FSR or Luma TAA).", gd.sr_active);
       ImGui::EndDisabled();
       // T2x needs the motion vectors, which a multisampled scene doesn't get
       const bool t2x_unavailable = gd.sr_active || gd.msaa_active;
       ImGui::BeginDisabled(!g_smaa_enable || t2x_unavailable);
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", t2x_unavailable ? &off : &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR, Luma TAA or the game's MSAA (Anti-Aliasing in the game's display settings).");
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR, Luma TAA or the game's MSAA (Anti-Aliasing in the game's display settings).", t2x_unavailable);
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !gd.sr_active);
       DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off).");
       ImGui::EndDisabled();
 #if DEVELOPMENT
       DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, nullptr);
-      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, nullptr, "%.3f", NAME, ImGuiSliderFlags_Logarithmic);
+      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, nullptr, "%.3f", ImGuiSliderFlags_Logarithmic);
 
       ImGui::SeparatorText("Motion Vectors (DLSS/FSR/Luma TAA)");
       ImGui::Checkbox("MV Enable", &g_mv_enable);

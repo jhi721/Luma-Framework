@@ -1388,7 +1388,7 @@ class Borderlands2 final : public Game
       {
          sr_instance_data = nullptr;
       }
-      gd.mv_jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) && GetPerfMotionVectorDraws() != 0) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{};
+      gd.mv_jitter = ((((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) && GetPerfMotionVectorDraws() != 0) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
       // 2. That is its table read with y up, which measured better (docs/SMAA-Lab.md). The projection moves the other way.
       gd.t2x_phase = ((gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex && GetPerfMotionVectorDraws() != 0) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
@@ -3841,12 +3841,10 @@ public:
       const bool sr_active = IsSRActive(device_data);
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
-      bool smaa_shown = g_smaa_enable && !sr_active;
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (works with the game's Anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (works with the game's Anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).", sr_active);
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable || sr_active);
-      bool t2x_shown = g_smaa_t2x && !sr_active;
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", sr_active ? &t2x_shown : &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR or Luma TAA.");
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR or Luma TAA.", sr_active);
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
       DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off).");
@@ -3856,7 +3854,7 @@ public:
       // Predication is not a preference: it only relaxes the edge threshold back to base ULTRA on geometry and
       // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight.
       DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, "Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps cel-shade texture noise from being antialiased while still catching real silhouettes.");
-      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.", "%.3f", NAME, ImGuiSliderFlags_Logarithmic);
+      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.", "%.3f", ImGuiSliderFlags_Logarithmic);
       ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
       if (ImGui::IsItemHovered())
       {

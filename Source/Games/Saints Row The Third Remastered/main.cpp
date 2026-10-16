@@ -1303,22 +1303,7 @@ public:
 #else
       constexpr bool sr_active = false;
 #endif
-      ImGui::BeginDisabled(sr_active);
-      bool fix_native_taa_jitter = g_fix_native_taa_jitter || sr_active;
-      if (ImGui::Checkbox("Fix Native TAA Jitter", &fix_native_taa_jitter))
-      {
-         reshade::set_config_value(nullptr, NAME, "FixNativeTAAJitter", fix_native_taa_jitter);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("The game's TAA only uses half of the detail it was designed to gather over frames. This fixes it, for a sharper, steadier image.\nDLAA, FSR 3 and Luma TAA always use their own fix.");
-      }
-      DrawResetButton(fix_native_taa_jitter, true, "FixNativeTAAJitter"); // Hidden while forced on
-      if (!sr_active)
-      {
-         g_fix_native_taa_jitter = fix_native_taa_jitter;
-      }
-      ImGui::EndDisabled();
+      DrawSettingCheckbox("Fix Native TAA Jitter", "FixNativeTAAJitter", &g_fix_native_taa_jitter, true, "The game's TAA only uses half of the detail it was designed to gather over frames. This fixes it, for a sharper, steadier image.\nDLAA, FSR 3 and Luma TAA always use their own fix.", sr_active, true);
    }
 
 #if DEVELOPMENT

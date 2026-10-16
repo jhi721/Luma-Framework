@@ -465,7 +465,7 @@ class TheWitcherGame final : public Game
       const SR::InstanceData* sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       if (sr_instance_data && !sr_implementations[device_data.sr_type]->IsReady(sr_instance_data))
          sr_instance_data = nullptr;
-      gd.mv_jitter = (sr_instance_data || g_mv_force_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{};
+      gd.mv_jitter = ((sr_instance_data || g_mv_force_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
       gd.mv_jitter_ndc = {gd.mv_jitter[0] * 2.f / device_data.output_resolution.x, gd.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -1398,8 +1398,7 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       const bool sr_active = IsSRActive(device_data);
       ImGui::BeginDisabled(sr_active);
-      bool smaa_shown = g_smaa_enable && !sr_active;
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Adds SMAA anti-aliasing (the game has none of its own; not used with DLSS/FSR).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing (the game has none of its own; not used with DLSS/FSR).", sr_active);
       ImGui::EndDisabled();
 #if DEVELOPMENT
       if (g_smaa_enable && !sr_active)

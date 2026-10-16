@@ -4036,7 +4036,7 @@ public:
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_smaa_enable);
       DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, kDefaultSmaaPredication, "Finds edges by geometry (scene depth) as well as by brightness.\nKeeps textures sharp while still antialiasing real silhouettes.");
-      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, kDefaultSmaaPredTolerance, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges.", "%.3f", NAME, ImGuiSliderFlags_Logarithmic);
+      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, kDefaultSmaaPredTolerance, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges.", "%.3f", ImGuiSliderFlags_Logarithmic);
       ImGui::EndDisabled();
 #endif
 
@@ -4073,36 +4073,8 @@ public:
 
       ImGui::SeparatorText("Fixes");
       // SR replaces the TAA resolve (no built-in sharpening) and uses its own Halton jitter: both fixes are shown as always on
-      ImGui::BeginDisabled(sr_selected);
-      bool disable_taa_sharpening = g_disable_taa_sharpening || sr_selected;
-      if (ImGui::Checkbox("Disable Native TAA Sharpening", &disable_taa_sharpening))
-      {
-         reshade::set_config_value(nullptr, NAME, "DisableTAASharpening", disable_taa_sharpening);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("The game's TAA sharpens its output in tiles, which boosts leftover noise and leaves a faint grid. This turns it off, for a cleaner image.\nDLSS / FSR never use it.");
-      }
-      if (!sr_selected)
-      {
-         DrawResetButton(disable_taa_sharpening, kDefaultDisableTaaSharpening, "DisableTAASharpening");
-      }
-      bool improve_taa_jitter = g_improve_taa_jitter || sr_selected;
-      if (ImGui::Checkbox("Fix Native TAA Jitter", &improve_taa_jitter))
-      {
-         reshade::set_config_value(nullptr, NAME, "ImproveTAAJitter", improve_taa_jitter);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("The game's TAA samples each pixel in a clumped pattern, so still images flicker. This spreads the samples evenly, for a steadier image.\nDLSS / FSR always use their own fix.");
-      }
-      if (!sr_selected)
-      {
-         DrawResetButton(improve_taa_jitter, kDefaultImproveTaaJitter, "ImproveTAAJitter");
-         g_disable_taa_sharpening = disable_taa_sharpening;
-         g_improve_taa_jitter = improve_taa_jitter;
-      }
-      ImGui::EndDisabled();
+      DrawSettingCheckbox("Disable Native TAA Sharpening", "DisableTAASharpening", &g_disable_taa_sharpening, kDefaultDisableTaaSharpening, "The game's TAA sharpens its output in tiles, which boosts leftover noise and leaves a faint grid. This turns it off, for a cleaner image.\nDLSS / FSR never use it.", sr_selected, true);
+      DrawSettingCheckbox("Fix Native TAA Jitter", "ImproveTAAJitter", &g_improve_taa_jitter, kDefaultImproveTaaJitter, "The game's TAA samples each pixel in a clumped pattern, so still images flicker. This spreads the samples evenly, for a steadier image.\nDLSS / FSR always use their own fix.", sr_selected, true);
    }
 
 #if DEVELOPMENT
