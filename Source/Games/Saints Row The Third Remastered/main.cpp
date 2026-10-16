@@ -1007,6 +1007,7 @@ public:
          draw_data.far_plane = camera.far_plane;
       }
       draw_data.reset = device_data.force_reset_sr || sr_inputs_changed;
+      draw_data.output_recreated = new_output;
       device_data.force_reset_sr = false;
 
       const bool sr_succeeded = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data);
@@ -1016,17 +1017,9 @@ public:
       SR_TIMING_MARK(SRStepStateRestore);
       if (!sr_succeeded)
          return DrawOrDispatchOverrideType::None;
-      // OUT-4: DLSS draws nothing into a new output until its feature is created again after a draw; a settings change forces that at the next
-      // "UpdateSettings" (as in SR4)
       if (new_output)
       {
          game_device_data.sr_outputs[1] = std::exchange(game_device_data.sr_outputs[0], output_color);
-         if (device_data.sr_type == SR::Type::DLSS)
-         {
-            SR::SettingsData throwaway_settings_data = settings_data;
-            throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
-            sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
-         }
       }
       device_data.has_drawn_sr = true;
       return DrawOrDispatchOverrideType::Replaced; // The game's TAA history isn't updated, it's only read again if SR is turned off

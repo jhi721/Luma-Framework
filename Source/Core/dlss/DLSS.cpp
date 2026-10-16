@@ -43,6 +43,8 @@ namespace NGX
 		// Current global capabilities params (independent from the current settings/res).
 		NVSDK_NGX_Parameter*								capabilities_params = nullptr;
 		Microsoft::WRL::ComPtr<ID3D11Device>		device;
+		// Set by a successful draw into a new output ("DrawData::output_recreated")
+		mutable bool										recreate_feature = false;
 
 		virtual ~DLSSInstanceData()
 		{
@@ -321,7 +323,7 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 
 	// No need to re-instantiate DLSS "features" if all the params are the same
 	if (settings_data == custom_data->settings_data
-		&& custom_data->instance.command_list.Get() == command_list && feature_instance_created)
+		&& custom_data->instance.command_list.Get() == command_list && feature_instance_created && !custom_data->recreate_feature)
 	{
 		return true;
 	}
@@ -390,6 +392,7 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 	custom_data->ReleaseSuperSamplingFeature();
 
 	custom_data->settings_data = settings_data;
+	custom_data->recreate_feature = false;
 	custom_data->instance = custom_data->CreateSuperSamplingFeature(command_list, quality_mode);
 	custom_data->unique_handles.insert(custom_data->instance.super_sampling_feature);
 	custom_data->unique_parameters.insert(custom_data->instance.runtime_params);
@@ -452,7 +455,12 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
 
 	//ASSERT_MSGF(NVSDK_NGX_SUCCEED(result), "DLSS Error: %u\n", uint32_t(result));
 
-	return NVSDK_NGX_SUCCEED(result);
+	const bool succeeded = NVSDK_NGX_SUCCEED(result);
+	if (succeeded && draw_data.output_recreated)
+	{
+		custom_data->recreate_feature = true;
+	}
+	return succeeded;
 }
 
 #endif

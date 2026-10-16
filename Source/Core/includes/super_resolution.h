@@ -235,6 +235,9 @@ namespace SR
 		struct DrawData
 		{
 			bool reset = false;
+			// The first draws into a new "output_color", until one succeeds. DLSS writes nothing into a new output until its feature is
+			// created again after a draw (DLSS-Best-Practices OUT-4): a successful draw with this set recreates it at the next "UpdateSettings()".
+			bool output_recreated = false;
 
 			ID3D11Resource* output_color = nullptr;
 			ID3D11Resource* source_color = nullptr;

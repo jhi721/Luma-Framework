@@ -3433,6 +3433,7 @@ class MassEffectAndromeda final : public Game
       const SR::SuperResolutionImpl::DrawData draw_data = {
          // Smooth FOV changes are left to the upscaler's own history rejection: resetting every ramp frame starves it.
          .reset = device_data.force_reset_sr || output_resized,
+         .output_recreated = gd->sr_output_recreated,
          .output_color = device_data.sr_output_color.get(),
          .source_color = res_color.get(),
          .motion_vectors = res_mvs.get(),
@@ -3481,15 +3482,7 @@ class MassEffectAndromeda final : public Game
 
       if (!drawn)
          return suppress_sr();
-      // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame
-      // shows the texture's stale memory until its feature is created again after a draw. Settings changed once here force that
-      // at the next frame's "UpdateSettings".
-      if (std::exchange(gd->sr_output_recreated, false) && device_data.sr_type == SR::Type::DLSS)
-      {
-         SR::SettingsData throwaway_settings_data = settings_data;
-         throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
-         sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
-      }
+      gd->sr_output_recreated = false;
       MEA_COUNT(sr_draws);
       if (output_size != size)
       {

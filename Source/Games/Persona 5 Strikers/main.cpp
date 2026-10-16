@@ -1900,21 +1900,13 @@ public:
          draw_data.near_plane = 0.32f;
          draw_data.far_plane = 2400.f;
          draw_data.reset = device_data->force_reset_sr;
+         draw_data.output_recreated = output_recreated;
          if (output_color && sr_implementations[device_data->sr_type]->Draw(sr_instance_data, native_device_context.get(), draw_data))
          {
             // DLAA writes back into the scene; upscaling leaves the output to the post process (see "RedirectPostDraw")
             if (!split.output_color)
             {
                native_device_context->CopySubresourceRegion(split.source_color.get(), 0, 0, 0, 0, output_color, 0, nullptr);
-            }
-            // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame
-            // shows the texture's stale memory until its feature is created again after a draw. Settings changed once here force that at
-            // the next frame's "UpdateSettings".
-            if (output_recreated && device_data->sr_type == SR::Type::DLSS)
-            {
-               SR::SettingsData throwaway_settings_data = settings_data;
-               throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
-               sr_implementations[device_data->sr_type]->UpdateSettings(sr_instance_data, native_device_context.get(), throwaway_settings_data);
             }
             device_data->has_drawn_sr = true;
             game_device_data.sr_drawn_output = split.output_color;

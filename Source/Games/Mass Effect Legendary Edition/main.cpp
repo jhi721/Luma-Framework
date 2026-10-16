@@ -2165,6 +2165,7 @@ class MassEffectLE final : public Game
       draw_data.jitter_x = game_device_data.mv_jitter[0];
       draw_data.jitter_y = game_device_data.mv_jitter[1];
       draw_data.reset = device_data.force_reset_sr || game_device_data.sr_render_size != std::array<uint32_t, 2>{render_width, render_height};
+      draw_data.output_recreated = game_device_data.sr_output_recreated;
       draw_data.vert_fov = game_device_data.sr_vert_fov;
       if (camera.near_plane > 0.0)
       {
@@ -2180,15 +2181,7 @@ class MassEffectLE final : public Game
       }
       game_device_data.sr_input = scene_resource;
       game_device_data.sr_render_size = {render_width, render_height};
-      // DLSS draws nothing into a new output texture (the session's first, or one made after "None", which Core frees): the frame shows
-      // the texture's stale memory until its feature is created again after a draw. Settings changed once here force that at the next
-      // frame's "UpdateSettings".
-      if (std::exchange(game_device_data.sr_output_recreated, false) && device_data.sr_type == SR::Type::DLSS)
-      {
-         SR::SettingsData throwaway_settings_data = settings_data;
-         throwaway_settings_data.mvs_jittered = !throwaway_settings_data.mvs_jittered;
-         sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, throwaway_settings_data);
-      }
+      game_device_data.sr_output_recreated = false;
       device_data.has_drawn_sr = true;
       device_data.has_drawn_main_post_processing = true; // Core's upscaler status icon
       return true;
