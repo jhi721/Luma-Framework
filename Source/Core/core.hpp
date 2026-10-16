@@ -11349,6 +11349,64 @@ namespace
       return edited;
    }
 
+   // Persisted user setting widgets: the control, its ini save, a tooltip (also shown while disabled) and a reset button.
+   // "section" must match the one the game's "LoadConfigs" reads. Each returns whether the value changed this frame.
+   bool DrawSettingSlider(const char* label, const char* key, float* value, float default_value, float min_value, float max_value, const char* tooltip, const char* format = "%.3f", const char* section = NAME, ImGuiSliderFlags flags = 0)
+   {
+      bool changed = ImGui::SliderFloat(label, value, min_value, max_value, format, flags);
+      // Saved once the edit ends, not on every drag step
+      if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         reshade::set_config_value(nullptr, section, key, *value);
+      }
+      if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("%s", tooltip);
+      }
+      if (DrawResetButton<float, false>(*value, default_value, key))
+      {
+         reshade::set_config_value(nullptr, section, key, *value);
+         changed = true;
+      }
+      return changed;
+   }
+
+   bool DrawSettingCheckbox(const char* label, const char* key, bool* value, bool default_value, const char* tooltip, const char* section = NAME)
+   {
+      bool changed = ImGui::Checkbox(label, value);
+      if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("%s", tooltip);
+      }
+      changed |= DrawResetButton<bool, false>(*value, default_value, key);
+      if (changed)
+      {
+         reshade::set_config_value(nullptr, section, key, *value);
+      }
+      return changed;
+   }
+
+   // A 0/1 float (usually a cbuffer field) shown as a checkbox
+   bool DrawSettingCheckbox(const char* label, const char* key, float* value, float default_value, const char* tooltip, const char* section = NAME)
+   {
+      bool enabled = *value > 0.5f;
+      bool changed = ImGui::Checkbox(label, &enabled);
+      if (changed)
+      {
+         *value = enabled ? 1.f : 0.f;
+      }
+      if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("%s", tooltip);
+      }
+      changed |= DrawResetButton<float, false>(*value, default_value, key);
+      if (changed)
+      {
+         reshade::set_config_value(nullptr, section, key, *value);
+      }
+      return changed;
+   }
+
    void OnRegisterMessagesOverlay(reshade::api::effect_runtime* runtime)
    {
       OverlayLog::UnpauseMessages();
