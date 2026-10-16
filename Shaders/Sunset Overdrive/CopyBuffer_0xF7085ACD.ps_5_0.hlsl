@@ -23,9 +23,5 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
    // One step of the output quantizer: an 8 bit code in SDR, 10 bit BT.2020 PQ in HDR and SDR on HDR.
    // The value is the game's sRGB-encoded color, which the display composition decodes with gamma 2.2 and scales by the UI paper white
    // (after the pre-scale above).
-#if UI_DRAW_TYPE >= 2
-   ApplyOutputDithering(o0.rgb, v1, true, LumaSettings.DisplayMode != 0, UIPaperWhiteNits);
-#else
-   ApplyOutputDithering(o0.rgb, v1, true, LumaSettings.DisplayMode != 0, GamePaperWhiteNits);
-#endif
+   ApplyOutputDithering(o0.rgb, v1, true, LumaSettings.DisplayMode != 0, (UI_DRAW_TYPE >= 2 ? UIPaperWhiteNits : GamePaperWhiteNits));
 }

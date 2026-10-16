@@ -10,12 +10,12 @@ float3 VideoOutput(float3 color)
 {
    // The vanilla 8-bit targets clamped the conversion (negatives and whites up to 1.25)
    color = saturate(color);
-   [branch] if (LumaData.CustomData1 != 0 && LumaSettings.DisplayMode == 1 && LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      color = linear_to_gamma(VideoAutoHDR(gamma_to_linear(color), true, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits), GCT_NONE);
-   }
    [branch] if (LumaData.CustomData1 != 0)
    {
+      [branch] if (LumaSettings.DisplayMode == 1 && LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
+      {
+         color = linear_to_gamma(VideoAutoHDR(gamma_to_linear(color), true, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits), GCT_NONE);
+      }
       color = PreScaleForUIPaperWhite(color);
    }
    return color;
