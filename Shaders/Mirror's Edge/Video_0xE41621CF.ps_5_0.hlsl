@@ -36,21 +36,7 @@ cbuffer cb4 : register(b4)
    float4 cb4[236];
 }
 
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE)
 {
    const float luma = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]).x; // Y'
    const float cb = ApplyDgvMask(t1.Sample(s1_s, v5.xy), cb3[46], cb3[47]).x;
@@ -70,5 +56,5 @@ void main(
       const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
       color = PumboAutoHDR(color, peakNits, LumaSettings.GamePaperWhiteNits);
    }
-   o0.xyz = linear_to_gamma(PreScaleForUIPaperWhite(color));
+   o0.xyz = linear_to_gamma(color * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true));
 }

@@ -22,9 +22,7 @@
 // Settings.hlsl's empty dummy wins -> "invalid subscript 'BloomIntensity'".
 #include "Includes/Common.hlsl"             // LumaGameSettings (the grade sliders)
 #include "../Includes/Color.hlsl"
-#include "../Includes/PsychoV31.hlsl"       // PsychoVDisplayMap
-#include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise: soft hue reference
-#include "../Includes/MacLeodBoynton.hlsl"      // MacLeodBoynton::HueOnlyBT2020 (RenoDX-derived hue/purity model)
+#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
 // clang-format on
 
 // HDR / vanilla. 1 = extended UE3 grade + PsychoV31 display map (default). 0 = vanilla clamped SDR reference.
@@ -115,34 +113,26 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
 
    // The colour stage runs in a BT.2020 working space (converted back to BT.709 for the display map): gamut-correct
    // handling of highly saturated highlights, not a display-gamut expansion.
-   float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-
    // 4. Soft hue reference, per channel in BT.2020 where the RenoDX BL1 port builds it (common.hlsli, ApplyCustomGrading). Linear
    // below 1.5 and rolling toward 5 above, it compresses a saturated highlight's strong channel before its weak ones (see the
    // header). Reinhard.hlsl's ReinhardPiecewise is the RenoDX formula (identical at the x_min = 0 it fixes). BL1 policy: this donor,
    // and nothing else, supplies the hue.
-   float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
-
    // 5. MacLeod–Boynton hue emulation (the RenoDX BL1 colour stage): the reference's hue direction rebuilt on the
    // target's own purity and T = L + M anchor. BL1 policy, all of it chosen here and none of it inside the model:
    // hue strength 1.0 and chrominance strength 0 (RenoDX's "Hue Shift 100%, Blowout 0"), and, as RenoDX applies
    // it before its display map, before PsychoV31. Nothing is restored after it.
-   float3 hueTransferredBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020);
-
-   // 6. The display map (see "PsychoVDisplayMap"). The hue transfer can leave BT.709, so its source boundary is
-   // BT.2020. The output is linear BT.709, 1.0 = paper white.
-   outColor = PsychoVDisplayMap(BT2020_To_BT709(hueTransferredBT2020),
-                                LumaSettings.GameSettings.Contrast,
-                                LumaSettings.GameSettings.Saturation,
-                                LumaSettings.GameSettings.HighlightDechroma,
-                                renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
+   // 6. The display map. The output is linear BT.709, 1.0 = paper white. All three: see "PsychoVDisplayMapWithHueReference".
+   outColor = PsychoVDisplayMapWithHueReference(extendedLinear,
+                                                LumaSettings.GameSettings.Contrast,
+                                                LumaSettings.GameSettings.Saturation,
+                                                LumaSettings.GameSettings.HighlightDechroma);
 #else
    // Vanilla reference: the exact clamped SDR grade (gamma-encoded), linearized.
    outColor = gamma_to_linear(saturate(GradeUE3_FromPostMidtones(postMidtones, true)));
 #endif
 
    // --- Common tail: the UI paper white pre-scale and the post-process space encode ---
-   outColor = PreScaleForUIPaperWhite(outColor);
+   outColor *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
    // The extended grade and the MacLeod-Boynton hue stage can emit NaN or negatives (the scene carries small negative/WCG values):
    // none may reach the swapchain.
    outColor = (outColor == outColor) ? outColor : 0.0; // NaN -> 0 (NaN != NaN)
@@ -154,10 +144,7 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    const bool dither = LumaSettings.GameSettings.Dithering > 0.5;
    if (dither && LumaSettings.DisplayMode != 0)
    {
-      const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-      float3 pq = Linear_to_PQ(BT709_To_BT2020(outColor * pqScale), GCT_MIRROR);
-      ApplyDithering(pq, v1.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-      outColor = BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale;
+      ApplyOutputDithering(outColor, v1.xy, false, true, max(LumaSettings.UIPaperWhiteNits, 1.0));
    }
 #endif
    // Store gamma so the game's gamma-space HUD blends like vanilla; composition decodes + applies paper white. Mirrored: the PQ dither
@@ -165,7 +152,9 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    outColor = linear_to_gamma(outColor, GCT_MIRROR);
 #if TONEMAP_TYPE >= 1
    if (dither && LumaSettings.DisplayMode == 0)
-      ApplyDithering(outColor, v1.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
+   {
+      ApplyOutputDithering(outColor, v1.xy, true, false, 1.0);
+   }
 #endif
 #endif
 }

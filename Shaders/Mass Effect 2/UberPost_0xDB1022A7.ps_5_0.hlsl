@@ -3,7 +3,7 @@
 #define ME2_UBER_FILMIC 1
 #include "Luma_ME2_Tonemap.hlsl"
 
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    // Alpha stays at the vanilla 0: SMAA predication reads the game's own fp16 scene, captured at this draw's t0, so
    // nothing needs depth here - and an Unreal-unit depth in an fp16 canvas alpha is a side channel no blend expects.

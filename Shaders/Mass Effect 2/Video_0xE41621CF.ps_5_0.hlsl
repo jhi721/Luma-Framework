@@ -30,7 +30,7 @@ SamplerState s2_s : register(s2);
 #define BinkConstant PsConstants[11] // .x = the constant input the matrix's fourth column multiplies, .w = output alpha
 
 // Only TEXCOORD0 (v5.xy, the movie UV) is read.
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    // --- YUV plane fetch + dgVoodoo format-emulation mask (verbatim; all three planes share v5.xy) ---
    float4 yuv1;
@@ -62,8 +62,7 @@ void main(ME2_MAIN_SIGNATURE)
    // Gated like the scene passes: on TONEMAP_TYPE 0 they write the vanilla value with no pre-scale, so the movie must
    // not carry one either. Accessors, not LumaSettings - a deliberate divergence from ME1 2007: they carry the
    // HDR_TONEMAP_* overrides and the devkit white level. The zero guard has to stay.
-   if (GamePaperWhiteNits > 0.0)
-      lin *= GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0);
+   lin *= GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, true);
 #endif
 
    o0.rgb = linear_to_gamma(lin); // the canvas is a gamma-space buffer; the composition decodes it at present

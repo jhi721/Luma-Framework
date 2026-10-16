@@ -79,10 +79,8 @@ void main(
       lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
    }
 #endif
-#if UI_DRAW_TYPE >= 2
    // Match the tonemap's linear pre-scale: land movies at the same brightness as in-game after the
    // composition's UIPaperWhite rescale (when UIPaperWhite != GamePaperWhite).
-   lin *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
+   lin *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
    o0.rgb = linear_to_gamma(lin); // re-encode for the gamma post buffer the composition expects
 }

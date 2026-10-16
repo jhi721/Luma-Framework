@@ -8,9 +8,7 @@
 #include "Includes/Common.hlsl"
 // clang-format off
 #include "../Includes/Color.hlsl"
-#include "../Includes/PsychoV31.hlsl"
-#include "../Includes/Reinhard.hlsl"
-#include "../Includes/MacLeodBoynton.hlsl"
+#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
 #include "../Includes/DgVoodoo.hlsl"
 // clang-format on
 
@@ -72,21 +70,7 @@ float3 GradeTd(float3 scene, float exposure, bool clampSDR)
 }
 
 // dgVoodoo's fixed interpolator layout: every entry is declared, linkage is by register.
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE)
 {
    const float exposure = ApplyDgvMask(ExposureTexture.Sample(ExposureSampler, 0.5), DgvConstants[50], DgvConstants[51]).x * 64.0;
    const float3 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorSampler, v5.xy), DgvConstants[44], DgvConstants[45]).xyz * LumaSettings.GameSettings.Exposure;
@@ -95,35 +79,21 @@ void main(
    const float3 extendedLinear = gamma_to_linear(GradeTd(scene, exposure, false));
 
    // The per-channel curves lean saturated highlights; the soft per-channel reference keeps that lean without the
-   // clip's whitening, MacLeod-Boynton puts its hue on the extended grade's own purity.
-   const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-   const float3 hueTransferredBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5));
-   // See "PsychoVDisplayMap". The hue transfer can leave BT.709, so its source boundary is BT.2020.
-   float3 outColor = PsychoVDisplayMap(BT2020_To_BT709(hueTransferredBT2020),
-                                       LumaSettings.GameSettings.Contrast,
-                                       LumaSettings.GameSettings.Saturation,
-                                       LumaSettings.GameSettings.HighlightsDesaturation,
-                                       renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
+   // clip's whitening, MacLeod-Boynton puts its hue on the extended grade's own purity (see "PsychoVDisplayMapWithHueReference").
+   float3 outColor = PsychoVDisplayMapWithHueReference(extendedLinear,
+                                                       LumaSettings.GameSettings.Contrast,
+                                                       LumaSettings.GameSettings.Saturation,
+                                                       LumaSettings.GameSettings.HighlightsDesaturation);
 #else
    float3 outColor = gamma_to_linear(GradeTd(scene, exposure, true));
 #endif
 
    // Gamma space canvas (POST_PROCESS_SPACE_TYPE 0): the HUD blends onto it like vanilla.
-   outColor = linear_to_gamma(max(0.0, PreScaleForUIPaperWhite(outColor)));
+   outColor = linear_to_gamma(max(0.0, outColor * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true)));
    // One step of the output quantizer: the 8 bit code in SDR, the 10 bit BT.2020 PQ code in HDR
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      if (LumaSettings.DisplayMode == 0)
-      {
-         ApplyDithering(outColor, v5.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      }
-      else
-      {
-         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(outColor, GCT_MIRROR) * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, v5.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         outColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-      }
+      ApplyOutputDithering(outColor, v5.xy, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
    }
    // Last: the dither can step below 0 and the grade can emit NaN (a NaN in the canvas reads back black)
    outColor = IsNaN_Strict(outColor) ? 0.0 : max(0.0, outColor);

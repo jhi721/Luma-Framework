@@ -13,7 +13,7 @@
 
 // The original reads v0 = TEXCOORD0 (blur UV, t1) and v1 = TEXCOORD1 (scene UV, t0), which dgVoodoo lands on
 // v5 and v6 exactly as it does for the uber.
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    o0 = RunME2DofBloomBlend(v5.xy, v6.xy);
 }

@@ -1,7 +1,7 @@
 // Mass Effect 2 (2010) - near-death blood feedback material (mat_GameOverBlood). See Includes/FXMaterial.hlsl.
 #include "Includes/FXMaterial.hlsl"
 
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    const float s = FXC(5).x; // damage amount
    const float2 a = v5.xy * 2.5 - 1.25;

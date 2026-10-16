@@ -17,13 +17,14 @@
 
 #include "Includes/Common.hlsl"
 
+#include "../Includes/DepthEdges.hlsl"
+
 Texture2D<float> depth : register(t0);
 RWTexture2D<float> edgeness : register(u0);
 
 float LinearDepth(int3 p)
 {
-   const float d = depth.Load(p);
-   return rcp(max(LumaData.CustomData1 != 0u ? d : 1.0 - d, 1.0 / 16777216.0));
+   return RelativeViewDepth(depth.Load(p), LumaData.CustomData1 != 0u);
 }
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
@@ -35,15 +36,7 @@ float LinearDepth(int3 p)
    const float topZ = (id.y > 0) ? LinearDepth(p - int3(0, 1, 0)) : centerZ;
    const float bottomZ = LinearDepth(p + int3(0, 1, 0));
 
-   // Compare each one-sided delta against the slope implied by the opposite neighbour and keep the smaller: on a plane
-   // (any orientation) they agree and this cancels to ~0; at a depth discontinuity neither cancels.
-   float4 edgesLRTB = float4(leftZ, rightZ, topZ, bottomZ) - centerZ;
-   const float slopeLR = (edgesLRTB.y - edgesLRTB.x) * 0.5;
-   const float slopeTB = (edgesLRTB.w - edgesLRTB.z) * 0.5;
-   edgesLRTB = min(abs(edgesLRTB), abs(edgesLRTB + float4(slopeLR, -slopeLR, slopeTB, -slopeTB)));
-
    // Plane deviation counted as a full edge, as a fraction of view depth (LumaData.CustomData3: TW2's validated 0.02,
    // a DEV slider for calibration).
-   const float tolerance = centerZ * LumaData.CustomData3;
-   edgeness[id.xy] = saturate(max(edgesLRTB.x, edgesLRTB.z) / tolerance);
+   edgeness[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, centerZ * LumaData.CustomData3);
 }

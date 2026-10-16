@@ -29,6 +29,8 @@
 // Because the result is normalized by centreZ it is a unitless edge-ness signal, so SMAA_PREDICATION_THRESHOLD is
 // simply 0.5 — independent of scene scale, units, camera height, FOV and resolution. Tune P.x, never that.
 
+#include "../Includes/DepthEdges.hlsl"
+
 Texture2D<float4> scene : register(t0); // fp16 scene colour; .w carries NON-linear depth (see the header)
 RWTexture2D<float> uav : register(u0);  // R16_FLOAT predication signal (0 = on the local plane, 1 = edge)
 
@@ -66,19 +68,8 @@ float LinearDepth(float raw)
    const float topZ = (id.y > 0) ? LinearDepth(scene.Load(p - int3(0, 1, 0)).w) : centerZ;
    const float bottomZ = LinearDepth(scene.Load(p + int3(0, 1, 0)).w);
 
-   // Deviation from the local plane: compare each one-sided delta against the slope implied by the opposite
-   // neighbour, and keep whichever is smaller. On a plane (any orientation) the two agree and this cancels to
-   // ~0; at a depth discontinuity neither cancels.
-   float4 edgesLRTB = float4(leftZ, rightZ, topZ, bottomZ) - centerZ;
-   const float slopeLR = (edgesLRTB.y - edgesLRTB.x) * 0.5;
-   const float slopeTB = (edgesLRTB.w - edgesLRTB.z) * 0.5;
-   const float4 edgesLRTBSlopeAdjusted = edgesLRTB + float4(slopeLR, -slopeLR, slopeTB, -slopeTB);
-   edgesLRTB = min(abs(edgesLRTB), abs(edgesLRTBSlopeAdjusted));
-
    // Depth-proportional tolerance: the deviation that matters scales with distance (a step that is a silhouette
    // up close is noise far away). Both terms are required — the slope adjustment alone still degrades toward the
    // vanishing point, and a depth-proportional threshold alone cannot reject a grazing plane at all.
-   const float tolerance = max(centerZ, 1e-3) * max(P.x, 1e-4);
-   // Left and top only (see the header): this is the axis pairing SMAA's predication actually compares.
-   uav[id.xy] = saturate(max(edgesLRTB.x, edgesLRTB.z) / tolerance);
+   uav[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, max(centerZ, 1e-3) * max(P.x, 1e-4));
 }

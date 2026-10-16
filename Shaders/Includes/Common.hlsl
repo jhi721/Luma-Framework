@@ -218,6 +218,25 @@ float4 SDRToHDR(float4 Color, bool InGammaSpace = true, bool IsAfterDisplayTrans
 	return float4(SDRToHDR(Color.rgb, InGammaSpace, IsAfterDisplayTransfer, IsUI), Color.a);
 }
 
+// UI_DRAW_TYPE 2, for scene content written under a gamma SDR UI on the same canvas: the display composition scales the whole canvas
+// by UI Paper White, so scene content pre-scaled by this lands back at Game Paper White. 1 in the other UI draw types.
+// "guardUnset": also 1 when Game Paper White is unset (<= 0), which would black the scene and leave the UI.
+float GetUIPaperWhitePreScale(float gamePaperWhiteNits, float uiPaperWhiteNits, bool guardUnset)
+{
+#if UI_DRAW_TYPE >= 2
+   if (guardUnset)
+   {
+      if (gamePaperWhiteNits > 0.0)
+      {
+         return gamePaperWhiteNits / max(uiPaperWhiteNits, 1.0);
+      }
+      return 1.0;
+   }
+   return gamePaperWhiteNits / max(uiPaperWhiteNits, 1.0);
+#endif
+   return 1.0;
+}
+
 // LUMA FT: added these functions to decode and re-encode the "back buffer" from any range to a range that roughly matched SDR linear space
 float3 EncodeBackBufferFromLinearSDRRange(float3 color, bool UI = false)
 {
@@ -409,6 +428,29 @@ void ApplyDithering(inout float3 color, float2 uv, bool gammaSpace = true, float
 #endif // HIGH_QUALITY_POST_PROCESS_SPACE_CONVERSIONS
   }
   color *= paperWhite;
+}
+
+// Anti-banding dither of one output quantizer step: the 8 bit code in SDR, the 10 bit BT.2020 PQ code in HDR.
+// "gammaSpace": whether "color" is gamma encoded (else linear). "paperWhiteNits": the nits the display composition maps 1 to,
+// which places the PQ code steps (HDR only).
+void ApplyOutputDithering(inout float3 color, float2 uv, bool gammaSpace, bool hdr, float paperWhiteNits)
+{
+   if (!hdr)
+   {
+      ApplyDithering(color, uv, gammaSpace, 1.0, 8u, LumaSettings.FrameIndex, true);
+   }
+   else
+   {
+      const float pqScale = paperWhiteNits / HDR10_MaxWhiteNits;
+      const float3 linearColor = gammaSpace ? gamma_to_linear(color, GCT_MIRROR) : color;
+      float3 pq = Linear_to_PQ(BT709_To_BT2020(linearColor * pqScale), GCT_MIRROR);
+      ApplyDithering(pq, uv, true, 1.0, 10u, LumaSettings.FrameIndex, true);
+      color = BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale;
+      if (gammaSpace)
+      {
+         color = linear_to_gamma(color, GCT_MIRROR);
+      }
+   }
 }
 
 // Fix up sharpening/blurring when done on HDR images in post processing. In SDR, the source color could only be between 0 and 1,

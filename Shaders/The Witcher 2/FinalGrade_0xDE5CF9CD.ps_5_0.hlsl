@@ -2,10 +2,8 @@
 // ORDER MATTERS — see Luma_TW2_Tonemap.hlsl (game-local Common.hlsl defines LumaGameSettings first).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings — keep FIRST
 #include "../Includes/Color.hlsl"
-#include "../Includes/Reinhard.hlsl"    // Reinhard::ReinhardPiecewise, the soft hue reference
-#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
 #include "Includes/GameBindings.hlsl"   // b3/b4, the dgVoodoo masks, ApplyDgvMask, DgVoodooRcp, DgVoodooLog2
-#include "../Includes/PsychoV31.hlsl"     // PsychoVDisplayMap
+#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
 // clang-format on
 
 // The Witcher 2 FINAL GRADE pass (dgVoodoo -> ps_5_0, hash 0xDE5CF9CD), the engine's
@@ -49,21 +47,7 @@ float4 SampleScene(float2 uv)
    return ApplyDgvMask(t0.SampleLevel(s0_s, uv, 0.0), DgvMaskT0, DgvFillT0);
 }
 
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE)
 {
    float4 sampleM = SampleScene(v5.xy);
    float3 aaColor = sampleM.rgb; // the no-AA permutation stops here; the FXAA one may replace it below
@@ -269,29 +253,21 @@ void main(
          // BT.2020 channels of a BT.709 colour never exceed its max, so the reference equals the colour, the stage is a
          // no-op up to float rounding, and those pixels skip the MacLeod-Boynton solve. One constant for both keeps them
          // from drifting apart.
-         const float hueReferenceShoulder = 1.5;
-         [branch] if (max3(lin) > hueReferenceShoulder)
-         {
-            const float3 target2020 = BT709_To_BT2020(lin);
-            lin = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(target2020, Reinhard::ReinhardPiecewise(target2020, 5.0, hueReferenceShoulder)));
-         }
-
-         // See "PsychoVDisplayMap". The hue stage above works in BT.2020, so its colours can leave BT.709.
-         postProcessedColor = PsychoVDisplayMap(lin,
-                                                LumaSettings.GameSettings.Contrast,
-                                                LumaSettings.GameSettings.Saturation,
-                                                LumaSettings.GameSettings.HighlightDechroma,
-                                                renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
+         // See "PsychoVDisplayMapWithHueReference".
+         postProcessedColor = PsychoVDisplayMapWithHueReference(lin,
+                                                                LumaSettings.GameSettings.Contrast,
+                                                                LumaSettings.GameSettings.Saturation,
+                                                                LumaSettings.GameSettings.HighlightDechroma,
+                                                                1.5,
+                                                                true);
       }
       else // SDR (still presented through the scRGB swapchain)
       {
          postProcessedColor = lin;
       }
 
-#if UI_DRAW_TYPE >= 2
       // Pre-scale so the gamma-SDR HUD drawn on top lands at UIPaperWhite after composition.
-      postProcessedColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
+      postProcessedColor *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
 
       postProcessedColor = IsNaN_Strict(postProcessedColor) ? 0.0 : postProcessedColor; // explicit exponent/mantissa bit test
       postProcessedColor = max(0.0, postProcessedColor);
@@ -300,15 +276,7 @@ void main(
       // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
       if (LumaSettings.GameSettings.Dithering > 0.5)
       {
-         if (LumaSettings.DisplayMode == 0)
-            ApplyDithering(postProcessedColor, v5.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-         else
-         {
-            const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-            float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(postProcessedColor, GCT_MIRROR) * pqScale), GCT_MIRROR);
-            ApplyDithering(pq, v5.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-            postProcessedColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-         }
+         ApplyOutputDithering(postProcessedColor, v5.xy, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
       }
 
       vanillaColor = postProcessedColor;

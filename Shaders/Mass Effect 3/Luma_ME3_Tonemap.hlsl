@@ -20,9 +20,8 @@
 // LUMA_GAME_CB_STRUCTS before any shared header pulls Settings.hlsl, or GameSettings resolves to the empty dummy.
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
-#include "../Includes/Reinhard.hlsl"        // ReinhardRange (grade proxy), ReinhardPiecewise (ALU hue reference)
-#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
-#include "../Includes/PsychoV31.hlsl"      // PsychoVDisplayMap
+#include "../Includes/Reinhard.hlsl"        // ReinhardRange (grade proxy)
+#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
 #include "Includes/GameBindings.hlsl"
 // clang-format on
 
@@ -274,18 +273,12 @@ float3 ME3_Grade(float3 untonemapped, bool hdr, float3 vignette)
       // no-op. The test is taken in BT.709, before the conversion, because every BT.2020 channel is a convex
       // combination of the BT.709 ones (the matrix rows sum to 1) and so can never exceed their max. Worth a real
       // branch: the model runs purity solves, some 300 instructions that most of the frame does not need.
-      float3 hueTransferred = extendedLinear;
-      [branch] if (max3(extendedLinear) > ME3_HUE_REFERENCE_SHOULDER)
-      {
-         const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-         const float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, ME3_HUE_REFERENCE_SHOULDER);
-         hueTransferred = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020));
-      }
-      const float3 hdrColor = PsychoVDisplayMap(hueTransferred,
-                                                LumaSettings.GameSettings.Contrast,
-                                                LumaSettings.GameSettings.Saturation,
-                                                LumaSettings.GameSettings.HighlightDechroma,
-                                                renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
+      const float3 hdrColor = PsychoVDisplayMapWithHueReference(extendedLinear,
+                                                                LumaSettings.GameSettings.Contrast,
+                                                                LumaSettings.GameSettings.Saturation,
+                                                                LumaSettings.GameSettings.HighlightDechroma,
+                                                                ME3_HUE_REFERENCE_SHOULDER,
+                                                                true);
 
       // The output scale is also the engine fade: re-applied last, as the gain the vanilla chain gives it (before the
       // gamma exponent and the display decode), so a fade matches vanilla instead of biasing the hue stage or the map.
@@ -430,22 +423,14 @@ float3 ME3_Grade(float3 untonemapped, bool hdr)
 float4 ME3_FinalEncode(float3 encoded, float2 ditherUV)
 {
    // UI Paper White pre-scale, in gamma (a pure pow, so equal to the linear multiply).
-   const float uiPreScaleEncoded = linear_to_gamma1(GetUIPaperWhitePreScale(), GCT_POSITIVE);
+   const float uiPreScaleEncoded = linear_to_gamma1(GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, true), GCT_POSITIVE);
    encoded *= uiPreScaleEncoded;
 
 #if TONEMAP_TYPE >= 1
    // Anti-banding dither, one step of the output quantizer: 8-bit in SDR, 10-bit BT.2020 PQ in HDR.
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      if (LumaSettings.DisplayMode == 0)
-         ApplyDithering(encoded, ditherUV, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      else
-      {
-         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(encoded, GCT_MIRROR) * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, ditherUV, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         encoded = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-      }
+      ApplyOutputDithering(encoded, ditherUV, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
    }
 #endif
 

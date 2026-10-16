@@ -15,6 +15,8 @@
 // a symmetric mask would read 1 on both sides and difference to 0 where predication must fire. Single-channel
 // because the predication Gather reads only R. With this signal SMAA_PREDICATION_THRESHOLD is simply 0.5.
 
+#include "../Includes/DepthEdges.hlsl"
+
 Texture2D<float> depth : register(t0); // game r32_float depth (LINEAR view-space metres)
 RWTexture2D<float> uav : register(u0); // R16_FLOAT predication signal (0 = on the local plane, 1 = edge)
 
@@ -33,20 +35,9 @@ cbuffer PredCB : register(b0)
    const float topZ = (id.y > 0) ? depth.Load(p - int3(0, 1, 0)) : centerZ;
    const float bottomZ = depth.Load(p + int3(0, 1, 0));
 
-   // Deviation from the local plane: compare each one-sided delta against the slope implied by the opposite
-   // neighbour, and keep whichever is smaller. On a plane (any orientation) the two agree and this cancels to
-   // ~0; at a depth discontinuity neither cancels.
-   float4 edgesLRTB = float4(leftZ, rightZ, topZ, bottomZ) - centerZ;
-   const float slopeLR = (edgesLRTB.y - edgesLRTB.x) * 0.5;
-   const float slopeTB = (edgesLRTB.w - edgesLRTB.z) * 0.5;
-   const float4 edgesLRTBSlopeAdjusted = edgesLRTB + float4(slopeLR, -slopeLR, slopeTB, -slopeTB);
-   edgesLRTB = min(abs(edgesLRTB), abs(edgesLRTBSlopeAdjusted));
-
    // Depth-proportional tolerance: the deviation that matters scales with distance (a 10 cm step is a
    // silhouette at 2 m and noise at 200 m). Both terms are required — the slope adjustment alone still
    // degrades toward the vanishing point, and a depth-proportional threshold alone cannot reject a grazing
    // plane at all.
-   const float tolerance = max(centerZ, 1e-3) * max(P.x, 1e-4);
-   // Left and top only (see the header): this is the axis pairing SMAA's predication actually compares.
-   uav[id.xy] = saturate(max(edgesLRTB.x, edgesLRTB.z) / tolerance);
+   uav[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, max(centerZ, 1e-3) * max(P.x, 1e-4));
 }

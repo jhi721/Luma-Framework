@@ -3,7 +3,7 @@
 #include "Includes/CanvasUI.hlsl"
 
 // This shader reads COLOR0 (v2) only.
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    o0 = saturate(ME2_CanvasTransform(v2));
 }

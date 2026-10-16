@@ -58,7 +58,7 @@ void main(
    }
 #endif
    // Full-screen movies land at the in-game brightness after the composition's UIPaperWhite rescale
-   lin = PreScaleForUIPaperWhite(lin);
+   lin *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
    o0.rgb = linear_to_gamma(lin); // Gamma, as the tonemap pass stores it
    return;
 }

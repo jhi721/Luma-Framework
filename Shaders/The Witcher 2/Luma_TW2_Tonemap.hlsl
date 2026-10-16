@@ -70,21 +70,7 @@ SamplerState s_adapt_s : register(TM_S_ADAPT);
 
 // Full dgVoodoo interpolator set; v5 = TEXCOORD0 (scene UV in .xy) is the only one the pass uses.
 // Output: the exposed linear color (alpha: scene passthrough on the exposure perm, 1 on the bright-pass perm).
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE)
 {
    // --- vanilla body (verbatim transcription) ---
 #if TM_STATIC

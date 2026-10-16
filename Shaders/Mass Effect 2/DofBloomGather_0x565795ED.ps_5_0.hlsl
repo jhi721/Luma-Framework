@@ -3,7 +3,7 @@
 #include "Includes/DofBloomGather.hlsl"
 
 // Tap pairs are (vN.xy, vN.wz) for N = 5..12 - note the swapped second pair.
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    float4 sceneSum = (float4)0.0;
    float3 bloomSum = (float3)0.0;

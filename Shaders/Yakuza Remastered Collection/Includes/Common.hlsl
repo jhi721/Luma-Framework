@@ -11,9 +11,7 @@
 // the HUD is drawn on top in gamma SDR, so the output is pre-scaled to land at UI paper white after composition.
 float3 YRC_EncodeOutput(float3 color)
 {
-#if UI_DRAW_TYPE >= 2
-   color *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
+   color *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
    return linear_to_gamma(color);
 }
 

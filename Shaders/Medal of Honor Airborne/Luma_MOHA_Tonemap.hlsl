@@ -20,9 +20,7 @@
 // LumaSettings.GameSettings resolves to the real grade struct rather than the empty dummy.
 #include "Includes/Common.hlsl"             // game-local: defines LumaGameSettings (grade sliders) before the LumaSettings cbuffer
 #include "../Includes/Color.hlsl"
-#include "../Includes/PsychoV31.hlsl"       // PsychoVDisplayMap
-#include "../Includes/Reinhard.hlsl"        // Reinhard::ReinhardPiecewise, the soft hue reference
-#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
+#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
 // clang-format on
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
@@ -107,16 +105,11 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
    // saturated highlight's strong channel before its weak ones, so the hue leans the way the vanilla clip leaned it,
    // without the clip's whitening. MacLeod-Boynton then rebuilds that reference's hue direction on the target's own
    // purity and T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it.
-   const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
-
-   // 5. The display map (see "PsychoVDisplayMap"). The hue transfer can leave BT.709, so its source boundary is
-   // BT.2020.
-   const float3 hueTransferredBT2020 = MacLeodBoynton::HueOnlyBT2020(extendedBT2020, Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5));
-   float3 hdr = PsychoVDisplayMap(BT2020_To_BT709(hueTransferredBT2020),
-                                  LumaSettings.GameSettings.Contrast,
-                                  LumaSettings.GameSettings.Saturation,
-                                  LumaSettings.GameSettings.HighlightsDesaturation,
-                                  renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
+   // 5. The display map (see "PsychoVDisplayMapWithHueReference" for both).
+   float3 hdr = PsychoVDisplayMapWithHueReference(extendedLinear,
+                                                  LumaSettings.GameSettings.Contrast,
+                                                  LumaSettings.GameSettings.Saturation,
+                                                  LumaSettings.GameSettings.HighlightsDesaturation);
 
    // Re-apply the engine fade linearly, LAST, after the display map: its contrast pivots on mid-gray, so a fade
    // before it would never reach black. At rest both are no-ops.
@@ -130,7 +123,7 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
 #endif
 
    // --- Common tail: UI paper-white pre-scale + post-process-space encode ---
-   outColor = PreScaleForUIPaperWhite(outColor);
+   outColor *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true);
    outColor = max(0.0, outColor); // negatives would turn into NaN in linear_to_gamma below
 #if POST_PROCESS_SPACE_TYPE == 0
    // Store gamma so the game's gamma-space HUD blends like vanilla; composition decodes + applies paper white.
@@ -139,15 +132,7 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
 #if TONEMAP_TYPE >= 1
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      if (LumaSettings.DisplayMode == 0)
-         ApplyDithering(outColor, sceneUV, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      else
-      {
-         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(outColor, GCT_MIRROR) * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, sceneUV, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         outColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-      }
+      ApplyOutputDithering(outColor, sceneUV, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
    }
 #endif
 #endif

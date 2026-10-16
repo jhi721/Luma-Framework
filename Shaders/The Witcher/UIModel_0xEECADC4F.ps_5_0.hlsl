@@ -3,6 +3,8 @@
 // The 8-bit canvas clamped its output to [0, 1]; on the upgraded fp16 canvas its lighting reached -0.96 and 1.86 around the medallion
 // (Luma MCP readback, 2026-09-30): the output keeps the canvas' floor at 0 and lets the specular highlights exceed 1.
 
+#include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE_CENTROID
+
 cbuffer cb3 : register(b3)
 {
    float4 cb3[77]; // dgVoodoo's own constants: texture format masks (and/or pairs), alpha test reference at [8].z
@@ -38,21 +40,7 @@ float3 NormalizeOrZero(float3 value)
    return value * inverse_length;
 }
 
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    centroid float4 v2 : COLOR0,
-    centroid float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE_CENTROID)
 {
    const float4 diffuse = ApplyFormatMask(t2.Sample(s2_s, v5.xy), cb3[48], cb3[49]);
    const float3 eye = NormalizeOrZero(v7.xyz);

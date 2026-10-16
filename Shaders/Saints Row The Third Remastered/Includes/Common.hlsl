@@ -28,13 +28,6 @@ float SRTTR_Bayer(uint2 pixel)
    return kBayer4x4[((pixel.x & 3u) << 2) | (pixel.y & 3u)] * 0.125 - 1.0;
 }
 
-// UI_DRAW_TYPE 2: the scene is scaled by this before the GUI layer is blended over it, so that the final UI paper white
-// scaling lands it at the scene paper white
-float SRTTR_SceneToUIScale()
-{
-   return LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-}
-
 // Anti-banding dither at the last scene pass, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020
 // PQ in HDR and SDR on HDR (as the other Luma mods). The input is gamma code with 1 = UI paper white (UI_DRAW_TYPE 2).
 void SRTTR_DitherOutput(inout float3 color, float2 uv)
@@ -43,13 +36,5 @@ void SRTTR_DitherOutput(inout float3 color, float2 uv)
    {
       return;
    }
-   if (LumaSettings.DisplayMode == 0)
-   {
-      ApplyDithering(color, uv, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      return;
-   }
-   const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-   float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(color, GCT_MIRROR) * pqScale), GCT_MIRROR);
-   ApplyDithering(pq, uv, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-   color = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
+   ApplyOutputDithering(color, uv, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
 }

@@ -4,6 +4,8 @@
 // scale blows the icon to ~10000 nits. Fix: re-add the saturate. Body verbatim from the dgVoodoo ps_5_0 disasm; the
 // cb3 and/or pairs are dgVoodoo's texture-format bit emulation (mask+set), kept exactly via asuint/asfloat.
 
+#include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE
+
 Texture2D<float4> t0 : register(t0);
 Texture2D<float4> t1 : register(t1);
 Texture2D<float4> t2 : register(t2);
@@ -25,21 +27,7 @@ cbuffer cb4 : register(b4)
 
 #define cmp -
 
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE)
 {
    float4 r0, r1, r2, r3;
 

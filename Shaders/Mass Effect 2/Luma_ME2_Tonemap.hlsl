@@ -101,7 +101,7 @@ float3 DecodeME2Canvas(float3 encoded)
 // LumaSettings (see MapME2ToDisplay), and still guarded: a zero would black the scene and leave the HUD.
 float ME2_CanvasUIPrescale()
 {
-   const float prescale = GamePaperWhiteNits > 0.0 ? GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0) : 1.0;
+   const float prescale = GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, true);
 #if POST_PROCESS_SPACE_TYPE == 0
    return linear_to_gamma1(prescale, GCT_POSITIVE);
 #else
@@ -122,15 +122,7 @@ float3 FinishME2Canvas(float3 encoded, float2 ditherUV, bool dither)
    // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
    [branch] if (dither && LumaSettings.GameSettings.Dithering > 0.5)
    {
-      if (LumaSettings.DisplayMode == 0)
-         ApplyDithering(encoded, ditherUV, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      else
-      {
-         const float pqScale = max(UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(encoded, GCT_MIRROR) * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, ditherUV, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         encoded = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-      }
+      ApplyOutputDithering(encoded, ditherUV, true, LumaSettings.DisplayMode != 0, max(UIPaperWhiteNits, 1.0));
    }
 #endif
 

@@ -262,7 +262,7 @@ groupshared float3 gContinuation;
 
 #if UI_DRAW_TYPE >= 2
       // The GUI layer is blended over this in gamma space by compose; the composition rescales by UI paper white.
-      hdr *= SRTTR_SceneToUIScale();
+      hdr *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
 #endif
       hdr = IsNaN_Strict(hdr) ? 0.0 : max(0.0, hdr);
       outputCode = linear_to_gamma(hdr, GCT_NONE);
@@ -273,7 +273,7 @@ groupshared float3 gContinuation;
 #if UI_DRAW_TYPE >= 2
       [branch] if (LumaSettings.GamePaperWhiteNits != LumaSettings.UIPaperWhiteNits)
       {
-         outputCode = linear_to_gamma(gamma_to_linear(outputCode, GCT_MIRROR) * SRTTR_SceneToUIScale(), GCT_MIRROR);
+         outputCode = linear_to_gamma(gamma_to_linear(outputCode, GCT_MIRROR) * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false), GCT_MIRROR);
       }
 #endif
    }

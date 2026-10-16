@@ -6,7 +6,7 @@ Texture2D<float4> t0 : register(t0);
 SamplerState s0_s : register(s0);
 
 // This shader reads only TEXCOORD0 (v5.xy).
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    const float4 tile = ApplyDgvMask(t0.Sample(s0_s, v5.xy), DgvMaskT0, DgvFillT0);
    o0 = saturate(ME2_CanvasTransform(tile));

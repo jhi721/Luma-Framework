@@ -1,3 +1,6 @@
+#ifndef LUMA_REINHARD_HLSL
+#define LUMA_REINHARD_HLSL
+
 #include "Color.hlsl"
 
 // Erik Reinhard, Michael Stark, Peter Shirley, and James Ferwerda.
@@ -233,3 +236,5 @@ float3 ReinhardTonemap(float3 color, float peak_nits, float diffuse_nits, Reinha
       return color_output;
     };
 }
+
+#endif // LUMA_REINHARD_HLSL

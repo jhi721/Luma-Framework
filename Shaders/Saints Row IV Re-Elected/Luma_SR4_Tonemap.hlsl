@@ -113,15 +113,7 @@ float3 SR4_DisplayMap(float3 hdrLinear, float2 uv)
    // composition scales this image by UIPaperWhite, so that is the PQ scale.
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      if (LumaSettings.DisplayMode == 0)
-         ApplyDithering(encoded, uv, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      else
-      {
-         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(encoded, GCT_MIRROR) * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, uv, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         encoded = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-      }
+      ApplyOutputDithering(encoded, uv, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
    }
    return encoded;
 }

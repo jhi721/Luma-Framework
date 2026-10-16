@@ -40,10 +40,4 @@ float ME3_DoFBlur(float depth, float3 dofParams, float2 maxBlur)
    return min(blur, signedDistance >= 0.0 ? maxBlur.y : maxBlur.x);
 }
 
-// dgVoodoo's fixed interpolator layout (linkage is by register): every entry point declares all 13, read or not. 2.87.3
-// declares the colours centroid in the Scaleform/canvas shaders.
-#define DGV_SIGNATURE_TAIL          float4 v4 : TEXCOORD9, float4 v5 : TEXCOORD0, float4 v6 : TEXCOORD1, float4 v7 : TEXCOORD2, float4 v8 : TEXCOORD3, float4 v9 : TEXCOORD4, float4 v10 : TEXCOORD5, float4 v11 : TEXCOORD6, float4 v12 : TEXCOORD7, out float4 o0 : SV_TARGET0
-#define DGV_MAIN_SIGNATURE          float4 v0 : SV_POSITION0, float4 v1 : TEXCOORD8, float4 v2 : COLOR0, float4 v3 : COLOR1, DGV_SIGNATURE_TAIL
-#define DGV_MAIN_SIGNATURE_CENTROID float4 v0 : SV_POSITION0, float4 v1 : TEXCOORD8, centroid float4 v2 : COLOR0, centroid float4 v3 : COLOR1, DGV_SIGNATURE_TAIL
-
 #endif // LUMA_ME3_GAME_BINDINGS

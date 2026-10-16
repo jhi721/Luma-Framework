@@ -12,11 +12,7 @@
 // 1.0 whenever UI Paper White equals Game Paper White; deriving it keeps both anchors honest on any setting.
 float UiPreScale()
 {
-#if UI_DRAW_TYPE >= 2
-   if (LumaSettings.GamePaperWhiteNits > 0.0)
-      return LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
-   return 1.0;
+   return GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true);
 }
 
 // Where scene paper white lands in this canvas' encoding: the value the 8-bit post chain treated as 1.0, and the

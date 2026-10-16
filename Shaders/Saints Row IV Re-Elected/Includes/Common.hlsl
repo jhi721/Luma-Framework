@@ -34,8 +34,6 @@ float4 SR4_SampleDistortionMap(Texture2D<float4> map, float2 uv)
 // UI drawn on top at the UI paper white and the scene back at its own.
 float3 SR4_EncodeOutput(float3 color)
 {
-#if UI_DRAW_TYPE >= 2
-   color *= GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0);
-#endif
+   color *= GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, false);
    return linear_to_gamma(color, GCT_POSITIVE);
 }

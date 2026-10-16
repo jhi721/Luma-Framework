@@ -1,7 +1,7 @@
 // Mass Effect 2 (2010) - Arrival mech hacking feedback material (Hack_Mech_Fb). See Includes/FXMaterial.hlsl.
 #include "Includes/FXMaterial.hlsl"
 
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    // Blocky scanline jitter: noise-driven offsets snapped to whole units, scaled by 0.004.
    const float2 a = FX_Fetch(Tex1, Sampler1, v5.xy * float2(0.025, 0.05) + FXC(2).xy + v5.xy * float2(0.1, 0.5) + FXC(3).xy, 1).xy * float2(2.0, 1.0) - float2(1.0, 0.0);

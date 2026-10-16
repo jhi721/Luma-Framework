@@ -32,21 +32,7 @@ SamplerState s2_s : register(s2);
 
 // 13 interpolators, all declared in order - linkage is by REGISTER (see Luma_ME1_Tonemap.hlsl). Only TEXCOORD0 (v5.xy,
 // the movie UV) is read.
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE)
 {
    // Plane fetch + dgVoodoo mask (verbatim; all three planes share v5.xy).
    float4 yuv1;
@@ -76,6 +62,6 @@ void main(
 
    // Same pre-scale as the scene passes, so movies land at gameplay brightness. The canvas is a gamma-space buffer;
    // the composition decodes it at present.
-   o0.rgb = linear_to_gamma(PreScaleForUIPaperWhite(lin));
+   o0.rgb = linear_to_gamma(lin * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true));
    o0.w = BinkConstant.w; // vanilla alpha (constant)
 }

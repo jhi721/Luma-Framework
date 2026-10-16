@@ -23,7 +23,7 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
       // Anti-banding dither, one step of the output quantizer (the 8-bit code)
       [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
       {
-         ApplyDithering(o0.rgb, uv, true, 1.0, 8u, LumaSettings.FrameIndex, true);
+         ApplyOutputDithering(o0.rgb, uv, true, false, 1.0);
       }
       return;
    }
@@ -35,10 +35,7 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
    // Anti-banding dither, one step of the output quantizer: 10-bit BT.2020 PQ at the game paper white the composition applies (ME1)
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      const float pqScale = GamePaperWhiteNits / HDR10_MaxWhiteNits;
-      float3 pq = Linear_to_PQ(BT709_To_BT2020(color * pqScale), GCT_MIRROR);
-      ApplyDithering(pq, uv, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-      color = BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale;
+      ApplyOutputDithering(color, uv, false, true, GamePaperWhiteNits);
    }
    o0.rgb = linear_to_gamma(color, GCT_MIRROR);
 }

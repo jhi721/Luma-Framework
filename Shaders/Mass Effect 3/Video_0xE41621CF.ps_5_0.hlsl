@@ -56,6 +56,6 @@ void main(DGV_MAIN_SIGNATURE)
 
    // Same UI Paper White pre-scale as the uber (which applies it on both TONEMAP_TYPEs), so movies land at gameplay
    // brightness; the canvas stays gamma, Core's composition decodes it at present.
-   o0.rgb = linear_to_gamma(lin * GetUIPaperWhitePreScale());
+   o0.rgb = linear_to_gamma(lin * GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, true));
    o0.w = BinkConstant.w; // vanilla alpha (constant)
 }

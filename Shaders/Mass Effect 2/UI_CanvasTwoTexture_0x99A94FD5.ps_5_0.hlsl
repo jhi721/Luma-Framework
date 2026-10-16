@@ -7,7 +7,7 @@ Texture2D<float4> t1 : register(t1);
 SamplerState s1_s : register(s1);
 
 // This shader reads COLOR1.z (v3.z), TEXCOORD0 (v5.xy) and TEXCOORD1 (v6.xy).
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    const float4 a = ApplyDgvMask(t0.Sample(s0_s, v5.xy), DgvMaskT0, DgvFillT0);
    const float4 b = ApplyDgvMask(t1.Sample(s1_s, v6.xy), DgvMaskT1, DgvFillT1);

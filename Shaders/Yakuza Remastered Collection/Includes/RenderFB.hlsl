@@ -41,15 +41,7 @@ float4 RenderFB(float2 uv)
    // SDR, 10-bit BT.2020 PQ in HDR. The composition scales this image by UIPaperWhite, so that is the PQ scale.
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      if (LumaSettings.DisplayMode == 0)
-         ApplyDithering(result.rgb, uv, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      else
-      {
-         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(result.rgb, GCT_MIRROR) * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, uv, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         result.rgb = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-      }
+      ApplyOutputDithering(result.rgb, uv, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
    }
    return result;
 }

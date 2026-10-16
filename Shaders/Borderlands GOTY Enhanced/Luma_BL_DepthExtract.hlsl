@@ -14,6 +14,8 @@
 // expression XeGTAO uses. DepthScaleRT is not applied: the tolerance is a fraction of view depth, so a uniform divisor cancels out
 // of the ratio and the calibrated value carries across games.
 
+#include "../Includes/DepthEdges.hlsl"
+
 Texture2D<float4> depth : register(t0); // hardware d24 scene depth (r24_unorm_x8_uint view), non-reverse-Z
 RWTexture2D<float> uav : register(u0);  // R16_FLOAT predication signal (0 = on the local plane, 1 = edge)
 
@@ -45,20 +47,8 @@ float ViewDepthAt(int3 p)
    const float topZ = (id.y > 0) ? ViewDepthAt(p - int3(0, 1, 0)) : centerZ;
    const float bottomZ = ViewDepthAt(p + int3(0, 1, 0));
 
-   // Deviation from the local plane: compare each one-sided delta against the slope implied by the opposite
-   // neighbour and keep the smaller. On a plane (any orientation) the two agree and this cancels to ~0; at a depth
-   // discontinuity neither cancels. Taking the min also means a garbage opposite tap (the last row/column, where
-   // the Load runs off the texture) can only shrink the result, never invent an edge.
-   float4 edgesLRTB = float4(leftZ, rightZ, topZ, bottomZ) - centerZ;
-   const float slopeLR = (edgesLRTB.y - edgesLRTB.x) * 0.5;
-   const float slopeTB = (edgesLRTB.w - edgesLRTB.z) * 0.5;
-   const float4 edgesLRTBSlopeAdjusted = edgesLRTB + float4(slopeLR, -slopeLR, slopeTB, -slopeTB);
-   edgesLRTB = min(abs(edgesLRTB), abs(edgesLRTBSlopeAdjusted));
-
    // Depth-proportional tolerance: what matters scales with distance (a 10 cm step is a silhouette at 2 m and
    // noise at 200 m). Both terms are required - the slope adjustment alone degrades toward the vanishing point,
    // and a depth-proportional threshold alone cannot reject a grazing plane at all.
-   const float tolerance = max(centerZ, 1e-3) * max(P.x, 1e-4);
-   // Left and top only (see the header).
-   uav[id.xy] = saturate(max(edgesLRTB.x, edgesLRTB.z) / tolerance);
+   uav[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, max(centerZ, 1e-3) * max(P.x, 1e-4));
 }

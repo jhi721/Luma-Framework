@@ -5,6 +5,7 @@
 // and every LumaSettings.GameSettings.* reference fails to compile (invalid subscript).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings (grade sliders) + shared Common (Color/Math/Settings) — keep FIRST
 #include "../Includes/PsychoV31.hlsl"
+#include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE
 // clang-format on
 
 // Borderlands 2 + The Pre-Sequel — uber post-process / tonemap SHARED IMPLEMENTATION (UE3, via dgVoodoo D3D9->11).
@@ -477,11 +478,9 @@ float4 RunTonemap(float4 v5, float4 v6)
       postProcessedColor = sdrLinear;
    }
 
-#if UI_DRAW_TYPE >= 2
    // Pre-scale so the gamma-SDR HUD drawn on top (not pre-scaled) lands at UIPaperWhite after the composition
    // rescales the buffer by it; the scene then lands at GamePaperWhite. Gives the HUD its own paper white.
-   postProcessedColor *= LumaSettings.GamePaperWhiteNits / max(LumaSettings.UIPaperWhiteNits, 1.0);
-#endif
+   postProcessedColor *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
 
    // Sanitize (signed LUT excursions, the user grade and the display map can emit NaN/negatives -> garbage on the swapchain).
    // max returns the non-NaN operand, so NaN -> 0 too.
@@ -496,36 +495,14 @@ float4 RunTonemap(float4 v5, float4 v6)
 #if TONEMAP_TYPE >= 1
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      if (LumaSettings.DisplayMode == 0)
-         ApplyDithering(postProcessedColor, v6.xy, true, 1.0, 8u, LumaSettings.FrameIndex, true);
-      else
-      {
-         const float pqScale = max(LumaSettings.UIPaperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
-         float3 pq = Linear_to_PQ(BT709_To_BT2020(gamma_to_linear(postProcessedColor, GCT_MIRROR) * pqScale), GCT_MIRROR);
-         ApplyDithering(pq, v6.xy, true, 1.0, 10u, LumaSettings.FrameIndex, true);
-         postProcessedColor = linear_to_gamma(BT2020_To_BT709(PQ_to_Linear(pq, GCT_MIRROR)) / pqScale, GCT_MIRROR);
-      }
+      ApplyOutputDithering(postProcessedColor, v6.xy, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
    }
 #endif
 
    return float4(postProcessedColor, 0.0); // vanilla wrote o0.w = 0
 }
 
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0,
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+void main(DGV_MAIN_SIGNATURE)
 {
    o0 = RunTonemap(v5, v6);
 }

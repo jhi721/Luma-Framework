@@ -3,7 +3,7 @@
 #define ME2_MATERIAL_GRAIN 1
 #include "Luma_ME2_Tonemap.hlsl"
 
-void main(ME2_MAIN_SIGNATURE)
+void main(DGV_MAIN_SIGNATURE)
 {
    // Vanilla writes v10.w into alpha, which the pass's 0x7 write mask then discards; kept for fidelity.
    o0 = float4(RunME2Material(v5.xy, v10.xyw), v10.w);
