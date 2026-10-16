@@ -196,6 +196,7 @@ cbuffer LumaSettings : register(LUMA_SETTINGS_CB_INDEX)
     float UIPaperWhiteNits; // Access this through the global variables below (only usable in certain "UI_DRAW_TYPE" modes)
     uint SRType; // Which SR is enabled if any (implies it'd be engaged and compatible) (this is on even in fullscreen UI menus that don't use upscaling)
     uint FrameIndex; // Frame counter, no need for this to be by device or swapchain
+    uint HDRToneMapper; // The game's HDR tone mapper choice, an index into its "hdr_tone_mapper_names" (0 if it has only one)
     
 // These ideally should be after anything else or if we toggled the "DEVELOPMENT" flag, the rest would get misaligned,
 // however for some reason the alignment of nested structs (the ones below) doesn't match between c++ and hlsl,
@@ -214,8 +215,9 @@ cbuffer LumaSettings : register(LUMA_SETTINGS_CB_INDEX)
     float DevSetting08; // 0, 0, 1
     float DevSetting09; // 0, 0, 1
     float DevSetting10; // 0, 0, 1
+    float3 Padding1;
 #else
-    float2 Padding1;
+    float Padding1;
 #endif
 
     // NOTE: keep anything before the game settings aligned to 16 bytes (4 floats/ints). This is the only way to match both c++ and hlsl quirks at the same time.

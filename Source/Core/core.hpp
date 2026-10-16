@@ -615,6 +615,9 @@ namespace
       bool show_display_settings_without_composition = false;
       // The UI Paper White slider whatever "UI_DRAW_TYPE" is (a mod scaling the UI on its own)
       bool force_separate_ui_paper_white = false;
+      // Set in "Game::OnInit()" by games with more than one HDR tone mapper, the first being the default: the display settings
+      // then offer them in HDR, and shaders read the choice from "LumaSettings.HDRToneMapper"
+      std::vector<const char*> hdr_tone_mapper_names;
 
       //
       // Samplers
@@ -15021,6 +15024,19 @@ namespace
                if (display_mode == DisplayModeType::HDR)
                {
                   ImGui::BeginDisabled(!mod_active);
+                  if (hdr_tone_mapper_names.size() > 1)
+                  {
+                     int hdr_tone_mapper = int(cb_luma_global_settings.HDRToneMapper);
+                     if (ImGui::SliderInt("Tone Mapper", &hdr_tone_mapper, 0, int(hdr_tone_mapper_names.size()) - 1, hdr_tone_mapper_names[hdr_tone_mapper], ImGuiSliderFlags_NoInput))
+                     {
+                        cb_luma_global_settings.HDRToneMapper = uint(hdr_tone_mapper);
+                        reshade::set_config_value(runtime, NAME, "HDRToneMapper", hdr_tone_mapper);
+                     }
+                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                     {
+                        ImGui::SetTooltip("How the HDR image is mapped to the display's peak brightness.");
+                     }
+                  }
                   // We should this even if "IsModActive()" is false
                   if (ImGui::SliderFloat("Scene Peak White", &cb_luma_global_settings.ScenePeakWhite, 400.0, 10000.f, "%.f"))
                   {
@@ -16704,6 +16720,9 @@ void Init(bool async)
       int display_mode_i = int(cb_luma_global_settings.DisplayMode);
       reshade::get_config_value(runtime, NAME, "DisplayMode", display_mode_i);
       cb_luma_global_settings.DisplayMode = DisplayModeType(display_mode_i);
+      int hdr_tone_mapper_i = int(cb_luma_global_settings.HDRToneMapper);
+      reshade::get_config_value(runtime, NAME, "HDRToneMapper", hdr_tone_mapper_i);
+      cb_luma_global_settings.HDRToneMapper = uint(std::clamp(hdr_tone_mapper_i, 0, max(int(hdr_tone_mapper_names.size()) - 1, 0)));
 #if !DEVELOPMENT && !TEST // Don't allow "SDR in HDR for HDR" mode (there's no strong reason not to, but it avoids permutations exposed to users)
       if (cb_luma_global_settings.DisplayMode >= DisplayModeType::SDRInHDR)
       {
