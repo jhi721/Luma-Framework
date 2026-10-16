@@ -467,8 +467,6 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    bool sr_output_recreated = false;
    // "IsSRActive", taken at present (see there)
    bool sr_active = false;
-   // None was picked ("CleanExtraSRResources", from the overlay): the motion vector and render scale resources go at the next present
-   std::atomic<bool> release_sr_resources = false;
 
    // GPU copies of the native bloom's constants, taken at their own draws earlier in the same frame: the brightpass vc0
    // (bound at b0 for the prefilter) and vc4 (b4), the combine vc4 (b5) and the source downsample vc4 (b6). Copied only
@@ -1263,9 +1261,7 @@ class SaintsRowIV final : public Game
                game_device_data.mv_blend_opaque = true;
                // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
                const SR::InstanceData* const sr_instance_data = (IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr);
-               const int phases = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-               const unsigned int phase = cb_luma_global_settings.FrameIndex % phases;
-               game_device_data.mv_jitter = (((sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
+               game_device_data.mv_jitter = (((sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
                // The render size: the render scale's sub-rect (see "ScaleSceneViewport"), else the scene's
                const float scale = GetSubRectScale(device_data);
                const float render_width = std::round(float(gbuffer_depth_size.x) * scale), render_height = std::round(float(gbuffer_depth_size.y) * scale);
@@ -2862,19 +2858,7 @@ public:
 
       const bool sr_active = IsSRActive(device_data);
       ImGui::BeginDisabled(!sr_active);
-      // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
-      static int held_render_scale = 0; // The slider's value while it's held, else 0
-      int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(g_render_scale * 100.f)));
-      ImGui::SliderInt("Render Scale (%)", &render_scale, int(min_render_scale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
-      held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-      {
-         g_render_scale = float(render_scale) / 100.f;
-         reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR.");
-      DrawResetButton(g_render_scale, 1.f, "RenderScale");
+      DrawRenderScaleSlider(&g_render_scale, min_render_scale, "The resolution the game renders at, upscaled by DLSS/FSR.");
       ImGui::EndDisabled();
 
       // The upscaler (Super Resolution, in the Settings tab) replaces MSAA and SMAA: shown off, the saved choices are kept
@@ -2955,11 +2939,6 @@ public:
          ImGui::SetTooltip("Disables the in-game UI.");
    }
 
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
-   }
-
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -2989,7 +2968,7 @@ public:
          game_device_data.mv_previous_camera_valid = false;
       }
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again)
-      if (device_data.sr_type == SR::Type::None && game_device_data.release_sr_resources.exchange(false) && !g_mv_enable)
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false) && !g_mv_enable)
       {
          {
             const std::unique_lock lock(game_device_data.mv_mutex);
@@ -3054,12 +3033,8 @@ public:
       game_device_data.mv_frame_ended = true;
       game_device_data.mv_scene_color_wanted = false;
       game_device_data.mv_fill_pending = false;
-      if (!custom_texture_mip_lod_bias_offset)
-      {
-         const std::unique_lock lock(s_mutex_samplers);
-         // -1 at native resolution, lower below it (the render scale)
-         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(std::round(device_data.output_resolution.y * GetSubRectScale(device_data)), device_data.output_resolution.y) : 0.f);
-      }
+      // -1 at native resolution, lower below it (the render scale)
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(std::round(device_data.output_resolution.y * GetSubRectScale(device_data)), device_data.output_resolution.y) : 0.f));
       // Turning XeGTAO off gives its scratch back; it is rebuilt on demand.
       if (!g_gtao_enable && game_device_data.gtao_width != 0)
          game_device_data.ReleaseGTAOScratch();

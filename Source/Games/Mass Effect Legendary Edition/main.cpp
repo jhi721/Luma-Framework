@@ -772,8 +772,6 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    // Motion vectors: shaders patched on first use, by original hash (null on failure), and the target (sized like the scene; every
    // blend state writes it unblended, see "OnCreateBlendState")
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
-   // None was picked ("CleanExtraSRResources", from the overlay): our upscaler resources go at the next present
-   std::atomic<bool> release_sr_resources = false;
    std::shared_mutex mv_mutex;
    // A patched shader (null if refused) with, for a vertex shader, whether it reads b3 (skinned), the byte offset of its LocalToWorld
    // translation row in b0 (none for world space geometry, matched by draw key alone), and the bytes of b0 / b1 / b3 it reads
@@ -1612,13 +1610,11 @@ class MassEffectLE final : public Game
       game_device_data.mv_blend_depth_only = false;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
       const SR::InstanceData* const sr_instance_data = (IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr);
-      const unsigned int phase_count = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % phase_count;
       bool jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter;
 #if DEVELOPMENT
       jitter &= perf_test_modes[Perf::g_test].motion_vector_draws >= 1; // "Performance Test" without jitter draws
 #endif
-      game_device_data.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
+      game_device_data.mv_jitter = (jitter ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
       D3D11_VIEWPORT viewport = {};
       UINT viewport_count = 1;
       native_device_context->RSGetViewports(&viewport_count, &viewport);
@@ -3494,11 +3490,6 @@ public:
       return RunSMAAResolve(native_device, native_device_context, device_data, &gd, original_shader_hashes, is_custom_pass);
    }
 
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
-   }
-
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -3533,7 +3524,7 @@ public:
       }
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again). The DEV
       // "MV Enable" still draws motion vectors without an upscaler: their resources stay then.
-      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
       }
@@ -3838,24 +3829,7 @@ public:
       if (EngineScale::installed)
       {
          ImGui::BeginDisabled(!sr_active);
-         // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
-         static int held_render_scale = 0; // The slider's value while it's held, else 0
-         int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(EngineScale::g_render_scale * 100.f)));
-         ImGui::SliderInt("Render Scale (%)", &render_scale, int(EngineScale::MIN_RENDER_SCALE * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
-         held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-         {
-            EngineScale::g_render_scale = float(render_scale) / 100.f;
-            reshade::set_config_value(nullptr, PROJECT_NAME, "RenderScale", EngineScale::g_render_scale);
-         }
-         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         {
-            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.");
-         }
-         if (DrawResetButton<float, false>(EngineScale::g_render_scale, 1.f, "RenderScale"))
-         {
-            reshade::set_config_value(nullptr, PROJECT_NAME, "RenderScale", EngineScale::g_render_scale);
-         }
+         DrawRenderScaleSlider(&EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, "The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.", PROJECT_NAME);
          ImGui::EndDisabled();
       }
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept

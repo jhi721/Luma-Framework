@@ -95,8 +95,6 @@ struct TheWitcherGameDeviceData final : public GameDeviceData
    // post passes read), drawn from this view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
-   // None was picked ("CleanExtraSRResources", from the overlay): the upscaler's resources go at the next present
-   std::atomic<bool> release_sr_resources = false;
 
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    bool scene_active = false;           // The scene's start and end are tracked this frame: motion vectors, or SMAA (set at present)
@@ -467,8 +465,7 @@ class TheWitcherGame final : public Game
       const SR::InstanceData* sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
       if (sr_instance_data && !sr_implementations[device_data.sr_type]->IsReady(sr_instance_data))
          sr_instance_data = nullptr;
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      gd.mv_jitter = (sr_instance_data || g_mv_force_jitter) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+      gd.mv_jitter = (sr_instance_data || g_mv_force_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{};
       gd.mv_jitter_ndc = {gd.mv_jitter[0] * 2.f / device_data.output_resolution.x, gd.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -1311,11 +1308,6 @@ public:
          CenterWindowAndRemoveBorders();
    }
 
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
-   }
-
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -1331,7 +1323,7 @@ public:
       }
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when
       // an upscaler is picked again (the helper takes seconds to start).
-      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
          if (!g_mv_enable)
@@ -1360,12 +1352,8 @@ public:
       gd.mv_scene_open = false;
       gd.mv_scene_done = false;
       gd.mv_frame_ended = true;
-      if (!custom_texture_mip_lod_bias_offset)
-      {
-         const std::unique_lock lock(s_mutex_samplers);
-         // -1 at native resolution (Core biases the anisotropic samplers)
-         device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f;
-      }
+      // -1 at native resolution (Core biases the anisotropic samplers)
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
 #if DEVELOPMENT
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run

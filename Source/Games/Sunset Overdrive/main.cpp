@@ -1040,7 +1040,7 @@ public:
       if (game_device_data.sr_active)
       {
          render_aa_option = AA_OPTION_OFF;
-         jitter_phases = (sr_drew_last_frame ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : STAMP_ONLY_JITTER);
+         jitter_phases = (sr_drew_last_frame ? GetSRJitterPhases(device_data, sr_instance_data) : STAMP_ONLY_JITTER);
       }
       else if (game_device_data.t2x_active)
       {

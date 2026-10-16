@@ -509,8 +509,6 @@ struct MassEffectAndromedaGameDeviceData final : public GameDeviceData
    // "LatchSRFrame" at present: an upscaler is picked and hasn't failed. Fixed for the whole frame.
    bool sr_active = false;
    uint32_t taa_resolve_frame = UINT32_MAX; // The last frame with a TAA resolve SR can replace (the render scale needs one)
-   // "CleanExtraSRResources" ran (None picked): ours go at the next present
-   std::atomic<bool> release_sr_resources = false;
 
    // --- Upscaling (the upscaler drew above the render size): the frame from the tonemap on at the output size. The engine's
    // tonemap target stays render sized; Luma's "upscaled_scene" replaces it for every later draw that reads or writes it (the
@@ -1168,7 +1166,7 @@ class MassEffectAndromeda final : public Game
       {
          const SR::InstanceData* sr_instance_data = device_data.GetSRInstanceData();
          values.jitter_use_cmj = 1;
-         values.jitter_count = uint32_t((sr_active && sr_instance_data) ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : g_halton_jitter_native_phases);
+         values.jitter_count = uint32_t((sr_active && sr_instance_data) ? GetSRJitterPhases(device_data, sr_instance_data) : g_halton_jitter_native_phases);
          // The engine rebuilds the table at the new count during the next frame: the points go in from the present after it
          const JitterTable& table = FindJitterTable();
          if (table.begin && *table.begin && size_t(*table.end - *table.begin) == size_t(values.jitter_count) * 2)
@@ -3860,13 +3858,6 @@ public:
 #endif
    }
 
-#if ENABLE_SR
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
-   }
-#endif
-
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -3905,7 +3896,7 @@ public:
       apply_engine_mode(g_game_render_settings, kGrsRenderScaleResampleMode, g_dev_engine_resample_mode, &g_dev_engine_resample_mode_value);
 #endif
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again)
-      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
          gd.ReleaseUpscaledScene();
@@ -4035,24 +4026,7 @@ public:
       ImGui::SeparatorText("Anti-Aliasing");
 #if ENABLE_SR
       ImGui::BeginDisabled(!sr_selected);
-      // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
-      static int held_render_scale = 0; // The slider's value while it's held, else 0
-      int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(g_render_scale * 100.f)));
-      ImGui::SliderInt("Render Scale (%)", &render_scale, int(kMinRenderScale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
-      held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-      {
-         g_render_scale = float(render_scale) / 100.f;
-         reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR. Replaces the game's Resolution Scale while they run.");
-      }
-      if (DrawResetButton<float, false>(g_render_scale, 1.f, "RenderScale"))
-      {
-         reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
-      }
+      DrawRenderScaleSlider(&g_render_scale, kMinRenderScale, "The resolution the game renders at, upscaled by DLSS/FSR. Replaces the game's Resolution Scale while they run.");
       ImGui::EndDisabled();
 #endif
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, kDefaultSmaaEnable, "Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");

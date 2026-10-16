@@ -385,8 +385,6 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
-   // None was picked ("CleanExtraSRResources", from the overlay): the upscaler's resources go at the next present
-   std::atomic<bool> release_sr_resources = false;
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
    // A game shader's patched version (null if refused), patched on first use, by its hash; a vertex shader's with the bytes of vc4
@@ -1349,11 +1347,9 @@ class TheWitcher2Game final : public Game
       {
          sr_instance_data = nullptr;
       }
-      const int phase_count = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % unsigned(phase_count);
       const bool upscaled_last_frame = sr_instance_data && !device_data.force_reset_sr;
       const bool jitter = (upscaled_last_frame || g_mv_force_jitter) && !g_mv_disable_jitter && gd.mv_previous_scene_done && GetPerfMotionVectorDraws() != 0;
-      gd.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
+      gd.mv_jitter = (jitter ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
 #if DEVELOPMENT
       // The upscaler's start as it happens: when the jitter turns on or off, and why
       if (jitter != gd.mv_logged_jitter)
@@ -3128,7 +3124,7 @@ public:
       RenderArea::render_size = {};
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when
       // an upscaler is picked again (the helper takes seconds to start).
-      if (device_data.sr_type == SR::Type::None && game_device_data.release_sr_resources.exchange(false))
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          game_device_data.sr_output_srv.reset();
          game_device_data.sr_adaptation_srv.reset();
@@ -3347,11 +3343,6 @@ public:
 #endif
    }
 
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
-   }
-
    void LoadConfigs() override
    {
 #if ENABLE_SMAA
@@ -3391,21 +3382,7 @@ public:
       if (RenderArea::scale_installed)
       {
          ImGui::BeginDisabled(!sr_active);
-         // Applied on release: every render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging
-         static int held_render_scale = 0; // The slider's value while it's held, else 0
-         int render_scale = (held_render_scale != 0 ? held_render_scale : int(std::round(g_render_scale * 100.f)));
-         ImGui::SliderInt("Render Scale (%)", &render_scale, int(MIN_RENDER_SCALE * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
-         held_render_scale = (ImGui::IsItemActive() ? render_scale : 0);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-         {
-            g_render_scale = float(render_scale) / 100.f;
-            reshade::set_config_value(nullptr, NAME, "RenderScale", g_render_scale);
-         }
-         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         {
-            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.");
-         }
-         DrawResetButton(g_render_scale, 1.f, "RenderScale");
+         DrawRenderScaleSlider(&g_render_scale, MIN_RENDER_SCALE, "The resolution the game renders at, upscaled by DLSS/FSR or Luma TAA.");
          ImGui::EndDisabled();
       }
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept

@@ -166,9 +166,6 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
    // passes read), drawn from this view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
-   // None was picked ("CleanExtraSRResources", from the overlay) or T2x turned off: the upscaler's resources go at the next present
-   // while none is picked
-   std::atomic<bool> release_sr_resources = false;
 
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler, SMAA T2x or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
@@ -1369,8 +1366,7 @@ class MirrorsEdge final : public Game
       {
          sr_instance_data = nullptr;
       }
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      gd.mv_jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{});
+      gd.mv_jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
       // 2. That is its table read with y up, which measured better (docs/SMAA-Lab.md). The projection moves the other way.
       gd.t2x_phase = ((gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
@@ -2335,7 +2331,7 @@ public:
       if (t2x_was_active && !gd.t2x_active)
       {
          gd.ReleaseT2xFrames();
-         gd.release_sr_resources = true;
+         device_data.release_sr_resources = true;
       }
       if (gd.t2x_frames[0] && cb_luma_global_settings.FrameIndex - gd.t2x_frame > IDLE_RELEASE_FRAMES)
       {
@@ -2344,7 +2340,7 @@ public:
       gd.mv_active = (gd.sr_active || gd.t2x_active || g_mv_enable) && !gd.msaa_active;
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when an
       // upscaler is picked again (the helper takes seconds to start).
-      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
          if (!g_mv_enable && !gd.t2x_active)
@@ -2440,11 +2436,6 @@ public:
          }
       }
 #endif
-   }
-
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
    }
 
    void LoadConfigs() override

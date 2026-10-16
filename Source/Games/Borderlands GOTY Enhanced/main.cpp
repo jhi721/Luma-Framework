@@ -441,8 +441,6 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
    // The upscaler's output, read in place of its input (the scene's last copy, else the scene) by the uber and the DOF/Bloom gather
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
    ID3D11Resource* sr_input = nullptr;
-   // None was picked ("CleanExtraSRResources", from the overlay): the upscaler's resources go at the next present
-   std::atomic<bool> release_sr_resources = false;
 
    // DLSS / FSR: the per pixel DOF blur amount accumulated over frames (Luma_BL_DOFGather.hlsl), ping-pong, and its constants (b5)
    com_ptr<ID3D11Texture2D> dof_history[2];
@@ -1116,8 +1114,7 @@ class BorderlandsGoty final : public Game
       game_device_data.mv_blend_opaque = true;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up)
       const SR::InstanceData* const sr_instance_data = IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr;
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+      game_device_data.mv_jitter = (sr_instance_data || g_mv_force_jitter) && !g_mv_disable_jitter ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{};
       game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / device_data.output_resolution.x, game_device_data.mv_jitter[1] * -2.f / device_data.output_resolution.y};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -2420,11 +2417,6 @@ public:
       return DrawOrDispatchOverrideType::None;
    }
 
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
-   }
-
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -2448,7 +2440,7 @@ public:
          gd.mv_previous_camera.reset();
       }
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again)
-      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false) && !g_mv_enable)
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false) && !g_mv_enable)
       {
          gd.sr_output_srv.reset();
          gd.sr_input = nullptr;
@@ -2480,12 +2472,8 @@ public:
       gd.mv_frame_ended = true;
       gd.mv_fill_pending = false;
       gd.fxaa_replaced = false;
-      if (!custom_texture_mip_lod_bias_offset)
-      {
-         const std::unique_lock lock(s_mutex_samplers);
-         // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
-         device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f;
-      }
+      // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
       // SMAA's resources go once it stopped running (the upscaler antialiases, or the game's AA is off), the snapshot too once RCAS
       // stopped as well; on the render thread, between frames
       if (cb_luma_global_settings.FrameIndex - gd.smaa_frame > smaa_idle_release_frames)

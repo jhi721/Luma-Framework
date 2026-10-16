@@ -403,8 +403,6 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    // post passes read), drawn from this view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
-   // None was picked ("CleanExtraSRResources", from the overlay): the upscaler's resources go at the next present
-   std::atomic<bool> release_sr_resources = false;
 
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
@@ -1390,8 +1388,7 @@ class Borderlands2 final : public Game
       {
          sr_instance_data = nullptr;
       }
-      const unsigned int phase = cb_luma_global_settings.FrameIndex % (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      gd.mv_jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) && GetPerfMotionVectorDraws() != 0) ? std::array<float, 2>{SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)} : std::array<float, 2>{};
+      gd.mv_jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) && GetPerfMotionVectorDraws() != 0) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{};
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
       // 2. That is its table read with y up, which measured better (docs/SMAA-Lab.md). The projection moves the other way.
       gd.t2x_phase = ((gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex && GetPerfMotionVectorDraws() != 0) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
@@ -3563,11 +3560,6 @@ public:
       return DrawOrDispatchOverrideType::None;
    }
 
-   void CleanExtraSRResources(DeviceData& device_data) override
-   {
-      GetGameDeviceData(device_data).release_sr_resources = true;
-   }
-
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -3589,7 +3581,7 @@ public:
       if (t2x_was_active && !gd.t2x_active)
       {
          gd.ReleaseT2xFrames();
-         gd.release_sr_resources = true;
+         device_data.release_sr_resources = true;
       }
       gd.mv_active = IsSRActive(device_data) || g_mv_enable || gd.t2x_active;
       // The proxy's vertex constant mirror, while its CSMT layer runs; the buffer hooks only where it can't replace them. Registered on
@@ -3622,7 +3614,7 @@ public:
       }
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when an
       // upscaler is picked again (the helper takes seconds to start).
-      if (device_data.sr_type == SR::Type::None && gd.release_sr_resources.exchange(false))
+      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          gd.sr_output_srv.reset();
          if (!g_mv_enable && !gd.t2x_active)
@@ -3769,12 +3761,8 @@ public:
       gd.mv_scene_done = false;
       gd.mv_frame_ended = true;
       gd.mv_fill_pending = false;
-      if (!custom_texture_mip_lod_bias_offset)
-      {
-         const std::unique_lock lock(s_mutex_samplers);
-         // -1 at native resolution (Core biases the game's anisotropic samplers, all upgraded to AF16x)
-         device_data.texture_mip_lod_bias_offset = IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f;
-      }
+      // -1 at native resolution (Core biases the game's anisotropic samplers, all upgraded to AF16x)
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
 #if DEVELOPMENT
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       if (g_mv_trace_loading && gd.mv_last_stats.near_plane > 0.f && gd.mv_last_stats.near_plane < 1.f)

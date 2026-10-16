@@ -798,8 +798,7 @@ class Persona5Strikers final : public Game
       // Halton (2, 3) over the upscaler's phase count (from its last settings; more at lower render scales)
       const bool jitter = IsSRActive(device_data) && game_device_data.sr_drew;
       const SR::InstanceData* const sr_instance_data = (jitter ? device_data.GetSRInstanceData() : nullptr);
-      const int phases = (sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases());
-      game_device_data.mv_jitter = (jitter ? std::array<float, 2>{SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 2), SR::HaltonSequence(cb_luma_global_settings.FrameIndex % phases, 3)} : std::array<float, 2>{});
+      game_device_data.mv_jitter = (jitter ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
       // Pixels to NDC (y up)
       const float ndc_jitter[4] = {game_device_data.mv_jitter[0] * 2.f / float(depth_size.x), game_device_data.mv_jitter[1] * -2.f / float(depth_size.y), 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -3255,12 +3254,8 @@ public:
          UpdateRenderScale(&game_device_data, menu);
       }
       // A mip sharper under DLSS/FSR, which resolves the detail over its jittered frames (Core applies it to anisotropic samplers)
-      if (!custom_texture_mip_lod_bias_offset)
-      {
-         const std::unique_lock lock(s_mutex_samplers);
-         const auto heights = game_device_data.sr_heights.load();
-         device_data.texture_mip_lod_bias_offset = (IsSRActive(device_data) ? SR::GetMipLODBias(heights.render, heights.output) : 0.f);
-      }
+      const auto heights = game_device_data.sr_heights.load();
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(heights.render, heights.output) : 0.f));
 #if DEVELOPMENT
       // "Performance Test": the finished timestamp sets, averaged into a log line every 120 frames (the first 60 after a mode change or
       // a pause skipped)
