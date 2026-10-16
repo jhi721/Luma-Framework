@@ -11363,15 +11363,19 @@ namespace
       return edited;
    }
 
+#ifndef LUMA_SETTINGS_SECTION
+#define LUMA_SETTINGS_SECTION NAME
+#endif
+
    // Persisted user setting widgets: the control, its ini save, a tooltip (also shown while disabled) and a reset button.
-   // "section" must match the one the game's "LoadConfigs" reads. Each returns whether the value changed this frame.
-   bool DrawSettingSlider(const char* label, const char* key, float* value, float default_value, float min_value, float max_value, const char* tooltip, const char* format = "%.3f", const char* section = NAME, ImGuiSliderFlags flags = 0)
+   // They save to LUMA_SETTINGS_SECTION, which must match the section the game's "LoadConfigs" reads. Each returns whether the value changed this frame.
+   bool DrawSettingSlider(const char* label, const char* key, float* value, float default_value, float min_value, float max_value, const char* tooltip, const char* format = "%.3f", ImGuiSliderFlags flags = 0)
    {
       bool changed = ImGui::SliderFloat(label, value, min_value, max_value, format, flags);
       // Saved once the edit ends, not on every drag step
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
-         reshade::set_config_value(nullptr, section, key, *value);
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, key, *value);
       }
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
@@ -11379,51 +11383,48 @@ namespace
       }
       if (DrawResetButton<float, false>(*value, default_value, key))
       {
-         reshade::set_config_value(nullptr, section, key, *value);
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, key, *value);
          changed = true;
       }
       return changed;
    }
 
-   bool DrawSettingCheckbox(const char* label, const char* key, bool* value, bool default_value, const char* tooltip, const char* section = NAME)
+   // A bool, or a 0/1 float (usually a cbuffer field), shown as a checkbox. "forced": shown as "forced_value" and disabled (e.g. while
+   // another feature replaces it or always applies it), keeping the saved choice
+   template <typename T>
+   bool DrawSettingCheckbox(const char* label, const char* key, T* value, std::type_identity_t<T> default_value, const char* tooltip, bool forced = false, bool forced_value = false)
    {
-      bool changed = ImGui::Checkbox(label, value);
-      if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("%s", tooltip);
-      }
-      changed |= DrawResetButton<bool, false>(*value, default_value, key);
+      static_assert(std::is_same_v<T, bool> || std::is_same_v<T, float>);
+      bool shown = forced ? forced_value : (float(*value) > 0.5f);
+      ImGui::BeginDisabled(forced);
+      bool changed = ImGui::Checkbox(label, &shown);
+      ImGui::EndDisabled();
       if (changed)
       {
-         reshade::set_config_value(nullptr, section, key, *value);
-      }
-      return changed;
-   }
-
-   // A 0/1 float (usually a cbuffer field) shown as a checkbox
-   bool DrawSettingCheckbox(const char* label, const char* key, float* value, float default_value, const char* tooltip, const char* section = NAME)
-   {
-      bool enabled = *value > 0.5f;
-      bool changed = ImGui::Checkbox(label, &enabled);
-      if (changed)
-      {
-         *value = enabled ? 1.f : 0.f;
+         *value = T(shown);
       }
       if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("%s", tooltip);
       }
-      changed |= DrawResetButton<float, false>(*value, default_value, key);
+      if (forced)
+      {
+         DrawResetButton<bool, false>(shown, shown, key); // Only its spacer, the saved choice can't be reset from here
+      }
+      else
+      {
+         changed |= DrawResetButton<T, false>(*value, default_value, key);
+      }
       if (changed)
       {
-         reshade::set_config_value(nullptr, section, key, *value);
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, key, *value);
       }
       return changed;
    }
 
    // The "Render Scale (%)" slider of a Luma-driven render scale, saved as a 0-1 float ("RenderScale"). Applied on release: every
    // render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging. Draw it once per mod (it holds the dragged value).
-   void DrawRenderScaleSlider(float* render_scale, float min_render_scale, const char* tooltip, const char* section = NAME)
+   void DrawRenderScaleSlider(float* render_scale, float min_render_scale, const char* tooltip)
    {
       static int held_render_scale = 0; // The slider's value while it's held, else 0
       int render_scale_percent = (held_render_scale != 0 ? held_render_scale : int(std::round(*render_scale * 100.f)));
@@ -11432,7 +11433,7 @@ namespace
       if (ImGui::IsItemDeactivatedAfterEdit())
       {
          *render_scale = float(render_scale_percent) / 100.f;
-         reshade::set_config_value(nullptr, section, "RenderScale", *render_scale);
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, "RenderScale", *render_scale);
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
@@ -11440,7 +11441,7 @@ namespace
       }
       if (DrawResetButton<float, false>(*render_scale, 1.f, "RenderScale"))
       {
-         reshade::set_config_value(nullptr, section, "RenderScale", *render_scale);
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, "RenderScale", *render_scale);
       }
    }
 
