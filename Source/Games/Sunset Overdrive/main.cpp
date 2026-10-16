@@ -338,7 +338,7 @@ public:
       GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');
       // 0 stays selectable as the vanilla reference every HDR change gets compared against (Includes/ToneMap.hlsl)
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - Vanilla SDR\n1 - Luma HDR (Vanilla+)", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - Vanilla SDR\n1 - Luma HDR", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -368,6 +368,9 @@ public:
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
       native_shaders_definitions.emplace(shader_hash_SmaaPredication, ShaderDefinition{"Luma_SO_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
+      // "ToneMap.hlsl": 0 the vanilla curve's shoulder stretched to the peak, 1 PsychoV31
+      hdr_tone_mapper_names = {"Vanilla+", "PsychoV-31"};
+
       // SMAA T2x's own passes ("SMAA_T2X" in "Luma_SMAA_impl.hlsl"). The edge detection and the vertex shaders are 1x's.
       native_shaders_definitions.emplace(shader_hash_SmaaT2xWeights, ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(shader_hash_SmaaT2xBlend, ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});

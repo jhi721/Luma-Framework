@@ -1,15 +1,17 @@
 // Shared body of the 16 PS_ToneMap* permutations (exe shader table names, _tools/sunset_overdrive/shader_names.csv).
 // The including file defines TONEMAP_VIGNETTE, while the bloom, color correction (3D LUT) and film grain follow the hash.
 //
-// Vanilla, per channel: scene = radiance * exposure -> 1D tone curve (R16_UNORM, 256 texels over log2(scene) in [-8, 5])
-// -> + bloom (display linear) -> saturate -> sRGB encode -> * brightness -> saturate -> 3D LUT (32^3 RGBA8, sRGB in and out)
-// -> film grain lerp -> vignette. The output target is R10G10B10A2 (sRGB encoded), later SMAA and PS_CopyBuffer to the swapchain.
+// Vanilla, per channel: scene = scene-linear RGB (g_RadianceMap) * exposure -> 1D tone curve (R16_UNORM, 256 texels over
+// log2(scene) in [-8, 5]) -> + bloom (display linear) -> saturate -> sRGB encode -> * g_TM_Brightness -> saturate -> 3D LUT
+// (32^3 RGBA8, sRGB in and out) -> film grain lerp -> vignette. The output target is R10G10B10A2 (sRGB encoded), later SMAA
+// and PS_CopyBuffer to the swapchain.
 //
 // Luma HDR runs that chain a second time with its two clips lifted: the tone curve is continued past its inflection with a
-// secant read from the bound curve (it reaches 1 at scene ~16.7 and stays flat), and the LUT is extrapolated. Only the luminance
-// of that working value is kept: the colour (hue, saturation and the whitening of the per-channel curve) stays the vanilla
-// grade's, as in Mass Effect Legendary Edition, Mass Effect 2, Borderlands 2 and Saints Row The Third Remastered. RenoDX's
-// PsychoV31 then maps the scene to the display peak.
+// secant read from the bound curve (it reaches 1 at scene ~16.7 and stays flat), and the LUT is extrapolated. Only the relative
+// luminance of that working value is kept: the chromaticity (the RGB ratios, with the whitening of the per-channel curve) stays
+// the vanilla grade's, as in Mass Effect Legendary Edition, Mass Effect 2, Borderlands 2 and Saints Row The Third Remastered.
+// The user's HDR tone mapper then maps the scene to the display peak: "Vanilla+" (the vanilla curve's shoulder stretched to
+// it, default) or RenoDX's PsychoV31.
 
 #define LUT_3D 1
 
@@ -21,7 +23,6 @@
 // The game's Common.hlsl must come first, or the shared headers declare a placeholder GameSettings struct
 // clang-format off
 #include "Common.hlsl"
-#include "../../Includes/ColorGradingLUT.hlsl"
 #include "../../Includes/PsychoV31.hlsl"
 // clang-format on
 
@@ -73,15 +74,65 @@ float SampleToneCurve(float scene)
 
 // Tangent (secant) continuation above the curve's inflection, measured on the shipped curve (linear output over linear scene):
 // the slope peaks at scene ~1.0 (output 0.17, 17% of white), so continuing there is the brightest choice that never dips
-// under vanilla. The anchors are reads of the bound curve, so a different time-of-day curve gets its own continuation.
-float3 ToneCurveHDR(float3 scene, float3 vanillaCurve)
+// under vanilla. The bound curve is one of three static tables baked in the exe (time of day doesn't change it), all with their
+// peak slope at scene ~0.97; the anchors are reads of the bound one, so each table gets its own continuation.
+static const float ToneCurvePivot = 1.0;
+
+float ToneCurvePivotSlope()
 {
-   static const float pivot = 1.0;
    static const float probeLow = 0.8;
    static const float probeHigh = 1.25;
-   const float pivotValue = SampleToneCurve(pivot);
-   const float slope = (SampleToneCurve(probeHigh) - SampleToneCurve(probeLow)) / (probeHigh - probeLow);
-   return scene > pivot ? pivotValue + max(slope, 0.0) * (scene - pivot) : vanillaCurve;
+   return max((SampleToneCurve(probeHigh) - SampleToneCurve(probeLow)) / (probeHigh - probeLow), 0.0);
+}
+
+float3 ToneCurveHDR(float3 scene, float3 vanillaCurve)
+{
+   return scene > ToneCurvePivot ? SampleToneCurve(ToneCurvePivot) + ToneCurvePivotSlope() * (scene - ToneCurvePivot) : vanillaCurve;
+}
+
+// The "Vanilla+" HDR tone mapper (PsychoV31 is the other): the vanilla curve's own shoulder, stretched from SDR white to the display
+// peak, applied by BT.709 relative luminance to the graded linear value (SDR white = 1). Identity up to the pivot's output; above
+// it the relative luminance is read back as the continuation's scene (ToneCurveHDR is linear there) and that scene is compressed
+// towards the pivot by (1 - pivot value) / (peak - pivot value), which keeps the slope continuous at the pivot and lands the
+// curve's end (scene 32, the last texel = 1) on the peak. At a peak equal to SDR white this is the vanilla curve. The map is a
+// function of the final graded value (bloom, brightness and the LUT included), not a reconstruction of the scene.
+// The user sliders, all neutral at their defaults: contrast is a power around mid gray before the map, saturation and the
+// highlights desaturation (toward neutral, by the height on the shoulder) after it. Channels beyond the peak are then
+// desaturated into it in BT.2020, as DICE's "correct channels beyond peak white".
+float3 VanillaShoulderDisplayMap(float3 color)
+{
+   const float contrast = LumaSettings.GameSettings.Contrast;
+   [branch] if (contrast != 1.0)
+   {
+      color *= pow(max(GetLuminance(color, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+   }
+
+   const float peak = max(PeakWhiteNits / max(GamePaperWhiteNits, 1.0), 1.0);
+   const float pivotValue = SampleToneCurve(ToneCurvePivot);
+   const float luminance = GetLuminance(color, CS_BT709);
+   float mappedLuminance = luminance;
+   if (luminance > pivotValue)
+   {
+      const float continuationScene = (luminance - pivotValue) / max(ToneCurvePivotSlope(), FLT_MIN);
+      const float shoulderScene = ToneCurvePivot + continuationScene * (1.0 - pivotValue) / (peak - pivotValue);
+      mappedLuminance = pivotValue + (peak - pivotValue) * (SampleToneCurve(shoulderScene) - pivotValue) / (1.0 - pivotValue);
+      color *= mappedLuminance / luminance;
+   }
+
+   const float saturation = LumaSettings.GameSettings.Saturation;
+   [branch] if (saturation != 1.0)
+   {
+      color = Saturation(color, saturation, CS_BT709);
+   }
+   const float shoulderHeight = saturate((mappedLuminance - pivotValue) / (peak - pivotValue));
+   color = lerp(color, mappedLuminance, LumaSettings.GameSettings.HighlightsDesaturation * shoulderHeight);
+
+   const float3 colorBT2020 = BT709_To_BT2020(color);
+   [branch] if (max3(colorBT2020) > peak)
+   {
+      color = BT2020_To_BT709(CorrectOutOfRangeColor(colorBT2020, false, true, 1.0, peak, 0.0, CS_BT2020));
+   }
+   return color;
 }
 
 float3 SampleFilmGrain(float2 uv)
@@ -122,7 +173,7 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
 
    if (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
    {
-      // The working value: brightness scales the encoded value, as in vanilla, without its clip
+      // The working value: the game's g_TM_Brightness gain on the sRGB-encoded value, as in vanilla, without its clip
       const float3 workingEncoded = linear_to_sRGB_gamma(ToneCurveHDR(scene, vanillaCurve) + bloom, GCT_MIRROR) * g_TM_Brightness;
       float3 workingLinear = gamma_sRGB_to_linear(workingEncoded, GCT_MIRROR);
 #if TONEMAP_COLOR_CORRECTION
@@ -136,13 +187,20 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
       extrapolationSettings.extrapolationQuality = 2;
       workingLinear = lerp(workingLinear, SampleLUTWithExtrapolation(g_ColorLut3d, g_LinearClampSampler_s, extrapolationData, extrapolationSettings), LumaSettings.GameSettings.ColorGradingIntensity);
 #endif
-      // The vanilla grade's colour at the working value's BT.709 luminance. Below the curve's pivot and inside the LUT both chains
+      // The vanilla grade's chromaticity at the working value's BT.709 relative luminance. Below the curve's pivot and inside the LUT both chains
       // match, so the gain is 1 there. A (near) black vanilla grade stays black.
       float3 gradedLinear = RestoreLuminance(gamma_sRGB_to_linear(color), workingLinear, true, CS_BT709);
-      gradedLinear = PsychoVDisplayMap(gradedLinear,
-                                       LumaSettings.GameSettings.Contrast,
-                                       LumaSettings.GameSettings.Saturation,
-                                       LumaSettings.GameSettings.HighlightsDesaturation);
+      if (LumaSettings.HDRToneMapper == 0) // "Vanilla+" (see "hdr_tone_mapper_names" in main.cpp)
+      {
+         gradedLinear = VanillaShoulderDisplayMap(gradedLinear);
+      }
+      else
+      {
+         gradedLinear = PsychoVDisplayMap(gradedLinear,
+                                          LumaSettings.GameSettings.Contrast,
+                                          LumaSettings.GameSettings.Saturation,
+                                          LumaSettings.GameSettings.HighlightsDesaturation);
+      }
       color = linear_to_sRGB_gamma(gradedLinear, GCT_MIRROR);
    }
 
