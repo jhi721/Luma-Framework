@@ -5806,6 +5806,19 @@ namespace
       return SR::Type::None;
    }
 
+   // The upscaler's jitter phase count (at least 1), or the native TAA default without an upscaler instance
+   int GetSRJitterPhases(const DeviceData& device_data, const SR::InstanceData* sr_instance_data)
+   {
+      return sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
+   }
+
+   // This frame's Halton (2, 3) jitter in pixels, over "GetSRJitterPhases()"
+   std::array<float, 2> GetSRJitter(const DeviceData& device_data, const SR::InstanceData* sr_instance_data)
+   {
+      const unsigned int phase = cb_luma_global_settings.FrameIndex % unsigned(GetSRJitterPhases(device_data, sr_instance_data));
+      return {SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)};
+   }
+
    // Switches the SR. Core applies the overlay's and the MCP's "sr_type_selected" at present, before the game's "OnPresent", so a frame's
    // draws never see two types and the game can release its resources there.
    // We wouldn't really need to do anything other than clearing "sr_output_color",
@@ -5845,6 +5858,7 @@ namespace
          device_data.sr_render_resolution_scale = 1.f; // Reset this to 1 when SR is toggled, even if dynamic resolution scaling is active (e.g. in Prey), we'll set it back to a low value if DRS is used again.
          device_data.sr_scene_exposure = 1.f;
          device_data.sr_scene_pre_exposure = 1.f;
+         device_data.release_sr_resources = true;
          game->CleanExtraSRResources(device_data);
       }
    }
@@ -11405,6 +11419,29 @@ namespace
          reshade::set_config_value(nullptr, section, key, *value);
       }
       return changed;
+   }
+
+   // The "Render Scale (%)" slider of a Luma-driven render scale, saved as a 0-1 float ("RenderScale"). Applied on release: every
+   // render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging. Draw it once per mod (it holds the dragged value).
+   void DrawRenderScaleSlider(float* render_scale, float min_render_scale, const char* tooltip, const char* section = NAME)
+   {
+      static int held_render_scale = 0; // The slider's value while it's held, else 0
+      int render_scale_percent = (held_render_scale != 0 ? held_render_scale : int(std::round(*render_scale * 100.f)));
+      ImGui::SliderInt("Render Scale (%)", &render_scale_percent, int(min_render_scale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+      held_render_scale = (ImGui::IsItemActive() ? render_scale_percent : 0);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         *render_scale = float(render_scale_percent) / 100.f;
+         reshade::set_config_value(nullptr, section, "RenderScale", *render_scale);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("%s", tooltip);
+      }
+      if (DrawResetButton<float, false>(*render_scale, 1.f, "RenderScale"))
+      {
+         reshade::set_config_value(nullptr, section, "RenderScale", *render_scale);
+      }
    }
 
    void OnRegisterMessagesOverlay(reshade::api::effect_runtime* runtime)
