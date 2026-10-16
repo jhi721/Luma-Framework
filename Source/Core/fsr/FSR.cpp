@@ -156,7 +156,7 @@ namespace FidelityFX
          return false;
 
       // No need to re-instantiate FSR "features" if all the params are the same
-      if (memcmp(&settings_data, &custom_data->settings_data, sizeof(SR::SettingsData)) == 0 && custom_data->has_context)
+      if (settings_data == custom_data->settings_data && custom_data->has_context) // Not memcmp: the struct's padding is indeterminate
       {
          return true;
       }
