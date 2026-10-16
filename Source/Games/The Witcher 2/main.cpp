@@ -3411,37 +3411,14 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
-      {
-         reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
-      }
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR or Luma TAA).");
       ImGui::EndDisabled();
       // Canon deviation (docs/UI-Toggle-Standard.md), as Saints Row The Third Remastered: RCAS runs after any anti-aliasing, in place
       // of the game's sharpen (cut from its scene pass)
-      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-      {
-         reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
-      }
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Sharpening applied on top of anti-aliasing (0 = off). Replaces the game's Sharpen setting.");
-      }
-      DrawResetButton(g_rcas_sharpness, 0.f, "RCASSharpness");
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of anti-aliasing (0 = off). Replaces the game's Sharpen setting.");
       ImGui::BeginDisabled(!g_smaa_enable || sr_active);
 #if DEVELOPMENT || TEST
-      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
-      {
-         reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("Relaxes the edge threshold back to base ULTRA on geometric silhouettes only. Off = plain ULTRA everywhere (threshold scale 1.0).");
-      }
+      DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, "Relaxes the edge threshold back to base ULTRA on geometric silhouettes only. Off = plain ULTRA everywhere (threshold scale 1.0).");
       ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.1f, "%.3f", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
@@ -3456,49 +3433,26 @@ public:
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& gs_def = default_luma_global_game_settings;
 
-      // One grade slider: draw, mark the cbuffer dirty, persist when the edit ends, tooltip, reset (DrawResetButton
-      // writes the config itself). AllowWhenDisabled so the tooltip still shows inside a BeginDisabled block.
-      const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max_value, const char* tooltip)
-      {
-         ImGui::SliderFloat(label, value, 0.f, max_value);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-         {
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         {
-            ImGui::SetTooltip("%s", tooltip);
-         }
-         DrawResetButton(*value, default_value, key);
-      };
-
-      slider("Exposure", &gs.Exposure, gs_def.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
+      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, gs_def.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
       // Not HDR-gated: the split toning this fades lives in the vanilla grade tail, so it applies in SDR as well.
-      slider("Color Grading Intensity", &gs.ColorGradingIntensity, gs_def.ColorGradingIntensity, "ColorGradingIntensity", 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
+      DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, gs_def.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       // Hidden outside HDR: the final grade's SDR branch skips the whole HDR block, so these would be dead
       // controls. Matches the shader's own "DisplayMode == 1" test.
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         slider("Contrast", &gs.Contrast, gs_def.Contrast, "Contrast", 2.f, "Overall image contrast, HDR only (1 = vanilla).");
-         slider("Saturation", &gs.Saturation, gs_def.Saturation, "Saturation", 2.f, "Color saturation, HDR only (1 = vanilla).");
-         slider("Highlights Desaturation", &gs.HighlightDechroma, gs_def.HighlightDechroma, "HighlightDechroma", 1.f,
+         DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, gs_def.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+         DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, gs_def.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
+         DrawSettingSlider("Highlights Desaturation", "HighlightDechroma", &gs.HighlightDechroma, gs_def.HighlightDechroma, 0.f, 1.f,
             "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       }
 
       // No "Luma Bloom Enable": the engine's glow is kept and only scaled. Applies in SDR too.
       ImGui::SeparatorText("Bloom");
-      slider("Bloom Intensity", &gs.BloomIntensity, gs_def.BloomIntensity, "BloomIntensity", 2.f, "Bloom strength (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, gs_def.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
-      {
-         reshade::set_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
-      }
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's video settings).");
-      }
+      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's video settings).");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
@@ -3529,37 +3483,19 @@ public:
       ImGui::SeparatorText("Effects");
 
       // Vignette lives in the vanilla grade tail, so this applies in SDR as well as HDR.
-      slider("Vignette Intensity", &gs.VignetteIntensity, gs_def.VignetteIntensity, "VignetteIntensity", 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &gs.VignetteIntensity, gs_def.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
 
       // HDR-path only: PumboAutoHDR self-noops when peak == paper white, which both SDR modes force.
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-         if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
-         {
-            gs.VideoAutoHDREnable = (video_auto_hdr ? 1.f : 0.f);
-            reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", video_auto_hdr);
-         }
-         if (ImGui::IsItemHovered())
-         {
-            ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
-         }
-         ImGui::BeginDisabled(!video_auto_hdr);
-         slider("Video HDR Boost", &gs.VideoAutoHDRBoost, gs_def.VideoAutoHDRBoost, "VideoAutoHDRBoost", 1.f, "Video highlight strength (0 = off).");
+         DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &gs.VideoAutoHDREnable, gs_def.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only).");
+         ImGui::BeginDisabled(gs.VideoAutoHDREnable <= 0.5f);
+         DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, gs_def.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
          ImGui::EndDisabled();
       }
 
       // The final grade dithers in SDR and HDR alike, so this stays outside the HDR gate above.
-      bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
-      {
-         gs.Dithering = (dithering ? 1.f : 0.f);
-         reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-      }
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Reduces gradient banding.");
-      }
+      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, gs_def.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.

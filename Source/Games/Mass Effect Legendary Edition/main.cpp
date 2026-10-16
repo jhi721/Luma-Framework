@@ -3861,111 +3861,39 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
-      {
-         reshade::set_config_value(nullptr, PROJECT_NAME, "SMAAEnable", g_smaa_enable);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR or Luma TAA).");
-      }
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR or Luma TAA).", PROJECT_NAME);
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
-      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-      {
-         reshade::set_config_value(nullptr, PROJECT_NAME, "RCASSharpness", g_rcas_sharpness);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off; requires AA enabled in the game's video settings).");
-      }
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA, DLSS/FSR or Luma TAA (0 = off; requires AA enabled in the game's video settings).", "%.3f", PROJECT_NAME);
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Grade");
       auto& gs = cb_luma_global_settings.GameSettings;
       auto& default_game_settings = default_luma_global_game_settings;
-      // A [0, max] float setting: slider saved on edit, and a reset button saved here (DrawResetButton's own save, off here, writes
-      // NAME, but LoadConfigs reads PROJECT_NAME)
-      const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max, const char* tooltip)
-      {
-         ImGui::SliderFloat(label, value, 0.f, max);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-         {
-            reshade::set_config_value(nullptr, PROJECT_NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         {
-            ImGui::SetTooltip("%s", tooltip);
-         }
-         if (DrawResetButton<float, false>(*value, default_value, key))
-         {
-            reshade::set_config_value(nullptr, PROJECT_NAME, key, *value);
-         }
-      };
-
-      slider("Exposure", &gs.Exposure, default_game_settings.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
+      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).", "%.3f", PROJECT_NAME);
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         slider("Contrast", &gs.Contrast, default_game_settings.Contrast, "Contrast", 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+         DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).", "%.3f", PROJECT_NAME);
 
-         slider("Saturation", &gs.Saturation, default_game_settings.Saturation, "Saturation", 2.f, "Color saturation, HDR only (1 = vanilla).");
+         DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).", "%.3f", PROJECT_NAME);
 
-         slider("Highlights Desaturation", &gs.HighlightDechroma, default_game_settings.HighlightDechroma, "HighlightDechroma", 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+         DrawSettingSlider("Highlights Desaturation", "HighlightDechroma", &gs.HighlightDechroma, default_game_settings.HighlightDechroma, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).", "%.3f", PROJECT_NAME);
       }
 
       ImGui::SeparatorText("Bloom");
-      if (ImGui::Checkbox("Luma Bloom Enable", &g_bloom_enable))
-      {
-         reshade::set_config_value(nullptr, PROJECT_NAME, "BloomEnable", g_bloom_enable);
-      }
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
-      }
+      DrawSettingCheckbox("Luma Bloom Enable", "BloomEnable", &g_bloom_enable, true, "Replaces the game's bloom with a wider, softer HDR bloom.", PROJECT_NAME);
       ImGui::BeginDisabled(!g_bloom_enable);
-      slider("Bloom Intensity", &g_bloom_intensity, default_game_settings.BloomIntensity, "BloomIntensity", 2.f, "Bloom strength (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &g_bloom_intensity, default_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).", "%.3f", PROJECT_NAME);
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
-      {
-         reshade::set_config_value(nullptr, PROJECT_NAME, "GTAOEnable", g_gtao_enable);
-      }
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
-      }
+      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).", PROJECT_NAME);
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
-      if (ImGui::IsItemDeactivatedAfterEdit())
-      {
-         reshade::set_config_value(nullptr, PROJECT_NAME, "GTAOFinalValuePower", g_gtao_final_value_power);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("Primary darkness dial (higher = darker AO). Calibrate to match vanilla's overall darkening.");
-      }
-      ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 10.f, 200.f, "%.0f", ImGuiSliderFlags_Logarithmic);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-      {
-         reshade::set_config_value(nullptr, PROJECT_NAME, "GTAODepthScale", g_gtao_depth_scale);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("viewZ divisor (UE3 units -> ~meters). FIRST dial if AO shows broad depth-correlated over-occlusion.");
-      }
-      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 3.f, "%.3f");
-      if (ImGui::IsItemDeactivatedAfterEdit())
-      {
-         reshade::set_config_value(nullptr, PROJECT_NAME, "GTAORadiusOverride", g_gtao_radius_override);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("0 = shader EFFECT_RADIUS define; > 0 overrides it to match the vanilla HBAO+ radius (uu / DepthScale).");
-      }
+      DrawSettingSlider("GTAO Final Value Power", "GTAOFinalValuePower", &g_gtao_final_value_power, 1.f, 0.3f, 4.5f, "Primary darkness dial (higher = darker AO). Calibrate to match vanilla's overall darkening.", "%.2f", PROJECT_NAME);
+      DrawSettingSlider("GTAO Depth Scale", "GTAODepthScale", &g_gtao_depth_scale, 50.f, 10.f, 200.f, "viewZ divisor (UE3 units -> ~meters). FIRST dial if AO shows broad depth-correlated over-occlusion.", "%.0f", PROJECT_NAME, ImGuiSliderFlags_Logarithmic);
+      DrawSettingSlider("GTAO Radius Override", "GTAORadiusOverride", &g_gtao_radius_override, 0.f, 0.f, 3.f, "0 = shader EFFECT_RADIUS define; > 0 overrides it to match the vanilla HBAO+ radius (uu / DepthScale).", "%.3f", PROJECT_NAME);
       ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
@@ -3982,36 +3910,22 @@ public:
 #endif
 
       ImGui::SeparatorText("Effects");
-      slider("Vignette Intensity", &gs.VignetteIntensity, default_game_settings.VignetteIntensity, "VignetteIntensity", 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &gs.VignetteIntensity, default_game_settings.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).", "%.3f", PROJECT_NAME);
 
-      slider("Film Grain Intensity", &gs.FilmGrainIntensity, default_game_settings.FilmGrainIntensity, "FilmGrainIntensity", 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
+      DrawSettingSlider("Film Grain Intensity", "FilmGrainIntensity", &gs.FilmGrainIntensity, default_game_settings.FilmGrainIntensity, 0.f, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).", "%.3f", PROJECT_NAME);
 
       if (cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
       {
-         if (ImGui::Checkbox("Video AutoHDR", &g_video_auto_hdr_enable))
+         if (DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &g_video_auto_hdr_enable, true, "Adds HDR highlights to pre-rendered videos (HDR only).", PROJECT_NAME))
          {
-            reshade::set_config_value(nullptr, PROJECT_NAME, "VideoAutoHDREnable", g_video_auto_hdr_enable);
             gs.VideoAutoHDREnable = (g_video_auto_hdr_enable ? 1.f : 0.f);
          }
-         if (ImGui::IsItemHovered())
-         {
-            ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
-         }
          ImGui::BeginDisabled(!g_video_auto_hdr_enable);
-         slider("Video HDR Boost", &gs.VideoAutoHDRBoost, default_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost", 1.f, "Video highlight strength (0 = off).");
+         DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_game_settings.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).", "%.3f", PROJECT_NAME);
          ImGui::EndDisabled();
       }
 
-      bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
-      {
-         gs.Dithering = (dithering ? 1.f : 0.f);
-         reshade::set_config_value(nullptr, PROJECT_NAME, "Dithering", gs.Dithering);
-      }
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Reduces gradient banding.");
-      }
+      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_game_settings.Dithering, "Reduces gradient banding.", PROJECT_NAME);
 
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only to avoid a confusing HUD-less restart.

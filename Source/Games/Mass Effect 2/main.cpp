@@ -680,23 +680,14 @@ public:
       // Nothing in this section touches cb_luma_global_settings, so none of it sets the dirty flag: these are the
       // mod's own injected passes, driven by plain globals.
       ImGui::SeparatorText("Anti-Aliasing");
-      if (ImGui::Checkbox("SMAA Enable", &g_smaa_enable))
-         reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Adds SMAA anti-aliasing (the game has none of its own).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing (the game has none of its own).");
       if (g_smaa_enable)
       {
 #if DEVELOPMENT
          // Predication is not a preference: it only relaxes the edge threshold back to base ULTRA on geometry and
          // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight.
-         if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
-            reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.");
-         if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
-            reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
+         DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, "Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps textures sharp while still antialiasing real silhouettes.");
+         DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.", "%.3f", NAME, ImGuiSliderFlags_Logarithmic);
          ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
@@ -706,11 +697,7 @@ public:
             ImGui::SetTooltip("Log the mask's coverage above 0.5 plus percentiles to ReShade.log.\nReal silhouettes are ~1% of a typical frame; a working mask barely moves across a 20x tolerance sweep.\nAn all-zero mask means the scene alpha is not carrying depth.\nStalls the GPU for one frame.");
 #endif
 
-         if (ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f))
-            reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Sharpening applied on top of SMAA (0 = off).");
-         DrawResetButton(g_rcas_sharpness, 0.f, "RCASSharpness"); // writes the config itself (Serialize defaults true)
+         DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA (0 = off).");
       }
 #endif // ENABLE_SMAA
 
@@ -720,68 +707,26 @@ public:
       ImGui::SeparatorText("Grade");
 
       // Applied scene-referred, before the grade.
-      if (ImGui::SliderFloat("Exposure", &gs.Exposure, 0.f, 2.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "Exposure", gs.Exposure);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Overall image brightness (1 = vanilla).");
-      DrawResetButton(gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure");
-
-      if (ImGui::SliderFloat("Contrast", &gs.Contrast, 0.f, 2.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "Contrast", gs.Contrast);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Overall image contrast, HDR only (1 = vanilla).");
-      DrawResetButton(gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast");
-
-      if (ImGui::SliderFloat("Saturation", &gs.Saturation, 0.f, 2.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "Saturation", gs.Saturation);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Color saturation, HDR only (1 = vanilla).");
-      DrawResetButton(gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation");
-
-      if (ImGui::SliderFloat("Highlights Desaturation", &gs.HighlightDechroma, 0.f, 1.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightDechroma);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
-      DrawResetButton(gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightsDesaturation");
+      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
+      DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+      DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
+      DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
 
 #if ENABLE_BLOOM
       ImGui::SeparatorText("Bloom");
-      if (ImGui::Checkbox("Luma Bloom Enable", &g_luma_bloom_enable))
+      if (DrawSettingCheckbox("Luma Bloom Enable", "LumaBloomEnable", &g_luma_bloom_enable, true, "Replaces the game's bloom with a wider, softer HDR bloom."))
       {
-         reshade::set_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
          gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f; // mirrored: the uber and the gather both read it
       }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Replaces the game's bloom with a wider, softer HDR bloom.");
 
       // Everything below drives the Luma pyramid and nothing else, so it all greys out with it: no slider here can
       // reach the game's own glow, which shares a buffer with the DoF blur and only has an off switch.
       ImGui::BeginDisabled(!g_luma_bloom_enable);
 
-      if (ImGui::SliderFloat("Bloom Intensity", &gs.BloomIntensity, 0.f, 2.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "BloomIntensity", gs.BloomIntensity);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Bloom strength (1 = vanilla, 0 = none).");
-      DrawResetButton(gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity");
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
 #if DEVELOPMENT
-      if (ImGui::SliderFloat("Bloom Threshold", &gs.BloomThreshold, 0.f, 4.f, "%.2f"))
-      {
-         reshade::set_config_value(nullptr, NAME, "BloomThreshold", gs.BloomThreshold);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Linear scene brightness where bloom starts. 1.0 is where the game's own bright-pass sits.\nNear 0 the whole scene glows - that is the failure mode, not a setting.");
-      DrawResetButton(gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, "BloomThreshold");
+      DrawSettingSlider("Bloom Threshold", "BloomThreshold", &gs.BloomThreshold, default_luma_global_game_settings.BloomThreshold, 0.f, 4.f, "Linear scene brightness where bloom starts. 1.0 is where the game's own bright-pass sits.\nNear 0 the whole scene glows - that is the failure mode, not a setting.", "%.2f");
 
       // The engine gain the intensity slider multiplies. Read-only: it comes from the gather, not from the user.
       ImGui::Text("Engine BloomScale: %.5f", gs.BloomScaleLive);
@@ -793,51 +738,18 @@ public:
 
       // Row order is the house one, with MELE's Effects section as the exact twin. Both sliders scale only the
       // effect, never the vignette's blue-tinted white point, which is part of the vanilla grade.
-      if (ImGui::SliderFloat("Vignette Intensity", &gs.VignetteIntensity, 0.f, 1.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "VignetteIntensity", gs.VignetteIntensity);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Scales the game's vignette darkening (1 = vanilla, 0 = none).");
-      DrawResetButton(gs.VignetteIntensity, default_luma_global_game_settings.VignetteIntensity, "VignetteIntensity");
-
-      if (ImGui::SliderFloat("Film Grain Intensity", &gs.FilmGrainIntensity, 0.f, 1.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "FilmGrainIntensity", gs.FilmGrainIntensity);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Scales the game's film grain (1 = vanilla, 0 = off).");
-      DrawResetButton(gs.FilmGrainIntensity, default_luma_global_game_settings.FilmGrainIntensity, "FilmGrainIntensity");
+      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &gs.VignetteIntensity, default_luma_global_game_settings.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Film Grain Intensity", "FilmGrainIntensity", &gs.FilmGrainIntensity, default_luma_global_game_settings.FilmGrainIntensity, 0.f, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
 
       // Read in Video_0xE41621CF.ps_5_0.hlsl, gated on TONEMAP_TYPE, not on display mode. The config key stays
       // "VideoAutoHDRBoost" under the canon "Video HDR Boost" label, so the rename does not reset existing users.
-      bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
-      {
-         gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
-         reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
+      DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &gs.VideoAutoHDREnable, default_luma_global_game_settings.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only).");
 
-      ImGui::BeginDisabled(!video_auto_hdr);
-      if (ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f))
-      {
-         reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Video highlight strength (0 = off).");
-      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
+      ImGui::BeginDisabled(gs.VideoAutoHDREnable <= 0.5f);
+      DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
       ImGui::EndDisabled();
 
-      bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
-      {
-         gs.Dithering = dithering ? 1.f : 0.f;
-         reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Reduces gradient banding.");
+      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_luma_global_game_settings.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui); // Session-only: a stuck "on" would look like a broken HUD.

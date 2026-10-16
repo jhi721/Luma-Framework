@@ -2659,28 +2659,15 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       ImGui::BeginDisabled(sr_active);
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
-         reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (requires AA enabled in the game's video settings; not used with DLSS/FSR).");
       ImGui::EndDisabled();
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
-      ImGui::SliderFloat("RCAS Sharpness", &g_rcas_sharpness, 0.f, 1.f); // updates live; persist on release
-      if (ImGui::IsItemDeactivatedAfterEdit())
-         reshade::set_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Sharpening applied on top of SMAA or DLSS/FSR (0 = off; requires AA enabled in the game's video settings).");
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off; requires AA enabled in the game's video settings).");
 #if DEVELOPMENT
       // Predication is not a preference: it only relaxes the edge threshold back to base ULTRA on geometry and
       // never below, so off is strictly worse. Kept as a bisect switch for devs, shipped on and out of sight.
-      if (ImGui::Checkbox("SMAA Predication", &g_smaa_predication))
-         reshade::set_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps texture noise from being antialiased while still catching real silhouettes.");
-      if (ImGui::SliderFloat("SMAA Predication Tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic))
-         reshade::set_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.");
+      DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, "Finds edges by geometry (scene depth) instead of by brightness alone.\nKeeps texture noise from being antialiased while still catching real silhouettes.");
+      DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, "How far a surface may deviate from its local plane before it counts as an edge,\nas a fraction of view depth. Lower = more edges. This is the calibration lever,\nnot the SMAA threshold. Logarithmic: the parameter is relative.", "%.3f", NAME, ImGuiSliderFlags_Logarithmic);
       ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.\nAll red = tolerance too low (predication is doing nothing).\nAll black = too high (silhouettes never regain sensitivity).");
@@ -2693,30 +2680,17 @@ public:
 
       // --- Grade (read in Luma_BL_Tonemap.hlsl via LumaSettings.GameSettings) ---
       auto& gs = cb_luma_global_settings.GameSettings;
-      const auto slider = [&](const char* label, float* value, float default_value, const char* key, float max_value, const char* tooltip)
-      {
-         if (ImGui::SliderFloat(label, value, 0.f, max_value))
-         {
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", tooltip);
-         DrawResetButton(*value, default_value, key);
-      };
       ImGui::SeparatorText("Grade");
-      slider("Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, "Exposure", 2.f, "Overall image brightness (1 = vanilla).");
-      slider("Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, "Contrast", 2.f, "Overall image contrast, HDR only (1 = vanilla).");
-      slider("Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, "Saturation", 2.f, "Color saturation, HDR only (1 = vanilla).");
-      slider("Highlights Desaturation", &gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, "HighlightDechroma", 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
+      DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+      DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
+      DrawSettingSlider("Highlights Desaturation", "HighlightDechroma", &gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
 
       ImGui::SeparatorText("Bloom");
-      slider("Bloom Intensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, "BloomIntensity", 2.f, "Bloom strength (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      if (ImGui::Checkbox("XeGTAO Enable", &g_gtao_enable))
-         reshade::set_config_value(nullptr, NAME, "XeGTAOEnable", g_gtao_enable);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
+      DrawSettingCheckbox("XeGTAO Enable", "XeGTAOEnable", &g_gtao_enable, true, "Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
 #if DEVELOPMENT || TEST
       // DEVELOPMENT/TEST calibration only (drive cb_gtao, written at the deinterleave hook). Not persisted.
       ImGui::BeginDisabled(!g_gtao_enable);
@@ -2732,46 +2706,21 @@ public:
 
       ImGui::SeparatorText("Effects");
 
-      slider("Lens Flare Intensity", &gs.FlareOut, default_luma_global_game_settings.FlareOut, "FlareOut", 1.f, "Lens-flare / glare strength (1 = vanilla, 0 = off).");
+      DrawSettingSlider("Lens Flare Intensity", "FlareOut", &gs.FlareOut, default_luma_global_game_settings.FlareOut, 0.f, 1.f, "Lens-flare / glare strength (1 = vanilla, 0 = off).");
 
-      bool video_auto_hdr = gs.VideoAutoHDREnable > 0.5f;
-      if (ImGui::Checkbox("Video AutoHDR", &video_auto_hdr))
-      {
-         gs.VideoAutoHDREnable = video_auto_hdr ? 1.f : 0.f;
-         reshade::set_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Adds HDR highlights to pre-rendered videos (HDR only).");
+      DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &gs.VideoAutoHDREnable, default_luma_global_game_settings.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only).");
 
-      ImGui::BeginDisabled(!video_auto_hdr);
-      ImGui::SliderFloat("Video HDR Boost", &gs.VideoAutoHDRBoost, 0.f, 1.f);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-         reshade::set_config_value(nullptr, NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Video highlight strength (0 = off).");
-      DrawResetButton(gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, "VideoAutoHDRBoost");
+      ImGui::BeginDisabled(gs.VideoAutoHDREnable <= 0.5f);
+      DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
       ImGui::EndDisabled();
 
-      bool dithering = gs.Dithering > 0.5f;
-      if (ImGui::Checkbox("Dithering", &dithering))
-      {
-         gs.Dithering = dithering ? 1.f : 0.f;
-         reshade::set_config_value(nullptr, NAME, "Dithering", gs.Dithering);
-      }
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Reduces gradient banding.");
+      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_luma_global_game_settings.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
-      if (ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui))
-         reshade::set_config_value(nullptr, NAME, "HideUI", g_hide_ui);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Disables the in-game UI.");
+      DrawSettingCheckbox("Hide Gameplay UI", "HideUI", &g_hide_ui, false, "Disables the in-game UI.");
 
       ImGui::SeparatorText("Fixes");
-      if (ImGui::Checkbox("Fix Movie Memory Leak", &g_fix_movie_leak))
-         reshade::set_config_value(nullptr, NAME, "FixMovieLeak", g_fix_movie_leak);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Frees the loading/cutscene movie memory the game leaks on each transition (fixes the RAM-growth crash). Movies still play.");
+      DrawSettingCheckbox("Fix Movie Memory Leak", "FixMovieLeak", &g_fix_movie_leak, true, "Frees the loading/cutscene movie memory the game leaks on each transition (fixes the RAM-growth crash). Movies still play.");
       if (g_fix_movie_leak && !BLMovieLeakFix::g_have_movie.load() && BLMovieLeakFix::g_frame >= BLMovieLeakFix::BUILD_CHECK_FRAME)
          ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "Inactive: no movie buffers detected (game build may differ).");
 #if DEVELOPMENT || TEST

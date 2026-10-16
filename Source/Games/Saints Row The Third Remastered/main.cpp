@@ -1259,73 +1259,30 @@ public:
    {
       auto& settings = cb_luma_global_settings.GameSettings;
       const auto& defaults = default_luma_global_game_settings;
-      const auto slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
-      {
-         ImGui::SliderFloat(label, value, 0.f, max_value);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-         {
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered())
-         {
-            ImGui::SetTooltip("%s", tooltip);
-         }
-         DrawResetButton(*value, default_value, key);
-      };
-
-      // A float setting shown as a checkbox; returns whether it's on
-      const auto toggle = [&](const char* label, const char* key, float* value, float default_value, const char* tooltip)
-      {
-         bool enabled = *value > 0.5f;
-         if (ImGui::Checkbox(label, &enabled))
-         {
-            *value = (enabled ? 1.f : 0.f);
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered())
-         {
-            ImGui::SetTooltip("%s", tooltip);
-         }
-         DrawResetButton(*value, default_value, key);
-         return *value > 0.5f;
-      };
-
-      // A bool setting's checkbox, saved on change
-      const auto bool_toggle = [&](const char* label, const char* key, bool* value, bool default_value, const char* tooltip)
-      {
-         if (ImGui::Checkbox(label, value))
-         {
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered())
-         {
-            ImGui::SetTooltip("%s", tooltip);
-         }
-         DrawResetButton(*value, default_value, key);
-      };
 
       ImGui::SeparatorText("Anti-Aliasing");
-      bool_toggle("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");
       // Canon deviation (docs/UI-Toggle-Standard.md): RCAS runs after any anti-aliasing, in place of the game's disabled sharpen
-      slider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, defaults.RCASSharpness, 1.f, "Sharpening applied on top of anti-aliasing (0 = off). Replaces the game's Sharpen setting.");
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, defaults.RCASSharpness, 0.f, 1.f, "Sharpening applied on top of anti-aliasing (0 = off). Replaces the game's Sharpen setting.");
 
       ImGui::SeparatorText("Grade");
-      slider("Exposure", "Exposure", &settings.Exposure, defaults.Exposure, 2.f, "Overall image brightness (1 = vanilla).");
-      slider("Contrast", "Contrast", &settings.Contrast, defaults.Contrast, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
-      slider("Saturation", "Saturation", &settings.Saturation, defaults.Saturation, 2.f, "Color saturation, HDR only (1 = vanilla).");
-      slider("Highlights Desaturation", "HighlightsDesaturation", &settings.HighlightsDesaturation, defaults.HighlightsDesaturation, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
-      slider("Color Grading Intensity", "ColorGradingIntensity", &settings.ColorGradingIntensity, defaults.ColorGradingIntensity, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
+      DrawSettingSlider("Exposure", "Exposure", &settings.Exposure, defaults.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
+      DrawSettingSlider("Contrast", "Contrast", &settings.Contrast, defaults.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+      DrawSettingSlider("Saturation", "Saturation", &settings.Saturation, defaults.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
+      DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &settings.HighlightsDesaturation, defaults.HighlightsDesaturation, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+      DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &settings.ColorGradingIntensity, defaults.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      bool_toggle("XeGTAO Enable", "XeGTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion enabled in the game's display settings).");
+      DrawSettingCheckbox("XeGTAO Enable", "XeGTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion enabled in the game's display settings).");
 
       ImGui::SeparatorText("Effects");
-      slider("Vignette Intensity", "VignetteIntensity", &settings.VignetteIntensity, defaults.VignetteIntensity, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
-      slider("Film Grain Intensity", "FilmGrainIntensity", &settings.FilmGrainIntensity, defaults.FilmGrainIntensity, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
-      ImGui::BeginDisabled(!toggle("Video AutoHDR", "VideoAutoHDREnable", &settings.VideoAutoHDREnable, defaults.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only)."));
-      slider("Video HDR Boost", "VideoAutoHDRBoost", &settings.VideoAutoHDRBoost, defaults.VideoAutoHDRBoost, 1.f, "Video highlight strength (0 = off).");
+      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &settings.VignetteIntensity, defaults.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Film Grain Intensity", "FilmGrainIntensity", &settings.FilmGrainIntensity, defaults.FilmGrainIntensity, 0.f, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
+      DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &settings.VideoAutoHDREnable, defaults.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only).");
+      ImGui::BeginDisabled(settings.VideoAutoHDREnable <= 0.5f);
+      DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &settings.VideoAutoHDRBoost, defaults.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
       ImGui::EndDisabled();
-      toggle("Dithering", "Dithering", &settings.Dithering, defaults.Dithering, "Reduces gradient banding.");
+      DrawSettingCheckbox("Dithering", "Dithering", &settings.Dithering, defaults.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
       // Session only, so a restart never comes back without a HUD

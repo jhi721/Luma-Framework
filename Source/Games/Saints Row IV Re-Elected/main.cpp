@@ -2858,36 +2858,6 @@ public:
    {
       auto& gs = cb_luma_global_settings.GameSettings;
 
-      // Persisted controls with their tooltip. The GameSettings ones (toggle, slider) also mark the Luma cbuffer for upload.
-      const auto config_checkbox = [](const char* label, const char* key, bool* value, const char* tooltip)
-      {
-         if (ImGui::Checkbox(label, value))
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", tooltip);
-      };
-      const auto settings_toggle = [&](const char* label, const char* key, float* value, const char* tooltip)
-      {
-         bool enabled = *value > 0.5f;
-         if (ImGui::Checkbox(label, &enabled))
-         {
-            *value = (enabled ? 1.f : 0.f);
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         }
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", tooltip);
-         return enabled;
-      };
-      const auto slider = [&](const char* label, const char* key, float* value, float default_value, float max_value, const char* tooltip)
-      {
-         ImGui::SliderFloat(label, value, 0.f, max_value);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-            reshade::set_config_value(nullptr, NAME, key, *value);
-         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", tooltip);
-         DrawResetButton(*value, default_value, key);
-      };
-
       ImGui::SeparatorText("Anti-Aliasing");
 
       const bool sr_active = IsSRActive(device_data);
@@ -2910,21 +2880,15 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces MSAA and SMAA: shown off, the saved choices are kept
       ImGui::BeginDisabled(sr_active);
       bool msaa_shown = g_luma_msaa_enable && !sr_active;
-      if (ImGui::Checkbox("Luma MSAA Enable", sr_active ? &msaa_shown : &g_luma_msaa_enable))
-         reshade::set_config_value(nullptr, NAME, "MSAAResolveEnable", g_luma_msaa_enable);
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR).");
+      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", sr_active ? &msaa_shown : &g_luma_msaa_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR).");
       bool smaa_shown = g_smaa_enable && !sr_active;
-      if (ImGui::Checkbox("SMAA Enable", sr_active ? &smaa_shown : &g_smaa_enable))
-         reshade::set_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off or low in the game's display settings; not used with DLSS/FSR).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", sr_active ? &smaa_shown : &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off or low in the game's display settings; not used with DLSS/FSR).");
       ImGui::EndDisabled();
       if (device_data.sr_type != SR::Type::None && GetGameDeviceData(device_data).msaa_scene)
          ImGui::TextColored(ImVec4(1.f, 0.6f, 0.f, 1.f), "DLSS/FSR inactive: turn Anti-Aliasing off in the game's display settings.");
 
       ImGui::BeginDisabled(!g_smaa_enable && !sr_active);
-      slider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
 #if DEVELOPMENT
       ImGui::Checkbox("SMAA Predication", &g_smaa_predication);
       if (ImGui::IsItemHovered())
@@ -2937,20 +2901,20 @@ public:
 
       ImGui::SeparatorText("Grade");
 
-      slider("Exposure", "Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, 2.f, "Overall image brightness (1 = vanilla).");
-      slider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
-      slider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 2.f, "Color saturation, HDR only (1 = vanilla).");
-      slider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
-      slider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
+      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
+      DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+      DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
+      DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+      DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       ImGui::SeparatorText("Bloom");
 
-      config_checkbox("Luma Bloom Enable", "BloomEnable", &g_luma_bloom_enable, "Replaces the game's bloom with a wider, softer HDR bloom.");
-      slider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
+      DrawSettingCheckbox("Luma Bloom Enable", "BloomEnable", &g_luma_bloom_enable, true, "Replaces the game's bloom with a wider, softer HDR bloom.");
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
 
-      config_checkbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion set to Medium or High in the game's display settings).");
+      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires Ambient Occlusion set to Medium or High in the game's display settings).");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
@@ -2975,13 +2939,14 @@ public:
 
       ImGui::SeparatorText("Effects");
 
-      slider("Vignette Intensity", "VignetteIntensity", &gs.VignetteIntensity, default_luma_global_game_settings.VignetteIntensity, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
-      slider("Film Grain Intensity", "FilmGrainIntensity", &gs.FilmGrainIntensity, default_luma_global_game_settings.FilmGrainIntensity, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
-      ImGui::BeginDisabled(!settings_toggle("Video AutoHDR", "VideoAutoHDREnable", &gs.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only)."));
-      slider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, 1.f, "Video highlight strength (0 = off).");
+      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &gs.VignetteIntensity, default_luma_global_game_settings.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
+      DrawSettingSlider("Film Grain Intensity", "FilmGrainIntensity", &gs.FilmGrainIntensity, default_luma_global_game_settings.FilmGrainIntensity, 0.f, 1.f, "Scales the game's film grain (1 = vanilla, 0 = off).");
+      DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &gs.VideoAutoHDREnable, default_luma_global_game_settings.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only).");
+      ImGui::BeginDisabled(gs.VideoAutoHDREnable <= 0.5f);
+      DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
       ImGui::EndDisabled();
 
-      settings_toggle("Dithering", "Dithering", &gs.Dithering, "Reduces gradient banding.");
+      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_luma_global_game_settings.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");
 
