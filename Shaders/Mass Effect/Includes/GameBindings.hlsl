@@ -2,6 +2,7 @@
 #define LUMA_ME1_GAME_BINDINGS
 
 #include "../../Includes/DgVoodoo.hlsl"
+#include "../../Includes/UE3Grade.hlsl" // PowUE3, UE3Grade
 
 // Bindings shared by the replaced passes (tonemap, gather, Bink video, GFx HUD), and nothing else. NO textures,
 // samplers or b4 row aliases: meaning is per pass (t0 = scene here, Y plane in Video; cb4[8] = DoFParams vs matrix
@@ -26,12 +27,6 @@ cbuffer PixelShaderConstants : register(b4)
 #define DgvFillT1 DgvConstants[47]
 #define DgvMaskT2 DgvConstants[48]
 #define DgvFillT2 DgvConstants[49]
-
-// The grade's pow() as the original computes it. The tiny floor replaces the compiler's own log2(0) guard.
-float3 PowUE3(float3 base, float3 exponent)
-{
-   return exp2(exponent * log2(max(abs(base), 1e-30)));
-}
 
 // UE3's depth-of-field blur weight at linear `depth`, as both the gather and the uber grade compute it. The rows are
 // passed in, each pass naming them from its own register map: `dofParams` .x focus distance, .y 1/range, .z falloff

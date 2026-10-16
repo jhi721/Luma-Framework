@@ -121,6 +121,22 @@ float3 PumboAutoHDR(float3 SDRColor, float MaxPeakWhiteNits, float _PaperWhiteNi
 	return SDRColor * lerp(SingleColorScale, PerChannelColorScale, SaturationExpansionIntensity);
 }
 
+#ifndef VIDEO_AUTO_HDR_PEAK_NITS
+// Kept low on purpose: movies (e.g. Bink) are low bitrate, a higher peak exposes compression blocks in the highlights
+#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
+#endif
+
+// Light "PumboAutoHDR" for SDR movies (linear in and out). "Boost" 0 puts the peak at sRGB white, where PumboAutoHDR is a no-op;
+// 1 is the full VIDEO_AUTO_HDR_PEAK_NITS. "PaperWhiteNits" is the white the movie lands at.
+float3 VideoAutoHDR(float3 LinearColor, bool Enable, float Boost, float PaperWhiteNits)
+{
+   if (Enable)
+   {
+      LinearColor = PumboAutoHDR(LinearColor, lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(Boost)), PaperWhiteNits);
+   }
+   return LinearColor;
+}
+
 // Takes an SDR/HDR linear color (that doesn't have that much dynamic range) and expands the high midtones and highlights.
 // Note: this allows "FakeHDRIntensity" to be < 0 in case you wanted to undo the effect (approximately).
 // "NormalizationPoint" needs to be > 0.

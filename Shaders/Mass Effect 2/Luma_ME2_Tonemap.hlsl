@@ -197,19 +197,7 @@ float3 VanillaToLinear(float3 graded)
 // channel ratio. `outputScale` is 1 on the HDR path because that row doubles as the engine fade, re-applied later.
 float3 GradeUE3(float3 curved, bool clampSDR, float3 outputScale)
 {
-   // Head: shadows -> scale -> midtones.
-   float3 c = curved - SceneShadowsAndDesat.xyz;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mad_sat in the original
-   c = c * SceneInverseHighLights.xyz;
-   c = PowUE3(c, SceneMidTones.xyz);
-
-   // Tail: desat + tint + output scale + display encode.
-   const float desat = dot(c, SceneLuminanceWeights.xyz);
-   c = c * SceneShadowsAndDesat.www + GammaOverlayColor.xyz;
-   c = c + desat;
-   c = c * outputScale;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mul_sat in the original
-   return PowUE3(c, GammaColorScaleAndInverse.www);
+   return UE3Grade(curved, clampSDR, outputScale, SceneShadowsAndDesat, SceneInverseHighLights.xyz, SceneMidTones.xyz, SceneLuminanceWeights.xyz, GammaOverlayColor.xyz, GammaColorScaleAndInverse.w);
 }
 
 float3 RunME2Uber(float2 blurUV, float2 sceneUV)

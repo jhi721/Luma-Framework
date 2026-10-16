@@ -7,11 +7,6 @@
 #include "Includes/GameBindings.hlsl" // b3/b4, ApplyDgvMask
 // clang-format on
 
-// Peak kept low: Bink is low-bitrate and a high peak amplifies block artifacts.
-#ifndef VIDEO_AUTO_HDR_PEAK_NITS
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-#endif
-
 Texture2D<float4> t0 : register(t0); // Y plane
 Texture2D<float4> t1 : register(t1); // U plane
 Texture2D<float4> t2 : register(t2); // V plane
@@ -46,12 +41,7 @@ void main(DGV_MAIN_SIGNATURE)
    float3 lin = gamma_to_linear(rgb);
 #if TONEMAP_TYPE >= 1
    // Gated on TONEMAP_TYPE, not display mode: PumboAutoHDR's SDR self-noop does not cover TONEMAP_TYPE 0 on scRGB.
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      // Boost 0 = peak at sRGB white -> no-op; 1 = full VIDEO_AUTO_HDR_PEAK_NITS.
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
-   }
+   lin = VideoAutoHDR(lin, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
 #endif
 
    // Same UI Paper White pre-scale as the uber (which applies it on both TONEMAP_TYPEs), so movies land at gameplay

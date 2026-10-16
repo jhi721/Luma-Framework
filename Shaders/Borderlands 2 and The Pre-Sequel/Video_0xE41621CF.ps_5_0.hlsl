@@ -12,9 +12,6 @@
 #ifndef ENABLE_VIDEO_AUTO_HDR
 #define ENABLE_VIDEO_AUTO_HDR 1
 #endif
-#ifndef VIDEO_AUTO_HDR_PEAK_NITS
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-#endif
 
 Texture2D<float4> t0 : register(t0); // Y' plane
 Texture2D<float4> t1 : register(t1); // Color difference plane
@@ -72,12 +69,7 @@ void main(
    o0.rgb = saturate(o0.rgb);
    float3 lin = gamma_to_linear(o0.rgb);
 #if ENABLE_VIDEO_AUTO_HDR
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      // boost 0 = peak at paper white -> PumboAutoHDR no-ops (off); 1 = full VIDEO_AUTO_HDR_PEAK_NITS.
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
-   }
+   lin = VideoAutoHDR(lin, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
 #endif
    // Match the tonemap's linear pre-scale: land movies at the same brightness as in-game after the
    // composition's UIPaperWhite rescale (when UIPaperWhite != GamePaperWhite).

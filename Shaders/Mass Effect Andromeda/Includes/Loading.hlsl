@@ -11,10 +11,6 @@
 #define MEA_OUTPUT_SDR 0
 #endif
 
-#ifndef VIDEO_AUTO_HDR_PEAK_NITS
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-#endif
-
 #if !defined(MEA_LOADING_SCENE_SAMPLER) || !defined(MEA_LOADING_FILTER)
 #error "Define MEA_LOADING_SCENE_SAMPLER and MEA_LOADING_FILTER before including Loading.hlsl"
 #endif
@@ -58,11 +54,7 @@ float4 main(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Targ
    // AutoHDR. "Video HDR Boost" 0 puts the AutoHDR peak at sRGB white, where it's a no-op.
    if (HDRFixEnabled() && LumaSettings.GameSettings.VideoActive != 0.0)
    {
-      if (LumaSettings.GameSettings.VideoAutoHDREnable != 0.0)
-      {
-         const float peak_nits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-         ui.rgb = PumboAutoHDR(ui.rgb, peak_nits, SceneWhiteNits());
-      }
+      ui.rgb = VideoAutoHDR(ui.rgb, LumaSettings.GameSettings.VideoAutoHDREnable != 0.0, LumaSettings.GameSettings.VideoAutoHDRBoost, SceneWhiteNits());
       ui.rgb *= SceneWhiteNits() / UIWhiteNits();
    }
    return OutputHDR10(gamma_sRGB_to_linear(max(scene.rgb, 0.0), GCT_NONE), scene.a, ui, cbData[2], texcoord);

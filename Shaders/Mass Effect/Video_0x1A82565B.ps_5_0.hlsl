@@ -11,9 +11,6 @@
 #ifndef ENABLE_VIDEO_AUTO_HDR
 #define ENABLE_VIDEO_AUTO_HDR 1
 #endif
-#ifndef VIDEO_AUTO_HDR_PEAK_NITS
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-#endif
 
 // Y' and the two chroma planes; which one is Cb or Cr is up to the cb4 matrix.
 Texture2D<float4> t0 : register(t0);
@@ -52,12 +49,7 @@ void main(DGV_MAIN_SIGNATURE)
 
    float3 lin = gamma_to_linear(rgb);
 #if ENABLE_VIDEO_AUTO_HDR
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      // boost 0 = peak at sRGB white (80 nits) -> PumboAutoHDR no-ops (off); 1 = full VIDEO_AUTO_HDR_PEAK_NITS.
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
-   }
+   lin = VideoAutoHDR(lin, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
 #endif
 
    // Same pre-scale as the scene passes, so movies land at gameplay brightness. The canvas is a gamma-space buffer;

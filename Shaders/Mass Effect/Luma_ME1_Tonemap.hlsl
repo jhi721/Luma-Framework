@@ -79,21 +79,10 @@ float3 VanillaToLinear(float3 graded)
 
 // The game's grade, verbatim from the disassembly. `clampSDR` false = max(0) instead of saturate, keeping the real
 // channel ratio. `outputScale` is GammaColorScaleAndInverse.xyz; the HDR path passes 1 and re-applies it later.
+// Its gamma encode (GammaColorScaleAndInverse.w) is a measured identity.
 float3 GradeUE3(float3 scene, bool clampSDR, float3 outputScale)
 {
-   // Head: shadows -> scale -> midtones.
-   float3 c = scene - SceneShadowsAndDesat.xyz;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mad_sat in the original
-   c = c * SceneInverseHighLights.xyz;
-   c = PowUE3(c, SceneMidTones.xyz);
-
-   // Tail: desat + tint + output scale + (measured identity) gamma encode.
-   float desat = dot(c, SceneLuminanceWeights.xyz);
-   c = c * SceneShadowsAndDesat.www + GammaOverlayColor.xyz;
-   c = c + desat;
-   c = c * outputScale;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mul_sat in the original
-   return PowUE3(c, GammaColorScaleAndInverse.www);
+   return UE3Grade(scene, clampSDR, outputScale, SceneShadowsAndDesat, SceneInverseHighLights.xyz, SceneMidTones.xyz, SceneLuminanceWeights.xyz, GammaOverlayColor.xyz, GammaColorScaleAndInverse.w);
 }
 
 // Sanitize anything stored in fp16 or the canvas: the extended grade, the hue stage, encode and dither can each emit

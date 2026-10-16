@@ -11,9 +11,6 @@
 #ifndef ENABLE_VIDEO_AUTO_HDR
 #define ENABLE_VIDEO_AUTO_HDR 1
 #endif
-#ifndef VIDEO_AUTO_HDR_PEAK_NITS
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-#endif
 
 cbuffer _Globals : register(b0)
 {
@@ -49,13 +46,7 @@ void main(
    // so the pre-scale must compensate that multiply before the re-encode (in gamma it diverges when GamePaperWhite != UIPaperWhite).
    float3 lin = gamma_to_linear(o0.rgb);
 #if ENABLE_VIDEO_AUTO_HDR
-   // Runtime-gated ("Video AutoHDR"). "Video HDR Boost" 0 puts the peak at sRGB white, where PumboAutoHDR is a no-op; 1 is the full
-   // VIDEO_AUTO_HDR_PEAK_NITS.
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
-   }
+   lin = VideoAutoHDR(lin, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
 #endif
    // Full-screen movies land at the in-game brightness after the composition's UIPaperWhite rescale
    lin *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);

@@ -67,19 +67,7 @@ float3 ApplyLumaBloom(float3 untonemapped, float2 sceneUV)
 // clamp(c, 0, FLT_MAX) keeps two extra per-pixel min() instructions in the HDR path.
 float3 GradeUE3(float3 scene, bool clampSDR, float3 outputScale)
 {
-   // Head: shadows -> scale -> midtones.
-   float3 c = scene - SceneShadowsAndDesat.xyz;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mad_sat in the original
-   c = c * SceneInverseHighLights.xyz;
-   c = PowUE3(c, SceneMidTones.xyz);
-
-   // Tail: desat + tint + output scale + gamma encode.
-   float desat = dot(c, SceneLuminanceWeights.xyz);
-   c = c * SceneShadowsAndDesat.www + GammaOverlayColor.xyz;
-   c = c + desat;
-   c = c * outputScale;
-   c = clampSDR ? saturate(c) : max(0.0, c); // mul_sat in the original
-   return PowUE3(c, GammaColorScaleAndInverse.www);
+   return UE3Grade(scene, clampSDR, outputScale, SceneShadowsAndDesat, SceneInverseHighLights.xyz, SceneMidTones.xyz, SceneLuminanceWeights.xyz, GammaOverlayColor.xyz, GammaColorScaleAndInverse.w);
 }
 
 // Shared HDR back half, used by both replaced passes: extended grade -> contrast -> BT.2020 -> soft hue reference ->

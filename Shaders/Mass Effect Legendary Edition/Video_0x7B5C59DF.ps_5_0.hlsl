@@ -16,9 +16,6 @@
 #ifndef ENABLE_VIDEO_AUTO_HDR
 #define ENABLE_VIDEO_AUTO_HDR 1
 #endif
-#ifndef VIDEO_AUTO_HDR_PEAK_NITS
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-#endif
 
 Texture2D<float4> tex0 : register(t0); // Y plane
 Texture2D<float4> tex1 : register(t1); // Cr plane
@@ -71,12 +68,8 @@ void main(
       float3 lin = gamma_to_linear(clamped, GCT_MIRROR);
 
 #if ENABLE_VIDEO_AUTO_HDR
-      [branch] if (autoHDR)
-      {
-         // Linear 1 lands at UI Paper White once the transport ratio and Game Paper White are applied.
-         const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-         lin = PumboAutoHDR(lin, peakNits, LumaSettings.UIPaperWhiteNits);
-      }
+      // Linear 1 lands at UI Paper White once the transport ratio and Game Paper White are applied.
+      lin = VideoAutoHDR(lin, autoHDR, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.UIPaperWhiteNits);
 #endif
 
       // Linear output carries the transport ratio and Game Paper White like stage 2, so video white lands at UI Paper White.

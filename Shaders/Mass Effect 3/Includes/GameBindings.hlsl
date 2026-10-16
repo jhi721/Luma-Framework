@@ -2,6 +2,7 @@
 #define LUMA_ME3_GAME_BINDINGS
 
 #include "../../Includes/DgVoodoo.hlsl"
+#include "../../Includes/UE3Grade.hlsl" // PowUE3, UE3Grade
 
 // Bindings and vanilla math shared by the replaced passes: no textures, samplers or cbuffer-row aliases, since slot and
 // row meaning is per pass.
@@ -21,12 +22,6 @@ cbuffer PixelShaderConstants : register(b4)
 float4 ApplyDgvMask(float4 value, uint slot)
 {
    return ApplyDgvMask(value, DgvConstants[44 + 2 * slot], DgvConstants[45 + 2 * slot]);
-}
-
-// The grade's pow() as the original computes it. The tiny floor replaces the compiler's own log2(0) guard.
-float3 PowUE3(float3 base, float3 exponent)
-{
-   return exp2(exponent * log2(max(abs(base), 1e-30)));
 }
 
 // UE3's DoF blur weight from view depth, as both the full-res uber and the gather compute it: pow(saturate(|depth -

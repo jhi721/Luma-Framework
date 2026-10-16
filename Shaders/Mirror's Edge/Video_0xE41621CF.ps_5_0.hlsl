@@ -11,9 +11,6 @@
 #define BINK_ALPHA 0
 #endif
 
-// Bink is low bitrate: a low peak keeps compression blocks out of the highlights
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-
 Texture2D<float4> t0 : register(t0); // Y'
 Texture2D<float4> t1 : register(t1); // Cb/Cr
 Texture2D<float4> t2 : register(t2); // Cr/Cb
@@ -50,11 +47,7 @@ void main(DGV_MAIN_SIGNATURE)
 #endif
 
    color = gamma_to_linear(color);
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      // Boost 0 = peak at SDR white: PumboAutoHDR no-ops. It also no-ops in SDR output (peak == paper white).
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      color = PumboAutoHDR(color, peakNits, LumaSettings.GamePaperWhiteNits);
-   }
+   // PumboAutoHDR also no-ops in SDR output (peak == paper white)
+   color = VideoAutoHDR(color, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
    o0.xyz = linear_to_gamma(color * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true));
 }

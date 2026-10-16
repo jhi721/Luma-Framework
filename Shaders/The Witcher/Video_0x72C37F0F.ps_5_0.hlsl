@@ -12,9 +12,6 @@
 #ifndef ENABLE_VIDEO_AUTO_HDR
 #define ENABLE_VIDEO_AUTO_HDR 1
 #endif
-#ifndef VIDEO_AUTO_HDR_PEAK_NITS
-#define VIDEO_AUTO_HDR_PEAK_NITS 250.0
-#endif
 
 cbuffer cb3 : register(b3)
 {
@@ -48,9 +45,7 @@ void main(DGV_MAIN_SIGNATURE)
 #if ENABLE_VIDEO_AUTO_HDR
    if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
    {
-      // boost 0 = peak at sRGB white (80 nits) -> PumboAutoHDR no-ops (off); 1 = full VIDEO_AUTO_HDR_PEAK_NITS.
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      rgb = linear_to_gamma(PumboAutoHDR(gamma_to_linear(rgb), peakNits, LumaSettings.GamePaperWhiteNits));
+      rgb = linear_to_gamma(VideoAutoHDR(gamma_to_linear(rgb), true, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits));
    }
 #endif
    o0 = float4(rgb, 1.0);
