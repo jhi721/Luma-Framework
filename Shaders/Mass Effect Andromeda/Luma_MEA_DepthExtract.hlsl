@@ -19,13 +19,13 @@ cbuffer PredCB : register(b0)
       return;
    const int3 p = int3(id.xy, 0);
    const float centerZ = depth.Load(p);
-   // Out-of-bounds Loads return 0, so mirror the centre on every border: a flat border beats a false edge.
-   const float leftZ = (id.x > 0) ? depth.Load(p - int3(1, 0, 0)) : centerZ;
+   // Right/bottom also mirror the centre (left/top are mirrored by PlaneDeviationEdgenessMirrored).
+   const float leftZ = depth.Load(p - int3(1, 0, 0));
    const float rightZ = (id.x + 1 < w) ? depth.Load(p + int3(1, 0, 0)) : centerZ;
-   const float topZ = (id.y > 0) ? depth.Load(p - int3(0, 1, 0)) : centerZ;
+   const float topZ = depth.Load(p - int3(0, 1, 0));
    const float bottomZ = (id.y + 1 < h) ? depth.Load(p + int3(0, 1, 0)) : centerZ;
 
    // Depth-proportional tolerance: what matters scales with distance. Both terms are required - the slope adjustment
    // alone degrades toward the vanishing point, a depth-proportional threshold alone cannot reject a grazing plane.
-   uav[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, max(centerZ, 1e-3) * max(P.x, 1e-4));
+   uav[id.xy] = PlaneDeviationEdgenessMirrored(id.xy, centerZ, leftZ, rightZ, topZ, bottomZ, DepthExtractTolerance(centerZ, P.x));
 }

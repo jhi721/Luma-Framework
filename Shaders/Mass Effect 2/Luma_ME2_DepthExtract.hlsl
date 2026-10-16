@@ -14,14 +14,12 @@ cbuffer PredCB : register(b0)
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    const int3 p = int3(id.xy, 0);
    const float centerZ = scene.Load(p).w;
-   // Out-of-bounds Loads return 0 (D3D11-defined); mirroring the centre there keeps the border flat instead of
-   // reporting a false edge along the screen edges.
-   const float leftZ = (id.x > 0) ? scene.Load(p - int3(1, 0, 0)).w : centerZ;
+   const float leftZ = scene.Load(p - int3(1, 0, 0)).w;
    const float rightZ = scene.Load(p + int3(1, 0, 0)).w;
-   const float topZ = (id.y > 0) ? scene.Load(p - int3(0, 1, 0)).w : centerZ;
+   const float topZ = scene.Load(p - int3(0, 1, 0)).w;
    const float bottomZ = scene.Load(p + int3(0, 1, 0)).w;
 
    // Depth-proportional tolerance: what matters scales with distance. Both terms are required - the slope adjustment
    // alone degrades toward the vanishing point, a depth-proportional threshold alone cannot reject a grazing plane.
-   uav[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, max(centerZ, 1e-3) * max(P.x, 1e-4));
+   uav[id.xy] = PlaneDeviationEdgenessMirrored(id.xy, centerZ, leftZ, rightZ, topZ, bottomZ, DepthExtractTolerance(centerZ, P.x));
 }

@@ -40,15 +40,13 @@ float ViewDepthAt(int3 p)
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    const int3 p = int3(id.xy, 0);
    const float centerZ = ViewDepthAt(p);
-   // Out-of-bounds Loads return 0 (D3D11-defined); mirroring the centre there keeps the border flat instead of
-   // reporting a false edge along the screen edges.
-   const float leftZ = (id.x > 0) ? ViewDepthAt(p - int3(1, 0, 0)) : centerZ;
+   const float leftZ = ViewDepthAt(p - int3(1, 0, 0));
    const float rightZ = ViewDepthAt(p + int3(1, 0, 0));
-   const float topZ = (id.y > 0) ? ViewDepthAt(p - int3(0, 1, 0)) : centerZ;
+   const float topZ = ViewDepthAt(p - int3(0, 1, 0));
    const float bottomZ = ViewDepthAt(p + int3(0, 1, 0));
 
    // Depth-proportional tolerance: what matters scales with distance (a 10 cm step is a silhouette at 2 m and
    // noise at 200 m). Both terms are required - the slope adjustment alone degrades toward the vanishing point,
    // and a depth-proportional threshold alone cannot reject a grazing plane at all.
-   uav[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, max(centerZ, 1e-3) * max(P.x, 1e-4));
+   uav[id.xy] = PlaneDeviationEdgenessMirrored(id.xy, centerZ, leftZ, rightZ, topZ, bottomZ, DepthExtractTolerance(centerZ, P.x));
 }

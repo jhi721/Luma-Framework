@@ -61,15 +61,13 @@ float LinearDepth(float raw)
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    const int3 p = int3(id.xy, 0);
    const float centerZ = LinearDepth(scene.Load(p).w);
-   // Out-of-bounds Loads return 0 (D3D11-defined), which linearises to a bogus depth, so the border mirrors the
-   // centre instead — a flat border rather than a false edge along the screen edges.
-   const float leftZ = (id.x > 0) ? LinearDepth(scene.Load(p - int3(1, 0, 0)).w) : centerZ;
+   const float leftZ = LinearDepth(scene.Load(p - int3(1, 0, 0)).w);
    const float rightZ = LinearDepth(scene.Load(p + int3(1, 0, 0)).w);
-   const float topZ = (id.y > 0) ? LinearDepth(scene.Load(p - int3(0, 1, 0)).w) : centerZ;
+   const float topZ = LinearDepth(scene.Load(p - int3(0, 1, 0)).w);
    const float bottomZ = LinearDepth(scene.Load(p + int3(0, 1, 0)).w);
 
    // Depth-proportional tolerance: the deviation that matters scales with distance (a step that is a silhouette
    // up close is noise far away). Both terms are required — the slope adjustment alone still degrades toward the
    // vanishing point, and a depth-proportional threshold alone cannot reject a grazing plane at all.
-   uav[id.xy] = PlaneDeviationEdgeness(centerZ, leftZ, rightZ, topZ, bottomZ, max(centerZ, 1e-3) * max(P.x, 1e-4));
+   uav[id.xy] = PlaneDeviationEdgenessMirrored(id.xy, centerZ, leftZ, rightZ, topZ, bottomZ, DepthExtractTolerance(centerZ, P.x));
 }
