@@ -5,7 +5,10 @@
 // dgVoodoo's texture-format bit emulation, kept via asuint/asfloat. dgVoodoo dropped the SM3 saturate(o) (the UNORM
 // backbuffer clamped for free), so it is re-added before the AutoHDR - kills the matrix's overshoot and negatives.
 
-#include "Includes/Common.hlsl" // game-local: pulls GameCBuffers (LumaGameSettings VideoAutoHDR* fields) + shared Common
+// clang-format off
+#include "Includes/Common.hlsl"      // game-local: pulls GameCBuffers (LumaGameSettings VideoAutoHDR* fields) + shared Common
+#include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE
+// clang-format on
 
 // Light AutoHDR on videos (0 = off -> flat SDR at paper white). Peak kept low on purpose (Bink is low-bitrate;
 // pushing peak amplifies block/compression artifacts in highlights). PumboAutoHDR self-noops in SDR (peak==paper).
@@ -30,21 +33,8 @@ cbuffer cb4 : register(b4)
    float4 cb4[236];
 }
 
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0, // movie UV (only .xy used)
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+// v5.xy: the movie UV
+void main(DGV_MAIN_SIGNATURE)
 {
    float4 r0, r1;
 

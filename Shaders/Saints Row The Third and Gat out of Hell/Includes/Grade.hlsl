@@ -54,7 +54,7 @@ float3 SR_DisplayMap(float3 hdrLinear, float2 uv)
    // composition scales this image by UIPaperWhite, so that is the PQ scale.
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(encoded, uv, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+      ApplyOutputDithering(encoded, uv, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
    }
    return encoded;
 }

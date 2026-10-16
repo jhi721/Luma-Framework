@@ -495,7 +495,7 @@ float4 RunTonemap(float4 v5, float4 v6)
 #if TONEMAP_TYPE >= 1
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(postProcessedColor, v6.xy, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+      ApplyOutputDithering(postProcessedColor, v6.xy, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
    }
 #endif
 

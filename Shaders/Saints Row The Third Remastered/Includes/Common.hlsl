@@ -36,5 +36,5 @@ void SRTTR_DitherOutput(inout float3 color, float2 uv)
    {
       return;
    }
-   ApplyOutputDithering(color, uv, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+   ApplyOutputDithering(color, uv, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
 }

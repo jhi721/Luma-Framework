@@ -250,7 +250,7 @@ float3 RunME1GammaCorrection(float2 sceneUV)
    // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(outColor, sceneUV, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+      ApplyOutputDithering(outColor, sceneUV, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
    }
 #endif
 #else

@@ -41,7 +41,7 @@ float4 RenderFB(float2 uv)
    // SDR, 10-bit BT.2020 PQ in HDR. The composition scales this image by UIPaperWhite, so that is the PQ scale.
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(result.rgb, uv, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+      ApplyOutputDithering(result.rgb, uv, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
    }
    return result;
 }

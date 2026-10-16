@@ -29,9 +29,7 @@ float4 SR4_SampleDistortionMap(Texture2D<float4> map, float2 uv)
    return lerp(lerp(SR4_LoadDistortionTexel(map, base, limit), SR4_LoadDistortionTexel(map, base + int2(1, 0), limit), f.x), lerp(SR4_LoadDistortionTexel(map, base + int2(0, 1), limit), SR4_LoadDistortionTexel(map, base + int2(1, 1), limit), f.x), f.y);
 }
 
-// Linear (1.0 = paper white) -> the gamma-encoded post-process space. With UI_DRAW_TYPE 2 the scene is pre-scaled by
-// GamePaperWhite / UIPaperWhite: the composition rescales the whole image by UIPaperWhite, which puts the gamma-space
-// UI drawn on top at the UI paper white and the scene back at its own.
+// Linear (1.0 = paper white) -> the gamma-encoded post-process space, with the "GetUIPaperWhitePreScale" pre-scale.
 float3 SR4_EncodeOutput(float3 color)
 {
    color *= GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, false);

@@ -1,5 +1,5 @@
-#ifndef LUMA_REINHARD_HLSL
-#define LUMA_REINHARD_HLSL
+#ifndef SRC_REINHARD_HLSL
+#define SRC_REINHARD_HLSL
 
 #include "Color.hlsl"
 
@@ -237,4 +237,4 @@ float3 ReinhardTonemap(float3 color, float peak_nits, float diffuse_nits, Reinha
     };
 }
 
-#endif // LUMA_REINHARD_HLSL
+#endif // SRC_REINHARD_HLSL

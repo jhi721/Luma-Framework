@@ -120,7 +120,7 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
 #if TONEMAP_TYPE >= 1
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(outColor, sceneUV, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+      ApplyOutputDithering(outColor, sceneUV, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
    }
 #endif
 #endif

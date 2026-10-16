@@ -58,10 +58,8 @@ void main(DGV_MAIN_SIGNATURE)
 
    float3 lin = gamma_to_linear(rgb);
    // Light AutoHDR on movies (off = flat SDR at paper white). PumboAutoHDR self-noops in SDR (peak == paper white), so
-   // no display branch. Peak: boost 0 = sRGB white, which makes PumboAutoHDR's own headroom 1 -> identity (off); boost
-   // 1 = 250 nits, kept low on purpose: Bink is low-bitrate and pushing peak amplifies block artifacts.
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-      lin = PumboAutoHDR(lin, lerp(sRGB_WhiteLevelNits, 250.0, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost)), LumaSettings.GamePaperWhiteNits);
+   // no display branch.
+   lin = VideoAutoHDR(lin, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
 
    // Same pre-scale as the scene passes, so movies land at gameplay brightness. The canvas is a gamma-space buffer; the
    // composition decodes it at present.

@@ -20,8 +20,7 @@
 // LUMA_GAME_CB_STRUCTS before any shared header pulls Settings.hlsl, or GameSettings resolves to the empty dummy.
 #include "Includes/Common.hlsl"
 #include "../Includes/Color.hlsl"
-#include "../Includes/Reinhard.hlsl"        // ReinhardRange (grade proxy)
-#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
+#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference; its Reinhard.hlsl: ReinhardRange (grade proxy)
 #include "Includes/GameBindings.hlsl"
 // clang-format on
 
@@ -430,7 +429,7 @@ float4 ME3_FinalEncode(float3 encoded, float2 ditherUV)
    // Anti-banding dither, one step of the output quantizer: 8-bit in SDR, 10-bit BT.2020 PQ in HDR.
    if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(encoded, ditherUV, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+      ApplyOutputDithering(encoded, ditherUV, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
    }
 #endif
 

@@ -98,7 +98,7 @@ float4 OutputSDR(float3 srgb, float alpha, float2 uv)
    srgb = saturate(srgb);
    if (LumaSettings.GameSettings.Dithering != 0.0)
    {
-      ApplyDithering(srgb, uv, true, 1.0, 8u, LumaSettings.FrameIndex, true);
+      ApplyOutputDithering(srgb, uv, true, false, 1.0);
    }
    return float4(srgb, alpha);
 }

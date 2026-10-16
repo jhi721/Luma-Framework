@@ -19,7 +19,7 @@ float3 PreScaleForUIPaperWhite(float3 encoded)
    [branch] if (GamePaperWhiteNits != UIPaperWhiteNits)
    {
       const float3 composed = ColorGradingLUTTransferFunctionOutCorrected(encoded, VANILLA_ENCODING_TYPE, GAMMA_CORRECTION_TYPE);
-      encoded = ColorGradingLUTTransferFunctionInCorrected(composed * (GamePaperWhiteNits / max(UIPaperWhiteNits, 1.0)), GAMMA_CORRECTION_TYPE, VANILLA_ENCODING_TYPE);
+      encoded = ColorGradingLUTTransferFunctionInCorrected(composed * GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, false), GAMMA_CORRECTION_TYPE, VANILLA_ENCODING_TYPE);
    }
 #endif
    return encoded;

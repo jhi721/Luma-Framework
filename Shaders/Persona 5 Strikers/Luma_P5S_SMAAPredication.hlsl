@@ -1,16 +1,7 @@
-// SMAA predication signal from the game's full resolution D32 scene depth (the copy the SSAO downsample reads).
-// Port of Saints Row: The Third's Luma_SR3_SMAAPredication.hlsl (itself from Luma_TW2_DepthExtract.hlsl).
-//
-// A plain depth first difference (SMAA's predication) can't separate a silhouette from a surface seen edge-on: a plane's
-// per-pixel change grows with distance, so no remap or threshold fixes it. This measures the deviation from the local tangent
-// plane instead: a slope-adjusted second difference with a depth-proportional tolerance, as XeGTAO_CalculateEdges.
-//
-// 1 / d (reversed Z, sky = 0) is about proportional to linear view depth, and the relative tolerance cancels the unknown near
-// plane: no camera constants needed. Sky clamps at 2^-24.
-//
-// Output: edge-ness in [0,1] against the LEFT and TOP neighbors only. SMAA compares center-vs-left and center-vs-top, so a
-// one-sided measure jumps 0 -> 1 exactly ACROSS a silhouette; a symmetric mask would read 1 on both sides and difference to 0
-// where predication must fire. Hence SMAA_PREDICATION_THRESHOLD 0.5.
+// SMAA predication signal from the game's full resolution D32 scene depth (the copy the SSAO downsample reads; reversed Z,
+// sky = 0). Port of Saints Row: The Third's Luma_SR3_SMAAPredication.hlsl (itself from Luma_TW2_DepthExtract.hlsl).
+// Method and the SMAA_PREDICATION_THRESHOLD 0.5 contract: see "PlaneDeviationEdgeness" and "RelativeViewDepth" in
+// Includes/DepthEdges.hlsl.
 
 #include "../Includes/DepthEdges.hlsl"
 

@@ -260,10 +260,8 @@ groupshared float3 gContinuation;
                                      LumaSettings.GameSettings.Saturation,
                                      LumaSettings.GameSettings.HighlightsDesaturation);
 
-#if UI_DRAW_TYPE >= 2
       // The GUI layer is blended over this in gamma space by compose; the composition rescales by UI paper white.
       hdr *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
-#endif
       hdr = IsNaN_Strict(hdr) ? 0.0 : max(0.0, hdr);
       outputCode = linear_to_gamma(hdr, GCT_NONE);
    }

@@ -7,8 +7,8 @@
 // Game specific settings
 #include "Settings.hlsl"
 
-// Linear (1.0 = paper white) -> the gamma-space post-process output of the scene grade and the videos. With UI_DRAW_TYPE 2
-// the HUD is drawn on top in gamma SDR, so the output is pre-scaled to land at UI paper white after composition.
+// Linear (1.0 = paper white) -> the gamma-space post-process output of the scene grade and the videos, with the
+// "GetUIPaperWhitePreScale" pre-scale (the HUD is drawn on top in gamma SDR).
 float3 YRC_EncodeOutput(float3 color)
 {
    color *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);

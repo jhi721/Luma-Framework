@@ -276,7 +276,7 @@ void main(DGV_MAIN_SIGNATURE)
       // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
       if (LumaSettings.GameSettings.Dithering > 0.5)
       {
-         ApplyOutputDithering(postProcessedColor, v5.xy, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+         ApplyOutputDithering(postProcessedColor, v5.xy, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
       }
 
       vanillaColor = postProcessedColor;

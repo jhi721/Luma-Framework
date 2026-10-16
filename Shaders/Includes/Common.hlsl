@@ -130,7 +130,7 @@ float3 PumboAutoHDR(float3 SDRColor, float MaxPeakWhiteNits, float _PaperWhiteNi
 // 1 is the full VIDEO_AUTO_HDR_PEAK_NITS. "PaperWhiteNits" is the white the movie lands at.
 float3 VideoAutoHDR(float3 LinearColor, bool Enable, float Boost, float PaperWhiteNits)
 {
-   if (Enable)
+   [branch] if (Enable)
    {
       LinearColor = PumboAutoHDR(LinearColor, lerp(sRGB_WhiteLevelNits, VIDEO_AUTO_HDR_PEAK_NITS, saturate(Boost)), PaperWhiteNits);
    }
@@ -240,17 +240,12 @@ float4 SDRToHDR(float4 Color, bool InGammaSpace = true, bool IsAfterDisplayTrans
 float GetUIPaperWhitePreScale(float gamePaperWhiteNits, float uiPaperWhiteNits, bool guardUnset)
 {
 #if UI_DRAW_TYPE >= 2
-   if (guardUnset)
-   {
-      if (gamePaperWhiteNits > 0.0)
-      {
-         return gamePaperWhiteNits / max(uiPaperWhiteNits, 1.0);
-      }
+   if (guardUnset && gamePaperWhiteNits <= 0.0)
       return 1.0;
-   }
    return gamePaperWhiteNits / max(uiPaperWhiteNits, 1.0);
-#endif
+#else
    return 1.0;
+#endif
 }
 
 // LUMA FT: added these functions to decode and re-encode the "back buffer" from any range to a range that roughly matched SDR linear space
@@ -448,16 +443,12 @@ void ApplyDithering(inout float3 color, float2 uv, bool gammaSpace = true, float
 
 // Anti-banding dither of one output quantizer step: the 8 bit code in SDR, the 10 bit BT.2020 PQ code in HDR.
 // "gammaSpace": whether "color" is gamma encoded (else linear). "paperWhiteNits": the nits the display composition maps 1 to,
-// which places the PQ code steps (HDR only).
+// which places the PQ code steps (HDR only, floored at 1).
 void ApplyOutputDithering(inout float3 color, float2 uv, bool gammaSpace, bool hdr, float paperWhiteNits)
 {
-   if (!hdr)
+   if (hdr)
    {
-      ApplyDithering(color, uv, gammaSpace, 1.0, 8u, LumaSettings.FrameIndex, true);
-   }
-   else
-   {
-      const float pqScale = paperWhiteNits / HDR10_MaxWhiteNits;
+      const float pqScale = max(paperWhiteNits, 1.0) / HDR10_MaxWhiteNits;
       const float3 linearColor = gammaSpace ? gamma_to_linear(color, GCT_MIRROR) : color;
       float3 pq = Linear_to_PQ(BT709_To_BT2020(linearColor * pqScale), GCT_MIRROR);
       ApplyDithering(pq, uv, true, 1.0, 10u, LumaSettings.FrameIndex, true);
@@ -466,6 +457,10 @@ void ApplyOutputDithering(inout float3 color, float2 uv, bool gammaSpace, bool h
       {
          color = linear_to_gamma(color, GCT_MIRROR);
       }
+   }
+   else
+   {
+      ApplyDithering(color, uv, gammaSpace, 1.0, 8u, LumaSettings.FrameIndex, true);
    }
 }
 

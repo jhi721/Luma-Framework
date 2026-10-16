@@ -8,9 +8,6 @@
 
 #include "Includes/Common.hlsl"
 
-// Video AutoHDR peak at full boost.
-static const float VideoAutoHDRPeakNits = 250.0;
-
 cbuffer vc1 : register(b1)
 {
    float2 Prim_tex_texel_size : packoffset(c8);
@@ -43,12 +40,8 @@ void main(float4 pos : SV_Position, float2 uv : TEXCOORD0, float4 vertexColor : 
    o0 = saturate(color * Tint_color);
 
    float3 lin = gamma_to_linear(o0.rgb);
-   // Boost 0 = peak at sRGB white, where PumboAutoHDR no-ops; it also no-ops in SDR, where the peak is paper white.
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VideoAutoHDRPeakNits, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      lin = PumboAutoHDR(lin, peakNits, GamePaperWhiteNits);
-   }
+   // No-op in SDR, where the peak is paper white.
+   lin = VideoAutoHDR(lin, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, GamePaperWhiteNits);
    // Drawn with the UI, so pre-scaled like the scene to land at the scene paper white.
    o0.rgb = SR_EncodeOutput(lin);
 }

@@ -7,9 +7,7 @@
 #include "../../Includes/Common.hlsl"
 // clang-format on
 
-// Linear (1.0 = paper white) -> the gamma-encoded post-process space. With UI_DRAW_TYPE 2 the scene is pre-scaled by
-// GamePaperWhite / UIPaperWhite: the composition rescales the whole image by UIPaperWhite, which puts the gamma-space
-// UI drawn on top at the UI paper white and the scene back at its own.
+// Linear (1.0 = paper white) -> the gamma-encoded post-process space, with the "GetUIPaperWhitePreScale" pre-scale.
 float3 SR_EncodeOutput(float3 color)
 {
    color *= GetUIPaperWhitePreScale(GamePaperWhiteNits, UIPaperWhiteNits, false);

@@ -6,18 +6,13 @@
 
 #include "Common.hlsl"
 
-// Video AutoHDR peak at full boost, as in other Luma mods
-static const float VideoAutoHDRPeakNits = 250.0;
-
 float3 VideoOutput(float3 color)
 {
    // The vanilla 8-bit targets clamped the conversion (negatives and whites up to 1.25)
    color = saturate(color);
-   // Boost 0 = peak at sRGB white, where PumboAutoHDR no-ops
    [branch] if (LumaData.CustomData1 != 0 && LumaSettings.DisplayMode == 1 && LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
    {
-      const float peakNits = lerp(sRGB_WhiteLevelNits, VideoAutoHDRPeakNits, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      color = linear_to_gamma(PumboAutoHDR(gamma_to_linear(color), peakNits, LumaSettings.GamePaperWhiteNits), GCT_NONE);
+      color = linear_to_gamma(VideoAutoHDR(gamma_to_linear(color), true, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits), GCT_NONE);
    }
    [branch] if (LumaData.CustomData1 != 0)
    {

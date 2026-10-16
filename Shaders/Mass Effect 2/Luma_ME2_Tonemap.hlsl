@@ -122,7 +122,7 @@ float3 FinishME2Canvas(float3 encoded, float2 ditherUV, bool dither)
    // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR.
    [branch] if (dither && LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(encoded, ditherUV, true, LumaSettings.DisplayMode != 0, max(UIPaperWhiteNits, 1.0));
+      ApplyOutputDithering(encoded, ditherUV, true, LumaSettings.DisplayMode != 0, UIPaperWhiteNits);
    }
 #endif
 

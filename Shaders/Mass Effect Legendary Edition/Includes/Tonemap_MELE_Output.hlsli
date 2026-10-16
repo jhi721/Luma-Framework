@@ -113,7 +113,7 @@ const float rEncoded = linear_to_gamma1(uiPaperWhiteRelativeToGame, GCT_MIRROR);
 // Anti-banding dither, one step of the output quantizer: 8-bit in SDR, 10-bit BT.2020 PQ in HDR and SDR on HDR.
 if (LumaSettings.GameSettings.Dithering > 0.5)
 {
-   ApplyOutputDithering(o0.xyz, v1.xy, true, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+   ApplyOutputDithering(o0.xyz, v1.xy, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
 }
 
 #if TM_ALPHA_LUMA

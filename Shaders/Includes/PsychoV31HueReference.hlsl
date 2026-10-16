@@ -1,5 +1,5 @@
-#ifndef LUMA_PSYCHOV31_HUE_REFERENCE_HLSL
-#define LUMA_PSYCHOV31_HUE_REFERENCE_HLSL
+#ifndef SRC_PSYCHOV31_HUE_REFERENCE_HLSL
+#define SRC_PSYCHOV31_HUE_REFERENCE_HLSL
 
 // Kept apart from "PsychoV31.hlsl" so its other consumers don't pull in the MacLeod-Boynton model (its static initializers alone
 // perturb fxc's code generation). Include this after the game's "Common.hlsl".
@@ -26,4 +26,4 @@ float3 PsychoVDisplayMapWithHueReference(float3 color, float contrast, float sat
    return PsychoVDisplayMap(color, contrast, saturation, highlightsDesaturation, renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
 }
 
-#endif // LUMA_PSYCHOV31_HUE_REFERENCE_HLSL
+#endif // SRC_PSYCHOV31_HUE_REFERENCE_HLSL

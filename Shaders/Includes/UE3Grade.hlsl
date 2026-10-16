@@ -20,7 +20,7 @@ float PowUE3(float base, float exponent)
 // out. `clampSDR` false = the extended grade: max(0) instead of each saturate, keeping the real channel ratio.
 // `shadowsAndDesat` .xyz = shadows, .w = desaturation; `outputScale` is normally GammaColorScaleAndInverse.xyz and
 // `inverseGamma` its .w.
-float3 UE3Grade(float3 scene, bool clampSDR, float3 outputScale, float4 shadowsAndDesat, float3 inverseHighLights, float3 midTones, float3 luminanceWeights, float3 overlayColor, float inverseGamma)
+float3 UE3Grade(float3 scene, bool clampSDR, float3 outputScale, float4 shadowsAndDesat, float3 inverseHighLights, float3 midTones, float3 lumaWeights, float3 overlayColor, float inverseGamma)
 {
    // Head: shadows -> scale -> midtones.
    float3 c = scene - shadowsAndDesat.xyz;
@@ -29,7 +29,7 @@ float3 UE3Grade(float3 scene, bool clampSDR, float3 outputScale, float4 shadowsA
    c = PowUE3(c, midTones);
 
    // Tail: desat + tint + output scale + display encode.
-   const float desat = dot(c, luminanceWeights);
+   const float desat = dot(c, lumaWeights);
    c = c * shadowsAndDesat.www + overlayColor;
    c = c + desat;
    c = c * outputScale;

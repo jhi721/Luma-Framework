@@ -36,5 +36,5 @@ void P5S_DitherOutput(inout float3 color, float2 uv)
 {
    if (TONEMAP_TYPE < 1 || LumaSettings.GameSettings.Dithering <= 0.5)
       return;
-   ApplyOutputDithering(color, uv, false, LumaSettings.DisplayMode != 0, max(LumaSettings.UIPaperWhiteNits, 1.0));
+   ApplyOutputDithering(color, uv, false, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
 }

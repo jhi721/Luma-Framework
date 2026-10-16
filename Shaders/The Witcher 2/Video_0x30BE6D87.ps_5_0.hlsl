@@ -24,21 +24,8 @@ SamplerState s0_s : register(s0);
 SamplerState s1_s : register(s1);
 SamplerState s2_s : register(s2);
 
-void main(
-    float4 v0 : SV_POSITION0,
-    float4 v1 : TEXCOORD8,
-    float4 v2 : COLOR0,
-    float4 v3 : COLOR1,
-    float4 v4 : TEXCOORD9,
-    float4 v5 : TEXCOORD0, // movie UV (only .xy used)
-    float4 v6 : TEXCOORD1,
-    float4 v7 : TEXCOORD2,
-    float4 v8 : TEXCOORD3,
-    float4 v9 : TEXCOORD4,
-    float4 v10 : TEXCOORD5,
-    float4 v11 : TEXCOORD6,
-    float4 v12 : TEXCOORD7,
-    out float4 o0 : SV_TARGET0)
+// v5.xy: the movie UV
+void main(DGV_MAIN_SIGNATURE)
 {
    // --- border fade / content crop (verbatim): full weight inside the 1280x720 content, hard ramp at edges ---
    float fade = saturate(700.0 * (0.703125 - v5.y)) * saturate(700.0 * (0.625 - v5.x)) * saturate(700.0 * v5.x) * saturate(700.0 * v5.y);
@@ -61,15 +48,8 @@ void main(
    // --- restore vanilla 8-bit clamp, then light AutoHDR ---
    o0.rgb = saturate(o0.rgb);
    float3 lin = gamma_to_linear(o0.rgb);
-   // Light AutoHDR (VideoAutoHDREnable 0 = flat SDR at paper white). The 250-nit peak stays low on purpose: the movies
-   // are low-bitrate, and a higher peak amplifies block/compression artifacts in highlights. PumboAutoHDR self-noops
-   // in SDR (peak == paper white).
-   if (LumaSettings.GameSettings.VideoAutoHDREnable > 0.5)
-   {
-      // boost 0 = peak at paper white -> PumboAutoHDR no-ops (off); 1 = the full 250 nits.
-      const float peakNits = lerp(sRGB_WhiteLevelNits, 250.0, saturate(LumaSettings.GameSettings.VideoAutoHDRBoost));
-      lin = PumboAutoHDR(lin, peakNits, LumaSettings.GamePaperWhiteNits);
-   }
+   // Light AutoHDR (VideoAutoHDREnable 0 = flat SDR at paper white). PumboAutoHDR self-noops in SDR (peak == paper white).
+   lin = VideoAutoHDR(lin, LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
    // Match the final grade's linear pre-scale: land movies at the same brightness as in-game after the
    // composition's UIPaperWhite rescale (when UIPaperWhite != GamePaperWhite).
    lin *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);

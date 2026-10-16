@@ -1,13 +1,8 @@
 // SMAA predication signal from the scene depth (D32S8, reversed-Z with near at 1 and the sky at 0), taken from the camera velocity
 // pass. This is Saints Row: The Third Remastered's "Luma_SRTTR_SMAAPredication.hlsl" with the depth reversed, see there for the method.
-// It measures the deviation from the local tangent plane, a slope-adjusted second difference with a depth-proportional tolerance (as
-// "XeGTAO_CalculateEdges").
-//
-// Depth: the projection gives d = near / z minus a far term of ~1e-5, so 1 / d is about proportional to linear view depth, and the
-// relative tolerance cancels the unknown near plane. Sky clamps at 2^-24.
-//
-// Output is edge-ness in [0,1] against the LEFT and TOP neighbours only (SMAA compares centre-vs-left and centre-vs-top), so
-// SMAA_PREDICATION_THRESHOLD is 0.5.
+// Depth: the projection gives d = near / z minus a far term of ~1e-5, so 1 / d is about proportional to linear view depth.
+// Method and the SMAA_PREDICATION_THRESHOLD 0.5 contract: see "PlaneDeviationEdgeness" and "RelativeViewDepth" in
+// Includes/DepthEdges.hlsl.
 
 #include "../Includes/DepthEdges.hlsl"
 
