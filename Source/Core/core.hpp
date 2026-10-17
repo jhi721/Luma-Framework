@@ -403,6 +403,8 @@ namespace
    // Mutexes:
    // For "pipeline_cache_by_pipeline_handle", "pipeline_cache_by_pipeline_clone_handle", "pipeline_caches_by_shader_hash" and "cloned_pipeline_count"
    recursive_shared_mutex s_mutex_generic;
+   // Bumped (under "s_mutex_generic") whenever a pipeline leaves "pipeline_cache_by_pipeline_handle", invalidating the per-thread lookup cache in "OnBindPipeline()"
+   std::atomic<uint32_t> pipeline_cache_generation = 0;
    // For "shaders_to_dump", "dumped_shaders", "dumped_shaders_meta_paths", "shader_cache". In general for dumping shaders to disk (this almost always needs to be read and write locked together so there's no need for it to be a shared mutex)
    std::recursive_mutex s_mutex_dumping;
    // For "custom_shaders_cache", "pipelines_to_reload". In general for loading shaders from disk and compiling them
@@ -1006,8 +1008,16 @@ namespace
    thread_local reshade::api::format last_attempted_upgraded_resource_view_creation_view_format = reshade::api::format::unknown;
 
    bool trace_scheduled = false; // For next frame
-   bool trace_running = false; // For this frame
+   std::atomic<bool> trace_running = false; // For this frame. Atomic so hot paths can skip "s_mutex_trace" while no trace runs
    uint32_t trace_count = 0; // Not exactly necessary but... it might help
+
+   // Locks "s_mutex_trace" only while a trace runs, so untraced draws, binds and copies take no lock. Recheck "trace_running" under the returned lock, the trace might have ended in between.
+   std::shared_lock<std::shared_mutex> LockTraceIfRunning()
+   {
+      if (!trace_running)
+         return {};
+      return std::shared_lock(s_mutex_trace);
+   }
 
    uint64_t last_drawn_shader = SHADER_HASH_NONE; // Not exactly thread safe but it's fine...
 
@@ -3032,6 +3042,7 @@ namespace
             const std::unique_lock lock(s_mutex_generic); // Nobody should be accessing our device data at this point but who knows
             pipeline_cache_by_pipeline_handle = device_data.pipeline_cache_by_pipeline_handle;
             device_data.pipeline_cache_by_pipeline_handle.clear(); // Redundant but, let's do it anyway (change the mutex lock to shared if you change this)
+            pipeline_cache_generation++;
          }
          for (auto& pipeline_pair : pipeline_cache_by_pipeline_handle)
          {
@@ -4824,6 +4835,7 @@ namespace
             }
 
             device_data.pipeline_cache_by_pipeline_handle.erase(pipeline_cache_pair);
+            pipeline_cache_generation++;
          }
 
 #if DEVELOPMENT
@@ -4869,26 +4881,52 @@ namespace
 
       if (pipeline.handle != 0)
       {
-         const DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
-         const std::shared_lock lock(s_mutex_generic);
-         auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle);
-         if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end())
+         // Direct-mapped per-thread cache of the lookup below, so binds (every VS/PS/CS set) skip "s_mutex_generic". A handle can only be reused after its pipeline is destroyed,
+         // which bumps the generation and flushes every thread's cache, so a hit never returns a stale pipeline. Colliding handles fall back to the locked lookup.
+         struct BindCacheEntry
          {
-            ASSERT_ONCE(pipeline_pair->second != nullptr); // Shouldn't usually happen but if it did, it's supported anyway and innocuous
-            cached_pipeline = pipeline_pair->second; // This is guaranteed to not be destroyed while it's bound
+            uint64_t pipeline_handle = 0;
+            const Shader::CachedPipeline* cached_pipeline = nullptr;
+         };
+         static thread_local std::array<BindCacheEntry, 256> bind_cache = {};
+         static thread_local uint32_t bind_cache_generation = 0;
+         if (const uint32_t generation = pipeline_cache_generation; bind_cache_generation != generation)
+         {
+            bind_cache = {};
+            bind_cache_generation = generation;
+         }
+         BindCacheEntry& bind_cache_entry = bind_cache[(pipeline.handle >> 4) % bind_cache.size()]; // Native objects are at least 16 byte aligned
+         if (bind_cache_entry.pipeline_handle == pipeline.handle)
+         {
+            cached_pipeline = bind_cache_entry.cached_pipeline;
          }
          else
          {
-#if ENABLE_GAME_PIPELINE_STATE_READBACK // Allow either game engines or other mods between the game and ReShade to read back states we had changed
-            // "Deus Ex: Human Revolution" with the golden filter restoration mod sets back customized shaders to the pipeline,
-            // as it also read back the state of DX etc, so make sure to search it from the cloned shaders list too!
-            auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_clone_handle.find(pipeline.handle);
-            if (pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_clone_handle.end())
+            const DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+            const std::shared_lock lock(s_mutex_generic);
+            auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle);
+            if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end())
             {
-               cached_pipeline = pipeline_pair_2->second;
+               ASSERT_ONCE(pipeline_pair->second != nullptr); // Shouldn't usually happen but if it did, it's supported anyway and innocuous
+               cached_pipeline = pipeline_pair->second; // This is guaranteed to not be destroyed while it's bound
+               if (cached_pipeline != nullptr)
+               {
+                  bind_cache_entry = {.pipeline_handle = pipeline.handle, .cached_pipeline = cached_pipeline};
+               }
             }
+            else
+            {
+#if ENABLE_GAME_PIPELINE_STATE_READBACK // Allow either game engines or other mods between the game and ReShade to read back states we had changed
+               // "Deus Ex: Human Revolution" with the golden filter restoration mod sets back customized shaders to the pipeline,
+               // as it also read back the state of DX etc, so make sure to search it from the cloned shaders list too!
+               auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_clone_handle.find(pipeline.handle);
+               if (pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_clone_handle.end())
+               {
+                  cached_pipeline = pipeline_pair_2->second;
+               }
 #endif
-            ASSERT_ONCE(cached_pipeline != nullptr); // Why can't we find the shader?
+               ASSERT_ONCE(cached_pipeline != nullptr); // Why can't we find the shader?
+            }
          }
 
          if (cached_pipeline != nullptr)
@@ -5189,8 +5227,8 @@ namespace
       }
 
 #if DEVELOPMENT // Note: we only print the supported ones!
-      const std::shared_lock lock_trace(s_mutex_trace);
-      if (trace_running)
+      const auto lock_trace = LockTraceIfRunning();
+      if (lock_trace && trace_running)
       {
          CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
          const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -5655,8 +5693,8 @@ namespace
 
       cmd_list_data.temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 
-      const std::shared_lock lock_trace(s_mutex_trace);
-      if (trace_running)
+      const auto lock_trace = LockTraceIfRunning();
+      if (lock_trace && trace_running)
       {
          const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
          TraceDrawCallData trace_draw_call_data;
@@ -5674,8 +5712,8 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
 
-      const std::shared_lock lock_trace(s_mutex_trace);
-      if (trace_running)
+      const auto lock_trace = LockTraceIfRunning();
+      if (lock_trace && trace_running)
       {
          CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
          const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -5755,8 +5793,8 @@ namespace
       }
       secondary_cmd_list_data.requires_join = false;
 
-      const std::shared_lock lock_trace(s_mutex_trace);
-      if (trace_running)
+      const auto lock_trace = LockTraceIfRunning();
+      if (lock_trace && trace_running)
       {
          const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
          TraceDrawCallData trace_draw_call_data;
@@ -6302,8 +6340,8 @@ namespace
 
 #if DEVELOPMENT
             {
-               const std::shared_lock lock_trace(s_mutex_trace);
-               if (trace_running)
+               const auto lock_trace = LockTraceIfRunning();
+               if (lock_trace && trace_running)
                {
                   const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
                   TraceDrawCallData trace_draw_call_data;
@@ -6426,8 +6464,8 @@ namespace
 
 #if DEVELOPMENT
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
          {
             CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -6797,8 +6835,8 @@ namespace
 
       {
          // Do this before any custom code runs as the state might change
-         const std::shared_lock lock_trace(s_mutex_trace); // TODO: it's not safe to lock global mutexes that might have already been locked by other concurrent functions, while also calling functions in the device or primary device context (in DX11) (because they have their own locks inside that might cause deadlocks!). The solution here would be to cache the data upfront and then lock a mutex to add it to our array. This might be safe if the game threading was already safe though, I'm not 100% sure.
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning(); // TODO: it's not safe to lock global mutexes that might have already been locked by other concurrent functions, while also calling functions in the device or primary device context (in DX11) (because they have their own locks inside that might cause deadlocks!). The solution here would be to cache the data upfront and then lock a mutex to add it to our array. This might be safe if the game threading was already safe though, I'm not 100% sure.
+         if (lock_trace && trace_running)
          {
             const std::shared_lock lock_generic(s_mutex_generic);
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -6862,8 +6900,8 @@ namespace
                   do_ui = true;
 
 #if DEVELOPMENT
-                  const std::shared_lock lock_trace(s_mutex_trace);
-                  if (trace_running)
+                  const auto lock_trace = LockTraceIfRunning();
+                  if (lock_trace && trace_running)
                   {
                      const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
                      AddCustomTraceDrawCallData(cmd_list_data.trace_draw_calls_data, native_device_context, "Redirect UI", rtv.get(), true);
@@ -7422,8 +7460,8 @@ namespace
          // (the game's calls ran in the callback above), even when the draw was
          // cancelled/replaced.
          {
-            const std::shared_lock lock_trace(s_mutex_trace);
-            if (trace_running)
+            const auto lock_trace = LockTraceIfRunning();
+            if (lock_trace && trace_running)
             {
                const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
                for (size_t i = trace_start_index; i < cmd_list_data.trace_draw_calls_data.size(); ++i)
@@ -7814,8 +7852,8 @@ namespace
 #if DEVELOPMENT
 #if 0 // TODO: We should do this manually when replacing each draw call, we don't know if it was replaced or cancelled here
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (cancelled_or_replaced && trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (cancelled_or_replaced && lock_trace && trace_running)
          {
             const std::shared_lock lock_generic(s_mutex_generic);
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9332,8 +9370,8 @@ namespace
             ID3D11Buffer* buffer = reinterpret_cast<ID3D11Buffer*>(buffer_range.buffer.handle);
 
 #if DEVELOPMENT
-            const std::shared_lock lock_trace(s_mutex_trace);
-            if (trace_running)
+            const auto lock_trace = LockTraceIfRunning();
+            if (lock_trace && trace_running)
             {
                CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
                const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9484,8 +9522,8 @@ namespace
       DeviceData& device_data = *device->get_private_data<DeviceData>();
 
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
          {
             auto& cmd_list_data = *device_data.primary_command_list_data;
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9512,8 +9550,8 @@ namespace
       DeviceData& device_data = *device->get_private_data<DeviceData>();
 
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
          {
             auto& cmd_list_data = cmd_list ? *cmd_list->get_private_data<CommandListData>() : *device_data.primary_command_list_data;
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9555,8 +9593,8 @@ namespace
 
 #if DEVELOPMENT
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
          {
             auto& cmd_list_data = *device_data.primary_command_list_data;
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9694,8 +9732,8 @@ namespace
 
 #if DEVELOPMENT
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
          {
             auto& cmd_list_data = *device_data.primary_command_list_data;
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9779,8 +9817,8 @@ namespace
 
 #if DEVELOPMENT
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running && dsv.handle != 0)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running && dsv.handle != 0)
          {
             CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9818,8 +9856,8 @@ namespace
 
 #if DEVELOPMENT
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running && rtv.handle != 0)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running && rtv.handle != 0)
          {
             CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9859,8 +9897,8 @@ namespace
 
 #if DEVELOPMENT
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
          {
             CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -9912,8 +9950,8 @@ namespace
 
 #if DEVELOPMENT
       {
-         const std::shared_lock lock_trace(s_mutex_trace);
-         if (trace_running)
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
          {
             CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
             const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -10278,8 +10316,8 @@ namespace
 
 #if DEVELOPMENT
                {
-                  const std::shared_lock lock_trace(s_mutex_trace);
-                  if (trace_running)
+                  const auto lock_trace = LockTraceIfRunning();
+                  if (lock_trace && trace_running)
                   {
                      const std::shared_lock lock_generic(s_mutex_generic);
                      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
