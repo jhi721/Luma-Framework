@@ -955,10 +955,10 @@ int main(int argc, char** argv)
    SetUnhandledExceptionFilter(&CrashReport);
    StartWatchdog(8000);
    if (argc < 2)
-      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [bench=N] [work=MS]\n"), 2;
+      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [ex] [bench=N] [work=MS]\n"), 2;
    UINT frames = 6, bench_draws = 0;
    double work_ms = 0;
-   bool reset = false, redevice = false, thread = false, constants = false;
+   bool reset = false, redevice = false, thread = false, constants = false, ex = false;
    for (int i = 2; i < argc; i++)
    {
       constants |= !strcmp(argv[i], "constants");
@@ -968,6 +968,7 @@ int main(int argc, char** argv)
       reset |= !strcmp(argv[i], "reset");
       redevice |= !strcmp(argv[i], "redevice");
       thread |= !strcmp(argv[i], "thread");
+      ex |= !strcmp(argv[i], "ex"); // A D3D9Ex game's path (Bayonetta): Direct3DCreate9Ex and CreateDeviceEx
    }
    // "import": d3d9.dll resolved by the loader from the exe's folder, as a game's import does (dgVoodoo behind the
    // proxy recurses into itself when the proxy is loaded by path instead).
@@ -977,7 +978,16 @@ int main(int argc, char** argv)
                                               : nullptr);
    if (constants && !Vc4Check::Install())
       return printf("FAIL constants: no D3D11CreateDevice to hook\n"), 1;
-   IDirect3D9* d3d = create9 ? create9(D3D_SDK_VERSION) : nullptr;
+   IDirect3D9Ex* d3d_ex = nullptr;
+   if (ex)
+   {
+      auto create9ex = (!strcmp(argv[1], "import") ? &Direct3DCreate9Ex
+                        : d3d9                     ? (HRESULT(WINAPI*)(UINT, IDirect3D9Ex**))GetProcAddress(d3d9, "Direct3DCreate9Ex")
+                                                   : nullptr);
+      if (!create9ex || FAILED(create9ex(D3D_SDK_VERSION, &d3d_ex)))
+         return printf("FAIL Direct3DCreate9Ex (%s)\n", argv[1]), 1;
+   }
+   IDirect3D9* d3d = (ex ? d3d_ex : (create9 ? create9(D3D_SDK_VERSION) : nullptr));
    if (!d3d)
       return printf("FAIL Direct3DCreate9 (%s)\n", argv[1]), 1;
    WNDCLASSA wc = {.lpfnWndProc = DefWindowProcA, .hInstance = GetModuleHandleA(nullptr), .lpszClassName = "d3d9csmt"};
@@ -997,8 +1007,9 @@ int main(int argc, char** argv)
    {
       IDirect3DDevice9* device = nullptr;
       // MULTITHREADED as UE3 asks: the second thread needs it without the CSMT layer.
-      HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
-         D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED | D3DCREATE_FPU_PRESERVE, &pp, &device);
+      constexpr DWORD behavior = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED | D3DCREATE_FPU_PRESERVE;
+      HRESULT hr = (ex ? d3d_ex->CreateDeviceEx(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd, behavior, &pp, nullptr, (IDirect3DDevice9Ex**)&device)
+                       : d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd, behavior, &pp, &device));
       if (FAILED(hr))
          return printf("FAIL CreateDevice 0x%08lX\n", hr), 1;
       Scene scene;

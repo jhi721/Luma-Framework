@@ -70,6 +70,9 @@ $runs = @(
     @{ Name = "reset"; Args = @("frames=8", "reset") },
     @{ Name = "redevice"; Args = @("frames=4", "redevice") },
     @{ Name = "thread"; Args = @("frames=12", "thread") },
+    # A D3D9Ex game (Bayonetta): its own Direct3DCreate9Ex and CreateDeviceEx reach the layer
+    @{ Name = "ex"; Args = @("frames=8", "ex") },
+    @{ Name = "ex_reset"; Args = @("frames=8", "reset", "ex") },
     # dgVoodoo's uploaded vertex constants against the proxy's mirror at every D3D11 draw (Luma reads the mirror)
     @{ Name = "constants"; Args = @("frames=8", "constants") }
 )

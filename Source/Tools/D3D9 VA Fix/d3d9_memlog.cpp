@@ -46,12 +46,11 @@
 #include <vector>
 #include <windows.h>
 
-// Everything but Direct3DCreate9 goes straight to the real D3D9 (the loader
-// resolves d3d9_chain.dll from the exe's folder).
+// Everything but Direct3DCreate9 and Direct3DCreate9Ex goes straight to the real
+// D3D9 (the loader resolves d3d9_chain.dll from the exe's folder).
 #pragma comment(linker, "/EXPORT:Direct3DCreate9=_ProxyDirect3DCreate9@4")
+#pragma comment(linker, "/EXPORT:Direct3DCreate9Ex=_ProxyDirect3DCreate9Ex@8")
 #pragma comment(linker, "/EXPORT:LumaGetVertexConstants=_LumaGetVertexConstants@0")
-#pragma comment(linker, \
-   "/EXPORT:Direct3DCreate9Ex=d3d9_chain.Direct3DCreate9Ex")
 #pragma comment(linker, \
    "/EXPORT:D3DPERF_BeginEvent=d3d9_chain.D3DPERF_BeginEvent")
 #pragma comment(linker, "/EXPORT:D3DPERF_EndEvent=d3d9_chain.D3DPERF_EndEvent")
@@ -85,8 +84,9 @@ namespace
       17;                        // IDirect3DTexture9, IDirect3DCubeTexture9
    constexpr int SLOT_LOCK = 19; // LockRect (2D, cube), LockBox (volume)
    constexpr int SLOT_UNLOCK = 20;
-   constexpr int SLOT_CREATE_DEVICE = 16; // IDirect3D9
-   constexpr int SLOT_RESET = 16;         // IDirect3DDevice9
+   constexpr int SLOT_CREATE_DEVICE = 16;    // IDirect3D9
+   constexpr int SLOT_CREATE_DEVICE_EX = 20; // IDirect3D9Ex
+   constexpr int SLOT_RESET = 16;            // IDirect3DDevice9
    constexpr int SLOT_CREATE_TEXTURE = 23;
    constexpr int SLOT_CREATE_VOLUME_TEXTURE = 24;
    constexpr int SLOT_CREATE_CUBE_TEXTURE = 25;
@@ -1810,49 +1810,11 @@ namespace
       return accepted;
    }
 
-   HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* self, UINT adapter,
-      D3DDEVTYPE type, HWND window,
-      DWORD behavior,
-      D3DPRESENT_PARAMETERS* params,
-      IDirect3DDevice9** device)
+   // The device's hooks and the CSMT layer, after CreateDevice or CreateDeviceEx ("ex_device": a D3D9Ex device the VA fix
+   // applies to)
+   HRESULT OnDeviceCreated(HRESULT hr, IDirect3DDevice9** device, bool ex_device, bool csmt, DWORD behavior,
+      const D3DPRESENT_PARAMETERS* params)
    {
-      // CSMT runs only on dgVoodoo: on a native runtime NVIDIA's D3D9 driver hung
-      // when work recorded on the worker was waited for from the game thread (a
-      // query's GetData, a managed texture's UnlockRect), with or without
-      // MULTITHREADED, and the driver already threads its own work there. Under
-      // MULTITHREADED dgVoodoo takes its own critical section in every call; with
-      // CSMT only one thread calls it at a time, so the flag only costs.
-      const bool csmt = g_csmt_requested && ChainIsDgVoodoo();
-      if (g_strip_multithreaded || csmt)
-      {
-         behavior &= ~D3DCREATE_MULTITHREADED;
-      }
-      HRESULT hr = E_FAIL;
-      bool ex_device = false;
-      if (IDirect3D9Ex* ex = nullptr;
-         g_fix_requested && params &&
-         SUCCEEDED(self->QueryInterface(IID_IDirect3D9Ex, (void**)&ex)))
-      {
-         D3DDISPLAYMODEEX mode = {.Size = sizeof(mode),
-            .Width = params->BackBufferWidth,
-            .Height = params->BackBufferHeight,
-            .RefreshRate = params->FullScreen_RefreshRateInHz,
-            .Format = params->BackBufferFormat,
-            .ScanLineOrdering =
-               D3DSCANLINEORDERING_PROGRESSIVE};
-         hr = ex->CreateDeviceEx(adapter, type, window, behavior, params,
-            params->Windowed ? nullptr : &mode,
-            (IDirect3DDevice9Ex**)device);
-         ex->Release();
-         ex_device = SUCCEEDED(hr);
-         fprintf(g_log, "VA fix: CreateDeviceEx -> 0x%08lX%s\n", hr,
-            ex_device ? "" : ", falling back to CreateDevice (fix off)");
-      }
-      if (!ex_device)
-      {
-         hr = Original<decltype(&HookCreateDevice)>(self, SLOT_CREATE_DEVICE)(
-            self, adapter, type, window, behavior, params, device);
-      }
       fprintf(g_log, "CreateDevice behavior 0x%08lX %ux%u windowed %d -> 0x%08lX\n",
          behavior, params ? params->BackBufferWidth : 0,
          params ? params->BackBufferHeight : 0, params ? params->Windowed : -1,
@@ -1899,6 +1861,69 @@ namespace
       return hr;
    }
 
+   HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* self, UINT adapter,
+      D3DDEVTYPE type, HWND window,
+      DWORD behavior,
+      D3DPRESENT_PARAMETERS* params,
+      IDirect3DDevice9** device)
+   {
+      // CSMT runs only on dgVoodoo: on a native runtime NVIDIA's D3D9 driver hung
+      // when work recorded on the worker was waited for from the game thread (a
+      // query's GetData, a managed texture's UnlockRect), with or without
+      // MULTITHREADED, and the driver already threads its own work there. Under
+      // MULTITHREADED dgVoodoo takes its own critical section in every call; with
+      // CSMT only one thread calls it at a time, so the flag only costs.
+      const bool csmt = g_csmt_requested && ChainIsDgVoodoo();
+      if (g_strip_multithreaded || csmt)
+      {
+         behavior &= ~D3DCREATE_MULTITHREADED;
+      }
+      HRESULT hr = E_FAIL;
+      bool ex_device = false;
+      if (IDirect3D9Ex* ex = nullptr;
+         g_fix_requested && params &&
+         SUCCEEDED(self->QueryInterface(IID_IDirect3D9Ex, (void**)&ex)))
+      {
+         D3DDISPLAYMODEEX mode = {.Size = sizeof(mode),
+            .Width = params->BackBufferWidth,
+            .Height = params->BackBufferHeight,
+            .RefreshRate = params->FullScreen_RefreshRateInHz,
+            .Format = params->BackBufferFormat,
+            .ScanLineOrdering =
+               D3DSCANLINEORDERING_PROGRESSIVE};
+         // Below our CreateDeviceEx hook (a Direct3DCreate9Ex object has one): this device is set up once, here
+         using CreateDeviceExFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD,
+            D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9Ex**);
+         hr = Original<CreateDeviceExFn>(ex, SLOT_CREATE_DEVICE_EX)(ex, adapter, type, window, behavior, params,
+            params->Windowed ? nullptr : &mode, (IDirect3DDevice9Ex**)device);
+         ex->Release();
+         ex_device = SUCCEEDED(hr);
+         fprintf(g_log, "VA fix: CreateDeviceEx -> 0x%08lX%s\n", hr,
+            ex_device ? "" : ", falling back to CreateDevice (fix off)");
+      }
+      if (!ex_device)
+      {
+         hr = Original<decltype(&HookCreateDevice)>(self, SLOT_CREATE_DEVICE)(
+            self, adapter, type, window, behavior, params, device);
+      }
+      return OnDeviceCreated(hr, device, ex_device, csmt, behavior, params);
+   }
+
+   // A D3D9Ex game's device (Bayonetta): set up as CreateDevice's, the VA fix applying when requested
+   HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(IDirect3D9Ex* self, UINT adapter, D3DDEVTYPE type, HWND window, DWORD behavior,
+      D3DPRESENT_PARAMETERS* params, D3DDISPLAYMODEEX* mode, IDirect3DDevice9Ex** device)
+   {
+      const bool csmt = g_csmt_requested && ChainIsDgVoodoo();
+      if (g_strip_multithreaded || csmt)
+      {
+         behavior &= ~D3DCREATE_MULTITHREADED;
+      }
+      const HRESULT hr = Original<decltype(&HookCreateDeviceEx)>(self, SLOT_CREATE_DEVICE_EX)(self, adapter, type, window, behavior,
+         params, mode, device);
+      fprintf(g_log, "CreateDeviceEx:\n");
+      return OnDeviceCreated(hr, (IDirect3DDevice9**)device, g_fix_requested, csmt, behavior, params);
+   }
+
    DWORD WINAPI ReportThread(void*)
    {
       char interval[16] = {};
@@ -1922,6 +1947,22 @@ extern "C" const VertexConstantMirror* WINAPI LumaGetVertexConstants()
 {
    return &Csmt::g_vertex_constants;
 }
+
+namespace
+{
+   void HookDirect3D(IDirect3D9* d3d, bool ex)
+   {
+      Patch(d3d, SLOT_CREATE_DEVICE, (void*)&HookCreateDevice);
+      if (ex)
+      {
+         Patch(d3d, SLOT_CREATE_DEVICE_EX, (void*)&HookCreateDeviceEx);
+      }
+      if (g_log_enabled)
+      {
+         static const HANDLE thread = CreateThread(nullptr, 0, ReportThread, nullptr, 0, nullptr);
+      }
+   }
+} // namespace
 
 extern "C" IDirect3D9* WINAPI ProxyDirect3DCreate9(UINT sdk_version)
 {
@@ -1950,14 +1991,25 @@ extern "C" IDirect3D9* WINAPI ProxyDirect3DCreate9(UINT sdk_version)
    fflush(g_log);
    if (d3d)
    {
-      Patch(d3d, SLOT_CREATE_DEVICE, (void*)&HookCreateDevice);
-      if (g_log_enabled)
-      {
-         static const HANDLE thread =
-            CreateThread(nullptr, 0, ReportThread, nullptr, 0, nullptr);
-      }
+      HookDirect3D(d3d, false);
    }
    return d3d;
+}
+
+// D3D9Ex games create their IDirect3D9Ex here: its CreateDevice and CreateDeviceEx are hooked as Direct3DCreate9's CreateDevice
+extern "C" HRESULT WINAPI ProxyDirect3DCreate9Ex(UINT sdk_version, IDirect3D9Ex** d3d)
+{
+   using CreateEx = HRESULT(WINAPI*)(UINT, IDirect3D9Ex**);
+   HMODULE chain = Chain();
+   auto create_ex = (chain ? (CreateEx)GetProcAddress(chain, "Direct3DCreate9Ex") : nullptr);
+   const HRESULT hr = (create_ex ? create_ex(sdk_version, d3d) : D3DERR_NOTAVAILABLE);
+   fprintf(g_log, "Direct3DCreate9Ex(%u) -> 0x%08lX\n", sdk_version, hr);
+   fflush(g_log);
+   if (SUCCEEDED(hr) && d3d && *d3d)
+   {
+      HookDirect3D(*d3d, true);
+   }
+   return hr;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
