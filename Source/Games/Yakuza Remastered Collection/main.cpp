@@ -16,6 +16,7 @@
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
+#include "..\..\Core\includes\dxbc.h"
 
 // The engine has no tone curve: materials write gamma-space `color * exposure` into an 8-bit scene RT whose UNORM clamp
 // is the only highlight limit (Y5R materials add their own curve, see "PatchY5MaterialToneCurve"). The whole post chain
@@ -911,7 +912,6 @@ public:
    // Every other Y5R pixel shader goes through "PatchY5MaterialToneCurve".
    std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
    {
-      constexpr uint32_t ret_token = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1);
       if (type != reshade::api::pipeline_subobject_type::pixel_shader || size % sizeof(uint32_t) != 0 || size < sizeof(uint32_t))
          return nullptr;
       if (!unorm_clamped_effect_pixel_shaders.contains(uint32_t(shader_hash)))
@@ -926,24 +926,7 @@ public:
          std::memcpy(new_code.get(), patched.data(), size);
          return new_code;
       }
-      if (reinterpret_cast<const uint32_t*>(code)[size / sizeof(uint32_t) - 1] != ret_token)
-         return nullptr;
-      // Encoded by hand rather than with ShaderPatching::GetSatInstruction, whose source operand uses the mask selection mode;
-      // fxc encodes sources as swizzles (checked on a patched container with fxc /dumpbin).
-      constexpr uint32_t operand_o0 = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_OUTPUT) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_1D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
-      constexpr uint32_t patch[] = {
-         ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(5) | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true),
-         operand_o0 | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) | D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL, 0,
-         operand_o0 | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | D3D10_SB_OPERAND_4_COMPONENT_NOSWIZZLE, 0};
-      static_assert(patch[0] == 0x05002036 && patch[1] == 0x001020F2 && patch[3] == 0x00102E46);
-      constexpr size_t patch_size = sizeof(patch);
-      const size_t ret_offset = size - sizeof(uint32_t);
-      auto new_code = std::make_unique<std::byte[]>(size + patch_size);
-      std::memcpy(new_code.get(), code, ret_offset);
-      std::memcpy(new_code.get() + ret_offset, patch, patch_size);
-      std::memcpy(new_code.get() + ret_offset + patch_size, code + ret_offset, sizeof(uint32_t));
-      size += patch_size;
-      return new_code;
+      return DXBC::ClampOutput0(code, &size);
    }
 
    void OnInit(bool async) override
@@ -951,7 +934,8 @@ public:
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
       Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
-         {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"gtao_skip_apply", &g_gtao_skip_apply}, {"hide_ui", &g_hide_ui}});
+         {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"gtao_skip_apply", &g_gtao_skip_apply}, { "hide_ui",
+            &g_hide_ui }});
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
          {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
