@@ -6438,6 +6438,22 @@ namespace
 
       game->OnPresent(native_device, device_data);
 
+#if DEVELOPMENT
+      // Luma passes the game drew at present (or outside its draw hooks) on this thread
+      {
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running && device_data.primary_command_list_data)
+         {
+            const std::unique_lock lock_trace_2(device_data.primary_command_list_data->mutex_trace);
+            MoveInjectedPassTraces(&device_data.primary_command_list_data->trace_draw_calls_data, device_data.primary_command_list.get());
+         }
+         else
+         {
+            MoveInjectedPassTraces(nullptr, nullptr);
+         }
+      }
+#endif
+
 #if 0 // TODO: this breaks games atm, need more restrictive checks
       // Invalidate indirect mirrors when the scale-relevant state changed this frame (render resolution or
       // SR selection). Mirrors are queued and freed at the start of the NEXT present, before any seed/chain
@@ -7490,6 +7506,12 @@ namespace
                   }
                   entry.patch_enabled = !shader_hash ? false : cmd_list_data.patch_clone_handles.contains(shader_hash);
                }
+               // Luma passes the game drew from its hook (SMAA, RCAS, bloom, SR), after the draw's own entries
+               MoveInjectedPassTraces(&cmd_list_data.trace_draw_calls_data, native_device_context);
+            }
+            else
+            {
+               MoveInjectedPassTraces(nullptr, native_device_context);
             }
          }
 #endif

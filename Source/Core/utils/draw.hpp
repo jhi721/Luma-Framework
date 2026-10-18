@@ -884,6 +884,51 @@ void AddCustomTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls
    else
       trace_draw_calls_data.push_back(trace_draw_call_data);
 }
+
+// Luma passes drawn by the Core helpers below, usually from a game's draw or present hook. They can't reach the trace state (declared
+// after this file), so they queue here and Core moves the queue into the frame trace after those hooks.
+// ponytail: queued every frame even without a trace (a push and an AddRef per pass); a pass drawn outside those hooks is moved at the
+// next hook on its thread, later than where it ran.
+struct InjectedPassTrace
+{
+   ID3D11DeviceContext* context = nullptr;
+   const char* name = nullptr;
+   com_ptr<ID3D11DeviceChild> target; // A view or a resource
+};
+thread_local std::vector<InjectedPassTrace> injected_pass_traces;
+
+void QueueInjectedPassTrace(ID3D11DeviceContext* context, const char* name, ID3D11DeviceChild* target)
+{
+   injected_pass_traces.push_back({.context = context, .name = name, .target = target});
+}
+
+// Moves the passes queued for "context" into "trace_draw_calls_data" (nullptr when no trace runs: they are dropped) and clears the queue.
+// Expects the trace mutexes to already be locked.
+void MoveInjectedPassTraces(std::vector<TraceDrawCallData>* trace_draw_calls_data, ID3D11DeviceContext* context)
+{
+   if (trace_draw_calls_data)
+   {
+      for (const InjectedPassTrace& pass : injected_pass_traces)
+      {
+         if (pass.context != context)
+            continue;
+         TraceDrawCallData& trace_draw_call_data = trace_draw_calls_data->emplace_back();
+         trace_draw_call_data.type = TraceDrawCallData::TraceDrawCallType::Custom;
+         trace_draw_call_data.command_list = context;
+         trace_draw_call_data.custom_name = pass.name;
+         // The target goes in the RTV fields, like "AddCustomTraceDrawCallData()"
+         if (com_ptr<ID3D11View> view; pass.target && SUCCEEDED(pass.target->QueryInterface(&view)))
+         {
+            GetResourceInfo(view.get(), trace_draw_call_data.rt_size[0], trace_draw_call_data.rt_format[0], &trace_draw_call_data.rt_type_name[0], &trace_draw_call_data.rt_hash[0]);
+         }
+         else if (com_ptr<ID3D11Resource> resource; pass.target && SUCCEEDED(pass.target->QueryInterface(&resource)))
+         {
+            GetResourceInfo(resource.get(), trace_draw_call_data.rt_size[0], trace_draw_call_data.rt_format[0], &trace_draw_call_data.rt_type_name[0], &trace_draw_call_data.rt_hash[0]);
+         }
+      }
+   }
+   injected_pass_traces.clear();
+}
 #endif
 
 // Fullscreen (full render target) pass. "second_target_resource_texture_view" (optional): a second target of the same size, for a pixel
@@ -1667,6 +1712,10 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    release_com_array(rtvs_original);
    release_com_array(ps_samplers_original);
    release_com_array(ps_srvs_original);
+
+#if DEVELOPMENT
+   QueueInjectedPassTrace(device_context, "Luma SMAA", rtv);
+#endif
 }
 
 #if ENABLE_RCAS
@@ -1713,6 +1762,10 @@ void DrawRCAS(ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D
       device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("RCAS PS"_h).get(), srv_source, rtv, size.x, size.y, false);
 
    draw_state_stack.Restore(device_context);
+
+#if DEVELOPMENT
+   QueueInjectedPassTrace(device_context, "Luma RCAS", rtv);
+#endif
 }
 #endif // ENABLE_RCAS
 
@@ -2115,6 +2168,9 @@ void DrawBloom(ID3D11Device* device, ID3D11DeviceContext* device_context, Device
    // Return the final bloom.
    *srv_bloom = srv_mips_y[0];
    (*srv_bloom)->AddRef();
+#if DEVELOPMENT
+   QueueInjectedPassTrace(device_context, "Luma Bloom", *srv_bloom);
+#endif
 
    // Restore.
    device_context->OMSetBlendState(blend_original.get(), blend_factor_original, sample_mask_original);
