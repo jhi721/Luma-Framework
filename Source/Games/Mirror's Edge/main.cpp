@@ -21,6 +21,7 @@
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
 #include "MotionVectorPatches.h"
 #include "..\..\Core\includes\patched_draws.h"
+#include "..\..\Core\includes\coverage_patch.h"
 
 // Mirror's Edge (2008, Steam) is x86 UE3 on D3D9: it runs through dgVoodoo (D3D9 -> D3D11), so every hash below is a dgVoodoo
 // 2.87.5 (ps_5_0) and 2.81.3 (ps_4_0, the Linux build) translation, mapped offline from the cooked RefShaderCache (NOTES.md).
@@ -52,7 +53,7 @@ static float g_rcas_sharpness = 0.f;
 // DEV tuning: predication from the scene alpha's linear depth, and its plane-deviation tolerance (Luma_ME_DepthExtract.hlsl)
 static bool g_smaa_predication = true;
 static float g_smaa_pred_tolerance = 0.02f;
-// HDR-weighted MSAA resolve (Luma_ME_MSAAResolve) in place of the game's, with the game's Anti-Aliasing on
+// HDR-weighted MSAA resolve (Core's "DrawMSAAResolve()") in place of the game's, with the game's Anti-Aliasing on
 static bool g_msaa_resolve_enable = true;
 #if DEVELOPMENT
 static bool g_msaa_resolve_average_depth = false; // The game's averaged depth in the resolved alpha, for halo A/B
@@ -179,7 +180,7 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
       UINT translation_offset = 0;
    };
    std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
-   // By "PixelShaderPatch" (the coverage one null for every shader without a masked material's clip, see "PatchPixelShaderCoverage")
+   // By "PixelShaderPatch" (the coverage one null for every shader without a masked material's clip, see "CoveragePatch::PatchPixelShader")
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> patched_pixel_shaders[size_t(PixelShaderPatch::COUNT)];
    // The motion vector target (sized like the scene; the alpha blending states blend it like their color, the others write it
    // unblended, see "OnCreateBlendState")
@@ -221,8 +222,10 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> mv_scene_srv; // The fill's view of it, kept while the scene is the same resource
    // The copy of the scene the first post pass reads (UE3 resolves the scene surface into a texture), null if it reads none. The
    // upscaler's output goes into both ("ME Copy Back PS"): a post pass that draws onto the scene and resolves it again would
-   // otherwise resolve the jittered scene (Borderlands 2's light shafts).
+   // otherwise resolve the jittered scene (Borderlands 2's light shafts). Found from the game's last CopyResource of the scene (dgVoodoo
+   // copies a whole surface with it): a texture matched by description can be another target's copy (Bayonetta's camera blur velocity).
    com_ptr<ID3D11Resource> mv_scene_copy;
+   com_ptr<ID3D11Resource> mv_scene_last_copy;
    com_ptr<ID3D11RenderTargetView> mv_scene_copy_rtv;
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    // The projection jitter (pixels, +y down), chosen when the scene opens; its NDC offset is at VS "MotionVectorPatches::jitter_slot"
@@ -837,340 +840,6 @@ class MirrorsEdge final : public Game
       return queried.get();
    }
 
-   // Alpha to coverage for the masked materials, whose clip(OpacityMask - OpacityMaskClipValue) dgVoodoo translates as
-   // "add rD, rS.c, l(-k, -k, -k, -k)" -> lt -> discard_nz (k 0.3333 or 0.25, baked per material; base and light passes alike). Their
-   // scene alpha is the linear depth, so the coverage goes out through oMask rather than A2C. Right after the add: the sharpened
-   // alpha c = saturate(d / fwidth(d) + 0.5) (Golus; the plain alpha would thin cut-outs out) and oMask = the first
-   // n = floor(c * samples + 0.5) samples. The clip's value is then replaced by n - 0.5, so only an empty mask discards and coverage
-   // ramps 0..1 across the vanilla edge (thin wires keep their weight). When something else reads that value the discard is left as
-   // it was ("inward only": c >= 0.5 where a pixel is kept, edges soften inward). The same mask in a material's base and light passes
-   // keeps the light off the samples the base pass left out. Empty, with "error", for any other shader (the light radius clips add to
-   // a negated source, dissolve clips to l(-1)).
-   static std::vector<uint8_t> PatchPixelShaderCoverage(const uint8_t* code, size_t size, std::string* error)
-   {
-      std::vector<DXBC::Chunk> chunks;
-      std::vector<DXBC::SignatureElement> outputs;
-      std::vector<uint32_t> tokens;
-      std::vector<DXBC::Instruction> instructions;
-      size_t first_body = 0;
-      DXBC::Chunk* program = nullptr;
-      DXBC::Chunk* output_signature = nullptr;
-      if (DXBC::ReadChunks(code, size, &chunks))
-      {
-         program = DXBC::FindChunk(&chunks, DXBC::FourCC("SHEX"), DXBC::FourCC("SHDR"));
-         output_signature = DXBC::FindChunk(&chunks, DXBC::FourCC("OSGN"));
-      }
-      if (!program || !output_signature || !DXBC::ReadSignature(output_signature->data, &outputs) || !DXBC::ReadProgram(*program, &tokens, &instructions, &first_body))
-      {
-         *error = "unreadable";
-         return {};
-      }
-      // sampleinfo and oMask are SM 4.1 (dgVoodoo 2.81.3's ps_4_0 has neither)
-      if (DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(tokens[0]) * 10 + DECODE_D3D10_SB_TOKENIZED_PROGRAM_MINOR_VERSION(tokens[0]) < 41)
-      {
-         *error = "no clip (below SM 4.1)";
-         return {};
-      }
-
-      // Flow control nesting: 1 opens a block, -1 closes one
-      const auto nesting = [](auto opcode)
-      {
-         switch (opcode)
-         {
-         case D3D10_SB_OPCODE_IF:
-         case D3D10_SB_OPCODE_LOOP:
-         case D3D10_SB_OPCODE_SWITCH:
-            return 1;
-         case D3D10_SB_OPCODE_ENDIF:
-         case D3D10_SB_OPCODE_ENDLOOP:
-         case D3D10_SB_OPCODE_ENDSWITCH:
-            return -1;
-         default:
-            return 0;
-         }
-      };
-      // The clip's add, outside flow control (the derivatives need all the quad's lanes): a temp destination, a temp source without a
-      // modifier and the threshold as a replicated immediate
-      size_t clip = SIZE_MAX;
-      uint32_t clip_register = 0;
-      uint32_t clip_component = 0;
-      uint32_t clip_mask = 0; // Operand token form (x = D3D10_SB_OPERAND_4_COMPONENT_MASK_X)
-      int depth = 0;
-      for (size_t i = first_body; i < instructions.size() && clip == SIZE_MAX; i++)
-      {
-         const DXBC::Instruction& instruction = instructions[i];
-         if (const int step = nesting(instruction.opcode); step != 0)
-         {
-            depth += step;
-            continue;
-         }
-         const uint32_t* const t = &tokens[instruction.begin];
-         if (depth != 0 || instruction.opcode != D3D10_SB_OPCODE_ADD || instruction.length != 10 || DECODE_IS_D3D10_SB_OPCODE_EXTENDED(t[0]))
-            continue;
-         // dgVoodoo's immediates carry an xyzw swizzle (0x00004E46), fxc's don't (0x00004002): the type and width only
-         if (DECODE_D3D10_SB_OPERAND_TYPE(t[1]) != D3D10_SB_OPERAND_TYPE_TEMP || DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(t[1]) != D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE || DECODE_D3D10_SB_OPERAND_TYPE(t[3]) != D3D10_SB_OPERAND_TYPE_TEMP || DECODE_IS_D3D10_SB_OPERAND_EXTENDED(t[3]) ||
-             DECODE_D3D10_SB_OPERAND_TYPE(t[5]) != D3D10_SB_OPERAND_TYPE_IMMEDIATE32 || DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(t[5]) != D3D10_SB_OPERAND_4_COMPONENT)
-            continue;
-         const float threshold = -std::bit_cast<float>(t[6]);
-         if (!(threshold > 0.f && threshold < 1.f) || t[7] != t[6] || t[8] != t[6] || t[9] != t[6])
-            continue;
-         clip = i;
-         clip_register = t[2];
-         clip_mask = DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(t[1]);
-         clip_component = std::countr_zero(clip_mask >> 4);
-      }
-      if (clip == SIZE_MAX)
-      {
-         *error = "no clip";
-         return {};
-      }
-      // The add must reach a discard's condition (data flow through temp components): other subtractions of a constant are no clip.
-      // "symmetric": nothing else reads what the clip computed (no output written from it before the discard, no read of it after),
-      // so the patch can replace it with the coverage's own test (see below).
-      bool symmetric = true;
-      {
-         // Components (bits xyzw) of each temp holding the clip's value or values computed from it
-         std::unordered_map<uint32_t, uint8_t> tainted = {{clip_register, uint8_t(clip_mask >> 4)}};
-         bool reaches = false;
-         depth = 0;
-         for (size_t i = clip + 1; i < instructions.size() && symmetric; i++)
-         {
-            const DXBC::Instruction& instruction = instructions[i];
-            depth += nesting(instruction.opcode);
-            // The first operand is the destination, except for these; two destinations (sincos, udiv...) aren't followed
-            bool has_destination = true;
-            bool two_destinations = false;
-            switch (instruction.opcode)
-            {
-            case D3D10_SB_OPCODE_IF:
-            case D3D10_SB_OPCODE_BREAKC:
-            case D3D10_SB_OPCODE_CONTINUEC:
-            case D3D10_SB_OPCODE_RETC:
-            case D3D10_SB_OPCODE_CALLC:
-            case D3D10_SB_OPCODE_DISCARD:
-            case D3D10_SB_OPCODE_SWITCH:
-            case D3D10_SB_OPCODE_CASE:
-               has_destination = false;
-               break;
-            case D3D10_SB_OPCODE_SINCOS:
-            case D3D10_SB_OPCODE_UDIV:
-            case D3D10_SB_OPCODE_UMUL:
-            case D3D10_SB_OPCODE_IMUL:
-            case D3D11_SB_OPCODE_SWAPC:
-            case D3D11_SB_OPCODE_UADDC:
-            case D3D11_SB_OPCODE_USUBB:
-               two_destinations = true;
-               break;
-            default:
-               break;
-            }
-            bool reads = false;
-            bool first_operand = true;
-            bool temp_destination = false;
-            uint32_t written_register = 0;
-            uint8_t written_mask = 0;
-            const bool walked = DXBC::WalkOperands(tokens, instruction, [&](size_t token_position, size_t index_position)
-               {
-                  const uint32_t token = tokens[token_position];
-                  const D3D10_SB_OPERAND_TYPE type = DECODE_D3D10_SB_OPERAND_TYPE(token);
-                  const auto mode = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(token);
-                  if (std::exchange(first_operand, false) && has_destination)
-                  {
-                     // Any destination's mask (outputs too, for the swizzle positions below); a 1 component one (oMask, oDepth) is x
-                     const bool masked = DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(token) == D3D10_SB_OPERAND_4_COMPONENT && mode == D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE;
-                     written_mask = (masked ? uint8_t(DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(token) >> 4) : uint8_t(0x1));
-                     temp_destination = type == D3D10_SB_OPERAND_TYPE_TEMP && index_position != DXBC::no_index && masked;
-                     if (temp_destination)
-                     {
-                        written_register = tokens[index_position];
-                     }
-                     return true;
-                  }
-                  if (type != D3D10_SB_OPERAND_TYPE_TEMP || index_position == DXBC::no_index)
-                     return true;
-                  const auto found = tainted.find(tokens[index_position]);
-                  if (found == tainted.end())
-                     return true;
-                  uint8_t components = 0;
-                  if (mode == D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE)
-                  {
-                     // The swizzle positions the instruction uses: the dot products' first 2 to 4, a component wise operation's
-                     // written ones, all of them otherwise (texture operations, no destination)
-                     uint8_t positions = 0xF;
-                     switch (instruction.opcode)
-                     {
-                     case D3D10_SB_OPCODE_DP2:
-                        positions = 0x3;
-                        break;
-                     case D3D10_SB_OPCODE_DP3:
-                        positions = 0x7;
-                        break;
-                     case D3D10_SB_OPCODE_DP4:
-                     case D3D10_SB_OPCODE_SAMPLE:
-                     case D3D10_SB_OPCODE_SAMPLE_L:
-                     case D3D10_SB_OPCODE_SAMPLE_D:
-                     case D3D10_SB_OPCODE_SAMPLE_B:
-                     case D3D10_SB_OPCODE_SAMPLE_C:
-                     case D3D10_SB_OPCODE_SAMPLE_C_LZ:
-                     case D3D10_SB_OPCODE_LD:
-                     case D3D10_SB_OPCODE_LD_MS:
-                     case D3D10_SB_OPCODE_RESINFO:
-                     case D3D10_1_SB_OPCODE_LOD:
-                     case D3D10_1_SB_OPCODE_GATHER4:
-                     case D3D10_1_SB_OPCODE_SAMPLE_POS:
-                     case D3D10_1_SB_OPCODE_SAMPLE_INFO:
-                     case D3D11_SB_OPCODE_GATHER4_C:
-                     case D3D11_SB_OPCODE_GATHER4_PO:
-                     case D3D11_SB_OPCODE_GATHER4_PO_C:
-                     case D3D11_SB_OPCODE_LD_UAV_TYPED:
-                     case D3D11_SB_OPCODE_LD_RAW:
-                     case D3D11_SB_OPCODE_LD_STRUCTURED:
-                     case D3D11_SB_OPCODE_BUFINFO:
-                        break;
-                     default:
-                        if (has_destination && !two_destinations)
-                        {
-                           positions = written_mask;
-                        }
-                        break;
-                     }
-                     for (uint32_t component = 0; component < 4; component++)
-                     {
-                        if (positions & (1u << component))
-                        {
-                           components |= uint8_t(1u << DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(token, component));
-                        }
-                     }
-                  }
-                  else if (mode == D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE)
-                  {
-                     components = uint8_t(1u << DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(token));
-                  }
-                  else
-                  {
-                     components = 0xF;
-                  }
-                  reads |= (found->second & components) != 0;
-                  return true; });
-            if (!walked)
-            {
-               symmetric = false;
-               break;
-            }
-            if (reaches)
-            {
-               // Read after the discard: the patch must keep the value
-               if (reads)
-               {
-                  symmetric = false;
-                  break;
-               }
-            }
-            else
-            {
-               if (instruction.opcode == D3D10_SB_OPCODE_DISCARD && reads)
-               {
-                  reaches = true;
-                  continue;
-               }
-               // Up to the discard the clip's value may flow through temps, not out of the shader
-               if (reads)
-               {
-                  if (two_destinations || !temp_destination)
-                  {
-                     symmetric = false;
-                     break;
-                  }
-                  tainted[written_register] |= written_mask;
-                  continue;
-               }
-            }
-            // Overwritten (only where it surely runs)
-            if (temp_destination && !two_destinations && depth == 0)
-            {
-               if (const auto found = tainted.find(written_register); found != tainted.end())
-               {
-                  found->second &= uint8_t(~written_mask);
-               }
-            }
-         }
-         // When the analysis stopped early, a discard after the clip still has to be there for the inward only coverage
-         if (!reaches && (symmetric || std::ranges::none_of(instructions.begin() + clip + 1, instructions.end(), [](const DXBC::Instruction& instruction)
-                                          { return instruction.opcode == D3D10_SB_OPCODE_DISCARD; })))
-         {
-            *error = "no clip (no discard on it)";
-            return {};
-         }
-      }
-      if (std::ranges::any_of(outputs, [](const DXBC::SignatureElement& element)
-             { return element.name == "SV_Coverage"; }))
-      {
-         *error = "writes oMask";
-         return {};
-      }
-      const size_t last_output = DXBC::FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPCODE_DCL_OUTPUT_SGV, D3D10_SB_OPCODE_DCL_OUTPUT_SIV});
-      if (last_output == first_body)
-      {
-         *error = "no outputs";
-         return {};
-      }
-
-      // dcl_output oMask, as fxc encodes it, after the other outputs
-      constexpr uint32_t omask = ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK);
-      uint32_t temp = 0;
-      std::vector<uint32_t> patched = DXBC::CopyDeclarations(tokens, instructions, first_body, 1, &temp, [&](size_t i)
-         { return i == last_output ? std::vector<uint32_t>{ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(2), omask} : std::vector<uint32_t>{}; });
-      constexpr uint32_t immediate_1 = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_1_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
-      constexpr uint32_t x_dst = DXBC::Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_X);
-      constexpr uint32_t y_dst = DXBC::Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y);
-      const uint32_t t_x = DXBC::Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 0, 0, 0);
-      const uint32_t t_y = DXBC::Source(D3D10_SB_OPERAND_TYPE_TEMP, 1, 1, 1, 1);
-      const uint32_t d = DXBC::Source(D3D10_SB_OPERAND_TYPE_TEMP, clip_component, clip_component, clip_component, clip_component);
-      constexpr uint32_t abs_modifier = ENCODE_D3D10_SB_EXTENDED_OPERAND_TYPE(D3D10_SB_EXTENDED_OPERAND_MODIFIER) | ENCODE_D3D10_SB_EXTENDED_OPERAND_MODIFIER(D3D10_SB_OPERAND_MODIFIER_ABS);
-      // sampleinfo's float form: the render target's sample count
-      constexpr uint32_t rasterizer_x = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_RASTERIZER) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE);
-      static_assert(omask == 0x0000F000 && rasterizer_x == 0x0000E00A); // fxc's "dcl_output oMask" and "sampleinfo r1.y, rasterizer.x"
-      const auto opcode = [](D3D10_SB_OPCODE_TYPE type, uint32_t length, bool saturate = false)
-      { return ENCODE_D3D10_SB_OPCODE_TYPE(type) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(length) | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(saturate); };
-      std::vector<uint32_t> coverage = {
-         // deriv_rtx t.x, d | deriv_rty t.y, d | add t.x, |t.x|, |t.y| | max t.x, t.x, l(0.0001)
-         opcode(D3D10_SB_OPCODE_DERIV_RTX, 5), x_dst, temp, d, clip_register,
-         opcode(D3D10_SB_OPCODE_DERIV_RTY, 5), y_dst, temp, d, clip_register,
-         opcode(D3D10_SB_OPCODE_ADD, 9), x_dst, temp, t_x | ENCODE_D3D10_SB_OPERAND_EXTENDED(1), abs_modifier, temp, t_y | ENCODE_D3D10_SB_OPERAND_EXTENDED(1), abs_modifier, temp,
-         opcode(D3D10_SB_OPCODE_MAX, 7), x_dst, temp, t_x, temp, immediate_1, std::bit_cast<uint32_t>(0.0001f),
-         // div t.x, d, t.x | add_sat t.x, t.x, l(0.5): the sharpened alpha
-         opcode(D3D10_SB_OPCODE_DIV, 7), x_dst, temp, d, clip_register, t_x, temp,
-         opcode(D3D10_SB_OPCODE_ADD, 7, true), x_dst, temp, t_x, temp, immediate_1, std::bit_cast<uint32_t>(0.5f),
-         // sampleinfo t.y, rasterizer.x | mad t.x, t.x, t.y, l(0.5) | ftou t.x, t.x: the covered sample count, rounded
-         opcode(D3D10_1_SB_OPCODE_SAMPLE_INFO, 4), y_dst, temp, rasterizer_x,
-         opcode(D3D10_SB_OPCODE_MAD, 9), x_dst, temp, t_x, temp, t_y, temp, immediate_1, std::bit_cast<uint32_t>(0.5f),
-         opcode(D3D10_SB_OPCODE_FTOU, 5), x_dst, temp, t_x, temp};
-      if (symmetric)
-      {
-         // utof t.y, t.x | add rD.mask, t.y, l(-0.5): the clip now discards only an empty mask, so coverage ramps 0..1 across the
-         // vanilla edge (the alpha test's line at half coverage) instead of 0.5..1 inside it
-         coverage.insert(coverage.end(), {opcode(D3D10_SB_OPCODE_UTOF, 5), y_dst, temp, t_x, temp,
-                                            opcode(D3D10_SB_OPCODE_ADD, 7), DXBC::Destination(D3D10_SB_OPERAND_TYPE_TEMP, clip_mask), clip_register, t_y, temp, immediate_1, std::bit_cast<uint32_t>(-0.5f)});
-      }
-      // ishl t.x, l(1), t.x | iadd oMask, t.x, l(-1)
-      coverage.insert(coverage.end(), {opcode(D3D10_SB_OPCODE_ISHL, 7), x_dst, temp, immediate_1, 1, t_x, temp,
-                                         opcode(D3D10_SB_OPCODE_IADD, 6), omask | ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_1_COMPONENT), t_x, temp, immediate_1, 0xFFFFFFFF});
-      for (size_t i = first_body; i < instructions.size(); i++)
-      {
-         patched.insert(patched.end(), tokens.begin() + instructions[i].begin, tokens.begin() + instructions[i].begin + instructions[i].length);
-         if (i == clip)
-         {
-            patched.insert(patched.end(), coverage.begin(), coverage.end());
-         }
-      }
-      DXBC::WriteProgram(&patched, program);
-      // fxc's element for it: uint, no register, x written
-      outputs.push_back({.name = "SV_Coverage", .semantic_index = 0, .system_value = 0, .component_type = 1, .reg = 0xFFFFFFFF, .mask = 0x1, .rw_mask = 0xE});
-      output_signature->data = DXBC::WriteSignature(outputs);
-      *error = (symmetric ? "" : "inward only (the clip's value is read elsewhere)");
-      return DXBC::WriteChunks(chunks);
-   }
-
    // The bound shader's patched version ("patch" for pixel shaders, see above), patched from Core's bytecode copy on first use (null if
    // it can't be, e.g. a vertex shader that doesn't place vertices with the view projection). The maps' nodes are never erased.
    template <typename T>
@@ -1226,7 +895,7 @@ class MirrorsEdge final : public Game
                   patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, &error);
                   break;
                case PixelShaderPatch::COVERAGE:
-                  patched = PatchPixelShaderCoverage(code, desc->code_size, &error);
+                  patched = CoveragePatch::PatchPixelShader(code, desc->code_size, &error);
                   break;
                }
             }
@@ -1348,6 +1017,7 @@ class MirrorsEdge final : public Game
       dsv->GetResource(&gd.mv_depth);
       gd.mv_scene_color.reset();
       gd.mv_scene_rtv.reset();
+      gd.mv_scene_last_copy.reset();
       gd.jitter_dsv = nullptr;
       gd.jitter_depth_stencil_state = nullptr;
       gd.jitter_depth_test = true;
@@ -2072,57 +1742,24 @@ class MirrorsEdge final : public Game
    }
 
    // The game's ResolveSubresource of the fp16 MSAA scene (three a frame, all into the texture the refraction and post passes read):
-   // Luma_ME_MSAAResolve instead. Anything else, or a pair we can't bind, keeps the hardware resolve.
+   // Core's weighted one instead. Anything else, or a pair it can't bind, keeps the hardware resolve.
    static bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
    {
       if (format != reshade::api::format::r16g16b16a16_float || source_subresource != 0 || dest_subresource != 0 || source_box != nullptr || dest_x != 0 || dest_y != 0 || dest_z != 0)
          return false;
-
-      com_ptr<ID3D11Texture2D> source_texture;
-      com_ptr<ID3D11Texture2D> dest_texture;
-      if (FAILED(reinterpret_cast<ID3D11Resource*>(source.handle)->QueryInterface(&source_texture)) || FAILED(reinterpret_cast<ID3D11Resource*>(dest.handle)->QueryInterface(&dest_texture)))
-         return false;
-      D3D11_TEXTURE2D_DESC source_desc;
-      source_texture->GetDesc(&source_desc);
-      if (source_desc.SampleDesc.Count <= 1)
-         return false;
       DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
       auto& gd = GetGameDeviceData(device_data);
-      // MSAA is on in the game, whatever the AA picked or the toggle (the settings, and the coverage draws' gate)
+      // MSAA is on in the game (a resolve source is always multisampled), whatever the AA picked or the toggle (the settings, and the
+      // coverage draws' gate)
       gd.msaa_resolved = true;
       if (!g_msaa_resolve_enable)
-         return false;
-      D3D11_TEXTURE2D_DESC dest_desc;
-      dest_texture->GetDesc(&dest_desc);
-      if (source_desc.ArraySize != 1 || dest_desc.ArraySize != 1 || (source_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 || (dest_desc.BindFlags & D3D11_BIND_RENDER_TARGET) == 0)
          return false;
 
       // Held through the draw so a shader reload can't release them mid-use
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-      auto* const resolve_ps = FindShader(device_data.native_pixel_shaders, g_msaa_resolve_average_depth ? CompileTimeStringHash("ME MSAA Resolve Average Depth PS") : CompileTimeStringHash("ME MSAA Resolve PS"));
-      if (!copy_vs || !resolve_ps)
+      const uint32_t resolve_ps = (g_msaa_resolve_average_depth ? CompileTimeStringHash("ME MSAA Resolve Average Depth PS") : CompileTimeStringHash("MSAA Resolve PS"));
+      if (!DrawMSAAResolve((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), device_data, reinterpret_cast<ID3D11Resource*>(source.handle), reinterpret_cast<ID3D11Resource*>(dest.handle), DXGI_FORMAT_R16G16B16A16_FLOAT, gd.srv_exposure.get(), nullptr, resolve_ps))
          return false;
-
-      ID3D11Device* native_device = (ID3D11Device*)(cmd_list->get_device()->get_native());
-      ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(cmd_list->get_native());
-
-      // ponytail: views are created per resolve (three a frame); cache them per resource if it ever shows in a profile
-      const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS};
-      const D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D};
-      com_ptr<ID3D11ShaderResourceView> source_srv;
-      com_ptr<ID3D11RenderTargetView> dest_rtv;
-      if (FAILED(native_device->CreateShaderResourceView(source_texture.get(), &srv_desc, &source_srv)) || FAILED(native_device->CreateRenderTargetView(dest_texture.get(), &rtv_desc, &dest_rtv)))
-         return false;
-
-      DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
-      draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
-      // The game resolves with the MSAA scene still bound for output, and D3D11 refuses it as a shader resource then
-      native_device_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
-      ID3D11ShaderResourceView* const exposure_srv = gd.srv_exposure.get();
-      native_device_context->PSSetShaderResources(1, 1, &exposure_srv);
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, resolve_ps, source_srv.get(), dest_rtv.get(), dest_desc.Width, dest_desc.Height);
-      draw_state_stack.Restore(native_device_context);
 #if DEVELOPMENT
       gd.mv_stats.msaa_resolves++;
 #endif
@@ -2158,31 +1795,13 @@ public:
 
    std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
    {
-      constexpr uint32_t ret_token = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_RET) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1);
-      if (type != reshade::api::pipeline_subobject_type::pixel_shader || size % sizeof(uint32_t) != 0 || size < sizeof(uint32_t))
+      if (type != reshade::api::pipeline_subobject_type::pixel_shader)
          return nullptr;
-      const bool saturate = ui_saturated_pixel_shaders.contains(uint32_t(shader_hash));
-      if (!saturate && !scene_floored_pixel_shaders.contains(uint32_t(shader_hash)))
-         return nullptr;
-      if (reinterpret_cast<const uint32_t*>(code)[size / sizeof(uint32_t) - 1] != ret_token)
-         return nullptr;
-      // As fxc encodes them (Yakuza Remastered Collection's mov_sat; the max checked on an fxc ps_4_0 compile)
-      constexpr uint32_t dst_o0 = DXBC::Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL);
-      constexpr uint32_t src_o0 = DXBC::Source(D3D10_SB_OPERAND_TYPE_OUTPUT, 0, 1, 2, 3);
-      constexpr uint32_t immediate_4 = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
-      // mov_sat o0.xyzw, o0.xyzw
-      constexpr uint32_t saturate_patch[] = {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(5) | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true), dst_o0, 0, src_o0, 0};
-      // max o0.xyzw, o0.xyzw, l(0, 0, 0, 0)
-      constexpr uint32_t floor_patch[] = {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MAX) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(10), dst_o0, 0, src_o0, 0, immediate_4, 0, 0, 0, 0};
-      static_assert(saturate_patch[0] == 0x05002036 && dst_o0 == 0x001020F2 && src_o0 == 0x00102E46 && floor_patch[0] == 0x0A000034 && immediate_4 == 0x00004002);
-      const std::span<const uint32_t> patch = (saturate ? std::span<const uint32_t>(saturate_patch) : std::span<const uint32_t>(floor_patch));
-      const size_t ret_offset = size - sizeof(uint32_t);
-      auto new_code = std::make_unique<std::byte[]>(size + patch.size_bytes());
-      std::memcpy(new_code.get(), code, ret_offset);
-      std::memcpy(new_code.get() + ret_offset, patch.data(), patch.size_bytes());
-      std::memcpy(new_code.get() + ret_offset + patch.size_bytes(), code + ret_offset, sizeof(uint32_t));
-      size += patch.size_bytes();
-      return new_code;
+      if (ui_saturated_pixel_shaders.contains(uint32_t(shader_hash)))
+         return DXBC::ClampOutput0(code, &size);
+      if (scene_floored_pixel_shaders.contains(uint32_t(shader_hash)))
+         return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::FLOOR);
+      return nullptr;
    }
 
    void OnInit(bool async) override
@@ -2212,12 +1831,15 @@ public:
          ShaderDefinition("Luma_ME_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("ME Copy Back PS"),
          ShaderDefinition("Luma_ME_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
-      native_shaders_definitions.emplace(CompileTimeStringHash("ME MSAA Resolve PS"),
-         ShaderDefinition("Luma_ME_MSAAResolve", reshade::api::pipeline_subobject_type::pixel_shader));
+      // The weighted MSAA resolve in TdToneMapping's exposure (1x1, exposure / 64, last frame's: the game builds this frame's after the
+      // resolves; unbound before the first tonemap). Alpha is the linear view depth (sky 65504) the post passes read (TdDirectionalHaze,
+      // DOF, bloom's sky exclusion): the nearest sample's, the game's average for the development A/B.
+      ShaderDefinition msaa_resolve{"Luma_MSAAResolve_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"MSAA_RESOLVE_EXPOSURE", "1"}, {"MSAA_RESOLVE_EXPOSURE_SCALE", "64.0"}}};
 #if DEVELOPMENT
-      native_shaders_definitions.emplace(CompileTimeStringHash("ME MSAA Resolve Average Depth PS"),
-         ShaderDefinition{"Luma_ME_MSAAResolve", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "main", { {"RESOLVE_AVERAGE_DEPTH", "1"} }});
+      native_shaders_definitions.emplace(CompileTimeStringHash("ME MSAA Resolve Average Depth PS"), msaa_resolve);
 #endif
+      msaa_resolve.defines_data.push_back({"MSAA_RESOLVE_ALPHA_MIN", "1"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("MSAA Resolve PS"), std::move(msaa_resolve));
       SetEvents(true);
 
 #if DEVELOPMENT
@@ -2289,6 +1911,16 @@ public:
       Game::OnDestroyDeviceData(device_data);
    }
 
+   bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) override
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      if (gd.mv_scene_open && gd.mv_scene_color && src_resource == reinterpret_cast<uint64_t>(gd.mv_scene_color.get()))
+      {
+         gd.mv_scene_last_copy = reinterpret_cast<ID3D11Resource*>(dst_resource);
+      }
+      return false;
+   }
+
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
       auto& gd = GetGameDeviceData(device_data);
@@ -2354,6 +1986,7 @@ public:
             gd.mv_scene_rtv.reset();
             gd.mv_scene_srv.reset();
             gd.mv_scene_copy.reset();
+            gd.mv_scene_last_copy.reset();
             gd.mv_scene_copy_rtv.reset();
             gd.mv_objects.clear();
             gd.mv_previous_objects.clear();
@@ -2546,9 +2179,8 @@ public:
          gd.canvas_res = bound_render_target_resource();
       }
       // Hide UI: cancel this frame's later draws into the canvas (the HUD, menus and overlays; "canvas_res" only lives from TdMotionBlur
-      // to the present). The UI shaders are patched, so "is_custom_pass" is true for them: an original pixel shader hash is what
-      // separates a game draw from Luma's own passes
-      else if (g_hide_ui && is_immediate && gd.canvas_res && (!is_custom_pass || original_shader_hashes.pixel_shaders[0] != UINT64_MAX))
+      // to the present)
+      else if (g_hide_ui && is_immediate && gd.canvas_res && !is_custom_pass)
       {
          // Any view of the canvas
          if (bound_render_target_resource() == gd.canvas_res)
@@ -2556,7 +2188,7 @@ public:
       }
 
       // MSAA (4x and up, as Saints Row: The Third's: 2x gives a coarser edge than the alpha test): the masked materials' draws into
-      // the multisampled scene with their alpha to coverage version (see "PatchPixelShaderCoverage"), the game's shader put back after
+      // the multisampled scene with their alpha to coverage version (see "CoveragePatch::PatchPixelShader"), the game's shader put back after
       // Ahead of the motion vector path, which refuses multisampled scenes anyway
       if (g_msaa_resolve_enable && g_msaa_coverage_enable && gd.msaa_active && is_immediate && !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
       {
@@ -2594,9 +2226,9 @@ public:
 #if DEVELOPMENT
                gd.mv_stats.ended_by = uint32_t(original_shader_hashes.pixel_shaders[0]);
 #endif
-               // A copy of the scene (same description, CopyResource compatible) among the pass's textures
+               // The scene's last copy, if the pass reads it
                gd.mv_scene_copy.reset();
-               if (gd.mv_scene_color)
+               if (gd.mv_scene_last_copy)
                {
                   com_ptr<ID3D11ShaderResourceView> srvs[8];
                   native_device_context->PSGetShaderResources(0, 8, &srvs[0]);
@@ -2607,7 +2239,7 @@ public:
                      {
                         srv->GetResource(&resource);
                      }
-                     if (resource && resource != gd.mv_scene_color && AreResourcesEqual(resource.get(), gd.mv_scene_color.get()))
+                     if (resource && resource == gd.mv_scene_last_copy)
                      {
                         gd.mv_scene_copy = resource;
                         break;
