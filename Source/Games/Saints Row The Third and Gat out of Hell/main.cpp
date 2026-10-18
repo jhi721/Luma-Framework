@@ -935,53 +935,17 @@ public:
    }
 
    // The game's one ResolveSubresource (grab_scene_color) resolves the FP16 MSAA scene before the tonemap: draw
-   // Luma_SR3_MSAAResolve instead. Anything else, or a target we cannot bind, keeps the hardware resolve.
+   // Core's weighted one instead. Anything else, or a target it cannot bind, keeps the hardware resolve.
    static bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
    {
       if (!g_luma_msaa_enable || format != reshade::api::format::r16g16b16a16_float || source_subresource != 0 || dest_subresource != 0 || source_box != nullptr || dest_x != 0 || dest_y != 0 || dest_z != 0)
          return false;
 
-      com_ptr<ID3D11Texture2D> source_texture;
-      com_ptr<ID3D11Texture2D> dest_texture;
-      if (FAILED(reinterpret_cast<ID3D11Resource*>(source.handle)->QueryInterface(&source_texture)) || FAILED(reinterpret_cast<ID3D11Resource*>(dest.handle)->QueryInterface(&dest_texture)))
-         return false;
-      D3D11_TEXTURE2D_DESC source_desc;
-      source_texture->GetDesc(&source_desc);
-      D3D11_TEXTURE2D_DESC dest_desc;
-      dest_texture->GetDesc(&dest_desc);
-      if (source_desc.SampleDesc.Count <= 1 || source_desc.ArraySize != 1 || (source_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 || (dest_desc.BindFlags & D3D11_BIND_RENDER_TARGET) == 0)
-         return false;
-
       DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
-      auto& game_device_data = GetGameDeviceData(device_data);
       // Held through the draw so a shader reload cannot release them mid-use.
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      if (!HasShaders(device_data.native_vertex_shaders, "Copy VS"_h) || !HasShaders(device_data.native_pixel_shaders, "SR3 MSAA Resolve PS"_h))
+      if (!DrawMSAAResolve((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), device_data, reinterpret_cast<ID3D11Resource*>(source.handle), reinterpret_cast<ID3D11Resource*>(dest.handle), DXGI_FORMAT_R16G16B16A16_FLOAT, nullptr, GetGameDeviceData(device_data).composite_tint_cb.get()))
          return false;
-
-      ID3D11Device* native_device = (ID3D11Device*)(cmd_list->get_device()->get_native());
-      ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(cmd_list->get_native());
-
-      // ponytail: views are created per resolve (one or two a frame); cache them per resource if it ever shows in a profile.
-      D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-      srv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-      srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
-      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-      rtv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-      rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-      com_ptr<ID3D11ShaderResourceView> source_srv;
-      com_ptr<ID3D11RenderTargetView> dest_rtv;
-      if (FAILED(native_device->CreateShaderResourceView(source_texture.get(), &srv_desc, &source_srv)) || FAILED(native_device->CreateRenderTargetView(dest_texture.get(), &rtv_desc, &dest_rtv)))
-         return false;
-
-      DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
-      draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
-      // The game resolves with the MSAA target still bound for output, and DX11 refuses to also bind it as a shader resource.
-      native_device_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
-      ID3D11Buffer* const tint_cb = game_device_data.composite_tint_cb.get();
-      native_device_context->PSSetConstantBuffers(4, 1, &tint_cb);
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("SR3 MSAA Resolve PS"_h).get(), source_srv.get(), dest_rtv.get(), dest_desc.Width, dest_desc.Height);
-      draw_state_stack.Restore(native_device_context);
 #if DEVELOPMENT
       g_msaa_resolves_this_frame++;
 #endif
@@ -1041,7 +1005,9 @@ public:
       // Gat out of Hell's brightpass keeps Bloom_curve_values at c22 and caps its input (Luma_Bloom_impl.hlsl).
       if (g_gat_out_of_hell)
          native_shaders_definitions.at("Bloom Prefilter PS"_h).defines_data.push_back({"GAT_OUT_OF_HELL", "1"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("SR3 MSAA Resolve PS"), ShaderDefinition{"Luma_SR3_MSAAResolve", reshade::api::pipeline_subobject_type::pixel_shader});
+      // The weighted MSAA resolve in the displayed exposure: last frame's copy of the composite's vc4 ("composite_tint_cb",
+      // Tint_color at c1)
+      native_shaders_definitions.emplace(CompileTimeStringHash("MSAA Resolve PS"), ShaderDefinition{"Luma_MSAAResolve_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"MSAA_RESOLVE_EXPOSURE", "2"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR3 SMAA Linearize CS"), ShaderDefinition{"Luma_SR3_SMAALinearize", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR3 SMAA Predication CS"), ShaderDefinition{"Luma_SR3_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("SR3 Sharpen PS"), ShaderDefinition{"Luma_SR3_Sharpen", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"});
