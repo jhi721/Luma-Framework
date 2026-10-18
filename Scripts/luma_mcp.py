@@ -55,7 +55,7 @@ ANALYSIS = {
 READ_TARGET = {
     "view": {"type": "string", "description": "rtv (default), srv, uav, depth, stencil, swapchain, ui, registered:<name>"},
     "slot": {"type": "integer", "description": "View slot (default 0)"},
-    "mip": {"type": "integer"},
+    "mip": {"type": "integer", "description": "Mip level (default 0)"},
     "replaced": {"type": "boolean", "description": "Read the bindings of Luma's replaced pass (default true) or the original ones"},
 }
 COMPARE_OPTIONS = {
@@ -76,17 +76,19 @@ READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
 # Live state changes (not saved to the config) or a dump file
 LIVE_WRITE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 ONE_SHOT = {**LIVE_WRITE, "idempotentHint": False}  # Some knobs fire once (perf_test, dump_*)
+# Writes into the repository's replay cases or baselines, replacing what is there
+REPLACES_FILES = {**LIVE_WRITE, "destructiveHint": True}
 
 
-def tool(name, description, properties=None, required=None, annotations=READ_ONLY):
-    schema = {"type": "object", "properties": {**(properties or {}), **COMMON}}
+def tool(name, description, properties=None, required=None, annotations=READ_ONLY, common=COMMON):
+    schema = {"type": "object", "properties": {**(properties or {}), **common}}
     if required:
         schema["required"] = required
     return {"name": name, "description": description, "inputSchema": schema, "annotations": annotations}
 
 
 TOOLS = [
-    tool("luma_list_games", "List running games that expose the Luma dev MCP pipe (Development builds only)."),
+    tool("luma_list_games", "List running games that expose the Luma dev MCP pipe (Development builds only).", common={}),
     tool("luma_status", "Game, resolutions, swapchain formats (real, after Luma upgrades), mod state, replaced shader count, compilation error flag, process address space use (x86 OOM watch). "
          "Answers even when the game stopped presenting (presenting=false, ms_since_present, pending_jobs, active_tool): the other tools would time out then."),
     tool("luma_log", "Tail of the game's ReShade.log (where Luma and the game mods log, e.g. the per 300 frames motion vector stats), optionally filtered by a regex.",
@@ -95,7 +97,8 @@ TOOLS = [
           "log_path": {"type": "string", "description": "Explicit log file (works without a running game)"}}),
     tool(
         "luma_trace_capture",
-        "Capture one frame with Luma's own frame trace. Unlike RenoDX DevKit it includes Luma's injected passes (type custom: SMAA, bloom, SR, AO...), "
+        "Capture one frame with Luma's own frame trace. Unlike RenoDX DevKit it includes Luma's injected passes as type custom entries "
+        "(Luma SMAA, RCAS, Bloom, Super Resolution, XeGTAO, display composition, redirected copies/UI, and what a game mod traces itself), "
         "merged deferred context work, clears/copies, and which shader variant ran. With 'trigger' it keeps capturing until a frame contains that shader. "
         "With 'frames' it captures several frames and returns draws per shader hash per frame (a capture spans two presents). "
         "'Did X draw at all' over a long window: trigger=<hash> max_frames=<N> (trigger_found).",
@@ -109,7 +112,8 @@ TOOLS = [
     tool(
         "luma_trace_diff",
         "Diff two captures stored with luma_trace_capture save_as (e.g. SR off vs on): aligned inserted/removed/changed blocks, and shaders whose draw counts differ.",
-        {"a": {"type": "string"}, "b": {"type": "string"}, "max_blocks": {"type": "integer", "description": "Default 60"}}, ["a", "b"],
+        {"a": {"type": "string", "description": "save_as name of the first capture"}, "b": {"type": "string", "description": "save_as name of the second capture"},
+         "max_blocks": {"type": "integer", "description": "Default 60"}}, ["a", "b"], common={},
     ),
     tool(
         "luma_trace_list",
@@ -117,17 +121,22 @@ TOOLS = [
         "Fields: index, type, stage, hash, replaced (none/file/patch_*), upgrade_flags (^ input upgraded, v output upgraded, \\ / scaled), rt0, depth, "
         "copy_kind, note (the game's own per draw decision, e.g. mv / jitter / unpatched / mv_reject=N).",
         {"type": {"type": "string", "description": "shader, custom, copy, clear, present, cpu_read, cpu_write, ..."},
-         "hash": {"type": "string"}, "stage": {"type": "string", "description": "PS, VS, CS, GS"},
+         "hash": {"type": "string", "description": "Only entries of this shader (0x12345678)"}, "stage": {"type": "string", "description": "PS, VS, CS, GS"},
          "resource": {"type": "string", "description": "Resource id (the 'resource' field of luma_trace_get) read or written by the entry"},
-         "replaced_only": {"type": "boolean"}, "include_vs": {"type": "boolean"}, "include_bindings": {"type": "boolean"},
-         "include_buffer_writes": {"type": "boolean"}, "offset": {"type": "integer"}, "limit": {"type": "integer", "description": "Default 300"}},
+         "replaced_only": {"type": "boolean", "description": "Only entries whose shader Luma replaced or patched"},
+         "include_vs": {"type": "boolean", "description": "Also list vertex shader entries"},
+         "include_bindings": {"type": "boolean", "description": "Also list resource binding entries"},
+         "include_buffer_writes": {"type": "boolean", "description": "Also list buffer map/update entries"},
+         "offset": {"type": "integer", "description": "First filtered entry returned, for paging"}, "limit": {"type": "integer", "description": "Default 300"}},
     ),
     tool(
         "luma_trace_get",
         "Full state of one captured entry: RTV/SRV/UAV/DSV resource and view formats and sizes, blend per RT, depth/stencil (func, write, stencil ref/ops), "
         "rasterizer (cull, scissor enable, depth clip/bias), all viewports and scissor rects, samplers (filter, address, mip bias), bound cbuffers (with D3D11.1 ranges), "
-        "input layout, draw/dispatch arguments, copy kind/regions (copy, region, resolve, buffer), clear values, custom shader file and compilation errors.",
-        {"index": {"type": "integer"}}, ["index"],
+        "input layout, draw/dispatch arguments, copy kind/regions (copy, region, resolve, buffer), clear values, custom shader file and compilation errors. "
+        "The state is recorded before the game mod's draw hook runs: a viewport it scales, a blend or shader it swaps in are not shown "
+        "(read the result with luma_read_resource instead).",
+        {"index": {"type": "integer", "description": "Entry index from luma_trace_list"}}, ["index"],
     ),
     tool(
         "luma_read_resource",
@@ -146,7 +155,8 @@ TOOLS = [
         "luma_compare",
         "Per-pixel difference of two readbacks (.bin paths from luma_read_resource / luma_sr_capture, e.g. an A/B with a dev toggle): abs diff stats, the max's position, diff.png. "
         "rect_a/rect_b crop first; if the sizes still differ the smaller is stretched bilinearly to the bigger (e.g. a render scale sub-rect vs a 100% readback).",
-        {"a": {"type": "string"}, "b": {"type": "string"}, **COMPARE_OPTIONS}, ["a", "b"],
+        {"a": {"type": "string", "description": "Reference .bin path (its .json meta must sit next to it)"}, "b": {"type": "string", "description": "Compared .bin path"},
+         **COMPARE_OPTIONS}, ["a", "b"], common={},
     ),
     tool(
         "luma_capture_pass",
@@ -154,10 +164,11 @@ TOOLS = [
         "targets at full size (zlib), the shader path and the exact compile defines. An offline replayer can then run the CURRENT "
         "HLSL on WARP and FLIP-compares it to the captured output, without the game. Each read is its own frame: pause the game first "
         "(static_scene=false means it moved). Refused: blending, depth/stencil tests, scissor, UAVs.",
-        {"index": {"type": "integer"}, "case": {"type": "string", "description": "<game>/<scene>, e.g. tw2/tonemap_day"},
+        {"index": {"type": "integer", "description": "Entry index of the replaced PS draw from luma_trace_list"},
+         "case": {"type": "string", "description": "<game>/<scene>, e.g. tw2/tonemap_day"},
          "max_flip": {"type": "number", "description": "Pass threshold, FLIP mean x100 (default 1.0; replay.py --accept recalibrates)"},
          "overwrite": {"type": "boolean", "description": "Replace an existing case of that name (refused otherwise)"}},
-        ["index", "case"],
+        ["index", "case"], annotations=REPLACES_FILES,
     ),
     tool(
         "luma_golden",
@@ -167,11 +178,11 @@ TOOLS = [
         "Baselines: %LUMA_BASELINES% or _tools/baselines, as <case>/<backend>.bin/.json/.golden.json.",
         {"path": {"type": "string", "description": "The .bin to check"},
          "case": {"type": "string", "description": "<game>/<scene>, e.g. mele/me2_normandy_menu"},
-         "backend": {"type": "string"},
-         "accept": {"type": "boolean"},
+         "backend": {"type": "string", "description": "What drew the image: native, dgvoodoo-<version>, dxvk..."},
+         "accept": {"type": "boolean", "description": "Replace the case's baseline with this readback instead of checking it"},
          "max_flip": {"type": "number", "description": "On accept: the case's threshold, FLIP mean x100 (default: kept, else 1.0; calibrate on the scene's "
                                                        "luma_ab noise floor)"}},
-        ["path", "case", "backend"],
+        ["path", "case", "backend"], annotations=REPLACES_FILES, common={},
     ),
     tool(
         "luma_ab",
@@ -179,7 +190,7 @@ TOOLS = [
         "even on failure. Returns a vs b diffs and the noise floor (a vs a, b vs b across repeats: the scene's own drift) with within_noise. "
         "Target arguments as luma_read_resource (index/hash/instance, view, slot, mip; view=swapchain needs no pass).",
         {"name": {"type": "string", "description": "Toggle, float or int from luma_dev_values"},
-         "a": {"type": ["string", "number", "boolean"]}, "b": {"type": ["string", "number", "boolean"]},
+         "a": {"type": ["string", "number", "boolean"], "description": "First value"}, "b": {"type": ["string", "number", "boolean"], "description": "Second value"},
          "settle": {"type": "integer", "description": "Frames waited after each change (default 8; TAA/upscaler history needs more)"},
          "repeats": {"type": "integer", "description": "Reads per side (default 2, max 8), 2+ gives a noise floor"},
          **TARGET, **READ_TARGET, **COMPARE_OPTIONS},
@@ -193,7 +204,7 @@ TOOLS = [
         {"frames": {"type": "integer", "description": "Measured frames per window (default 120)"},
          "settle": {"type": "integer", "description": "Frames skipped first (default 30)"},
          "name": {"type": "string", "description": "Dev value to sweep (e.g. render_scale, perf_test)"},
-         "values": {"type": "array", "items": {"type": ["string", "number", "boolean"]}},
+         "values": {"type": "array", "items": {"type": ["string", "number", "boolean"]}, "description": "Values of name to measure, needed with name"},
          "rounds": {"type": "integer", "description": "Sweep rounds (default 3)"}},
         annotations=ONE_SHOT,
     ),
@@ -213,7 +224,7 @@ TOOLS = [
     tool("luma_set_dev_value", "Change a registered toggle, float or int live (A/B tests; counters and textures are read only). Ints are range checked. "
          "Some are persisted user settings (smaa_enable, rcas_sharpness, gtao_*...): this bypasses the config, nothing is saved. perf_test runs the "
          "game's Performance Test mode like its combo. One-shots (smaa_pred_measure, dump_*) disarm themselves; read their result with luma_log.",
-         {"name": {"type": "string"}, "value": {"type": "string", "description": "true/false or 1/0 for toggles, a number otherwise"}}, ["name", "value"],
+         {"name": {"type": "string", "description": "Exact name from luma_dev_values"}, "value": {"type": "string", "description": "true/false or 1/0 for toggles, a number otherwise"}}, ["name", "value"],
          annotations=ONE_SHOT),
     tool(
         "luma_sr_state",
@@ -228,28 +239,31 @@ TOOLS = [
          **OUT_DIR, **ANALYSIS},
     ),
     tool("luma_shader_list", "Live shaders the game created: hash, stage, replaced, pipelines, shader model, size, and used slots (cbs/srvs/uavs/rtvs/samplers) from reflection.",
-         {"stage": {"type": "string", "description": "VS, PS, CS, GS"}, "replaced_only": {"type": "boolean"},
+         {"stage": {"type": "string", "description": "VS, PS, CS, GS"},
+          "replaced_only": {"type": "boolean", "description": "Only shaders Luma replaced or patched"},
           "include_unloaded": {"type": "boolean", "description": "Also shaders loaded earlier without a live pipeline now"},
-          "offset": {"type": "integer"}, "limit": {"type": "integer", "description": "Default 200, 'matched' vs 'returned' says more remain"}}),
+          "offset": {"type": "integer", "description": "First matched shader returned, for paging"}, "limit": {"type": "integer", "description": "Default 200, 'matched' vs 'returned' says more remain"}}),
     tool("luma_dump_shader", "Write a loaded shader's original bytecode (.cso) to Luma's dump folder, for offline disassembly (Scripts/dxbc.py).",
-         {"hash": {"type": "string"}}, ["hash"], annotations=LIVE_WRITE),
+         {"hash": {"type": "string", "description": "Shader hash (0x12345678)"}}, ["hash"], annotations=LIVE_WRITE),
     tool(
         "luma_shader_state",
         "Without hash: every replaced pipeline (file or patch) and the compilation error log. With hash: its pipelines, replacement kind, custom shader file and errors.",
-        {"hash": {"type": "string"}, "disasm": {"type": "boolean", "description": "Include the replacement's disassembly"}},
+        {"hash": {"type": "string", "description": "Shader hash (0x12345678)"}, "disasm": {"type": "boolean", "description": "Include the replacement's disassembly"}},
     ),
     tool("luma_reload_shaders", "Recompile and reload Luma's custom shaders (like the dev UI button) and return the compilation error log.",
-         {"unload": {"type": "boolean", "description": "Unload them instead"}}, annotations=LIVE_WRITE),
+         {"unload": {"type": "boolean", "description": "Unload them instead. Shader objects a game mod keeps itself (e.g. XeGTAO's compute shaders) keep running: "
+                                                       "test a missing-shader fallback with the feature's dev toggle"}}, annotations=LIVE_WRITE),
     tool("luma_get_settings", "Luma global settings (display mode, peak/paper white), the 10 dev settings with names/ranges, raw game settings slots, and shader defines."),
     tool(
         "luma_set_setting",
         "Change a setting live (not saved to the config). name: scene_peak_white, scene_paper_white, ui_paper_white, dev:<index>, game:<index>, define:<NAME> "
         "(defines need luma_reload_shaders).",
-        {"name": {"type": "string"}, "value": {"type": "string"}, "as_uint": {"type": "boolean", "description": "For game:<index>, write the raw uint bits"}},
+        {"name": {"type": "string", "description": "scene_peak_white, scene_paper_white, ui_paper_white, dev:<index>, game:<index> or define:<NAME>"},
+         "value": {"type": "string", "description": "A number (or 0/1)"}, "as_uint": {"type": "boolean", "description": "For game:<index>, write the raw uint bits"}},
         ["name", "value"], annotations=LIVE_WRITE,
     ),
 ]
-TOOL_NAMES = {t["name"] for t in TOOLS}
+TOOL_PROPERTIES = {t["name"]: set(t["inputSchema"]["properties"]) for t in TOOLS}
 
 # DXGI format id -> (dtype, channels, kind). kind: float, unorm, snorm, uint, bgra, depth24, stencil_hi, float_x8x24, stencil_x24,
 # r10g10b10a2(_uint), r11g11b10, r9g9b9e5. sRGB formats keep their encoded values, see SRGB_IDS
@@ -629,12 +643,12 @@ def replay_refusals(entry):
            (["UAVs"] if entry.get("uavs") else [])
 
 
-def capture_pass(index, case, max_flip=None, overwrite=False):
+def capture_pass(common, index, case, max_flip=None, overwrite=False):
     """Saves what one full screen PS pass read and wrote (SRVs, cbuffers, samplers, render targets, the compile defines) as an offline
     replay case (an offline replayer runs the current HLSL on it). Each read is a separate frame: hold the scene still."""
     if not re.fullmatch(CASE_RE, case):
         return {"ok": False, "error": "case is <game>/<scene>, letters, digits, . _ -"}
-    entry = backend.call("trace_get", {"index": index})
+    entry = backend.call("trace_get", {"index": index, **common})
     if not entry.get("ok"):
         return entry
     shader = entry.get("custom_shader", {})
@@ -646,7 +660,7 @@ def capture_pass(index, case, max_flip=None, overwrite=False):
     shader_path = os.path.abspath(shader["file"])
     if not shader_path.lower().startswith(REPO.lower() + os.sep):
         return {"ok": False, "error": f"{shader_path} isn't in this checkout (a Development build loads the repo's Shaders folder)"}
-    settings = backend.call("get_settings", {})
+    settings = backend.call("get_settings", {**common})
     if "compile_defines" not in settings:
         return {"ok": False, "error": "This build doesn't report compile_defines: rebuild the addon (Development)"}
     if any("filter_id" not in s for s in entry.get("samplers", [])):
@@ -660,7 +674,7 @@ def capture_pass(index, case, max_flip=None, overwrite=False):
         os.remove(os.path.join(out, name))
 
     def read(view, slot):
-        result = backend.call("read_resource", {"index": index, "view": view, "slot": slot})
+        result = backend.call("read_resource", {"index": index, "view": view, "slot": slot, **common})
         if not result.get("ok"):
             raise RuntimeError(f"{view} {slot}: {result.get('error')}")
         path = result["path"]
@@ -671,7 +685,7 @@ def capture_pass(index, case, max_flip=None, overwrite=False):
                 os.remove(leftover)
         return data, {k: result[k] for k in ("format_id", "view_format_id", "width", "rows", "row_pitch", "slices", "depth", "height") if k in result}
 
-    record = {"game": backend.call("status", {}).get("game"), "hash": entry.get("hash"), "shader": os.path.relpath(shader_path, REPO).replace("\\", "/"),
+    record = {"game": backend.call("status", {**common}).get("game"), "hash": entry.get("hash"), "shader": os.path.relpath(shader_path, REPO).replace("\\", "/"),
               "defines": settings["compile_defines"], "viewport": entry["viewport0"], "max_flip": float(max_flip if max_flip is not None else 1.0),
               "captured": time.strftime("%Y-%m-%d %H:%M:%S"), "srvs": [], "cbs": [], "samplers": [], "rts": []}
     try:
@@ -685,7 +699,7 @@ def capture_pass(index, case, max_flip=None, overwrite=False):
                     f.write(zlib.compress(data, 1))  # Level 1: several times faster than 6 on 66 MB 4K targets, a little bigger
                 record[prefix + "s"].append({"slot": bound["slot"], "file": name, **meta})
         for cb in entry.get("cbs", []):
-            result = backend.call("read_cbuffer", {"index": index, "slot": cb["slot"]})
+            result = backend.call("read_cbuffer", {"index": index, "slot": cb["slot"], **common})
             if not result.get("ok"):
                 raise RuntimeError(f"cb {cb['slot']}: {result.get('error')}")
             uints = dword_views(result["hex_dwords"])[1]
@@ -1052,7 +1066,8 @@ def call_tool(name, args):
     if name == "luma_compare":
         return compare(args["a"], args["b"], **{k: args.get(k) for k in COMPARE_OPTIONS})
     if name == "luma_capture_pass":
-        return capture_pass(int(args["index"]), args["case"], args.get("max_flip"), bool(args.get("overwrite")))
+        common = {k: args[k] for k in ("pid", "timeout_ms") if args.get(k) is not None}
+        return capture_pass(common, int(args["index"]), args["case"], args.get("max_flip"), bool(args.get("overwrite")))
     if name == "luma_golden":
         return golden(args["path"], args["case"], args["backend"], bool(args.get("accept")), args.get("max_flip"))
     if name == "luma_ab":
@@ -1132,13 +1147,17 @@ def dispatch(method, params):
         return {"tools": TOOLS}
     if method == "tools/call":
         name, args = params.get("name"), dict(params.get("arguments") or {})
-        if name not in TOOL_NAMES:
+        if name not in TOOL_PROPERTIES:
             raise RpcError(-32602, f"Unknown tool {name}")
+        unknown = set(args) - TOOL_PROPERTIES[name]
         # Execution failures (a missing file, a bad regex, a lost game) go back as tool results the model can act on, not protocol errors
         try:
             result = call_tool(name, args)
         except Exception as e:
             result = {"ok": False, "error": str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"}
+        # Bridge-side tools drop unknown arguments, game-side ones get them reported by the backend too
+        if unknown:
+            result["ignored_args"] = sorted(unknown | set(result.get("ignored_args", [])))
         return {"content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}], "isError": not result.get("ok", False)}
     if method == "ping":  # Legacy only, harmless to answer in the modern era too
         return {}
@@ -1228,12 +1247,16 @@ def self_test():
     backend = StubBackend()
     os.makedirs(os.path.join(REPLAY_ROOT, "game", "pass"))
     open(os.path.join(REPLAY_ROOT, "game", "pass", "case.json"), "w").close()
-    assert "already holds" in capture_pass(0, "game/pass")["error"]
-    assert "letters, digits" in capture_pass(0, "game/../pass")["error"]
+    assert "already holds" in capture_pass({}, 0, "game/pass")["error"]
+    assert "letters, digits" in capture_pass({}, 0, "game/../pass")["error"]
     backend = real_backend
     shutil.rmtree(root)
 
-    assert {"luma_ab", "luma_perf", "luma_golden"} <= TOOL_NAMES and len(INSTRUCTIONS) <= 2048, len(INSTRUCTIONS)
+    assert {"luma_ab", "luma_perf", "luma_golden"} <= TOOL_PROPERTIES.keys() and len(INSTRUCTIONS) <= 2048, len(INSTRUCTIONS)
+    undescribed = [(t["name"], k) for t in TOOLS for k, v in t["inputSchema"]["properties"].items() if "description" not in v]
+    assert not undescribed, undescribed
+    reply = json.loads(dispatch("tools/call", {"name": "luma_list_games", "arguments": {"bogus": 1}})["content"][0]["text"])
+    assert reply["ignored_args"] == ["bogus"], reply
     print("self test passed")
 
 
