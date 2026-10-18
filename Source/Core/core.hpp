@@ -6569,7 +6569,12 @@ namespace
          desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
 
          // Note: this is the main ingredient in making textures less blurry
-         if (samplers_upgrade_mode == 4)
+         if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero (as outside of development)
+         {
+            desc.MipLODBias = std::clamp((desc.MipLODBias == 0.f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+            desc.MinLOD = max(desc.MinLOD + min(desc.MipLODBias - original_desc.MipLODBias, 0.f), 0.f);
+         }
+         else if (samplers_upgrade_mode == 4)
          {
             desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
          }
