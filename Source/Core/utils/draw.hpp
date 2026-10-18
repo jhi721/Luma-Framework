@@ -1769,6 +1769,50 @@ void DrawRCAS(ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D
 }
 #endif // ENABLE_RCAS
 
+// HDR-weighted MSAA resolve ("Luma_MSAAResolve_PS.hlsl", registered by the game as "pixel_shader_name") of the whole single slice
+// "source" into "dest", in place of the game's ResolveSubresource of them in "format", which also makes their views. "exposure_srv" (t1)
+// and "exposure_cb" (b0) feed the shader's MSAA_RESOLVE_EXPOSURE. The caller holds "s_mutex_shader_objects" (shared) through it, so a
+// shader reload can't release the shaders mid-draw. False, with nothing drawn, if the pair can't be bound or the shaders aren't
+// compiled: the caller keeps the hardware resolve. Restores the state it changes.
+bool DrawMSAAResolve(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const DeviceData& device_data, ID3D11Resource* source, ID3D11Resource* dest, DXGI_FORMAT format,
+   ID3D11ShaderResourceView* exposure_srv = nullptr, ID3D11Buffer* exposure_cb = nullptr, uint32_t pixel_shader_name = "MSAA Resolve PS"_h)
+{
+   ComPtr<ID3D11Texture2D> source_texture;
+   ComPtr<ID3D11Texture2D> dest_texture;
+   if (FAILED(source->QueryInterface(source_texture.put())) || FAILED(dest->QueryInterface(dest_texture.put())))
+      return false;
+   D3D11_TEXTURE2D_DESC source_desc;
+   D3D11_TEXTURE2D_DESC dest_desc;
+   source_texture->GetDesc(&source_desc);
+   dest_texture->GetDesc(&dest_desc);
+   // MSAA targets are often created without a shader resource bind: the game adds it at their creation
+   if (source_desc.SampleDesc.Count <= 1 || source_desc.ArraySize != 1 || dest_desc.ArraySize != 1 || (source_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 || (dest_desc.BindFlags & D3D11_BIND_RENDER_TARGET) == 0)
+      return false;
+
+   auto* const vs = FindShader(device_data.native_vertex_shaders, "Copy VS"_h);
+   auto* const ps = FindShader(device_data.native_pixel_shaders, pixel_shader_name);
+   if (!vs || !ps)
+      return false;
+
+   // ponytail: views are created per resolve (one to three a frame); cache them per resource if it ever shows in a profile
+   const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {.Format = format, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS};
+   const D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {.Format = format, .ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D};
+   ComPtr<ID3D11ShaderResourceView> source_srv;
+   ComPtr<ID3D11RenderTargetView> dest_rtv;
+   if (FAILED(native_device->CreateShaderResourceView(source_texture.get(), &srv_desc, source_srv.put())) || FAILED(native_device->CreateRenderTargetView(dest_texture.get(), &rtv_desc, dest_rtv.put())))
+      return false;
+
+   DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+   draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+   // Games resolve with the MSAA target still bound for output, and D3D11 refuses it as a shader resource then
+   native_device_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
+   native_device_context->PSSetShaderResources(1, 1, &exposure_srv);
+   native_device_context->PSSetConstantBuffers(0, 1, &exposure_cb);
+   DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, vs, ps, source_srv.get(), dest_rtv.get(), dest_desc.Width, dest_desc.Height);
+   draw_state_stack.Restore(native_device_context);
+   return true;
+}
+
 // Frees "DrawKarisAverage"'s output, both views (e.g. while a game's bloom is off); its next draw recreates it
 void ReleaseKarisAverage(DeviceData& device_data)
 {

@@ -10555,6 +10555,9 @@ namespace
 #endif
 
             format = (reshade::api::format)format1; // Our upgrades "GetBestResourceUpgradeFormat()" are always non typeless so this is fine (this is the "view" format the MS resolve uses for the target and source textures)
+            if (source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0 &&
+                game->OverrideResolveTextureRegion((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle, format1))
+               return true;
             cmd_list->resolve_texture_region(source, source_subresource, source_box, dest, dest_subresource, dest_x, dest_y, dest_z, format);
             return true;
          }

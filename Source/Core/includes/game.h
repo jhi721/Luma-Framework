@@ -51,6 +51,9 @@ public:
    }
 
    virtual bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) { return false; }
+   // A whole-resource MSAA resolve after the indirect upgrade substitution ("dst_resource"/"src_resource" are the mirrors, "format" the
+   // mirrors' format). True if the game resolved it itself.
+   virtual bool OverrideResolveTextureRegion(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, uint64_t dst_resource, uint64_t src_resource, DXGI_FORMAT format) { return false; }
    virtual bool OverrideCopyTextureRegion(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const D3D11_BOX* dst_box, uint64_t& src_resource, uint32_t src_subresource, const D3D11_BOX* src_box) { return false; }
 
    // ============================================================================
