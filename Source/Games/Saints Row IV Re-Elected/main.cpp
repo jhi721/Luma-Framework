@@ -2320,6 +2320,9 @@ public:
             pass("SR4 XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (ao_width + 15) / 16, (ao_height + 7) / 8);
          pass("SR4 XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[single_denoise ? 0 : 1].get(), nullptr}, (ao_width + 15) / 16, (ao_height + 7) / 8);
       }
+#if DEVELOPMENT
+      QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", final_uav);
+#endif
       compute_state.Restore(native_device_context);
 
       // The target is still bound as the draw's render target, and a copy into an OM-bound resource is a hazard the runtime

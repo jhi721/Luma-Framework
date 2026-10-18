@@ -768,6 +768,9 @@ class GameYakuzaRC final : public Game
       pass("YRC XeGTAO Main Pass CS"_h, 1, &working_uavs[0], game_device_data.gtao_depth_mips_srv.get(), (width + 7) / 8, (height + 7) / 8);
       pass("YRC XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], game_device_data.gtao_working_srvs[0].get(), (width + 15) / 16, (height + 7) / 8);
       pass("YRC XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, game_device_data.gtao_working_srvs[1].get(), (width + 15) / 16, (height + 7) / 8);
+#if DEVELOPMENT
+      QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", final_uav);
+#endif
       compute_state.Restore(native_device_context);
       return true;
    }

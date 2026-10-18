@@ -3073,6 +3073,9 @@ public:
          }
          // Final denoiser writes the game's R8_UNORM AO target.
          dispatch(kNameGTAODenoise2CS, {gd->srv_gtao_working[single_denoise ? 0 : 1].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
+#if DEVELOPMENT
+         QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", uav_final.get());
+#endif
 
          compute_state.Restore(native_device_context);
          return DrawOrDispatchOverrideType::Replaced;

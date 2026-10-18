@@ -714,6 +714,9 @@ public:
                 native_device_context->CSSetShaderResources(0, 1, &game_device_data.srv_xe_gtao_denoise_pass1);
 
                 native_device_context->Dispatch((device_data.render_resolution.x + XE_GTAO_NUMTHREADS_X * 2 - 1) / (XE_GTAO_NUMTHREADS_X * 2), (device_data.render_resolution.y + XE_GTAO_NUMTHREADS_Y - 1) / XE_GTAO_NUMTHREADS_Y, 1);
+#if DEVELOPMENT
+                QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", game_device_data.uav_xe_gtao_denoise_pass2.get());
+#endif
 
                 //
 

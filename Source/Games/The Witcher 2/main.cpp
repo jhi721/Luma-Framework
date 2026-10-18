@@ -2675,6 +2675,9 @@ class TheWitcher2Game final : public Game
          native_device_context->CSSetUnorderedAccessViews(0, 1, uav_nulls5.data(), nullptr);
       }
 
+#if DEVELOPMENT
+      QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", gd->uav_gtao_final.get());
+#endif
       compute_state.Restore(native_device_context);
 
       // The destination is still bound as the draw's render target, and copying into an OM-bound resource is a

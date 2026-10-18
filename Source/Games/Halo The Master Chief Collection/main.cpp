@@ -460,6 +460,9 @@ namespace
                native_device_context->Dispatch((main_texdesc.Width + (NUMTHREADS_X * 2) - 1) / (NUMTHREADS_X * 2), (main_texdesc.Height + NUMTHREADS_Y - 1) / NUMTHREADS_Y,1); // half width, but cs does 2 pixels
             }
             ao_srv = !ao_flipflop ? main0_srv.get() : main1_srv.get();
+#if DEVELOPMENT
+            QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", ao_srv);
+#endif
 
             // unbind all!
             constexpr std::array<ID3D11UnorderedAccessView*, 1> null_1uavs = { };

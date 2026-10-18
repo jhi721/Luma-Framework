@@ -1764,6 +1764,9 @@ public:
          pass("P5S XeGTAO Denoise Pass 1 CS"_h, 1, &working_uavs[1], {game_device_data.gtao_working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
       }
       pass("P5S XeGTAO Denoise Pass 2 CS"_h, 1, &final_uav, {game_device_data.gtao_working_srvs[temporal ? 0 : 1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+#if DEVELOPMENT
+      QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", final_uav);
+#endif
       compute_state.Restore(native_device_context);
 
       // The target is still the draw's render target, and the runtime doesn't resolve copies into OM bound resources: unbind around the

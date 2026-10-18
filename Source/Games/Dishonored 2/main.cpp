@@ -540,6 +540,11 @@ public:
 
             // Should match the original draw call. Just call the original instead?
             native_device_context->Draw(3, 0);
+#if DEVELOPMENT
+            ComPtr<ID3D11RenderTargetView> ao_rtv;
+            native_device_context->OMGetRenderTargets(1, ao_rtv.put(), nullptr);
+            QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", ao_rtv.get());
+#endif
 
             //
 

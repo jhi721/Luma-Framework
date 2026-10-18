@@ -1694,6 +1694,9 @@ namespace XeGTAO
          native_device_context->Dispatch(thread_x_effective, thread_y_effective,1); // half width, but cs does 2 pixels
       }
       ID3D11ShaderResourceView* ao_srv = !ao_flipflop ? CreatedResource::Main0::srv.get() : CreatedResource::Main1::srv.get();
+#if DEVELOPMENT
+      QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", ao_srv);
+#endif
       
       // Unbind CS
       constexpr std::array<ID3D11UnorderedAccessView*, 1> null_uavs = { };

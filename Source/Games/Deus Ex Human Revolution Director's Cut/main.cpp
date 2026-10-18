@@ -818,6 +818,9 @@ public:
                native_device_context->CSSetShaderResources(0, 1, &srv_denoise_pass1);
 
                native_device_context->Dispatch((tex_desc.Width + (XE_GTAO_NUMTHREADS_X * 2) - 1) / (XE_GTAO_NUMTHREADS_X * 2), (tex_desc.Height + XE_GTAO_NUMTHREADS_Y - 1) / XE_GTAO_NUMTHREADS_Y, 1);
+#if DEVELOPMENT
+               QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", uav_normal.get());
+#endif
 
                ID3D11UnorderedAccessView* uav_null_denoise = {};
                native_device_context->CSSetUnorderedAccessViews(0, 1, &uav_null_denoise, nullptr);

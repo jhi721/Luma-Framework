@@ -876,6 +876,9 @@ public:
          pass(gtao_main_shader_hash, 1, &working_uavs[0], {scratch.depth_mips_srv.get(), srvs[1].get()}, (width + 7) / 8, (height + 7) / 8);
          pass(gtao_denoise_1_shader_hash, 1, &working_uavs[1], {scratch.working_srvs[0].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
          pass(gtao_denoise_2_shader_hash, 1, &ssao_uav, {scratch.working_srvs[1].get(), nullptr}, (width + 15) / 16, (height + 7) / 8);
+#if DEVELOPMENT
+         QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", ssao_uav);
+#endif
          compute_state.Restore(native_device_context);
       }
 

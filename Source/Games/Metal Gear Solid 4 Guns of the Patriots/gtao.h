@@ -396,6 +396,9 @@ namespace MGS4GTAO
       Dispatch(shaders[1], resources.depth.srv.get(), main_pass_uav_slot, resources.ao.uav.get(), 8);
       Dispatch(shaders[2], resources.ao.srv.get(), denoise_uav_slot, resources.denoised_ao.uav.get(), 16);
       Dispatch(shaders[3], resources.denoised_ao.srv.get(), denoise_uav_slot, resources.final_ao.uav.get(), 16);
+#if DEVELOPMENT
+      QueueInjectedPassTrace(context, "Luma XeGTAO", resources.final_ao.uav.get());
+#endif
       context->CSSetShaderResources(0, 3, null_srvs);
 
       // Multiply AO into the composed scene RGB. Its alpha is the scale the game divides RGB by, so it's left untouched.

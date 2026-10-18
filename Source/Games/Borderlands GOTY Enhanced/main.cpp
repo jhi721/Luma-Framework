@@ -2151,6 +2151,9 @@ public:
                dispatch(cs_denoise_1, {gd.srv_gtao_working[0].get()}, {gd.uav_gtao_working[1].get()}, (w + 15) / 16, (h + 7) / 8);
             // 4) Denoise 2 (final): working1 (working0 when single) -> the game's r16g16_float AO target.
             dispatch(cs_denoise_2, {gd.srv_gtao_working[single_denoise ? 0 : 1].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
+#if DEVELOPMENT
+            QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", uav_final.get());
+#endif
 
             st.Restore(native_device_context);
             return DrawOrDispatchOverrideType::Replaced; // cancel the native blur
