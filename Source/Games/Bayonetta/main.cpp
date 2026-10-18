@@ -8,8 +8,9 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads "last_draw_dispatch_data", which Publishing only fills with this
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
-// Luma TAA among the upscalers (in process; DLSS and FSR 3 run in the SR bridge's x64 helper, "UseLumaSRBridge")
-#define ENABLE_LUMA_TAA 1
+// Luma TAA among the upscalers (in process; DLSS and FSR 3 run in the SR bridge's x64 helper, "UseLumaSRBridge"). Off for now: the
+// floor flickers under it on a static frame (DLAA and FSR don't).
+#define ENABLE_LUMA_TAA 0
 // The game has MSAA but no shader AA: SMAA is added on the canvas after the scene copy (see "DrawSMAAOnCanvas")
 #define ENABLE_SMAA 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl), as TW1 and ME1
@@ -1890,7 +1891,7 @@ public:
       luma_data_cbuffer_index = 12;
       luma_ui_cbuffer_index = -1;
 
-      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS and FSR 3 require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
+      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS and FSR 3 require Luma-Upscaler.exe next to the game's exe.\n";
 
       default_luma_global_game_settings.Dithering = 1.f;
       // Light AutoHDR on the movies (the TW1/ME1 pair: at 0.5 the peak is 165 nits)
@@ -2375,7 +2376,7 @@ public:
       game_device_data.msaa_active = game_device_data.msaa_resolved.exchange(false);
       if (game_device_data.msaa_active && !msaa_was_active)
       {
-         reshade::log::message(reshade::log::level::warning, "[Bayonetta] The game's MSAA is on: DLAA, FSR, Luma TAA and SMAA T2x stay off until Anti-Aliasing is off in the game's options");
+         reshade::log::message(reshade::log::level::warning, "[Bayonetta] The game's MSAA is on: DLAA, FSR and SMAA T2x stay off until Anti-Aliasing is off in the game's options");
       }
 #if DEVELOPMENT
       game_device_data.aa_last_stats = std::exchange(game_device_data.aa_stats, {});
@@ -2547,20 +2548,20 @@ public:
       const auto& gd = GetGameDeviceData(device_data);
       if (gd.msaa_active)
       {
-         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR, Luma TAA and SMAA T2x need Anti-Aliasing off in the game's options.");
+         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR and SMAA T2x need Anti-Aliasing off in the game's options.");
       }
       // The HDR-weighted resolve and alpha to coverage: both act only with the game's MSAA on (Saints Row's merged toggle)
       ImGui::BeginDisabled(!gd.msaa_active);
-      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, foliage and fences; requires Anti-Aliasing enabled in the game's options; not used with DLSS/FSR or Luma TAA).", !gd.msaa_active);
+      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, foliage and fences; requires Anti-Aliasing enabled in the game's options; not used with DLSS/FSR).", !gd.msaa_active);
       ImGui::EndDisabled();
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: greyed, its value kept. Not with MSAA ("sr_active"): SMAA runs then
       ImGui::BeginDisabled(gd.sr_active);
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off; not used with DLSS/FSR or Luma TAA).", gd.sr_active);
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off; not used with DLSS/FSR).", gd.sr_active);
       ImGui::EndDisabled();
       // T2x needs the motion vectors, which a multisampled scene doesn't get
       const bool t2x_unavailable = gd.sr_active || gd.msaa_active;
       ImGui::BeginDisabled(!g_smaa_enable || t2x_unavailable);
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR, Luma TAA or the game's MSAA (Anti-Aliasing in the game's options).", t2x_unavailable);
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR or the game's MSAA (Anti-Aliasing in the game's options).", t2x_unavailable);
       ImGui::EndDisabled();
 #if DEVELOPMENT
       // Predication only relaxes the edge threshold back to ULTRA's on geometry, never below: off is strictly worse (MoH 2010, ME1)
@@ -2604,7 +2605,7 @@ public:
       }
 
 #if DEVELOPMENT
-      ImGui::SeparatorText("Motion Vectors (DLSS/FSR/Luma TAA)");
+      ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
       ImGui::Checkbox("MV Enable", &g_mv_enable);
       if (ImGui::IsItemHovered())
       {
@@ -2622,7 +2623,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Bayonetta\" is open source and free.\n"
-         "It adds HDR, DLAA, FSR 3 native anti-aliasing or Luma TAA, SMAA and an HDR-aware MSAA with alpha to coverage.\n"
+         "It adds HDR, DLAA or FSR 3 native anti-aliasing, SMAA and an HDR-aware MSAA with alpha to coverage.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Thanks to the Luma team and contributors.");
       ImGui::PopTextWrapPos();
