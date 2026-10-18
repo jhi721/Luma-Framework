@@ -36,6 +36,8 @@
   </PropertyGroup>
   <PropertyGroup>
     <UseDgVoodoo>true</UseDgVoodoo>
+    <UseDgVoodooLinux>true</UseDgVoodooLinux>
+    <UseLumaSRBridge>true</UseLumaSRBridge>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Development-Debug|Win32'" Label="Configuration">
@@ -167,7 +169,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Publishing-Release|Win32'">
@@ -216,7 +218,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Test-Release|Win32'">
@@ -265,7 +267,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Development-Release|Win32'">
@@ -314,7 +316,7 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BAYONETTA_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BAYONETTA_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BAYONETTA_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
