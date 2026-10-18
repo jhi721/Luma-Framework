@@ -1396,6 +1396,7 @@ namespace
             {
                Shader::CachedPipeline* cached_pipeline = pair.second;
                if (cached_pipeline == nullptr || cached_pipeline->cloned || cached_pipeline->pipeline_clone.handle != 0 || cached_pipeline->shader_hashes.size() == 0) continue;
+               if (cached_pipeline->patch_application_mode == Shader::PatchApplicationMode::Inplace) continue; // Its shader object already runs the patch
                if (ShouldQueuePatchPipeline(device_data, cached_pipeline->shader_hashes[0]))
                {
                   to_reload.emplace(cached_pipeline->pipeline.handle);
@@ -2565,6 +2566,9 @@ namespace
             for (CachedPipeline* cached_pipeline : pipelines_pair->second)
             {
                if (cached_pipeline == nullptr) continue;
+               // Its shader object already runs the patch (see OnInitPipeline): a clone of it would be a duplicate, and would make the
+               // game's draws custom passes
+               if (cached_pipeline->patch_application_mode == Shader::PatchApplicationMode::Inplace) continue;
                if (!pipelines_filter.empty() && !pipelines_filter.contains(cached_pipeline->pipeline.handle)) continue;
                if (!iterated_pipelines.emplace(cached_pipeline->pipeline.handle).second) continue;
                pipelines_to_clone.emplace_back(cached_pipeline);
@@ -2709,8 +2713,12 @@ namespace
          assert(!cached_pipeline->cloned && cached_pipeline->pipeline_clone.handle == 0); // We destroy the potential previous one above in "UnloadCustomShaders"
          cached_pipeline->pipeline_clone = pipeline_clone;
          cached_pipeline->cloned = true;
-         // Clones registered here come from the background AutoLoadShaders thread (async).
-         cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+         // Clones registered here come from the background AutoLoadShaders thread (async). "Inplace" describes the original shader
+         // object, under any file clone.
+         if (cached_pipeline->patch_application_mode != Shader::PatchApplicationMode::Inplace)
+         {
+            cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+         }
          // TODO: make sure the pixel shaders have the same signature (through reflections) unless the vertex shader was also changed and has a different output signature? Just to make sure random hashes didn't end up replacing an accidentally equal hash (however unlikely)
          device_data.pipeline_cache_by_pipeline_clone_handle[pipeline_clone.handle] = cached_pipeline;
          device_data.cloned_pipeline_count++;
@@ -11288,7 +11296,10 @@ namespace
             CachedPipeline* cached_pipeline = pipeline_it->second;
             cached_pipeline->pipeline_clone = clone;
             cached_pipeline->cloned = true;
-            cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+            if (cached_pipeline->patch_application_mode != Shader::PatchApplicationMode::Inplace) // Describes the original shader object
+            {
+               cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+            }
             cached_pipeline->clone_origin = entry.clone_origin;
             device_data.pipeline_cache_by_pipeline_clone_handle[clone.handle] = cached_pipeline;
 
