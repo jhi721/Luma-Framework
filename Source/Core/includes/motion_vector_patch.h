@@ -461,9 +461,11 @@ namespace MotionVectorPatch
    // wrote), else (blended INV_SRC_ALPHA) x and y = a, reactivity (thresholded by the fill: water, fountains) and transparency &
    // composition (faint glass and haze). Empty if unpatchable.
    // "ALPHA_MOTION_VECTORS" (blended INV_SRC_ALPHA, the vertex shader patched too): the draw also writes its motion vector to
-   // "target_slot" with its alpha in w, for a blend state that blends that target like the color ("OnCreateBlendState"'s
+   // "target_slot" with a weight in w, for a blend state that blends that target like the color ("OnCreateBlendState"'s
    // "blend_alpha_blended_target"): opaque texels (a chain link fence's wires, Mirror's Edge) move with the draw and keep their history,
-   // empty ones keep what's behind. No mask ("reactive_slot" ignored): FSR's masks are for content without motion vectors.
+   // empty ones keep what's behind. The weight is the alpha thresholded around 0.5 (0 up to 0.4, 1 from 0.6): faint texels (a dirty or
+   // cracked windshield, Bayonetta) would otherwise pull the motion of the background seen through them toward their own.
+   // No mask ("reactive_slot" ignored): FSR's masks are for content without motion vectors.
    enum class ReactiveMode : uint8_t
    {
       ALPHA,
@@ -598,9 +600,11 @@ namespace MotionVectorPatch
       }
       else if (motion_vectors)
       {
-         // The motion vector (as "PatchPixelShader"), then w = saturate(a) for the target's blend (z = 0: an unwritten component is
-         // undefined)
+         // The motion vector (as "PatchPixelShader"), then w = saturate(a * 5 - 2) for the target's blend (z = 0: an unwritten
+         // component is undefined)
          AppendMotionVector(&reactive, layout, scratch, previous_position_temp);
+         constexpr uint32_t weight_scale = std::bit_cast<uint32_t>(5.f); // saturate(a * 5 - 2): 0 up to 0.4, 1 from 0.6
+         constexpr uint32_t weight_offset = std::bit_cast<uint32_t>(-2.f);
          reactive.insert(reactive.end(), {
                                             ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8),
                                             Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_Z),
@@ -610,11 +614,21 @@ namespace MotionVectorPatch
                                             0,
                                             0,
                                             0,
-                                            mov | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true),
+                                            Opcode(D3D10_SB_OPCODE_MAD, 15, true),
                                             Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_W),
                                             layout.target_slot,
                                             Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3),
                                             color,
+                                            immediate,
+                                            weight_scale,
+                                            weight_scale,
+                                            weight_scale,
+                                            weight_scale,
+                                            immediate,
+                                            weight_offset,
+                                            weight_offset,
+                                            weight_offset,
+                                            weight_offset,
                                          });
       }
       else
