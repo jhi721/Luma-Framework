@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -256,6 +257,10 @@ namespace DXBC
    {
       return RegisterOperand(type) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(x, y, z, w);
    }
+   constexpr uint32_t Opcode(D3D10_SB_OPCODE_TYPE type, uint32_t length, bool saturate = false)
+   {
+      return ENCODE_D3D10_SB_OPCODE_TYPE(type) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(length) | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(saturate);
+   }
    constexpr uint32_t mask_xy = D3D10_SB_OPERAND_4_COMPONENT_MASK_X | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y;
    constexpr uint32_t mask_xyw = mask_xy | D3D10_SB_OPERAND_4_COMPONENT_MASK_W;
 
@@ -487,5 +492,114 @@ namespace DXBC
       (*tokens)[1] = uint32_t(tokens->size());
       program->data.resize(tokens->size() * 4);
       std::memcpy(program->data.data(), tokens->data(), program->data.size());
+   }
+
+   // The clamp a pixel shader's UNORM render target 0 applied, put back for when that target is upgraded to float. SATURATE:
+   // saturate(o0). UNORM8 also rounds to the 8-bit target's 1/255 steps: consumers that decode around 128/255 (an encoded 0.5 stores
+   // as that) read a written 0.5 as a small offset otherwise. BLEND_INPUT clamps only what blending needs, rgb >= 0 and alpha in
+   // [0, 1] (an alpha above 1 makes INV_SRC_ALPHA negative), and keeps colour above 1 for HDR. FLOOR only clamps negatives, alpha
+   // included, for passes over an HDR scene whose upper clamp would clip it.
+   enum class Output0Clamp : uint8_t
+   {
+      SATURATE,
+      UNORM8,
+      BLEND_INPUT,
+      FLOOR,
+   };
+
+   // For "Game::PatchShaderBytecodeSync" ("code": the program after its version and length tokens, "size" its size in and out).
+   // o0's writes go to an added temp, copied to o0 clamped before the final ret: reading an output ("mov_sat o0, o0") isn't something
+   // fxc emits, and WARP's shader JIT crashes on it. "components" are the target's signature mask (x = 1). Null for a program with
+   // another return, a relatively indexed output or nothing to clamp.
+   inline std::unique_ptr<std::byte[]> ClampOutput0(const std::byte* code, size_t* size, Output0Clamp clamp = Output0Clamp::SATURATE, uint32_t components = 0xF)
+   {
+      if (*size % sizeof(uint32_t) != 0)
+         return nullptr;
+      Chunk program{.fourcc = FourCC("SHEX"), .data = std::vector<uint8_t>(8 + *size)};
+      const uint32_t header[2] = {0, uint32_t(program.data.size() / sizeof(uint32_t))};
+      std::memcpy(program.data.data(), header, sizeof(header));
+      std::memcpy(program.data.data() + sizeof(header), code, *size);
+      std::vector<uint32_t> tokens;
+      std::vector<Instruction> instructions;
+      size_t first_body = 0;
+      if (!ReadProgram(program, &tokens, &instructions, &first_body) || first_body >= instructions.size() || instructions.back().opcode != D3D10_SB_OPCODE_RET ||
+          std::ranges::any_of(instructions.begin() + first_body, instructions.end() - 1, [](const Instruction& instruction)
+             { return instruction.opcode == D3D10_SB_OPCODE_RET || instruction.opcode == D3D10_SB_OPCODE_RETC; }))
+         return nullptr;
+      // BLEND_INPUT: "mask" (rgb) gets the max, alpha the saturate
+      const uint32_t mask = (clamp == Output0Clamp::BLEND_INPUT ? (components & 0x7) : (components & 0xF));
+      const bool alpha = clamp == Output0Clamp::BLEND_INPUT && (components & 0x8) != 0;
+      if (mask == 0 && !alpha)
+         return nullptr;
+
+      uint32_t color;
+      std::vector<uint32_t> patched = CopyDeclarations(tokens, instructions, first_body, 1, &color, [](size_t)
+         { return std::vector<uint32_t>(); });
+      for (size_t i = first_body; i + 1 < instructions.size(); i++)
+      {
+         const Instruction& instruction = instructions[i];
+         const size_t offset = patched.size();
+         patched.insert(patched.end(), tokens.begin() + instruction.begin, tokens.begin() + instruction.begin + instruction.length);
+         bool supported = true;
+         const bool walked = WalkOperands(tokens, instruction, [&](size_t token_position, size_t index_position)
+            {
+               uint32_t& token = patched[offset + token_position - instruction.begin];
+               if (DECODE_D3D10_SB_OPERAND_TYPE(token) != D3D10_SB_OPERAND_TYPE_OUTPUT)
+                  return true;
+               if (index_position == no_index || DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, token) != D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
+                  return supported = false;
+               if (tokens[index_position] == 0)
+               {
+                  token = (token & ~D3D10_SB_OPERAND_TYPE_MASK) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP);
+                  patched[offset + index_position - instruction.begin] = color;
+               }
+               return true; });
+         if (!walked || !supported)
+            return nullptr;
+      }
+
+      // Signature masks are plain component bits (x = 1), the operand token masks the same shifted
+      const auto output = [](uint32_t mask)
+      { return Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask << 4); };
+      constexpr uint32_t color_source = Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3);
+      constexpr uint32_t immediate = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+      switch (clamp)
+      {
+      case Output0Clamp::SATURATE:
+         patched.insert(patched.end(), {Opcode(D3D10_SB_OPCODE_MOV, 5, true), output(mask), 0, color_source, color});
+         break;
+      case Output0Clamp::UNORM8:
+      {
+         // mov_sat | mad 255, 0.5 | round_ni | mul 1 / 255: UNORM's round to nearest
+         constexpr uint32_t all = Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL);
+         constexpr uint32_t scale = std::bit_cast<uint32_t>(255.f);
+         constexpr uint32_t half = std::bit_cast<uint32_t>(0.5f);
+         constexpr uint32_t inverse_scale = std::bit_cast<uint32_t>(1.f / 255.f);
+         patched.insert(patched.end(), {Opcode(D3D10_SB_OPCODE_MOV, 5, true), all, color, color_source, color,
+                                          Opcode(D3D10_SB_OPCODE_MAD, 15), all, color, color_source, color, immediate, scale, scale, scale, scale, immediate, half, half, half, half,
+                                          Opcode(D3D10_SB_OPCODE_ROUND_NI, 5), all, color, color_source, color,
+                                          Opcode(D3D10_SB_OPCODE_MUL, 10), output(mask), 0, color_source, color, immediate, inverse_scale, inverse_scale, inverse_scale, inverse_scale});
+         break;
+      }
+      case Output0Clamp::FLOOR:
+         patched.insert(patched.end(), {Opcode(D3D10_SB_OPCODE_MAX, 10), output(mask), 0, color_source, color, immediate, 0, 0, 0, 0});
+         break;
+      case Output0Clamp::BLEND_INPUT:
+         if (mask != 0)
+         {
+            patched.insert(patched.end(), {Opcode(D3D10_SB_OPCODE_MAX, 10), output(mask), 0, color_source, color, immediate, 0, 0, 0, 0});
+         }
+         if (alpha)
+         {
+            patched.insert(patched.end(), {Opcode(D3D10_SB_OPCODE_MOV, 5, true), output(0x8), 0, color_source, color});
+         }
+         break;
+      }
+      patched.insert(patched.end(), tokens.begin() + instructions.back().begin, tokens.end());
+
+      *size = (patched.size() - 2) * sizeof(uint32_t);
+      auto new_code = std::make_unique<std::byte[]>(*size);
+      std::memcpy(new_code.get(), patched.data() + 2, *size);
+      return new_code;
    }
 } // namespace DXBC
