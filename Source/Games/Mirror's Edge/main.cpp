@@ -1496,8 +1496,10 @@ class MirrorsEdge final : public Game
    {
       if (format != reshade::api::format::r16g16b16a16_float || source_subresource != 0 || dest_subresource != 0 || source_box != nullptr || dest_x != 0 || dest_y != 0 || dest_z != 0)
          return false;
-      DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
-      auto& gd = GetGameDeviceData(device_data);
+      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
+      if (!device_data || !device_data->game)
+         return false;
+      auto& gd = GetGameDeviceData(*device_data);
       // MSAA is on in the game (a resolve source is always multisampled), whatever the AA picked or the toggle (the settings, and the
       // coverage draws' gate)
       gd.msaa_resolved = true;
@@ -1507,7 +1509,7 @@ class MirrorsEdge final : public Game
       // Held through the draw so a shader reload can't release them mid-use
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       const uint32_t resolve_ps = (g_msaa_resolve_average_depth ? CompileTimeStringHash("ME MSAA Resolve Average Depth PS") : CompileTimeStringHash("MSAA Resolve PS"));
-      if (!DrawMSAAResolve((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), device_data, reinterpret_cast<ID3D11Resource*>(source.handle), reinterpret_cast<ID3D11Resource*>(dest.handle), DXGI_FORMAT_R16G16B16A16_FLOAT, gd.srv_exposure.get(), nullptr, resolve_ps))
+      if (!DrawMSAAResolve((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), *device_data, reinterpret_cast<ID3D11Resource*>(source.handle), reinterpret_cast<ID3D11Resource*>(dest.handle), DXGI_FORMAT_R16G16B16A16_FLOAT, gd.srv_exposure.get(), nullptr, resolve_ps))
          return false;
 #if DEVELOPMENT
       gd.mv_stats.msaa_resolves++;
@@ -2167,8 +2169,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // The scene is already fp16 (alpha = linear depth); TdToneMapping writes fp16 too, then TdMotionBlur and the HUD
       // draw into the r8g8b8a8_typeless canvas that is copied to the swapchain: that canvas is the only HDR clip.
       // Indirect (mirror substituted at bind): changing a dgVoodoo resource's creation format breaks its bookkeeping
-      // (black screen, MOHA/BL2). Upgrading the A16B16G16R16 UNORM exposure and bloom buffers is optional (HDR bloom);
-      // the passes reading them then need the UNORM [0, 1] clamp back where vanilla relies on it.
+      // (black screen, MOHA/BL2). The A16B16G16R16 UNORM exposure and bloom buffers stay UNORM: their passes rely on its [0, 1] clamp
+      // (the exposure sees clipped input, bloom is stored / 4; _tools/mirrors_edge/NOTES.md).
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       enable_indirect_texture_format_upgrades = true;
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies;
