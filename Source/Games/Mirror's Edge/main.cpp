@@ -1906,6 +1906,8 @@ public:
    {
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
       auto& gd = GetGameDeviceData(device_data);
+      // The game's lists are all pixel shaders: looked up by this hash (a list's "Contains" of another walks the list)
+      const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
       // Render target 0's resource (null without one)
       const auto bound_render_target_resource = [&]
       {
@@ -1918,7 +1920,7 @@ public:
          }
          return resource;
       };
-      if (is_immediate && original_shader_hashes.Contains(shader_hashes_TdMotionBlur))
+      if (is_immediate && shader_hashes_TdMotionBlur.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
       {
          gd.canvas_res = bound_render_target_resource();
       }
@@ -1936,16 +1938,16 @@ public:
       // Ahead of the motion vector path, which refuses multisampled scenes anyway
       if (g_msaa_resolve_enable && g_msaa_coverage_enable && gd.msaa_active && is_immediate && !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
       {
-         ID3D11PixelShader* const coverage_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, uint32_t(original_shader_hashes.pixel_shaders[0]), cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::COVERAGE).shader.get();
-         if (coverage_shader)
+         // The target first: most draws with MSAA on (the UI, post) aren't multisampled, and need no shader lookup
+         com_ptr<ID3D11Texture2D> rt_texture;
+         D3D11_TEXTURE2D_DESC rt_desc = {};
+         if (const com_ptr<ID3D11Resource> rt = bound_render_target_resource(); rt && SUCCEEDED(rt->QueryInterface(&rt_texture)))
          {
-            com_ptr<ID3D11Texture2D> rt_texture;
-            D3D11_TEXTURE2D_DESC rt_desc = {};
-            if (const com_ptr<ID3D11Resource> rt = bound_render_target_resource(); rt && SUCCEEDED(rt->QueryInterface(&rt_texture)))
-            {
-               rt_texture->GetDesc(&rt_desc);
-            }
-            if (rt_desc.SampleDesc.Count >= 4)
+            rt_texture->GetDesc(&rt_desc);
+         }
+         if (rt_desc.SampleDesc.Count >= 4)
+         {
+            if (ID3D11PixelShader* const coverage_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::COVERAGE).shader.get())
             {
                com_ptr<ID3D11PixelShader> game_shader;
                native_device_context->PSGetShader(&game_shader, nullptr, nullptr);
@@ -1963,12 +1965,12 @@ public:
       {
          // A game draw (not Luma's) with a vertex shader, which the patched shaders can redo
          const bool game_mesh_draw = !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
-         if (!gd.mv_scene_done && original_shader_hashes.Contains(shader_hashes_ScenePost))
+         if (!gd.mv_scene_done && shader_hashes_ScenePost.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
          {
             if (gd.mv_scene_open)
             {
 #if DEVELOPMENT
-               gd.mv_stats.ended_by = uint32_t(original_shader_hashes.pixel_shaders[0]);
+               gd.mv_stats.ended_by = pixel_shader_hash;
 #endif
                // The scene's last copy, if the pass reads it
                gd.mv_scene_copy.reset();
@@ -2050,7 +2052,7 @@ public:
       // ends in GammaCorrection before the main scene is drawn.
       static std::atomic<uint32_t> tonemap_frame = UINT32_MAX;
 #endif
-      if (const bool tonemap = original_shader_hashes.Contains(shader_hashes_ToneMapping); tonemap || original_shader_hashes.Contains(shader_hashes_GammaCorrection))
+      if (const bool tonemap = shader_hashes_ToneMapping.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel); tonemap || shader_hashes_GammaCorrection.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
       {
          device_data.has_drawn_main_post_processing = true;
 #if DEVELOPMENT
@@ -2097,12 +2099,11 @@ public:
       {
          static std::shared_mutex census_mutex;
          static std::unordered_set<uint32_t> census;
-         const uint32_t hash = original_shader_hashes.pixel_shaders[0];
          const std::unique_lock lock(census_mutex);
-         if (const auto [it, inserted] = census.insert(hash); inserted)
+         if (const auto [it, inserted] = census.insert(pixel_shader_hash); inserted)
          {
             reshade::log::message(reshade::log::level::info,
-               std::format("[Mirror's Edge] Post-tonemap PS 0x{:08X} ({}), frame {}", hash, (ui_saturated_pixel_shaders.contains(hash) ? "saturated" : (scene_blend_input_pixel_shaders.contains(hash) ? "blend input" : "UNCLAMPED")), cb_luma_global_settings.FrameIndex).c_str());
+               std::format("[Mirror's Edge] Post-tonemap PS 0x{:08X} ({}), frame {}", pixel_shader_hash, (ui_saturated_pixel_shaders.contains(pixel_shader_hash) ? "saturated" : (scene_blend_input_pixel_shaders.contains(pixel_shader_hash) ? "blend input" : "UNCLAMPED")), cb_luma_global_settings.FrameIndex).c_str());
          }
       }
 #endif
