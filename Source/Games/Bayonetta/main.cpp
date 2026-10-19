@@ -91,6 +91,7 @@ static bool g_smaa_pred_debug = false; // The predication mask instead of the an
 // resolution rises
 static bool g_resolution_scaled_effects = true;
 static bool g_fix_frame_pacing = true; // The game's frame limiters replaced (see "FrameLimiter")
+static bool g_60_fps_cutscenes = true; // The loop's 30 fps bit kept clear (see "FrameLimiter::Apply60FpsCutscenes")
 // The target size the pixel kernel passes read instead of c194, not used by dgVoodoo (b3, b4) nor Luma (b12, b13)
 static constexpr UINT TARGET_SIZE_CB_SLOT = 10;
 static bool g_gtao_enable = true; // XeGTAO replaces the game's SSAO (see "RunXeGTAO")
@@ -183,10 +184,20 @@ namespace FrameLimiter
    // The game's late thresholds (-24.19 and -48.38 ms) are 1.45 of its steps
    constexpr double LATE_PERIODS = 1.45;
 
+   // FUN_0045b4a0, run by the loop before each frame's 30/60 choice, applies a pending 30 fps request (DAT_051adefc, DAT_051adf00) to
+   // the loop's 30 fps bit (DAT_051ade24 0x200000); a 30 fps event (real-time cutscene) also sets the bit at its start (FUN_00536010).
+   // The loop updates the game at 60 Hz either way: the bit only skips every other update's draw and Present. Patched (BayoHook's bytes:
+   // "jz" no request -> 2 nops, "jz" request off -> "jmp") the function clears the bit before every frame.
+   uint8_t* const APPLY_30_FPS_REQUEST = reinterpret_cast<uint8_t*>(0x45B4A0);
+   constexpr std::array<uint8_t, 27> APPLY_30_FPS_REQUEST_ORIGINAL = {0x83, 0x3D, 0xFC, 0xDE, 0x1A, 0x05, 0x00, 0x74, 0x28, 0x83, 0x3D, 0x00, 0xDF, 0x1A, 0x05, 0x00, 0xC7, 0x05, 0xFC, 0xDE, 0x1A, 0x05, 0x00, 0x00, 0x00, 0x00, 0x74};
+   constexpr std::array<uint8_t, 27> APPLY_30_FPS_REQUEST_PATCHED = {0x83, 0x3D, 0xFC, 0xDE, 0x1A, 0x05, 0x00, 0x90, 0x90, 0x83, 0x3D, 0x00, 0xDF, 0x1A, 0x05, 0x00, 0xC7, 0x05, 0xFC, 0xDE, 0x1A, 0x05, 0x00, 0x00, 0x00, 0x00, 0xEB};
+
    using Limiter = void(__cdecl*)();
    Limiter original_60 = nullptr;
    Limiter original_30 = nullptr;
    bool installed = false;
+   bool cutscenes_patchable = false; // FUN_0045b4a0 as shipped (not already patched by another mod)
+   bool cutscenes_patched = false;
 
    // The game's main thread only. No VBlank phase lock (FL-9): D3DKMTGetScanLine, the only live VBlank source under independent flip,
    // stalls ~3.7 ms in 0.1-0.5% of its calls (p999 3.72 ms, measured 2026-10-19), a hitch before Present every few seconds.
@@ -280,8 +291,25 @@ namespace FrameLimiter
 #endif
    }
 
+   // On the game's main thread (from the limiters), the thread that runs FUN_0045b4a0
+   void Apply60FpsCutscenes()
+   {
+      const bool patch = cutscenes_patchable && g_60_fps_cutscenes;
+      if (patch == cutscenes_patched)
+         return;
+      const auto& bytes = (patch ? APPLY_30_FPS_REQUEST_PATCHED : APPLY_30_FPS_REQUEST_ORIGINAL);
+      DWORD old_protect;
+      if (!VirtualProtect(APPLY_30_FPS_REQUEST, bytes.size(), PAGE_EXECUTE_READWRITE, &old_protect))
+         return;
+      std::memcpy(APPLY_30_FPS_REQUEST, bytes.data(), bytes.size());
+      VirtualProtect(APPLY_30_FPS_REQUEST, bytes.size(), old_protect, &old_protect);
+      FlushInstructionCache(GetCurrentProcess(), APPLY_30_FPS_REQUEST, bytes.size());
+      cutscenes_patched = patch;
+   }
+
    void __cdecl Limit60()
    {
+      Apply60FpsCutscenes();
       if (g_fix_frame_pacing)
       {
          Limit(1);
@@ -295,6 +323,7 @@ namespace FrameLimiter
    // The caller pushes an unused argument (cdecl: it pops it)
    void __cdecl Limit30()
    {
+      Apply60FpsCutscenes();
       if (g_fix_frame_pacing)
       {
          Limit(2);
@@ -331,7 +360,9 @@ namespace FrameLimiter
       {
          MH_RemoveHook(LIMIT_60);
          MH_RemoveHook(LIMIT_30);
+         return;
       }
+      cutscenes_patchable = std::memcmp(APPLY_30_FPS_REQUEST, APPLY_30_FPS_REQUEST_ORIGINAL.data(), APPLY_30_FPS_REQUEST_ORIGINAL.size()) == 0;
    }
 } // namespace FrameLimiter
 
@@ -2165,6 +2196,7 @@ public:
             &FrameLimiter::spin_margin_us }});
       Mcp::RegisterToggles({
          {"fix_frame_pacing", &g_fix_frame_pacing},
+         {"60_fps_cutscenes", &g_60_fps_cutscenes},
          {"hide_ui", &g_hide_ui},
          {"msaa_resolve_enable", &g_msaa_resolve_enable},
          {"msaa_coverage_enable", &g_msaa_coverage_enable},
@@ -3075,6 +3107,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       reshade::get_config_value(nullptr, NAME, "FixHighResolutionEffects", g_resolution_scaled_effects);
       reshade::get_config_value(nullptr, NAME, "FixFramePacing", g_fix_frame_pacing);
+      reshade::get_config_value(nullptr, NAME, "60FPSCutscenes", g_60_fps_cutscenes);
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
@@ -3181,6 +3214,11 @@ public:
       ImGui::BeginDisabled(!FrameLimiter::installed);
       DrawSettingCheckbox("Fix Frame Pacing", "FixFramePacing", &g_fix_frame_pacing, true,
          "Replaces the game's frame limiter with a precise one at the display's refresh rate: even frame times and no periodic stutter at 60 Hz (the game paces at 59.94 fps and releases frames up to 2 ms early). Turn off an external frame rate limit with it.", !FrameLimiter::installed);
+      ImGui::EndDisabled();
+      // Patched from the limiter hooks, on the Steam executable only ("FrameLimiter::Apply60FpsCutscenes")
+      ImGui::BeginDisabled(!FrameLimiter::cutscenes_patchable);
+      DrawSettingCheckbox("60 FPS Cutscenes", "60FPSCutscenes", &g_60_fps_cutscenes, true,
+         "Draws the real-time cutscenes at 60 fps instead of 30. Their speed and audio don't change: the game updates at 60 fps in them too and only drew every other update.", !FrameLimiter::cutscenes_patchable);
       ImGui::EndDisabled();
 #if DEVELOPMENT
       ImGui::Text("Frame limiter: period %u us, spin margin %u us, late %u, resyncs %u, adopted %u", FrameLimiter::period_us, FrameLimiter::spin_margin_us, FrameLimiter::late_frames, FrameLimiter::resyncs, FrameLimiter::adopted_deadlines);
