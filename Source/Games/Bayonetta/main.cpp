@@ -37,6 +37,15 @@ const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437, 0x758
 const ShaderHashesList shader_hashes_DgVoodooPresent = {.pixel_shaders = {0x880A17D3}};
 // filtershaderssao: reads the depth prepass (R32F 1 - z/w) on t2, the SMAA predication source
 const ShaderHashesList shader_hashes_SSAO = {.pixel_shaders = {0x40AF18CC, 0xC32759B1}};
+// The passes whose kernels step in pixels of their target, by "g_TargetSize" c194 (cb4[202], the target's size): the shadow mask blurs
+// (filtershadow_1 to _3), the DoF gathers (filter08_0 to _4) and the SSAO (filtershaderssao). Authored at 1280x720, at 4K each kernel was
+// a third of its size (PCGamingWiki: razor sharp shadows, little depth of field). Their c194 reads come from "TARGET_SIZE_CB_SLOT" instead
+// ("PatchShaderBytecodeSync"), the target's size at 720p with "g_resolution_scaled_effects" (all of them draw into scene sized targets).
+// Not the shadow receivers (modelshadershadowrec00, shadowfixed): their PCF offsets are also c194 based (the screen's size, read in game)
+// but step on the point sampled 4096 shadow map, so at 720p's size the taps landed ~1.6 texels apart and drew offset copies of the
+// shadow edges (stripes in game). Pairs (2.87.5, 2.81.3) in that order.
+const ShaderHashesList shader_hashes_PixelKernels = {.pixel_shaders = {0x0788DCAD, 0xB02CEC5A, 0xA7C3CCD7, 0x60FA1018, 0x4894A725, 0xD4F6B2D2, 0x0B1A2B23, 0x917C0C95, 0x58C43DE9, 0x11E66C0B, 0x2A8528AE, 0xA801906F, 0x2B93FD4F, 0xA0BD8BBA, 0x40D84AAB,
+                                                        0x29CE44D6, 0x40AF18CC, 0xC32759B1}};
 // The Sofdec movies' Y'CbCr -> R'G'B', drawn on the canvas after the scene (Video_0xC60649FD)
 const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0xC60649FD, 0xED0DA20F}};
 // The scene's first post pass, which ends a motion vector frame (the fill and the upscaler run right before it): OtPost's motion blur
@@ -75,6 +84,11 @@ static bool g_hide_ui = false;              // Session-only, never persisted: a 
 #if DEVELOPMENT
 static bool g_smaa_pred_debug = false; // The predication mask instead of the antialiased canvas
 #endif
+// The pixel sized kernels at their 1280x720 size on screen ("shader_hashes_PixelKernels"); off: the PC version's, smaller as the
+// resolution rises
+static bool g_resolution_scaled_effects = true;
+// The target size the pixel kernel passes read instead of c194, not used by dgVoodoo (b3, b4) nor Luma (b12, b13)
+static constexpr UINT TARGET_SIZE_CB_SLOT = 10;
 static bool g_gtao_enable = true; // XeGTAO replaces the game's SSAO (see "RunXeGTAO")
 // XeGTAO's knobs, "register(b9)" in Luma_Bayonetta_XeGTAO.hlsl and Luma_Bayonetta_XeGTAOApply.hlsl
 static constexpr UINT GTAO_KNOBS_CB_SLOT = 9;
@@ -156,6 +170,9 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> scene_srv;
    // The depth prepass as this frame's SSAO pass read it (null without SSAO): the SMAA predication source
    ComPtr<ID3D11ShaderResourceView> depth_srv;
+   // What "shader_hashes_PixelKernels" read in place of c194 (see "BindPixelKernelTargetSize"), and its value
+   com_ptr<ID3D11Buffer> pixel_kernel_target_size_buffer;
+   std::array<float, 4> pixel_kernel_target_size = {};
    // XeGTAO (see "RunXeGTAO"): the scratch at the SSAO depth's size ("gtao_size", kept on a failed allocation so it isn't retried
    // every frame) and its knobs
    ComPtr<ID3D11Texture2D> gtao_depth_mips; // R32F view depth, 5 mips
@@ -1981,6 +1998,8 @@ public:
          {"sr_reactive_debug_view", &g_sr_reactive_debug_view},
       });
       Mcp::RegisterValues({{"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
+      Mcp::RegisterToggles({{"gtao_enable", &g_gtao_enable}, { "resolution_scaled_effects",
+                               &g_resolution_scaled_effects }});
       Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 0.01f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips), MCP_GAME_TEXTURE("gtao.output", gtao_output)});
@@ -2026,10 +2045,26 @@ public:
    {
       if (type != reshade::api::pipeline_subobject_type::pixel_shader)
          return nullptr;
+      // The pixel kernels' target size from "TARGET_SIZE_CB_SLOT" (see "shader_hashes_PixelKernels"), then the clamps below on top
+      std::unique_ptr<std::byte[]> redirected;
+      if (shader_hashes_PixelKernels.Contains(uint32_t(shader_hash), reshade::api::shader_stage::pixel))
+      {
+         redirected = DXBC::RedirectConstantRow(code, &size, MotionVectorPatches::object_slot, 202, TARGET_SIZE_CB_SLOT, 0);
+         ASSERT_ONCE(redirected);
+         if (redirected)
+         {
+            code = redirected.get();
+         }
+      }
+      // A clamp's patch, else the redirected program (or none)
+      const auto patched = [&](std::unique_ptr<std::byte[]> clamped)
+      {
+         return clamped ? std::move(clamped) : std::move(redirected);
+      };
       if (velocity_pixel_shaders.contains(uint32_t(shader_hash)))
-         return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::UNORM8);
+         return patched(DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::UNORM8));
       if (canvas_clamped_pixel_shaders.contains(uint32_t(shader_hash)))
-         return DXBC::ClampOutput0(code, &size);
+         return patched(DXBC::ClampOutput0(code, &size));
       // Every other float target 0 (dgVoodoo's own R32_UINT outputs aside): the game's targets are A8R8G8B8 (upgraded to fp16, which
       // doesn't clamp blend inputs) or R32F (depth in 0-1). Scene alpha reached 2 in captures, making the SRC_ALPHA/INV_SRC_ALPHA
       // blends' destination weight negative.
@@ -2041,12 +2076,12 @@ public:
          output_signature = DXBC::FindChunk(&chunks, DXBC::FourCC("OSGN"));
       }
       if (!output_signature || !DXBC::ReadSignature(output_signature->data, &outputs))
-         return nullptr;
+         return patched(nullptr);
       const auto target = std::ranges::find_if(outputs, [](const DXBC::SignatureElement& element)
          { return MotionVectorPatch::IsTarget(element) && element.reg == 0; });
       if (target == outputs.end() || target->component_type != D3D_REGISTER_COMPONENT_FLOAT32)
-         return nullptr;
-      return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT, target->mask);
+         return patched(nullptr);
+      return patched(DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT, target->mask));
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
@@ -2119,6 +2154,35 @@ public:
          game_device_data.mv_scene_last_copy = reinterpret_cast<ID3D11Resource*>(dst_resource);
       }
       return false;
+   }
+
+   // The target size "shader_hashes_PixelKernels" read in place of c194: render target 0's, or what it would be at 720p (width * 720 /
+   // height, 720) with "g_resolution_scaled_effects". Kept bound: neither dgVoodoo nor Luma uses its slot.
+   static void BindPixelKernelTargetSize(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd)
+   {
+      com_ptr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+      if (!rtv)
+         return;
+      const uint2 size = GetViewTextureSize(rtv.get());
+      if (size.y == 0)
+         return;
+      const float scale = (g_resolution_scaled_effects ? 720.f / float(size.y) : 1.f);
+      const std::array<float, 4> target_size = {float(size.x) * scale, float(size.y) * scale, 0.f, 0.f};
+      if (!gd->pixel_kernel_target_size_buffer)
+      {
+         const D3D11_BUFFER_DESC desc = {.ByteWidth = sizeof(target_size), .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_CONSTANT_BUFFER};
+         if (FAILED(native_device->CreateBuffer(&desc, nullptr, &gd->pixel_kernel_target_size_buffer)))
+            return;
+         gd->pixel_kernel_target_size = {};
+      }
+      if (target_size != gd->pixel_kernel_target_size)
+      {
+         native_device_context->UpdateSubresource(gd->pixel_kernel_target_size_buffer.get(), 0, nullptr, target_size.data(), 0, 0);
+         gd->pixel_kernel_target_size = target_size;
+      }
+      ID3D11Buffer* const buffer = gd->pixel_kernel_target_size_buffer.get();
+      native_device_context->PSSetConstantBuffers(TARGET_SIZE_CB_SLOT, 1, &buffer);
    }
 
    // XeGTAO's camera: where a depth prepass vertex shader keeps its affine view transform and the same transform followed by the
@@ -2416,12 +2480,18 @@ public:
          return DrawOrDispatchOverrideType::Replaced;
       };
 
+      // The pixel kernels' target size
+      if (original_shader_hashes.Contains(shader_hashes_PixelKernels))
+      {
+         BindPixelKernelTargetSize(native_device, native_device_context, &game_device_data);
+      }
       // XeGTAO's camera, from the frame's first depth prepass draw with a known layout. Before the motion vector draws, which replace the
       // prepass' draws when they jitter.
       if (g_gtao_enable && is_immediate && !game_device_data.gtao_camera_taken && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
       {
          TakePrepassCamera(native_device, native_device_context, cmd_list_data, device_data, uint32_t(original_shader_hashes.vertex_shaders[0]));
       }
+
       // DLAA/FSR/Luma TAA: the scene's draws with motion vectors or jitter (see "DrawWithMotionVectors"), and the fill and upscaler at
       // its first post pass
       if (game_device_data.mv_active && is_immediate)
@@ -2820,6 +2890,7 @@ public:
 #endif
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+      reshade::get_config_value(nullptr, NAME, "FixHighResolutionEffects", g_resolution_scaled_effects);
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
@@ -2918,6 +2989,10 @@ public:
       {
          ImGui::SetTooltip("Disables the in-game UI.");
       }
+
+      ImGui::SeparatorText("Fixes");
+      DrawSettingCheckbox("Fix High Resolution Effects", "FixHighResolutionEffects", &g_resolution_scaled_effects, true,
+         "Keeps shadow softness, depth of field and SSAO the size they had at 1280x720, the resolution the game was made for. Above it the game shrinks them (razor sharp shadows and little depth of field at 4K).");
 
 #if DEVELOPMENT
       ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
