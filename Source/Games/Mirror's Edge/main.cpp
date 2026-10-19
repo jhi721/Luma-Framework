@@ -1549,7 +1549,7 @@ public:
       set.template operator()<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       set.template operator()<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       set.template operator()<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      set.template operator()<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, false, true>);
+      set.template operator()<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true, true>);
       set.template operator()<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
       set.template operator()<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
       set.template operator()<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
