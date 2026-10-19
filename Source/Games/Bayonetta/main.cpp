@@ -644,7 +644,8 @@ struct BayonettaGameDeviceData final : public GameDeviceData
 
    // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, empty until its first upload), from
    // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest upload. Unlocked: the
-   // buffer hooks and the draws run on one thread (DEVELOPMENT checks it, "mv_constants_thread"); dgVoodoo has no deferred contexts.
+   // buffer hooks and the draws are all calls on the immediate context, which D3D11 requires its caller to serialize (dgVoodoo has no
+   // deferred contexts). Not always from one thread: the D3D9 Reset of a resolution change maps from the game's window thread.
    using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
    struct RegisteredConstants
    {
@@ -658,9 +659,6 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    // Raised at present when motion vectors restart: the uploads missed while the hooks were idle make every older "latest" stale. A
    // counter rather than emptying the entries, which the frame's thread owns (dgVoodoo presents from another thread).
    std::atomic<uint32_t> mv_constants_generation = 1;
-#if DEVELOPMENT
-   DWORD mv_constants_thread = 0; // The thread of the first buffer hook since they were registered
-#endif
    // The first registered buffers, their sizes and entries (a node's address stays while the map grows), so a buffer hook finds them
    // without a lookup. With more registered, every buffer takes the map lookup.
    static constexpr uint32_t MAX_FILTERED_BUFFERS = 8;
@@ -1009,13 +1007,6 @@ class Bayonetta final : public Game
       BayonettaGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &buffer_size);
       if (!registered)
          return;
-#if DEVELOPMENT
-      if (gd.mv_constants_thread == 0)
-      {
-         gd.mv_constants_thread = GetCurrentThreadId();
-      }
-      ASSERT_ONCE(gd.mv_constants_thread == GetCurrentThreadId());
-#endif
       // Overwritten at every Map, so a pointer from before a pause of the hooks never reaches an Unmap
       registered->mapped = (access == reshade::api::map_access::write_discard && offset == 0) ? *data : nullptr;
 #if DEVELOPMENT
@@ -1058,13 +1049,6 @@ class Bayonetta final : public Game
       BayonettaGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &known_size);
       if (!registered)
          return false;
-#if DEVELOPMENT
-      if (gd.mv_constants_thread == 0)
-      {
-         gd.mv_constants_thread = GetCurrentThreadId();
-      }
-      ASSERT_ONCE(gd.mv_constants_thread == GetCurrentThreadId());
-#endif
       const UINT buffer_size = GetBufferSize(resource.handle, known_size);
       if (offset >= buffer_size)
          return false;
@@ -1558,9 +1542,6 @@ class Bayonetta final : public Game
             AddFilteredBuffer(gd, result.buffer, entry);
          }
       }
-#if DEVELOPMENT
-      ASSERT_ONCE(gd->mv_constants_thread == 0 || gd->mv_constants_thread == GetCurrentThreadId());
-#endif
       // An upload from before the hooks paused is stale (the draw stays uncopied until the next one)
       if (entry->latest.size() < vertex_shader.camera_offset + CAMERA_SIZE || entry->generation != gd->mv_constants_generation)
          return result;
