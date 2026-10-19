@@ -218,28 +218,28 @@ namespace FrameLimiter
    constexpr std::array<uint8_t, 27> APPLY_30_FPS_REQUEST_PATCHED = {0x83, 0x3D, 0xFC, 0xDE, 0x1A, 0x05, 0x00, 0x90, 0x90, 0x83, 0x3D, 0x00, 0xDF, 0x1A, 0x05, 0x00, 0xC7, 0x05, 0xFC, 0xDE, 0x1A, 0x05, 0x00, 0x00, 0x00, 0x00, 0xEB};
 
    using Limiter = void(__cdecl*)();
-   Limiter original_60 = nullptr;
-   Limiter original_30 = nullptr;
-   bool installed = false;
-   bool cutscenes_patchable = false; // FUN_0045b4a0 as shipped (not already patched by another mod)
-   bool cutscenes_patched = false;
+   static Limiter original_60 = nullptr;
+   static Limiter original_30 = nullptr;
+   static bool installed = false;
+   static bool cutscenes_patchable = false; // FUN_0045b4a0 as shipped (not already patched by another mod)
+   static bool cutscenes_patched = false;
 
    // The game's main thread only. No VBlank phase lock (FL-9): D3DKMTGetScanLine, the only live VBlank source under independent flip,
    // stalls ~3.7 ms in 0.1-0.5% of its calls (p999 3.72 ms, measured 2026-10-19), a hitch before Present every few seconds.
-   int64_t frequency = 0;
-   int64_t next = 0; // QPC
+   static int64_t frequency = 0;
+   static int64_t next = 0; // QPC
    // The deadline last written: any other value came from the game (its start, the movie sync, its own limiter while toggled off)
-   float written_next_ms = std::numeric_limits<float>::quiet_NaN();
-   HANDLE timer = nullptr;
-   int64_t spin_margin = 0; // FL-7
-   uint32_t display_query_frame = 0;
-   int64_t refresh_period = 0; // QPC ticks, 0 unknown
+   static float written_next_ms = std::numeric_limits<float>::quiet_NaN();
+   static HANDLE timer = nullptr;
+   static int64_t spin_margin = 0; // FL-7
+   static uint32_t display_query_frame = 0;
+   static int64_t refresh_period = 0; // QPC ticks, 0 unknown
 #if DEVELOPMENT
-   uint32_t late_frames = 0;
-   uint32_t resyncs = 0;
-   uint32_t adopted_deadlines = 0;
-   uint32_t period_us = 0;
-   uint32_t spin_margin_us = 0;
+   static uint32_t late_frames = 0;
+   static uint32_t resyncs = 0;
+   static uint32_t adopted_deadlines = 0;
+   static uint32_t period_us = 0;
+   static uint32_t spin_margin_us = 0;
 #endif
 
    void Limit(uint32_t frames)
@@ -380,6 +380,26 @@ namespace FrameLimiter
       }
       cutscenes_patchable = std::memcmp(APPLY_30_FPS_REQUEST, APPLY_30_FPS_REQUEST_ORIGINAL.data(), APPLY_30_FPS_REQUEST_ORIGINAL.size()) == 0;
    }
+
+   // From "DLL_PROCESS_DETACH": the game's limiters and its 30 fps request back as shipped
+   void Uninstall()
+   {
+      if (installed)
+      {
+         MH_RemoveHook(LIMIT_60);
+         MH_RemoveHook(LIMIT_30);
+         installed = false;
+      }
+      if (cutscenes_patched && System::PatchMemory(APPLY_30_FPS_REQUEST, APPLY_30_FPS_REQUEST_ORIGINAL.data(), APPLY_30_FPS_REQUEST_ORIGINAL.size(), System::PatchMemoryType::Code))
+      {
+         cutscenes_patched = false;
+      }
+      if (timer)
+      {
+         CloseHandle(timer);
+         timer = nullptr;
+      }
+   }
 } // namespace FrameLimiter
 
 // The shadow map's size: FUN_00402270 (applying the options) sets DAT_05abbe6c from {1024, 2048, 4096} (DAT_00d9d74c) by the shadow
@@ -393,7 +413,7 @@ namespace ShadowMap
    uint32_t* const SIZE = reinterpret_cast<uint32_t*>(0x5ABBE6C);
    constexpr std::array<uint32_t, 3> ORIGINAL_SIZES = {1024, 2048, 4096};
    constexpr uint32_t HIGH_RESOLUTION_SIZE = 8192; // 3 targets (R32F, RGBA8, D24S8): 768 MB, 576 more than at 4096
-   bool patchable = false;
+   static bool patchable = false;
 
    void Install()
    {
@@ -411,6 +431,15 @@ namespace ShadowMap
       if (*QUALITY == 2)
       {
          *SIZE = size;
+      }
+   }
+
+   // From "DLL_PROCESS_DETACH": the game's size table back (the map keeps its size until the game's next options change or level load)
+   void Uninstall()
+   {
+      if (patchable && SIZES[2] != ORIGINAL_SIZES.back())
+      {
+         System::PatchMemory(&SIZES[2], &ORIGINAL_SIZES.back(), sizeof(uint32_t), System::PatchMemoryType::Data);
       }
    }
 } // namespace ShadowMap
@@ -3351,15 +3380,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
    {
       Bayonetta::SetEvents(false);
-      if (FrameLimiter::installed)
-      {
-         MH_RemoveHook(FrameLimiter::LIMIT_60);
-         MH_RemoveHook(FrameLimiter::LIMIT_30);
-      }
-      if (FrameLimiter::timer)
-      {
-         CloseHandle(FrameLimiter::timer);
-      }
+      FrameLimiter::Uninstall();
+      ShadowMap::Uninstall();
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);
