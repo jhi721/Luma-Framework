@@ -3286,6 +3286,7 @@ public:
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
                   "\nSMAA (Iryoku)"
+                  "\nXeGTAO (Intel)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)"
                   "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
