@@ -6,26 +6,7 @@
 // signal; the hue follows a soft ReinhardPiecewise reference (MacLeod-Boynton), RenoDX's PsychoV31 maps to the
 // display (the Medal of Honor Airborne scheme, same UE3 grade family).
 #include "Includes/Common.hlsl"
-// clang-format off
-#include "../Includes/Color.hlsl"
-#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
-#include "../Includes/DgVoodoo.hlsl"
-// clang-format on
-
-// 1 = HDR, 0 = vanilla clamped SDR.
-#ifndef TONEMAP_TYPE
-#define TONEMAP_TYPE 1
-#endif
-
-// b3/b4 are dgVoodoo's state and the D3D9 pixel constants (c0 at row 8).
-cbuffer DgVoodooState : register(b3)
-{
-   float4 DgvConstants[77] : packoffset(c0);
-}
-cbuffer PixelShaderConstants : register(b4)
-{
-   float4 PsConstants[236] : packoffset(c0);
-}
+#include "Includes/Tonemap.hlsl"
 
 #define SceneShadowsAndDesaturation PsConstants[8]  // .xyz shadows (subtracted), .w desaturation weight
 #define SceneInverseHighLights      PsConstants[10] // .xyz scale
@@ -42,13 +23,6 @@ SamplerState SceneColorSampler : register(s0);
 SamplerState ColorCurvesKSampler : register(s1);
 SamplerState ColorCurvesMSampler : register(s2);
 SamplerState ExposureSampler : register(s3);
-
-// The original's pow: |x| floored at 1e-4, dgVoodoo's guarded log.
-float3 PowTd(float3 base, float3 exponent)
-{
-   const float3 b = max(abs(base), 0.0001);
-   return exp2(exponent * float3(DgVoodooLog2(b.x), DgVoodooLog2(b.y), DgVoodooLog2(b.z)));
-}
 
 // The game's grade, operand for operand. `clampSDR` false turns both upper clips into max(0).
 float3 GradeTd(float3 scene, float exposure, bool clampSDR)
@@ -76,27 +50,11 @@ void main(DGV_MAIN_SIGNATURE)
    const float3 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorSampler, v5.xy), DgvConstants[44], DgvConstants[45]).xyz * LumaSettings.GameSettings.Exposure;
 
 #if TONEMAP_TYPE >= 1
-   const float3 extendedLinear = gamma_to_linear(GradeTd(scene, exposure, false));
-
-   // The per-channel curves lean saturated highlights; the soft per-channel reference keeps that lean without the
-   // clip's whitening, MacLeod-Boynton puts its hue on the extended grade's own purity (see "PsychoVDisplayMapWithHueReference").
-   float3 outColor = PsychoVDisplayMapWithHueReference(extendedLinear,
-                                                       LumaSettings.GameSettings.Contrast,
-                                                       LumaSettings.GameSettings.Saturation,
-                                                       LumaSettings.GameSettings.HighlightsDesaturation);
+   const float3 displayLinear = DisplayMapTd(gamma_to_linear(GradeTd(scene, exposure, false)));
 #else
-   float3 outColor = gamma_to_linear(GradeTd(scene, exposure, true));
+   const float3 displayLinear = gamma_to_linear(GradeTd(scene, exposure, true));
 #endif
-
-   // Gamma space canvas (POST_PROCESS_SPACE_TYPE 0): the HUD blends onto it like vanilla.
-   outColor = linear_to_gamma(max(0.0, outColor * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true)));
-   // One step of the output quantizer: the 8 bit code in SDR, the 10 bit BT.2020 PQ code in HDR
-   if (LumaSettings.GameSettings.Dithering > 0.5)
-   {
-      ApplyOutputDithering(outColor, v5.xy, true, LumaSettings.DisplayMode != 0, LumaSettings.UIPaperWhiteNits);
-   }
-   // Last: the dither can step below 0 and the grade can emit NaN (a NaN in the canvas reads back black)
-   outColor = IsNaN_Strict(outColor) ? 0.0 : max(0.0, outColor);
+   float3 outColor = EncodeTdCanvas(displayLinear, v5.xy);
 
 #if DEVELOPMENT
    // Bring-up: DevSetting01 magenta (replacement bound), DevSetting02 the vanilla clamped grade.
