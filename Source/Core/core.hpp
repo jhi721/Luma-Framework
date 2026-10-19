@@ -4094,6 +4094,7 @@ namespace
          {
             DeviceData& device_data = *device->get_private_data<DeviceData>();
             const std::unique_lock lock_device(device_data.mutex);
+            std::vector<D3D11_INPUT_ELEMENT_DESC>& layout_descs = device_data.input_layouts_descs[reinterpret_cast<ID3D11InputLayout*>(pipeline.handle)];
             for (uint32_t j = 0; j < subobject.count; ++j)
             {
                reshade::api::input_element* desc = reinterpret_cast<reshade::api::input_element*>(subobject.data) + j;
@@ -4110,7 +4111,19 @@ namespace
                   internal_desc.SemanticName = "TEXCOORD";
                   internal_desc.SemanticIndex = desc->location;
                }
-               device_data.input_layouts_descs[reinterpret_cast<ID3D11InputLayout*>(pipeline.handle)].push_back(internal_desc);
+               layout_descs.push_back(internal_desc);
+            }
+            // For the shader warm-up pack, with the vertex shader it was created for
+            if (auto_dump)
+            {
+               for (uint32_t j = 0; j < subobject_count; ++j)
+               {
+                  if (subobjects[j].type == reshade::api::pipeline_subobject_type::vertex_shader && subobjects[j].count == 1)
+                  {
+                     const auto* signature_desc = static_cast<const reshade::api::shader_desc*>(subobjects[j].data);
+                     ShaderWarmup::DumpLayout(shaders_dump_path, signature_desc->code, signature_desc->code_size, layout_descs);
+                  }
+               }
             }
             return;
          }

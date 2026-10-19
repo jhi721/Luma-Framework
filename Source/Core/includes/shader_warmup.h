@@ -48,6 +48,103 @@ namespace ShaderWarmup
 
    constexpr uint32_t PACK_MAGIC = DXBC::FourCC("LSW1");
 
+   // An input layout the game created. AMD compiles a vertex shader again for each layout it's drawn with (NVIDIA doesn't:
+   // "_tools/shader_warmup/layout_probe.cpp"), so there each vertex shader is drawn with every layout created for its input signature (ISGN):
+   // dgVoodoo creates its layouts from a signature-only container, not from the shader. In the pack after the shaders, as stage 2 entries
+   // (a build without layouts stops reading there).
+   constexpr uint32_t LAYOUT_STAGE = 2;
+   constexpr uint32_t COMPUTE_STAGE = 3; // The wrapper's own compute shaders (dgVoodoo), after the vertex and pixel shaders
+   struct Layout
+   {
+      std::vector<std::string> names;
+      std::vector<D3D11_INPUT_ELEMENT_DESC> elements; // "SemanticName" is set from "names" when drawn
+   };
+
+   // The input signature chunk of a DXBC container, the key of its layouts (empty if it has none)
+   inline std::string GetInputSignature(const uint8_t* code, size_t size)
+   {
+      std::vector<DXBC::Chunk> chunks;
+      const DXBC::Chunk* signature = (DXBC::ReadChunks(code, size, &chunks) ? DXBC::FindChunk(&chunks, DXBC::FourCC("ISGN")) : nullptr);
+      return signature ? std::string(signature->data.begin(), signature->data.end()) : std::string();
+   }
+
+   // A layout entry: its vertex shader's input signature (size and bytes), the element count, then per element its name's size and
+   // bytes, semantic index, format, slot, offset and instance step rate (uint32_t each)
+   inline std::vector<uint8_t> SerializeLayout(const std::string& signature, const std::vector<D3D11_INPUT_ELEMENT_DESC>& elements)
+   {
+      std::vector<uint8_t> data;
+      const auto write = [&](const void* bytes, size_t size)
+      {
+         data.insert(data.end(), static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + size);
+      };
+      const auto write_uint = [&](uint32_t value)
+      {
+         write(&value, sizeof(value));
+      };
+      write_uint(uint32_t(signature.size()));
+      write(signature.data(), signature.size());
+      write_uint(uint32_t(elements.size()));
+      for (const D3D11_INPUT_ELEMENT_DESC& element : elements)
+      {
+         const std::string_view name = element.SemanticName;
+         write_uint(uint32_t(name.size()));
+         write(name.data(), name.size());
+         for (const uint32_t value : {element.SemanticIndex, uint32_t(element.Format), element.InputSlot, element.AlignedByteOffset, element.InstanceDataStepRate})
+         {
+            write_uint(value);
+         }
+      }
+      return data;
+   }
+
+   // The signature and layout of a layout entry, false if it's damaged
+   inline bool ParseLayout(const std::vector<uint8_t>& data, std::string* signature, Layout* layout)
+   {
+      size_t offset = 0;
+      const auto read = [&](void* bytes, size_t size)
+      {
+         if (offset + size > data.size())
+            return false;
+         std::memcpy(bytes, data.data() + offset, size);
+         offset += size;
+         return true;
+      };
+      uint32_t signature_size = 0;
+      if (!read(&signature_size, sizeof(signature_size)) || signature_size > data.size())
+         return false;
+      signature->resize(signature_size);
+      uint32_t count = 0;
+      if (!read(signature->data(), signature_size) || !read(&count, sizeof(count)) || count > D3D11_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT)
+         return false;
+      for (uint32_t i = 0; i < count; i++)
+      {
+         uint32_t name_size = 0;
+         if (!read(&name_size, sizeof(name_size)) || name_size > 64)
+            return false;
+         std::string& name = layout->names.emplace_back(name_size, '\0');
+         uint32_t values[5] = {}; // Semantic index, format, slot, offset, instance step rate
+         if (!read(name.data(), name_size) || !read(values, sizeof(values)) || values[2] >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)
+            return false;
+         layout->elements.push_back({.SemanticIndex = values[0], .Format = DXGI_FORMAT(values[1]), .InputSlot = values[2], .AlignedByteOffset = values[3], .InputSlotClass = (values[4] != 0 ? D3D11_INPUT_PER_INSTANCE_DATA : D3D11_INPUT_PER_VERTEX_DATA), .InstanceDataStepRate = values[4]});
+      }
+      return true;
+   }
+
+   // DEVELOPMENT, while dumping shaders: a layout the game created, next to the dumps ("layout_<hash>.bin") for
+   // "Scripts/build_warmup_pack.py". "signature_code" is the vertex shader it was created for.
+   inline void DumpLayout(const std::filesystem::path& dump_path, const void* signature_code, size_t signature_code_size, const std::vector<D3D11_INPUT_ELEMENT_DESC>& elements)
+   {
+      const std::string signature = GetInputSignature(static_cast<const uint8_t*>(signature_code), signature_code_size);
+      if (signature.empty())
+         return;
+      const std::vector<uint8_t> data = SerializeLayout(signature, elements);
+      const std::filesystem::path path = dump_path / std::format("layout_{:08X}.bin", Shader::BinToHash(data.data(), data.size()));
+      std::error_code error;
+      if (std::filesystem::exists(path, error) || (!std::filesystem::exists(dump_path, error) && !std::filesystem::create_directories(dump_path, error)))
+         return;
+      std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(data.data()), data.size());
+   }
+
    // The wrapper the game's shaders come from: dgVoodoo's D3D9 module ("d3d9_chain.dll" behind the D3D9 VA Fix proxy) describes itself
    // as "dgVoodoo 2.87.5 - Direct3D9". Anything else runs its own D3D11 bytecode.
    inline std::string GetWrapperName()
@@ -86,9 +183,9 @@ namespace ShaderWarmup
       return "D3D11";
    }
 
-   // Pack: "LSW1", the entry count, then per entry its stage (0 vertex, 1 pixel), size and DXBC container. A damaged pack keeps its valid
-   // entries.
-   inline std::vector<Entry> LoadPack(const std::filesystem::path& path)
+   // Pack: "LSW1", the entry count, then per entry its stage (0 vertex, 1 pixel, 3 compute, 2 layout), size and DXBC container (or
+   // layout). A damaged pack keeps its valid entries.
+   inline std::vector<Entry> LoadPack(const std::filesystem::path& path, std::unordered_map<std::string, std::vector<Layout>>* layouts)
    {
       std::vector<Entry> entries;
       std::ifstream file(path, std::ios::binary);
@@ -98,9 +195,22 @@ namespace ShaderWarmup
       for (uint32_t i = 0; i < header[1]; i++)
       {
          uint32_t entry_header[2] = {}; // Stage, size
-         if (!file.read(reinterpret_cast<char*>(entry_header), sizeof(entry_header)) || entry_header[0] > 1 || entry_header[1] < sizeof(Shader::DXBCHeader) || entry_header[1] > (16u << 20))
+         if (!file.read(reinterpret_cast<char*>(entry_header), sizeof(entry_header)) || entry_header[0] > COMPUTE_STAGE || entry_header[1] > (16u << 20))
             break;
-         Entry entry = {.type = (entry_header[0] == 0 ? reshade::api::pipeline_subobject_type::vertex_shader : reshade::api::pipeline_subobject_type::pixel_shader), .code = std::vector<uint8_t>(entry_header[1])};
+         if (entry_header[0] == LAYOUT_STAGE)
+         {
+            std::vector<uint8_t> data(entry_header[1]);
+            std::string signature;
+            Layout layout;
+            if (!file.read(reinterpret_cast<char*>(data.data()), data.size()) || !ParseLayout(data, &signature, &layout))
+               break;
+            (*layouts)[signature].push_back(std::move(layout));
+            continue;
+         }
+         if (entry_header[1] < sizeof(Shader::DXBCHeader))
+            break;
+         constexpr reshade::api::pipeline_subobject_type types[] = {reshade::api::pipeline_subobject_type::vertex_shader, reshade::api::pipeline_subobject_type::pixel_shader, {}, reshade::api::pipeline_subobject_type::compute_shader};
+         Entry entry = {.type = types[entry_header[0]], .code = std::vector<uint8_t>(entry_header[1])};
          if (!file.read(reinterpret_cast<char*>(entry.code.data()), entry.code.size()))
             break;
          const auto* container = reinterpret_cast<const Shader::DXBCHeader*>(entry.code.data());
@@ -197,7 +307,14 @@ namespace ShaderWarmup
             }
          }
       }
-      const std::vector<Entry> entries = LoadPack(pack_path);
+      std::unordered_map<std::string, std::vector<Layout>> layouts; // By vertex shader input signature
+      const std::vector<Entry> entries = LoadPack(pack_path, &layouts);
+      // NVIDIA warms a vertex shader for every layout at once
+      DXGI_ADAPTER_DESC adapter_desc = {};
+      if (SUCCEEDED(adapter->GetDesc(&adapter_desc)) && adapter_desc.VendorId == 0x10DE)
+      {
+         layouts.clear();
+      }
       g_worker.entry_count = entries.size();
       g_worker.processed = 0;
       g_worker.drawn = 0;
@@ -265,7 +382,8 @@ namespace ShaderWarmup
                std::this_thread::yield();
             }
          };
-         auto draw = [&](reshade::api::pipeline_subobject_type type, const std::vector<uint8_t>& code)
+         // One draw of "code", a vertex shader's once per layout of its signature ("vertex_shader_layouts", may be null)
+         auto draw = [&](reshade::api::pipeline_subobject_type type, const std::vector<uint8_t>& code, const std::vector<Layout>* vertex_shader_layouts)
          {
             context->ClearState();
             if (type == reshade::api::pipeline_subobject_type::compute_shader)
@@ -288,7 +406,7 @@ namespace ShaderWarmup
                context->RSSetViewports(1, &viewport);
                com_ptr<ID3D11VertexShader> vertex_shader;
                com_ptr<ID3D11PixelShader> pixel_shader;
-               com_ptr<ID3D11InputLayout> input_layout;
+               std::vector<com_ptr<ID3D11InputLayout>> input_layouts;
                if (type == reshade::api::pipeline_subobject_type::pixel_shader)
                {
                   const std::string signature(input_signature->data.begin(), input_signature->data.end());
@@ -323,28 +441,65 @@ namespace ShaderWarmup
                }
                else
                {
-                  // One layout of the inputs: AMD compiles a vertex shader again for each layout it's drawn with, so there only the
-                  // game's own layout is warm
-                  std::erase_if(inputs, [](const DXBC::SignatureElement& input)
-                     { return input.system_value != D3D_NAME_UNDEFINED; });
-                  std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
-                  for (const DXBC::SignatureElement& input : inputs)
-                  {
-                     const DXGI_FORMAT format = (input.component_type == D3D_REGISTER_COMPONENT_UINT32 ? DXGI_FORMAT_R32G32B32A32_UINT : (input.component_type == D3D_REGISTER_COMPONENT_SINT32 ? DXGI_FORMAT_R32G32B32A32_SINT : DXGI_FORMAT_R32G32B32A32_FLOAT));
-                     elements.push_back({.SemanticName = input.name.c_str(), .SemanticIndex = input.semantic_index, .Format = format, .AlignedByteOffset = UINT(elements.size() * 16), .InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA});
-                  }
                   device->CreateVertexShader(code.data(), code.size(), nullptr, &vertex_shader);
-                  if (!vertex_shader || elements.size() > D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || (!elements.empty() && FAILED(device->CreateInputLayout(elements.data(), UINT(elements.size()), code.data(), code.size(), &input_layout))))
+                  if (!vertex_shader)
                      return false;
-                  const UINT stride = UINT(zeros.size());
-                  const UINT offset = 0;
-                  ID3D11Buffer* const vertex_buffers[] = {vertices.get()};
-                  context->IASetVertexBuffers(0, 1, vertex_buffers, &stride, &offset);
-                  context->IASetInputLayout(input_layout.get());
+                  if (vertex_shader_layouts)
+                  {
+                     for (const Layout& layout : *vertex_shader_layouts)
+                     {
+                        std::vector<D3D11_INPUT_ELEMENT_DESC> elements = layout.elements;
+                        for (size_t i = 0; i < elements.size(); i++)
+                        {
+                           elements[i].SemanticName = layout.names[i].c_str();
+                        }
+                        // A layout the patched variants' inputs don't fit is skipped
+                        if (com_ptr<ID3D11InputLayout> input_layout; SUCCEEDED(device->CreateInputLayout(elements.data(), UINT(elements.size()), code.data(), code.size(), &input_layout)))
+                        {
+                           input_layouts.push_back(std::move(input_layout));
+                        }
+                     }
+                  }
+                  // Without a recorded layout, one of the inputs as R32x4 (the game's own layout stays cold on AMD)
+                  if (input_layouts.empty())
+                  {
+                     std::erase_if(inputs, [](const DXBC::SignatureElement& input)
+                        { return input.system_value != D3D_NAME_UNDEFINED; });
+                     std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
+                     for (const DXBC::SignatureElement& input : inputs)
+                     {
+                        const DXGI_FORMAT format = (input.component_type == D3D_REGISTER_COMPONENT_UINT32 ? DXGI_FORMAT_R32G32B32A32_UINT : (input.component_type == D3D_REGISTER_COMPONENT_SINT32 ? DXGI_FORMAT_R32G32B32A32_SINT : DXGI_FORMAT_R32G32B32A32_FLOAT));
+                        elements.push_back({.SemanticName = input.name.c_str(), .SemanticIndex = input.semantic_index, .Format = format, .AlignedByteOffset = UINT(elements.size() * 16), .InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA});
+                     }
+                     com_ptr<ID3D11InputLayout> input_layout;
+                     if (elements.size() > D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || (!elements.empty() && FAILED(device->CreateInputLayout(elements.data(), UINT(elements.size()), code.data(), code.size(), &input_layout))))
+                        return false;
+                     input_layouts.push_back(std::move(input_layout)); // Null without inputs
+                  }
+                  // The zeros on every slot a layout may read
+                  UINT strides[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+                  UINT offsets[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+                  ID3D11Buffer* vertex_buffers[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+                  std::ranges::fill(strides, UINT(zeros.size()));
+                  std::ranges::fill(vertex_buffers, vertices.get());
+                  context->IASetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, vertex_buffers, strides, offsets);
                }
                context->VSSetShader(vertex_shader.get(), nullptr, 0);
                context->PSSetShader(pixel_shader.get(), nullptr, 0);
-               context->DrawInstancedIndirect(arguments.get(), 0);
+               if (input_layouts.empty())
+               {
+                  context->DrawInstancedIndirect(arguments.get(), 0);
+               }
+               for (size_t i = 0; i < input_layouts.size(); i++)
+               {
+                  context->IASetInputLayout(input_layouts[i].get());
+                  context->DrawInstancedIndirect(arguments.get(), 0);
+                  // Every draw but the last counted here, the last one below
+                  if (i + 1 < input_layouts.size() && ++g_worker.drawn % 16 == 0)
+                  {
+                     wait_for_draws();
+                  }
+               }
             }
             // Waited on in batches (of both threads' draws, roughly): the driver's compile threads stay busy without a deep queue
             if (++g_worker.drawn % 16 == 0)
@@ -355,11 +510,11 @@ namespace ShaderWarmup
          };
          // Draws the codes of one entry; false once the device is gone (a shader the driver's compiler crashed on: every later creation
          // would fail)
-         auto warm = [&](reshade::api::pipeline_subobject_type type, const std::vector<std::vector<uint8_t>>& codes, size_t entry)
+         auto warm = [&](reshade::api::pipeline_subobject_type type, const std::vector<std::vector<uint8_t>>& codes, size_t entry, const std::vector<Layout>* vertex_shader_layouts)
          {
             for (const std::vector<uint8_t>& code : codes)
             {
-               if (!draw(type, code))
+               if (!draw(type, code, vertex_shader_layouts))
                {
                   g_worker.failed++;
                }
@@ -379,7 +534,8 @@ namespace ShaderWarmup
          {
             codes.clear();
             expand(entries[i].type, entries[i].code, &codes);
-            device_alive = warm(entries[i].type, codes, i);
+            const auto entry_layouts = (entries[i].type == reshade::api::pipeline_subobject_type::vertex_shader ? layouts.find(GetInputSignature(entries[i].code.data(), entries[i].code.size())) : layouts.end());
+            device_alive = warm(entries[i].type, codes, i, (entry_layouts != layouts.end() ? &entry_layouts->second : nullptr));
          }
          std::call_once(luma_shaders_fetched, [&]
             {
@@ -390,7 +546,7 @@ namespace ShaderWarmup
                } });
          for (size_t i = next_luma_shader++; i < luma_shaders.size() && !stopping() && device_alive; i = next_luma_shader++)
          {
-            device_alive = warm(luma_shaders[i].type, {luma_shaders[i].code}, entries.size() + i);
+            device_alive = warm(luma_shaders[i].type, {luma_shaders[i].code}, entries.size() + i, nullptr);
          }
          wait_for_draws();
          context->ClearState();
