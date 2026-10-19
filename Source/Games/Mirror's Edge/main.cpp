@@ -234,12 +234,10 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
    std::array<float, 2> mv_jitter_ndc = {}; // The same offset in NDC (y up), as the jitter buffer holds it
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
    // Per-draw lookups kept for the next draw (reset when the scene opens): the jitter path's last depth view and whether it's the scene
-   // depth, its last depth stencil state's depth test, the motion vector path's last accepted targets and the last blend state's
+   // depth (its depth test: "bound_states.DepthTested"), the motion vector path's last accepted targets and the last blend state's
    // opacity, the last vertex and pixel shader's patched versions (owned by the maps above, never erased)
    ID3D11DepthStencilView* jitter_dsv = nullptr;
    bool jitter_dsv_scene = false;
-   ID3D11DepthStencilState* jitter_depth_stencil_state = nullptr;
-   bool jitter_depth_test = true;
    ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
    ID3D11BlendState* mv_blend_state = nullptr; // See "ClassifyBoundBlend"
    bool mv_blend_opaque = true;
@@ -258,58 +256,19 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
    ID3D11DepthStencilView* mv_refused_dsv = nullptr;
    MotionVectorReject mv_refused_reason = REJECT_COUNT;
    ID3D11DepthStencilView* open_refused_dsv = nullptr;
-   bool mv_jitter_bound = false;
    // The marker texels got their camera motion before the frame's first alpha blended motion vector draw (see "DrawWithMotionVectors")
    bool mv_markers_filled = false;
    // MSAA is on in the game (a multisampled scene resolved): the upscalers and SMAA T2x can't run (shown in the settings).
    // "msaa_resolved" this frame, "msaa_active" the last one (the coverage draws come before this frame's resolves).
    bool msaa_resolved = false;
    bool msaa_active = false;
-   // The immediate context's blend and depth stencil states, vc4 (VS "MotionVectorPatches::object_slot"), vertex buffer 0 and index
-   // buffer as the game last bound them ("OnBindPipeline", "OnPushConstantBuffers", "OnBindVertexBuffers", "OnBindIndexBuffer"), so
-   // the draw hooks don't query them (an AddRef and a Release each, several per draw; Borderlands 2's). Not referenced: an object lives
-   // while bound. Luma's own passes bind theirs natively and put the game's back. False after a bind this can't read (another add-on's
-   // combined pipeline): queried then.
-   ID3D11BlendState* bound_blend_state = nullptr;
-   ID3D11DepthStencilState* bound_depth_stencil_state = nullptr;
-   ID3D11Buffer* bound_object_buffer = nullptr;
-   ID3D11Buffer* bound_vertex_buffer = nullptr;
-   UINT bound_vertex_offset = 0;
-   ID3D11Buffer* bound_index_buffer = nullptr;
-   UINT bound_index_offset = 0;
-   bool bound_states_tracked = true;
-
-   // Pointer and "HashCombine" keys: one multiply spreads them over the buckets (std::hash runs FNV-1a on every byte)
-   struct KeyHash
-   {
-      size_t operator()(uint64_t key) const noexcept
-      {
-         return size_t((key * 0x9E3779B97F4A7C15ull) >> 32);
-      }
-   };
-
-   // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, empty until its first upload), from
-   // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest upload, taken as is. Unlocked:
-   // the buffer hooks, the draws and "OnPresent" all run on the immediate context's thread (dgVoodoo has no deferred contexts).
-   using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
-   struct RegisteredConstants
-   {
-      // The last upload, a pooled copy (dgVoodoo maps a vc4 buffer for most draws, motion vector draws or not)
-      ConstantsCopy copy;
-      void* mapped = nullptr; // Mapped now, until its Unmap
-      UINT size = 0;          // The buffer's
-   };
-   std::unordered_map<uint64_t, RegisteredConstants, KeyHash> mv_constants_copies;
-   // The first registered buffers and their entries (a node's address stays while the map grows), so a buffer hook finds them without
-   // a lookup. With more registered, every buffer takes the map lookup.
-   static constexpr uint32_t MAX_FILTERED_BUFFERS = 8;
-   std::array<std::pair<uint64_t, RegisteredConstants*>, MAX_FILTERED_BUFFERS> mv_filtered_buffers = {};
-   uint32_t mv_filtered_buffer_count = 0;
-   bool mv_filter_overflow = false;
-   // Every pooled vc4 copy, and those nobody held anymore at the last present (taken by the next copies)
-   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
-   std::vector<uint32_t> mv_constants_pool_free;
-   size_t mv_constants_made = 0; // Copies asked for since the last present
+   // The immediate context's bindings as the game last bound them (see "PatchedDraws::BoundStates"), vc4 at
+   // "MotionVectorPatches::object_slot"; the jitter buffer's at "MotionVectorPatches::jitter_slot" ("BindJitter")
+   PatchedDraws::BoundStates<MotionVectorPatches::object_slot, MotionVectorPatches::jitter_slot> bound_states;
+   // CPU copies of the vc4 buffers the motion vector draws bind (see "PatchedDraws::ObjectConstants"): the buffer hooks, the draws
+   // and "OnPresent" all run on the immediate context's thread. Restarted at present when motion vectors restart.
+   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
+   PatchedDraws::ObjectConstants mv_constants;
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld and vc4. A draw takes the previous frame's vc4 of
@@ -319,8 +278,8 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
       PatchedDraws::ObjectTransform transform;
       ConstantsCopy constants;
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, KeyHash> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, KeyHash> mv_previous_objects;
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_objects;
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_previous_objects;
    // The frame's camera (vc4 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -626,67 +585,6 @@ class MirrorsEdge final : public Game
       return g_sr_reactive_enable && GetGameDeviceData(device_data).sr_active && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA);
    }
 
-   // The registered vc4 buffer's entry in "mv_constants_copies", null if the buffer isn't one
-   static MirrorsEdgeGameDeviceData::RegisteredConstants* FindRegisteredBuffer(MirrorsEdgeGameDeviceData* gd, uint64_t handle)
-   {
-      if (!gd->mv_filter_overflow)
-      {
-         for (uint32_t i = 0; i < gd->mv_filtered_buffer_count; i++)
-         {
-            if (const auto& [filtered_handle, entry] = gd->mv_filtered_buffers[i]; filtered_handle == handle)
-               return entry;
-         }
-         return nullptr;
-      }
-      const auto registered = gd->mv_constants_copies.find(handle);
-      return (registered != gd->mv_constants_copies.end() ? &registered->second : nullptr);
-   }
-
-   // Registers a vc4 buffer for the copies (see "mv_constants_copies"), in the filter while it has room
-   static MirrorsEdgeGameDeviceData::RegisteredConstants* RegisterBuffer(MirrorsEdgeGameDeviceData* gd, ID3D11Buffer* buffer)
-   {
-      MirrorsEdgeGameDeviceData::RegisteredConstants& entry = gd->mv_constants_copies[reinterpret_cast<uint64_t>(buffer)];
-      D3D11_BUFFER_DESC desc;
-      buffer->GetDesc(&desc);
-      entry.size = desc.ByteWidth;
-      if (gd->mv_filtered_buffer_count < MirrorsEdgeGameDeviceData::MAX_FILTERED_BUFFERS)
-      {
-         gd->mv_filtered_buffers[gd->mv_filtered_buffer_count++] = {reinterpret_cast<uint64_t>(buffer), &entry};
-      }
-      else
-      {
-         gd->mv_filter_overflow = true;
-      }
-      return &entry;
-   }
-
-   // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the last present, else a new one (a copy per
-   // upload)
-   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MirrorsEdgeGameDeviceData* gd, const uint8_t* bytes, size_t size)
-   {
-      gd->mv_constants_made++;
-      std::shared_ptr<std::vector<uint8_t>> copy;
-      if (gd->mv_constants_pool_free.empty())
-      {
-         copy = std::make_shared<std::vector<uint8_t>>();
-         gd->mv_constants_pool.push_back(copy);
-      }
-      else
-      {
-         copy = gd->mv_constants_pool[gd->mv_constants_pool_free.back()];
-         gd->mv_constants_pool_free.pop_back();
-      }
-      if (bytes)
-      {
-         copy->assign(bytes, bytes + size);
-      }
-      else
-      {
-         copy->assign(size, 0);
-      }
-      return copy;
-   }
-
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
@@ -694,15 +592,9 @@ class MirrorsEdge final : public Game
       if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active || !data || !*data)
          return;
       auto& gd = GetGameDeviceData(*device_data);
-      MirrorsEdgeGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle);
-      if (!registered)
-         return;
-      if (access == reshade::api::map_access::write_discard && offset == 0)
-      {
-         registered->mapped = *data;
-      }
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, *data);
 #if DEVELOPMENT
-      else
+      if (registered && !registered->mapped)
       {
          gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
       }
@@ -716,128 +608,37 @@ class MirrorsEdge final : public Game
       if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active)
          return;
       auto& gd = GetGameDeviceData(*device_data);
-      MirrorsEdgeGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle);
-      if (!registered || !registered->mapped)
-         return;
-      registered->copy = NewConstantsCopy(&gd, static_cast<const uint8_t*>(std::exchange(registered->mapped, nullptr)), registered->size);
+      if (gd.mv_constants.OnUnmap(resource.handle))
+      {
 #if DEVELOPMENT
-      gd.mv_stats.maps++;
+         gd.mv_stats.maps++;
 #endif
+      }
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs); a partial update is merged into the last
-   // copy. Needs the unsigned "full add-on support" ReShade (the signed build doesn't raise the event).
+   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs). Needs the unsigned "full add-on support"
+   // ReShade (the signed build doesn't raise the event).
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource resource, uint64_t offset, uint64_t size)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
       if (!device_data || !device_data->game || !data || !GetGameDeviceData(*device_data).mv_active)
          return false;
       auto& gd = GetGameDeviceData(*device_data);
-      MirrorsEdgeGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle);
-      if (!registered || offset >= registered->size)
-         return false;
-      const size_t updated_size = size_t((std::min)(size, uint64_t(registered->size) - offset));
-      // Merged into a copy of the last upload, else into zeros
-      auto updated = NewConstantsCopy(&gd, ((registered->copy && registered->copy->size() == registered->size) ? registered->copy->data() : nullptr), registered->size);
-      std::memcpy(updated->data() + offset, data, updated_size);
-      registered->copy = std::move(updated);
+      if (gd.mv_constants.OnUpdate(resource.handle, data, offset, size))
+      {
 #if DEVELOPMENT
-      gd.mv_stats.updates++;
+         gd.mv_stats.updates++;
 #endif
+      }
       return false;
    }
 
-   // "bound_blend_state" and "bound_depth_stencil_state", from the game's binds on the immediate context (ReShade raises one per state,
-   // and a reset binds none to every stage)
-   static void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
-   {
-      using reshade::api::pipeline_stage;
-      if ((stages & (pipeline_stage::output_merger | pipeline_stage::depth_stencil)) == 0)
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      if (stages == pipeline_stage::output_merger)
-      {
-         gd.bound_blend_state = reinterpret_cast<ID3D11BlendState*>(pipeline.handle);
-      }
-      else if (stages == pipeline_stage::depth_stencil)
-      {
-         gd.bound_depth_stencil_state = reinterpret_cast<ID3D11DepthStencilState*>(pipeline.handle);
-      }
-      else if (pipeline.handle == 0)
-      {
-         gd.bound_blend_state = nullptr;
-         gd.bound_depth_stencil_state = nullptr;
-      }
-      else
-      {
-         gd.bound_states_tracked = false;
-      }
-   }
-
-   // vc4's tracked binding (see "bound_object_buffer"); a game bind over the jitter slot (none seen) has it bound again
-   static void OnPushConstantBuffers(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
-   {
-      constexpr uint32_t slot = MotionVectorPatches::object_slot;
-      const auto covers = [&](uint32_t binding)
-      { return binding >= update.binding && binding < update.binding + update.count; };
-      if ((stages & reshade::api::shader_stage::vertex) == 0 || update.type != reshade::api::descriptor_type::constant_buffer || (!covers(slot) && !covers(MotionVectorPatches::jitter_slot)))
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      if (covers(MotionVectorPatches::jitter_slot))
-      {
-         gd.mv_jitter_bound = false;
-      }
-      if (covers(slot))
-      {
-         const auto* const ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
-         gd.bound_object_buffer = reinterpret_cast<ID3D11Buffer*>(ranges[slot - update.binding].buffer.handle);
-      }
-   }
-
-   // Vertex buffer 0's tracked binding (see "bound_vertex_buffer")
-   static void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
-   {
-      if (first != 0 || count == 0)
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      gd.bound_vertex_buffer = reinterpret_cast<ID3D11Buffer*>(buffers[0].handle);
-      gd.bound_vertex_offset = UINT(offsets[0]);
-   }
-
-   // The index buffer's tracked binding (see "bound_index_buffer")
-   static void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   // The tracked bindings the "PatchedDraws::BoundStates" events update: the immediate context's
+   static auto* GetBoundStates(reshade::api::command_list* cmd_list)
    {
       DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
       const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      gd.bound_index_buffer = reinterpret_cast<ID3D11Buffer*>(buffer.handle);
-      gd.bound_index_offset = UINT(offset);
-   }
-
-   // A bound object of the immediate context (not referenced: it lives while bound): "tracked" (see "bound_blend_state"), else what
-   // "query" writes to its argument (an object pointer to take over)
-   template <typename T, typename Query>
-   static T* BoundState(const MirrorsEdgeGameDeviceData* gd, T* tracked, const Query& query)
-   {
-      if (gd->bound_states_tracked)
-         return tracked;
-      com_ptr<T> queried;
-      query(&queried);
-      return queried.get();
+      return ((device_data && device_data->game && cmd_list_data && cmd_list_data->is_primary) ? &GetGameDeviceData(*device_data).bound_states : nullptr);
    }
 
    // The bound shader's patched version ("patch" for pixel shaders, see above), patched from Core's bytecode copy on first use (null if
@@ -957,8 +758,7 @@ class MirrorsEdge final : public Game
    // smoke, glass, water; reactive and transparency & composition), 2 additive (SRC_ALPHA / ONE: sparks, glows; reactive)
    static void ClassifyBoundBlend(ID3D11DeviceContext* native_device_context, MirrorsEdgeGameDeviceData* gd)
    {
-      ID3D11BlendState* const blend_state = BoundState(gd, gd->bound_blend_state, [&](ID3D11BlendState** state)
-         { native_device_context->OMGetBlendState(state, nullptr, nullptr); });
+      ID3D11BlendState* const blend_state = gd->bound_states.BlendState(native_device_context);
       if (blend_state == gd->mv_blend_state)
          return;
       D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
@@ -972,24 +772,6 @@ class MirrorsEdge final : public Game
       // Exactly the states whose motion vector target "PatchedDraws::OnCreateBlendState" blends ("blend_alpha_blended_target")
       gd->mv_alpha_blended = rt0.BlendEnable && rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA && rt0.BlendOp == D3D11_BLEND_OP_ADD;
       gd->mv_blend_state = blend_state;
-   }
-
-   // The bound depth stencil state tests depth (meshes do; full screen passes and composites don't), cached by state
-   static bool IsDepthTested(ID3D11DeviceContext* native_device_context, MirrorsEdgeGameDeviceData* gd)
-   {
-      ID3D11DepthStencilState* const depth_stencil_state = BoundState(gd, gd->bound_depth_stencil_state, [&](ID3D11DepthStencilState** state)
-         { native_device_context->OMGetDepthStencilState(state, nullptr); });
-      if (depth_stencil_state != gd->jitter_depth_stencil_state)
-      {
-         D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
-         if (depth_stencil_state)
-         {
-            depth_stencil_state->GetDesc(&depth_desc);
-         }
-         gd->jitter_depth_test = depth_desc.DepthEnable;
-         gd->jitter_depth_stencil_state = depth_stencil_state;
-      }
-      return gd->jitter_depth_test;
    }
 
    // Opens the scene at the frame's first mesh draw into output sized depth (the menu's 1280x720 scene never opens it): takes the scene
@@ -1019,12 +801,11 @@ class MirrorsEdge final : public Game
       gd.mv_scene_rtv.reset();
       gd.mv_scene_last_copy.reset();
       gd.jitter_dsv = nullptr;
-      gd.jitter_depth_stencil_state = nullptr;
-      gd.jitter_depth_test = true;
+      gd.bound_states.ResetDepthTest();
       gd.mv_accepted_dsv = nullptr;
       gd.mv_refused_rtv = nullptr;
       gd.mv_refused_dsv = nullptr;
-      gd.mv_jitter_bound = false;
+      gd.bound_states.jitter_bound = false;
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
       gd.mv_alpha_blended = false;
@@ -1065,10 +846,10 @@ class MirrorsEdge final : public Game
 #endif
 
    // The jitter buffer, bound once per scene (no translated shader reads b9, Luma draws nothing during the scene; a game bind over it
-   // resets "mv_jitter_bound", see "OnPushConstantBuffers")
+   // resets "jitter_bound", see "PatchedDraws::OnPushConstantBuffers")
    static void BindJitter(ID3D11DeviceContext* native_device_context, MirrorsEdgeGameDeviceData* gd)
    {
-      if (std::exchange(gd->mv_jitter_bound, true))
+      if (std::exchange(gd->bound_states.jitter_bound, true))
          return;
       ID3D11Buffer* const jitter = gd->mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
@@ -1089,7 +870,7 @@ class MirrorsEdge final : public Game
       }
       if (!rtvs[0] || !dsv || !gd.mv_scene_open)
          return MV_REJECT(REJECT_NO_SCENE);
-      if (!IsDepthTested(native_device_context, &gd))
+      if (!gd.bound_states.DepthTested(native_device_context))
          return MV_REJECT(REJECT_DEPTH_TEST);
       ClassifyBoundBlend(native_device_context, &gd);
       // Alpha blended draws (SRC_ALPHA / INV_SRC_ALPHA) take their own motion vectors too, blended by their alpha: the chain link
@@ -1242,19 +1023,13 @@ class MirrorsEdge final : public Game
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader reads
       // a constant buffer past b4.
-      ID3D11Buffer* const current = BoundState(&gd, gd.bound_object_buffer, [&](ID3D11Buffer** buffer)
-         { native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, buffer); });
+      ID3D11Buffer* const current = gd.bound_states.ObjectBuffer(native_device_context);
       const UINT read_size = gd.mv_last_vertex_shader.read_size;
-      // The buffer's CPU copy (null until its first upload); the lookup registers it for a copy at every upload
+      // The buffer's latest upload, whole (null until its first upload); the lookup registers it for a copy at every upload
       MirrorsEdgeGameDeviceData::ConstantsCopy constants;
       if (current)
       {
-         MirrorsEdgeGameDeviceData::RegisteredConstants* entry = FindRegisteredBuffer(&gd, reinterpret_cast<uint64_t>(current));
-         if (!entry)
-         {
-            entry = RegisterBuffer(&gd, current);
-         }
-         constants = entry->copy;
+         constants = gd.mv_constants.Snapshot(gd.mv_constants.Register(current));
       }
       // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
       // None (no CPU copy yet, another camera): the current one (zero motion).
@@ -1269,16 +1044,9 @@ class MirrorsEdge final : public Game
 
          // Draw key: same mesh, same shaders, no instance count
          // The offsets go with the buffers: queried with them, else tracked with them
-         UINT vertex_offset = gd.bound_vertex_offset;
-         ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
-            {
-               UINT stride;
-               native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &vertex_offset); });
-         UINT index_offset = gd.bound_index_offset;
-         ID3D11Buffer* const index_buffer = BoundState(&gd, gd.bound_index_buffer, [&](ID3D11Buffer** buffer)
-            {
-               DXGI_FORMAT format;
-               native_device_context->IAGetIndexBuffer(buffer, &format, &index_offset); });
+         UINT vertex_offset, index_offset;
+         ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context, &vertex_offset);
+         ID3D11Buffer* const index_buffer = gd.bound_states.IndexBuffer(native_device_context, &index_offset);
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
          uint64_t key = 0;
          for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer), uint64_t(vertex_offset),
@@ -1388,12 +1156,9 @@ class MirrorsEdge final : public Game
          gd.jitter_dsv = dsv;
          gd.jitter_dsv_scene = depth == gd.mv_depth;
       }
-      if (!gd.jitter_dsv_scene || !IsDepthTested(native_device_context, &gd))
+      if (!gd.jitter_dsv_scene || !gd.bound_states.DepthTested(native_device_context))
          return false;
-      const ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
-         {
-            UINT stride, offset;
-            native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &offset); });
+      const ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context);
       if (!vertex_buffer)
          return false;
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]).shader.get();
@@ -1785,10 +1550,10 @@ public:
       set.template operator()<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       set.template operator()<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       set.template operator()<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, false, true>);
-      set.template operator()<reshade::addon_event::bind_pipeline>(OnBindPipeline);
-      set.template operator()<reshade::addon_event::push_descriptors>(OnPushConstantBuffers);
-      set.template operator()<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
-      set.template operator()<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      set.template operator()<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
+      set.template operator()<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
+      set.template operator()<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
+      set.template operator()<reshade::addon_event::bind_index_buffer>(PatchedDraws::OnBindIndexBuffer<GetBoundStates>);
       set.template operator()<reshade::addon_event::create_resource>(OnCreateResource);
       set.template operator()<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
    }
@@ -1969,7 +1734,11 @@ public:
       {
          gd.ReleaseT2xFrames();
       }
-      gd.mv_active = (gd.sr_active || gd.t2x_active || g_mv_enable) && !gd.msaa_active;
+      // The uploads the buffer hooks missed while motion vectors were off make every earlier copy stale
+      if (!gd.mv_active.exchange((gd.sr_active || gd.t2x_active || g_mv_enable) && !gd.msaa_active) && gd.mv_active)
+      {
+         gd.mv_constants.Restart();
+      }
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when an
       // upscaler is picked again (the helper takes seconds to start).
       if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
@@ -1995,36 +1764,10 @@ public:
             gd.mv_fill_buffer.reset();
             gd.mv_jitter_buffer.reset();
             gd.mv_previous_constants = {}; // Its 4 MiB dynamic ring is address space too
-            gd.mv_constants_pool.clear();
-            gd.mv_constants_pool_free.clear();
+            gd.mv_constants.ReleasePool();
          }
       }
-      {
-         // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many as
-         // the last frame asked for: frames without a scene (loading, videos, menus) would keep their peak otherwise. Without motion
-         // vectors, none.
-         size_t kept_free = 0;
-         if (gd.mv_active)
-         {
-            kept_free = std::exchange(gd.mv_constants_made, 0);
-         }
-         std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
-            {
-               if (copy.use_count() != 1)
-                  return false;
-               if (kept_free == 0)
-                  return true;
-               kept_free--;
-               return false; });
-         gd.mv_constants_pool_free.clear();
-         for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
-         {
-            if (gd.mv_constants_pool[i].use_count() == 1)
-            {
-               gd.mv_constants_pool_free.push_back(i);
-            }
-         }
-      }
+      gd.mv_constants.TrimPool(gd.mv_active);
       // The reactive masks go once the fill stopped writing them (DLSS, the masks off, SMAA), like SMAA's resources above
       if (gd.mv_reactive_target && cb_luma_global_settings.FrameIndex - gd.sr_reactive_frame > IDLE_RELEASE_FRAMES)
       {
