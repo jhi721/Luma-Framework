@@ -2375,6 +2375,9 @@ public:
          }
          return;
       }
+      // dgVoodoo's own compute shaders have no variants
+      if (type != reshade::api::pipeline_subobject_type::pixel_shader)
+         return;
       for (size_t patch = 0; patch < size_t(PixelShaderPatch::COUNT); patch++)
       {
          if (std::vector<uint8_t> patched = PatchPixelShader(PixelShaderPatch(patch), code.data(), code.size(), &error); !patched.empty())
