@@ -30,14 +30,14 @@
 const ShaderHashesList shader_hashes_ToneMapping = {.pixel_shaders = {0x1A760388, 0x602DA054}};
 // Passes drawn onto the post-tonemap canvas, which used to be UNORM: it clamped their output (dgVoodoo drops the SM3 _sat). Pairs are
 // 2.87.5, 2.81.3 (Source/Games/Mirror's Edge/NOTES.md, UI table). Each has a single o0.xyzw output and a single final ret.
-// UI overlays: saturate, as the UNORM store did.
-// Simple Element, Simple Element Gamma (HUD, text), Simple Element Masked Gamma, Td UI Compositing, Td UI Blur Effect, Td UI Blur
-// Gather (and Max Samples), Td UI Approximate Alpha, menu panels, pause background blur
-const std::unordered_set<uint32_t> ui_saturated_pixel_shaders = {0x088F76F5, 0x889B0C84, 0xD81C8836, 0x3DFF6336, 0xC39EFBF2, 0x5325C38B, 0xA5AC2B70, 0xFB0A84E8, 0x92F6FB51, 0x49DB6B1C, 0xE93BE915, 0xA288BD8B, 0xC58A89A8, 0xC086B17E, 0xF8554FA4, 0x643DB945, 0xACB81A27, 0x6B9A89FF, 0x713B6AF9, 0xBFF59A82};
-// Gameplay effects over the scene they read: rgb floored at 0 and alpha saturated (blending's inputs, as the UNORM store clamped
-// them), no upper rgb clamp, which would clip the HDR scene under them.
-// Sniper scope, hurt filter, speed lines
-const std::unordered_set<uint32_t> scene_blend_input_pixel_shaders = {0x946977C0, 0xC982CDCC, 0x70AD2D05, 0x15B360EC, 0x26F03F7F, 0x63D0CA51};
+// The Td UI blur and alpha passes write the fp16 UI target, which never clamped: no clamp.
+// UI drawn straight onto the canvas: saturate, as the UNORM store did.
+// Simple Element, Simple Element Gamma (HUD, text), Simple Element Masked Gamma, menu panels
+const std::unordered_set<uint32_t> ui_saturated_pixel_shaders = {0x088F76F5, 0x889B0C84, 0xD81C8836, 0x3DFF6336, 0xC39EFBF2, 0x5325C38B, 0xACB81A27, 0x6B9A89FF};
+// Passes over the scene they read: rgb floored at 0 and alpha saturated (blending's inputs, as the UNORM store clamped them), no
+// upper rgb clamp, which would clip the HDR scene under them.
+// Td UI Compositing (lerp(scene, UI, UI.a)), pause background blur, sniper scope, hurt filter, speed lines
+const std::unordered_set<uint32_t> scene_blend_input_pixel_shaders = {0xA5AC2B70, 0xFB0A84E8, 0x713B6AF9, 0xBFF59A82, 0x946977C0, 0xC982CDCC, 0x70AD2D05, 0x15B360EC, 0x26F03F7F, 0x63D0CA51};
 const ShaderHashesList shader_hashes_GammaCorrection = {.pixel_shaders = {0x0160196C, 0x87D136D3}};
 // The last scene pass: it writes the canvas the HUD then draws onto
 const ShaderHashesList shader_hashes_TdMotionBlur = {.pixel_shaders = {0x4177BC6E, 0xA99AD9DD}};
