@@ -1141,6 +1141,28 @@ class Bayonetta final : public Game
       return queried.get();
    }
 
+   // A game pixel shader's "patch", from the bytecode its shader object was created with; empty with "error" if it can't be patched. Any
+   // thread ("AddShaderWarmupVariants" too).
+   static std::vector<uint8_t> PatchPixelShader(PixelShaderPatch patch, const uint8_t* code, size_t code_size, std::string* error)
+   {
+      switch (patch)
+      {
+      case PixelShaderPatch::MOTION_VECTORS:
+         return MotionVectorPatch::PatchPixelShader(code, code_size, MotionVectorPatches::layout, error, /* targets_only */ true);
+      case PixelShaderPatch::MASK_ALPHA:
+      case PixelShaderPatch::MASK_ADDITIVE:
+         return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot,
+            (patch == PixelShaderPatch::MASK_ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA), error);
+      case PixelShaderPatch::BLENDED:
+         return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
+      case PixelShaderPatch::COVERAGE:
+         // The alpha tested materials clip at 0.5 (42 shaders in the 2.87.5 dump); the clips at 0.001 (blended materials' invisible
+         // texels) and the depth prepass's at 0.05 are below the threshold and stay as they are
+         return CoveragePatch::PatchPixelShader(code, code_size, error, 0.1f);
+      }
+      return {};
+   }
+
    // The bound shader's patched version ("patch" for pixel shaders, see above), patched from Core's bytecode copy on first use (null if
    // it can't be, e.g. a vertex shader that doesn't place vertices with the view projection). The maps' nodes are never erased.
    template <typename T>
@@ -1211,25 +1233,7 @@ class Bayonetta final : public Game
             }
             else
             {
-               switch (patch)
-               {
-               case PixelShaderPatch::MOTION_VECTORS:
-                  patched = MotionVectorPatch::PatchPixelShader(code, code_size, MotionVectorPatches::layout, &error, /* targets_only */ true);
-                  break;
-               case PixelShaderPatch::MASK_ALPHA:
-               case PixelShaderPatch::MASK_ADDITIVE:
-                  patched = MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot,
-                     (patch == PixelShaderPatch::MASK_ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA), &error);
-                  break;
-               case PixelShaderPatch::BLENDED:
-                  patched = MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, &error);
-                  break;
-               case PixelShaderPatch::COVERAGE:
-                  // The alpha tested materials clip at 0.5 (42 shaders in the 2.87.5 dump); the clips at 0.001 (blended materials'
-                  // invisible texels) and the depth prepass's at 0.05 are below the threshold and stay as they are
-                  patched = CoveragePatch::PatchPixelShader(code, code_size, &error, 0.1f);
-                  break;
-               }
+               patched = PatchPixelShader(patch, code, code_size, &error);
             }
          }
          else
@@ -2332,6 +2336,27 @@ public:
       if (target == outputs.end() || target->component_type != D3D_REGISTER_COMPONENT_FLOAT32)
          return patched(nullptr);
       return patched(DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT, target->mask));
+   }
+
+   // Every patch a draw may ask "GetPatchedShader" for: which one it takes depends on its state
+   void AddShaderWarmupVariants(reshade::api::pipeline_subobject_type type, const std::vector<uint8_t>& code, std::vector<std::vector<uint8_t>>* variants) override
+   {
+      std::string error;
+      if (type == reshade::api::pipeline_subobject_type::vertex_shader)
+      {
+         if (std::vector<uint8_t> patched = MotionVectorPatch::PatchVertexShader(code.data(), code.size(), MotionVectorPatches::layout, &error); !patched.empty())
+         {
+            variants->push_back(std::move(patched));
+         }
+         return;
+      }
+      for (size_t patch = 0; patch < size_t(PixelShaderPatch::COUNT); patch++)
+      {
+         if (std::vector<uint8_t> patched = PatchPixelShader(PixelShaderPatch(patch), code.data(), code.size(), &error); !patched.empty())
+         {
+            variants->push_back(std::move(patched));
+         }
+      }
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
