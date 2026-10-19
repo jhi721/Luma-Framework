@@ -178,6 +178,7 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
 
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler, SMAA T2x or the DEV toggle (set at present)
+   // Guards the patched shader maps and the motion vector and mask targets below (created on draws, released at present)
    std::shared_mutex mv_mutex;
    // A game shader's patched version (null if refused), patched on first use, by its hash; a vertex shader's with the bytes of vc4 it
    // reads ("DXBC::ConstantBufferBytes": the previous frame's copy uploads only those) and its LocalToWorld translation row
@@ -780,8 +781,8 @@ class MirrorsEdge final : public Game
    static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash, ID3D11DepthStencilView* dsv)
    {
       auto& gd = GetGameDeviceData(device_data);
-      uint4 depth_size;
-      DXGI_FORMAT unused_format;
+      uint4 depth_size = {};
+      DXGI_FORMAT unused_format = DXGI_FORMAT_UNKNOWN;
       GetResourceInfo(dsv, depth_size, unused_format);
       if (depth_size.x != device_data.output_resolution.x || depth_size.y != device_data.output_resolution.y)
       {
@@ -898,7 +899,7 @@ class MirrorsEdge final : public Game
          rtvs[0]->GetResource(&color);
          if (depth != gd.mv_depth || !color || (gd.mv_scene_color && color != gd.mv_scene_color))
             return refuse(REJECT_OTHER_DEPTH_COLOR);
-         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
          rtvs[0]->GetDesc(&rtv_desc);
          com_ptr<ID3D11Texture2D> color_texture;
          D3D11_TEXTURE2D_DESC color_desc = {};
@@ -981,7 +982,7 @@ class MirrorsEdge final : public Game
          // The reactive masks: what the alpha blended draws write, from zero
          if (IsReactiveMaskUsed(device_data) && !gd.mv_reactive_target)
          {
-            D3D11_TEXTURE2D_DESC mv_desc;
+            D3D11_TEXTURE2D_DESC mv_desc = {};
             gd.mv_texture->GetDesc(&mv_desc);
             const CD3D11_TEXTURE2D_DESC reactive_desc(DXGI_FORMAT_R8G8_UNORM, mv_desc.Width, mv_desc.Height, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
             const std::unique_lock lock(gd.mv_mutex);
@@ -1046,7 +1047,7 @@ class MirrorsEdge final : public Game
 
          // Draw key: same mesh, same shaders, no instance count
          // The offsets go with the buffers: queried with them, else tracked with them
-         UINT vertex_offset, index_offset;
+         UINT vertex_offset = 0, index_offset = 0;
          ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context, &vertex_offset);
          ID3D11Buffer* const index_buffer = gd.bound_states.IndexBuffer(native_device_context, &index_offset);
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
@@ -1223,7 +1224,7 @@ class MirrorsEdge final : public Game
       com_ptr<ID3D11Texture2D> scene;
       if (FAILED(gd.mv_scene_color->QueryInterface(&scene)))
          return false;
-      D3D11_TEXTURE2D_DESC scene_desc;
+      D3D11_TEXTURE2D_DESC scene_desc = {};
       scene->GetDesc(&scene_desc);
       SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
       if (!sr_instance_data)
@@ -1331,9 +1332,9 @@ class MirrorsEdge final : public Game
             com_ptr<ID3D11Texture2D> copy;
             if (SUCCEEDED(gd.mv_scene_copy->QueryInterface(&copy)))
             {
-               D3D11_TEXTURE2D_DESC copy_desc;
+               D3D11_TEXTURE2D_DESC copy_desc = {};
                copy->GetDesc(&copy_desc);
-               D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+               D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
                gd.mv_scene_rtv->GetDesc(&rtv_desc);
                if (copy_desc.BindFlags & D3D11_BIND_RENDER_TARGET)
                {
@@ -1566,26 +1567,26 @@ public:
       // Core registers the 6 SMAA passes and RCAS (ENABLE_RCAS); these are this game's own.
       // SMAA predication: the scene alpha's linear depth -> R16F plane-deviation edge-ness
       native_shaders_definitions.emplace(CompileTimeStringHash("ME Depth Extract CS"),
-         ShaderDefinition("Luma_ME_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
+         ShaderDefinition{.file_name = "Luma_ME_DepthExtract", .type = reshade::api::pipeline_subobject_type::compute_shader});
       // SMAA T2x's own passes ("SMAA_T2X" in Luma_SMAA_impl.hlsl). The edge detection and the vertex shaders are 1x's.
       native_shaders_definitions.emplace(CompileTimeStringHash("ME SMAA T2x Blending Weight Calculation PS"),
-         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
+         ShaderDefinition{.file_name = "Luma_SMAA_impl", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "smaa_blending_weight_calculation_ps", .defines_data = {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("ME SMAA T2x Neighborhood Blending PS"),
-         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});
+         ShaderDefinition{.file_name = "Luma_SMAA_impl", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "smaa_neighborhood_blending_ps", .defines_data = {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("ME SMAA T2x Resolve PS"),
-         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
+         ShaderDefinition{.file_name = "Luma_SMAA_impl", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "smaa_resolve_ps", .defines_data = {{"SMAA_T2X", "1"}}});
 
       // DLSS/FSR/Luma TAA: their depth and the camera motion from the scene's alpha, the CPU copies of vc4 (dgVoodoo maps it or updates
       // it), and the motion vector target written by every blend state
       sr_game_tooltip = "DLSS and FSR 3 require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
       native_shaders_definitions.emplace(CompileTimeStringHash("ME Motion Vector Fill CS"),
-         ShaderDefinition("Luma_ME_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
+         ShaderDefinition{.file_name = "Luma_ME_MotionVectorFill", .type = reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("ME Copy Back PS"),
-         ShaderDefinition("Luma_ME_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
+         ShaderDefinition{.file_name = "Luma_ME_CopyBack", .type = reshade::api::pipeline_subobject_type::pixel_shader});
       // The weighted MSAA resolve in TdToneMapping's exposure (1x1, exposure / 64, last frame's: the game builds this frame's after the
       // resolves; unbound before the first tonemap). Alpha is the linear view depth (sky 65504) the post passes read (TdDirectionalHaze,
       // DOF, bloom's sky exclusion): the nearest sample's, the game's average for the development A/B.
-      ShaderDefinition msaa_resolve{"Luma_MSAAResolve_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"MSAA_RESOLVE_EXPOSURE", "1"}, {"MSAA_RESOLVE_EXPOSURE_SCALE", "64.0"}}};
+      ShaderDefinition msaa_resolve{.file_name = "Luma_MSAAResolve_PS", .type = reshade::api::pipeline_subobject_type::pixel_shader, .defines_data = {{"MSAA_RESOLVE_EXPOSURE", "1"}, {"MSAA_RESOLVE_EXPOSURE_SCALE", "64.0"}}};
 #if DEVELOPMENT
       native_shaders_definitions.emplace(CompileTimeStringHash("ME MSAA Resolve Average Depth PS"), msaa_resolve);
 #endif
@@ -1777,7 +1778,7 @@ public:
          const std::shared_lock lock(gd.mv_mutex);
          if (g_mv_debug_view && gd.mv_texture)
          {
-            D3D11_TEXTURE2D_DESC desc;
+            D3D11_TEXTURE2D_DESC desc = {};
             gd.mv_texture->GetDesc(&desc);
             debug_draw_auto_clear_texture = false;
             debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace;
