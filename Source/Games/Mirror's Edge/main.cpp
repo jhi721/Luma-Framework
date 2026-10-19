@@ -34,9 +34,10 @@ const ShaderHashesList shader_hashes_ToneMapping = {.pixel_shaders = {0x1A760388
 // Simple Element, Simple Element Gamma (HUD, text), Simple Element Masked Gamma, Td UI Compositing, Td UI Blur Effect, Td UI Blur
 // Gather (and Max Samples), Td UI Approximate Alpha, menu panels, pause background blur
 const std::unordered_set<uint32_t> ui_saturated_pixel_shaders = {0x088F76F5, 0x889B0C84, 0xD81C8836, 0x3DFF6336, 0xC39EFBF2, 0x5325C38B, 0xA5AC2B70, 0xFB0A84E8, 0x92F6FB51, 0x49DB6B1C, 0xE93BE915, 0xA288BD8B, 0xC58A89A8, 0xC086B17E, 0xF8554FA4, 0x643DB945, 0xACB81A27, 0x6B9A89FF, 0x713B6AF9, 0xBFF59A82};
-// Gameplay effects over the scene they read: floored at 0 only, an upper clamp would clip the HDR scene under them.
+// Gameplay effects over the scene they read: rgb floored at 0 and alpha saturated (blending's inputs, as the UNORM store clamped
+// them), no upper rgb clamp, which would clip the HDR scene under them.
 // Sniper scope, hurt filter, speed lines
-const std::unordered_set<uint32_t> scene_floored_pixel_shaders = {0x946977C0, 0xC982CDCC, 0x70AD2D05, 0x15B360EC, 0x26F03F7F, 0x63D0CA51};
+const std::unordered_set<uint32_t> scene_blend_input_pixel_shaders = {0x946977C0, 0xC982CDCC, 0x70AD2D05, 0x15B360EC, 0x26F03F7F, 0x63D0CA51};
 const ShaderHashesList shader_hashes_GammaCorrection = {.pixel_shaders = {0x0160196C, 0x87D136D3}};
 // The last scene pass: it writes the canvas the HUD then draws onto
 const ShaderHashesList shader_hashes_TdMotionBlur = {.pixel_shaders = {0x4177BC6E, 0xA99AD9DD}};
@@ -1564,8 +1565,8 @@ public:
          return nullptr;
       if (ui_saturated_pixel_shaders.contains(uint32_t(shader_hash)))
          return DXBC::ClampOutput0(code, &size);
-      if (scene_floored_pixel_shaders.contains(uint32_t(shader_hash)))
-         return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::FLOOR);
+      if (scene_blend_input_pixel_shaders.contains(uint32_t(shader_hash)))
+         return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT);
       return nullptr;
    }
 
@@ -2101,7 +2102,7 @@ public:
          if (const auto [it, inserted] = census.insert(hash); inserted)
          {
             reshade::log::message(reshade::log::level::info,
-               std::format("[Mirror's Edge] Post-tonemap PS 0x{:08X} ({}), frame {}", hash, (ui_saturated_pixel_shaders.contains(hash) ? "saturated" : (scene_floored_pixel_shaders.contains(hash) ? "floored" : "UNCLAMPED")), cb_luma_global_settings.FrameIndex).c_str());
+               std::format("[Mirror's Edge] Post-tonemap PS 0x{:08X} ({}), frame {}", hash, (ui_saturated_pixel_shaders.contains(hash) ? "saturated" : (scene_blend_input_pixel_shaders.contains(hash) ? "blend input" : "UNCLAMPED")), cb_luma_global_settings.FrameIndex).c_str());
          }
       }
 #endif
