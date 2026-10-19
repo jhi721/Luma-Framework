@@ -190,8 +190,8 @@ namespace
    bool g_mv_debug_view = false;
    bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
    bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
-   // A/B of the motion vector path's CPU and GPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy", "mv_vertex_shader_read_sizes",
-   // "mv_texture")
+   // A/B of the motion vector path's CPU and GPU savings (see "PatchedDraws::ObjectConstants", synced at present,
+   // "mv_vertex_shader_read_sizes", "mv_texture")
    bool g_mv_buffer_filter = true;
    bool g_mv_constants_pool = true;
    bool g_mv_read_sizes = true;
@@ -562,30 +562,16 @@ struct SaintsRowIVGameDeviceData final : public GameDeviceData
    std::array<UINT, std::size(MotionVectorPatches::previous_slots)> mv_last_vertex_shader_read_sizes = {};
 
    // CPU copies of the vc2 / vc3 buffers the motion vector draws bind (one shared buffer each, mapped with discard every few draws;
-   // draws in between reuse the last contents), by buffer (an entry registers it, null until its first Unmap): each Map's pointer,
-   // copied at Unmap into a new snapshot the draws share
-   using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
+   // draws in between reuse the last contents, see "PatchedDraws::ObjectConstants"), and the render scale's vc4 buffers below, whose
+   // Maps it remembers too. Every call but "MayBeRegistered" under "mv_constants_mutex": a destroyed buffer's release can come from
+   // another thread.
+   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
    std::shared_mutex mv_constants_mutex;
-   std::unordered_map<uint64_t, void*> mv_mapped_constants;
-   std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
-   // Render scale: the scene draws' PS vc4 buffers, whose "IR_Pixel_Steps" (c9) is rewritten at Unmap, and the last one registered
-   // (read without the lock, cleared when that buffer is destroyed)
+   PatchedDraws::ObjectConstants mv_constants;
+   // Render scale: the scene draws' PS vc4 buffers (registered in "mv_constants"), whose "IR_Pixel_Steps" (c9) is rewritten at Unmap,
+   // and the last one registered (read without the lock, cleared when that buffer is destroyed)
    std::unordered_set<uint64_t> sub_rect_vc4_buffers;
    std::atomic<ID3D11Buffer*> sub_rect_last_vc4 = nullptr;
-   // The first registered buffers (vc2 / vc3 copies, render scale vc4) and their sizes again, for the Map hooks to skip the game's
-   // other buffers without the lock and the lookups (see "MayBeRegisteredBuffer"). Written under "mv_constants_mutex"; with more
-   // registered, every buffer takes the lock.
-   static constexpr uint32_t max_filtered_buffers = 32;
-   static constexpr uint64_t destroyed_buffer_slot = 1; // A destroyed buffer's slot, reused by the next registration (never a handle)
-   std::array<std::atomic<uint64_t>, max_filtered_buffers> mv_filtered_buffers = {};
-   std::array<std::atomic<UINT>, max_filtered_buffers> mv_filtered_buffer_sizes = {};
-   std::atomic<uint32_t> mv_filtered_buffer_count = 0; // Every registered buffer, past "max_filtered_buffers" too
-   // Every copy made, and by size those nobody held anymore at the last present (the next copies take them, see "NewConstantsCopy").
-   // Every copy is in the pool, so one with a use count of 2 is held by "mv_constants_copies" and the pool alone. Under
-   // "mv_constants_mutex".
-   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
-   std::unordered_map<size_t, std::vector<uint32_t>> mv_constants_pool_free;
-   size_t mv_constants_made = 0;          // Copies asked for since the last present
    std::vector<uint8_t> mv_camera_upload; // Scratch: an unmatched draw's vc2 with last frame's camera
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
@@ -715,80 +701,13 @@ class SaintsRowIV final : public Game
       return (g_render_scale < 1.f && GetGameDeviceData(device_data).mv_active) ? g_render_scale : 1.f;
    }
 
-   // Registers a buffer for the Map hooks' lock free filter ("MayBeRegisteredBuffer"), with its size. Under "mv_constants_mutex".
-   static void RegisterFilteredBuffer(SaintsRowIVGameDeviceData* game_device_data, ID3D11Buffer* buffer)
-   {
-      // A destroyed buffer's slot, else the next one (the size before the handle, which the hooks read first)
-      const uint32_t count = game_device_data->mv_filtered_buffer_count.load(std::memory_order_relaxed);
-      uint32_t slot = 0;
-      while (slot < (std::min)(count, SaintsRowIVGameDeviceData::max_filtered_buffers) && game_device_data->mv_filtered_buffers[slot].load(std::memory_order_relaxed) != SaintsRowIVGameDeviceData::destroyed_buffer_slot)
-         slot++;
-      if (slot < SaintsRowIVGameDeviceData::max_filtered_buffers)
-      {
-         D3D11_BUFFER_DESC desc;
-         buffer->GetDesc(&desc);
-         game_device_data->mv_filtered_buffer_sizes[slot].store(desc.ByteWidth, std::memory_order_relaxed);
-         game_device_data->mv_filtered_buffers[slot].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_release);
-      }
-      // Past the list, the count still grows: every buffer then takes the lock
-      if (slot >= count)
-      {
-         game_device_data->mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
-      }
-   }
-
-   // False if the buffer surely isn't a registered one; "size" its size if known (else 0). Lock free: the Map hooks see every Map of
-   // the game (vc0-vc4 are mapped with discard many times a frame, most of them other buffers).
-   static bool MayBeRegisteredBuffer(const SaintsRowIVGameDeviceData& game_device_data, uint64_t handle, UINT* size)
-   {
-      *size = 0;
-      const uint32_t count = game_device_data.mv_filtered_buffer_count.load(std::memory_order_acquire);
-      if (!g_mv_buffer_filter || count > SaintsRowIVGameDeviceData::max_filtered_buffers)
-         return true;
-      for (uint32_t i = 0; i < count; i++)
-      {
-         if (game_device_data.mv_filtered_buffers[i].load(std::memory_order_acquire) == handle)
-         {
-            *size = game_device_data.mv_filtered_buffer_sizes[i].load(std::memory_order_relaxed);
-            return true;
-         }
-      }
-      return false;
-   }
-
    // A vc2 / vc3 buffer's CPU copy (null until its first Unmap); registers it for a copy at every Unmap
    static SaintsRowIVGameDeviceData::ConstantsCopy GetConstantsCopy(SaintsRowIVGameDeviceData* game_device_data, ID3D11Buffer* buffer)
    {
       if (!buffer)
          return nullptr;
       const std::lock_guard lock(game_device_data->mv_constants_mutex);
-      const auto [entry, registered] = game_device_data->mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(buffer));
-      if (registered && !game_device_data->sub_rect_vc4_buffers.contains(reinterpret_cast<uint64_t>(buffer)))
-      {
-         RegisterFilteredBuffer(game_device_data, buffer);
-      }
-      return entry->second;
-   }
-
-   // A vc2 / vc3 copy of "size" bytes from "bytes": one of that size nobody held anymore at the last present, else a new one. Under
-   // "mv_constants_mutex".
-   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(SaintsRowIVGameDeviceData* game_device_data, const uint8_t* bytes, size_t size)
-   {
-      game_device_data->mv_constants_made++;
-      if (g_mv_constants_pool)
-      {
-         if (const auto free_copies = game_device_data->mv_constants_pool_free.find(size); free_copies != game_device_data->mv_constants_pool_free.end() && !free_copies->second.empty())
-         {
-            auto copy = game_device_data->mv_constants_pool[free_copies->second.back()];
-            free_copies->second.pop_back();
-            std::memcpy(copy->data(), bytes, size);
-            return copy;
-         }
-      }
-      auto copy = std::make_shared<std::vector<uint8_t>>(bytes, bytes + size);
-      // Pooled even without "g_mv_constants_pool", which only gates the reuse: the in-place rewrite relies on it (see "mv_constants_pool")
-      game_device_data->mv_constants_pool.push_back(copy);
-      return copy;
+      return game_device_data->mv_constants.Snapshot(game_device_data->mv_constants.Register(buffer));
    }
 
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
@@ -800,17 +719,17 @@ class SaintsRowIV final : public Game
 #if DEVELOPMENT
          const Perf::HookTimer timer{&game_device_data.perf_window.hook_ns};
 #endif
-         UINT unused_size = 0;
-         if (!MayBeRegisteredBuffer(game_device_data, resource.handle, &unused_size))
+         // Lock free: the Map hooks see every Map of the game (vc0-vc4 are mapped with discard many times a frame, most of them other
+         // buffers)
+         if (!game_device_data.mv_constants.MayBeRegistered(resource.handle))
             return;
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
-         if (game_device_data.mv_constants_copies.contains(resource.handle) || game_device_data.sub_rect_vc4_buffers.contains(resource.handle))
-            game_device_data.mv_mapped_constants[resource.handle] = *data;
+         game_device_data.mv_constants.OnMap(resource.handle, offset, access, *data);
       }
    }
 
    // Before a registered buffer's Unmap (the game has written it): the render scale's vc4 rewrite, and the motion vectors' CPU copy
-   // of a vc2 / vc3 buffer, read back from the mapped memory.
+   // of the buffer, read back from the mapped memory.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
@@ -820,61 +739,42 @@ class SaintsRowIV final : public Game
 #if DEVELOPMENT
          const Perf::HookTimer timer{&game_device_data.perf_window.hook_ns};
 #endif
-         UINT buffer_size = 0;
-         if (!MayBeRegisteredBuffer(game_device_data, resource.handle, &buffer_size))
+         if (!game_device_data.mv_constants.MayBeRegistered(resource.handle))
             return;
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
-         if (const auto mapped = game_device_data.mv_mapped_constants.find(resource.handle); mapped != game_device_data.mv_mapped_constants.end())
+         const PatchedDraws::ObjectConstants::Entry* const registered = game_device_data.mv_constants.Find(resource.handle);
+         if (!registered || !registered->mapped)
+            return;
+         const UINT buffer_size = registered->size;
+         auto* const mapped_data = static_cast<uint8_t*>(registered->mapped);
+         // Render scale: the material pass maps its screen texel to UV as ((ndc + 1) / 2 * c9.zw + 0.5) * c9.xy (y flipped), so
+         // zw = the render size puts it in the sub-rect, xy stays 1 / the full texture size. Only the output sized steps (reflections
+         // have their own). The G-buffer's stipple (LOD fades, translucents) samples its pattern at the viewport UV times
+         // "IR_Stipple_Repeat_Info" (c12.xy, pattern repeats over the target): scaled alike, so its pixels keep the parity the material
+         // pass's DSF expects.
+         if (const float scale = GetSubRectScale(*device_data); scale < 1.f && buffer_size >= 10 * 16 && game_device_data.sub_rect_vc4_buffers.contains(resource.handle))
          {
-            if (buffer_size == 0)
+            float pixel_steps[4];
+            std::memcpy(pixel_steps, mapped_data + 9 * 16, sizeof(pixel_steps));
+            if (pixel_steps[2] == device_data->output_resolution.x && pixel_steps[3] == device_data->output_resolution.y)
             {
-               D3D11_BUFFER_DESC desc;
-               reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
-               buffer_size = desc.ByteWidth;
-            }
-            auto* const mapped_data = static_cast<uint8_t*>(mapped->second);
-            // Render scale: the material pass maps its screen texel to UV as ((ndc + 1) / 2 * c9.zw + 0.5) * c9.xy (y flipped), so
-            // zw = the render size puts it in the sub-rect, xy stays 1 / the full texture size. Only the output sized steps (reflections
-            // have their own). The G-buffer's stipple (LOD fades, translucents) samples its pattern at the viewport UV times
-            // "IR_Stipple_Repeat_Info" (c12.xy, pattern repeats over the target): scaled alike, so its pixels keep the parity the material
-            // pass's DSF expects.
-            if (const float scale = GetSubRectScale(*device_data); scale < 1.f && buffer_size >= 10 * 16 && game_device_data.sub_rect_vc4_buffers.contains(resource.handle))
-            {
-               float pixel_steps[4];
-               std::memcpy(pixel_steps, mapped_data + 9 * 16, sizeof(pixel_steps));
-               if (pixel_steps[2] == device_data->output_resolution.x && pixel_steps[3] == device_data->output_resolution.y)
-               {
-                  pixel_steps[2] = std::round(pixel_steps[2] * scale);
-                  pixel_steps[3] = std::round(pixel_steps[3] * scale);
-                  std::memcpy(mapped_data + 9 * 16, pixel_steps, sizeof(pixel_steps));
+               pixel_steps[2] = std::round(pixel_steps[2] * scale);
+               pixel_steps[3] = std::round(pixel_steps[3] * scale);
+               std::memcpy(mapped_data + 9 * 16, pixel_steps, sizeof(pixel_steps));
 #if DEVELOPMENT
-                  g_pixel_steps_overrides_this_frame++;
+               g_pixel_steps_overrides_this_frame++;
 #endif
-                  if (buffer_size >= 13 * 16)
-                  {
-                     float stipple_repeat[2];
-                     std::memcpy(stipple_repeat, mapped_data + 12 * 16, sizeof(stipple_repeat));
-                     stipple_repeat[0] *= pixel_steps[2] / device_data->output_resolution.x;
-                     stipple_repeat[1] *= pixel_steps[3] / device_data->output_resolution.y;
-                     std::memcpy(mapped_data + 12 * 16, stipple_repeat, sizeof(stipple_repeat));
-                  }
+               if (buffer_size >= 13 * 16)
+               {
+                  float stipple_repeat[2];
+                  std::memcpy(stipple_repeat, mapped_data + 12 * 16, sizeof(stipple_repeat));
+                  stipple_repeat[0] *= pixel_steps[2] / device_data->output_resolution.x;
+                  stipple_repeat[1] *= pixel_steps[3] / device_data->output_resolution.y;
+                  std::memcpy(mapped_data + 12 * 16, stipple_repeat, sizeof(stipple_repeat));
                }
             }
-            if (const auto copy = game_device_data.mv_constants_copies.find(resource.handle); copy != game_device_data.mv_constants_copies.end())
-            {
-               // The buffer's last copy, rewritten in place when no draw or object holds it (only the map and the pool do): most Maps go
-               // to buffers no motion vector draw read since. Made non-const ("NewConstantsCopy"), so writing it is defined.
-               if (g_mv_constants_pool && copy->second && copy->second.use_count() == 2 && copy->second->size() == buffer_size)
-               {
-                  std::memcpy(const_cast<uint8_t*>(copy->second->data()), mapped_data, buffer_size);
-               }
-               else
-               {
-                  copy->second = NewConstantsCopy(&game_device_data, mapped_data, buffer_size);
-               }
-            }
-            game_device_data.mv_mapped_constants.erase(mapped);
          }
+         game_device_data.mv_constants.OnUnmap(resource.handle);
       }
    }
 
@@ -886,25 +786,14 @@ class SaintsRowIV final : public Game
       if (!device_data || !device_data->game)
          return;
       auto& game_device_data = GetGameDeviceData(*device_data);
-      UINT unused_size = 0;
-      if (!MayBeRegisteredBuffer(game_device_data, resource.handle, &unused_size))
+      if (!game_device_data.mv_constants.MayBeRegistered(resource.handle))
          return;
       const std::lock_guard lock(game_device_data.mv_constants_mutex);
-      const bool registered = (game_device_data.mv_constants_copies.erase(resource.handle) + game_device_data.sub_rect_vc4_buffers.erase(resource.handle)) != 0;
-      game_device_data.mv_mapped_constants.erase(resource.handle);
-      if (!registered)
+      game_device_data.sub_rect_vc4_buffers.erase(resource.handle);
+      if (!game_device_data.mv_constants.Unregister(resource.handle))
          return;
       ID3D11Buffer* destroyed = reinterpret_cast<ID3D11Buffer*>(resource.handle);
       game_device_data.sub_rect_last_vc4.compare_exchange_strong(destroyed, nullptr, std::memory_order_relaxed);
-      const uint32_t count = (std::min)(game_device_data.mv_filtered_buffer_count.load(std::memory_order_relaxed), SaintsRowIVGameDeviceData::max_filtered_buffers);
-      for (uint32_t i = 0; i < count; i++)
-      {
-         if (game_device_data.mv_filtered_buffers[i].load(std::memory_order_relaxed) == resource.handle)
-         {
-            game_device_data.mv_filtered_buffers[i].store(SaintsRowIVGameDeviceData::destroyed_buffer_slot, std::memory_order_release);
-            break;
-         }
-      }
    }
 
    // Motion vectors: the copy of the material target into the post scene (see "mv_scene_color")
@@ -1118,9 +1007,9 @@ class SaintsRowIV final : public Game
       {
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
          game_device_data.sub_rect_last_vc4.store(vc4.get(), std::memory_order_relaxed);
-         if (game_device_data.sub_rect_vc4_buffers.insert(reinterpret_cast<uint64_t>(vc4.get())).second && !game_device_data.mv_constants_copies.contains(reinterpret_cast<uint64_t>(vc4.get())))
+         if (game_device_data.sub_rect_vc4_buffers.insert(reinterpret_cast<uint64_t>(vc4.get())).second)
          {
-            RegisterFilteredBuffer(&game_device_data, vc4.get());
+            game_device_data.mv_constants.Register(vc4.get());
          }
       }
       return true;
@@ -2677,9 +2566,11 @@ public:
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool (the counters are the last complete frame's)
       Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter},
-         {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}, {"mv_half_float", &g_mv_half_float}});
+         {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}, { "mv_half_float",
+            &g_mv_half_float }});
       Mcp::RegisterCounters({{"msaa_resolves", &g_msaa_resolves_last_frame}, {"finals", &g_finals_last_frame}, {"pixel_steps_overrides", &g_pixel_steps_overrides_last_frame},
-         {"sub_rect_draws", &g_sub_rect_draws_last_frame}, {"mv.tiebreak_collisions", &g_mv_tiebreak_collisions_last_frame}});
+         {"sub_rect_draws", &g_sub_rect_draws_last_frame}, { "mv.tiebreak_collisions",
+            &g_mv_tiebreak_collisions_last_frame }});
       Mcp::RegisterToggles({{"luma_msaa_enable", &g_luma_msaa_enable}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_edges_debug", &g_smaa_edges_debug},
          {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, {"hide_ui", &g_hide_ui}, { "perf_hook_timers",
             &Perf::g_hook_timers }});
@@ -2919,9 +2810,8 @@ public:
          // mapped again, not a stale one
          {
             const std::lock_guard lock(game_device_data.mv_constants_mutex);
-            for (auto& [buffer, copy] : game_device_data.mv_constants_copies)
-               copy.reset();
-            game_device_data.mv_mapped_constants.clear();
+            game_device_data.mv_constants.ReleaseUploads();
+            game_device_data.mv_constants.Restart();
          }
          game_device_data.mv_objects.clear();
          game_device_data.mv_previous_objects.clear();
@@ -2965,28 +2855,10 @@ public:
       // last frame asked for: a burst between two presents (loading screens) would keep its peak otherwise. Without motion vectors, none.
       {
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
-         size_t kept_free = std::exchange(game_device_data.mv_constants_made, 0);
-         if (!game_device_data.mv_active)
-         {
-            kept_free = 0;
-         }
-         std::erase_if(game_device_data.mv_constants_pool, [&](const auto& copy)
-            {
-               if (copy.use_count() != 1)
-                  return false;
-               if (kept_free == 0)
-                  return true;
-               kept_free--;
-               return false; });
-         for (auto& [size, free_copies] : game_device_data.mv_constants_pool_free)
-            free_copies.clear();
-         for (uint32_t i = 0; i < uint32_t(game_device_data.mv_constants_pool.size()); i++)
-         {
-            if (game_device_data.mv_constants_pool[i].use_count() == 1)
-            {
-               game_device_data.mv_constants_pool_free[game_device_data.mv_constants_pool[i]->size()].push_back(i);
-            }
-         }
+         game_device_data.mv_constants.TrimPool(game_device_data.mv_active);
+         // The CPU savings' development toggles, for the next frame
+         game_device_data.mv_constants.filter = g_mv_buffer_filter;
+         game_device_data.mv_constants.pooled = g_mv_constants_pool;
       }
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before the G-buffer
       game_device_data.mv_scene_open = false;
@@ -3103,7 +2975,7 @@ public:
          ImGui::SetTooltip("Motion vector target R16G16_FLOAT instead of R32G32_FLOAT (A/B of the GPU saving; the target is recreated). Not saved.");
       {
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
-         ImGui::Text("Filtered buffers: %u, pooled constant copies: %zu", game_device_data.mv_filtered_buffer_count.load(std::memory_order_relaxed), game_device_data.mv_constants_pool.size());
+         ImGui::Text("Registered buffers: %zu, pooled constant copies: %zu", game_device_data.mv_constants.entries.size(), game_device_data.mv_constants.pool.size());
       }
 
       ImGui::SeparatorText("Performance");
