@@ -1,7 +1,7 @@
 #include "Includes/Common.hlsl"
 
-// Bayonetta: dgVoodoo 2.87.5's present blit (ps_4_0 0x880A17D3, as in TW1), dgVoodoo's copy of its D3D9 back buffer (the canvas)
-// loaded 1:1 into the swapchain.
+// Bayonetta: dgVoodoo's present blit (ps_4_0 0x880A17D3 on both builds, as in TW1), dgVoodoo's copy of its D3D9 back buffer (the
+// canvas) loaded 1:1 into the swapchain.
 // The UI draws on the canvas after the scene, many of its layers additively (SRC_ALPHA, ONE): the 8-bit canvas clamped every blend
 // at 1, the fp16 mirror keeps summing. main.cpp binds the canvas as the scene copy (ResetRender) or the last movie draw left it, so
 // everything the UI added is clamped back to max(that, 1): the UI stays within its paper white like vanilla, the HDR scene and the

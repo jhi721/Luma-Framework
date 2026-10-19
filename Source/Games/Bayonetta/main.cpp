@@ -13,7 +13,7 @@
 #define ENABLE_LUMA_TAA 0
 // The game has MSAA but no shader AA: SMAA is added on the canvas after the scene copy (see "DrawSMAAOnCanvas")
 #define ENABLE_SMAA 1
-// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl), as TW1 and ME1
+// SMAA's area texture without the U-shape smoothing (see "SMAA_AreaTex_SharpU.h"), as TW1 and ME1
 #define SMAA_SMOOTH_U_SHAPES 0
 // RCAS sharpening after SMAA, opt-in (ME1/TW2)
 #define ENABLE_RCAS 1
@@ -55,9 +55,9 @@ const ShaderHashesList shader_hashes_PixelKernels = {.pixel_shaders = {0x0788DCA
 const ShaderHashesList shader_hashes_ShadowReceivers = {.pixel_shaders = {0x98BD17D3, 0x5088AF5D, 0x45E82A5F, 0x8B9A11DF, 0xCDA8ACDD, 0x06EB4448}};
 // The Sofdec movies' Y'CbCr -> R'G'B', drawn on the canvas after the scene (Video_0xC60649FD)
 const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0xC60649FD, 0xED0DA20F}};
-// The bloom chain (_tools/bayonetta/NOTES.md "Bloom"), all into the fixed size 320x176 bloom target: filter05 (the scene into level 0,
-// then each level's threshold and halving into the next), filter02 / filter01 (each level's V / H blur), then copytex (the levels added
-// into level 0, and the composite onto the scene)
+// The bloom chain (_tools/bayonetta/NOTES.md "Frame order"), all into the fixed size 320x176 bloom target: filter05 (the scene
+// into level 0, then each level's threshold and halving into the next), filter02 / filter01 (each level's V / H blur), then copytex
+// (the levels added into level 0, and the composite onto the scene)
 const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x8B6A8D61, 0x29FE50C2}};
 const ShaderHashesList shader_hashes_BloomBlur = {.pixel_shaders = {0x91CC01D3, 0xA5207DF1, 0xCE62BA4B, 0x4B605EEB}};
 // The scene's first post pass, which ends a motion vector frame (the fill and the upscaler run right before it): OtPost's motion blur
@@ -170,7 +170,8 @@ enum class ReactiveBlend : uint8_t
    ADDITIVE,
 };
 
-// A pixel shader's patch: the motion vector target, the mask target of an alpha blended or additive draw, or an alpha blended draw's own motion vectors; or the MSAA alpha to coverage
+// A pixel shader's patch: the motion vector target, the mask target of an alpha blended or additive draw, or an alpha blended
+// draw's own motion vectors; or the MSAA alpha to coverage
 enum class PixelShaderPatch : uint8_t
 {
    MOTION_VECTORS,
@@ -555,7 +556,8 @@ struct BayonettaGameDeviceData final : public GameDeviceData
       UINT translation_offset = 0;
    };
    std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
-   // By "PixelShaderPatch" (the coverage one null for every shader without a masked material's clip, see "CoveragePatch::PatchPixelShader")
+   // By "PixelShaderPatch" (the coverage one null for every shader without a masked material's clip, see
+   // "CoveragePatch::PatchPixelShader")
    std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> patched_pixel_shaders[size_t(PixelShaderPatch::COUNT)];
    // The motion vector target (sized like the scene; the alpha blending states blend it like their color, the others write it
    // unblended, see "OnCreateBlendState")
@@ -1005,8 +1007,8 @@ class Bayonetta final : public Game
       case PixelShaderPatch::BLENDED:
          return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
       case PixelShaderPatch::COVERAGE:
-         // The alpha tested materials clip at 0.5; the clips at 0.001 (blended materials' invisible
-         // texels) and the depth prepass's at 0.05 are below the threshold and stay as they are
+         // The alpha tested materials clip at 0.5; the clips at 0.001 (blended materials' invisible texels) and the depth prepass's
+         // at 0.05 are below the threshold and stay as they are
          return CoveragePatch::PatchPixelShader(code, code_size, error, 0.1f);
       }
       return {};
@@ -1056,8 +1058,8 @@ class Bayonetta final : public Game
                {
                   constexpr uint32_t slot = MotionVectorPatches::object_slot;
                   read_size = DXBC::ConstantBufferBytes(code, code_size, slot);
-                  // No vertex shader reads both cameras (census of the dump). The tie-break transform: the first bone (world space,
-                  // indexed relatively), else the world matrix of the materials or of the effects that have one.
+                  // No vertex shader reads both cameras (see "MotionVectorPatches"). The tie-break transform: the first bone (world
+                  // space, indexed relatively), else the world matrix of the materials or of the effects that have one.
                   if (DXBC::ReadsConstantRow(code, code_size, slot, MotionVectorPatches::view_projection_row))
                   {
                      camera_offset = VIEW_PROJECTION_OFFSET;
@@ -1111,8 +1113,8 @@ class Bayonetta final : public Game
          }
 #endif
       }
-      // Failures in every build (bug reports), except the expected refusals (screen space; every shader without a clip offered to the
-      // coverage patch, logged in development only when patched); every patched shader only in development
+      // Every build logs the unexpected failures (bug reports). The expected refusals are a screen space vertex shader and a pixel
+      // shader without a clip offered to the coverage patch. Development also logs every patched shader and the other patches' refusals.
       const bool expected = error.starts_with("screen space") || error.starts_with("no clip");
       if ((DEVELOPMENT && (shader || patch != PixelShaderPatch::COVERAGE)) || (!shader && !expected))
       {
@@ -1191,7 +1193,8 @@ class Bayonetta final : public Game
       rtv->GetResource(&color);
       const D3D11_TEXTURE2D_DESC color_desc = GetTexture2DDesc(color.get());
       // Only the depth prepass (R32F 1 - z/w next to the normals) opens the scene: OtMirror draws its reflection earlier into another
-      // full size fp16 target, with no prepass (and a view projection whose determinant has the opposite sign of the scene's). The scene color is the first fp16 target drawn with this depth ("DrawWithMotionVectors").
+      // full size fp16 target, with no prepass (and a view projection whose determinant has the opposite sign of the scene's). The
+      // scene color is the first fp16 target drawn with this depth ("DrawWithMotionVectors").
       const bool scene_format = rtv_desc.Format == DXGI_FORMAT_R32_FLOAT && has_second_target;
       if (!scene_format || color_desc.SampleDesc.Count != 1 || color_desc.Width != depth_size.x || color_desc.Height != depth_size.y)
       {
@@ -1303,9 +1306,9 @@ class Bayonetta final : public Game
       return gd->mv_constants.Snapshot(*entry, vertex_shader.read_size, min_size);
    }
 
-   // A scene draw's vc4 buffer with its upload registered for copies at every Map and Update. The frame's camera is taken here, from
-   // the first scene view projection draw; the reprojection with it.
-   // "entry" is null without an upload holding the draw's camera. For a vertex shader with a camera.
+   // A scene draw's vc4 buffer, registered for copies at every Map and Update, and its entry (null without an upload holding the
+   // draw's camera), for a vertex shader with a camera. The frame's camera and the reprojection are taken here, at the first scene
+   // view projection draw.
    struct SceneDrawConstants
    {
       ID3D11Buffer* buffer = nullptr;
@@ -1386,7 +1389,8 @@ class Bayonetta final : public Game
          rtvs[0]->GetDesc(&rtv_desc);
          const D3D11_TEXTURE2D_DESC color_desc = GetTexture2DDesc(color.get());
          // The upscaler reads the scene: it needs a shader resource view. Filtered by the resource, not the view (dgVoodoo binds
-         // single-slice array views). A multisampled scene is refused here only on MSAA's first frame ("msaa_active" then stops this path).
+         // single-slice array views). A multisampled scene is refused here only on MSAA's first frame ("msaa_active" then stops this
+         // path).
          if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || color_desc.ArraySize != 1 || color_desc.SampleDesc.Count != 1 || (color_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0)
             return refuse(REJECT_FORMAT);
          const uint2 size = {color_desc.Width, color_desc.Height};
@@ -1494,8 +1498,8 @@ class Bayonetta final : public Game
       const std::vector<uint8_t>* upload = nullptr;
       if (constants)
       {
-         // Draw key: same mesh, same shaders, no instance count
-         // The offsets go with the buffers: queried with them, else tracked with them
+         // Draw key: same mesh, same shaders, no instance count. The offsets go with the buffers: queried with them, else tracked
+         // with them.
          UINT vertex_offset, index_offset;
          ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context, &vertex_offset);
          ID3D11Buffer* const index_buffer = gd.bound_states.IndexBuffer(native_device_context, &index_offset);
@@ -1838,7 +1842,6 @@ class Bayonetta final : public Game
       return true;
    }
 
-   // The fill's constants ("Luma_Bayonetta_MotionVectorFill.hlsl" b0)
    // The depth and camera motion fill (see "Luma_Bayonetta_MotionVectorFill.hlsl"), with the reactive masks if "write_reactive". The
    // caller caches and restores the state. False if it didn't run.
    static bool FillMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool write_reactive)
@@ -2589,7 +2592,7 @@ public:
          return DrawOrDispatchOverrideType::None;
       }
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
-      // The game's lists are all pixel shaders: looked up by this hash (a list's "Contains" of another walks the list)
+      // The game's lists are all pixel shaders, looked up by this hash ("Contains" with a whole hash list would walk it)
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
       const auto bind_luma_cbuffers = [&](uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0)
       {
@@ -2905,7 +2908,7 @@ public:
       }
       // MSAA (4x and up, as Mirror's Edge: 2x gives a coarser edge than the alpha test): the alpha tested materials' draws into the
       // multisampled scene with their alpha to coverage version, the game's shader put back after. The coverage version keeps the
-      // in place "PatchShaderBytecodeSync" clamp of the float target 0 shaders
+      // in place "PatchShaderBytecodeSync" clamp of the float target 0 shaders.
       else if (g_msaa_resolve_enable && g_msaa_coverage_enable && game_device_data.msaa_active && !is_custom_pass && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE)
       {
          // The target first: most draws with MSAA on (the UI, post) aren't multisampled, and need no shader lookup
@@ -3114,7 +3117,8 @@ public:
       ImGui::BeginDisabled(!gd.msaa_active);
       DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, foliage and fences; requires Anti-Aliasing enabled in the game's options; not used with DLSS/FSR).", !gd.msaa_active);
       ImGui::EndDisabled();
-      // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: greyed, its value kept. Not with MSAA ("sr_active"): SMAA runs then
+      // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: greyed, its value kept. Not with MSAA ("sr_active"): SMAA
+      // runs then.
       ImGui::BeginDisabled(gd.sr_active);
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off; not used with DLSS/FSR).", gd.sr_active);
       ImGui::EndDisabled();
@@ -3314,8 +3318,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // dgVoodoo forwards D3D9 SetGammaRamp to the OS device ramp, which distorts HDR output
       allow_disabling_gamma_ramp = true;
 
-      // The upscalers' mip bias. Mode 3: only samplers at bias 0 get it, the game already sets -1 on its material samplers (trace)
-      // and adding ours would make -2. force_upgrade_linear_samplers also gives the trilinear ones the bias (Core rewrites only
+      // The upscalers' mip bias. Mode 3: only samplers at bias 0 get it, the game already sets -1 on its material samplers (seen in a
+      // trace) and adding ours would make -2. force_upgrade_linear_samplers also gives the trilinear ones the bias (Core rewrites only
       // anisotropic samplers otherwise, TW2).
       enable_samplers_upgrade = true; // boot-time only (cannot be changed after device creation)
       samplers_upgrade_mode = 3;

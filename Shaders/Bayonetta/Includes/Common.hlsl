@@ -4,8 +4,8 @@
 #include "GameCBuffers.hlsl"
 // Global common
 #include "../../Includes/Common.hlsl"
-// Game specific settings
 #include "../../Includes/Reinhard.hlsl"
+// Game specific settings
 #include "Settings.hlsl"
 
 // The game's Y' weights, on encoded values

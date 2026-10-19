@@ -3,8 +3,8 @@
 #include "Includes/DoF.hlsl"
 // clang-format on
 
-// Bayonetta "filter08_4" (dgVoodoo 2.87.5 -> ps_5_0 0x40D84AAB), the DoF gather's 3x3 variant (mode 4, k = 2 * g_Param2.x from the
-// exe): 8 taps at (+-k, +-k), (+-k, 0) and (0, +-k) kernel pixels. See "Includes/DoF.hlsl".
+// Bayonetta "filter08_4" (dgVoodoo 2.87.5 -> ps_5_0 0x40D84AAB), the DoF gather's 3x3 variant (mode 4, k = g_Param2.x, which the
+// exe doubles for this mode): 8 taps at (+-k, +-k), (+-k, 0) and (0, +-k) kernel pixels. See "Includes/DoF.hlsl".
 void main(DGV_MAIN_SIGNATURE)
 {
    const DoFContext context = MakeDoFContext(v5);

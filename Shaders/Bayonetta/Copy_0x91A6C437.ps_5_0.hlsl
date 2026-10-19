@@ -9,9 +9,9 @@
 // main.cpp flags one draw a frame with LumaData.CustomData1: "ResetRender", the scene copied into dgVoodoo's D3D9 back buffer (the
 // canvas) right before the UI and the movies draw on it. The scene is gamma encoded (1 = paper white, gamma 2.2 display) with the
 // grade's and the bloom's values above 1, so that copy carries the HDR display map: linearize, RenoDX's PsychoV31 to the peak (with
-// the user's contrast, saturation and highlights desaturation, neutral at their defaults), the
-// UI paper white pre-scale (UI_DRAW_TYPE 2), encode back for the Core composition. Elsewhere the copy is vanilla, unclamped on the
-// fp16 targets (the bloom levels are 8-bit and clamp on their own), but for the bloom composite's alpha (CustomData1 2 and 3).
+// the user's contrast, saturation and highlights desaturation, neutral at their defaults), the UI paper white pre-scale
+// (UI_DRAW_TYPE 2), encode back for the Core composition. Elsewhere the copy is vanilla, its colour unclamped on the fp16 targets
+// (the bloom levels are 8-bit and clamp on their own), except for the bloom composite's alpha (CustomData1 2 and 3).
 
 cbuffer cb3 : register(b3)
 {

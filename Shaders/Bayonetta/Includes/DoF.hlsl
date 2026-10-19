@@ -6,11 +6,11 @@
 // Bayonetta's DoF passes ("filter08_0" to "_4", picked by FUN_00449c40's mode), transcribed from the SM3 sources and their dgVoodoo
 // translations: the authored taps, weights and normalization, read as the game read them at 1280x720. A gather tap's weight is its
 // own depth's circle of confusion (near and far ramps in g_Param), the centre's is 1, and alpha is the centre's (the blend into the
-// scene). docs/DoF-Best-Practices.md (DOF-1, DOF-2, DOF-13) for the choices. The taps step
-// in pixels of "kernel_target_size": the target's size, or with "Fix High Resolution Effects" its size at 720p (b10, see
-// "BindPixelKernelTargetSize"). Scaled that way the original read one bilinear sample per tap of a target 3x finer at 4K, so sharp
-// edges came out as offset copies; here a tap averages the target over the bilinear footprint a 720p texel had (a tent of +-1 kernel
-// pixel), and with one kernel pixel per target pixel (the fix off, or 720p) it is the original's single sample.
+// scene). See docs/DoF-Best-Practices.md (DOF-1, DOF-2, DOF-13) for the choices. The taps step in pixels of "kernel_target_size": the
+// target's size, or with "Fix High Resolution Effects" its size at 720p (b10, see "BindPixelKernelTargetSize"). Scaled that way the
+// original read one bilinear sample per tap of a target 3x finer at 4K, so sharp edges came out as offset copies. Here a tap averages
+// the target over the bilinear footprint a 720p texel had (a tent of +-1 kernel pixel), and with one kernel pixel per target pixel
+// (the fix off, or 720p) it is the original's single sample.
 // D3D9 c(n) = cb4[n + 8].
 
 cbuffer cb3 : register(b3)
