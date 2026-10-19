@@ -3450,7 +3450,7 @@ public:
       DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       ImGui::SeparatorText("Bloom");
-      DrawSettingCheckbox("Luma Bloom Enable", "LumaBloomEnable", &g_luma_bloom_enable, true, "Draws the game's bloom at a higher resolution: the same look, without its blocky, flickering glow.");
+      DrawSettingCheckbox("Luma Bloom Enable", "LumaBloomEnable", &g_luma_bloom_enable, true, "Replaces the game's bloom with a higher resolution one (the same look, without its blocky, flickering glow).");
       // Read in Copy_0x91A6C437.ps_5_0.hlsl on the bloom composite
       DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
@@ -3510,16 +3510,16 @@ public:
 
       ImGui::SeparatorText("Fixes");
       DrawSettingCheckbox("Fix High Resolution Effects", "FixHighResolutionEffects", &g_resolution_scaled_effects, true,
-         "Keeps shadow softness, depth of field and SSAO the size they had at 1280x720, the resolution the game was made for. Above it the game shrinks them (razor sharp shadows and little depth of field at 4K).");
+         "Keeps shadow softness, depth of field and SSAO the size they had at 1280x720, the resolution the game was made for.");
       // Only the Steam executable's limiters are hooked ("FrameLimiter::Install")
       ImGui::BeginDisabled(!FrameLimiter::installed);
       DrawSettingCheckbox("Fix Frame Pacing", "FixFramePacing", &g_fix_frame_pacing, true,
-         "Replaces the game's frame limiter with a precise one at the display's refresh rate: even frame times and no periodic stutter at 60 Hz (the game paces at 59.94 fps and releases frames up to 2 ms early). Turn off an external frame rate limit with it.", !FrameLimiter::installed);
+         "Replaces the game's frame limiter with a precise one. Turn off an external frame rate limit with it.", !FrameLimiter::installed);
       ImGui::EndDisabled();
       // Patched from the limiter hooks, on the Steam executable only ("FrameLimiter::Apply60FpsCutscenes")
       ImGui::BeginDisabled(!FrameLimiter::cutscenes_patchable);
       DrawSettingCheckbox("60 FPS Cutscenes", "60FPSCutscenes", &g_60_fps_cutscenes, true,
-         "Draws the real-time cutscenes at 60 fps instead of 30. Their speed and audio don't change: the game updates at 60 fps in them too and only drew every other update.", !FrameLimiter::cutscenes_patchable);
+         "Draws the real-time cutscenes at 60 fps instead of 30.", !FrameLimiter::cutscenes_patchable);
       ImGui::EndDisabled();
 #if DEVELOPMENT
       ImGui::Text("Frame limiter: period %u us, spin margin %u us, late %u, resyncs %u, adopted %u", FrameLimiter::period_us, FrameLimiter::spin_margin_us, FrameLimiter::late_frames, FrameLimiter::resyncs, FrameLimiter::adopted_deadlines);
