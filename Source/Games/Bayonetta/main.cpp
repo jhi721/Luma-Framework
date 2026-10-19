@@ -1005,7 +1005,7 @@ class Bayonetta final : public Game
       case PixelShaderPatch::BLENDED:
          return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
       case PixelShaderPatch::COVERAGE:
-         // The alpha tested materials clip at 0.5 (42 shaders in the 2.87.5 dump); the clips at 0.001 (blended materials' invisible
+         // The alpha tested materials clip at 0.5; the clips at 0.001 (blended materials' invisible
          // texels) and the depth prepass's at 0.05 are below the threshold and stay as they are
          return CoveragePatch::PatchPixelShader(code, code_size, error, 0.1f);
       }
