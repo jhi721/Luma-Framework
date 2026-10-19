@@ -75,6 +75,15 @@ static bool g_hide_ui = false;              // Session-only, never persisted: a 
 #if DEVELOPMENT
 static bool g_smaa_pred_debug = false; // The predication mask instead of the antialiased canvas
 #endif
+static bool g_gtao_enable = true; // XeGTAO replaces the game's SSAO (see "RunXeGTAO")
+// XeGTAO's knobs, "register(b9)" in Luma_Bayonetta_XeGTAO.hlsl and Luma_Bayonetta_XeGTAOApply.hlsl
+static constexpr UINT GTAO_KNOBS_CB_SLOT = 9;
+static float g_gtao_final_value_power = 1.f; // Darkness dial (higher = darker)
+static float g_gtao_depth_scale = 1.f;       // View depth divisor (game units -> ~meters)
+static float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (view units after the depth scale)
+#if DEVELOPMENT
+static int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges (the shader's debug blocks are DEVELOPMENT only)
+#endif
 // The reactive masks' resources go after this many frames without their pass
 constexpr uint32_t IDLE_RELEASE_FRAMES = 600;
 
@@ -147,6 +156,26 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> scene_srv;
    // The depth prepass as this frame's SSAO pass read it (null without SSAO): the SMAA predication source
    ComPtr<ID3D11ShaderResourceView> depth_srv;
+   // XeGTAO (see "RunXeGTAO"): the scratch at the SSAO depth's size ("gtao_size", kept on a failed allocation so it isn't retried
+   // every frame) and its knobs
+   ComPtr<ID3D11Texture2D> gtao_depth_mips; // R32F view depth, 5 mips
+   ComPtr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5];
+   ComPtr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
+   ComPtr<ID3D11Texture2D> gtao_working[2]; // R8G8 AO and edges, ping-pong
+   ComPtr<ID3D11UnorderedAccessView> gtao_working_uavs[2];
+   ComPtr<ID3D11ShaderResourceView> gtao_working_srvs[2];
+   ComPtr<ID3D11Texture2D> gtao_output; // R8 visibility
+   ComPtr<ID3D11UnorderedAccessView> gtao_output_uav;
+   ComPtr<ID3D11ShaderResourceView> gtao_output_srv;
+   uint2 gtao_size = {};
+   com_ptr<ID3D11Buffer> gtao_knobs_buffer;
+   // The camera: a copy of a depth prepass draw's vertex constants (dgVoodoo's cb4) and the rows of its two matrices there
+   // ("CB::GTAOKnobs"), taken once per frame ("gtao_camera_taken"); the last frame's serves a frame without one. The prepass vertex
+   // shaders' layouts by hash (see "ClassifyPrepassCamera").
+   com_ptr<ID3D11Buffer> gtao_camera_buffer;
+   uint2 gtao_camera_rows = {};
+   bool gtao_camera_taken = false;
+   std::unordered_map<uint32_t, uint2> gtao_camera_layouts;
    ComPtr<ID3D11Texture2D> smaa_predication;
    ComPtr<ID3D11UnorderedAccessView> smaa_predication_uav;
    ComPtr<ID3D11ShaderResourceView> smaa_predication_srv;
@@ -398,6 +427,27 @@ struct BayonettaGameDeviceData final : public GameDeviceData
          native_device->CreateBlendState(&blend_desc, &sr_rgb_blend_state);
       }
       return sr_rgb_blend_state.get();
+   }
+
+   // XeGTAO's scratch (~90 MB at 4K), recreated at its next use
+   void ReleaseGTAOScratch()
+   {
+      gtao_depth_mips.reset();
+      for (auto& uav : gtao_depth_mip_uavs)
+      {
+         uav.reset();
+      }
+      gtao_depth_mips_srv.reset();
+      for (int i = 0; i < 2; i++)
+      {
+         gtao_working[i].reset();
+         gtao_working_uavs[i].reset();
+         gtao_working_srvs[i].reset();
+      }
+      gtao_output.reset();
+      gtao_output_uav.reset();
+      gtao_output_srv.reset();
+      gtao_size = {};
    }
 
    void ReleaseT2xFrames()
@@ -1886,6 +1936,7 @@ public:
       // UI does the HDR display map and pre-scales the scene by the UI paper white, which the composition applies to the canvas.
       std::vector<ShaderDefineData> game_shader_defines_data = {
          {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended grade + PsychoV31 display map", 1},
+         {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -1930,6 +1981,9 @@ public:
          {"sr_reactive_debug_view", &g_sr_reactive_debug_view},
       });
       Mcp::RegisterValues({{"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
+      Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 0.01f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips), MCP_GAME_TEXTURE("gtao.output", gtao_output)});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv), MCP_GAME_TEXTURE("canvas.scene", scene_srv), MCP_GAME_TEXTURE("depth_prepass", depth_srv),
          MCP_GAME_TEXTURE("mv.velocity", mv_texture), MCP_GAME_TEXTURE("mv.depth", mv_device_depth), MCP_GAME_TEXTURE("mv.prepass", prepass_depth_srv),
          MCP_GAME_TEXTURE("sr.reactive", mv_reactive), MCP_GAME_TEXTURE("sr.transparency", mv_transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv_reactive_target)});
@@ -1948,6 +2002,16 @@ public:
       // it), and the motion vector target written by every blend state
       native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta Motion Vector Fill CS"), ShaderDefinition("Luma_Bayonetta_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta Copy Back PS"), ShaderDefinition("Luma_Bayonetta_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
+      // XeGTAO in place of the game's SSAO (see "RunXeGTAO"); the two denoisers differ only by XE_GTAO_FINAL_APPLY
+      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Prefilter Depths CS"),
+         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Main Pass CS"),
+         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 1 CS"),
+         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 2 CS"),
+         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Apply PS"), ShaderDefinition("Luma_Bayonetta_XeGTAOApply", reshade::api::pipeline_subobject_type::pixel_shader));
       // The weighted MSAA resolve on the samples as they are: the scene is gamma encoded, its values above 1 from the lighting, grade
       // and bloom (1 = SDR white). The 8-bit targets averaged samples clipped at 1, the fp16 mirrors the unclipped ones, which the weight
       // brings back to the edge gradient the game was made for. Alpha (the bloom source's threshold input) keeps the average.
@@ -2057,6 +2121,204 @@ public:
       return false;
    }
 
+   // XeGTAO's camera: where a depth prepass vertex shader keeps its affine view transform and the same transform followed by the
+   // projection, as rows of dgVoodoo's cb4 (D3D9 c(n) = row n + 20): "Rmodelview" c20 + "Rmodelviewproj" c24 (static meshes, grass) or
+   // "view" c0 + "g_ViewProjection" c8 (skinned meshes). {} for any other shader. Cached by hash.
+   static uint2 ClassifyPrepassCamera(DeviceData& device_data, BayonettaGameDeviceData* gd, uint32_t hash, reshade::api::pipeline pipeline)
+   {
+      if (const auto it = gd->gtao_camera_layouts.find(hash); it != gd->gtao_camera_layouts.end())
+         return it->second;
+      uint2 rows = {};
+      {
+         const std::shared_lock lock(s_mutex_generic);
+         if (const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second->subobjects_cache)
+         {
+            const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
+            const auto reads = [&](uint32_t row)
+            {
+               return DXBC::ReadsConstantRow(static_cast<const uint8_t*>(desc->code), desc->code_size, MotionVectorPatches::object_slot, row);
+            };
+            if (reads(40) && reads(44))
+            {
+               rows = {40, 44};
+            }
+            else if (reads(20) && reads(28))
+            {
+               rows = {20, 28};
+            }
+         }
+      }
+      gd->gtao_camera_layouts.emplace(hash, rows);
+      return rows;
+   }
+
+   // XeGTAO's camera from a depth prepass draw (R32F "1 - z/w" in target 0, the normals in target 1): its vertex constants copied as they
+   // are on the GPU (the projection is solved in the shader), and the rows of its matrices there
+   static void TakePrepassCamera(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      const uint2 rows = ClassifyPrepassCamera(device_data, &gd, vertex_shader_hash, cmd_list_data.pipeline_state_original_vertex_shader);
+      if (rows.x == 0)
+         return;
+      com_ptr<ID3D11RenderTargetView> rtvs[2];
+      native_device_context->OMGetRenderTargets(2, &rtvs[0], nullptr);
+      if (!rtvs[0] || !rtvs[1])
+         return;
+      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+      rtvs[0]->GetDesc(&rtv_desc);
+      if (rtv_desc.Format != DXGI_FORMAT_R32_FLOAT)
+         return;
+      com_ptr<ID3D11Buffer> constants;
+      native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, &constants);
+      if (!constants)
+         return;
+      D3D11_BUFFER_DESC desc;
+      constants->GetDesc(&desc);
+      D3D11_BUFFER_DESC copy_desc = {};
+      if (gd.gtao_camera_buffer)
+      {
+         gd.gtao_camera_buffer->GetDesc(&copy_desc);
+      }
+      if (copy_desc.ByteWidth != desc.ByteWidth)
+      {
+         gd.gtao_camera_buffer.reset();
+         const D3D11_BUFFER_DESC new_desc = {.ByteWidth = desc.ByteWidth, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_CONSTANT_BUFFER};
+         if (FAILED(native_device->CreateBuffer(&new_desc, nullptr, &gd.gtao_camera_buffer)))
+            return;
+      }
+      native_device_context->CopyResource(gd.gtao_camera_buffer.get(), constants.get());
+      gd.gtao_camera_rows = rows;
+      gd.gtao_camera_taken = true;
+   }
+
+   // XeGTAO in place of the game's SSAO, from the SSAO draw's inputs (t1 the prepass' view space normals, t2 its "1 - z/w") and the
+   // prepass' camera ("TakePrepassCamera"): 4 compute passes into "gtao_output", then the draw with "Bayonetta XeGTAO Apply PS" in place
+   // of the game's (scene * visibility). False, for the game's SSAO to draw, without the shaders, a camera, or on a failed allocation.
+   static bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, const std::function<void()>& draw)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      if (!gd.gtao_camera_buffer)
+         return false;
+      auto* const prefilter_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Prefilter Depths CS"));
+      auto* const main_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Main Pass CS"));
+      auto* const denoise_1_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 1 CS"));
+      auto* const denoise_2_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 2 CS"));
+      auto* const apply_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta XeGTAO Apply PS"));
+      if (!prefilter_cs || !main_cs || !denoise_1_cs || !denoise_2_cs || !apply_ps)
+         return false;
+      com_ptr<ID3D11ShaderResourceView> inputs[2]; // t1, t2
+      native_device_context->PSGetShaderResources(1, 2, &inputs[0]);
+      ID3D11ShaderResourceView* const normals = inputs[0].get();
+      ID3D11ShaderResourceView* const depth = inputs[1].get();
+      if (!normals || !depth)
+         return false;
+      const uint2 size = GetViewTextureSize(depth);
+      if (size.x == 0 || size.y == 0)
+         return false;
+
+      if (size != gd.gtao_size)
+      {
+         gd.ReleaseGTAOScratch();
+         const CD3D11_TEXTURE2D_DESC depth_desc(DXGI_FORMAT_R32_FLOAT, size.x, size.y, 1, 5 /* XE_GTAO_DEPTH_MIP_LEVELS */, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         bool created = SUCCEEDED(native_device->CreateTexture2D(&depth_desc, nullptr, gd.gtao_depth_mips.put()));
+         for (UINT mip = 0; created && mip < 5; mip++)
+         {
+            const CD3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc(D3D11_UAV_DIMENSION_TEXTURE2D, depth_desc.Format, mip);
+            created = SUCCEEDED(native_device->CreateUnorderedAccessView(gd.gtao_depth_mips.get(), &uav_desc, gd.gtao_depth_mip_uavs[mip].put()));
+         }
+         created = created && SUCCEEDED(native_device->CreateShaderResourceView(gd.gtao_depth_mips.get(), nullptr, gd.gtao_depth_mips_srv.put()));
+         const CD3D11_TEXTURE2D_DESC working_desc(DXGI_FORMAT_R8G8_UNORM, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         for (int i = 0; created && i < 2; i++)
+         {
+            created = SUCCEEDED(native_device->CreateTexture2D(&working_desc, nullptr, gd.gtao_working[i].put())) && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.gtao_working[i].get(), nullptr, gd.gtao_working_uavs[i].put())) &&
+                      SUCCEEDED(native_device->CreateShaderResourceView(gd.gtao_working[i].get(), nullptr, gd.gtao_working_srvs[i].put()));
+         }
+         const CD3D11_TEXTURE2D_DESC output_desc(DXGI_FORMAT_R8_UNORM, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         created = created && SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, gd.gtao_output.put())) && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.gtao_output.get(), nullptr, gd.gtao_output_uav.put())) &&
+                   SUCCEEDED(native_device->CreateShaderResourceView(gd.gtao_output.get(), nullptr, gd.gtao_output_srv.put()));
+         if (!created)
+         {
+            gd.ReleaseGTAOScratch();
+         }
+         // Kept on a failure too: the game's SSAO draws at this size, without an allocation attempt per frame (32-bit address space)
+         gd.gtao_size = size;
+      }
+      if (!gd.gtao_output_srv)
+         return false;
+
+#if DEVELOPMENT
+      const float debug_view = float(g_gtao_debug_view);
+#else
+      const float debug_view = 0.f;
+#endif
+      const CB::GTAOKnobs knobs = {
+         .final_value_power = g_gtao_final_value_power,
+         .depth_scale = g_gtao_depth_scale,
+         .radius_override = g_gtao_radius_override,
+         .debug_view = debug_view,
+         .viewport_pixel_size = {1.f / float(size.x), 1.f / float(size.y)},
+         .noise_index = (gd.sr_active ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f),
+         .camera_affine_row = float(gd.gtao_camera_rows.x),
+         .camera_matrix_row = float(gd.gtao_camera_rows.y),
+      };
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.gtao_knobs_buffer), &knobs, sizeof(knobs)))
+         return false;
+      ID3D11Buffer* const knobs_buffer = gd.gtao_knobs_buffer.get();
+
+      {
+         DrawStateStack<DrawStateStackType::Compute> compute_state;
+         compute_state.Cache(native_device_context, device_data.uav_max_count);
+         ID3D11Buffer* const camera_buffer = gd.gtao_camera_buffer.get();
+         native_device_context->CSSetConstantBuffers(MotionVectorPatches::object_slot, 1, &camera_buffer);
+         native_device_context->CSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &knobs_buffer);
+         ID3D11SamplerState* const point_sampler = device_data.sampler_state_point.get();
+         native_device_context->CSSetSamplers(0, 1, &point_sampler);
+         // Each pass binds its destination UAVs before its source SRVs: D3D11 otherwise nulls an SRV that still aliases the previous
+         // pass' bound UAV
+         ID3D11ShaderResourceView* const null_srvs[2] = {};
+         ID3D11UnorderedAccessView* const null_uavs[5] = {};
+         const auto pass = [&](ID3D11ComputeShader* shader, UINT uav_count, ID3D11UnorderedAccessView* const* uavs, ID3D11ShaderResourceView* const(&srvs)[2], UINT groups_x, UINT groups_y)
+         {
+            native_device_context->CSSetShaderResources(0, 2, null_srvs);
+            native_device_context->CSSetUnorderedAccessViews(0, uav_count, uavs, nullptr);
+            native_device_context->CSSetShaderResources(0, 2, srvs);
+            native_device_context->CSSetShader(shader, nullptr, 0);
+            native_device_context->Dispatch(groups_x, groups_y, 1);
+            native_device_context->CSSetUnorderedAccessViews(0, uav_count, null_uavs, nullptr);
+         };
+         ID3D11UnorderedAccessView* const mip_uavs[5] = {gd.gtao_depth_mip_uavs[0].get(), gd.gtao_depth_mip_uavs[1].get(), gd.gtao_depth_mip_uavs[2].get(), gd.gtao_depth_mip_uavs[3].get(), gd.gtao_depth_mip_uavs[4].get()};
+         ID3D11UnorderedAccessView* const working_uavs[2] = {gd.gtao_working_uavs[0].get(), gd.gtao_working_uavs[1].get()};
+         ID3D11UnorderedAccessView* const output_uav = gd.gtao_output_uav.get();
+         pass(prefilter_cs, 5, mip_uavs, {depth, nullptr}, (size.x + 15) / 16, (size.y + 15) / 16);
+         pass(main_cs, 1, &working_uavs[0], {gd.gtao_depth_mips_srv.get(), normals}, (size.x + 7) / 8, (size.y + 7) / 8);
+         pass(denoise_1_cs, 1, &working_uavs[1], {gd.gtao_working_srvs[0].get(), nullptr}, (size.x + 15) / 16, (size.y + 7) / 8);
+         pass(denoise_2_cs, 1, &output_uav, {gd.gtao_working_srvs[1].get(), nullptr}, (size.x + 15) / 16, (size.y + 7) / 8);
+#if DEVELOPMENT
+         QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", output_uav);
+#endif
+         compute_state.Restore(native_device_context);
+      }
+
+      // The game's draw (its vertex shader, target, t0 scene and t2 depth) with the apply shader, the visibility on t3 and the knobs
+      com_ptr<ID3D11PixelShader> game_shader;
+      native_device_context->PSGetShader(&game_shader, nullptr, nullptr);
+      com_ptr<ID3D11ShaderResourceView> game_t3;
+      native_device_context->PSGetShaderResources(3, 1, &game_t3);
+      com_ptr<ID3D11Buffer> game_knobs_slot;
+      native_device_context->PSGetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &game_knobs_slot);
+      ID3D11ShaderResourceView* const output_srv = gd.gtao_output_srv.get();
+      native_device_context->PSSetShader(apply_ps, nullptr, 0);
+      native_device_context->PSSetShaderResources(3, 1, &output_srv);
+      native_device_context->PSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &knobs_buffer);
+      draw();
+      native_device_context->PSSetShader(game_shader.get(), nullptr, 0);
+      ID3D11ShaderResourceView* const t3 = game_t3.get();
+      native_device_context->PSSetShaderResources(3, 1, &t3);
+      ID3D11Buffer* const knobs_slot = game_knobs_slot.get();
+      native_device_context->PSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &knobs_slot);
+      return true;
+   }
+
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -2154,6 +2416,12 @@ public:
          return DrawOrDispatchOverrideType::Replaced;
       };
 
+      // XeGTAO's camera, from the frame's first depth prepass draw with a known layout. Before the motion vector draws, which replace the
+      // prepass' draws when they jitter.
+      if (g_gtao_enable && is_immediate && !game_device_data.gtao_camera_taken && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
+      {
+         TakePrepassCamera(native_device, native_device_context, cmd_list_data, device_data, uint32_t(original_shader_hashes.vertex_shaders[0]));
+      }
       // DLAA/FSR/Luma TAA: the scene's draws with motion vectors or jitter (see "DrawWithMotionVectors"), and the fill and upscaler at
       // its first post pass
       if (game_device_data.mv_active && is_immediate)
@@ -2287,6 +2555,8 @@ public:
       {
          game_device_data.depth_srv.reset();
          native_device_context->PSGetShaderResources(2, 1, game_device_data.depth_srv.put());
+         if (g_gtao_enable && is_immediate && RunXeGTAO(native_device, native_device_context, device_data, *original_draw_dispatch_func))
+            return DrawOrDispatchOverrideType::Replaced;
       }
       else if (original_shader_hashes.Contains(shader_hashes_DgVoodooPresent))
       {
@@ -2391,6 +2661,12 @@ public:
       game_device_data.aa_last_stats = std::exchange(game_device_data.aa_stats, {});
 #endif
       game_device_data.depth_srv.reset(); // Don't hold the game's view across frames (a resize recreates it)
+      game_device_data.gtao_camera_taken = false;
+      // Turned off, XeGTAO gives its address space back (recreated at its next use)
+      if (!g_gtao_enable && game_device_data.gtao_size != uint2{})
+      {
+         game_device_data.ReleaseGTAOScratch();
+      }
 
       // DLSS/FSR/Luma TAA: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the
       // motion vector state are fixed here for the next frame (see "sr_active")
@@ -2543,6 +2819,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
 #endif
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
+      reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
@@ -2595,6 +2872,35 @@ public:
       DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
       DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
       DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightsDesaturation, default_luma_global_game_settings.HighlightsDesaturation, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+
+      ImGui::SeparatorText("Ambient Occlusion");
+      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's options).");
+#if DEVELOPMENT || TEST
+      ImGui::BeginDisabled(!g_gtao_enable);
+      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Darkness dial (higher = darker AO).");
+      }
+      ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 0.01f, 200.f, "%.2f", ImGuiSliderFlags_Logarithmic);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("View depth divisor (game units -> meters): the scale XeGTAO's radius and falloff are tuned for.");
+      }
+      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("0 = the shader's EFFECT_RADIUS; > 0 overrides it (view units after the depth scale).");
+      }
+#if DEVELOPMENT // The shader's debug blocks are DEVELOPMENT only
+      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Shows XeGTAO's diagnostics instead of the scene. Depth gradient dead or flat, or blocky normals = a wrong input; AO x8 = broad over-occlusion.");
+      }
+#endif
+      ImGui::EndDisabled();
+#endif
 
       ImGui::SeparatorText("Effects");
       // Read in Video_0xC60649FD.ps_5_0.hlsl. Inert in SDR: peak == paper white makes PumboAutoHDR an identity.

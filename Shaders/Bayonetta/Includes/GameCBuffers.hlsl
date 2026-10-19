@@ -23,6 +23,24 @@ struct LumaGameData
 {
    float Dummy; // hlsl doesn't support empty structs
 };
+
+// XeGTAO's runtime knobs (Luma_Bayonetta_XeGTAO.hlsl, b9), written by "RunXeGTAO"
+struct GTAOKnobs
+{
+   float final_value_power;    // Darkness dial (higher = darker)
+   float depth_scale;          // View depth divisor (game units -> ~meters)
+   float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
+   float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl), shown alone by Luma_Bayonetta_XeGTAOApply.hlsl
+   float2 viewport_pixel_size; // 1 / the depth's size
+   float noise_index;          // XeGTAO's temporal noise: frame % 64 while DLSS/FSR accumulates the AO, else 0
+   float camera_affine_row;    // b4's first row of the prepass draw's affine view transform (3 rows)
+   float camera_matrix_row;    // b4's first row of the same transform followed by the projection (4 rows)
+   float3 padding;
+};
 } // namespace CB
+
+#ifdef __cplusplus
+static_assert(sizeof(CB::GTAOKnobs) == 48); // The HLSL cbuffer's size
+#endif
 
 #endif // LUMA_GAME_CB_STRUCTS
