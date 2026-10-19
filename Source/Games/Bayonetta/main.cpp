@@ -99,9 +99,10 @@ static bool g_smaa_pred_debug = false; // The predication mask instead of the an
 // The pixel sized kernels at their 1280x720 size on screen ("shader_hashes_PixelKernels"); off: the PC version's, smaller as the
 // resolution rises
 static bool g_resolution_scaled_effects = true;
-static bool g_fix_frame_pacing = true;  // The game's frame limiters replaced (see "FrameLimiter")
-static bool g_60_fps_cutscenes = true;  // The loop's 30 fps bit kept clear (see "FrameLimiter::Apply60FpsCutscenes")
-static bool g_luma_bloom_enable = true; // The game's bloom chain drawn at a higher resolution (see "DrawBloomPass")
+static bool g_fix_frame_pacing = true;        // The game's frame limiters replaced (see "FrameLimiter")
+static bool g_60_fps_cutscenes = true;        // The loop's 30 fps bit kept clear (see "FrameLimiter::Apply60FpsCutscenes")
+static bool g_luma_bloom_enable = true;       // The game's bloom chain drawn at a higher resolution (see "DrawBloomPass")
+static bool g_high_resolution_shadows = true; // An 8192 shadow map at the highest shadow quality (see "ShadowMap")
 #if DEVELOPMENT
 static int g_bloom_scale_override = 0; // Luma Bloom's scale, 0 = from the resolution
 #else
@@ -177,6 +178,14 @@ enum class PixelShaderPatch : uint8_t
 };
 constexpr const char* PIXEL_SHADER_PATCH_NAMES[size_t(PixelShaderPatch::COUNT)] = {"MV PS", "MV PS (mask)", "MV PS (mask)", "MV PS (blended)", "Coverage PS"};
 
+// The Steam executable, whose fixed addresses the game code patches below use (relocations stripped: fixed base)
+static bool IsSteamExecutable()
+{
+   constexpr DWORD STEAM_TIME_DATE_STAMP = 0x591AD330;
+   const auto* const image = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+   return reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew)->FileHeader.TimeDateStamp == STEAM_TIME_DATE_STAMP;
+}
+
 // The game's frame limiters, replaced with "g_fix_frame_pacing" (_tools/bayonetta/NOTES.md "Frame limiter and 30 fps cutscenes",
 // docs/Frame-Limiter-Best-Practices.md FL-n). The main loop calls FUN_00c54430 right before Present at 60 fps, FUN_00c54340 at 30
 // (cutscenes): both SleepEx until 2 ms before a float32 ms deadline stepping 16.683 ms (59.94 fps), so frames leave up to 2 ms early,
@@ -185,7 +194,6 @@ constexpr const char* PIXEL_SHADER_PATCH_NAMES[size_t(PixelShaderPatch::COUNT)] 
 // the late flag (the loop skips the next Present), its counter and the resync the loop allows. Game speed is per frame: the cap stays.
 namespace FrameLimiter
 {
-   constexpr DWORD STEAM_TIME_DATE_STAMP = 0x591AD330; // Fixed base (relocations stripped)
    uint8_t* const LIMIT_60 = reinterpret_cast<uint8_t*>(0xC54430);
    uint8_t* const LIMIT_30 = reinterpret_cast<uint8_t*>(0xC54340);
    // Both start with "movss xmm0, [next deadline]; sub esp, 0Ch; movss [previous deadline], xmm0"
@@ -351,9 +359,7 @@ namespace FrameLimiter
 
    void Install()
    {
-      const auto* const image = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
-      const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
-      if (nt->FileHeader.TimeDateStamp != STEAM_TIME_DATE_STAMP || std::memcmp(LIMIT_60, PROLOGUE.data(), PROLOGUE.size()) != 0 ||
+      if (!IsSteamExecutable() || std::memcmp(LIMIT_60, PROLOGUE.data(), PROLOGUE.size()) != 0 ||
           std::memcmp(LIMIT_30, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
          return;
       LARGE_INTEGER qpc_frequency;
@@ -380,6 +386,39 @@ namespace FrameLimiter
       cutscenes_patchable = std::memcmp(APPLY_30_FPS_REQUEST, APPLY_30_FPS_REQUEST_ORIGINAL.data(), APPLY_30_FPS_REQUEST_ORIGINAL.size()) == 0;
    }
 } // namespace FrameLimiter
+
+// The shadow map's size: FUN_00402270 (applying the options) sets DAT_05abbe6c from {1024, 2048, 4096} (DAT_00d9d74c) by the shadow
+// quality (options +0x17c, DAT_00fde17c), and FUN_0045b320 (after the options, level loads) recreates the map's targets (DAT_05abbe80,
+// DAT_051af108) when it differs from their size (DAT_05abbe70). Every other use reads the size from there (clears, viewports); the
+// receivers' replacements filter at the map's real size ("Includes/ShadowReceive.hlsl").
+namespace ShadowMap
+{
+   uint32_t* const SIZES = reinterpret_cast<uint32_t*>(0xD9D74C); // .rdata
+   const uint32_t* const QUALITY = reinterpret_cast<const uint32_t*>(0xFDE17C);
+   uint32_t* const SIZE = reinterpret_cast<uint32_t*>(0x5ABBE6C);
+   constexpr std::array<uint32_t, 3> ORIGINAL_SIZES = {1024, 2048, 4096};
+   constexpr uint32_t HIGH_RESOLUTION_SIZE = 8192; // 3 targets (R32F, RGBA8, D24S8): 768 MB, 576 more than at 4096
+   bool patchable = false;
+
+   void Install()
+   {
+      patchable = IsSteamExecutable() && std::memcmp(SIZES, ORIGINAL_SIZES.data(), sizeof(ORIGINAL_SIZES)) == 0;
+   }
+
+   // The highest quality's size; the current size follows at once when that quality is chosen, the targets with the game's next check
+   void Apply()
+   {
+      if (!patchable)
+         return;
+      const uint32_t size = (g_high_resolution_shadows ? HIGH_RESOLUTION_SIZE : ORIGINAL_SIZES.back());
+      if (!System::PatchMemory(&SIZES[2], &size, sizeof(size), System::PatchMemoryType::Data))
+         return;
+      if (*QUALITY == 2)
+      {
+         *SIZE = size;
+      }
+   }
+} // namespace ShadowMap
 
 struct BayonettaGameDeviceData final : public GameDeviceData
 {
@@ -2230,6 +2269,7 @@ public:
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
       FrameLimiter::Install();
+      ShadowMap::Install();
 #if DEVELOPMENT
       Mcp::RegisterCounters({{"frame_limiter.late_frames", &FrameLimiter::late_frames}, {"frame_limiter.resyncs", &FrameLimiter::resyncs}, {"frame_limiter.adopted_deadlines", &FrameLimiter::adopted_deadlines},
          {"frame_limiter.period_us", &FrameLimiter::period_us}, { "frame_limiter.spin_margin_us",
@@ -3369,6 +3409,8 @@ public:
       reshade::get_config_value(nullptr, NAME, "FixFramePacing", g_fix_frame_pacing);
       reshade::get_config_value(nullptr, NAME, "60FPSCutscenes", g_60_fps_cutscenes);
       reshade::get_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
+      reshade::get_config_value(nullptr, NAME, "HighResolutionShadows", g_high_resolution_shadows);
+      ShadowMap::Apply();
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
@@ -3469,6 +3511,14 @@ public:
       ImGui::EndDisabled();
 
       DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_luma_global_game_settings.Dithering, "Reduces gradient banding.");
+
+      // On the Steam executable only ("ShadowMap::Install")
+      if (DrawSettingCheckbox("High Resolution Shadows", "HighResolutionShadows", &g_high_resolution_shadows, true,
+             "Sharper, steadier shadow outlines at the game's highest shadow quality. Applies with the next level load or options change.",
+             !ShadowMap::patchable))
+      {
+         ShadowMap::Apply();
+      }
 
       ImGui::SeparatorText("UI");
       ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
