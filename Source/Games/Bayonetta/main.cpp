@@ -49,6 +49,10 @@ const ShaderHashesList shader_hashes_SSAO = {.pixel_shaders = {0x40AF18CC, 0xC32
 // shadow edges (stripes in game). Pairs (2.87.5, 2.81.3) in that order.
 const ShaderHashesList shader_hashes_PixelKernels = {.pixel_shaders = {0x0788DCAD, 0xB02CEC5A, 0xA7C3CCD7, 0x60FA1018, 0x4894A725, 0xD4F6B2D2, 0x0B1A2B23, 0x917C0C95, 0x58C43DE9, 0x11E66C0B, 0x2A8528AE, 0xA801906F, 0x2B93FD4F, 0xA0BD8BBA, 0x40D84AAB,
                                                         0x29CE44D6, 0x40AF18CC, 0xC32759B1}};
+// The shadow receivers, replaced ("ShadowReceive_*": bilinear PCF at the map's size in place of the 512 texel grid's weights): they step
+// their taps by the kernel target size too, without the c194 redirection of their originals. rec00_xxxxx, rec00_bxxxx, shadowfixed;
+// pairs (2.87.5, 2.81.3).
+const ShaderHashesList shader_hashes_ShadowReceivers = {.pixel_shaders = {0x98BD17D3, 0x5088AF5D, 0x45E82A5F, 0x8B9A11DF, 0xCDA8ACDD, 0x06EB4448}};
 // The Sofdec movies' Y'CbCr -> R'G'B', drawn on the canvas after the scene (Video_0xC60649FD)
 const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0xC60649FD, 0xED0DA20F}};
 // The bloom chain (_tools/bayonetta/NOTES.md "Bloom"), all into the fixed size 320x176 bloom target: filter05 (the scene into level 0,
@@ -2908,7 +2912,7 @@ public:
       };
 
       // The pixel kernels' target size
-      if (original_shader_hashes.Contains(shader_hashes_PixelKernels))
+      if (original_shader_hashes.Contains(shader_hashes_PixelKernels) || original_shader_hashes.Contains(shader_hashes_ShadowReceivers))
       {
          BindPixelKernelTargetSize(native_device, native_device_context, &game_device_data);
       }
