@@ -368,9 +368,6 @@ namespace FrameLimiter
       {
          timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS); // Before Windows 10 1803
       }
-      // FL-6: Windows 11 ignores the timer resolution and slows the process down when its window is occluded or in the background
-      PROCESS_POWER_THROTTLING_STATE throttling{.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION, .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, .StateMask = 0};
-      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
       installed = MH_CreateHook(LIMIT_60, reinterpret_cast<void*>(&Limit60), reinterpret_cast<void**>(&original_60)) == MH_OK &&
                   MH_CreateHook(LIMIT_30, reinterpret_cast<void*>(&Limit30), reinterpret_cast<void**>(&original_30)) == MH_OK &&
                   MH_EnableHook(LIMIT_60) == MH_OK && MH_EnableHook(LIMIT_30) == MH_OK;
@@ -380,6 +377,9 @@ namespace FrameLimiter
          MH_RemoveHook(LIMIT_30);
          return;
       }
+      // FL-6: Windows 11 ignores the timer resolution and slows the process down when its window is occluded or in the background
+      PROCESS_POWER_THROTTLING_STATE throttling{.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION, .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, .StateMask = 0};
+      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
       cutscenes_patchable = std::memcmp(APPLY_30_FPS_REQUEST, APPLY_30_FPS_REQUEST_ORIGINAL.data(), APPLY_30_FPS_REQUEST_ORIGINAL.size()) == 0;
    }
 
