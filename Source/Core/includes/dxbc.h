@@ -602,4 +602,81 @@ namespace DXBC
       std::memcpy(new_code.get(), patched.data() + 2, *size);
       return new_code;
    }
+
+   // For "Game::PatchShaderBytecodeSync" ("code": the program after its version and length tokens, "size" its size in and out).
+   // Every immediately indexed read of row "from_row" of constant buffer "from_slot" reads row "to_row" of "to_slot" instead, a buffer
+   // the game mod binds (declared here, immediately indexed): a value the game computes on the CPU, swapped for the mod's. Null if the
+   // shader doesn't read that row, may read it through a relative index, or already declares "to_slot".
+   inline std::unique_ptr<std::byte[]> RedirectConstantRow(const std::byte* code, size_t* size, uint32_t from_slot, uint32_t from_row, uint32_t to_slot, uint32_t to_row)
+   {
+      if (*size % sizeof(uint32_t) != 0)
+         return nullptr;
+      Chunk program{.fourcc = FourCC("SHEX"), .data = std::vector<uint8_t>(8 + *size)};
+      const uint32_t header[2] = {0, uint32_t(program.data.size() / sizeof(uint32_t))};
+      std::memcpy(program.data.data(), header, sizeof(header));
+      std::memcpy(program.data.data() + sizeof(header), code, *size);
+      std::vector<uint32_t> tokens;
+      std::vector<Instruction> instructions;
+      size_t first_body = 0;
+      if (!ReadProgram(program, &tokens, &instructions, &first_body))
+         return nullptr;
+      // The new declaration joins the source's (operand token, slot, size: SM5's 3D form isn't used below SM5.1)
+      const auto constant_buffer_slot = [&](const Instruction& instruction)
+      {
+         return (instruction.opcode == D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER && instruction.length == 4) ? tokens[instruction.begin + 2] : UINT32_MAX;
+      };
+      size_t source_declaration = first_body;
+      for (size_t i = 0; i < first_body; i++)
+      {
+         const uint32_t slot = constant_buffer_slot(instructions[i]);
+         if (slot == to_slot)
+            return nullptr;
+         if (slot == from_slot)
+            source_declaration = i;
+      }
+      if (source_declaration == first_body)
+         return nullptr;
+
+      uint32_t unused_temp;
+      std::vector<uint32_t> patched = CopyDeclarations(tokens, instructions, first_body, 0, &unused_temp, [&](size_t i)
+         {
+            if (i != source_declaration)
+               return std::vector<uint32_t>();
+            const Instruction& declaration = instructions[i];
+            const uint32_t opcode = (tokens[declaration.begin] & ~D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN_MASK) | ENCODE_D3D10_SB_D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN(D3D10_SB_CONSTANT_BUFFER_IMMEDIATE_INDEXED);
+            return std::vector<uint32_t>{opcode, tokens[declaration.begin + 1], to_slot, to_row + 1}; });
+      bool redirected = false;
+      bool supported = true;
+      for (size_t i = first_body; i < instructions.size(); i++)
+      {
+         const Instruction& instruction = instructions[i];
+         const size_t offset = patched.size();
+         patched.insert(patched.end(), tokens.begin() + instruction.begin, tokens.begin() + instruction.begin + instruction.length);
+         if (instruction.opcode == D3D10_SB_OPCODE_CUSTOMDATA)
+            continue;
+         const bool walked = WalkOperands(tokens, instruction, [&](size_t token_position, size_t index_position)
+            {
+               const uint32_t token = tokens[token_position];
+               if (DECODE_D3D10_SB_OPERAND_TYPE(token) != D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER || index_position == no_index || tokens[index_position] != from_slot)
+                  return true;
+               if (DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) != D3D10_SB_OPERAND_INDEX_2D || DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) != D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
+                  return supported = false;
+               if (tokens[index_position + 1] == from_row)
+               {
+                  patched[offset + index_position - instruction.begin] = to_slot;
+                  patched[offset + index_position + 1 - instruction.begin] = to_row;
+                  redirected = true;
+               }
+               return true; });
+         if (!walked || !supported)
+            return nullptr;
+      }
+      if (!redirected)
+         return nullptr;
+
+      *size = (patched.size() - 2) * sizeof(uint32_t);
+      auto new_code = std::make_unique<std::byte[]>(*size);
+      std::memcpy(new_code.get(), patched.data() + 2, *size);
+      return new_code;
+   }
 } // namespace DXBC
