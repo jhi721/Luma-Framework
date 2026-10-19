@@ -328,31 +328,28 @@ namespace FrameLimiter
       cutscenes_patched = patch;
    }
 
-   void __cdecl Limit60()
+   void LimitOrCallOriginal(uint32_t frames, Limiter original)
    {
       Apply60FpsCutscenes();
       if (g_fix_frame_pacing)
       {
-         Limit(1);
+         Limit(frames);
       }
       else
       {
-         original_60();
+         original();
       }
+   }
+
+   void __cdecl Limit60()
+   {
+      LimitOrCallOriginal(1, original_60);
    }
 
    // The caller pushes an unused argument (cdecl: it pops it)
    void __cdecl Limit30()
    {
-      Apply60FpsCutscenes();
-      if (g_fix_frame_pacing)
-      {
-         Limit(2);
-      }
-      else
-      {
-         original_30();
-      }
+      LimitOrCallOriginal(2, original_30);
    }
 
    void Install()
@@ -589,12 +586,10 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    bool mv_filled = false;                   // The fill wrote this frame's motion vectors (reset at present)
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
    // Per-draw lookups kept for the next draw (reset when the scene opens): the jitter path's last depth view and whether it's the scene
-   // depth, its last depth stencil state's depth test and write, the motion vector path's last accepted targets and the last blend
-   // state's opacity, the last vertex and pixel shader's patched versions (owned by the maps above, never erased)
+   // depth (its depth test: "bound_states.DepthTested"), the motion vector path's last accepted targets and the last blend state's
+   // opacity, the last vertex and pixel shader's patched versions (owned by the maps above, never erased)
    ID3D11DepthStencilView* jitter_dsv = nullptr;
    bool jitter_dsv_scene = false;
-   ID3D11DepthStencilState* jitter_depth_stencil_state = nullptr;
-   bool jitter_depth_test = true;
    ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
    ID3D11BlendState* mv_blend_state = nullptr; // See "ClassifyBoundBlend"
    bool mv_blend_opaque = true;
@@ -614,65 +609,16 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    MotionVectorReject mv_refused_reason = REJECT_COUNT;
    ID3D11RenderTargetView* open_refused_rtv = nullptr;
    ID3D11DepthStencilView* open_refused_dsv = nullptr;
-   bool mv_jitter_bound = false;
    // The marker texels got their camera motion before the frame's first alpha blended motion vector draw (see "DrawWithMotionVectors")
    bool mv_markers_filled = false;
-   // The immediate context's blend and depth stencil states, vc4 (VS "MotionVectorPatches::object_slot"), vertex buffer 0 and index
-   // buffer as the game last bound them ("OnBindPipeline", "OnPushConstantBuffers", "OnBindVertexBuffers", "OnBindIndexBuffer"), so
-   // the draw hooks don't query them (an AddRef and a Release each, several per draw). Not referenced: an object lives while bound.
-   // Luma's own passes bind theirs natively and put the game's back. False after a bind this can't read (another add-on's combined
-   // pipeline): queried then.
-   ID3D11BlendState* bound_blend_state = nullptr;
-   ID3D11DepthStencilState* bound_depth_stencil_state = nullptr;
-   ID3D11Buffer* bound_object_buffer = nullptr;
-   ID3D11Buffer* bound_vertex_buffer = nullptr;
-   UINT bound_vertex_offset = 0;
-   ID3D11Buffer* bound_index_buffer = nullptr;
-   UINT bound_index_offset = 0;
-   bool bound_states_tracked = true;
-
-   // Pointer and "HashCombine" keys: one multiply spreads them over the buckets (std::hash runs FNV-1a on every byte)
-   struct KeyHash
-   {
-      size_t operator()(uint64_t key) const noexcept
-      {
-         return size_t((key * 0x9E3779B97F4A7C15ull) >> 32);
-      }
-   };
-
-   // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, empty until its first upload), from
-   // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest upload. Unlocked: the
-   // buffer hooks and the draws are all calls on the immediate context, which D3D11 requires its caller to serialize (dgVoodoo has no
-   // deferred contexts). Not always from one thread: the D3D9 Reset of a resolution change maps from the game's window thread.
-   using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
-   struct RegisteredConstants
-   {
-      // The last upload, rewritten in place: dgVoodoo maps a vc4 buffer for most draws, motion vector draws or not
-      std::vector<uint8_t> latest;
-      ConstantsCopy copy;      // "latest" whole, for the draws since that upload reading all of it (skinned: shared; made by the first)
-      void* mapped = nullptr;  // Mapped now, until its Unmap
-      uint32_t generation = 0; // "mv_constants_generation" at the upload: an older one predates a pause of the hooks
-   };
-   std::unordered_map<uint64_t, RegisteredConstants, KeyHash> mv_constants_copies;
-   // Raised at present when motion vectors restart: the uploads missed while the hooks were idle make every older "latest" stale. A
-   // counter rather than emptying the entries, which the frame's thread owns (dgVoodoo presents from another thread).
-   std::atomic<uint32_t> mv_constants_generation = 1;
-   // The first registered buffers, their sizes and entries (a node's address stays while the map grows), so a buffer hook finds them
-   // without a lookup. With more registered, every buffer takes the map lookup.
-   static constexpr uint32_t MAX_FILTERED_BUFFERS = 8;
-   struct FilteredBuffer
-   {
-      uint64_t handle = 0;
-      UINT size = 0;
-      RegisteredConstants* entry = nullptr;
-   };
-   std::array<FilteredBuffer, MAX_FILTERED_BUFFERS> mv_filtered_buffers = {};
-   uint32_t mv_filtered_buffer_count = 0;
-   bool mv_filter_overflow = false;
-   // Every pooled vc4 copy, and by size those nobody held anymore at the last present (taken by the next copies of that size)
-   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
-   std::unordered_map<size_t, std::vector<uint32_t>> mv_constants_pool_free;
-   size_t mv_constants_made = 0; // Copies asked for since the last present
+   // The immediate context's bindings as the game last bound them (see "PatchedDraws::BoundStates"), vc4 at
+   // "MotionVectorPatches::object_slot"; the jitter buffer's at "MotionVectorPatches::jitter_slot" ("BindJitter")
+   PatchedDraws::BoundStates<MotionVectorPatches::object_slot, MotionVectorPatches::jitter_slot> bound_states;
+   // CPU copies of the vc4 buffers the motion vector draws bind (see "PatchedDraws::ObjectConstants"). Not always from one thread:
+   // the D3D9 Reset of a resolution change maps from the game's window thread. Restarted at present when motion vectors restart
+   // (dgVoodoo presents from another thread than the frame's).
+   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
+   PatchedDraws::ObjectConstants mv_constants;
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with their tie-break transform and vc4. A draw takes the previous
@@ -682,8 +628,8 @@ struct BayonettaGameDeviceData final : public GameDeviceData
       PatchedDraws::ObjectTransform transform;
       ConstantsCopy constants;
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, KeyHash> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, KeyHash> mv_previous_objects;
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_objects;
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_previous_objects;
    // The frame's camera (vc4 of its first scene depth writing view projection draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -783,6 +729,18 @@ class Bayonetta final : public Game
    static BayonettaGameDeviceData& GetGameDeviceData(DeviceData& device_data)
    {
       return *static_cast<BayonettaGameDeviceData*>(device_data.game);
+   }
+
+   // Zeroed for a resource that isn't a 2D texture
+   static D3D11_TEXTURE2D_DESC GetTexture2DDesc(ID3D11Resource* resource)
+   {
+      D3D11_TEXTURE2D_DESC desc = {};
+      com_ptr<ID3D11Texture2D> texture;
+      if (resource && SUCCEEDED(resource->QueryInterface(&texture)))
+      {
+         texture->GetDesc(&desc);
+      }
+      return desc;
    }
 
    // The weighted resolve reads the samples of the MSAA targets, which dgVoodoo creates without a shader resource bind (their mirrors
@@ -934,83 +892,27 @@ class Bayonetta final : public Game
       return g_sr_reactive_enable && static_cast<const BayonettaGameDeviceData*>(device_data.game)->sr_active && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA);
    }
 
-   // The registered vc4 buffer's entry in "mv_constants_copies", null if the buffer isn't one; "size" its size if known (else 0)
-   static BayonettaGameDeviceData::RegisteredConstants* FindRegisteredBuffer(BayonettaGameDeviceData* gd, uint64_t handle, UINT* size)
+   // The game's data for the vc4 buffer hooks, while motion vectors are on
+   static BayonettaGameDeviceData* GetMotionVectorGameDeviceData(reshade::api::device* device)
    {
-      *size = 0;
-      if (!gd->mv_filter_overflow)
-      {
-         for (uint32_t i = 0; i < gd->mv_filtered_buffer_count; i++)
-         {
-            if (const auto& [filtered_handle, filtered_size, entry] = gd->mv_filtered_buffers[i]; filtered_handle == handle)
-            {
-               *size = filtered_size;
-               return entry;
-            }
-         }
+      DeviceData* const device_data = device->get_private_data<DeviceData>();
+      if (!device_data || !device_data->game)
          return nullptr;
-      }
-      const auto registered = gd->mv_constants_copies.find(handle);
-      return (registered != gd->mv_constants_copies.end() ? &registered->second : nullptr);
-   }
-
-   // A buffer registered in "mv_constants_copies" joins the filter while it has room
-   static void AddFilteredBuffer(BayonettaGameDeviceData* gd, ID3D11Buffer* buffer, BayonettaGameDeviceData::RegisteredConstants* entry)
-   {
-      const uint32_t count = gd->mv_filtered_buffer_count;
-      if (count >= BayonettaGameDeviceData::MAX_FILTERED_BUFFERS)
-      {
-         gd->mv_filter_overflow = true;
-         return;
-      }
-      D3D11_BUFFER_DESC desc;
-      buffer->GetDesc(&desc);
-      gd->mv_filtered_buffers[count] = {.handle = reinterpret_cast<uint64_t>(buffer), .size = desc.ByteWidth, .entry = entry};
-      gd->mv_filtered_buffer_count = count + 1;
-   }
-
-   static UINT GetBufferSize(uint64_t handle, UINT known_size)
-   {
-      if (known_size != 0)
-         return known_size;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(handle)->GetDesc(&desc);
-      return desc.ByteWidth;
-   }
-
-   // A vc4 copy of "size" bytes from "bytes": one nobody held anymore at the last present, else a new one
-   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(BayonettaGameDeviceData* gd, const uint8_t* bytes, size_t size)
-   {
-      gd->mv_constants_made++;
-      if (const auto free_copies = gd->mv_constants_pool_free.find(size); free_copies != gd->mv_constants_pool_free.end() && !free_copies->second.empty())
-      {
-         auto copy = gd->mv_constants_pool[free_copies->second.back()];
-         free_copies->second.pop_back();
-         std::memcpy(copy->data(), bytes, size);
-         return copy;
-      }
-      auto copy = std::make_shared<std::vector<uint8_t>>(bytes, bytes + size);
-      gd->mv_constants_pool.push_back(copy);
-      return copy;
+      auto& gd = GetGameDeviceData(*device_data);
+      return gd.mv_active ? &gd : nullptr;
    }
 
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
-      DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active || !data || !*data)
+      BayonettaGameDeviceData* const gd = GetMotionVectorGameDeviceData(device);
+      if (!gd || !data || !*data)
          return;
-      auto& gd = GetGameDeviceData(*device_data);
-      UINT buffer_size;
-      BayonettaGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &buffer_size);
-      if (!registered)
-         return;
-      // Overwritten at every Map, so a pointer from before a pause of the hooks never reaches an Unmap
-      registered->mapped = (access == reshade::api::map_access::write_discard && offset == 0) ? *data : nullptr;
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd->mv_constants.OnMap(resource.handle, offset, access, *data);
 #if DEVELOPMENT
-      if (!registered->mapped)
+      if (registered && !registered->mapped)
       {
-         gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
+         gd->mv_stats.other_maps++; // A partial or appending write: the copies would miss it
       }
 #endif
    }
@@ -1018,152 +920,39 @@ class Bayonetta final : public Game
    // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
-      DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active)
+      BayonettaGameDeviceData* const gd = GetMotionVectorGameDeviceData(device);
+      if (!gd)
          return;
-      auto& gd = GetGameDeviceData(*device_data);
-      UINT buffer_size;
-      BayonettaGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &buffer_size);
-      if (!registered || !registered->mapped)
-         return;
-      const uint8_t* const mapped = static_cast<const uint8_t*>(std::exchange(registered->mapped, nullptr));
-      registered->latest.assign(mapped, mapped + GetBufferSize(resource.handle, buffer_size));
-      registered->copy.reset();
-      registered->generation = gd.mv_constants_generation;
+      if (gd->mv_constants.OnUnmap(resource.handle))
+      {
 #if DEVELOPMENT
-      gd.mv_stats.maps++;
+         gd->mv_stats.maps++;
 #endif
+      }
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs); a partial update is merged into the
-   // last copy. Needs the unsigned "full add-on support" ReShade (the signed build doesn't raise the event).
+   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs). Needs the unsigned "full add-on support"
+   // ReShade (the signed build doesn't raise the event).
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource resource, uint64_t offset, uint64_t size)
    {
-      DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (!device_data || !device_data->game || !data || !GetGameDeviceData(*device_data).mv_active)
+      BayonettaGameDeviceData* const gd = GetMotionVectorGameDeviceData(device);
+      if (!gd || !data)
          return false;
-      auto& gd = GetGameDeviceData(*device_data);
-      UINT known_size;
-      BayonettaGameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &known_size);
-      if (!registered)
-         return false;
-      const UINT buffer_size = GetBufferSize(resource.handle, known_size);
-      if (offset >= buffer_size)
-         return false;
-      const size_t updated_size = size_t((std::min)(size, uint64_t(buffer_size) - offset));
-      // Merged into the last upload of the same size, else into zeros
-      std::vector<uint8_t>& latest = registered->latest;
-      const uint32_t generation = gd.mv_constants_generation;
-      if (latest.size() != buffer_size || registered->generation != generation)
+      if (gd->mv_constants.OnUpdate(resource.handle, data, offset, size))
       {
-         latest.assign(buffer_size, 0);
-      }
-      std::memcpy(latest.data() + offset, data, updated_size);
-      registered->copy.reset();
-      registered->generation = generation;
 #if DEVELOPMENT
-      gd.mv_stats.updates++;
+         gd->mv_stats.updates++;
 #endif
+      }
       return false;
    }
 
-   // "bound_blend_state" and "bound_depth_stencil_state", from the game's binds on the immediate context (ReShade raises one per state,
-   // and a reset binds none to every stage)
-   static void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
-   {
-      using reshade::api::pipeline_stage;
-      if ((stages & (pipeline_stage::output_merger | pipeline_stage::depth_stencil)) == 0)
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      if (stages == pipeline_stage::output_merger)
-      {
-         gd.bound_blend_state = reinterpret_cast<ID3D11BlendState*>(pipeline.handle);
-      }
-      else if (stages == pipeline_stage::depth_stencil)
-      {
-         gd.bound_depth_stencil_state = reinterpret_cast<ID3D11DepthStencilState*>(pipeline.handle);
-      }
-      else if (pipeline.handle == 0)
-      {
-         gd.bound_blend_state = nullptr;
-         gd.bound_depth_stencil_state = nullptr;
-      }
-      else
-      {
-         gd.bound_states_tracked = false;
-      }
-   }
-
-   // vc4's tracked binding (see "bound_object_buffer"); a game bind over the jitter slot (none seen) has it bound again
-   static void OnPushConstantBuffers(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
-   {
-      constexpr uint32_t slot = MotionVectorPatches::object_slot;
-      const auto covers = [&](uint32_t binding)
-      { return binding >= update.binding && binding < update.binding + update.count; };
-      if ((stages & reshade::api::shader_stage::vertex) == 0 || update.type != reshade::api::descriptor_type::constant_buffer || (!covers(slot) && !covers(MotionVectorPatches::jitter_slot)))
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      if (covers(MotionVectorPatches::jitter_slot))
-      {
-         gd.mv_jitter_bound = false;
-      }
-      if (covers(slot))
-      {
-         const auto* const ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
-         gd.bound_object_buffer = reinterpret_cast<ID3D11Buffer*>(ranges[slot - update.binding].buffer.handle);
-      }
-   }
-
-   // Vertex buffer 0's tracked binding (see "bound_vertex_buffer")
-   static void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
-   {
-      if (first != 0 || count == 0)
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      gd.bound_vertex_buffer = reinterpret_cast<ID3D11Buffer*>(buffers[0].handle);
-      gd.bound_vertex_offset = UINT(offsets[0]);
-   }
-
-   // The index buffer's tracked binding (see "bound_index_buffer")
-   static void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   // The tracked bindings the "PatchedDraws::BoundStates" events update: the immediate context's
+   static auto* GetBoundStates(reshade::api::command_list* cmd_list)
    {
       DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
       const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      gd.bound_index_buffer = reinterpret_cast<ID3D11Buffer*>(buffer.handle);
-      gd.bound_index_offset = UINT(offset);
-   }
-
-   // A bound object of the immediate context (not referenced: it lives while bound): "tracked" (see "bound_blend_state"), else what
-   // "query" writes to its argument (an object pointer to take over). "g_bound_state_check" counts the times they differ.
-   template <typename T, typename Query>
-   static T* BoundState(BayonettaGameDeviceData* gd, T* tracked, const Query& query)
-   {
-      if (gd->bound_states_tracked && !g_bound_state_check)
-         return tracked;
-      com_ptr<T> queried;
-      query(&queried);
-#if DEVELOPMENT
-      if (g_bound_state_check && gd->bound_states_tracked && queried.get() != tracked)
-      {
-         gd->mv_stats.bound_state_mismatches++;
-      }
-#endif
-      return queried.get();
+      return ((device_data && device_data->game && cmd_list_data && cmd_list_data->is_primary) ? &GetGameDeviceData(*device_data).bound_states : nullptr);
    }
 
    // A game pixel shader's "patch", from the bytecode its shader object was created with; empty with "error" if it can't be patched. Any
@@ -1324,8 +1113,7 @@ class Bayonetta final : public Game
    // smoke, glass, water; reactive and transparency & composition), ADDITIVE (SRC_ALPHA / ONE: sparks, glows; reactive)
    static void ClassifyBoundBlend(ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd)
    {
-      ID3D11BlendState* const blend_state = BoundState(gd, gd->bound_blend_state, [&](ID3D11BlendState** state)
-         { native_device_context->OMGetBlendState(state, nullptr, nullptr); });
+      ID3D11BlendState* const blend_state = gd->bound_states.BlendState(native_device_context);
       if (blend_state == gd->mv_blend_state)
          return;
       D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
@@ -1339,24 +1127,6 @@ class Bayonetta final : public Game
       // Exactly the states whose motion vector target "PatchedDraws::OnCreateBlendState" blends ("blend_alpha_blended_target")
       gd->mv_alpha_blended = rt0.BlendEnable && rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA && rt0.BlendOp == D3D11_BLEND_OP_ADD;
       gd->mv_blend_state = blend_state;
-   }
-
-   // The bound depth stencil state tests depth (meshes do; full screen passes and composites don't), cached by state
-   static bool IsDepthTested(ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd)
-   {
-      ID3D11DepthStencilState* const depth_stencil_state = BoundState(gd, gd->bound_depth_stencil_state, [&](ID3D11DepthStencilState** state)
-         { native_device_context->OMGetDepthStencilState(state, nullptr); });
-      if (depth_stencil_state != gd->jitter_depth_stencil_state)
-      {
-         D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
-         if (depth_stencil_state)
-         {
-            depth_stencil_state->GetDesc(&depth_desc);
-         }
-         gd->jitter_depth_test = depth_desc.DepthEnable;
-         gd->jitter_depth_stencil_state = depth_stencil_state;
-      }
-      return gd->jitter_depth_test;
    }
 
    // Opens the scene at the frame's first mesh draw into its targets: a single sample fp16 color or the depth prepass' R32F (with the
@@ -1373,9 +1143,7 @@ class Bayonetta final : public Game
          gd.open_refused_rtv = rtv;
          gd.open_refused_dsv = dsv;
       };
-      uint4 depth_size;
-      DXGI_FORMAT unused_format;
-      GetResourceInfo(dsv, depth_size, unused_format);
+      const uint2 depth_size = GetViewTextureSize(dsv);
       const uint2 output_size = {uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
       if (depth_size.x > output_size.x || depth_size.y > output_size.y || depth_size.x * 2 < output_size.x || depth_size.y * 2 < output_size.y)
       {
@@ -1386,12 +1154,7 @@ class Bayonetta final : public Game
       rtv->GetDesc(&rtv_desc);
       com_ptr<ID3D11Resource> color;
       rtv->GetResource(&color);
-      com_ptr<ID3D11Texture2D> color_texture;
-      D3D11_TEXTURE2D_DESC color_desc = {};
-      if (SUCCEEDED(color->QueryInterface(&color_texture)))
-      {
-         color_texture->GetDesc(&color_desc);
-      }
+      const D3D11_TEXTURE2D_DESC color_desc = GetTexture2DDesc(color.get());
       // Only the depth prepass (R32F 1 - z/w next to the normals) opens the scene: OtMirror draws its reflection earlier into another
       // full size fp16 target, with no prepass (and a view projection whose determinant has the opposite sign of the scene's). The scene color is the first fp16 target drawn with this depth ("DrawWithMotionVectors").
       const bool scene_format = rtv_desc.Format == DXGI_FORMAT_R32_FLOAT && has_second_target;
@@ -1406,21 +1169,19 @@ class Bayonetta final : public Game
       if (viewport_count == 0 || viewport.Width != float(depth_size.x) || viewport.Height != float(depth_size.y) || !GetPatchedVertexShader(native_device, cmd_list_data, device_data, vertex_shader_hash).shader)
          return;
       gd.mv_scene_open = true;
-      const uint2 scene_size = {depth_size.x, depth_size.y};
-      const bool same_size = gd.mv_scene_size == scene_size;
-      gd.mv_scene_size = scene_size;
+      const bool same_size = gd.mv_scene_size == depth_size;
+      gd.mv_scene_size = depth_size;
       gd.mv_depth.reset();
       dsv->GetResource(&gd.mv_depth);
       gd.mv_scene_color.reset();
       gd.mv_scene_rtv.reset();
       gd.mv_scene_last_copy.reset();
       gd.jitter_dsv = nullptr;
-      gd.jitter_depth_stencil_state = nullptr;
-      gd.jitter_depth_test = true;
+      gd.bound_states.ResetDepthTest();
       gd.mv_accepted_dsv = nullptr;
       gd.mv_refused_rtv = nullptr;
       gd.mv_refused_dsv = nullptr;
-      gd.mv_jitter_bound = false;
+      gd.bound_states.jitter_bound = false;
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
       gd.mv_alpha_blended = false;
@@ -1466,7 +1227,7 @@ class Bayonetta final : public Game
          const float shift = (gd.t2x_phase == 0 ? -0.25f : 0.25f);
          gd.mv_jitter = {shift, shift};
       }
-      gd.mv_jitter_ndc = {gd.mv_jitter[0] * 2.f / float(scene_size.x), gd.mv_jitter[1] * -2.f / float(scene_size.y)};
+      gd.mv_jitter_ndc = {gd.mv_jitter[0] * 2.f / float(depth_size.x), gd.mv_jitter[1] * -2.f / float(depth_size.y)};
       const float ndc_jitter[4] = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
       {
@@ -1486,10 +1247,10 @@ class Bayonetta final : public Game
 #endif
 
    // The jitter buffer, bound once per scene (no translated shader reads b9, Luma draws nothing during the scene; a game bind over it
-   // resets "mv_jitter_bound", see "OnPushConstantBuffers")
+   // resets "jitter_bound", see "PatchedDraws::OnPushConstantBuffers")
    static void BindJitter(ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd)
    {
-      if (std::exchange(gd->mv_jitter_bound, true))
+      if (std::exchange(gd->bound_states.jitter_bound, true))
          return;
       ID3D11Buffer* const jitter = gd->mv_jitter_buffer.get();
       native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
@@ -1498,20 +1259,13 @@ class Bayonetta final : public Game
    // What the next frame keeps of a draw's vc4: only the bytes its vertex shader reads (at least its camera and tie-break transform),
    // copied from the buffer's latest upload. A draw reading all of it (skinned) shares the entry's one copy. Null if the upload doesn't
    // hold the camera yet.
-   static BayonettaGameDeviceData::ConstantsCopy SnapshotConstants(BayonettaGameDeviceData* gd, BayonettaGameDeviceData::RegisteredConstants* entry, const BayonettaGameDeviceData::PatchedShader<ID3D11VertexShader>& vertex_shader)
+   static BayonettaGameDeviceData::ConstantsCopy SnapshotConstants(BayonettaGameDeviceData* gd, PatchedDraws::ObjectConstants::Entry* entry, const BayonettaGameDeviceData::PatchedShader<ID3D11VertexShader>& vertex_shader)
    {
       const size_t camera_end = vertex_shader.camera_offset + CAMERA_SIZE;
       if (entry->latest.size() < camera_end)
          return nullptr;
       const size_t min_size = (std::max)(camera_end, vertex_shader.translation_offset != 0 ? vertex_shader.translation_offset + sizeof(PatchedDraws::ObjectTransform) : 0);
-      const size_t read_size = (vertex_shader.read_size != 0 ? std::clamp<size_t>(vertex_shader.read_size, (std::min)(min_size, entry->latest.size()), entry->latest.size()) : entry->latest.size());
-      if (read_size < entry->latest.size())
-         return NewConstantsCopy(gd, entry->latest.data(), read_size);
-      if (!entry->copy)
-      {
-         entry->copy = NewConstantsCopy(gd, entry->latest.data(), read_size);
-      }
-      return entry->copy;
+      return gd->mv_constants.Snapshot(*entry, vertex_shader.read_size, min_size);
    }
 
    // A scene draw's vc4 buffer with its upload registered for copies at every Map and Update. The frame's camera is taken here, from
@@ -1520,35 +1274,24 @@ class Bayonetta final : public Game
    struct SceneDrawConstants
    {
       ID3D11Buffer* buffer = nullptr;
-      BayonettaGameDeviceData::RegisteredConstants* entry = nullptr;
+      PatchedDraws::ObjectConstants::Entry* entry = nullptr;
    };
    static SceneDrawConstants ReadSceneDrawConstants(ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd, const BayonettaGameDeviceData::PatchedShader<ID3D11VertexShader>& vertex_shader)
    {
       SceneDrawConstants result;
-      result.buffer = BoundState(gd, gd->bound_object_buffer, [&](ID3D11Buffer** buffer)
-         { native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, buffer); });
+      result.buffer = gd->bound_states.ObjectBuffer(native_device_context);
       if (!result.buffer)
          return result;
-      UINT known_size;
-      BayonettaGameDeviceData::RegisteredConstants* entry = FindRegisteredBuffer(gd, reinterpret_cast<uint64_t>(result.buffer), &known_size);
-      if (!entry)
-      {
-         const auto [registered_buffer, registered] = gd->mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(result.buffer));
-         entry = &registered_buffer->second;
-         if (registered)
-         {
-            AddFilteredBuffer(gd, result.buffer, entry);
-         }
-      }
+      PatchedDraws::ObjectConstants::Entry& entry = gd->mv_constants.Register(result.buffer);
       // An upload from before the hooks paused is stale (the draw stays uncopied until the next one)
-      if (entry->latest.size() < vertex_shader.camera_offset + CAMERA_SIZE || entry->generation != gd->mv_constants_generation)
+      if (const auto* const latest = gd->mv_constants.Latest(entry); !latest || latest->size() < vertex_shader.camera_offset + CAMERA_SIZE)
          return result;
-      result.entry = entry;
+      result.entry = &entry;
       // Any scene view projection draw: the prepass and the base passes share the camera, and the prepass' draws reach here only once
       // they are jittered (after the upscaler's first frame, which needs this camera for its fill)
       if (!gd->mv_camera && vertex_shader.camera_offset == VIEW_PROJECTION_OFFSET)
       {
-         gd->mv_camera = SnapshotConstants(gd, entry, vertex_shader);
+         gd->mv_camera = SnapshotConstants(gd, &entry, vertex_shader);
          // Previous clip space from the current: previous * inverse(current), in double (absolute world translation)
          gd->mv_reprojection.SetIdentity();
          if (gd->mv_previous_camera)
@@ -1578,7 +1321,7 @@ class Bayonetta final : public Game
       }
       if (!rtvs[0] || !dsv || !gd.mv_scene_open)
          return MV_REJECT(REJECT_NO_SCENE);
-      if (!IsDepthTested(native_device_context, &gd))
+      if (!gd.bound_states.DepthTested(native_device_context))
          return MV_REJECT(REJECT_DEPTH_TEST);
       ClassifyBoundBlend(native_device_context, &gd);
       // Alpha blended draws (SRC_ALPHA / INV_SRC_ALPHA) take their own motion vectors too, blended by their alpha: the particles are
@@ -1606,12 +1349,7 @@ class Bayonetta final : public Game
             return refuse(REJECT_OTHER_DEPTH_COLOR);
          D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
          rtvs[0]->GetDesc(&rtv_desc);
-         com_ptr<ID3D11Texture2D> color_texture;
-         D3D11_TEXTURE2D_DESC color_desc = {};
-         if (SUCCEEDED(color->QueryInterface(&color_texture)))
-         {
-            color_texture->GetDesc(&color_desc);
-         }
+         const D3D11_TEXTURE2D_DESC color_desc = GetTexture2DDesc(color.get());
          // The upscaler reads the scene: it needs a shader resource view. Filtered by the resource, not the view (dgVoodoo binds
          // single-slice array views). A multisampled scene is refused here only on MSAA's first frame ("msaa_active" then stops this path).
          if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || color_desc.ArraySize != 1 || color_desc.SampleDesc.Count != 1 || (color_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0)
@@ -1723,18 +1461,11 @@ class Bayonetta final : public Game
       {
          // Draw key: same mesh, same shaders, no instance count
          // The offsets go with the buffers: queried with them, else tracked with them
-         UINT vertex_offset = gd.bound_vertex_offset;
-         ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
-            {
-               UINT stride;
-               native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &vertex_offset); });
-         UINT index_offset = gd.bound_index_offset;
-         ID3D11Buffer* const index_buffer = BoundState(&gd, gd.bound_index_buffer, [&](ID3D11Buffer** buffer)
-            {
-               DXGI_FORMAT format;
-               native_device_context->IAGetIndexBuffer(buffer, &format, &index_offset); });
+         UINT vertex_offset, index_offset;
+         ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context, &vertex_offset);
+         ID3D11Buffer* const index_buffer = gd.bound_states.IndexBuffer(native_device_context, &index_offset);
 #if DEVELOPMENT
-         if (g_bound_state_check && gd.bound_states_tracked && (vertex_offset != gd.bound_vertex_offset || index_offset != gd.bound_index_offset))
+         if (gd.bound_states.check && gd.bound_states.tracked && (vertex_offset != gd.bound_states.vertex_offset || index_offset != gd.bound_states.index_offset))
          {
             gd.mv_stats.bound_state_mismatches++;
          }
@@ -1872,12 +1603,9 @@ class Bayonetta final : public Game
          gd.jitter_dsv = dsv;
          gd.jitter_dsv_scene = depth == gd.mv_depth;
       }
-      if (!gd.jitter_dsv_scene || !IsDepthTested(native_device_context, &gd))
+      if (!gd.jitter_dsv_scene || !gd.bound_states.DepthTested(native_device_context))
          return false;
-      const ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
-         {
-            UINT stride, offset;
-            native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &offset); });
+      const ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context);
       if (!vertex_buffer)
          return false;
       const auto& vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
@@ -1976,7 +1704,8 @@ class Bayonetta final : public Game
          device_data.sr_suppressed = true;
          return false;
       }
-      if (!gd.GetRGBBlendState(native_device))
+      ID3D11BlendState* const rgb_blend_state = gd.GetRGBBlendState(native_device);
+      if (!rgb_blend_state)
          return false;
 
       // FSR needs the camera (column vectors: vc4's view projection rows are the clip components)
@@ -2063,7 +1792,7 @@ class Bayonetta final : public Game
          }
          copy_rtv = gd.mv_scene_copy_rtv.get();
       }
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), gd.sr_rgb_blend_state.get(), nullptr, copy_vs, copy_rtv ? copy_back_ps : copy_ps,
+      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), rgb_blend_state, nullptr, copy_vs, copy_rtv ? copy_back_ps : copy_ps,
          gd.sr_output_srv.get(), gd.mv_scene_rtv.get(), scene_desc.Width, scene_desc.Height, true, copy_rtv);
       if (gd.mv_scene_copy && !copy_rtv)
       {
@@ -2197,10 +1926,10 @@ public:
          }
       };
       set.template operator()<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, false, true>);
-      set.template operator()<reshade::addon_event::bind_pipeline>(OnBindPipeline);
-      set.template operator()<reshade::addon_event::push_descriptors>(OnPushConstantBuffers);
-      set.template operator()<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
-      set.template operator()<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      set.template operator()<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
+      set.template operator()<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
+      set.template operator()<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
+      set.template operator()<reshade::addon_event::bind_index_buffer>(PatchedDraws::OnBindIndexBuffer<GetBoundStates>);
       set.template operator()<reshade::addon_event::create_resource>(OnCreateResource);
       set.template operator()<reshade::addon_event::copy_resource>(OnCopyResource);
       set.template operator()<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
@@ -2470,16 +2199,10 @@ public:
          return;
       const float scale = (g_resolution_scaled_effects ? 720.f / float(size.y) : 1.f);
       const std::array<float, 4> target_size = {float(size.x) * scale, float(size.y) * scale, 0.f, 0.f};
-      if (!gd->pixel_kernel_target_size_buffer)
-      {
-         const D3D11_BUFFER_DESC desc = {.ByteWidth = sizeof(target_size), .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_CONSTANT_BUFFER};
-         if (FAILED(native_device->CreateBuffer(&desc, nullptr, &gd->pixel_kernel_target_size_buffer)))
-            return;
-         gd->pixel_kernel_target_size = {};
-      }
       if (target_size != gd->pixel_kernel_target_size)
       {
-         native_device_context->UpdateSubresource(gd->pixel_kernel_target_size_buffer.get(), 0, nullptr, target_size.data(), 0, 0);
+         if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->pixel_kernel_target_size_buffer), target_size.data(), sizeof(target_size)))
+            return;
          gd->pixel_kernel_target_size = target_size;
       }
       ID3D11Buffer* const buffer = gd->pixel_kernel_target_size_buffer.get();
@@ -2616,12 +2339,17 @@ public:
          return false;
       ComPtr<ID3D11RenderTargetView> rtv;
       native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-      ComPtr<ID3D11ShaderResourceView> source_srv;
-      native_device_context->PSGetShaderResources(0, 1, source_srv.put());
-      if (!rtv || !source_srv)
+      if (!rtv)
          return false;
       ComPtr<ID3D11Resource> target;
       rtv->GetResource(target.put());
+      // Before the source and sizes: most copies draw elsewhere
+      if (!is_bloom_source && uint64_t(target.get()) != gd.bloom_target)
+         return false;
+      ComPtr<ID3D11ShaderResourceView> source_srv;
+      native_device_context->PSGetShaderResources(0, 1, source_srv.put());
+      if (!source_srv)
+         return false;
       const uint2 target_size = GetViewTextureSize(rtv.get());
       const uint2 source_size = GetViewTextureSize(source_srv.get());
       const bool from_scene = is_bloom_source && source_size.y > target_size.y;
@@ -2759,12 +2487,11 @@ public:
       if (!gd.gtao_output_srv)
          return false;
 
-      const float debug_view = float(g_gtao_debug_view);
       const CB::GTAOKnobs knobs = {
          .final_value_power = g_gtao_final_value_power,
          .depth_scale = g_gtao_depth_scale,
          .radius_override = g_gtao_radius_override,
-         .debug_view = debug_view,
+         .debug_view = float(g_gtao_debug_view),
          .viewport_pixel_size = {1.f / float(size.x), 1.f / float(size.y)},
          .noise_index = (gd.sr_active ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f),
          .camera_affine_row = float(gd.gtao_camera_rows.x),
@@ -2894,39 +2621,37 @@ public:
                native_device->CreateShaderResourceView(game_device_data.scene_texture.get(), &srv_desc, game_device_data.scene_srv.put());
             }
          }
-         if (game_device_data.scene_srv)
+         if (!game_device_data.scene_srv)
+            return DrawOrDispatchOverrideType::Replaced;
+         native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
+         game_device_data.has_copied_scene_to_canvas = true;
+         // SMAA then RCAS on the scene copy (not on the movies), each reading the snapshot and writing the canvas, then the snapshot
+         // again: the UI clamp floor must be the final canvas. An upscaler that drew this frame antialiased it: SMAA stays out, RCAS
+         // stays on.
+         if (custom_data != 1)
+            return DrawOrDispatchOverrideType::Replaced;
+         game_device_data.has_drawn_reset_render = true;
+         bool canvas_changed = false;
+         D3D11_VIEWPORT scene_rect;
+         UINT viewport_count = 1;
+         native_device_context->RSGetViewports(&viewport_count, &scene_rect);
+         if (g_smaa_enable && !device_data.has_drawn_sr && viewport_count == 1)
+         {
+            DrawSMAAOnCanvas(native_device, native_device_context, device_data, rtv, scene_rect);
+            canvas_changed = true;
+         }
+         if (g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data))
+         {
+            if (canvas_changed)
+            {
+               native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
+            }
+            DrawRCAS(native_device_context, device_data, game_device_data.scene_srv.get(), rtv, g_rcas_sharpness);
+            canvas_changed = true;
+         }
+         if (canvas_changed)
          {
             native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
-            game_device_data.has_copied_scene_to_canvas = true;
-            // SMAA then RCAS on the scene copy (not on the movies), each reading the snapshot and writing the canvas, then the snapshot
-            // again: the UI clamp floor must be the final canvas. An upscaler that drew this frame antialiased it: SMAA stays out, RCAS
-            // stays on.
-            if (custom_data == 1)
-            {
-               game_device_data.has_drawn_reset_render = true;
-               bool canvas_changed = false;
-               D3D11_VIEWPORT scene_rect;
-               UINT viewport_count = 1;
-               native_device_context->RSGetViewports(&viewport_count, &scene_rect);
-               if (g_smaa_enable && !device_data.has_drawn_sr && viewport_count == 1)
-               {
-                  DrawSMAAOnCanvas(native_device, native_device_context, device_data, rtv, scene_rect);
-                  canvas_changed = true;
-               }
-               if (g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data))
-               {
-                  if (canvas_changed)
-                  {
-                     native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
-                  }
-                  DrawRCAS(native_device_context, device_data, game_device_data.scene_srv.get(), rtv, g_rcas_sharpness);
-                  canvas_changed = true;
-               }
-               if (canvas_changed)
-               {
-                  native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
-               }
-            }
          }
          return DrawOrDispatchOverrideType::Replaced;
       };
@@ -2938,7 +2663,8 @@ public:
       }
       // XeGTAO's camera, from the frame's first depth prepass draw with a known layout. Before the motion vector draws, which replace the
       // prepass' draws when they jitter.
-      if (g_gtao_enable && is_immediate && !game_device_data.gtao_camera_taken && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
+      const bool has_vertex_shader = (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
+      if (g_gtao_enable && is_immediate && !game_device_data.gtao_camera_taken && has_vertex_shader)
       {
          TakePrepassCamera(native_device, native_device_context, cmd_list_data, device_data, uint32_t(original_shader_hashes.vertex_shaders[0]));
       }
@@ -2949,13 +2675,13 @@ public:
       {
          // A game draw with a vertex shader, which the patched shaders can redo: replaced ones too (the particles translate to copytex,
          // replaced by "Copy_0x91A6C437"; their patched versions come from the game's code, see "GetPatchedShader")
-         const bool game_mesh_draw = (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE;
+         const bool game_mesh_draw = has_vertex_shader && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE;
          if (!game_device_data.mv_scene_done && shader_hashes_ScenePost.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
          {
             if (game_device_data.mv_scene_open)
             {
 #if DEVELOPMENT
-               game_device_data.mv_stats.ended_by = uint32_t(original_shader_hashes.pixel_shaders[0]);
+               game_device_data.mv_stats.ended_by = pixel_shader_hash;
                game_device_data.mv_stats.prepass_drawn = game_device_data.prepass_drawn;
 #endif
                // The scene's last copy, if the pass reads it
@@ -3010,12 +2736,7 @@ public:
                   {
                      com_ptr<ID3D11Resource> resource;
                      rtvs[0]->GetResource(&resource);
-                     com_ptr<ID3D11Texture2D> texture;
-                     D3D11_TEXTURE2D_DESC desc = {};
-                     if (SUCCEEDED(resource->QueryInterface(&texture)))
-                     {
-                        texture->GetDesc(&desc);
-                     }
+                     const D3D11_TEXTURE2D_DESC desc = GetTexture2DDesc(resource.get());
                      if (desc.SampleDesc.Count == 1 && (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 && uint2{desc.Width, desc.Height} == game_device_data.mv_scene_size)
                      {
                         game_device_data.prepass_is_depth = true;
@@ -3069,7 +2790,8 @@ public:
       }
 
       const bool is_bloom_source = shader_hashes_BloomSource.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
-      if (is_immediate && (is_bloom_source || shader_hashes_BloomBlur.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || shader_hashes_Copy.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel)) &&
+      const bool is_copy = shader_hashes_Copy.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
+      if (is_immediate && (is_bloom_source || shader_hashes_BloomBlur.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || is_copy) &&
           DrawBloomPass(native_device, native_device_context, cmd_list_data, device_data, stages, is_bloom_source, *original_draw_dispatch_func, &updated_cbuffers))
          return DrawOrDispatchOverrideType::Replaced;
 
@@ -3102,9 +2824,9 @@ public:
          native_device_context->PSSetShaderResources(1, 1, &null_srv);
          return DrawOrDispatchOverrideType::Replaced;
       }
-      else if (is_custom_pass && (shader_hashes_Copy.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel)))
+      else if (is_custom_pass && (is_copy || shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel)))
       {
-         const bool is_video = shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
+         const bool is_video = !is_copy;
          // The bloom composite (FUN_0044bc90): the bloom target blended onto the scene, its mode 1 SRCALPHA/INVSRCALPHA or 2
          // SRCALPHA/ONE (mode 0, opaque, is its copies between levels). The shader scales the source alpha by "Bloom Intensity"
          // (LumaData.CustomData1 2 when it adds, 3 when it lerps); with Luma Bloom it reads "bloom_texture" (CustomData2 1: a B-spline
@@ -3143,7 +2865,7 @@ public:
             }
          }
          // ResetRender is the frame's first opaque copy into the canvas (the bloom composite also copies, additively, into the scene)
-         if (!is_video && game_device_data.has_copied_scene_to_canvas)
+         if (!is_video && (game_device_data.has_copied_scene_to_canvas || blend_desc.RenderTarget[0].BlendEnable))
          {
             return DrawOrDispatchOverrideType::None;
          }
@@ -3152,16 +2874,8 @@ public:
          {
             return DrawOrDispatchOverrideType::None;
          }
-         auto* const canvas = reinterpret_cast<ID3D11Resource*>(uint64_t(game_device_data.canvas));
          // The movies' AutoHDR goes above 1, which the present blit's clamp must keep
-         if (is_video)
-         {
-            return draw_and_snapshot_canvas(rtv.get(), canvas, 0);
-         }
-         if (!blend_desc.RenderTarget[0].BlendEnable)
-         {
-            return draw_and_snapshot_canvas(rtv.get(), canvas, 1);
-         }
+         return draw_and_snapshot_canvas(rtv.get(), reinterpret_cast<ID3D11Resource*>(uint64_t(game_device_data.canvas)), is_video ? 0 : 1);
       }
       // MSAA (4x and up, as Mirror's Edge: 2x gives a coarser edge than the alpha test): the alpha tested materials' draws into the
       // multisampled scene with their alpha to coverage version, the game's shader put back after. The coverage version keeps the
@@ -3172,17 +2886,11 @@ public:
          ComPtr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
          ComPtr<ID3D11Resource> rt;
-         ComPtr<ID3D11Texture2D> rt_texture;
-         D3D11_TEXTURE2D_DESC rt_desc = {};
          if (rtv)
          {
             rtv->GetResource(rt.put());
-            if (SUCCEEDED(rt->QueryInterface(rt_texture.put())))
-            {
-               rt_texture->GetDesc(&rt_desc);
-            }
          }
-         if (rt_desc.SampleDesc.Count >= 4)
+         if (GetTexture2DDesc(rt.get()).SampleDesc.Count >= 4)
          {
             if (ID3D11PixelShader* const coverage_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::COVERAGE).shader.get())
             {
@@ -3246,7 +2954,7 @@ public:
       const bool mv_was_active = game_device_data.mv_active.exchange((game_device_data.sr_active || game_device_data.t2x_active || g_mv_enable) && !game_device_data.msaa_active);
       if (game_device_data.mv_active && !mv_was_active)
       {
-         game_device_data.mv_constants_generation++;
+         game_device_data.mv_constants.Restart();
       }
       // SMAA turned off or replaced by an upscaler that drew: its ~80 MB of 4K intermediates go
       if ((!g_smaa_enable || game_device_data.mv_jitter_allowed) && game_device_data.smaa_resources_live)
@@ -3284,38 +2992,15 @@ public:
             game_device_data.mv_fill_buffer.reset();
             game_device_data.mv_jitter_buffer.reset();
             game_device_data.mv_previous_constants = {}; // Its 4 MiB dynamic ring is address space too
-            game_device_data.mv_constants_pool.clear();
-            game_device_data.mv_constants_pool_free.clear();
+            game_device_data.mv_constants.ReleasePool();
          }
       }
-      {
-         // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many as
-         // the last frame asked for: frames without a scene (loading, videos, menus) would keep their peak otherwise. Without motion
-         // vectors, none.
-         size_t kept_free = (game_device_data.mv_active ? std::exchange(game_device_data.mv_constants_made, 0) : 0);
-         std::erase_if(game_device_data.mv_constants_pool, [&](const auto& copy)
-            {
-               if (copy.use_count() != 1)
-                  return false;
-               if (kept_free == 0)
-                  return true;
-               kept_free--;
-               return false; });
-         for (auto& [size, free_copies] : game_device_data.mv_constants_pool_free)
-         {
-            free_copies.clear();
-         }
-         for (uint32_t i = 0; i < uint32_t(game_device_data.mv_constants_pool.size()); i++)
-         {
-            if (game_device_data.mv_constants_pool[i].use_count() == 1)
-            {
-               game_device_data.mv_constants_pool_free[game_device_data.mv_constants_pool[i]->size()].push_back(i);
-            }
-         }
+      game_device_data.mv_constants.TrimPool(game_device_data.mv_active);
 #if DEVELOPMENT
-         game_device_data.mv_stats.constants_pool = uint32_t(game_device_data.mv_constants_pool.size());
+      game_device_data.mv_stats.constants_pool = uint32_t(game_device_data.mv_constants.pool.size());
+      game_device_data.bound_states.check = g_bound_state_check;
+      game_device_data.mv_stats.bound_state_mismatches += std::exchange(game_device_data.bound_states.mismatches, 0);
 #endif
-      }
       // The reactive masks go once the fill stopped writing them (DLSS, the masks off, SMAA)
       if (game_device_data.mv_reactive_target && cb_luma_global_settings.FrameIndex - game_device_data.sr_reactive_frame > IDLE_RELEASE_FRAMES)
       {
@@ -3624,8 +3309,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_format_upgrades_2d_custom_aspect_ratios = {16.f / 9.f};
       // dgVoodoo creates its D3D9 back buffer (the canvas) before it sizes the swapchain (a 1x1 one at device creation, the old size
       // on a resolution change), so the size filters miss it at creation: its mirror is made when the scene copy (ResetRender) binds it
-      auto_texture_format_upgrade_shader_hashes[0x91A6C437] = {.rtv_slots = {0}};
-      auto_texture_format_upgrade_shader_hashes[0x7584B641] = {.rtv_slots = {0}};
+      for (const uint32_t hash : shader_hashes_Copy.pixel_shaders)
+      {
+         auto_texture_format_upgrade_shader_hashes[hash] = {.rtv_slots = {0}};
+      }
 
 #if DEVELOPMENT
       // Offline map of the post shaders (both dgVoodoo builds), for traces and the DevKit
