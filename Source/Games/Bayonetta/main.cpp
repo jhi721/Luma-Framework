@@ -118,6 +118,8 @@ static float g_gtao_depth_scale = 1.f;       // View depth divisor (game units -
 static float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (view units after the depth scale)
 #if DEVELOPMENT
 static int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges (the shader's debug blocks are DEVELOPMENT only)
+#else
+constexpr int g_gtao_debug_view = 0;
 #endif
 // The reactive masks' resources go after this many frames without their pass
 constexpr uint32_t IDLE_RELEASE_FRAMES = 600;
@@ -321,12 +323,8 @@ namespace FrameLimiter
       if (patch == cutscenes_patched)
          return;
       const auto& bytes = (patch ? APPLY_30_FPS_REQUEST_PATCHED : APPLY_30_FPS_REQUEST_ORIGINAL);
-      DWORD old_protect;
-      if (!VirtualProtect(APPLY_30_FPS_REQUEST, bytes.size(), PAGE_EXECUTE_READWRITE, &old_protect))
+      if (!System::PatchMemory(APPLY_30_FPS_REQUEST, bytes.data(), bytes.size(), System::PatchMemoryType::Code))
          return;
-      std::memcpy(APPLY_30_FPS_REQUEST, bytes.data(), bytes.size());
-      VirtualProtect(APPLY_30_FPS_REQUEST, bytes.size(), old_protect, &old_protect);
-      FlushInstructionCache(GetCurrentProcess(), APPLY_30_FPS_REQUEST, bytes.size());
       cutscenes_patched = patch;
    }
 
@@ -2587,11 +2585,8 @@ public:
             return;
          shadow = gd.bloom_shadows.insert(gd.bloom_shadows.end(), std::move(created));
       }
-      const uint32_t width = source_box ? (source_box->right - source_box->left) : dest_desc.Width;
-      const uint32_t height = source_box ? (source_box->bottom - source_box->top) : dest_desc.Height;
-      const uint32_t left = source_box ? source_box->left : 0;
-      const uint32_t top = source_box ? source_box->top : 0;
-      const D3D11_BOX box = {.left = left * scale, .top = top * scale, .front = 0, .right = (left + width) * scale, .bottom = (top + height) * scale, .back = 1};
+      const D3D11_BOX box = (source_box ? D3D11_BOX{.left = source_box->left * scale, .top = source_box->top * scale, .front = 0, .right = source_box->right * scale, .bottom = source_box->bottom * scale, .back = 1}
+                                        : D3D11_BOX{.left = 0, .top = 0, .front = 0, .right = dest_desc.Width * scale, .bottom = dest_desc.Height * scale, .back = 1});
       auto* const native_device_context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
       native_device_context->CopySubresourceRegion(shadow->texture.get(), 0, dest_box ? dest_box->left * scale : 0, dest_box ? dest_box->top * scale : 0, 0, gd.bloom_texture.get(), 0, &box);
    }
@@ -2648,9 +2643,8 @@ public:
             gd.bloom_shadows.clear();
             // 16 bit UNORM: the 8 bit target's [0, 1] range (the chain relies on its clamp) without its banding at the finer size
             const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R16G16B16A16_UNORM, target_size.x * scale, target_size.y * scale, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
-            const bool created = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, gd.bloom_texture.put())) && SUCCEEDED(native_device->CreateRenderTargetView(gd.bloom_texture.get(), nullptr, gd.bloom_rtv.put())) &&
-                                 SUCCEEDED(native_device->CreateShaderResourceView(gd.bloom_texture.get(), nullptr, gd.bloom_srv.put()));
-            if (!created)
+            if (FAILED(native_device->CreateTexture2D(&desc, nullptr, gd.bloom_texture.put())) || FAILED(native_device->CreateRenderTargetView(gd.bloom_texture.get(), nullptr, gd.bloom_rtv.put())) ||
+                FAILED(native_device->CreateShaderResourceView(gd.bloom_texture.get(), nullptr, gd.bloom_srv.put())))
             {
                gd.bloom_rtv.reset();
             }
@@ -2765,11 +2759,7 @@ public:
       if (!gd.gtao_output_srv)
          return false;
 
-#if DEVELOPMENT
       const float debug_view = float(g_gtao_debug_view);
-#else
-      const float debug_view = 0.f;
-#endif
       const CB::GTAOKnobs knobs = {
          .final_value_power = g_gtao_final_value_power,
          .depth_scale = g_gtao_depth_scale,
@@ -2846,6 +2836,12 @@ public:
          return DrawOrDispatchOverrideType::None;
       }
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+      const auto bind_luma_cbuffers = [&](uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0)
+      {
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, custom_data_1, custom_data_2);
+         updated_cbuffers = true;
+      };
       // The bound render target 0's view if it's the canvas (dgVoodoo's D3D9 back buffer), else null
       const auto bound_canvas_rtv = [&]
       {
@@ -2872,9 +2868,7 @@ public:
       // present blit clamps the later UI to
       auto draw_and_snapshot_canvas = [&](ID3D11RenderTargetView* rtv, ID3D11Resource* canvas, uint32_t custom_data)
       {
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, custom_data);
-         updated_cbuffers = true;
+         bind_luma_cbuffers(custom_data);
          (*original_draw_dispatch_func)();
          D3D11_TEXTURE2D_DESC canvas_desc;
          static_cast<ID3D11Texture2D*>(canvas)->GetDesc(&canvas_desc);
@@ -3098,9 +3092,7 @@ public:
             srv->GetResource(source.put());
             game_device_data.present_source = uint64_t(source.get());
          }
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData);
-         updated_cbuffers = true;
+         bind_luma_cbuffers();
          ID3D11ShaderResourceView* const scene_srv = (game_device_data.has_copied_scene_to_canvas ? game_device_data.scene_srv.get() : nullptr);
          native_device_context->PSSetShaderResources(1, 1, &scene_srv);
          (*original_draw_dispatch_func)();
@@ -3115,6 +3107,13 @@ public:
          // SRCALPHA/ONE (mode 0, opaque, is its copies between levels). The shader scales the source alpha by "Bloom Intensity"
          // (LumaData.CustomData1 2 when it adds, 3 when it lerps); with Luma Bloom it reads "bloom_texture" (CustomData2 1: a B-spline
          // magnification).
+         ComPtr<ID3D11BlendState> blend_state;
+         native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
+         D3D11_BLEND_DESC blend_desc = {};
+         if (blend_state)
+         {
+            blend_state->GetDesc(&blend_desc);
+         }
          ComPtr<ID3D11ShaderResourceView> source_srv;
          if (!is_video && game_device_data.bloom_target != 0)
          {
@@ -3127,20 +3126,11 @@ public:
          }
          if (source && uint64_t(source.get()) == game_device_data.bloom_target)
          {
-            ComPtr<ID3D11BlendState> blend_state;
-            native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
-            D3D11_BLEND_DESC blend_desc = {};
-            if (blend_state)
-            {
-               blend_state->GetDesc(&blend_desc);
-            }
             const D3D11_RENDER_TARGET_BLEND_DESC& blend = blend_desc.RenderTarget[0];
             if (blend.BlendEnable && blend.SrcBlend == D3D11_BLEND_SRC_ALPHA && (blend.DestBlend == D3D11_BLEND_ONE || blend.DestBlend == D3D11_BLEND_INV_SRC_ALPHA))
             {
                ID3D11ShaderResourceView* const luma_bloom_srv = (g_luma_bloom_enable ? game_device_data.bloom_srv.get() : nullptr);
-               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, (blend.DestBlend == D3D11_BLEND_ONE ? 2 : 3), luma_bloom_srv ? 1 : 0);
-               updated_cbuffers = true;
+               bind_luma_cbuffers((blend.DestBlend == D3D11_BLEND_ONE ? 2 : 3), luma_bloom_srv ? 1 : 0);
                if (!luma_bloom_srv)
                   return DrawOrDispatchOverrideType::None;
                native_device_context->PSSetShaderResources(0, 1, &luma_bloom_srv);
@@ -3165,13 +3155,6 @@ public:
          if (is_video)
          {
             return draw_and_snapshot_canvas(rtv.get(), canvas, 0);
-         }
-         ComPtr<ID3D11BlendState> blend_state;
-         native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
-         D3D11_BLEND_DESC blend_desc = {};
-         if (blend_state)
-         {
-            blend_state->GetDesc(&blend_desc);
          }
          if (!blend_desc.RenderTarget[0].BlendEnable)
          {
@@ -3526,9 +3509,7 @@ public:
       ImGui::EndDisabled();
 #if DEVELOPMENT
       ImGui::Text("Frame limiter: period %u us, spin margin %u us, late %u, resyncs %u, adopted %u", FrameLimiter::period_us, FrameLimiter::spin_margin_us, FrameLimiter::late_frames, FrameLimiter::resyncs, FrameLimiter::adopted_deadlines);
-#endif
 
-#if DEVELOPMENT
       ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
       ImGui::Checkbox("MV Enable", &g_mv_enable);
       if (ImGui::IsItemHovered())
