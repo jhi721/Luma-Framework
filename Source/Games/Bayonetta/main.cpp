@@ -8,8 +8,8 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads "last_draw_dispatch_data", which Publishing only fills with this
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
-// Luma TAA among the upscalers (in process; DLSS and FSR 3 run in the SR bridge's x64 helper, "UseLumaSRBridge"). Off for now: the
-// floor flickers under it on a static frame (DLAA and FSR don't).
+// Luma TAA among the upscalers (in process; DLSS and FSR 3 run in the SR bridge's x64 helper, "UseLumaSRBridge"). Off: the floor
+// flickers under it on a static frame (DLAA and FSR don't).
 #define ENABLE_LUMA_TAA 0
 // The game has MSAA but no shader AA: SMAA is added on the canvas after the scene copy (see "DrawSMAAOnCanvas")
 #define ENABLE_SMAA 1
@@ -110,6 +110,8 @@ constexpr int g_bloom_scale_override = 0;
 #endif
 // The target size the pixel kernel passes read instead of c194, not used by dgVoodoo (b3, b4) nor Luma (b12, b13)
 static constexpr UINT TARGET_SIZE_CB_SLOT = 10;
+// Their c194 row in dgVoodoo's cb4 (pixel shaders: D3D9 c(n) = row n + 8)
+static constexpr UINT TARGET_SIZE_ROW = 194 + 8;
 static bool g_gtao_enable = true; // XeGTAO replaces the game's SSAO (see "RunXeGTAO")
 // XeGTAO's knobs, "register(b9)" in Luma_Bayonetta_XeGTAO.hlsl and Luma_Bayonetta_XeGTAOApply.hlsl
 static constexpr UINT GTAO_KNOBS_CB_SLOT = 9;
@@ -225,7 +227,7 @@ namespace FrameLimiter
    static bool cutscenes_patched = false;
 
    // The game's main thread only. No VBlank phase lock (FL-9): D3DKMTGetScanLine, the only live VBlank source under independent flip,
-   // stalls ~3.7 ms in 0.1-0.5% of its calls (p999 3.72 ms, measured 2026-10-19), a hitch before Present every few seconds.
+   // stalls ~3.7 ms in 0.1-0.5% of its calls (p999 3.72 ms), a hitch before Present every few seconds.
    static int64_t frequency = 0;
    static int64_t next = 0; // QPC
    // The deadline last written: any other value came from the game (its start, the movie sync, its own limiter while toggled off)
@@ -2077,7 +2079,7 @@ public:
       std::unique_ptr<std::byte[]> redirected;
       if (shader_hashes_PixelKernels.Contains(uint32_t(shader_hash), reshade::api::shader_stage::pixel))
       {
-         redirected = DXBC::RedirectConstantRow(code, &size, MotionVectorPatches::object_slot, 202, TARGET_SIZE_CB_SLOT, 0);
+         redirected = DXBC::RedirectConstantRow(code, &size, MotionVectorPatches::object_slot, TARGET_SIZE_ROW, TARGET_SIZE_CB_SLOT, 0);
          ASSERT_ONCE(redirected);
          if (redirected)
          {
@@ -2236,6 +2238,8 @@ public:
    // "view" c0 + "g_ViewProjection" c8 (skinned meshes). {} for any other shader. Cached by hash.
    static uint2 ClassifyPrepassCamera(DeviceData& device_data, BayonettaGameDeviceData* gd, uint32_t hash, reshade::api::pipeline pipeline)
    {
+      constexpr uint2 MODELVIEW_ROWS = {MotionVectorPatches::object_row_offset + 20, MotionVectorPatches::object_row_offset + 24}; // "Rmodelview" c20, "Rmodelviewproj" c24
+      constexpr uint2 VIEW_ROWS = {MotionVectorPatches::object_row_offset, MotionVectorPatches::view_projection_row};              // "view" c0, "g_ViewProjection" c8
       if (const auto it = gd->gtao_camera_layouts.find(hash); it != gd->gtao_camera_layouts.end())
          return it->second;
       uint2 rows = {};
@@ -2248,13 +2252,13 @@ public:
             {
                return DXBC::ReadsConstantRow(static_cast<const uint8_t*>(desc->code), desc->code_size, MotionVectorPatches::object_slot, row);
             };
-            if (reads(40) && reads(44))
+            if (reads(MODELVIEW_ROWS.x) && reads(MODELVIEW_ROWS.y))
             {
-               rows = {40, 44};
+               rows = MODELVIEW_ROWS;
             }
-            else if (reads(20) && reads(28))
+            else if (reads(VIEW_ROWS.x) && reads(VIEW_ROWS.y))
             {
-               rows = {20, 28};
+               rows = VIEW_ROWS;
             }
          }
       }
@@ -2384,7 +2388,7 @@ public:
 
       if (from_scene)
       {
-         const uint32_t scale = (g_bloom_scale_override > 0) ? uint32_t(g_bloom_scale_override) : (std::max)(1u, uint32_t(std::lround(source_size.y / 720.0)));
+         const uint32_t scale = ((g_bloom_scale_override > 0) ? uint32_t(g_bloom_scale_override) : (std::max)(1u, uint32_t(std::lround(source_size.y / 720.0))));
          if (scale != gd.bloom_scale || !gd.bloom_rtv || GetViewTextureSize(gd.bloom_rtv.get()) != uint2{target_size.x * scale, target_size.y * scale})
          {
             gd.bloom_rtv.reset();
@@ -2422,7 +2426,7 @@ public:
       native_device_context->RSGetViewports(&viewport_count, viewports);
       // The origin isn't scaled past a quarter texel right of the game's (dgVoodoo's 0.5, D3D9's pixel center): the game's quads
       // start just inside the target's first texel, so scaled exactly they leave the first Luma texels unwritten, black for the
-      // blurs' clamped taps (a dark top and left edge). Measured at k 1 to 3 against the game's bloom: no shift, edges matched.
+      // blurs' clamped taps (a dark top and left edge).
       for (UINT i = 0; i < viewport_count; i++)
       {
          viewports[i].TopLeftX = (std::min)(viewports[i].TopLeftX * gd.bloom_scale, viewports[i].TopLeftX + 0.25f);
@@ -3367,8 +3371,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
               {"5BF04DF8", "Object Motion Blur"},
               {"651AC335", "Skinned Velocity (BlurSrcWeight)"},
               {"988429CF", "Skinned Velocity (BlurSrcWeight)"},
-              {"C60649FD", "Video YUV"},
-              {"ED0DA20F", "Video YUV"},
+              {"C60649FD", "Video Y'CbCr"},
+              {"ED0DA20F", "Video Y'CbCr"},
            })
       {
          forced_shader_names.emplace(std::stoul(hash, nullptr, 16), name);
