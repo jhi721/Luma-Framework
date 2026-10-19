@@ -23,6 +23,9 @@
 #include "..\..\Core\includes\patched_draws.h"
 #include "..\..\Core\includes\coverage_patch.h"
 
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
+
 // Bayonetta (PC, 2017) is x86 D3D9Ex: it runs through dgVoodoo (D3D9 -> D3D11), so every hash below is a dgVoodoo translation.
 // Hashes come from an offline mapping of the game's shader.dat through both dgVoodoo builds. Each pair is dgVoodoo 2.87.5 (ps_5_0, the
 // main zip) then 2.81.3 (ps_4_0, the Linux zip); the 2.81.3 replacements are forwarders to the 2.87.5 bodies (same signature and rows).
@@ -87,6 +90,7 @@ static bool g_smaa_pred_debug = false; // The predication mask instead of the an
 // The pixel sized kernels at their 1280x720 size on screen ("shader_hashes_PixelKernels"); off: the PC version's, smaller as the
 // resolution rises
 static bool g_resolution_scaled_effects = true;
+static bool g_fix_frame_pacing = true; // The game's frame limiters replaced (see "FrameLimiter")
 // The target size the pixel kernel passes read instead of c194, not used by dgVoodoo (b3, b4) nor Luma (b12, b13)
 static constexpr UINT TARGET_SIZE_CB_SLOT = 10;
 static bool g_gtao_enable = true; // XeGTAO replaces the game's SSAO (see "RunXeGTAO")
@@ -156,6 +160,180 @@ enum class PixelShaderPatch : uint8_t
    COUNT
 };
 constexpr const char* PIXEL_SHADER_PATCH_NAMES[size_t(PixelShaderPatch::COUNT)] = {"MV PS", "MV PS (mask)", "MV PS (mask)", "MV PS (blended)", "Coverage PS"};
+
+// The game's frame limiters, replaced with "g_fix_frame_pacing" (_tools/bayonetta/NOTES.md "Frame limiter and 30 fps cutscenes",
+// docs/Frame-Limiter-Best-Practices.md FL-n). The main loop calls FUN_00c54430 right before Present at 60 fps, FUN_00c54340 at 30
+// (cutscenes): both SleepEx until 2 ms before a float32 ms deadline stepping 16.683 ms (59.94 fps), so frames leave up to 2 ms early,
+// beat against a 60 Hz display (a repeated frame every ~17 s) and lose precision with play time. The replacement keeps their contract
+// with the loop: the previous and next deadline globals (float ms on the game's QPC time base; the movie sync rewrites the next one),
+// the late flag (the loop skips the next Present), its counter and the resync the loop allows. Game speed is per frame: the cap stays.
+namespace FrameLimiter
+{
+   constexpr DWORD STEAM_TIME_DATE_STAMP = 0x591AD330; // Fixed base (relocations stripped)
+   uint8_t* const LIMIT_60 = reinterpret_cast<uint8_t*>(0xC54430);
+   uint8_t* const LIMIT_30 = reinterpret_cast<uint8_t*>(0xC54340);
+   // Both start with "movss xmm0, [next deadline]; sub esp, 0Ch; movss [previous deadline], xmm0"
+   constexpr std::array<uint8_t, 19> PROLOGUE = {0xF3, 0x0F, 0x10, 0x05, 0x28, 0x95, 0xBB, 0x05, 0x83, 0xEC, 0x0C, 0xF3, 0x0F, 0x11, 0x05, 0x24, 0x95, 0xBB, 0x05};
+   float* const next_deadline_ms = reinterpret_cast<float*>(0x5BB9528);
+   float* const previous_deadline_ms = reinterpret_cast<float*>(0x5BB9524);
+   uint32_t* const late = reinterpret_cast<uint32_t*>(0x5BB9578);
+   int32_t* const late_count = reinterpret_cast<int32_t*>(0x5BB957C); // +1 per late frame at 60 fps, +2 at 30
+   const uint32_t* const resync_allowed = reinterpret_cast<const uint32_t*>(0xF45CC8);
+   const int64_t* const time_base = reinterpret_cast<const int64_t*>(0x5BCFBF8); // The QPC at the game's start (FUN_00c78090)
+   // The game's late thresholds (-24.19 and -48.38 ms) are 1.45 of its steps
+   constexpr double LATE_PERIODS = 1.45;
+
+   using Limiter = void(__cdecl*)();
+   Limiter original_60 = nullptr;
+   Limiter original_30 = nullptr;
+   bool installed = false;
+
+   // The game's main thread only. No VBlank phase lock (FL-9): D3DKMTGetScanLine, the only live VBlank source under independent flip,
+   // stalls ~3.7 ms in 0.1-0.5% of its calls (p999 3.72 ms, measured 2026-10-19), a hitch before Present every few seconds.
+   int64_t frequency = 0;
+   int64_t next = 0; // QPC
+   // The deadline last written: any other value came from the game (its start, the movie sync, its own limiter while toggled off)
+   float written_next_ms = std::numeric_limits<float>::quiet_NaN();
+   HANDLE timer = nullptr;
+   int64_t spin_margin = 0; // FL-7
+   uint32_t display_query_frame = 0;
+   int64_t refresh_period = 0; // QPC ticks, 0 unknown
+#if DEVELOPMENT
+   uint32_t late_frames = 0;
+   uint32_t resyncs = 0;
+   uint32_t adopted_deadlines = 0;
+   uint32_t period_us = 0;
+   uint32_t spin_margin_us = 0;
+#endif
+
+   void Limit(uint32_t frames)
+   {
+      const auto qpc = []
+      {
+         LARGE_INTEGER now;
+         QueryPerformanceCounter(&now);
+         return now.QuadPart;
+      };
+      const double ticks_per_ms = double(frequency) / 1000.0;
+      const float game_next_ms = *next_deadline_ms;
+      *previous_deadline_ms = game_next_ms;
+      if (game_next_ms != written_next_ms)
+      {
+         next = *time_base + int64_t(double(game_next_ms) * ticks_per_ms);
+#if DEVELOPMENT
+         adopted_deadlines++;
+#endif
+      }
+
+      // Each second: the display's period (DWM's is right under independent flip, its VBlank time isn't: FL-9a)
+      if (display_query_frame++ % 60 == 0)
+      {
+         DWM_TIMING_INFO timing{.cbSize = sizeof(timing)};
+         refresh_period = (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing)) ? int64_t(timing.qpcRefreshPeriod) : 0);
+      }
+      // FL-9b: whole refreshes when that's the game's rate within 0.5% (60, 120, 240 and 59.94 Hz displays), else exactly 60 fps
+      const int64_t game_period = int64_t(frames) * frequency / 60;
+      const int64_t refreshes = (refresh_period > 0 ? (game_period + refresh_period / 2) / refresh_period : 0);
+      const bool display_period = refreshes > 0 && std::abs(refreshes * refresh_period - game_period) * 200 <= game_period;
+      const int64_t period = (display_period ? refreshes * refresh_period : game_period);
+
+      // FL-4/5: a high resolution timer until the measured wake-up lateness before the deadline, then a spin
+      int64_t now = qpc();
+      const int64_t wake = next - spin_margin;
+      if (timer && wake > now)
+      {
+         const LARGE_INTEGER due{.QuadPart = -(wake - now) * 10'000'000 / frequency}; // Relative, in 100 ns
+         if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) && WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0)
+         {
+            now = qpc();
+            // FL-7: the worst recent lateness (decaying by 1/64 a frame) plus a guard
+            const int64_t guard = frequency / 4000;
+            spin_margin = std::clamp((std::max)(spin_margin - spin_margin / 64, now - wake + guard), guard, frequency / 250);
+         }
+      }
+      while (now < next)
+      {
+         YieldProcessor();
+         now = qpc();
+      }
+
+      const bool is_late = now - next > int64_t(LATE_PERIODS * double(period));
+      *late_count = (is_late ? *late_count + int32_t(frames) : 0);
+      *late = is_late;
+#if DEVELOPMENT
+      late_frames += is_late;
+#endif
+      if (*resync_allowed && *late_count > int32_t(4 * frames - 1))
+      {
+         *late_count = 0;
+         next = now;
+#if DEVELOPMENT
+         resyncs++;
+#endif
+      }
+      next += period;
+      written_next_ms = float(double(next - *time_base) / ticks_per_ms);
+      *next_deadline_ms = written_next_ms;
+#if DEVELOPMENT
+      period_us = uint32_t(period * 1'000'000 / frequency);
+      spin_margin_us = uint32_t(spin_margin * 1'000'000 / frequency);
+#endif
+   }
+
+   void __cdecl Limit60()
+   {
+      if (g_fix_frame_pacing)
+      {
+         Limit(1);
+      }
+      else
+      {
+         original_60();
+      }
+   }
+
+   // The caller pushes an unused argument (cdecl: it pops it)
+   void __cdecl Limit30()
+   {
+      if (g_fix_frame_pacing)
+      {
+         Limit(2);
+      }
+      else
+      {
+         original_30();
+      }
+   }
+
+   void Install()
+   {
+      const auto* const image = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+      const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+      if (nt->FileHeader.TimeDateStamp != STEAM_TIME_DATE_STAMP || std::memcmp(LIMIT_60, PROLOGUE.data(), PROLOGUE.size()) != 0 ||
+          std::memcmp(LIMIT_30, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
+         return;
+      LARGE_INTEGER qpc_frequency;
+      QueryPerformanceFrequency(&qpc_frequency);
+      frequency = qpc_frequency.QuadPart;
+      spin_margin = frequency / 1000;
+      timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+      if (!timer)
+      {
+         timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS); // Before Windows 10 1803
+      }
+      // FL-6: Windows 11 ignores the timer resolution and slows the process down when its window is occluded or in the background
+      PROCESS_POWER_THROTTLING_STATE throttling{.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION, .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, .StateMask = 0};
+      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+      installed = MH_CreateHook(LIMIT_60, reinterpret_cast<void*>(&Limit60), reinterpret_cast<void**>(&original_60)) == MH_OK &&
+                  MH_CreateHook(LIMIT_30, reinterpret_cast<void*>(&Limit30), reinterpret_cast<void**>(&original_30)) == MH_OK &&
+                  MH_EnableHook(LIMIT_60) == MH_OK && MH_EnableHook(LIMIT_30) == MH_OK;
+      if (!installed)
+      {
+         MH_RemoveHook(LIMIT_60);
+         MH_RemoveHook(LIMIT_30);
+      }
+   }
+} // namespace FrameLimiter
 
 struct BayonettaGameDeviceData final : public GameDeviceData
 {
@@ -1980,8 +2158,13 @@ public:
       default_luma_global_game_settings.HighlightsDesaturation = 0.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
+      FrameLimiter::Install();
 #if DEVELOPMENT
+      Mcp::RegisterCounters({{"frame_limiter.late_frames", &FrameLimiter::late_frames}, {"frame_limiter.resyncs", &FrameLimiter::resyncs}, {"frame_limiter.adopted_deadlines", &FrameLimiter::adopted_deadlines},
+         {"frame_limiter.period_us", &FrameLimiter::period_us}, { "frame_limiter.spin_margin_us",
+            &FrameLimiter::spin_margin_us }});
       Mcp::RegisterToggles({
+         {"fix_frame_pacing", &g_fix_frame_pacing},
          {"hide_ui", &g_hide_ui},
          {"msaa_resolve_enable", &g_msaa_resolve_enable},
          {"msaa_coverage_enable", &g_msaa_coverage_enable},
@@ -2891,6 +3074,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
       reshade::get_config_value(nullptr, NAME, "FixHighResolutionEffects", g_resolution_scaled_effects);
+      reshade::get_config_value(nullptr, NAME, "FixFramePacing", g_fix_frame_pacing);
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
@@ -2993,6 +3177,14 @@ public:
       ImGui::SeparatorText("Fixes");
       DrawSettingCheckbox("Fix High Resolution Effects", "FixHighResolutionEffects", &g_resolution_scaled_effects, true,
          "Keeps shadow softness, depth of field and SSAO the size they had at 1280x720, the resolution the game was made for. Above it the game shrinks them (razor sharp shadows and little depth of field at 4K).");
+      // Only the Steam executable's limiters are hooked ("FrameLimiter::Install")
+      ImGui::BeginDisabled(!FrameLimiter::installed);
+      DrawSettingCheckbox("Fix Frame Pacing", "FixFramePacing", &g_fix_frame_pacing, true,
+         "Replaces the game's frame limiter with a precise one at the display's refresh rate: even frame times and no periodic stutter at 60 Hz (the game paces at 59.94 fps and releases frames up to 2 ms early). Turn off an external frame rate limit with it.", !FrameLimiter::installed);
+      ImGui::EndDisabled();
+#if DEVELOPMENT
+      ImGui::Text("Frame limiter: period %u us, spin margin %u us, late %u, resyncs %u, adopted %u", FrameLimiter::period_us, FrameLimiter::spin_margin_us, FrameLimiter::late_frames, FrameLimiter::resyncs, FrameLimiter::adopted_deadlines);
+#endif
 
 #if DEVELOPMENT
       ImGui::SeparatorText("Motion Vectors (DLSS/FSR)");
@@ -3153,6 +3345,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
    {
       Bayonetta::SetEvents(false);
+      if (FrameLimiter::installed)
+      {
+         MH_RemoveHook(FrameLimiter::LIMIT_60);
+         MH_RemoveHook(FrameLimiter::LIMIT_30);
+      }
+      if (FrameLimiter::timer)
+      {
+         CloseHandle(FrameLimiter::timer);
+      }
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);
