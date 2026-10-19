@@ -857,6 +857,9 @@ class Bayonetta final : public Game
          if (const auto it = shaders->find(hash); it != shaders->end())
             return it->second;
       }
+#if DEVELOPMENT
+      const auto create_start = std::chrono::steady_clock::now();
+#endif
       std::vector<uint8_t> patched;
       std::string error; // Written by a refusal only
       UINT read_size = 0;
@@ -944,6 +947,12 @@ class Bayonetta final : public Game
          {
             error = std::format("create 0x{:08X}", uint32_t(hr));
          }
+#if DEVELOPMENT
+         else
+         {
+            Perf::g_shader_creates.AddLuma(std::chrono::steady_clock::now() - create_start);
+         }
+#endif
       }
       // Failures in every build (bug reports), except the expected refusals (screen space; every shader without a clip offered to the
       // coverage patch, logged in development only when patched); every patched shader only in development
