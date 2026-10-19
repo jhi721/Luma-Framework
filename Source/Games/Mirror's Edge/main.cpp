@@ -102,8 +102,16 @@ enum MotionVectorReject
 constexpr const char* MOTION_VECTOR_REJECT_NAMES[REJECT_COUNT] = {"extra_target", "no_scene", "depth_test", "blend", "other_depth_color", "format", "size", "create", "shaders"};
 #endif
 
-// A pixel shader's patch: the motion vector target, the mask target of an alpha blended (1, as "mv_reactive_blend") or additive (2)
-// draw, or an alpha blended draw's own motion vectors; or the MSAA alpha to coverage
+// A draw's blend for the reactive masks (see "ClassifyBoundBlend")
+enum class ReactiveBlend : uint8_t
+{
+   NONE,
+   ALPHA,
+   ADDITIVE,
+};
+
+// A pixel shader's patch: the motion vector target, the mask target of an alpha blended or additive draw, or an alpha blended draw's
+// own motion vectors; or the MSAA alpha to coverage
 enum class PixelShaderPatch : uint8_t
 {
    MOTION_VECTORS,
@@ -243,9 +251,9 @@ struct MirrorsEdgeGameDeviceData final : public GameDeviceData
    ID3D11BlendState* mv_blend_state = nullptr; // See "ClassifyBoundBlend"
    bool mv_blend_opaque = true;
    bool mv_alpha_blended = false;
-   uint8_t mv_reactive_blend = 0;
+   ReactiveBlend mv_reactive_blend = ReactiveBlend::NONE;
    uint32_t mv_last_vertex_shader_hash = 0;
-   PatchedShader<ID3D11VertexShader> mv_last_vertex_shader;
+   const PatchedShader<ID3D11VertexShader>* mv_last_vertex_shader = nullptr;
    uint32_t mv_last_pixel_shader_hash = 0;
    ID3D11PixelShader* mv_last_pixel_shader = nullptr;
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
@@ -439,7 +447,7 @@ class MirrorsEdge final : public Game
       if (pred_ok)
       {
          const CB::DepthExtractConstants extract_constants = {.tolerance = g_smaa_pred_tolerance};
-         PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_pred), &extract_constants, sizeof(extract_constants));
+         pred_ok = PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_pred), &extract_constants, sizeof(extract_constants));
          if (!gd->srv_pred || GetViewTextureSize(gd->srv_pred.get()) != uint2{w, h})
          {
             gd->uav_pred.reset();
@@ -450,7 +458,7 @@ class MirrorsEdge final : public Game
                native_device->CreateShaderResourceView(gd->tex_pred.get(), nullptr, gd->srv_pred.put());
             }
          }
-         pred_ok = gd->cb_pred && gd->uav_pred && gd->srv_pred;
+         pred_ok = pred_ok && gd->uav_pred && gd->srv_pred;
       }
 
       if (do_sharpen)
@@ -737,18 +745,18 @@ class MirrorsEdge final : public Game
    static const MirrorsEdgeGameDeviceData::PatchedShader<ID3D11VertexShader>& GetPatchedVertexShader(ID3D11Device* native_device, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t hash)
    {
       auto& gd = GetGameDeviceData(device_data);
-      if (hash != gd.mv_last_vertex_shader_hash)
+      if (hash != gd.mv_last_vertex_shader_hash || !gd.mv_last_vertex_shader)
       {
-         gd.mv_last_vertex_shader = GetPatchedShader<ID3D11VertexShader>(native_device, device_data, hash, cmd_list_data.pipeline_state_original_vertex_shader);
+         gd.mv_last_vertex_shader = &GetPatchedShader<ID3D11VertexShader>(native_device, device_data, hash, cmd_list_data.pipeline_state_original_vertex_shader);
          gd.mv_last_vertex_shader_hash = hash;
       }
-      return gd.mv_last_vertex_shader;
+      return *gd.mv_last_vertex_shader;
    }
 
    // Classifies the bound blend state (cached in "mv_blend_state"): "mv_blend_opaque" for the motion vectors (additive lights, decals
    // and translucents keep the motion vectors of what's behind them, and so do colorless draws: the occlusion query bounding boxes), and
-   // "mv_reactive_blend": 0 not alpha blended (opaque, lights ONE/ONE, shadows DEST_COLOR), 1 alpha blended (SRC_ALPHA / INV_SRC_ALPHA:
-   // smoke, glass, water; reactive and transparency & composition), 2 additive (SRC_ALPHA / ONE: sparks, glows; reactive)
+   // "mv_reactive_blend": NONE not alpha blended (opaque, lights ONE/ONE, shadows DEST_COLOR), ALPHA (SRC_ALPHA / INV_SRC_ALPHA: smoke,
+   // glass, water; reactive and transparency & composition), ADDITIVE (SRC_ALPHA / ONE: sparks, glows; reactive)
    static void ClassifyBoundBlend(ID3D11DeviceContext* native_device_context, MirrorsEdgeGameDeviceData* gd)
    {
       ID3D11BlendState* const blend_state = gd->bound_states.BlendState(native_device_context);
@@ -761,7 +769,7 @@ class MirrorsEdge final : public Game
       }
       const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = blend_desc.RenderTarget[0];
       gd->mv_blend_opaque = rt0.RenderTargetWriteMask != 0 && (!rt0.BlendEnable || (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_ZERO && rt0.BlendOp == D3D11_BLEND_OP_ADD));
-      gd->mv_reactive_blend = ((!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? 0 : (rt0.DestBlend == D3D11_BLEND_ONE ? 2 : 1));
+      gd->mv_reactive_blend = ((!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? ReactiveBlend::NONE : (rt0.DestBlend == D3D11_BLEND_ONE ? ReactiveBlend::ADDITIVE : ReactiveBlend::ALPHA));
       // Exactly the states whose motion vector target "PatchedDraws::OnCreateBlendState" blends ("blend_alpha_blended_target")
       gd->mv_alpha_blended = rt0.BlendEnable && rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA && rt0.BlendOp == D3D11_BLEND_OP_ADD;
       gd->mv_blend_state = blend_state;
@@ -802,7 +810,7 @@ class MirrorsEdge final : public Game
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
       gd.mv_alpha_blended = false;
-      gd.mv_reactive_blend = 0;
+      gd.mv_reactive_blend = ReactiveBlend::NONE;
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's helper
       // starting shows the scene as it is, antialiased with SMAA).
       const SR::InstanceData* sr_instance_data = (gd.sr_active ? device_data.GetSRInstanceData() : nullptr);
@@ -943,7 +951,7 @@ class MirrorsEdge final : public Game
          gd.mv_accepted_dsv = dsv;
       }
 
-      ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]).shader.get();
+      const auto& vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
       // The alpha blended draws write no masks: they write their own motion vectors, and FSR's reactive and transparency & composition
       // masks are for content without them (AMD's FSR manual)
       ID3D11PixelShader* pixel_shader = nullptr;
@@ -960,7 +968,7 @@ class MirrorsEdge final : public Game
          }
          pixel_shader = gd.mv_last_pixel_shader;
       }
-      if (!vertex_shader || !pixel_shader || !gd.mv_jitter_buffer)
+      if (!vertex_shader.shader || !pixel_shader || !gd.mv_jitter_buffer)
          return MV_REJECT(REJECT_SHADERS);
       if (std::exchange(gd.mv_frame_ended, false))
       {
@@ -1017,12 +1025,13 @@ class MirrorsEdge final : public Game
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader reads
       // a constant buffer past b4.
       ID3D11Buffer* const current = gd.bound_states.ObjectBuffer(native_device_context);
-      const UINT read_size = gd.mv_last_vertex_shader.read_size;
-      // The buffer's latest upload, whole (null until its first upload); the lookup registers it for a copy at every upload
+      const UINT read_size = vertex_shader.read_size;
+      // The buffer's latest upload, only what the shader reads (at least the camera and the tie-break row; null until its first upload);
+      // the lookup registers it for a copy at every upload
       MirrorsEdgeGameDeviceData::ConstantsCopy constants;
       if (current)
       {
-         constants = gd.mv_constants.Snapshot(gd.mv_constants.Register(current));
+         constants = gd.mv_constants.Snapshot(gd.mv_constants.Register(current), read_size, (std::max)(VIEW_PROJECTION_OFFSET + CAMERA_SIZE, size_t(vertex_shader.translation_offset) + 16));
       }
       // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
       // None (no CPU copy yet, another camera): the current one (zero motion).
@@ -1050,7 +1059,7 @@ class MirrorsEdge final : public Game
          }
          // LocalToWorld (c5-c8) separates objects that share a key (props), as a tie-break only (see "PatchedDraws::ObjectTransform").
          // Skinned meshes' c8 is a bone row, the same for copies of a model (Mass Effect 2007's holstered weapons): theirs is c230-c233.
-         const size_t translation_offset = (constants->size() >= gd.mv_last_vertex_shader.translation_offset + 16 ? gd.mv_last_vertex_shader.translation_offset : TRANSLATION_OFFSET);
+         const size_t translation_offset = (constants->size() >= vertex_shader.translation_offset + 16 ? vertex_shader.translation_offset : TRANSLATION_OFFSET);
          const PatchedDraws::ObjectTransform transform = PatchedDraws::ReadRowVectorTransform(constants->data() + translation_offset - 3 * 16);
 
          // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
@@ -1070,10 +1079,8 @@ class MirrorsEdge final : public Game
          }
          else if (gd.mv_previous_camera && std::memcmp(constants->data() + VIEW_PROJECTION_OFFSET, gd.mv_camera->data() + VIEW_PROJECTION_OFFSET, CAMERA_SIZE) == 0)
          {
-            // Not found, drawn with the frame's camera: its own constants with last frame's camera (camera motion only), only what the
-            // shader reads (at least the camera)
-            const size_t copy_size = (read_size != 0 ? std::clamp<size_t>(read_size, VIEW_PROJECTION_OFFSET + CAMERA_SIZE, constants->size()) : constants->size());
-            gd.mv_camera_only_copy.assign(constants->begin(), constants->begin() + copy_size);
+            // Not found, drawn with the frame's camera: its own constants with last frame's camera (camera motion only)
+            gd.mv_camera_only_copy.assign(constants->begin(), constants->end());
             std::memcpy(gd.mv_camera_only_copy.data() + VIEW_PROJECTION_OFFSET, gd.mv_previous_camera->data() + VIEW_PROJECTION_OFFSET, CAMERA_SIZE);
             upload = &gd.mv_camera_only_copy;
 #if DEVELOPMENT
@@ -1120,7 +1127,7 @@ class MirrorsEdge final : public Game
          targets[MotionVectorPatches::target_slot] = gd.mv_rtv.get();
          native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
       }
-      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader, &gd.mv_bound_vertex_shader);
+      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader.shader.get(), &gd.mv_bound_vertex_shader);
       PatchedDraws::BindPatchedShader(native_device_context, pixel_shader, &gd.mv_bound_pixel_shader);
 
       draw();
@@ -1164,9 +1171,9 @@ class MirrorsEdge final : public Game
       if (IsReactiveMaskUsed(device_data) && gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
       {
          ClassifyBoundBlend(native_device_context, &gd);
-         if (const uint8_t blend = gd.mv_reactive_blend; blend != 0)
+         if (const ReactiveBlend blend = gd.mv_reactive_blend; blend != ReactiveBlend::NONE)
          {
-            reactive_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, (blend == 2 ? PixelShaderPatch::MASK_ADDITIVE : PixelShaderPatch::MASK_ALPHA)).shader.get();
+            reactive_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, (blend == ReactiveBlend::ADDITIVE ? PixelShaderPatch::MASK_ADDITIVE : PixelShaderPatch::MASK_ALPHA)).shader.get();
          }
       }
 
@@ -1381,17 +1388,14 @@ class MirrorsEdge final : public Game
       }
       const Math::Matrix44D reprojection = previous * current;
       const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, /* row_vectors */ true);
-      CB::MotionVectorFillConstants constants = {
+      const CB::MotionVectorFillConstants constants = {
+         .reprojection = reprojection,
          .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
          .depth_from_view = {float(camera.depth_a), float(camera.depth_b)},
          .reactive_scale = g_sr_reactive_scale,
          .reactive_threshold = g_sr_reactive_threshold,
          .reactive_enabled = (write_reactive ? 1.f : 0.f),
       };
-      for (int i = 0; i < 16; i++)
-      {
-         constants.reprojection.GetData()[i] = float(reprojection.GetData()[i]);
-      }
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_fill_buffer), &constants, sizeof(constants)))
          return false;
       // The scene and the motion vectors may be bound as render targets
@@ -1590,7 +1594,8 @@ public:
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
       Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_t2x", &g_smaa_t2x}, {"smaa_predication", &g_smaa_predication}, {"hide_ui", &g_hide_ui}, {"mv_enable", &g_mv_enable},
-         {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"sr_reactive_enable", &g_sr_reactive_enable}, {"sr_reactive_debug_view", &g_sr_reactive_debug_view}, {"msaa_resolve_enable", &g_msaa_resolve_enable}, {"msaa_resolve_average_depth", &g_msaa_resolve_average_depth}, { "msaa_coverage_enable",
+         {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"sr_reactive_enable", &g_sr_reactive_enable}, {"sr_reactive_debug_view", &g_sr_reactive_debug_view},
+         {"msaa_resolve_enable", &g_msaa_resolve_enable}, {"msaa_resolve_average_depth", &g_msaa_resolve_average_depth}, { "msaa_coverage_enable",
             &g_msaa_coverage_enable }});
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f},
          {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
@@ -1715,7 +1720,8 @@ public:
          gd.ReleaseT2xFrames();
       }
       // The uploads the buffer hooks missed while motion vectors were off make every earlier copy stale
-      if (!gd.mv_active.exchange((gd.sr_active || gd.t2x_active || g_mv_enable) && !gd.msaa_active) && gd.mv_active)
+      const bool mv_active = (gd.sr_active || gd.t2x_active || g_mv_enable) && !gd.msaa_active;
+      if (!gd.mv_active.exchange(mv_active) && mv_active)
       {
          gd.mv_constants.Restart();
       }
@@ -1822,13 +1828,9 @@ public:
          ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR, Luma TAA and SMAA T2x need Anti-Aliasing off in the game's display settings.");
       }
       // Only does something with the game's MSAA
-      ImGui::BeginDisabled(!gd.msaa_active);
       DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, foliage and fences; requires Anti-Aliasing enabled in the game's display settings; not used with DLSS/FSR or Luma TAA).", !gd.msaa_active);
-      ImGui::EndDisabled();
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA. Not with MSAA ("sr_active"): SMAA runs then
-      ImGui::BeginDisabled(gd.sr_active);
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off in the game's display settings; not used with DLSS/FSR or Luma TAA).", gd.sr_active);
-      ImGui::EndDisabled();
       // T2x needs the motion vectors, which a multisampled scene doesn't get
       const bool t2x_unavailable = gd.sr_active || gd.msaa_active;
       ImGui::BeginDisabled(!g_smaa_enable || t2x_unavailable);
@@ -1887,6 +1889,8 @@ public:
       auto& gd = GetGameDeviceData(device_data);
       // The game's lists are all pixel shaders: looked up by this hash (a list's "Contains" of another walks the list)
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
+      // A game draw (not Luma's) that can be drawn again with patched shaders
+      const bool game_draw = !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func;
       // Render target 0's resource (null without one)
       const auto bound_render_target_resource = [&]
       {
@@ -1915,7 +1919,7 @@ public:
       // MSAA (4x and up, as Saints Row: The Third's: 2x gives a coarser edge than the alpha test): the masked materials' draws into
       // the multisampled scene with their alpha to coverage version (see "CoveragePatch::PatchPixelShader"), the game's shader put back after
       // Ahead of the motion vector path, which refuses multisampled scenes anyway
-      if (g_msaa_resolve_enable && g_msaa_coverage_enable && gd.msaa_active && is_immediate && !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
+      if (g_msaa_resolve_enable && g_msaa_coverage_enable && gd.msaa_active && is_immediate && game_draw && original_shader_hashes.pixel_shaders[0] != UINT64_MAX)
       {
          // The target first: most draws with MSAA on (the UI, post) aren't multisampled, and need no shader lookup
          com_ptr<ID3D11Texture2D> rt_texture;
@@ -1942,8 +1946,8 @@ public:
       // upscaler at its first post pass
       if (gd.mv_active && is_immediate)
       {
-         // A game draw (not Luma's) with a vertex shader, which the patched shaders can redo
-         const bool game_mesh_draw = !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
+         // With a vertex shader, which the patched shaders can redo
+         const bool game_mesh_draw = game_draw && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
          if (!gd.mv_scene_done && shader_hashes_ScenePost.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
          {
             if (gd.mv_scene_open)
@@ -1964,7 +1968,7 @@ public:
                      {
                         srv->GetResource(&resource);
                      }
-                     if (resource && resource == gd.mv_scene_last_copy)
+                     if (resource == gd.mv_scene_last_copy)
                      {
                         gd.mv_scene_copy = resource;
                         break;
@@ -2042,35 +2046,33 @@ public:
 #endif
          if (tonemap && is_immediate)
          {
-            gd.srv_exposure.reset();
             native_device_context->PSGetShaderResources(3, 1, gd.srv_exposure.put());
-         }
-         // TdToneMapping: run it, then SMAA on its target. The bindings are read here, before any "is_custom_pass" gate: the
-         // replaced tonemap is a custom pass
-         const bool antialias = (device_data.has_drawn_sr ? g_rcas_sharpness > 0.f : g_smaa_enable);
-         if (antialias && tonemap && is_immediate && original_draw_dispatch_func != nullptr)
-         {
-            ComPtr<ID3D11RenderTargetView> rtv;
-            native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-            // The scene (linear depth in .a) for the predication; the tonemap only reads it
-            gd.srv_scene_depth.reset();
-            native_device_context->PSGetShaderResources(0, 1, gd.srv_scene_depth.put());
-            // Returning Replaced skips Core's per-pass SetLumaConstantBuffers: upload them here or the draw reads last frame's values
-            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-            updated_cbuffers = true;
-            (*original_draw_dispatch_func)();
-            if (rtv)
+            // TdToneMapping: run it, then SMAA on its target. The bindings are read here, before any "is_custom_pass" gate: the
+            // replaced tonemap is a custom pass
+            const bool antialias = (device_data.has_drawn_sr ? g_rcas_sharpness > 0.f : g_smaa_enable);
+            if (antialias && original_draw_dispatch_func != nullptr)
             {
-               // One state save and restore around the whole chain (its passes bind their own, see "RunPostTonemapSMAA")
-               DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-               DrawStateStack<DrawStateStackType::Compute> compute_state;
-               graphics_state.Cache(native_device_context, device_data.uav_max_count);
-               compute_state.Cache(native_device_context, device_data.uav_max_count);
-               RunPostTonemapSMAA(native_device, native_device_context, device_data, &gd, rtv.get(), !device_data.has_drawn_sr);
-               compute_state.Restore(native_device_context);
-               graphics_state.Restore(native_device_context);
+               ComPtr<ID3D11RenderTargetView> rtv;
+               native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+               // The scene (linear depth in .a) for the predication; the tonemap only reads it
+               native_device_context->PSGetShaderResources(0, 1, gd.srv_scene_depth.put());
+               // Returning Replaced skips Core's per-pass SetLumaConstantBuffers: upload them here or the draw reads last frame's values
+               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+               updated_cbuffers = true;
+               (*original_draw_dispatch_func)();
+               if (rtv)
+               {
+                  // One state save and restore around the whole chain (its passes bind their own, see "RunPostTonemapSMAA")
+                  DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+                  DrawStateStack<DrawStateStackType::Compute> compute_state;
+                  graphics_state.Cache(native_device_context, device_data.uav_max_count);
+                  compute_state.Cache(native_device_context, device_data.uav_max_count);
+                  RunPostTonemapSMAA(native_device, native_device_context, device_data, &gd, rtv.get(), !device_data.has_drawn_sr);
+                  compute_state.Restore(native_device_context);
+                  graphics_state.Restore(native_device_context);
+               }
+               return DrawOrDispatchOverrideType::Replaced;
             }
-            return DrawOrDispatchOverrideType::Replaced;
          }
       }
 #if DEVELOPMENT
