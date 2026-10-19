@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstring>
@@ -189,6 +190,449 @@ namespace PatchedDraws
          }
       }
    };
+
+   // Pointer and "HashCombine" keys: one multiply spreads them over the buckets (std::hash runs FNV-1a on every byte)
+   struct KeyHash
+   {
+      size_t operator()(uint64_t key) const noexcept
+      {
+         return size_t((key * 0x9E3779B97F4A7C15ull) >> 32);
+      }
+   };
+
+   // CPU copies of the constant buffers the patched draws read their object and camera from (dgVoodoo's vc4), by buffer: a draw
+   // registers its buffer ("Register", empty until its first upload), the buffer hooks copy every upload (a Map(WRITE_DISCARD) at its
+   // Unmap, an UpdateSubresource), and a draw's constants are its buffer's latest upload ("Snapshot"). Unlocked: the buffer hooks and
+   // the draws are all calls on the immediate context, which D3D11 requires its caller to serialize (dgVoodoo has no deferred
+   // contexts); only "Restart" and "MayBeRegistered" may come from another thread. A game whose hooks can run on other threads (a
+   // destroyed buffer's release, its present) holds its own lock around every other call, taken only for "MayBeRegistered" buffers.
+   struct ObjectConstants
+   {
+      using Copy = std::shared_ptr<const std::vector<uint8_t>>;
+      struct Entry
+      {
+         // The last upload, rewritten in place: dgVoodoo maps a vc4 buffer for most draws, patched ones or not
+         std::vector<uint8_t> latest;
+         Copy copy;               // "latest" whole, for the draws since that upload reading all of it (skinned: shared; made by the first)
+         void* mapped = nullptr;  // Mapped now, until its Unmap
+         UINT size = 0;           // The buffer's
+         uint32_t generation = 0; // "generation" at the upload: an older one predates a pause of the hooks
+      };
+      std::unordered_map<uint64_t, Entry, KeyHash> entries;
+      // Raised when the hooks restart ("Restart"): the uploads they missed make every older "latest" stale. A counter rather than
+      // emptying the entries, which the frame's thread owns (dgVoodoo may present from another thread).
+      std::atomic<uint32_t> generation = 1;
+      // The first registered buffers and their entries (a node's address stays while the map grows), so a buffer hook finds them
+      // without a lookup. With more registered, or "filter" off, every buffer takes the map lookup. The handles are read lock free
+      // ("MayBeRegistered"); an unregistered buffer's slot holds "free_slot" until the next registration takes it.
+      static constexpr uint32_t max_filtered = 32;
+      static constexpr uint64_t free_slot = 1; // Never a handle
+      std::array<std::atomic<uint64_t>, max_filtered> filtered_handles = {};
+      std::array<Entry*, max_filtered> filtered_entries = {};
+      std::atomic<uint32_t> filtered_count = 0;
+      std::atomic<bool> filter_overflow = false;
+      // Every pooled copy, and by size those nobody held anymore at the last "TrimPool" (taken by the next copies of that size)
+      std::vector<std::shared_ptr<std::vector<uint8_t>>> pool;
+      std::unordered_map<size_t, std::vector<uint32_t>> pool_free;
+      size_t made = 0; // Copies asked for since the last "TrimPool"
+      // A/B of the CPU savings (development toggles)
+      bool filter = true;
+      bool pooled = true;
+
+      // False if the buffer surely isn't registered. Lock free, from any thread: a game's buffer hooks skip the game's other buffers
+      // before taking its lock.
+      bool MayBeRegistered(uint64_t handle) const
+      {
+         if (!filter || filter_overflow.load(std::memory_order_acquire))
+            return true;
+         const uint32_t count = filtered_count.load(std::memory_order_acquire);
+         for (uint32_t i = 0; i < count; i++)
+         {
+            if (filtered_handles[i].load(std::memory_order_acquire) == handle)
+               return true;
+         }
+         return false;
+      }
+
+      // The registered buffer's entry, null if the buffer isn't one
+      Entry* Find(uint64_t handle)
+      {
+         if (filter && !filter_overflow.load(std::memory_order_relaxed))
+         {
+            const uint32_t count = filtered_count.load(std::memory_order_relaxed);
+            for (uint32_t i = 0; i < count; i++)
+            {
+               if (filtered_handles[i].load(std::memory_order_relaxed) == handle)
+                  return filtered_entries[i];
+            }
+            return nullptr;
+         }
+         const auto it = entries.find(handle);
+         return (it != entries.end() ? &it->second : nullptr);
+      }
+
+      // The buffer's entry, registered (and filtered while there is room) on its first draw; "added" (optional) tells which
+      Entry& Register(ID3D11Buffer* buffer, bool* added = nullptr)
+      {
+         const uint64_t handle = reinterpret_cast<uint64_t>(buffer);
+         Entry* entry = Find(handle);
+         if (added)
+            *added = !entry;
+         if (entry)
+            return *entry;
+         entry = &entries[handle];
+         D3D11_BUFFER_DESC desc;
+         buffer->GetDesc(&desc);
+         entry->size = desc.ByteWidth;
+         // An unregistered buffer's slot, else the next one (the entry before the handle, which "Find" reads first)
+         const uint32_t count = filtered_count.load(std::memory_order_relaxed);
+         uint32_t slot = 0;
+         while (slot < count && filtered_handles[slot].load(std::memory_order_relaxed) != free_slot)
+            slot++;
+         if (slot < max_filtered)
+         {
+            filtered_entries[slot] = entry;
+            filtered_handles[slot].store(handle, std::memory_order_release);
+            if (slot == count)
+               filtered_count.store(count + 1, std::memory_order_release);
+         }
+         else
+         {
+            filter_overflow.store(true, std::memory_order_release);
+         }
+         return *entry;
+      }
+
+      // A destroyed buffer leaves the entries and the filter (its address can come back as another buffer, of another size); the
+      // copies the draws took stay theirs. True if it was registered.
+      bool Unregister(uint64_t handle)
+      {
+         if (entries.erase(handle) == 0)
+            return false;
+         const uint32_t count = filtered_count.load(std::memory_order_relaxed);
+         for (uint32_t i = 0; i < count; i++)
+         {
+            if (filtered_handles[i].load(std::memory_order_relaxed) == handle)
+            {
+               filtered_handles[i].store(free_slot, std::memory_order_release);
+               break;
+            }
+         }
+         return true;
+      }
+
+      // The entry's last upload, null if there was none since the last "Restart"
+      const std::vector<uint8_t>* Latest(const Entry& entry) const
+      {
+         return (entry.generation == generation ? &entry.latest : nullptr);
+      }
+
+      // A copy of "size" bytes from "bytes": one nobody held anymore at the last "TrimPool", else a new one
+      Copy NewCopy(const uint8_t* bytes, size_t size)
+      {
+         made++;
+         if (const auto free_copies = pool_free.find(size); pooled && free_copies != pool_free.end() && !free_copies->second.empty())
+         {
+            auto copy = pool[free_copies->second.back()];
+            free_copies->second.pop_back();
+            std::memcpy(copy->data(), bytes, size);
+            return copy;
+         }
+         auto copy = std::make_shared<std::vector<uint8_t>>(bytes, bytes + size);
+         if (pooled)
+            pool.push_back(copy);
+         return copy;
+      }
+
+      // What a draw keeps of its buffer's latest upload: the bytes its vertex shader reads ("read_size", "DXBC::ConstantBufferBytes";
+      // at least "min_size"; 0: all), a copy of its own, or the entry's one copy for the draws reading all of it. Null without an
+      // upload since the last "Restart".
+      Copy Snapshot(Entry& entry, size_t read_size = 0, size_t min_size = 0)
+      {
+         if (!Latest(entry))
+            return nullptr;
+         const size_t size = entry.latest.size();
+         const size_t copied = (read_size != 0 ? std::clamp<size_t>(read_size, (std::min)(min_size, size), size) : size);
+         if (copied < size)
+            return NewCopy(entry.latest.data(), copied);
+         if (!entry.copy)
+            entry.copy = NewCopy(entry.latest.data(), size);
+         return entry.copy;
+      }
+
+      // The "map_buffer_region" event: a registered buffer mapped for a whole rewrite is remembered until its Unmap; a partial or
+      // appending write (the copies would miss it) leaves the entry's "mapped" null. Null if the buffer isn't registered.
+      Entry* OnMap(uint64_t handle, uint64_t offset, reshade::api::map_access access, void* data)
+      {
+         Entry* const entry = Find(handle);
+         if (entry)
+         {
+            // Overwritten at every Map, so a pointer from before a pause of the hooks never reaches an Unmap
+            entry->mapped = ((access == reshade::api::map_access::write_discard && offset == 0) ? data : nullptr);
+         }
+         return entry;
+      }
+
+      // The "unmap_buffer_region" event: a remembered Map's copy, before its Unmap (the game has written it). True if copied.
+      bool OnUnmap(uint64_t handle)
+      {
+         Entry* const entry = Find(handle);
+         if (!entry || !entry->mapped)
+            return false;
+         const uint8_t* const mapped = static_cast<const uint8_t*>(std::exchange(entry->mapped, nullptr));
+         entry->latest.assign(mapped, mapped + entry->size);
+         entry->copy.reset();
+         entry->generation = generation;
+         return true;
+      }
+
+      // The "update_buffer_region" event (before the UpdateSubresource runs; the signed ReShade doesn't raise it): a partial update is
+      // merged into the last upload, else into zeros. True if copied.
+      bool OnUpdate(uint64_t handle, const void* data, uint64_t offset, uint64_t size)
+      {
+         Entry* const entry = Find(handle);
+         if (!entry || offset >= entry->size)
+            return false;
+         const uint32_t current = generation;
+         if (entry->latest.size() != entry->size || entry->generation != current)
+            entry->latest.assign(entry->size, 0);
+         std::memcpy(entry->latest.data() + offset, data, size_t((std::min)(size, uint64_t(entry->size) - offset)));
+         entry->copy.reset();
+         entry->generation = current;
+         return true;
+      }
+
+      // The hooks restart after a pause (motion vectors off, the hooks unregistered): every upload so far is stale. Any thread.
+      void Restart()
+      {
+         generation++;
+      }
+
+      // At present: the pooled copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as
+      // many as were asked for since the last call ("active", else none): frames without a scene (loading, videos, menus) would keep
+      // their peak otherwise
+      void TrimPool(bool active)
+      {
+         size_t kept_free = (active ? std::exchange(made, 0) : 0);
+         std::erase_if(pool, [&](const auto& copy)
+            {
+               if (copy.use_count() != 1)
+                  return false;
+               if (kept_free == 0)
+                  return true;
+               kept_free--;
+               return false; });
+         for (auto& [size, free_copies] : pool_free)
+         {
+            free_copies.clear();
+         }
+         for (uint32_t i = 0; i < uint32_t(pool.size()); i++)
+         {
+            if (pool[i].use_count() == 1)
+               pool_free[pool[i]->size()].push_back(i);
+         }
+      }
+
+      void ReleasePool()
+      {
+         pool.clear();
+         pool_free.clear();
+      }
+
+      // Frees the uploads (the buffers stay registered and filtered, their draws uncopied until the next upload). Only from the thread
+      // of the buffer hooks.
+      void ReleaseUploads()
+      {
+         for (auto& [buffer, entry] : entries)
+         {
+            std::vector<uint8_t>().swap(entry.latest);
+            entry.copy.reset();
+            entry.mapped = nullptr;
+         }
+      }
+   };
+
+   // The immediate context's blend and depth stencil states, the vertex shader's "object_slot" constant buffer, vertex buffer 0 and
+   // the index buffer as the game last bound them (the bind hooks below), so the draw hooks don't query them (an AddRef and a Release
+   // each, several per draw). Not referenced: an object lives while bound. Luma's own passes bind theirs natively and put the game's
+   // back. "tracked" is false after a bind this can't read (another add-on's combined pipeline): queried then.
+   template <uint32_t object_slot, uint32_t jitter_slot = UINT32_MAX>
+   struct BoundStates
+   {
+      static constexpr uint32_t object_buffer_slot = object_slot;
+      static constexpr uint32_t jitter_buffer_slot = jitter_slot;
+
+      ID3D11BlendState* blend_state = nullptr;
+      ID3D11DepthStencilState* depth_stencil_state = nullptr;
+      ID3D11Buffer* object_buffer = nullptr;
+      ID3D11Buffer* vertex_buffer = nullptr;
+      UINT vertex_offset = 0;
+      ID3D11Buffer* index_buffer = nullptr;
+      UINT index_offset = 0;
+      bool tracked = true;
+      // The patched draws' jitter buffer is still bound at "jitter_slot" (a game bind over it resets it)
+      bool jitter_bound = false;
+      // Development toggles: "tracking" off queries every time; "check" queries too, counting the tracked objects that weren't the
+      // bound ones in "mismatches"
+      bool tracking = true;
+      bool check = false;
+      uint32_t mismatches = 0;
+      // "DepthTested"'s last state and its result (see "ResetDepthTest")
+      ID3D11DepthStencilState* depth_test_state = nullptr;
+      bool depth_test = true;
+
+      // A bound object: "object" (its tracked binding), else what "query" writes to its argument (an object pointer to take over)
+      template <typename T, typename Query>
+      T* Get(T* object, const Query& query)
+      {
+         if (tracking && tracked && !check)
+            return object;
+         com_ptr<T> queried;
+         query(&queried);
+         if (check && tracked && queried.get() != object)
+            mismatches++;
+         return queried.get();
+      }
+
+      ID3D11BlendState* BlendState(ID3D11DeviceContext* native_device_context)
+      {
+         return Get(blend_state, [&](ID3D11BlendState** state)
+            { native_device_context->OMGetBlendState(state, nullptr, nullptr); });
+      }
+      ID3D11DepthStencilState* DepthStencilState(ID3D11DeviceContext* native_device_context)
+      {
+         return Get(depth_stencil_state, [&](ID3D11DepthStencilState** state)
+            { native_device_context->OMGetDepthStencilState(state, nullptr); });
+      }
+      ID3D11Buffer* ObjectBuffer(ID3D11DeviceContext* native_device_context)
+      {
+         return Get(object_buffer, [&](ID3D11Buffer** buffer)
+            { native_device_context->VSGetConstantBuffers(object_slot, 1, buffer); });
+      }
+      // The buffers with their offsets (optional): queried with them, else tracked with them
+      ID3D11Buffer* VertexBuffer(ID3D11DeviceContext* native_device_context, UINT* offset = nullptr)
+      {
+         UINT queried_offset = vertex_offset;
+         ID3D11Buffer* const buffer = Get(vertex_buffer, [&](ID3D11Buffer** queried)
+            {
+               UINT stride;
+               native_device_context->IAGetVertexBuffers(0, 1, queried, &stride, &queried_offset); });
+         if (offset)
+            *offset = queried_offset;
+         return buffer;
+      }
+      ID3D11Buffer* IndexBuffer(ID3D11DeviceContext* native_device_context, UINT* offset = nullptr)
+      {
+         UINT queried_offset = index_offset;
+         ID3D11Buffer* const buffer = Get(index_buffer, [&](ID3D11Buffer** queried)
+            {
+               DXGI_FORMAT format;
+               native_device_context->IAGetIndexBuffer(queried, &format, &queried_offset); });
+         if (offset)
+            *offset = queried_offset;
+         return buffer;
+      }
+
+      // The bound depth stencil state tests depth (meshes do; full screen passes and composites don't), cached by state
+      bool DepthTested(ID3D11DeviceContext* native_device_context)
+      {
+         ID3D11DepthStencilState* const state = DepthStencilState(native_device_context);
+         if (state != depth_test_state)
+         {
+            D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
+            if (state)
+               state->GetDesc(&depth_desc);
+            depth_test = depth_desc.DepthEnable;
+            depth_test_state = state;
+         }
+         return depth_test;
+      }
+      // Forgets "DepthTested"'s cached state (when the scene opens: a released state's address comes back for another)
+      void ResetDepthTest()
+      {
+         depth_test_state = nullptr;
+         depth_test = true;
+      }
+   };
+
+   // "BoundStates"' ReShade events. "get" gives a command list's states, null unless it's the immediate context's ("is_primary").
+   // "bind_pipeline": ReShade raises one per state, and a reset binds none to every stage.
+   template <auto get>
+   void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
+   {
+      using reshade::api::pipeline_stage;
+      if ((stages & (pipeline_stage::output_merger | pipeline_stage::depth_stencil)) == 0)
+         return;
+      auto* const states = get(cmd_list);
+      if (!states)
+         return;
+      if (stages == pipeline_stage::output_merger)
+      {
+         states->blend_state = reinterpret_cast<ID3D11BlendState*>(pipeline.handle);
+      }
+      else if (stages == pipeline_stage::depth_stencil)
+      {
+         states->depth_stencil_state = reinterpret_cast<ID3D11DepthStencilState*>(pipeline.handle);
+      }
+      else if (pipeline.handle == 0)
+      {
+         states->blend_state = nullptr;
+         states->depth_stencil_state = nullptr;
+      }
+      else
+      {
+         states->tracked = false;
+      }
+   }
+
+   // "push_descriptors": the object slot's binding; a game bind over the jitter slot has the jitter bound again ("jitter_bound")
+   template <auto get>
+   void OnPushConstantBuffers(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
+   {
+      using States = std::remove_pointer_t<decltype(get(cmd_list))>;
+      constexpr uint32_t slot = States::object_buffer_slot;
+      constexpr uint32_t jitter_slot = States::jitter_buffer_slot;
+      const auto covers = [&](uint32_t binding)
+      { return binding >= update.binding && binding < update.binding + update.count; };
+      if ((stages & reshade::api::shader_stage::vertex) == 0 || update.type != reshade::api::descriptor_type::constant_buffer || (!covers(slot) && (jitter_slot == UINT32_MAX || !covers(jitter_slot))))
+         return;
+      States* const states = get(cmd_list);
+      if (!states)
+         return;
+      if (jitter_slot != UINT32_MAX && covers(jitter_slot))
+      {
+         states->jitter_bound = false;
+      }
+      if (covers(slot))
+      {
+         const auto* const ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
+         states->object_buffer = reinterpret_cast<ID3D11Buffer*>(ranges[slot - update.binding].buffer.handle);
+      }
+   }
+
+   // "bind_vertex_buffers": vertex buffer 0's binding
+   template <auto get>
+   void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
+   {
+      if (first != 0 || count == 0)
+         return;
+      if (auto* const states = get(cmd_list))
+      {
+         states->vertex_buffer = reinterpret_cast<ID3D11Buffer*>(buffers[0].handle);
+         states->vertex_offset = UINT(offsets[0]);
+      }
+   }
+
+   // "bind_index_buffer"
+   template <auto get>
+   void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   {
+      if (auto* const states = get(cmd_list))
+      {
+         states->index_buffer = reinterpret_cast<ID3D11Buffer*>(buffer.handle);
+         states->index_offset = UINT(offset);
+      }
+   }
 
    // An object's world transform, the tie-break between the motion vector draws sharing a draw key (props): its axes and translation
    // (3x4). The translation alone ties for modular pieces that share a pivot and differ only by rotation (BL2's arches).
