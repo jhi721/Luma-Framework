@@ -13,30 +13,25 @@
 #define SMAA_T2X 0
 #endif
 
-// (1/W, 1/H, W, H) at output resolution — filled by the mod (see main.cpp RunPostTonemapSMAA).
+#include "Includes/GameCBuffers.hlsl"
+
 cbuffer SmaaMetricsCB : register(b1)
 {
-   float4 SmaaRtMetrics;
-   // x = predication threshold scale: 2.0 when predication is active (edge-ness texture bound) -> frame-wide
-   // threshold 0.10 on flats; 1.0 with a null predication texture (fallback) -> plain ULTRA threshold 0.05. yzw unused.
-   float4 SmaaPredication;
-#if SMAA_T2X
-   float4 SmaaSubsampleIndices; // The jitter phase's "SMAA.hlsl" @SUBSAMPLE_INDICES, 0 when the scene didn't jitter
-#endif
+   CB::SmaaMetrics smaa_metrics;
 }
 
 #if SMAA_T2X
-#define SMAA_SUBSAMPLE_INDICES SmaaSubsampleIndices
+#define SMAA_SUBSAMPLE_INDICES smaa_metrics.subsample_indices
 #define SMAA_REPROJECTION      1
 // The motion vector target ("mv_texture" in main.cpp) holds the UV delta from the current to the previous position. SMAA's velocity
 // is the opposite.
 #define SMAA_DECODE_VELOCITY(sample) (-(sample).rg)
 #endif
 
-#define SMAA_RT_METRICS SmaaRtMetrics
+#define SMAA_RT_METRICS smaa_metrics.rt_metrics
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION       1
-#define SMAA_PREDICATION_SCALE SmaaPredication.x
+#define SMAA_PREDICATION_SCALE smaa_metrics.predication.x
 // Predication budget:
 //  - flat threshold  = SCALE * SMAA_THRESHOLD           = 2.0 * 0.05       = 0.10 (rejects cel-shade texture noise)
 //  - silhouette thr  = SCALE * SMAA_THRESHOLD * (1-STR) = 2.0 * 0.05 * 0.5 = 0.05 (= plain ULTRA base; predication

@@ -27,6 +27,39 @@ struct LumaGameData
 {
    float Dummy; // hlsl doesn't support empty structs
 };
+
+// The motion vector fill's constants (Luma_ME_MotionVectorFill.hlsl, b0), written by "FillMotionVectors"
+struct MotionVectorFillConstants
+{
+   row_major float4x4 reprojection; // Current clip space to the previous frame's
+   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
+   float2 depth_from_view;          // The projection's depth row: device depth = x + y / view depth
+   float reactive_scale;
+   float reactive_threshold;
+   float reactive_enabled; // 0/1
+   float padding;
+};
+
+// SMAA's metrics (Luma_SMAA_impl.hlsl, VS+PS b1), written by "RunPostTonemapSMAA"
+struct SmaaMetrics
+{
+   float4 rt_metrics;        // (1/W, 1/H, W, H) at output resolution
+   float4 predication;       // x = predication threshold scale: 2 with predication, 1 with a null predication texture (plain ULTRA 0.05)
+   float4 subsample_indices; // SMAA T2x's jitter phase "SMAA.hlsl" @SUBSAMPLE_INDICES, 0 when the scene didn't jitter (unread without T2x)
+};
+
+// The SMAA predication signal's constants (Luma_ME_DepthExtract.hlsl, b0)
+struct DepthExtractConstants
+{
+   float tolerance; // Plane deviation counted as a full edge, as a fraction of view depth
+   float3 padding;
+};
 } // namespace CB
+
+#ifdef __cplusplus
+static_assert(sizeof(CB::MotionVectorFillConstants) == 96); // The HLSL cbuffers' sizes
+static_assert(sizeof(CB::SmaaMetrics) == 48);
+static_assert(sizeof(CB::DepthExtractConstants) == 16);
+#endif
 
 #endif // LUMA_GAME_CB_STRUCTS

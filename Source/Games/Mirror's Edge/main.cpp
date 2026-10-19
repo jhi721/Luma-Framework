@@ -438,8 +438,8 @@ class MirrorsEdge final : public Game
       bool pred_ok = g_smaa_predication && gd->srv_scene_depth && pred_cs != nullptr && GetViewTextureSize(gd->srv_scene_depth.get()) == uint2{w, h};
       if (pred_ok)
       {
-         const float p[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
-         PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_pred), p, sizeof(p));
+         const CB::DepthExtractConstants extract_constants = {.tolerance = g_smaa_pred_tolerance};
+         PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_pred), &extract_constants, sizeof(extract_constants));
          if (!gd->srv_pred || GetViewTextureSize(gd->srv_pred.get()) != uint2{w, h})
          {
             gd->uav_pred.reset();
@@ -514,15 +514,7 @@ class MirrorsEdge final : public Game
 
       // b1: the metrics, the predication threshold scale and T2x's subsample indices for the jitter phase (see "OpenScene"), 0 for 1x
       const float subsample_indices = ((t2x && gd->t2x_phase >= 0) ? float(gd->t2x_phase + 1) : 0.f);
-      // "Luma_SMAA_impl.hlsl"'s "SmaaMetricsCB"
-      struct SmaaMetricsConstants
-      {
-         float rt_metrics[4];
-         float predication[4];
-         float subsample_indices[4];
-      };
-      static_assert(sizeof(SmaaMetricsConstants) == 48);
-      const SmaaMetricsConstants metrics = {
+      const CB::SmaaMetrics metrics = {
          .rt_metrics = {1.f / (float)w, 1.f / (float)h, (float)w, (float)h},
          .predication = {(pred_ok ? 2.0f : 1.0f), 0.f, 0.f, 0.f},
          .subsample_indices = {subsample_indices, subsample_indices, subsample_indices, 0.f},
@@ -1355,19 +1347,6 @@ class MirrorsEdge final : public Game
       return true;
    }
 
-   // The fill's constants ("Luma_ME_MotionVectorFill.hlsl" b0)
-   struct MotionVectorFillConstants
-   {
-      float reprojection[16]; // Current clip space to the previous frame's, row major
-      float jitter_ndc[2];
-      float depth_from_view[2];
-      float reactive_scale;
-      float reactive_threshold;
-      float reactive_enabled;
-      float padding;
-   };
-   static_assert(sizeof(MotionVectorFillConstants) == 96);
-
    // The depth and camera motion fill (see "Luma_ME_MotionVectorFill.hlsl"), with the reactive masks if "write_reactive". The caller
    // caches and restores the state. False if it didn't run.
    static bool FillMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool write_reactive)
@@ -1402,7 +1381,7 @@ class MirrorsEdge final : public Game
       }
       const Math::Matrix44D reprojection = previous * current;
       const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, /* row_vectors */ true);
-      MotionVectorFillConstants constants = {
+      CB::MotionVectorFillConstants constants = {
          .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
          .depth_from_view = {float(camera.depth_a), float(camera.depth_b)},
          .reactive_scale = g_sr_reactive_scale,
@@ -1411,7 +1390,7 @@ class MirrorsEdge final : public Game
       };
       for (int i = 0; i < 16; i++)
       {
-         constants.reprojection[i] = float(reprojection.GetData()[i]);
+         constants.reprojection.GetData()[i] = float(reprojection.GetData()[i]);
       }
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_fill_buffer), &constants, sizeof(constants)))
          return false;
