@@ -112,10 +112,10 @@ static bool g_mv_debug_view = false;
 static bool g_mv_force_jitter = false;        // The projection jitter without an upscaler
 static bool g_mv_disable_jitter = false;      // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
 static bool g_mv_untransformed_static = true; // Draws without a tie-break transform take no other draw's previous frame (see "DrawWithMotionVectors")
-// A/B of the CPU savings (see "FindRegisteredBuffer", "NewConstantsCopy")
+// A/B of the CPU savings (see "PatchedDraws::ObjectConstants", synced at present)
 static bool g_mv_buffer_filter = true;
 static bool g_mv_constants_pool = true;
-static bool g_bound_state_tracking = true; // See "BoundState"
+static bool g_bound_state_tracking = true; // See "PatchedDraws::BoundStates"
 static bool g_bound_state_check = false;   // The tracked states against the bound ones ("bound state mismatches" in the "[TW2 MV]" log)
 // "Performance Test" (see "OnPresent"): GPU timestamps and hook CPU time to ReShade.log ("[TW2 Perf]"). A mode ("Perf::g_test") sets
 // the anti-aliasing, or turns one of the CPU savings above off, while it runs (the user's values come back on leaving it, never saved).
@@ -486,14 +486,12 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    std::array<float, 2> mv_jitter_ndc = {}; // The same offset in NDC (y up), as the jitter buffer holds it
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
    // Per-draw lookups kept for the next draw (reset when the scene opens): the jitter path's last depth view and whether it's the scene
-   // depth, its last depth stencil state's depth test, the motion vector path's last accepted targets (and the G-buffer's), the last
+   // depth (its depth test: "bound_states.DepthTested"), the motion vector path's last accepted targets (and the G-buffer's), the last
    // blend state's opacity, the reactive path's last target and whether it's a scene target, the last vertex and pixel shader's patched
    // versions (owned by the maps above, never erased)
    ID3D11DepthStencilView* jitter_dsv = nullptr;
    ID3D11DepthStencilView* mv_not_scene_dsv = nullptr; // This frame's last depth view of another size than the scene (shadow maps)
    bool jitter_dsv_scene = false;
-   ID3D11DepthStencilState* jitter_depth_stencil_state = nullptr;
-   bool jitter_depth_test = true;
    ID3D11RenderTargetView* mv_accepted_rtv = nullptr;
    ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
    ID3D11RenderTargetView* mv_linear_depth_rtv = nullptr;
@@ -503,19 +501,9 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ID3D11BlendState* mv_blend_state = nullptr; // See "ClassifyBoundBlend"
    bool mv_blend_opaque = true;
    ReactiveBlend mv_reactive_blend = ReactiveBlend::NONE;
-   // The immediate context's blend and depth stencil states, vc4 (VS "MotionVectorPatches::object_slot"), vertex buffer 0 and index
-   // buffer as the game last bound them ("OnBindPipeline", "OnPushConstantBuffers", "OnBindVertexBuffers", "OnBindIndexBuffer"), so
-   // the draw hooks don't query them (an AddRef and a Release each, several per draw). Not referenced: an object lives while bound.
-   // Luma's own passes bind theirs natively and put the game's back. False after a bind this can't read (another add-on's combined
-   // pipeline): queried then.
-   ID3D11BlendState* bound_blend_state = nullptr;
-   ID3D11DepthStencilState* bound_depth_stencil_state = nullptr;
-   ID3D11Buffer* bound_object_buffer = nullptr;
-   ID3D11Buffer* bound_vertex_buffer = nullptr;
-   UINT bound_vertex_offset = 0;
-   ID3D11Buffer* bound_index_buffer = nullptr;
-   UINT bound_index_offset = 0;
-   bool bound_states_tracked = true;
+   // The immediate context's bindings as the game last bound them (see "PatchedDraws::BoundStates"), vc4 at
+   // "MotionVectorPatches::object_slot"
+   PatchedDraws::BoundStates<MotionVectorPatches::object_slot> bound_states;
    // The last draw's patched shaders, by the game's hash
    uint32_t mv_last_vertex_shader_hash = 0;
    PatchedShader<ID3D11VertexShader> mv_last_vertex;
@@ -524,35 +512,14 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
    PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
 
-   // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, empty until its first upload), from
-   // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest upload. Unlocked: the buffer
-   // hooks, the draws and "OnPresent" all run on the immediate context's thread ("mv_constants_thread"; dgVoodoo has no deferred
-   // contexts), as the exe hook "ResolveRenderArea".
-   using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
-   struct RegisteredConstants
-   {
-      // The last upload, rewritten in place: the shadow passes' ~1800 Unmaps a frame are draws that aren't motion vector ones
-      std::vector<uint8_t> latest;
-      ConstantsCopy copy;     // "latest" whole, for the draws since that upload reading all of it (skinned: shared; made by the first)
-      void* mapped = nullptr; // Mapped now, until its Unmap
-   };
-   std::unordered_map<uint64_t, RegisteredConstants> mv_constants_copies;
+   // CPU copies of the vc4 buffers the motion vector draws bind (see "PatchedDraws::ObjectConstants"; the shadow passes' ~1800 Unmaps a
+   // frame are draws that aren't motion vector ones): the buffer hooks, the draws and "OnPresent" all run on the immediate context's
+   // thread ("mv_constants_thread"), as the exe hook "ResolveRenderArea". Restarted when the buffer hooks are registered again.
+   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
+   PatchedDraws::ObjectConstants mv_constants;
 #if DEVELOPMENT
    DWORD mv_constants_thread = 0; // The thread of the last "OnPresent", checked by the buffer hooks
 #endif
-   // "g_mv_buffer_filter": the first registered buffers, their sizes and entries (a node's address stays while the map grows), so a
-   // buffer hook finds them without a lookup. With more registered, every buffer takes the map lookup as without the filter.
-   static constexpr uint32_t MAX_FILTERED_BUFFERS = 8;
-   std::array<uint64_t, MAX_FILTERED_BUFFERS> mv_filtered_buffers = {};
-   std::array<UINT, MAX_FILTERED_BUFFERS> mv_filtered_buffer_sizes = {};
-   std::array<RegisteredConstants*, MAX_FILTERED_BUFFERS> mv_filtered_entries = {};
-   uint32_t mv_filtered_buffer_count = 0;
-   bool mv_filter_overflow = false;
-   // Every pooled vc4 copy, and by size those nobody held anymore at the last present (taken by the next copies of that size, instead
-   // of a new allocation per copy).
-   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
-   std::unordered_map<size_t, std::vector<uint32_t>> mv_constants_pool_free;
-   size_t mv_constants_made = 0; // Copies asked for since the last present
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with their transform and vc4. A draw takes the previous frame's
@@ -562,16 +529,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       PatchedDraws::ObjectTransform transform;
       ConstantsCopy constants;
    };
-   // The keys are "HashCombine" outputs already: one multiply spreads them over the buckets (std::hash runs FNV-1a on every byte)
-   struct DrawKeyHash
-   {
-      size_t operator()(uint64_t key) const noexcept
-      {
-         return size_t((key * 0x9E3779B97F4A7C15ull) >> 32);
-      }
-   };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, DrawKeyHash> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, DrawKeyHash> mv_previous_objects;
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_objects;
+   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_previous_objects;
    // The frame's camera (vc4 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -602,7 +561,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       uint32_t untransformed_ambiguous = 0; // Draws without a tie-break transform whose key had several previous candidates
       uint32_t terrain_inexact = 0;         // Terrain chunks whose nearest previous candidate was another chunk (not drawn last frame)
       uint32_t bound_state_mismatches = 0;  // "g_bound_state_check": tracked states that weren't the bound ones
-      uint32_t constants_pool = 0;          // At present: the pooled copies (see "NewConstantsCopy")
+      uint32_t constants_pool = 0;          // At present: the pooled copies (see "PatchedDraws::ObjectConstants")
       uint32_t tiebreak_collisions = 0;     // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
       uint32_t ended_by = 0;
       float near_plane = 0.f, far_plane = 0.f;                   // The upscaler's, from the camera's projection (0: none found)
@@ -989,78 +948,6 @@ class TheWitcher2Game final : public Game
    static constexpr uint32_t TERRAIN_CHUNK_ROW = MotionVectorPatches::object_row_offset + 24;
    static_assert(sizeof(PatchedDraws::ObjectTransform) == 3 * 16);
 
-   // The registered vc4 buffer's entry in "mv_constants_copies", null if the buffer isn't one; "size" its size if known (else 0)
-   static TheWitcher2GameDeviceData::RegisteredConstants* FindRegisteredBuffer(TheWitcher2GameDeviceData* gd, uint64_t handle, UINT* size)
-   {
-      *size = 0;
-      if (g_mv_buffer_filter && !gd->mv_filter_overflow)
-      {
-         for (uint32_t i = 0; i < gd->mv_filtered_buffer_count; i++)
-         {
-            if (gd->mv_filtered_buffers[i] == handle)
-            {
-               *size = gd->mv_filtered_buffer_sizes[i];
-               return gd->mv_filtered_entries[i];
-            }
-         }
-         return nullptr;
-      }
-      const auto registered = gd->mv_constants_copies.find(handle);
-      return (registered != gd->mv_constants_copies.end() ? &registered->second : nullptr);
-   }
-
-   // A buffer registered in "mv_constants_copies" joins the filter ("g_mv_buffer_filter")
-   static void AddFilteredBuffer(TheWitcher2GameDeviceData* gd, ID3D11Buffer* buffer, TheWitcher2GameDeviceData::RegisteredConstants* entry)
-   {
-      const uint32_t count = gd->mv_filtered_buffer_count;
-      if (count >= TheWitcher2GameDeviceData::MAX_FILTERED_BUFFERS)
-      {
-         gd->mv_filter_overflow = true;
-         return;
-      }
-      D3D11_BUFFER_DESC desc;
-      buffer->GetDesc(&desc);
-      gd->mv_filtered_buffer_sizes[count] = desc.ByteWidth;
-      gd->mv_filtered_buffers[count] = reinterpret_cast<uint64_t>(buffer);
-      gd->mv_filtered_entries[count] = entry;
-      gd->mv_filtered_buffer_count = count + 1;
-   }
-
-   static UINT GetBufferSize(uint64_t handle, UINT known_size)
-   {
-      if (known_size != 0)
-         return known_size;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(handle)->GetDesc(&desc);
-      return desc.ByteWidth;
-   }
-
-   // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the last present, else a new one
-   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(TheWitcher2GameDeviceData* gd, const uint8_t* bytes, size_t size)
-   {
-      gd->mv_constants_made++;
-      if (const auto free_copies = gd->mv_constants_pool_free.find(size); g_mv_constants_pool && free_copies != gd->mv_constants_pool_free.end() && !free_copies->second.empty())
-      {
-         auto copy = gd->mv_constants_pool[free_copies->second.back()];
-         free_copies->second.pop_back();
-         if (bytes)
-         {
-            std::memcpy(copy->data(), bytes, size);
-         }
-         else
-         {
-            std::fill(copy->begin(), copy->end(), uint8_t(0));
-         }
-         return copy;
-      }
-      auto copy = (bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size));
-      if (g_mv_constants_pool)
-      {
-         gd->mv_constants_pool.push_back(copy);
-      }
-      return copy;
-   }
-
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
@@ -1071,21 +958,15 @@ class TheWitcher2Game final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      UINT buffer_size;
-      TheWitcher2GameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &buffer_size);
-      if (!registered)
-         return;
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, *data);
 #if DEVELOPMENT
-      ASSERT_ONCE(gd.mv_constants_thread == 0 || gd.mv_constants_thread == GetCurrentThreadId());
-#endif
-      if (access == reshade::api::map_access::write_discard && offset == 0)
+      if (registered)
       {
-         registered->mapped = *data;
-      }
-#if DEVELOPMENT
-      else
-      {
-         gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
+         ASSERT_ONCE(gd.mv_constants_thread == 0 || gd.mv_constants_thread == GetCurrentThreadId());
+         if (!registered->mapped)
+         {
+            gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
+         }
       }
 #endif
    }
@@ -1100,20 +981,16 @@ class TheWitcher2Game final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      UINT buffer_size;
-      TheWitcher2GameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &buffer_size);
-      if (!registered || !registered->mapped)
-         return;
-      const uint8_t* const mapped = static_cast<const uint8_t*>(std::exchange(registered->mapped, nullptr));
-      registered->latest.assign(mapped, mapped + GetBufferSize(resource.handle, buffer_size));
-      registered->copy.reset();
+      if (gd.mv_constants.OnUnmap(resource.handle))
+      {
 #if DEVELOPMENT
-      gd.mv_stats.maps++;
+         gd.mv_stats.maps++;
 #endif
+      }
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs); a partial update is merged into the
-   // last copy. Needs the unsigned "full add-on support" ReShade (the signed build doesn't raise the event).
+   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs). Needs the unsigned "full add-on support"
+   // ReShade (the signed build doesn't raise the event).
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource resource, uint64_t offset, uint64_t size)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
@@ -1123,28 +1000,13 @@ class TheWitcher2Game final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      UINT known_size;
-      TheWitcher2GameDeviceData::RegisteredConstants* const registered = FindRegisteredBuffer(&gd, resource.handle, &known_size);
-      if (!registered)
-         return false;
-#if DEVELOPMENT
-      ASSERT_ONCE(gd.mv_constants_thread == 0 || gd.mv_constants_thread == GetCurrentThreadId());
-#endif
-      const UINT buffer_size = GetBufferSize(resource.handle, known_size);
-      if (offset >= buffer_size)
-         return false;
-      const size_t updated_size = size_t((std::min)(size, uint64_t(buffer_size) - offset));
-      // Merged into the last upload of the same size, else into zeros
-      std::vector<uint8_t>& latest = registered->latest;
-      if (latest.size() != buffer_size)
+      if (gd.mv_constants.OnUpdate(resource.handle, data, offset, size))
       {
-         latest.assign(buffer_size, 0);
-      }
-      std::memcpy(latest.data() + offset, data, updated_size);
-      registered->copy.reset();
 #if DEVELOPMENT
-      gd.mv_stats.updates++;
+         ASSERT_ONCE(gd.mv_constants_thread == 0 || gd.mv_constants_thread == GetCurrentThreadId());
+         gd.mv_stats.updates++;
 #endif
+      }
       return false;
    }
 
@@ -1240,94 +1102,13 @@ class TheWitcher2Game final : public Game
       return gd.mv_last_vertex.shader.get();
    }
 
-   // "bound_blend_state" and "bound_depth_stencil_state", from the game's binds on the immediate context (ReShade raises one per state,
-   // and a reset binds none to every stage). The handle is the created state ("PatchedDraws::OnCreateBlendState"'s repaired one
-   // included): what the context holds.
-   static void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
-   {
-      using reshade::api::pipeline_stage;
-      if ((stages & (pipeline_stage::output_merger | pipeline_stage::depth_stencil)) == 0)
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      if (stages == pipeline_stage::output_merger)
-      {
-         gd.bound_blend_state = reinterpret_cast<ID3D11BlendState*>(pipeline.handle);
-      }
-      else if (stages == pipeline_stage::depth_stencil)
-      {
-         gd.bound_depth_stencil_state = reinterpret_cast<ID3D11DepthStencilState*>(pipeline.handle);
-      }
-      else if (pipeline.handle == 0)
-      {
-         gd.bound_blend_state = nullptr;
-         gd.bound_depth_stencil_state = nullptr;
-      }
-      else
-      {
-         gd.bound_states_tracked = false;
-      }
-   }
-
-   // vc4's tracked binding (see "bound_object_buffer")
-   static void OnPushConstantBuffers(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
-   {
-      constexpr uint32_t slot = MotionVectorPatches::object_slot;
-      if ((stages & reshade::api::shader_stage::vertex) == 0 || update.type != reshade::api::descriptor_type::constant_buffer || slot < update.binding || slot >= update.binding + update.count)
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      const auto* const ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
-      GetGameDeviceData(*device_data).bound_object_buffer = reinterpret_cast<ID3D11Buffer*>(ranges[slot - update.binding].buffer.handle);
-   }
-
-   // Vertex buffer 0's tracked binding (see "bound_vertex_buffer")
-   static void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
-   {
-      if (first != 0 || count == 0)
-         return;
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      gd.bound_vertex_buffer = reinterpret_cast<ID3D11Buffer*>(buffers[0].handle);
-      gd.bound_vertex_offset = UINT(offsets[0]);
-   }
-
-   // The index buffer's tracked binding (see "bound_index_buffer")
-   static void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   // The tracked bindings the "PatchedDraws::BoundStates" events update: the immediate context's. A blend state's handle is the
+   // created state ("PatchedDraws::OnCreateBlendState"'s repaired one included): what the context holds.
+   static auto* GetBoundStates(reshade::api::command_list* cmd_list)
    {
       DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
       const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      if (!device_data || !device_data->game || !cmd_list_data || !cmd_list_data->is_primary)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      gd.bound_index_buffer = reinterpret_cast<ID3D11Buffer*>(buffer.handle);
-      gd.bound_index_offset = UINT(offset);
-   }
-
-   // A bound object of the immediate context (not referenced: it lives while bound): "tracked" (see "bound_blend_state"), else what
-   // "query" writes to its argument (an object pointer to take over). "g_bound_state_check" counts the times they differ.
-   template <typename T, typename Query>
-   static T* BoundState(TheWitcher2GameDeviceData* gd, T* tracked, const Query& query)
-   {
-      if (g_bound_state_tracking && gd->bound_states_tracked && !g_bound_state_check)
-         return tracked;
-      com_ptr<T> queried;
-      query(&queried);
-#if DEVELOPMENT
-      if (g_bound_state_check && gd->bound_states_tracked && queried.get() != tracked)
-      {
-         gd->mv_stats.bound_state_mismatches++;
-      }
-#endif
-      return queried.get();
+      return ((device_data && device_data->game && cmd_list_data && cmd_list_data->is_primary) ? &GetGameDeviceData(*device_data).bound_states : nullptr);
    }
 
    // Classifies the bound blend state (cached in "mv_blend_state"): "mv_blend_opaque" for the motion vectors (decals, lights and
@@ -1337,8 +1118,7 @@ class TheWitcher2Game final : public Game
    // translucents are premultiplied (ONE / INV_SRC_ALPHA, e.g. 0x171B986E): Mass Effect 2007's SRC_ALPHA-only test found none.
    static void ClassifyBoundBlend(ID3D11DeviceContext* native_device_context, TheWitcher2GameDeviceData* gd)
    {
-      ID3D11BlendState* const blend_state = BoundState(gd, gd->bound_blend_state, [&](ID3D11BlendState** state)
-         { native_device_context->OMGetBlendState(state, nullptr, nullptr); });
+      ID3D11BlendState* const blend_state = gd->bound_states.BlendState(native_device_context);
       if (blend_state == gd->mv_blend_state)
          return;
       D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
@@ -1402,8 +1182,7 @@ class TheWitcher2Game final : public Game
          }
       }
       gd.jitter_dsv = nullptr;
-      gd.jitter_depth_stencil_state = nullptr;
-      gd.jitter_depth_test = true;
+      gd.bound_states.ResetDepthTest();
       gd.mv_accepted_rtv = nullptr;
       gd.mv_accepted_dsv = nullptr;
       gd.mv_linear_depth_rtv = nullptr; // A view recreated at the same address (resize) would keep the old texture
@@ -1624,37 +1403,19 @@ class TheWitcher2Game final : public Game
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
       // reads a constant buffer past b5.
-      ID3D11Buffer* const current = BoundState(&gd, gd.bound_object_buffer, [&](ID3D11Buffer** buffer)
-         { native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, buffer); });
+      ID3D11Buffer* const current = gd.bound_states.ObjectBuffer(native_device_context);
       // What the next frame keeps of this draw's vc4: only the bytes its vertex shader reads (at least the camera), copied from the
       // buffer's latest upload. Skinned draws read it all and share the entry's one copy.
       TheWitcher2GameDeviceData::ConstantsCopy object_constants;
       // The buffer's CPU copy (empty until its first upload); the lookup registers it for a copy at every upload
       if (current)
       {
-         const auto [registered_buffer, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current));
-         TheWitcher2GameDeviceData::RegisteredConstants& entry = registered_buffer->second;
-         if (registered)
-         {
-            AddFilteredBuffer(&gd, current, &entry);
-         }
-         if (entry.latest.size() >= VIEW_PROJECTION_OFFSET + CAMERA_SIZE)
+         PatchedDraws::ObjectConstants::Entry& entry = gd.mv_constants.Register(current);
+         if (const auto* const latest = gd.mv_constants.Latest(entry); latest && latest->size() >= VIEW_PROJECTION_OFFSET + CAMERA_SIZE)
          {
             // At least the camera and the tie-break transform's 3 rows (a VS may read only the transform's first one)
             const size_t min_size = (std::max)(VIEW_PROJECTION_OFFSET + CAMERA_SIZE, gd.mv_last_vertex.transform_offset + sizeof(PatchedDraws::ObjectTransform));
-            const size_t read_size = (gd.mv_last_vertex.read_size != 0 ? std::clamp<size_t>(gd.mv_last_vertex.read_size, (std::min)(min_size, entry.latest.size()), entry.latest.size()) : entry.latest.size());
-            if (read_size == entry.latest.size())
-            {
-               if (!entry.copy)
-               {
-                  entry.copy = NewConstantsCopy(&gd, entry.latest.data(), read_size);
-               }
-               object_constants = entry.copy;
-            }
-            else
-            {
-               object_constants = NewConstantsCopy(&gd, entry.latest.data(), read_size);
-            }
+            object_constants = gd.mv_constants.Snapshot(entry, gd.mv_last_vertex.read_size, min_size);
          }
       }
       // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
@@ -1671,18 +1432,11 @@ class TheWitcher2Game final : public Game
 
          // Draw key: same mesh, same shaders, no instance count
          // The offsets go with the buffers: queried with them, else tracked with them
-         UINT vertex_offset = gd.bound_vertex_offset;
-         ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
-            {
-               UINT stride;
-               native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &vertex_offset); });
-         UINT index_offset = gd.bound_index_offset;
-         ID3D11Buffer* const index_buffer = BoundState(&gd, gd.bound_index_buffer, [&](ID3D11Buffer** buffer)
-            {
-               DXGI_FORMAT format;
-               native_device_context->IAGetIndexBuffer(buffer, &format, &index_offset); });
+         UINT vertex_offset, index_offset;
+         ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context, &vertex_offset);
+         ID3D11Buffer* const index_buffer = gd.bound_states.IndexBuffer(native_device_context, &index_offset);
 #if DEVELOPMENT
-         if (g_bound_state_check && gd.bound_states_tracked && (vertex_offset != gd.bound_vertex_offset || index_offset != gd.bound_index_offset))
+         if (gd.bound_states.check && gd.bound_states.tracked && (vertex_offset != gd.bound_states.vertex_offset || index_offset != gd.bound_states.index_offset))
          {
             gd.mv_stats.bound_state_mismatches++;
          }
@@ -1866,24 +1620,9 @@ class TheWitcher2Game final : public Game
       }
       if (!gd.jitter_dsv_scene)
          return false;
-      ID3D11DepthStencilState* const depth_stencil_state = BoundState(&gd, gd.bound_depth_stencil_state, [&](ID3D11DepthStencilState** state)
-         { native_device_context->OMGetDepthStencilState(state, nullptr); });
-      if (depth_stencil_state != gd.jitter_depth_stencil_state)
-      {
-         D3D11_DEPTH_STENCIL_DESC depth_desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
-         if (depth_stencil_state)
-         {
-            depth_stencil_state->GetDesc(&depth_desc);
-         }
-         gd.jitter_depth_test = depth_desc.DepthEnable;
-         gd.jitter_depth_stencil_state = depth_stencil_state;
-      }
-      if (!gd.jitter_depth_test)
+      if (!gd.bound_states.DepthTested(native_device_context))
          return false;
-      const ID3D11Buffer* const vertex_buffer = BoundState(&gd, gd.bound_vertex_buffer, [&](ID3D11Buffer** buffer)
-         {
-            UINT stride, offset;
-            native_device_context->IAGetVertexBuffers(0, 1, buffer, &stride, &offset); });
+      const ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context);
       if (!vertex_buffer)
          return false;
       ID3D11VertexShader* const vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
@@ -2902,10 +2641,10 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 AO Generator Fullscreen VS"),
          ShaderDefinition{"Luma_TW2_AOGenerator", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "fullscreen_dgv_vs"});
       // The buffer hooks are registered at present, only while motion vectors need them (see "OnPresent")
-      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
-      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushConstantBuffers);
-      reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
-      reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      reshade::register_event<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
+      reshade::register_event<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
+      reshade::register_event<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
+      reshade::register_event<reshade::addon_event::bind_index_buffer>(PatchedDraws::OnBindIndexBuffer<GetBoundStates>);
       // dgVoodoo's per-target blend repaired: Flotsam water (PS 0xDA16C815) blended RT1, the linear depth fog reads (the shader writes it
       // to every channel, so src_alpha is the depth)
       reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true>);
@@ -2917,10 +2656,10 @@ public:
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true>);
-      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
-      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushConstantBuffers);
-      reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
-      reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
+      reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
+      reshade::unregister_event<reshade::addon_event::bind_index_buffer>(PatchedDraws::OnBindIndexBuffer<GetBoundStates>);
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
@@ -2961,13 +2700,12 @@ public:
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
       if (g_hide_ui && game_device_data.final_grade_fired_this_frame && !is_custom_pass && !is_final_grade)
       {
-         // Tracked on the immediate context (see "bound_blend_state")
+         // Tracked on the immediate context (see "bound_states")
          com_ptr<ID3D11BlendState> queried_blend_state;
          ID3D11BlendState* blend_state = nullptr;
          if (is_immediate)
          {
-            blend_state = BoundState(&game_device_data, game_device_data.bound_blend_state, [&](ID3D11BlendState** state)
-               { native_device_context->OMGetBlendState(state, nullptr, nullptr); });
+            blend_state = game_device_data.bound_states.BlendState(native_device_context);
          }
          else
          {
@@ -3228,6 +2966,8 @@ public:
          g_buffer_hooks_registered = buffer_hooks;
          if (buffer_hooks)
          {
+            // The uploads missed while unregistered make every earlier copy stale: the draws are uncopied (zero motion) until the next
+            game_device_data.mv_constants.Restart();
             reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
             reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
             reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
@@ -3237,15 +2977,6 @@ public:
             reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
             reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
             reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-            // Uploads and a Map in flight go unseen from now: a kept "latest" would be older than the buffer, and a kept "mapped"
-            // would be read at an Unmap after the next registering. Emptied, not erased: the buffers stay registered (and in the
-            // filter), and their draws are uncopied (zero motion) until the next upload.
-            for (auto& [buffer, entry] : game_device_data.mv_constants_copies)
-            {
-               entry.latest.clear();
-               entry.copy.reset();
-               entry.mapped = nullptr;
-            }
          }
       }
       // Render scale: the next 3D frame's scene shrinks only with an upscaler ready to draw (not while the SR bridge's helper starts,
@@ -3289,15 +3020,8 @@ public:
             game_device_data.mv_fill_buffer.reset();
             game_device_data.mv_jitter_buffer.reset();
             game_device_data.mv_previous_constants = {};
-            // Emptied, not erased: the buffers stay registered (and in the filter)
-            for (auto& [buffer, entry] : game_device_data.mv_constants_copies)
-            {
-               std::vector<uint8_t>().swap(entry.latest);
-               entry.copy.reset();
-               entry.mapped = nullptr;
-            }
-            game_device_data.mv_constants_pool.clear();
-            game_device_data.mv_constants_pool_free.clear();
+            game_device_data.mv_constants.ReleaseUploads();
+            game_device_data.mv_constants.ReleasePool();
          }
       }
       if (game_device_data.mv_reactive_target && cb_luma_global_settings.FrameIndex - game_device_data.sr_reactive_frame > IDLE_RELEASE_FRAMES)
@@ -3372,35 +3096,15 @@ public:
          native_device->GetImmediateContext(&native_device_context);
          SetTextureMipLodBias(native_device_context.get(), device_data, 0.f);
       }
-      {
-         // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many as
-         // the last frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their peak
-         // otherwise. Without motion vectors, none.
-         size_t kept_free = (game_device_data.mv_active ? std::exchange(game_device_data.mv_constants_made, 0) : 0);
-         std::erase_if(game_device_data.mv_constants_pool, [&](const auto& copy)
-            {
-               if (copy.use_count() != 1)
-                  return false;
-               if (kept_free == 0)
-                  return true;
-               kept_free--;
-               return false; });
-         for (auto& [size, free_copies] : game_device_data.mv_constants_pool_free)
-         {
-            free_copies.clear();
-         }
-         for (uint32_t i = 0; i < uint32_t(game_device_data.mv_constants_pool.size()); i++)
-         {
-            if (game_device_data.mv_constants_pool[i].use_count() == 1)
-            {
-               game_device_data.mv_constants_pool_free[game_device_data.mv_constants_pool[i]->size()].push_back(i);
-            }
-         }
+      game_device_data.mv_constants.TrimPool(game_device_data.mv_active);
+      // The CPU savings' development toggles, for the next frame
+      game_device_data.mv_constants.filter = g_mv_buffer_filter;
+      game_device_data.mv_constants.pooled = g_mv_constants_pool;
+      game_device_data.bound_states.tracking = g_bound_state_tracking;
+      game_device_data.bound_states.check = g_bound_state_check;
 #if DEVELOPMENT
-         game_device_data.mv_stats.constants_pool = uint32_t(game_device_data.mv_constants_pool.size());
-#endif
-      }
-#if DEVELOPMENT
+      game_device_data.mv_stats.constants_pool = uint32_t(game_device_data.mv_constants.pool.size());
+      game_device_data.mv_stats.bound_state_mismatches += std::exchange(game_device_data.bound_states.mismatches, 0);
       game_device_data.mv_last_stats = std::exchange(game_device_data.mv_stats, {});
       // The DEV counts in ReShade.log every 300 frames while motion vectors run
       if (const auto& stats = game_device_data.mv_last_stats; game_device_data.mv_active && cb_luma_global_settings.FrameIndex % 300 == 0)
