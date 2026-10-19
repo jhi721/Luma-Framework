@@ -3,15 +3,11 @@
 // "Includes/MotionVectorFill.hlsl"). The Witcher's fill with Mirror's Edge's masks. The game has no depth view to read.
 
 #include "../Includes/MotionVectorFill.hlsl"
+#include "Includes/GameCBuffers.hlsl"
 
 cbuffer MotionVectorFill : register(b0)
 {
-   row_major float4x4 reprojection; // Current clip space to the previous frame's
-   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
-   float reactive_scale;
-   float reactive_threshold;
-   float reactive_enabled;
-   float3 padding;
+   CB::MotionVectorFillConstants fill;
 };
 
 Texture2D<float> prepass : register(t0);
@@ -26,14 +22,14 @@ RWTexture2D<float> transparency : register(u3);
    motion_vectors.GetDimensions(size.x, size.y);
    if (any(id.xy >= size))
       return;
-   if (reactive_enabled != 0.0)
+   if (fill.reactive_enabled != 0.0)
    {
-      WriteFsrMasks(reactive, transparency, id.xy, mask_input.Load(int3(id.xy, 0)), reactive_scale, reactive_threshold);
+      WriteFsrMasks(reactive, transparency, id.xy, mask_input.Load(int3(id.xy, 0)), fill.reactive_scale, fill.reactive_threshold);
    }
    // saturate() also drops a NaN
    const float depth = saturate(1.0 - prepass.Load(int3(id.xy, 0)));
    device_depth[id.xy] = depth;
    if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
       return;
-   WriteCameraMotion(motion_vectors, id.xy, size, reprojection, jitter_ndc, depth);
+   WriteCameraMotion(motion_vectors, id.xy, size, fill.reprojection, fill.jitter_ndc, depth);
 }

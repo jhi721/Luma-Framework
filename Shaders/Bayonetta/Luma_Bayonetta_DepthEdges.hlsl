@@ -4,23 +4,24 @@
 // (the scene copy's viewport): texels outside it are flat.
 
 #include "../Includes/DepthEdges.hlsl"
+#include "Includes/GameCBuffers.hlsl"
 
 Texture2D<float> depth : register(t0); // R32F 1 - z/w, the scene rect's size
 RWTexture2D<float> uav : register(u0); // R16_FLOAT predication signal at the canvas size (0 = on the local plane, 1 = edge)
 
 cbuffer PredCB : register(b0)
 {
-   float4 P; // x = relative tolerance (plane deviation counted as a full edge, as a fraction of view depth), yz = the scene rect's origin
+   CB::DepthEdgesConstants edges;
 }
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    uint2 size;
    depth.GetDimensions(size.x, size.y);
-   const int2 pixel = int2(id.xy) - int2(P.yz);
+   const int2 pixel = int2(id.xy) - int2(edges.scene_origin);
    if (any(pixel < 0) || any(pixel >= int2(size)))
    {
       uav[id.xy] = 0.0;
       return;
    }
-   uav[id.xy] = DepthPredicationEdgeness(depth, uint2(pixel), true, max(P.x, 1e-4));
+   uav[id.xy] = DepthPredicationEdgeness(depth, uint2(pixel), true, max(edges.tolerance, 1e-4));
 }

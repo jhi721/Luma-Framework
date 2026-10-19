@@ -39,10 +39,40 @@ struct GTAOKnobs
    float camera_matrix_row;    // b4's first row of the same transform followed by the projection (4 rows)
    float3 padding;
 };
+
+// The motion vector fill's constants (Luma_Bayonetta_MotionVectorFill.hlsl, b0), written by "FillMotionVectors"
+struct MotionVectorFillConstants
+{
+   row_major float4x4 reprojection; // Current clip space to the previous frame's
+   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
+   float reactive_scale;
+   float reactive_threshold;
+   float reactive_enabled; // 0/1
+   float3 padding;
+};
+
+// SMAA's metrics (Luma_SMAA_impl.hlsl, VS+PS b1), written by "DrawSMAAOnCanvas"
+struct SmaaMetrics
+{
+   float4 rt_metrics;        // (1/W, 1/H, W, H) at output resolution
+   float4 predication;       // x = predication threshold scale: 2 with predication, 1 with a null predication texture (plain ULTRA 0.05)
+   float4 subsample_indices; // SMAA T2x's jitter phase "SMAA.hlsl" @SUBSAMPLE_INDICES, 0 when the scene didn't jitter (unread without T2x)
+};
+
+// The SMAA predication signal's constants (Luma_Bayonetta_DepthEdges.hlsl, b0)
+struct DepthEdgesConstants
+{
+   float tolerance;     // Plane deviation counted as a full edge, as a fraction of view depth
+   float2 scene_origin; // The scene rect's origin on the canvas
+   float padding;
+};
 } // namespace CB
 
 #ifdef __cplusplus
-static_assert(sizeof(CB::GTAOKnobs) == 48); // The HLSL cbuffer's size
+static_assert(sizeof(CB::GTAOKnobs) == 48); // The HLSL cbuffers' sizes
+static_assert(sizeof(CB::MotionVectorFillConstants) == 96);
+static_assert(sizeof(CB::SmaaMetrics) == 48);
+static_assert(sizeof(CB::DepthEdgesConstants) == 16);
 #endif
 
 #endif // LUMA_GAME_CB_STRUCTS

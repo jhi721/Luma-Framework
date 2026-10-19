@@ -15,30 +15,23 @@
 
 #include "Includes/Common.hlsl"
 
-// (1/W, 1/H, W, H) at output resolution — filled by the mod (see main.cpp "DrawSMAAOnCanvas").
 cbuffer SmaaMetricsCB : register(b1)
 {
-   float4 SmaaRtMetrics;
-   // x = predication threshold scale: 2.0 when predication is active, 1.0 with a null predication texture
-   // (fallback) -> plain ULTRA threshold 0.05. yzw unused.
-   float4 SmaaPredication;
-#if SMAA_T2X
-   float4 SmaaSubsampleIndices; // The jitter phase's "SMAA.hlsl" @SUBSAMPLE_INDICES, 0 when the scene didn't jitter
-#endif
+   CB::SmaaMetrics smaa_metrics;
 }
 
 #if SMAA_T2X
-#define SMAA_SUBSAMPLE_INDICES SmaaSubsampleIndices
+#define SMAA_SUBSAMPLE_INDICES smaa_metrics.subsample_indices
 #define SMAA_REPROJECTION      1
 // The motion vector target ("mv_texture" in main.cpp) holds the UV delta from the current to the previous position. SMAA's velocity
 // is the opposite.
 #define SMAA_DECODE_VELOCITY(sample) (-(sample).rg)
 #endif
 
-#define SMAA_RT_METRICS SmaaRtMetrics
+#define SMAA_RT_METRICS smaa_metrics.rt_metrics
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION       1
-#define SMAA_PREDICATION_SCALE SmaaPredication.x
+#define SMAA_PREDICATION_SCALE smaa_metrics.predication.x
 // Predication is live (CS mask, SCALE 2.0), so both values below are load-bearing: flat = SCALE * SMAA_THRESHOLD =
 // 0.10, silhouette = flat * (1 - STRENGTH) = 0.05 (ULTRA base). SMAA_PREDICATION_THRESHOLD 0.5 is scale-free; tune the CS.
 #define SMAA_PREDICATION_STRENGTH  0.5

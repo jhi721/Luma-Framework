@@ -780,8 +780,8 @@ class Bayonetta final : public Game
             native_device->CreateShaderResourceView(gd.smaa_predication.get(), nullptr, gd.smaa_predication_srv.put());
          }
       }
-      const float predication_constants[4] = {g_smaa_pred_tolerance, scene_rect.TopLeftX, scene_rect.TopLeftY, 0.f};
-      predication = predication && gd.smaa_predication_srv && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_predication_buffer), predication_constants, sizeof(predication_constants));
+      const CB::DepthEdgesConstants predication_constants = {.tolerance = g_smaa_pred_tolerance, .scene_origin = {scene_rect.TopLeftX, scene_rect.TopLeftY}};
+      predication = predication && gd.smaa_predication_srv && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_predication_buffer), &predication_constants, sizeof(predication_constants));
       // SMAA T2x: SMAA into this frame's linear target with the velocity, then the resolve with the previous frame into the canvas
       // (Mirror's Edge's). It needs this frame's motion vectors from the fill, at the canvas' size: the motion vectors cover the scene
       // rect, so a canvas wider than the scene (PreserveAspect) stays 1x. Without them this frame is 1x and the next one doesn't jitter.
@@ -812,8 +812,12 @@ class Bayonetta final : public Game
       // b1 ("Luma_SMAA_impl.hlsl"'s "SmaaMetricsCB"): the metrics, the predication threshold scale and T2x's subsample indices for the
       // jitter phase (see "OpenScene"), 0 for 1x
       const float subsample_indices = ((t2x && gd.t2x_phase >= 0) ? float(gd.t2x_phase + 1) : 0.f);
-      const float metrics[12] = {1.f / float(size.x), 1.f / float(size.y), float(size.x), float(size.y), predication ? 2.f : 1.f, 0.f, 0.f, 0.f, subsample_indices, subsample_indices, subsample_indices, 0.f};
-      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_metrics_buffer), metrics, sizeof(metrics)))
+      const CB::SmaaMetrics metrics = {
+         .rt_metrics = {1.f / float(size.x), 1.f / float(size.y), float(size.x), float(size.y)},
+         .predication = {(predication ? 2.f : 1.f), 0.f, 0.f, 0.f},
+         .subsample_indices = {subsample_indices, subsample_indices, subsample_indices, 0.f},
+      };
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_metrics_buffer), &metrics, sizeof(metrics)))
          return;
 
       if (predication)
@@ -1804,17 +1808,6 @@ class Bayonetta final : public Game
    }
 
    // The fill's constants ("Luma_Bayonetta_MotionVectorFill.hlsl" b0)
-   struct MotionVectorFillConstants
-   {
-      float reprojection[16]; // Current clip space to the previous frame's, row major
-      float jitter_ndc[2];
-      float reactive_scale;
-      float reactive_threshold;
-      float reactive_enabled;
-      float padding[3];
-   };
-   static_assert(sizeof(MotionVectorFillConstants) == 96);
-
    // The depth and camera motion fill (see "Luma_Bayonetta_MotionVectorFill.hlsl"), with the reactive masks if "write_reactive". The
    // caller caches and restores the state. False if it didn't run.
    static bool FillMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool write_reactive)
@@ -1823,7 +1816,7 @@ class Bayonetta final : public Game
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Motion Vector Fill CS"));
       if (!fill_shader || !gd.mv_camera || !gd.prepass_drawn || !gd.prepass_depth_srv)
          return false;
-      MotionVectorFillConstants constants = {
+      CB::MotionVectorFillConstants constants = {
          .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
          .reactive_scale = g_sr_reactive_scale,
          .reactive_threshold = g_sr_reactive_threshold,
@@ -1831,7 +1824,7 @@ class Bayonetta final : public Game
       };
       for (int i = 0; i < 16; i++)
       {
-         constants.reprojection[i] = float(gd.mv_reprojection.GetData()[i]);
+         constants.reprojection.GetData()[i] = float(gd.mv_reprojection.GetData()[i]);
       }
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_fill_buffer), &constants, sizeof(constants)))
          return false;
