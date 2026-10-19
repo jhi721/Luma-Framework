@@ -74,6 +74,11 @@ public:
    virtual std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash = -1, const std::byte* shader_object = nullptr, size_t shader_object_size = 0) { return nullptr; }
    virtual std::unique_ptr<std::byte[]> PatchShaderBytecodeAsync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash = -1, const std::byte* shader_object = nullptr, size_t shader_object_size = 0) { return nullptr; }
 
+   // The shader warm-up's (see "shader_warmup.h") variants of a game shader that the mod creates its own shader objects from (e.g. motion
+   // vector patches), appended to "variants". "code" is what the game's shader object was created with ("PatchShaderBytecodeSync"
+   // applied). Called on the warm-up thread.
+   virtual void AddShaderWarmupVariants(reshade::api::pipeline_subobject_type type, const std::vector<uint8_t>& code, std::vector<std::vector<uint8_t>>* variants) {}
+
 #if LUMA_USE_DXP
    // Recipe method: operates on the full DXBC container via a DXP recipe.
    virtual std::optional<dxp::RecipeReport> PatchShaderRecipeSync(DeviceData& device_data, const Patch::ShaderPatchRequest& request) { return std::nullopt; }

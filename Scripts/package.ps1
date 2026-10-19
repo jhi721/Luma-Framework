@@ -66,7 +66,9 @@ function Copy-PackageShaders {
         $isShader = $entry.Extension -in @(".hlsl", ".hlsli", ".h")
         $isRecipe = $entry.Name.EndsWith('.recipe.yml', [System.StringComparison]::OrdinalIgnoreCase)
         $isTexture = $relative -match '(^|[\\/])Textures[\\/]'
-        if (-not ($isShader -or $isRecipe -or $isTexture)) { continue }
+        # Shader warm-up packs (Core "shader_warmup.h"), one per wrapper version
+        $isWarmupPack = $relative -match '(^|[\\/])Warmup[\\/]' -and $entry.Extension -ieq ".bin"
+        if (-not ($isShader -or $isRecipe -or $isTexture -or $isWarmupPack)) { continue }
 
         New-Item -ItemType Directory -Path $Destination -Force | Out-Null
         Copy-Item -LiteralPath $entry.FullName -Destination $destinationPath -Force

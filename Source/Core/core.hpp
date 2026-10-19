@@ -232,6 +232,7 @@
 #include "utils/resource.hpp"
 #include "utils/draw.hpp"
 #include "utils/system.h"
+#include "includes/shader_warmup.h"
 #include "taa/LumaTAA.hpp" // see "ENABLE_LUMA_TAA"
 
 #define ICON_FK_CANCEL reinterpret_cast<const char*>(u8"\uf00d")
@@ -452,6 +453,8 @@ namespace
    bool allow_patches = true;
 #if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
    bool strip_original_shaders_debug_data = false;
+   // "OnCreatePipeline"'s, and the shader warm-up's (which must hand the driver the same bytecode)
+   constexpr UINT ORIGINAL_SHADER_STRIP_FLAGS = D3DCOMPILER_STRIP_REFLECTION_DATA | D3DCOMPILER_STRIP_DEBUG_INFO | D3DCOMPILER_STRIP_TEST_BLOBS /*| D3DCOMPILER_STRIP_PRIVATE_DATA*/ | D3DCOMPILER_STRIP_ROOT_SIGNATURE;
 #endif
    bool use_os_reference_white_level = true;
 #if ENABLE_REFLEX
@@ -2783,12 +2786,76 @@ namespace
       return false;
    }
 
+   // The shader warm-up's "Expand": the bytecode "OnCreatePipeline" hands the driver for a game shader (stripped, bytecode patch; not the
+   // recipe patches), and the game's own variants of it. On the warm-up thread, so the game's patch functions must be thread safe (they
+   // already run on any thread that creates shaders).
+   void GetShaderWarmupCodes(reshade::api::pipeline_subobject_type type, const std::vector<uint8_t>& code, std::vector<std::vector<uint8_t>>* codes)
+   {
+      std::vector<uint8_t> driver_code = code;
+#if (LUMA_PATCH_PROVIDERS & LUMA_PATCH_PROVIDER_BYTECODE_SYNC) && !LUMA_PATCH_SYNC_MODE_CLONE
+      com_ptr<ID3DBlob> stripped_code;
+      if (strip_original_shaders_debug_data && SUCCEEDED(d3d_stripShader(code.data(), code.size(), ORIGINAL_SHADER_STRIP_FLAGS, &stripped_code)))
+      {
+         const auto* stripped_bytes = static_cast<const uint8_t*>(stripped_code->GetBufferPointer());
+         driver_code.assign(stripped_bytes, stripped_bytes + stripped_code->GetBufferSize());
+      }
+      if (const Patch::ByteCodeView program = Patch::FindShaderByteCode(driver_code.data(), driver_code.size()); program.valid)
+      {
+         size_t byte_code_size = program.bytecode_size;
+         if (std::unique_ptr<std::byte[]> patched = game->PatchShaderBytecodeSync(reinterpret_cast<const std::byte*>(program.bytecode), byte_code_size, type, Shader::BinToHash(driver_code.data(), driver_code.size()), reinterpret_cast<const std::byte*>(driver_code.data()), driver_code.size()); patched && byte_code_size != 0)
+         {
+            if (std::vector<uint8_t> patched_code = Patch::BuildPatchedContainer(driver_code.data(), driver_code.size(), program.bytecode_offset, patched.get(), byte_code_size); !patched_code.empty())
+            {
+               driver_code = std::move(patched_code);
+            }
+         }
+      }
+#endif
+      game->AddShaderWarmupVariants(type, driver_code, codes);
+      codes->push_back(std::move(driver_code));
+   }
+
+   // The shader warm-up's Luma shaders: every compiled custom shader (the game replacements and Luma's own), once the boot compilation is
+   // done. Vertex, pixel and compute shaders (their container's program type).
+   std::vector<ShaderWarmup::Entry> GetLumaShaderWarmupEntries()
+   {
+      while (thread_auto_compiling_running && ShaderWarmup::g_worker.status != ShaderWarmup::Status::STOPPING)
+      {
+         Sleep(10);
+      }
+      std::vector<ShaderWarmup::Entry> entries;
+      const std::shared_lock lock_loading(s_mutex_loading);
+      for (const auto& [shader_hash, custom_shader] : custom_shaders_cache)
+      {
+         if (!custom_shader || custom_shader->code.empty())
+            continue;
+         const Patch::ByteCodeView program = Patch::FindShaderByteCode(custom_shader->code.data(), custom_shader->code.size());
+         if (!program.valid)
+            continue;
+         reshade::api::pipeline_subobject_type type;
+         switch (reinterpret_cast<const DXBCByteCodeChunk*>(program.bytecode - offsetof(DXBCByteCodeChunk, byte_code))->program_type)
+         {
+         case DXBCProgramType::VertexShader: type = reshade::api::pipeline_subobject_type::vertex_shader; break;
+         case DXBCProgramType::PixelShader: type = reshade::api::pipeline_subobject_type::pixel_shader; break;
+         case DXBCProgramType::ComputeShader: type = reshade::api::pipeline_subobject_type::compute_shader; break;
+         default: continue;
+         }
+         entries.push_back({.type = type, .code = custom_shader->code});
+      }
+      return entries;
+   }
+
    void OnInitDevice(reshade::api::device* device)
    {
       // Always skip this one, don't use "SKIP_UNSUPPORTED_DEVICE_API", some games create devices of other graphics API without actually doing anything with them (e.g. Deus Ex HR)
       if (!IsSupportedGraphicsAPI(device->get_api())) return;
 
       ID3D11Device* native_device = (ID3D11Device*)(device->get_native()); // This is the unproxied device, the one the game tried to natively create was instead created as a proxy by reshade, but we don't want that one, as that will pass all our calls through ReShade too, while we want to keep that layer only for stuff coming from the game
+      if (ShaderWarmup::g_is_warmup_thread)
+      {
+         ShaderWarmup::g_warmup_native_device = native_device;
+         return;
+      }
       DeviceData& device_data = *device->create_private_data<DeviceData>();
       device_data.native_device = native_device;
       device_data.reshade_device = device;
@@ -3024,11 +3091,16 @@ namespace
          SetThreadPriority(static_cast<HANDLE>(device_data.thread_auto_loading.native_handle()), THREAD_PRIORITY_BELOW_NORMAL);
       }
 #endif
+
+      ShaderWarmup::Start(native_device, shaders_path / Globals::GAME_NAME / "Warmup", GetShaderWarmupCodes, GetLumaShaderWarmupEntries);
    }
 
    void OnDestroyDevice(reshade::api::device* device)
    {
       if (!IsSupportedGraphicsAPI(device->get_api())) return;
+      if (ShaderWarmup::g_is_warmup_thread) return;
+
+      ShaderWarmup::Stop();
 
       ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
       DeviceData& device_data = *device->get_private_data<DeviceData>(); // No need to lock the data mutex here, it could be concurrently used at this point
@@ -3779,7 +3851,7 @@ namespace
                   {
                      stripped_shader_code = std::move(cached_stripped);
                   }
-                  else if (SUCCEEDED(d3d_stripShader(current_shader_data.code, current_shader_data.code_size, D3DCOMPILER_STRIP_REFLECTION_DATA | D3DCOMPILER_STRIP_DEBUG_INFO | D3DCOMPILER_STRIP_TEST_BLOBS /*| D3DCOMPILER_STRIP_PRIVATE_DATA*/ | D3DCOMPILER_STRIP_ROOT_SIGNATURE, &stripped_code_blob)))
+                  else if (SUCCEEDED(d3d_stripShader(current_shader_data.code, current_shader_data.code_size, ORIGINAL_SHADER_STRIP_FLAGS, &stripped_code_blob)))
                   {
                      const size_t stripped_shader_code_size = stripped_code_blob->GetBufferSize();
                      stripped_shader_code = std::make_shared<const std::vector<uint8_t>>(static_cast<const uint8_t*>(stripped_code_blob->GetBufferPointer()), static_cast<const uint8_t*>(stripped_code_blob->GetBufferPointer()) + stripped_shader_code_size);
@@ -5610,6 +5682,7 @@ namespace
    void OnInitCommandList(reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      if (ShaderWarmup::g_is_warmup_thread) return;
 
       CommandListData& cmd_list_data = *cmd_list->create_private_data<CommandListData>();
 
@@ -5661,6 +5734,7 @@ namespace
    void OnDestroyCommandList(reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      if (ShaderWarmup::g_is_warmup_thread) return;
 
       cmd_list->destroy_private_data<CommandListData>();
    }
@@ -15473,6 +15547,7 @@ namespace
 
             game->DrawImGuiSettings(device_data);
             device_data.cb_luma_global_settings_dirty = true; // Again after the game's settings, so their edits are never missed by an upload that ran in between
+            ShaderWarmup::DrawImGuiSection(device_data.native_device);
 
 #if DEVELOPMENT || TEST
             ImGui::SetNextItemOpen(true, ImGuiCond_Once);
@@ -17486,6 +17561,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
             global_device_data->thread_auto_loading.detach();
          }
       }
+      ShaderWarmup::Detach();
 
       break;
    }
