@@ -17,6 +17,8 @@ struct LumaGameSettings
    float Contrast;               // HDR (PsychoV31 in Copy_0x91A6C437), 1 = vanilla
    float Saturation;             // HDR, 1 = vanilla
    float HighlightsDesaturation; // HDR (PsychoV "dechroma"), 0 = off
+   float ColorGradingIntensity;  // Grade_0x719339A9 / GradeLuma_0xB7A08D4A: 1 = vanilla, 0 = no curve, saturation or gradient
+   float BloomIntensity;         // Copy_0x91A6C437 on the bloom composite: 1 = vanilla, 0 = none
 };
 
 struct LumaGameData

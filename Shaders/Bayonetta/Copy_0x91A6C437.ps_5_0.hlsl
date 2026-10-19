@@ -11,7 +11,7 @@
 // grade's and the bloom's values above 1, so that copy carries the HDR display map: linearize, RenoDX's PsychoV31 to the peak (with
 // the user's contrast, saturation and highlights desaturation, neutral at their defaults), the
 // UI paper white pre-scale (UI_DRAW_TYPE 2), encode back for the Core composition. Elsewhere the copy is vanilla, unclamped on the
-// fp16 targets (the bloom levels are 8-bit and clamp on their own).
+// fp16 targets (the bloom levels are 8-bit and clamp on their own), but for the bloom composite's alpha (CustomData1 2 and 3).
 
 cbuffer cb3 : register(b3)
 {
@@ -31,6 +31,12 @@ void main(DGV_MAIN_SIGNATURE)
    o0 = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]) * cb4[192];
    // Additive blends read the source alpha: the 8-bit targets clamped it
    o0.a = saturate(o0.a);
+   // The bloom composite: "Bloom Intensity" through its blend's source alpha, at most 1 when the blend lerps (3)
+   if (LumaData.CustomData1 >= 2)
+   {
+      o0.a *= (LumaData.CustomData1 == 2) ? LumaSettings.GameSettings.BloomIntensity : min(LumaSettings.GameSettings.BloomIntensity, 1.0);
+      return;
+   }
    if (LumaData.CustomData1 == 0)
    {
       return;

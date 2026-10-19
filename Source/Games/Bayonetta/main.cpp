@@ -2187,6 +2187,8 @@ public:
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
       default_luma_global_game_settings.HighlightsDesaturation = 0.f;
+      default_luma_global_game_settings.ColorGradingIntensity = 1.f;
+      default_luma_global_game_settings.BloomIntensity = 1.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
       FrameLimiter::Install();
@@ -2866,6 +2868,34 @@ public:
       else if (is_custom_pass && (original_shader_hashes.Contains(shader_hashes_Copy) || original_shader_hashes.Contains(shader_hashes_Video)))
       {
          const bool is_video = original_shader_hashes.Contains(shader_hashes_Video);
+         // The bloom composite (FUN_0044bc90): the fixed size 320x176 bloom target blended onto the scene, its mode 1
+         // SRCALPHA/INVSRCALPHA or 2 SRCALPHA/ONE (mode 0, opaque, is its copies between levels). The shader scales the source
+         // alpha by "Bloom Intensity": LumaData.CustomData1 2 when it adds, 3 when it lerps.
+         if (!is_video)
+         {
+            ComPtr<ID3D11BlendState> blend_state;
+            native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
+            D3D11_BLEND_DESC blend_desc = {};
+            if (blend_state)
+            {
+               blend_state->GetDesc(&blend_desc);
+            }
+            const D3D11_RENDER_TARGET_BLEND_DESC& blend = blend_desc.RenderTarget[0];
+            const bool blends_source_alpha = blend.BlendEnable && blend.SrcBlend == D3D11_BLEND_SRC_ALPHA && (blend.DestBlend == D3D11_BLEND_ONE || blend.DestBlend == D3D11_BLEND_INV_SRC_ALPHA);
+            ComPtr<ID3D11ShaderResourceView> source_srv;
+            if (blends_source_alpha)
+            {
+               native_device_context->PSGetShaderResources(0, 1, source_srv.put());
+            }
+            const uint2 source_size = (source_srv ? GetViewTextureSize(source_srv.get()) : uint2{});
+            if (source_size.x == 320 && source_size.y == 176)
+            {
+               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, (blend.DestBlend == D3D11_BLEND_ONE ? 2 : 3));
+               updated_cbuffers = true;
+               return DrawOrDispatchOverrideType::None;
+            }
+         }
          // ResetRender is the frame's first opaque copy into the canvas (the bloom composite also copies, additively, into the scene)
          if (!is_video && game_device_data.has_copied_scene_to_canvas)
          {
@@ -3114,6 +3144,8 @@ public:
       reshade::get_config_value(nullptr, NAME, "Contrast", cb_luma_global_settings.GameSettings.Contrast);
       reshade::get_config_value(nullptr, NAME, "Saturation", cb_luma_global_settings.GameSettings.Saturation);
       reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", cb_luma_global_settings.GameSettings.HighlightsDesaturation);
+      reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
+      reshade::get_config_value(nullptr, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -3160,6 +3192,12 @@ public:
       DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
       DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
       DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightsDesaturation, default_luma_global_game_settings.HighlightsDesaturation, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+      // Read in Grade_0x719339A9.ps_5_0.hlsl and GradeLuma_0xB7A08D4A.ps_5_0.hlsl
+      DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
+
+      ImGui::SeparatorText("Bloom");
+      // Read in Copy_0x91A6C437.ps_5_0.hlsl on the bloom composite
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
       DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's options).");

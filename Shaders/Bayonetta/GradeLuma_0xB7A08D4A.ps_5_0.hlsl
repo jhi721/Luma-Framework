@@ -44,9 +44,18 @@ void main(DGV_MAIN_SIGNATURE)
    }
    // The compression is a scalar, so it cancels out of color/luma: only the curve's input moves
    const float luma = dot(color, kLumaWeights) * scale;
-   const float curved = Curve(luma);
+   float curved = Curve(luma);
+   // "Color Grading Intensity" fades the curve toward identity and the saturation (an offset from the colour) toward none, as in
+   // Grade_0x719339A9; the g_MatrialColor gain (auto exposure) stays
+   const float gradeIntensity = LumaSettings.GameSettings.ColorGradingIntensity;
+   float3 saturation = cb4[193].xyz;
+   [branch] if (gradeIntensity != 1.0)
+   {
+      curved = lerp(luma, curved, gradeIntensity);
+      saturation *= gradeIntensity;
+   }
    const float3 toned = color * scale * curved * DgVoodooRcp(luma);
-   o0.rgb = ((toned - curved) * cb4[193].xyz + toned) / scale * cb4[192].xyz;
+   o0.rgb = ((toned - curved) * saturation + toned) / scale * cb4[192].xyz;
    // The 8-bit target floored the saturation's negatives and, in SDR, clipped the top
    o0.rgb = hdr ? max(o0.rgb, 0.0) : saturate(o0.rgb);
    o0.a = saturate(cb4[192].w);

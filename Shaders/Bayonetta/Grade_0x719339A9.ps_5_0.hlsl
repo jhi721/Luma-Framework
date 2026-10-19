@@ -50,9 +50,11 @@ void main(DGV_MAIN_SIGNATURE)
 
    const bool hdr = TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1;
    float luma = vanillaLuma;
+   // The curve's input, as the curve reads it
+   float3 color = saturate(scene.rgb);
    [branch] if (hdr)
    {
-      const float3 color = IsNaN_Strict(scene.rgb) ? 0.0 : max(scene.rgb, 0.0);
+      color = IsNaN_Strict(scene.rgb) ? 0.0 : max(scene.rgb, 0.0);
       const float peak = max3(color);
       // The max channel is what the curve's domain must hold
       if (peak > kCurveShoulder)
@@ -63,7 +65,20 @@ void main(DGV_MAIN_SIGNATURE)
       }
    }
 
-   o0.rgb = ((curved - luma) * cb4[193].xyz + curved) * cb4[192].xyz + gradient;
+   // "Color Grading Intensity" fades the level's look: the curve toward identity, the saturation (an offset from the colour, 0 =
+   // none) and the gradient toward none. The g_MatrialColor gain stays: it carries the auto exposure. Alpha keeps the vanilla curve.
+   const float gradeIntensity = LumaSettings.GameSettings.ColorGradingIntensity;
+   float3 saturation = cb4[193].xyz;
+   float3 gradientTint = gradient;
+   [branch] if (gradeIntensity != 1.0)
+   {
+      curved = lerp(color, curved, gradeIntensity);
+      luma = dot(curved, kLumaWeights);
+      saturation *= gradeIntensity;
+      gradientTint *= gradeIntensity;
+   }
+
+   o0.rgb = ((curved - luma) * saturation + curved) * cb4[192].xyz + gradientTint;
    // The 8-bit target floored the saturation's negatives and, in SDR, clipped the top
    o0.rgb = hdr ? max(o0.rgb, 0.0) : saturate(o0.rgb);
 }
