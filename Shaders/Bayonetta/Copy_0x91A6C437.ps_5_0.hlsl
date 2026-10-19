@@ -51,11 +51,14 @@ float4 SampleBSpline(float2 uv)
 
 void main(DGV_MAIN_SIGNATURE)
 {
-   o0 = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]) * cb4[192];
    // The bloom composite from Luma Bloom's texture (main.cpp, CustomData2 1): a B-spline magnification, not the bilinear's creases
    [branch] if (LumaData.CustomData1 >= 2 && LumaData.CustomData2 == 1)
    {
       o0 = SampleBSpline(v5.xy) * cb4[192];
+   }
+   else
+   {
+      o0 = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]) * cb4[192];
    }
    // Additive blends read the source alpha: the 8-bit targets clamped it
    o0.a = saturate(o0.a);

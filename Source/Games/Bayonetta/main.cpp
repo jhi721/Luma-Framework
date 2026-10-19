@@ -1584,7 +1584,7 @@ class Bayonetta final : public Game
       // Alpha blended draws (SRC_ALPHA / INV_SRC_ALPHA) take their own motion vectors too, blended by their alpha: the particles are
       // such draws. Additive ones and the other blends keep what's behind them.
       const bool blended = gd.mv_alpha_blended;
-      if ((!gd.mv_blend_opaque && !blended) || (blended && original_shader_hashes.Contains(shader_hashes_SceneRefraction)))
+      if ((!gd.mv_blend_opaque && !blended) || (blended && shader_hashes_SceneRefraction.Contains(uint32_t(original_shader_hashes.pixel_shaders[0]), reshade::api::shader_stage::pixel)))
          return MV_REJECT(REJECT_BLEND);
       // Known targets: checked, and the motion vector target built for them (the depth prepass' R32F targets are refused here)
       if (rtvs[0] != gd.mv_scene_rtv || dsv != gd.mv_accepted_dsv)
@@ -2836,6 +2836,8 @@ public:
          return DrawOrDispatchOverrideType::None;
       }
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+      // The game's lists are all pixel shaders: looked up by this hash (a list's "Contains" of another walks the list)
+      const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
       const auto bind_luma_cbuffers = [&](uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0)
       {
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
@@ -2860,7 +2862,7 @@ public:
       };
       // Hide UI: cancel the game's draws into the canvas after this frame's scene copy (the HUD, menus and 2D effects), not the movies.
       // An original pixel shader hash is what separates a game draw.
-      if (g_hide_ui && game_device_data.has_drawn_reset_render && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE && !original_shader_hashes.Contains(shader_hashes_Video) && bound_canvas_rtv())
+      if (g_hide_ui && game_device_data.has_drawn_reset_render && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE && !shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) && bound_canvas_rtv())
       {
          return DrawOrDispatchOverrideType::Replaced;
       }
@@ -2930,7 +2932,7 @@ public:
       };
 
       // The pixel kernels' target size
-      if (original_shader_hashes.Contains(shader_hashes_PixelKernels) || original_shader_hashes.Contains(shader_hashes_ShadowReceivers))
+      if (shader_hashes_PixelKernels.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || shader_hashes_ShadowReceivers.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
       {
          BindPixelKernelTargetSize(native_device, native_device_context, &game_device_data);
       }
@@ -2948,7 +2950,7 @@ public:
          // A game draw with a vertex shader, which the patched shaders can redo: replaced ones too (the particles translate to copytex,
          // replaced by "Copy_0x91A6C437"; their patched versions come from the game's code, see "GetPatchedShader")
          const bool game_mesh_draw = (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE;
-         if (!game_device_data.mv_scene_done && original_shader_hashes.Contains(shader_hashes_ScenePost))
+         if (!game_device_data.mv_scene_done && shader_hashes_ScenePost.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
          {
             if (game_device_data.mv_scene_open)
             {
@@ -3066,23 +3068,23 @@ public:
          PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
       }
 
-      const bool is_bloom_source = original_shader_hashes.Contains(shader_hashes_BloomSource);
-      if (is_immediate && (is_bloom_source || original_shader_hashes.Contains(shader_hashes_BloomBlur) || original_shader_hashes.Contains(shader_hashes_Copy)) &&
+      const bool is_bloom_source = shader_hashes_BloomSource.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
+      if (is_immediate && (is_bloom_source || shader_hashes_BloomBlur.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || shader_hashes_Copy.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel)) &&
           DrawBloomPass(native_device, native_device_context, cmd_list_data, device_data, stages, is_bloom_source, *original_draw_dispatch_func, &updated_cbuffers))
          return DrawOrDispatchOverrideType::Replaced;
 
-      if (original_shader_hashes.Contains(shader_hashes_Grade))
+      if (shader_hashes_Grade.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
       {
          device_data.has_drawn_main_post_processing = true;
       }
-      else if (original_shader_hashes.Contains(shader_hashes_SSAO))
+      else if (shader_hashes_SSAO.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
       {
          game_device_data.depth_srv.reset();
          native_device_context->PSGetShaderResources(2, 1, game_device_data.depth_srv.put());
          if (g_gtao_enable && is_immediate && RunXeGTAO(native_device, native_device_context, device_data, *original_draw_dispatch_func))
             return DrawOrDispatchOverrideType::Replaced;
       }
-      else if (original_shader_hashes.Contains(shader_hashes_DgVoodooPresent))
+      else if (shader_hashes_DgVoodooPresent.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
       {
          ComPtr<ID3D11ShaderResourceView> srv;
          native_device_context->PSGetShaderResources(0, 1, srv.put());
@@ -3100,9 +3102,9 @@ public:
          native_device_context->PSSetShaderResources(1, 1, &null_srv);
          return DrawOrDispatchOverrideType::Replaced;
       }
-      else if (is_custom_pass && (original_shader_hashes.Contains(shader_hashes_Copy) || original_shader_hashes.Contains(shader_hashes_Video)))
+      else if (is_custom_pass && (shader_hashes_Copy.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel)))
       {
-         const bool is_video = original_shader_hashes.Contains(shader_hashes_Video);
+         const bool is_video = shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
          // The bloom composite (FUN_0044bc90): the bloom target blended onto the scene, its mode 1 SRCALPHA/INVSRCALPHA or 2
          // SRCALPHA/ONE (mode 0, opaque, is its copies between levels). The shader scales the source alpha by "Bloom Intensity"
          // (LumaData.CustomData1 2 when it adds, 3 when it lerps); with Luma Bloom it reads "bloom_texture" (CustomData2 1: a B-spline
@@ -3166,22 +3168,23 @@ public:
       // in place "PatchShaderBytecodeSync" clamp of the float target 0 shaders
       else if (g_msaa_resolve_enable && g_msaa_coverage_enable && game_device_data.msaa_active && !is_custom_pass && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE)
       {
-         if (ID3D11PixelShader* const coverage_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, uint32_t(original_shader_hashes.pixel_shaders[0]), cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::COVERAGE).shader.get())
+         // The target first: most draws with MSAA on (the UI, post) aren't multisampled, and need no shader lookup
+         ComPtr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+         ComPtr<ID3D11Resource> rt;
+         ComPtr<ID3D11Texture2D> rt_texture;
+         D3D11_TEXTURE2D_DESC rt_desc = {};
+         if (rtv)
          {
-            ComPtr<ID3D11RenderTargetView> rtv;
-            native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-            ComPtr<ID3D11Resource> rt;
-            ComPtr<ID3D11Texture2D> rt_texture;
-            D3D11_TEXTURE2D_DESC rt_desc = {};
-            if (rtv)
+            rtv->GetResource(rt.put());
+            if (SUCCEEDED(rt->QueryInterface(rt_texture.put())))
             {
-               rtv->GetResource(rt.put());
-               if (SUCCEEDED(rt->QueryInterface(rt_texture.put())))
-               {
-                  rt_texture->GetDesc(&rt_desc);
-               }
+               rt_texture->GetDesc(&rt_desc);
             }
-            if (rt_desc.SampleDesc.Count >= 4)
+         }
+         if (rt_desc.SampleDesc.Count >= 4)
+         {
+            if (ID3D11PixelShader* const coverage_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::COVERAGE).shader.get())
             {
                com_ptr<ID3D11PixelShader> game_shader;
                native_device_context->PSGetShader(&game_shader, nullptr, nullptr);
