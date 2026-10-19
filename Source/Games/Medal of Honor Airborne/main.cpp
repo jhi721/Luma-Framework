@@ -328,24 +328,13 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
    PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
 
-   // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, null until its first upload), from
-   // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest copy
-   using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
+   // CPU copies of the vc4 buffers the motion vector draws bind (see "PatchedDraws::ObjectConstants"; dgVoodoo maps its streaming
+   // buffers too), from a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource. Every call but "MayBeRegistered" under
+   // "mv_constants_mutex" (present trims the pool).
+   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
    std::mutex mv_constants_mutex;
-   std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
-   std::unordered_map<uint64_t, void*> mv_mapped_constants; // Registered buffers mapped now, until their Unmap
-   // The first registered buffers and their sizes, read by the buffer hooks without the lock (written under it, on the immediate
-   // context's thread as the hooks): dgVoodoo maps its streaming buffers too. With more registered, every buffer takes the lock.
-   static constexpr uint32_t kMaxFilteredBuffers = 8;
-   std::array<std::atomic<uint64_t>, kMaxFilteredBuffers> mv_filtered_buffers = {};
-   std::array<UINT, kMaxFilteredBuffers> mv_filtered_buffer_sizes = {};
-   std::atomic<uint32_t> mv_filtered_buffer_count = 0;
-   std::atomic<bool> mv_filter_overflow = false;
-   // Every pooled vc4 copy, and those nobody held anymore at the last present (taken by the next copies): no allocation per upload.
-   // Under "mv_constants_mutex".
-   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
-   std::vector<uint32_t> mv_constants_pool_free;
-   size_t mv_constants_made = 0; // Copies asked for since the last present
+   PatchedDraws::ObjectConstants mv_constants;
+
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with a tie-break transform and vc4. A draw takes the previous
@@ -635,73 +624,6 @@ class MedalOfHonorAirborne final : public Game
       return matrices;
    }
 
-   // False if the buffer surely isn't a registered vc4 one; "size" its size if known (else 0). Lock free.
-   static bool MayBeRegisteredBuffer(const MedalOfHonorAirborneGameDeviceData& gd, uint64_t handle, UINT* size)
-   {
-      *size = 0;
-      if (gd.mv_filter_overflow.load(std::memory_order_relaxed))
-         return true;
-      const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_acquire);
-      for (uint32_t i = 0; i < count; i++)
-      {
-         if (gd.mv_filtered_buffers[i].load(std::memory_order_relaxed) == handle)
-         {
-            *size = gd.mv_filtered_buffer_sizes[i];
-            return true;
-         }
-      }
-      return false;
-   }
-
-   // A buffer registered in "mv_constants_copies" joins the filter. Under "mv_constants_mutex".
-   static void AddFilteredBuffer(MedalOfHonorAirborneGameDeviceData& gd, ID3D11Buffer* buffer)
-   {
-      const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_relaxed);
-      if (count >= MedalOfHonorAirborneGameDeviceData::kMaxFilteredBuffers)
-      {
-         gd.mv_filter_overflow = true;
-         return;
-      }
-      D3D11_BUFFER_DESC desc;
-      buffer->GetDesc(&desc);
-      gd.mv_filtered_buffer_sizes[count] = desc.ByteWidth;
-      gd.mv_filtered_buffers[count].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_relaxed);
-      gd.mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
-   }
-
-   static UINT GetBufferSize(uint64_t handle, UINT known_size)
-   {
-      if (known_size != 0)
-         return known_size;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(handle)->GetDesc(&desc);
-      return desc.ByteWidth;
-   }
-
-   // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the last present, else a new one. Under
-   // "mv_constants_mutex".
-   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MedalOfHonorAirborneGameDeviceData& gd, const uint8_t* bytes, size_t size)
-   {
-      gd.mv_constants_made++;
-      if (!gd.mv_constants_pool_free.empty())
-      {
-         auto copy = gd.mv_constants_pool[gd.mv_constants_pool_free.back()];
-         gd.mv_constants_pool_free.pop_back();
-         if (bytes)
-         {
-            copy->assign(bytes, bytes + size);
-         }
-         else
-         {
-            copy->assign(size, 0);
-         }
-         return copy;
-      }
-      auto copy = (bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size));
-      gd.mv_constants_pool.push_back(copy);
-      return copy;
-   }
-
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
@@ -709,20 +631,17 @@ class MedalOfHonorAirborne final : public Game
       if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active || !data || !*data)
          return;
       auto& gd = GetGameDeviceData(*device_data);
-      UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      // Lock free: the hooks see every Map and Unmap of the game
+      if (!gd.mv_constants.MayBeRegistered(resource.handle))
          return;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      if (!gd.mv_constants_copies.contains(resource.handle))
-         return;
-      if (access != reshade::api::map_access::write_discard || offset != 0)
-      {
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, *data);
 #if DEVELOPMENT
+      if (registered && !registered->mapped)
+      {
          gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
-#endif
-         return;
       }
-      gd.mv_mapped_constants[resource.handle] = *data;
+#endif
    }
 
    // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
@@ -732,54 +651,34 @@ class MedalOfHonorAirborne final : public Game
       if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active)
          return;
       auto& gd = GetGameDeviceData(*device_data);
-      UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      if (!gd.mv_constants.MayBeRegistered(resource.handle))
          return;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto mapped = gd.mv_mapped_constants.find(resource.handle);
-      if (mapped == gd.mv_mapped_constants.end())
-         return;
-      gd.mv_constants_copies[resource.handle] = NewConstantsCopy(gd, static_cast<const uint8_t*>(mapped->second), GetBufferSize(resource.handle, buffer_size));
-      gd.mv_mapped_constants.erase(mapped);
+      if (gd.mv_constants.OnUnmap(resource.handle))
+      {
 #if DEVELOPMENT
-      gd.mv_stats.maps++;
+         gd.mv_stats.maps++;
 #endif
+      }
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs); a partial update is merged into the last
-   // copy. Needs the unsigned "full add-on support" ReShade (the signed build doesn't raise the event).
+   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs). Needs the unsigned "full add-on support"
+   // ReShade (the signed build doesn't raise the event).
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource resource, uint64_t offset, uint64_t size)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
       if (!device_data || !device_data->game || !data || !GetGameDeviceData(*device_data).mv_active)
          return false;
       auto& gd = GetGameDeviceData(*device_data);
-      UINT known_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &known_size))
+      if (!gd.mv_constants.MayBeRegistered(resource.handle))
          return false;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto copy = gd.mv_constants_copies.find(resource.handle);
-      if (copy == gd.mv_constants_copies.end())
-         return false;
-      const UINT buffer_size = GetBufferSize(resource.handle, known_size);
-      if (offset >= buffer_size)
-         return false;
-      const size_t updated_size = size_t((std::min)(size, uint64_t(buffer_size) - offset));
-      const auto* const bytes = static_cast<const uint8_t*>(data);
-      if (updated_size == buffer_size)
+      if (gd.mv_constants.OnUpdate(resource.handle, data, offset, size))
       {
-         copy->second = NewConstantsCopy(gd, bytes, updated_size);
-      }
-      else
-      {
-         const bool merge = copy->second && copy->second->size() == buffer_size;
-         auto updated = NewConstantsCopy(gd, merge ? copy->second->data() : nullptr, buffer_size);
-         std::memcpy(updated->data() + offset, bytes, updated_size);
-         copy->second = std::move(updated);
-      }
 #if DEVELOPMENT
-      gd.mv_stats.updates++;
+         gd.mv_stats.updates++;
 #endif
+      }
       return false;
    }
 
@@ -1095,12 +994,7 @@ class MedalOfHonorAirborne final : public Game
          // The buffer's CPU copy (null until its first upload); the lookup registers it for a copy at every upload
          if (current)
          {
-            const auto [copy, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current.get()));
-            constants = copy->second;
-            if (registered)
-            {
-               AddFilteredBuffer(gd, current.get());
-            }
+            constants = gd.mv_constants.Snapshot(gd.mv_constants.Register(current.get()));
          }
       }
       // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
@@ -2395,7 +2289,12 @@ public:
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
       // vector state are fixed here for the next frame (see "IsSRActive")
       gd.sr_active = LatchSRFrame(device_data);
-      gd.mv_active = IsSRActive(device_data) || g_mv_enable;
+      // The hooks resume: the uploads missed while they paused make every earlier copy stale, the draws are uncopied (zero motion)
+      // until the next
+      if (!gd.mv_active.exchange(IsSRActive(device_data) || g_mv_enable) && gd.mv_active)
+      {
+         gd.mv_constants.Restart();
+      }
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when an
       // upscaler is picked again (the helper takes seconds to start).
       if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
@@ -2419,8 +2318,7 @@ public:
             gd.mv_camera.reset();
             gd.mv_previous_camera.reset();
             const std::lock_guard constants_lock(gd.mv_constants_mutex);
-            gd.mv_constants_pool.clear();
-            gd.mv_constants_pool_free.clear();
+            gd.mv_constants.ReleasePool();
          }
       }
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before its first mesh
@@ -2437,23 +2335,7 @@ public:
          // frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their peak otherwise.
          // Without motion vectors, none.
          const std::lock_guard lock(gd.mv_constants_mutex);
-         size_t kept_free = (gd.mv_active ? std::exchange(gd.mv_constants_made, 0) : 0);
-         std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
-            {
-               if (copy.use_count() != 1)
-                  return false;
-               if (kept_free == 0)
-                  return true;
-               kept_free--;
-               return false; });
-         gd.mv_constants_pool_free.clear();
-         for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
-         {
-            if (gd.mv_constants_pool[i].use_count() == 1)
-            {
-               gd.mv_constants_pool_free.push_back(i);
-            }
-         }
+         gd.mv_constants.TrimPool(gd.mv_active);
       }
       // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
       SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
