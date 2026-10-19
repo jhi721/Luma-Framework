@@ -533,24 +533,12 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
    PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
 
-   // CPU copies of the vc4 buffers the motion vector draws bind, by buffer (an entry registers it, null until its first upload), from
-   // a Map(WRITE_DISCARD) at its Unmap or an UpdateSubresource: a draw's constants are its buffer's latest copy
-   using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
+   // CPU copies of the vc4 buffers the motion vector draws bind (see "PatchedDraws::ObjectConstants"), from a Map(WRITE_DISCARD) at
+   // its Unmap or an UpdateSubresource. Every call but "MayBeRegistered" under "mv_constants_mutex" (present reads them too).
+   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
    std::mutex mv_constants_mutex;
-   std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
-   std::unordered_map<uint64_t, void*> mv_mapped_constants; // Registered buffers mapped now, until their Unmap
-   // "kCpuVc4Filter": the first registered buffers and their sizes, read by the buffer hooks without the lock (written under it, on
-   // the immediate context's thread as the hooks). With more registered, every buffer takes the lock as without the filter.
-   static constexpr uint32_t kMaxFilteredBuffers = 8;
-   std::array<std::atomic<uint64_t>, kMaxFilteredBuffers> mv_filtered_buffers = {};
-   std::array<UINT, kMaxFilteredBuffers> mv_filtered_buffer_sizes = {};
-   std::atomic<uint32_t> mv_filtered_buffer_count = 0;
-   std::atomic<bool> mv_filter_overflow = false;
-   // "kCpuVc4Pool": every pooled copy, and those nobody held anymore at the last present (taken by the next copies). Under
-   // "mv_constants_mutex".
-   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
-   std::vector<uint32_t> mv_constants_pool_free;
-   size_t mv_constants_made = 0; // Copies asked for since the last present
+   PatchedDraws::ObjectConstants mv_constants;
+
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with LocalToWorld and vc4. A draw takes the previous frame's vc4
@@ -574,7 +562,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    {
       uint32_t motion_vector_draws = 0, jitter_draws = 0, reactive_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, maps = 0, updates = 0, other_maps = 0, sr_draws = 0;
       uint32_t offset_bindings = 0;     // vc4 bound at a constant buffer offset (a ring: the per-buffer copies would be wrong)
-      uint32_t constants_pool = 0;      // At present: the pooled copies (see "NewConstantsCopy")
+      uint32_t constants_pool = 0;      // At present: the pooled copies (see "PatchedDraws::ObjectConstants::NewCopy")
       uint32_t tiebreak_collisions = 0; // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
       uint32_t ended_by = 0;
       float near_plane = 0.f, far_plane = 0.f;                                                       // The upscaler's, from the camera's projection (0: none found)
@@ -1066,70 +1054,6 @@ class MassEffect final : public Game
       return GetGameDeviceData(device_data).sr_active;
    }
 
-   // "kCpuVc4Filter": false if the buffer surely isn't a registered vc4 one; "size" its size if known (else 0). Lock free.
-   static bool MayBeRegisteredBuffer(const MassEffectGameDeviceData& gd, uint64_t handle, UINT* size)
-   {
-      *size = 0;
-      if (!IsCpuOptimized(kCpuVc4Filter) || gd.mv_filter_overflow.load(std::memory_order_relaxed))
-         return true;
-      const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_acquire);
-      for (uint32_t i = 0; i < count; i++)
-      {
-         if (gd.mv_filtered_buffers[i].load(std::memory_order_relaxed) == handle)
-         {
-            *size = gd.mv_filtered_buffer_sizes[i];
-            return true;
-         }
-      }
-      return false;
-   }
-
-   // A buffer registered in "mv_constants_copies" joins the filter ("kCpuVc4Filter"). Under "mv_constants_mutex".
-   static void AddFilteredBuffer(MassEffectGameDeviceData& gd, ID3D11Buffer* buffer)
-   {
-      const uint32_t count = gd.mv_filtered_buffer_count.load(std::memory_order_relaxed);
-      if (count >= MassEffectGameDeviceData::kMaxFilteredBuffers)
-      {
-         gd.mv_filter_overflow = true;
-         return;
-      }
-      D3D11_BUFFER_DESC desc;
-      buffer->GetDesc(&desc);
-      gd.mv_filtered_buffer_sizes[count] = desc.ByteWidth;
-      gd.mv_filtered_buffers[count].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_relaxed);
-      gd.mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
-   }
-
-   static UINT GetBufferSize(uint64_t handle, UINT known_size)
-   {
-      if (known_size != 0)
-         return known_size;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(handle)->GetDesc(&desc);
-      return desc.ByteWidth;
-   }
-
-   // A vc4 copy of "size" bytes from "bytes" (null: zeroed): one nobody held anymore at the last present ("kCpuVc4Pool"), else a
-   // new one. Under "mv_constants_mutex".
-   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MassEffectGameDeviceData& gd, const uint8_t* bytes, size_t size)
-   {
-      gd.mv_constants_made++;
-      if (IsCpuOptimized(kCpuVc4Pool) && !gd.mv_constants_pool_free.empty())
-      {
-         auto copy = gd.mv_constants_pool[gd.mv_constants_pool_free.back()];
-         gd.mv_constants_pool_free.pop_back();
-         if (bytes)
-            copy->assign(bytes, bytes + size);
-         else
-            copy->assign(size, 0);
-         return copy;
-      }
-      auto copy = bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size);
-      if (IsCpuOptimized(kCpuVc4Pool))
-         gd.mv_constants_pool.push_back(copy);
-      return copy;
-   }
-
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device,
       reshade::api::resource resource, uint64_t offset,
@@ -1144,16 +1068,13 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      // Lock free ("kCpuVc4Filter"): the hooks see every Map and Unmap of the game
+      if (!gd.mv_constants.MayBeRegistered(resource.handle))
          return;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      if (!gd.mv_constants_copies.contains(resource.handle))
-         return;
-      if (access == reshade::api::map_access::write_discard && offset == 0)
-         gd.mv_mapped_constants[resource.handle] = *data;
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, *data);
 #if DEVELOPMENT
-      else
+      if (registered && !registered->mapped)
          gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
 #endif
    }
@@ -1170,22 +1091,19 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      UINT buffer_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &buffer_size))
+      if (!gd.mv_constants.MayBeRegistered(resource.handle))
          return;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto mapped = gd.mv_mapped_constants.find(resource.handle);
-      if (mapped == gd.mv_mapped_constants.end())
-         return;
-      gd.mv_constants_copies[resource.handle] = NewConstantsCopy(gd, static_cast<const uint8_t*>(mapped->second), GetBufferSize(resource.handle, buffer_size));
-      gd.mv_mapped_constants.erase(mapped);
+      if (gd.mv_constants.OnUnmap(resource.handle))
+      {
 #if DEVELOPMENT
-      gd.mv_stats.maps++;
+         gd.mv_stats.maps++;
 #endif
+      }
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs); a partial update is merged into the
-   // last copy. Needs the unsigned "full add-on support" ReShade (the signed build doesn't raise the event).
+   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs). Needs the unsigned "full add-on support"
+   // ReShade (the signed build doesn't raise the event).
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data,
       reshade::api::resource resource,
       uint64_t offset, uint64_t size)
@@ -1198,33 +1116,15 @@ class MassEffect final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      UINT known_size;
-      if (!MayBeRegisteredBuffer(gd, resource.handle, &known_size))
+      if (!gd.mv_constants.MayBeRegistered(resource.handle))
          return false;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      const auto copy = gd.mv_constants_copies.find(resource.handle);
-      if (copy == gd.mv_constants_copies.end())
-         return false;
-      const UINT buffer_size = GetBufferSize(resource.handle, known_size);
-      if (offset >= buffer_size)
-         return false;
-      const size_t updated_size =
-         size_t((std::min)(size, uint64_t(buffer_size) - offset));
-      const auto* const bytes = static_cast<const uint8_t*>(data);
-      if (updated_size == buffer_size)
+      if (gd.mv_constants.OnUpdate(resource.handle, data, offset, size))
       {
-         copy->second = NewConstantsCopy(gd, bytes, updated_size);
-      }
-      else
-      {
-         const bool merge = copy->second && copy->second->size() == buffer_size;
-         auto updated = NewConstantsCopy(gd, merge ? copy->second->data() : nullptr, buffer_size);
-         std::memcpy(updated->data() + offset, bytes, updated_size);
-         copy->second = std::move(updated);
-      }
 #if DEVELOPMENT
-      gd.mv_stats.updates++;
+         gd.mv_stats.updates++;
 #endif
+      }
       return false;
    }
 
@@ -1593,12 +1493,7 @@ class MassEffect final : public Game
          const std::lock_guard lock(gd.mv_constants_mutex);
          // The buffer's CPU copy (null until its first upload); the lookup registers it for a copy at every upload
          if (current)
-         {
-            const auto [copy, registered] = gd.mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(current.get()));
-            constants = copy->second;
-            if (registered)
-               AddFilteredBuffer(gd, current.get());
-         }
+            constants = gd.mv_constants.Snapshot(gd.mv_constants.Register(current.get()));
       }
       // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
       // None (no CPU copy yet, another camera): the current one (zero motion).
@@ -2884,10 +2779,10 @@ public:
       size_t constants_copies = 0, constants_bytes = 0;
       {
          const std::scoped_lock lock(gd.mv_constants_mutex);
-         for (const auto& [buffer, copy] : gd.mv_constants_copies)
+         for (const auto& [buffer, entry] : gd.mv_constants.entries)
          {
             constants_copies++;
-            constants_bytes += copy ? copy->size() : 0;
+            constants_bytes += entry.latest.size();
          }
       }
       constexpr double MiB = 1024.0 * 1024.0;
@@ -2941,7 +2836,12 @@ public:
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
       // vector state are fixed here for the next frame (see "IsSRActive")
       gd.sr_active = LatchSRFrame(device_data);
-      gd.mv_active = IsSRActive(device_data) || g_mv_enable;
+      // The hooks resume: the uploads missed while they paused make every earlier copy stale, the draws are uncopied (zero motion)
+      // until the next
+      if (!gd.mv_active.exchange(IsSRActive(device_data) || g_mv_enable) && gd.mv_active)
+      {
+         gd.mv_constants.Restart();
+      }
       // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when
       // an upscaler is picked again (the helper takes seconds to start).
       if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
@@ -2975,8 +2875,7 @@ public:
             gd.mv_camera.reset();
             gd.mv_previous_camera.reset();
             const std::lock_guard constants_lock(gd.mv_constants_mutex);
-            gd.mv_constants_pool.clear();
-            gd.mv_constants_pool_free.clear();
+            gd.mv_constants.ReleasePool();
          }
       }
 #if DEVELOPMENT
@@ -3187,23 +3086,12 @@ public:
          // as the last frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their
          // peak otherwise. Without motion vectors, none.
          const std::lock_guard lock(gd.mv_constants_mutex);
-         size_t kept_free = gd.mv_active ? std::exchange(gd.mv_constants_made, 0) : 0;
-         std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
-            {
-               if (copy.use_count() != 1)
-                  return false;
-               if (kept_free == 0)
-                  return true;
-               kept_free--;
-               return false; });
-         gd.mv_constants_pool_free.clear();
-         for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
-         {
-            if (gd.mv_constants_pool[i].use_count() == 1)
-               gd.mv_constants_pool_free.push_back(i);
-         }
+         gd.mv_constants.TrimPool(gd.mv_active);
+         // The CPU savings' development toggles ("kCpuVc4Filter", "kCpuVc4Pool"), for the next frame
+         gd.mv_constants.filter = IsCpuOptimized(kCpuVc4Filter);
+         gd.mv_constants.pooled = IsCpuOptimized(kCpuVc4Pool);
 #if DEVELOPMENT
-         gd.mv_stats.constants_pool = uint32_t(gd.mv_constants_pool.size());
+         gd.mv_stats.constants_pool = uint32_t(gd.mv_constants.pool.size());
 #endif
       }
 #if DEVELOPMENT
@@ -3260,7 +3148,7 @@ public:
 #endif
 
       gd.canvas_res.reset(); // do not hold a reference across frames: it would outlive a resize or a mirror swap
-      gd.srv_scene.reset(); // recaptured every frame; never held across one
+      gd.srv_scene.reset();  // recaptured every frame; never held across one
 
 #if ENABLE_BLOOM
       // Give the memory back on the render thread: core's DrawKarisAverage output (~66 MB at 4K) and DrawBloom's mip chains
