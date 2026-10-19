@@ -3242,8 +3242,9 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Bayonetta\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, DLAA or FSR 3 native anti-aliasing, SMAA (with T2x) and an HDR-aware MSAA with alpha to coverage.\n"
+         "It adds HDR, DLAA or FSR 3 native anti-aliasing, SMAA (with T2x) and an HDR-aware MSAA with alpha to coverage, and replaces the game's bloom with a higher resolution one and its SSAO with XeGTAO, plus higher resolution shadows, even frame pacing and 60 fps cutscenes.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
+         "Enable SSAO in the game's options for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
