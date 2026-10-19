@@ -3674,6 +3674,16 @@ namespace
       return prevent_fullscreen_state;
    }
 
+#if DEVELOPMENT
+   // "Perf::ShaderCreates": registered before "OnCreatePipeline", so the time includes Luma's work on the bytecode
+   thread_local std::chrono::steady_clock::time_point shader_create_start = {};
+   bool OnCreatePipelineStartTimer(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
+   {
+      shader_create_start = std::chrono::steady_clock::now();
+      return false;
+   }
+#endif // DEVELOPMENT
+
 #pragma optimize("t", on) // Temporarily override optimization, this function is too slow in debug otherwise (comment this out if ever needed)
 // Sync providers in INPLACE mode run here, before the shader is compiled: the
 // patch is applied to the shader description so D3D compiles the patched shader
@@ -3922,6 +3932,7 @@ namespace
                   constexpr bool verify_live_patched_shaders = true; // TODO: set false
                   if (verify_live_patched_shaders)
                   {
+                     const auto verify_start = std::chrono::steady_clock::now();
                      ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
                      HRESULT hr = S_OK;
                      if (subobject.type == reshade::api::pipeline_subobject_type::pixel_shader)
@@ -3948,6 +3959,8 @@ namespace
                            device_data.patch_context.SetProcessed(applied_patch->method, uint32_t(shader_luma_hash));
                         }
                      }
+                     // Out of "Perf::ShaderCreates": a development only second create
+                     shader_create_start += std::chrono::steady_clock::now() - verify_start;
                   }
 #endif
 
@@ -4041,6 +4054,12 @@ namespace
             ASSERT_ONCE(subobject_count == 1 || subobject_count == 2); // input layouts have two subobjects (input layout and vertex shader)
 #endif
             ASSERT_ONCE(subobject.count == 1);
+#if DEVELOPMENT
+            if (shader_create_start != std::chrono::steady_clock::time_point{})
+            {
+               Perf::g_shader_creates.AddGame(std::chrono::steady_clock::now() - std::exchange(shader_create_start, {}));
+            }
+#endif // DEVELOPMENT
 #if LUMA_PATCH_PROVIDERS != 0
             if (last_live_patched_shader_hash != -1)
             {
@@ -5964,6 +5983,32 @@ namespace
 
       // Before display composition, so a debug draw copy requested over MCP is read back and cleared before it's drawn
       Mcp::OnPresent(device_data, cmd_list_data, native_device_context, swapchain);
+
+      {
+         auto& creates = Perf::g_shader_creates;
+         const auto now = std::chrono::steady_clock::now();
+         const std::unique_lock lock(creates.mutex);
+         if (creates.game.samples != 0 || creates.luma.samples != 0)
+         {
+            const double frame_ms = std::chrono::duration<double, std::milli>(now - creates.last_present).count();
+            const std::string line = std::format("[Shader creates] frame {}: game {} in {:.2f} ms (max {:.2f}), Luma {} in {:.2f} ms, frame time {:.1f} ms",
+               cb_luma_global_settings.FrameIndex, creates.game.samples, creates.game.total_ms, creates.game.max_ms, creates.luma.samples, creates.luma.total_ms, frame_ms);
+            reshade::log::message(reshade::log::level::info, line.c_str());
+            for (auto [frame, total] : {std::pair{&creates.game, &creates.game_total}, std::pair{&creates.luma, &creates.luma_total}})
+            {
+               total->total_ms += frame->total_ms;
+               total->max_ms = (std::max)(total->max_ms, frame->max_ms);
+               total->samples += frame->samples;
+               *frame = {};
+            }
+            creates.game_count = creates.game_total.samples;
+            creates.game_ms = uint32_t(creates.game_total.total_ms);
+            creates.game_max_us = uint32_t(creates.game_total.max_ms * 1000.0);
+            creates.luma_count = creates.luma_total.samples;
+            creates.luma_ms = uint32_t(creates.luma_total.total_ms);
+         }
+         creates.last_present = now;
+      }
 #endif  // DEVELOPMENT
 
       // If there are no shaders being currently replaced in the game,
@@ -17159,6 +17204,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
+#if DEVELOPMENT
+      reshade::register_event<reshade::addon_event::create_pipeline>(OnCreatePipelineStartTimer);
+#endif // DEVELOPMENT
 #if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
 #endif
@@ -17299,6 +17347,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
+#if DEVELOPMENT
+      reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreatePipelineStartTimer);
+#endif // DEVELOPMENT
 #if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
       reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
 #endif

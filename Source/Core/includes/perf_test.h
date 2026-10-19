@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdint>
 #include <format>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -59,6 +61,39 @@ namespace Perf
          return samples != 0 ? total_ms / samples : 0.0;
       }
    };
+
+   // Shader creations, from any thread: the game's (its "Create*Shader" between ReShade's create and init pipeline events, Luma's work
+   // on the bytecode included) and Luma's patched variants (timed by the game mod). Present logs each frame that created any, with the
+   // frame's CPU time: a driver that compiles asynchronously (NVIDIA) returns from the create early and stalls at the shader's first
+   // draw, which only the frame time shows. The totals are the MCP counters "core.shader_creates_*".
+   struct ShaderCreates
+   {
+      std::shared_mutex mutex;
+      Stat game; // Since the last present
+      Stat luma;
+      Stat game_total;
+      Stat luma_total;
+      std::chrono::steady_clock::time_point last_present = {};
+
+      // Published from the totals at present
+      uint32_t game_count = 0;
+      uint32_t game_ms = 0;
+      uint32_t game_max_us = 0;
+      uint32_t luma_count = 0;
+      uint32_t luma_ms = 0;
+
+      void AddGame(std::chrono::steady_clock::duration duration)
+      {
+         const std::unique_lock lock(mutex);
+         game.Add(std::chrono::duration<double, std::milli>(duration).count());
+      }
+      void AddLuma(std::chrono::steady_clock::duration duration)
+      {
+         const std::unique_lock lock(mutex);
+         luma.Add(std::chrono::duration<double, std::milli>(duration).count());
+      }
+   };
+   inline ShaderCreates g_shader_creates;
 
    // The median of "values" (0 without any); NaN is a window that couldn't measure a column and is left out
    inline double Median(std::vector<double> values)

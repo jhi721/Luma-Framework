@@ -2338,6 +2338,9 @@ namespace Mcp
       RegisterToggles({{"core.hide_ui", &hide_ui}, {"core.force_disable_display_composition", &force_disable_display_composition}, {"core.ignore_upgraded_samplers", &ignore_upgraded_samplers},
          {"core.enable_upgraded_texture_resource_copy_redirection", &enable_upgraded_texture_resource_copy_redirection}});
       RegisterInts({{"core.frame_sleep_ms", &frame_sleep_ms, 0, 100}, {"core.frame_sleep_interval", &frame_sleep_interval, 1, 30}});
+      RegisterCounters({{"core.shader_creates_game", &Perf::g_shader_creates.game_count}, {"core.shader_creates_game_ms", &Perf::g_shader_creates.game_ms},
+         {"core.shader_creates_game_max_us", &Perf::g_shader_creates.game_max_us}, {"core.shader_creates_luma", &Perf::g_shader_creates.luma_count},
+         {"core.shader_creates_luma_ms", &Perf::g_shader_creates.luma_ms}});
 #if ENABLE_FIDELITY_SK && DEVELOPMENT && !defined(NDEBUG) // As "FidelityFX::draw_debug_view"
       RegisterToggles({{"core.fsr_debug_view", &FidelityFX::draw_debug_view}});
 #endif
