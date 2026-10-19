@@ -7232,6 +7232,9 @@ namespace
 
                bool any_changed = false;
                bool any_changed_inline = false;
+#if DEVELOPMENT
+               bool any_rtv_redirected = false; // By this draw: an already mirrored target (bound before) is kept as it is
+#endif
                std::shared_lock lock_device_read(device_data.mutex);
                if (!is_dispatch)
                {
@@ -7271,6 +7274,7 @@ namespace
                               rtvs[slot] = reinterpret_cast<ID3D11RenderTargetView*>(resource_view);
                               any_changed = true;
 #if DEVELOPMENT
+                              any_rtv_redirected = true;
                               if (trace_running)
                               {
                                  // Diagnostic: log when a hash-based (seed) RTV is redirected to a mirror, and at what size.
@@ -7372,8 +7376,9 @@ namespace
 #if DEVELOPMENT
                      // If we upgrade the target textures from the source texture, make sure blending is disabled and that the viewport is fullscreen,
                      // otherwise we might not be writing to the whole screen, and we'd miss the starting color of the background (unless we copied it),
-                     // so it'd make it weird/unnecessary/wrong to upgrade the target.
-                     if (inline_texture_upgrades)
+                     // so it'd make it weird/unnecessary/wrong to upgrade the target. Only when this draw redirects one: a target mirrored before
+                     // already holds the background (e.g. Bayonetta's bloom composite, blended onto the canvas its scene copy mirrored).
+                     if (inline_texture_upgrades && any_rtv_redirected)
                      {
                         com_ptr<ID3D11BlendState> blend_state;
                         native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
