@@ -583,7 +583,7 @@ static bool g_mv_disable_jitter = false; // No projection jitter under the upsca
 static bool g_mv_skip_fill = false;      // No camera fill (the debug view then shows the patched draws alone)
 static bool g_mv_dump = false;           // One shot: the motion vectors, depth and cameras to "Luma_MV_Dump", written at present
 static bool g_mv_probe = false;          // The scene's readers to ReShade.log (see "OnDrawOrDispatch"): reads every draw's bindings
-// A/B of the constant copies' CPU savings (see "MayBeRegisteredBuffer", "NewConstantsCopy", "PatchedShader::read_sizes")
+// A/B of the constant copies' CPU savings (see "PatchedDraws::ObjectConstants", synced at present, and "PatchedShader::read_sizes")
 static bool g_mv_buffer_filter = true;
 static bool g_mv_constants_pool = true;
 static bool g_mv_read_sizes = true;
@@ -843,25 +843,13 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
    PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
 
-   // CPU copies of the b0 / b1 / b3 buffers the motion vector draws bind, by buffer (an entry registers it, null until its first
-   // update): the engine uploads every one with UpdateSubresource (whole buffer, only when a constant changed), so a draw's constants
-   // are its buffer's latest copy
-   using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
+   // CPU copies of the b0 / b1 / b3 buffers the motion vector draws bind (see "PatchedDraws::ObjectConstants"): the engine uploads
+   // every one with UpdateSubresource (whole buffer, only when a constant changed). Every call but "MayBeRegistered" under
+   // "mv_constants_mutex": a destroyed buffer's release can come from another thread.
+   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
    std::shared_mutex mv_constants_mutex;
-   std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
-   // The first registered buffers and their sizes again, for the hook to skip the game's other buffers without the lock and the lookup
-   // (see "MayBeRegisteredBuffer"). Written under "mv_constants_mutex"; with more registered, every buffer takes the lock.
-   static constexpr uint32_t max_filtered_buffers = 32;
-   static constexpr uint64_t destroyed_buffer_slot = 1; // A destroyed buffer's slot, reused by the next registration (never a handle)
-   std::array<std::atomic<uint64_t>, max_filtered_buffers> mv_filtered_buffers = {};
-   std::array<UINT, max_filtered_buffers> mv_filtered_buffer_sizes = {};
-   std::atomic<uint32_t> mv_filtered_buffer_count = 0; // Every registered buffer, past "max_filtered_buffers" too
-   // Every copy made, and by size those nobody held anymore at the last present (the next copies take them, see "NewConstantsCopy").
-   // Every copy is in the pool, so one with a use count of 2 is held by "mv_constants_copies" and the pool alone. Under
-   // "mv_constants_mutex".
-   std::vector<std::shared_ptr<std::vector<uint8_t>>> mv_constants_pool;
-   std::unordered_map<size_t, std::vector<uint32_t>> mv_constants_pool_free;
-   size_t mv_constants_made = 0; // Copies asked for since the last present
+   PatchedDraws::ObjectConstants mv_constants;
+
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // An unmatched draw's b0 with LocalToWorld moved to last frame's PreViewTranslation (see "DrawWithMotionVectors"), kept for its
@@ -905,8 +893,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       uint32_t mirrored = 0;            // Draws of mirrored views (planar reflections), left untouched
       uint32_t view_restarts = 0;       // Scene reopened for a later view (see "IsNewView")
       uint32_t tiebreak_collisions = 0; // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
-      uint32_t registered_buffers = 0;  // At present: the b0 / b1 / b3 buffers with CPU copies (see "MayBeRegisteredBuffer")
-      uint32_t constants_pool = 0;      // At present: the pooled copies (see "NewConstantsCopy")
+      uint32_t registered_buffers = 0;  // At present: the b0 / b1 / b3 buffers with CPU copies (see "mv_constants")
+      uint32_t constants_pool = 0;      // At present: the pooled copies (see "PatchedDraws::ObjectConstants::NewCopy")
       uint32_t fxaa_skipped = 0;        // FXAA dispatches skipped before the replaced resolve (see "fxaa_replaced")
       uint32_t ended_by = 0;
       uint32_t rejected[REJECT_COUNT] = {};                                                          // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
@@ -1126,88 +1114,18 @@ class MassEffectLE final : public Game
       return translation;
    }
 
-   // A b0 / b1 / b3 buffer's CPU copy (null until its first update); registers it for a copy at every update, and for the lock free
-   // filter ("MayBeRegisteredBuffer") with its size. Under "mv_constants_mutex".
+   // A b0 / b1 / b3 buffer's CPU copy (null until its first update); registers it for a copy at every update. Under
+   // "mv_constants_mutex".
    static MassEffectGameDeviceData::ConstantsCopy GetConstantsCopy(MassEffectGameDeviceData* game_device_data, ID3D11Buffer* buffer)
    {
       if (!buffer)
          return nullptr;
-      const auto [entry, registered] = game_device_data->mv_constants_copies.try_emplace(reinterpret_cast<uint64_t>(buffer));
-      if (registered)
-      {
-         // A destroyed buffer's slot, else the next one (the size before the handle, which the hook reads first)
-         const uint32_t count = game_device_data->mv_filtered_buffer_count.load(std::memory_order_relaxed);
-         uint32_t slot = 0;
-         while (slot < (std::min)(count, MassEffectGameDeviceData::max_filtered_buffers) && game_device_data->mv_filtered_buffers[slot].load(std::memory_order_relaxed) != MassEffectGameDeviceData::destroyed_buffer_slot)
-         {
-            slot++;
-         }
-         if (slot < MassEffectGameDeviceData::max_filtered_buffers)
-         {
-            D3D11_BUFFER_DESC desc;
-            buffer->GetDesc(&desc);
-            game_device_data->mv_filtered_buffer_sizes[slot] = desc.ByteWidth;
-            game_device_data->mv_filtered_buffers[slot].store(reinterpret_cast<uint64_t>(buffer), std::memory_order_release);
-         }
-         // Past the list, the count still grows: every buffer then takes the lock
-         if (slot >= count)
-         {
-            game_device_data->mv_filtered_buffer_count.store(count + 1, std::memory_order_release);
-         }
-      }
-      return entry->second;
-   }
-
-   // False if the buffer surely isn't a registered b0 / b1 / b3 one; "size" its size if known (else 0). Lock free: the hook sees every
-   // UpdateSubresource of the game (a few thousand a frame, most into other buffers).
-   static bool MayBeRegisteredBuffer(const MassEffectGameDeviceData& game_device_data, uint64_t handle, UINT* size)
-   {
-      *size = 0;
-      const uint32_t count = game_device_data.mv_filtered_buffer_count.load(std::memory_order_acquire);
-      if (!g_mv_buffer_filter || count > MassEffectGameDeviceData::max_filtered_buffers)
-         return true;
-      for (uint32_t i = 0; i < count; i++)
-      {
-         if (game_device_data.mv_filtered_buffers[i].load(std::memory_order_acquire) == handle)
-         {
-            *size = game_device_data.mv_filtered_buffer_sizes[i];
-            return true;
-         }
-      }
-      return false;
-   }
-
-   // A b0 / b1 / b3 copy of "size" bytes from "bytes" (null: zeroed): one of that size nobody held anymore at the last present, else a
-   // new one. Under "mv_constants_mutex".
-   static std::shared_ptr<std::vector<uint8_t>> NewConstantsCopy(MassEffectGameDeviceData* game_device_data, const uint8_t* bytes, size_t size)
-   {
-      game_device_data->mv_constants_made++;
-      if (g_mv_constants_pool)
-      {
-         if (const auto free_copies = game_device_data->mv_constants_pool_free.find(size); free_copies != game_device_data->mv_constants_pool_free.end() && !free_copies->second.empty())
-         {
-            auto copy = game_device_data->mv_constants_pool[free_copies->second.back()];
-            free_copies->second.pop_back();
-            if (bytes)
-            {
-               std::memcpy(copy->data(), bytes, size);
-            }
-            else
-            {
-               std::fill(copy->begin(), copy->end(), uint8_t(0));
-            }
-            return copy;
-         }
-      }
-      auto copy = (bytes ? std::make_shared<std::vector<uint8_t>>(bytes, bytes + size) : std::make_shared<std::vector<uint8_t>>(size));
-      // Pooled even without "g_mv_constants_pool", which only gates the reuse: the in-place rewrite relies on it (see "mv_constants_pool")
-      game_device_data->mv_constants_pool.push_back(copy);
-      return copy;
+      return game_device_data->mv_constants.Snapshot(game_device_data->mv_constants.Register(buffer));
    }
 
    // Motion vectors: the CPU copy of a registered b0 / b1 / b3 buffer, from the game's UpdateSubresource (before it runs). UE3 uploads
-   // whole buffers (no box: "size" is UINT64_MAX); a partial update is merged into the last copy. Needs the ReShade build with full
-   // add-on support (the signed one raises no event for UpdateSubresource).
+   // whole buffers (no box: "size" is UINT64_MAX). Needs the ReShade build with full add-on support (the signed one raises no event for
+   // UpdateSubresource).
    static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource resource, uint64_t offset, uint64_t size)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
@@ -1219,45 +1137,16 @@ class MassEffectLE final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer timer{&game_device_data.perf_window.hook_ns};
 #endif
-      UINT buffer_size = 0;
-      if (!MayBeRegisteredBuffer(game_device_data, resource.handle, &buffer_size))
+      // Lock free: the hook sees every UpdateSubresource of the game (a few thousand a frame, most into other buffers)
+      if (!game_device_data.mv_constants.MayBeRegistered(resource.handle))
          return false;
       const std::lock_guard lock(game_device_data.mv_constants_mutex);
-      const auto entry = game_device_data.mv_constants_copies.find(resource.handle);
-      if (entry == game_device_data.mv_constants_copies.end())
-         return false;
-      if (buffer_size == 0)
+      if (game_device_data.mv_constants.OnUpdate(resource.handle, data, offset, size))
       {
-         D3D11_BUFFER_DESC desc;
-         reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
-         buffer_size = desc.ByteWidth;
-      }
-      if (offset >= buffer_size)
-         return false;
-      const size_t updated_size = size_t((std::min)(size, uint64_t(buffer_size) - offset));
-      const auto* const bytes = static_cast<const uint8_t*>(data);
-      // The buffer's last copy, rewritten in place when no draw or object holds it (only the map and the pool do, see
-      // "mv_constants_pool"): most of the updates go to buffers no motion vector draw read since. Made non-const ("NewConstantsCopy"), so
-      // writing it is defined.
-      auto& copy = entry->second;
-      if (g_mv_constants_pool && copy && copy.use_count() == 2 && copy->size() == buffer_size)
-      {
-         std::memcpy(const_cast<uint8_t*>(copy->data()) + offset, bytes, updated_size);
-      }
-      else if (updated_size == buffer_size)
-      {
-         copy = NewConstantsCopy(&game_device_data, bytes, updated_size);
-      }
-      else
-      {
-         const bool whole = copy && copy->size() == buffer_size;
-         auto updated = NewConstantsCopy(&game_device_data, whole ? copy->data() : nullptr, buffer_size);
-         std::memcpy(updated->data() + offset, bytes, updated_size);
-         copy = std::move(updated);
-      }
 #if DEVELOPMENT
-      game_device_data.mv_stats.updates++;
+         game_device_data.mv_stats.updates++;
 #endif
+      }
       return false;
    }
 
@@ -1269,21 +1158,11 @@ class MassEffectLE final : public Game
       if (!device_data || !device_data->game)
          return;
       auto& game_device_data = GetGameDeviceData(*device_data);
-      UINT unused_size = 0;
-      if (!MayBeRegisteredBuffer(game_device_data, resource.handle, &unused_size))
+      if (!game_device_data.mv_constants.MayBeRegistered(resource.handle))
          return;
       const std::lock_guard lock(game_device_data.mv_constants_mutex);
-      if (game_device_data.mv_constants_copies.erase(resource.handle) == 0)
+      if (!game_device_data.mv_constants.Unregister(resource.handle))
          return;
-      const uint32_t count = (std::min)(game_device_data.mv_filtered_buffer_count.load(std::memory_order_relaxed), MassEffectGameDeviceData::max_filtered_buffers);
-      for (uint32_t i = 0; i < count; i++)
-      {
-         if (game_device_data.mv_filtered_buffers[i].load(std::memory_order_relaxed) == resource.handle)
-         {
-            game_device_data.mv_filtered_buffers[i].store(MassEffectGameDeviceData::destroyed_buffer_slot, std::memory_order_release);
-            break;
-         }
-      }
 #if DEVELOPMENT
       game_device_data.mv_destroyed_buffers++;
 #endif
@@ -3504,10 +3383,8 @@ public:
          // buffer is uploaded again, not a stale one
          {
             const std::lock_guard lock(gd.mv_constants_mutex);
-            for (auto& [buffer, copy] : gd.mv_constants_copies)
-            {
-               copy.reset();
-            }
+            gd.mv_constants.ReleaseUploads();
+            gd.mv_constants.Restart();
          }
          gd.mv_objects.clear();
          gd.mv_previous_objects.clear();
@@ -3592,33 +3469,13 @@ public:
       // last frame asked for: a burst between two presents (loading screens) would keep its peak otherwise. Without motion vectors, none.
       {
          const std::lock_guard lock(gd.mv_constants_mutex);
-         size_t kept_free = std::exchange(gd.mv_constants_made, 0);
-         if (!gd.mv_active)
-         {
-            kept_free = 0;
-         }
-         std::erase_if(gd.mv_constants_pool, [&](const auto& copy)
-            {
-               if (copy.use_count() != 1)
-                  return false;
-               if (kept_free == 0)
-                  return true;
-               kept_free--;
-               return false; });
-         for (auto& [size, free_copies] : gd.mv_constants_pool_free)
-         {
-            free_copies.clear();
-         }
-         for (uint32_t i = 0; i < uint32_t(gd.mv_constants_pool.size()); i++)
-         {
-            if (gd.mv_constants_pool[i].use_count() == 1)
-            {
-               gd.mv_constants_pool_free[gd.mv_constants_pool[i]->size()].push_back(i);
-            }
-         }
+         gd.mv_constants.TrimPool(gd.mv_active);
+         // The CPU savings' development toggles, for the next frame
+         gd.mv_constants.filter = g_mv_buffer_filter;
+         gd.mv_constants.pooled = g_mv_constants_pool;
 #if DEVELOPMENT
-         gd.mv_stats.registered_buffers = gd.mv_filtered_buffer_count.load(std::memory_order_relaxed);
-         gd.mv_stats.constants_pool = uint32_t(gd.mv_constants_pool.size());
+         gd.mv_stats.registered_buffers = uint32_t(gd.mv_constants.entries.size());
+         gd.mv_stats.constants_pool = uint32_t(gd.mv_constants.pool.size());
 #endif
       }
       // No scene opens to set the upscaler's mip bias (see "OpenScene"): the game's own. Core biases the anisotropic samplers, all of the
