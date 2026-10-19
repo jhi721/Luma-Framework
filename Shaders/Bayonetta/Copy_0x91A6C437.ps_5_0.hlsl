@@ -26,9 +26,37 @@ cbuffer cb4 : register(b4)
 Texture2D<float4> t0 : register(t0);
 SamplerState s0_s : register(s0);
 
+// Cubic B-spline in 4 bilinear taps (Sigg and Hadwiger, "Fast Third-Order Texture Filtering", as Includes/Bloom.hlsl's upsample)
+float4 SampleBSpline(float2 uv)
+{
+   float2 size;
+   t0.GetDimensions(size.x, size.y);
+   const float2 grid = uv * size - 0.5;
+   const float2 index = floor(grid);
+   const float2 f = grid - index;
+   const float2 g = 1.0 - f;
+   const float2 w0 = g * g * g / 6.0;
+   const float2 w1 = 2.0 / 3.0 - 0.5 * f * f * (2.0 - f);
+   const float2 w2 = 2.0 / 3.0 - 0.5 * g * g * (2.0 - g);
+   const float2 w3 = f * f * f / 6.0;
+   const float2 g0 = w0 + w1;
+   const float2 h0 = (index + w1 / g0 - 0.5) / size;
+   const float2 h1 = (index + w3 / (w2 + w3) + 1.5) / size;
+   const float4 t00 = ApplyDgvMask(t0.SampleLevel(s0_s, h0, 0.0), cb3[44], cb3[45]);
+   const float4 t10 = ApplyDgvMask(t0.SampleLevel(s0_s, float2(h1.x, h0.y), 0.0), cb3[44], cb3[45]);
+   const float4 t01 = ApplyDgvMask(t0.SampleLevel(s0_s, float2(h0.x, h1.y), 0.0), cb3[44], cb3[45]);
+   const float4 t11 = ApplyDgvMask(t0.SampleLevel(s0_s, h1, 0.0), cb3[44], cb3[45]);
+   return lerp(lerp(t11, t01, g0.x), lerp(t10, t00, g0.x), g0.y);
+}
+
 void main(DGV_MAIN_SIGNATURE)
 {
    o0 = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]) * cb4[192];
+   // The bloom composite from Luma Bloom's texture (main.cpp, CustomData2 1): a B-spline magnification, not the bilinear's creases
+   [branch] if (LumaData.CustomData1 >= 2 && LumaData.CustomData2 == 1)
+   {
+      o0 = SampleBSpline(v5.xy) * cb4[192];
+   }
    // Additive blends read the source alpha: the 8-bit targets clamped it
    o0.a = saturate(o0.a);
    // The bloom composite: "Bloom Intensity" through its blend's source alpha, at most 1 when the blend lerps (3)

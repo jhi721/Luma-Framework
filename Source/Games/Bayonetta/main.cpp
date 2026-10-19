@@ -51,6 +51,11 @@ const ShaderHashesList shader_hashes_PixelKernels = {.pixel_shaders = {0x0788DCA
                                                         0x29CE44D6, 0x40AF18CC, 0xC32759B1}};
 // The Sofdec movies' Y'CbCr -> R'G'B', drawn on the canvas after the scene (Video_0xC60649FD)
 const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0xC60649FD, 0xED0DA20F}};
+// The bloom chain (_tools/bayonetta/NOTES.md "Bloom"), all into the fixed size 320x176 bloom target: filter05 (the scene into level 0,
+// then each level's threshold and halving into the next), filter02 / filter01 (each level's V / H blur), then copytex (the levels added
+// into level 0, and the composite onto the scene)
+const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x8B6A8D61, 0x29FE50C2}};
+const ShaderHashesList shader_hashes_BloomBlur = {.pixel_shaders = {0x91CC01D3, 0xA5207DF1, 0xCE62BA4B, 0x4B605EEB}};
 // The scene's first post pass, which ends a motion vector frame (the fill and the upscaler run right before it): OtPost's motion blur
 // (87A169B9) and its cm* passes, BlurSrcWeight (651AC335) and BlurWeight (45BE027E), the DoF filter08 passes, then the grade. The frame
 // before them: prepass + opaque, SSAO, the scene copy, ~400 blended particle draws (resolves with MSAA only). Pairs: modelshaderblur,
@@ -90,8 +95,14 @@ static bool g_smaa_pred_debug = false; // The predication mask instead of the an
 // The pixel sized kernels at their 1280x720 size on screen ("shader_hashes_PixelKernels"); off: the PC version's, smaller as the
 // resolution rises
 static bool g_resolution_scaled_effects = true;
-static bool g_fix_frame_pacing = true; // The game's frame limiters replaced (see "FrameLimiter")
-static bool g_60_fps_cutscenes = true; // The loop's 30 fps bit kept clear (see "FrameLimiter::Apply60FpsCutscenes")
+static bool g_fix_frame_pacing = true;  // The game's frame limiters replaced (see "FrameLimiter")
+static bool g_60_fps_cutscenes = true;  // The loop's 30 fps bit kept clear (see "FrameLimiter::Apply60FpsCutscenes")
+static bool g_luma_bloom_enable = true; // The game's bloom chain drawn at a higher resolution (see "DrawBloomPass")
+#if DEVELOPMENT
+static int g_bloom_scale_override = 0; // Luma Bloom's scale, 0 = from the resolution
+#else
+constexpr int g_bloom_scale_override = 0;
+#endif
 // The target size the pixel kernel passes read instead of c194, not used by dgVoodoo (b3, b4) nor Luma (b12, b13)
 static constexpr UINT TARGET_SIZE_CB_SLOT = 10;
 static bool g_gtao_enable = true; // XeGTAO replaces the game's SSAO (see "RunXeGTAO")
@@ -377,6 +388,23 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    // The canvas right after ResetRender, before the UI: the present blit clamps what the UI added (Present_0x880A17D3)
    ComPtr<ID3D11Texture2D> scene_texture;
    ComPtr<ID3D11ShaderResourceView> scene_srv;
+   // The game's 320x176 bloom target (the chain's first filter05 draws into it from the scene), identity only
+   uint64_t bloom_target = 0;
+   // Luma Bloom ("DrawBloomPass"): the target's chain at "bloom_scale" times its size. Each pass draws into the target's top left
+   // (the level's size) and dgVoodoo then copies that region into a texture of the region's size, which the next passes sample (the
+   // levels' last ones are what the composite adds up): "bloom_shadows" are those, by the game's texture, at the same scale
+   // ("MirrorBloomCopy").
+   struct BloomShadow
+   {
+      uint64_t game_texture = 0;
+      ComPtr<ID3D11Texture2D> texture;
+      ComPtr<ID3D11ShaderResourceView> srv;
+   };
+   uint32_t bloom_scale = 0;
+   ComPtr<ID3D11Texture2D> bloom_texture;
+   ComPtr<ID3D11RenderTargetView> bloom_rtv;
+   ComPtr<ID3D11ShaderResourceView> bloom_srv;
+   std::vector<BloomShadow> bloom_shadows;
    // The depth prepass as this frame's SSAO pass read it (null without SSAO): the SMAA predication source
    ComPtr<ID3D11ShaderResourceView> depth_srv;
    // What "shader_hashes_PixelKernels" read in place of c194 (see "BindPixelKernelTargetSize"), and its value
@@ -2148,6 +2176,8 @@ public:
       set.template operator()<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       set.template operator()<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       set.template operator()<reshade::addon_event::create_resource>(OnCreateResource);
+      set.template operator()<reshade::addon_event::copy_resource>(OnCopyResource);
+      set.template operator()<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
       // The vc4 copies' events stay registered too: ReShade changes its callback lists without a lock, and dgVoodoo presents from
       // another thread than the frame's (registering them at present would race the frame's events). They return at once while
       // "mv_active" is off.
@@ -2199,6 +2229,7 @@ public:
       Mcp::RegisterToggles({
          {"fix_frame_pacing", &g_fix_frame_pacing},
          {"60_fps_cutscenes", &g_60_fps_cutscenes},
+         {"luma_bloom_enable", &g_luma_bloom_enable},
          {"hide_ui", &g_hide_ui},
          {"msaa_resolve_enable", &g_msaa_resolve_enable},
          {"msaa_coverage_enable", &g_msaa_coverage_enable},
@@ -2220,6 +2251,8 @@ public:
       Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 0.01f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips), MCP_GAME_TEXTURE("gtao.output", gtao_output)});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("bloom.target", bloom_texture)});
+      Mcp::RegisterInts({{"bloom_scale_override", &g_bloom_scale_override, 0, 4}});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv), MCP_GAME_TEXTURE("canvas.scene", scene_srv), MCP_GAME_TEXTURE("depth_prepass", depth_srv),
          MCP_GAME_TEXTURE("mv.velocity", mv_texture), MCP_GAME_TEXTURE("mv.depth", mv_device_depth), MCP_GAME_TEXTURE("mv.prepass", prepass_depth_srv),
          MCP_GAME_TEXTURE("sr.reactive", mv_reactive), MCP_GAME_TEXTURE("sr.transparency", mv_transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv_reactive_target)});
@@ -2470,6 +2503,158 @@ public:
       native_device_context->CopyResource(gd.gtao_camera_buffer.get(), constants.get());
       gd.gtao_camera_rows = rows;
       gd.gtao_camera_taken = true;
+   }
+
+   // dgVoodoo's copy of the bloom target's region a chain pass just wrote into the texture the next passes sample, repeated from
+   // "bloom_texture" into that texture's "bloom_shadows" entry (made at the same scale on its first copy)
+   static void MirrorBloomCopy(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, const reshade::api::subresource_box* source_box, const reshade::api::subresource_box* dest_box)
+   {
+      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
+      if (!g_luma_bloom_enable || !device_data || !device_data->game)
+         return;
+      auto& gd = GetGameDeviceData(*device_data);
+      if (source.handle != gd.bloom_target || !gd.bloom_texture)
+         return;
+      auto* const dest_texture = reinterpret_cast<ID3D11Texture2D*>(dest.handle);
+      D3D11_TEXTURE2D_DESC dest_desc;
+      dest_texture->GetDesc(&dest_desc);
+      const uint32_t scale = gd.bloom_scale;
+      auto shadow = std::ranges::find(gd.bloom_shadows, dest.handle, &BayonettaGameDeviceData::BloomShadow::game_texture);
+      if (shadow == gd.bloom_shadows.end())
+      {
+         D3D11_TEXTURE2D_DESC desc;
+         gd.bloom_texture->GetDesc(&desc);
+         desc.Width = dest_desc.Width * scale;
+         desc.Height = dest_desc.Height * scale;
+         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+         BayonettaGameDeviceData::BloomShadow created{.game_texture = dest.handle};
+         ComPtr<ID3D11Device> native_device;
+         gd.bloom_texture->GetDevice(native_device.put());
+         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, created.texture.put())) || FAILED(native_device->CreateShaderResourceView(created.texture.get(), nullptr, created.srv.put())))
+            return;
+         shadow = gd.bloom_shadows.insert(gd.bloom_shadows.end(), std::move(created));
+      }
+      const uint32_t width = source_box ? (source_box->right - source_box->left) : dest_desc.Width;
+      const uint32_t height = source_box ? (source_box->bottom - source_box->top) : dest_desc.Height;
+      const uint32_t left = source_box ? source_box->left : 0;
+      const uint32_t top = source_box ? source_box->top : 0;
+      const D3D11_BOX box = {.left = left * scale, .top = top * scale, .front = 0, .right = (left + width) * scale, .bottom = (top + height) * scale, .back = 1};
+      auto* const native_device_context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+      native_device_context->CopySubresourceRegion(shadow->texture.get(), 0, dest_box ? dest_box->left * scale : 0, dest_box ? dest_box->top * scale : 0, 0, gd.bloom_texture.get(), 0, &box);
+   }
+
+   static bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   {
+      MirrorBloomCopy(cmd_list, source, dest, nullptr, nullptr);
+      return false;
+   }
+
+   static bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter)
+   {
+      MirrorBloomCopy(cmd_list, source, dest, source_box, dest_box);
+      return false;
+   }
+
+   // A bloom chain draw (filter05, the blurs, a level copy). Records the bloom target at the chain's first draw (the scene into it);
+   // with Luma Bloom, draws into "bloom_texture" instead: the bloom target's size times the scene's height / 720 (level 0 a quarter
+   // of the screen, as at the 1280x720 the game was made for), the viewport scaled alike, sampling the scene or a "bloom_shadows"
+   // texture, the game's shaders and constants unchanged (their taps are UV fractions: the same footprint, sampled finer). False, for
+   // the game's draw, on anything else.
+   static bool DrawBloomPass(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, bool is_bloom_source, const std::function<void()>& draw, bool* updated_cbuffers)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      // The copies (the game's most drawn pass: particles too) only matter into a known bloom target
+      if (!is_bloom_source && (!g_luma_bloom_enable || gd.bloom_target == 0))
+         return false;
+      ComPtr<ID3D11RenderTargetView> rtv;
+      native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
+      ComPtr<ID3D11ShaderResourceView> source_srv;
+      native_device_context->PSGetShaderResources(0, 1, source_srv.put());
+      if (!rtv || !source_srv)
+         return false;
+      ComPtr<ID3D11Resource> target;
+      rtv->GetResource(target.put());
+      const uint2 target_size = GetViewTextureSize(rtv.get());
+      const uint2 source_size = GetViewTextureSize(source_srv.get());
+      const bool from_scene = is_bloom_source && source_size.y > target_size.y;
+      if (from_scene)
+      {
+         gd.bloom_target = uint64_t(target.get());
+      }
+      if (!g_luma_bloom_enable || uint64_t(target.get()) != gd.bloom_target)
+         return false;
+
+      if (from_scene)
+      {
+         const uint32_t scale = (g_bloom_scale_override > 0) ? uint32_t(g_bloom_scale_override) : (std::max)(1u, uint32_t(std::lround(source_size.y / 720.0)));
+         if (scale != gd.bloom_scale || !gd.bloom_rtv || GetViewTextureSize(gd.bloom_rtv.get()) != uint2{target_size.x * scale, target_size.y * scale})
+         {
+            gd.bloom_rtv.reset();
+            gd.bloom_srv.reset();
+            gd.bloom_texture.reset();
+            gd.bloom_shadows.clear();
+            // 16 bit UNORM: the 8 bit target's [0, 1] range (the chain relies on its clamp) without its banding at the finer size
+            const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R16G16B16A16_UNORM, target_size.x * scale, target_size.y * scale, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+            const bool created = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, gd.bloom_texture.put())) && SUCCEEDED(native_device->CreateRenderTargetView(gd.bloom_texture.get(), nullptr, gd.bloom_rtv.put())) &&
+                                 SUCCEEDED(native_device->CreateShaderResourceView(gd.bloom_texture.get(), nullptr, gd.bloom_srv.put()));
+            if (!created)
+            {
+               gd.bloom_rtv.reset();
+            }
+            gd.bloom_scale = scale;
+         }
+      }
+      if (!gd.bloom_rtv)
+         return false;
+      ID3D11ShaderResourceView* source = source_srv.get();
+      if (!from_scene)
+      {
+         ComPtr<ID3D11Resource> game_source;
+         source_srv->GetResource(game_source.put());
+         const auto shadow = std::ranges::find(gd.bloom_shadows, uint64_t(game_source.get()), &BayonettaGameDeviceData::BloomShadow::game_texture);
+         // Not copied yet (Luma Bloom just turned on): the game's pass, this frame
+         if (shadow == gd.bloom_shadows.end())
+            return false;
+         source = shadow->srv.get();
+      }
+
+      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+      graphics_state.Cache(native_device_context, device_data.uav_max_count);
+      D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+      UINT viewport_count = std::size(viewports);
+      native_device_context->RSGetViewports(&viewport_count, viewports);
+      // The origin isn't scaled past a quarter texel right of the game's (dgVoodoo's 0.5, D3D9's pixel center): the game's quads
+      // start just inside the target's first texel, so scaled exactly they leave the first Luma texels unwritten, black for the
+      // blurs' clamped taps (a dark top and left edge). Measured at k 1 to 3 against the game's bloom: no shift, edges matched.
+      for (UINT i = 0; i < viewport_count; i++)
+      {
+         viewports[i].TopLeftX = (std::min)(viewports[i].TopLeftX * gd.bloom_scale, viewports[i].TopLeftX + 0.25f);
+         viewports[i].TopLeftY = (std::min)(viewports[i].TopLeftY * gd.bloom_scale, viewports[i].TopLeftY + 0.25f);
+         viewports[i].Width *= gd.bloom_scale;
+         viewports[i].Height *= gd.bloom_scale;
+      }
+      native_device_context->RSSetViewports(viewport_count, viewports);
+      D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+      UINT scissor_count = std::size(scissors);
+      native_device_context->RSGetScissorRects(&scissor_count, scissors);
+      for (UINT i = 0; i < scissor_count; i++)
+      {
+         scissors[i].left *= gd.bloom_scale;
+         scissors[i].top *= gd.bloom_scale;
+         scissors[i].right *= gd.bloom_scale;
+         scissors[i].bottom *= gd.bloom_scale;
+      }
+      native_device_context->RSSetScissorRects(scissor_count, scissors);
+      ID3D11RenderTargetView* const bloom_rtv = gd.bloom_rtv.get();
+      native_device_context->OMSetRenderTargets(1, &bloom_rtv, nullptr);
+      native_device_context->PSSetShaderResources(0, 1, &source);
+      // filter05 (BloomSource_0x8B6A8D61) averages the whole footprint of each texel
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, is_bloom_source ? 1 : 0);
+      *updated_cbuffers = true;
+      draw();
+      graphics_state.Restore(native_device_context);
+      return true;
    }
 
    // XeGTAO in place of the game's SSAO, from the SSAO draw's inputs (t1 the prepass' view space normals, t2 its "1 - z/w") and the
@@ -2834,6 +3019,11 @@ public:
          PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
       }
 
+      const bool is_bloom_source = original_shader_hashes.Contains(shader_hashes_BloomSource);
+      if (is_immediate && (is_bloom_source || original_shader_hashes.Contains(shader_hashes_BloomBlur) || original_shader_hashes.Contains(shader_hashes_Copy)) &&
+          DrawBloomPass(native_device, native_device_context, cmd_list_data, device_data, stages, is_bloom_source, *original_draw_dispatch_func, &updated_cbuffers))
+         return DrawOrDispatchOverrideType::Replaced;
+
       if (original_shader_hashes.Contains(shader_hashes_Grade))
       {
          device_data.has_drawn_main_post_processing = true;
@@ -2868,10 +3058,21 @@ public:
       else if (is_custom_pass && (original_shader_hashes.Contains(shader_hashes_Copy) || original_shader_hashes.Contains(shader_hashes_Video)))
       {
          const bool is_video = original_shader_hashes.Contains(shader_hashes_Video);
-         // The bloom composite (FUN_0044bc90): the fixed size 320x176 bloom target blended onto the scene, its mode 1
-         // SRCALPHA/INVSRCALPHA or 2 SRCALPHA/ONE (mode 0, opaque, is its copies between levels). The shader scales the source
-         // alpha by "Bloom Intensity": LumaData.CustomData1 2 when it adds, 3 when it lerps.
-         if (!is_video)
+         // The bloom composite (FUN_0044bc90): the bloom target blended onto the scene, its mode 1 SRCALPHA/INVSRCALPHA or 2
+         // SRCALPHA/ONE (mode 0, opaque, is its copies between levels). The shader scales the source alpha by "Bloom Intensity"
+         // (LumaData.CustomData1 2 when it adds, 3 when it lerps); with Luma Bloom it reads "bloom_texture" (CustomData2 1: a B-spline
+         // magnification).
+         ComPtr<ID3D11ShaderResourceView> source_srv;
+         if (!is_video && game_device_data.bloom_target != 0)
+         {
+            native_device_context->PSGetShaderResources(0, 1, source_srv.put());
+         }
+         ComPtr<ID3D11Resource> source;
+         if (source_srv)
+         {
+            source_srv->GetResource(source.put());
+         }
+         if (source && uint64_t(source.get()) == game_device_data.bloom_target)
          {
             ComPtr<ID3D11BlendState> blend_state;
             native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
@@ -2881,19 +3082,19 @@ public:
                blend_state->GetDesc(&blend_desc);
             }
             const D3D11_RENDER_TARGET_BLEND_DESC& blend = blend_desc.RenderTarget[0];
-            const bool blends_source_alpha = blend.BlendEnable && blend.SrcBlend == D3D11_BLEND_SRC_ALPHA && (blend.DestBlend == D3D11_BLEND_ONE || blend.DestBlend == D3D11_BLEND_INV_SRC_ALPHA);
-            ComPtr<ID3D11ShaderResourceView> source_srv;
-            if (blends_source_alpha)
+            if (blend.BlendEnable && blend.SrcBlend == D3D11_BLEND_SRC_ALPHA && (blend.DestBlend == D3D11_BLEND_ONE || blend.DestBlend == D3D11_BLEND_INV_SRC_ALPHA))
             {
-               native_device_context->PSGetShaderResources(0, 1, source_srv.put());
-            }
-            const uint2 source_size = (source_srv ? GetViewTextureSize(source_srv.get()) : uint2{});
-            if (source_size.x == 320 && source_size.y == 176)
-            {
+               ID3D11ShaderResourceView* const luma_bloom_srv = (g_luma_bloom_enable ? game_device_data.bloom_srv.get() : nullptr);
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, (blend.DestBlend == D3D11_BLEND_ONE ? 2 : 3));
+               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, (blend.DestBlend == D3D11_BLEND_ONE ? 2 : 3), luma_bloom_srv ? 1 : 0);
                updated_cbuffers = true;
-               return DrawOrDispatchOverrideType::None;
+               if (!luma_bloom_srv)
+                  return DrawOrDispatchOverrideType::None;
+               native_device_context->PSSetShaderResources(0, 1, &luma_bloom_srv);
+               (*original_draw_dispatch_func)();
+               ID3D11ShaderResourceView* const game_srv = source_srv.get();
+               native_device_context->PSSetShaderResources(0, 1, &game_srv);
+               return DrawOrDispatchOverrideType::Replaced;
             }
          }
          // ResetRender is the frame's first opaque copy into the canvas (the bloom composite also copies, additively, into the scene)
@@ -3138,6 +3339,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "FixHighResolutionEffects", g_resolution_scaled_effects);
       reshade::get_config_value(nullptr, NAME, "FixFramePacing", g_fix_frame_pacing);
       reshade::get_config_value(nullptr, NAME, "60FPSCutscenes", g_60_fps_cutscenes);
+      reshade::get_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
@@ -3196,6 +3398,7 @@ public:
       DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       ImGui::SeparatorText("Bloom");
+      DrawSettingCheckbox("Luma Bloom Enable", "LumaBloomEnable", &g_luma_bloom_enable, true, "Draws the game's bloom at a higher resolution: the same look, without its blocky, flickering glow.");
       // Read in Copy_0x91A6C437.ps_5_0.hlsl on the bloom composite
       DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
