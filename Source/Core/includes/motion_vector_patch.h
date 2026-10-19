@@ -447,6 +447,7 @@ namespace MotionVectorPatch
       SignatureElement output = shader.target;
       output.semantic_index = layout.target_slot;
       output.reg = layout.target_slot;
+      output.component_type = D3D_REGISTER_COMPONENT_FLOAT32; // Whatever the game's target holds
       output.mask = 0x3;
       output.rw_mask = 0;
       shader.outputs.insert(std::ranges::find_if(shader.outputs.rbegin(), shader.outputs.rend(), IsTarget).base(), output);
@@ -484,6 +485,10 @@ namespace MotionVectorPatch
       const bool mask = !motion_vectors && reactive_slot != UINT32_MAX;
       if (outputs.size() != 1 || (!mask && !motion_vectors))
          return (*error = "targets", std::vector<uint8_t>());
+      // The color is copied whole and its alpha read: a float4 target only (not e.g. dgVoodoo's own R32_UINT .x outputs, where the
+      // NVIDIA driver's compiler crashed on the result and removed the device)
+      if (target.component_type != D3D_REGISTER_COMPONENT_FLOAT32 || target.mask != 0xF)
+         return (*error = "target type", std::vector<uint8_t>());
       const size_t last_output = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_OUTPUT});
       if (last_output == first_body)
          return (*error = "no outputs", std::vector<uint8_t>());
