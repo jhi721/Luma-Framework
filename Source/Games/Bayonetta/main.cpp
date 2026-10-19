@@ -1934,8 +1934,8 @@ class Bayonetta final : public Game
    }
 
 public:
-   // The motion vector target in every blend state, the tracked bindings (always current, so the first motion vector frame finds
-   // them), the MSAA targets' shader resource bind and the vc4 copies
+   // The motion vector target in every blend state (and dgVoodoo's impossible per-target blends repaired, as TW2), the tracked
+   // bindings (always current, so the first motion vector frame finds them), the MSAA targets' shader resource bind and the vc4 copies
    static void SetEvents(bool enable)
    {
       const auto set = [enable]<reshade::addon_event event>(typename reshade::addon_event_traits<event>::decl callback)
@@ -1949,7 +1949,7 @@ public:
             reshade::unregister_event<event>(callback);
          }
       };
-      set.template operator()<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, false, true>);
+      set.template operator()<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true, true>);
       set.template operator()<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
       set.template operator()<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
       set.template operator()<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
