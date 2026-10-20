@@ -869,6 +869,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
+   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
+   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
    // The frame's world camera (b1 of its first motion vector draw with a perspective) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -1699,6 +1701,8 @@ class MassEffectLE final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
          // two frames go
          game_device_data.mv_previous_objects.swap(game_device_data.mv_objects);
+         game_device_data.mv_previous_exact_objects.entries.swap(game_device_data.mv_exact_objects.entries);
+         game_device_data.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
          game_device_data.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
             { return PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones); });
@@ -1712,7 +1716,9 @@ class MassEffectLE final : public Game
          if (!previous_valid)
          {
             game_device_data.mv_previous_objects.clear();
+            game_device_data.mv_previous_exact_objects.entries.clear();
          }
+         game_device_data.mv_previous_exact_objects.Seal();
       }
 
       // The game's b0 / b1 / b3. The slots added past them stay bound after the draw: no game vertex shader reads a constant buffer
@@ -1792,11 +1798,11 @@ class MassEffectLE final : public Game
             }
          }
 
-         // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
+         // The same object at the same transform by the exact index, else a linear search among the key's candidates
          const MassEffectGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
          {
-            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+            match = PatchedDraws::FindNearest(previous->second, game_device_data.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
                { return copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones); });
          }
          const bool world_camera = camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0);
@@ -1863,7 +1869,9 @@ class MassEffectLE final : public Game
             uploads[1] = &camera_previous_view;
          }
          // Kept as drawn for the next frame
-         game_device_data.mv_objects[key].push_back({.transform = transform, .object = std::move(object), .camera = std::move(camera), .bones = std::move(bones)});
+         auto& drawn_objects = game_device_data.mv_objects[key];
+         game_device_data.mv_exact_objects.Add(key, transform, drawn_objects.size());
+         drawn_objects.push_back({.transform = transform, .object = std::move(object), .camera = std::move(camera), .bones = std::move(bones)});
       }
 #if DEVELOPMENT
       else
@@ -3242,6 +3250,7 @@ public:
                   {
                      entry.second.clear();
                   }
+                  gd.mv_exact_objects.entries.clear();
                }
 #if DEVELOPMENT
                gd.mv_stats.view_restarts++;
@@ -3388,6 +3397,8 @@ public:
          }
          gd.mv_objects.clear();
          gd.mv_previous_objects.clear();
+         gd.mv_exact_objects = {};
+         gd.mv_previous_exact_objects = {};
          gd.mv_camera.reset();
          gd.mv_previous_camera.reset();
          gd.view_camera.reset();

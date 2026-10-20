@@ -346,6 +346,8 @@ struct MedalOfHonorAirborneGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
+   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
+   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
    // The frame's camera view projection (row vectors, from its first motion vector draw that has one, see "FindMatrices") and
    // the previous frame's
    using Matrix = std::array<float, 16>;
@@ -968,6 +970,8 @@ class MedalOfHonorAirborne final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the
          // last two frames go
          gd.mv_previous_objects.swap(gd.mv_objects);
+         gd.mv_previous_exact_objects.entries.swap(gd.mv_exact_objects.entries);
+         gd.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
          gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_previous_objects, [](const auto& a, const auto& b)
             { return PatchedDraws::SameBytes(a.constants, b.constants); });
@@ -981,7 +985,9 @@ class MedalOfHonorAirborne final : public Game
          if (!previous_valid)
          {
             gd.mv_previous_objects.clear();
+            gd.mv_previous_exact_objects.entries.clear();
          }
+         gd.mv_previous_exact_objects.Seal();
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
@@ -1039,12 +1045,11 @@ class MedalOfHonorAirborne final : public Game
             transform = PatchedDraws::ReadRowVectorTransform(constants->data() + matrices.world);
          }
 
-         // A linear search among the key's candidates: a handful at most here (a spatial lookup would pay off only for big crowds
-         // sharing one mesh)
+         // The same object at the same transform by the exact index, else a linear search among the key's candidates
          const MedalOfHonorAirborneGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end())
          {
-            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+            match = PatchedDraws::FindNearest(previous->second, gd.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == constants->size(); });
          }
          if (match)
@@ -1076,7 +1081,9 @@ class MedalOfHonorAirborne final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         gd.mv_objects[key].push_back({.transform = transform, .constants = constants});
+         auto& drawn_objects = gd.mv_objects[key];
+         gd.mv_exact_objects.Add(key, transform, drawn_objects.size());
+         drawn_objects.push_back({.transform = transform, .constants = constants});
       }
 #if DEVELOPMENT
       else
@@ -2315,6 +2322,8 @@ public:
             gd.mv_scene_copy_rtv.reset();
             gd.mv_objects.clear();
             gd.mv_previous_objects.clear();
+            gd.mv_exact_objects = {};
+            gd.mv_previous_exact_objects = {};
             gd.mv_camera.reset();
             gd.mv_previous_camera.reset();
             const std::lock_guard constants_lock(gd.mv_constants_mutex);

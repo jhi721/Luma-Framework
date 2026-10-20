@@ -531,6 +531,8 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_previous_objects;
+   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
+   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
    // The frame's camera (vc4 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -563,6 +565,9 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       uint32_t bound_state_mismatches = 0;  // "g_bound_state_check": tracked states that weren't the bound ones
       uint32_t constants_pool = 0;          // At present: the pooled copies (see "PatchedDraws::ObjectConstants")
       uint32_t tiebreak_collisions = 0;     // The previous frame's, see "PatchedDraws::CountTieBreakCollisions"
+      uint32_t nearest_scans = 0;           // Draws whose match wasn't in the exact index ("FindNearest" scanned their key's list)
+      uint32_t nearest_scanned = 0;         // The candidates those scans went through
+      uint32_t nearest_largest = 0;         // The longest list scanned
       uint32_t ended_by = 0;
       float near_plane = 0.f, far_plane = 0.f;                   // The upscaler's, from the camera's projection (0: none found)
       uint32_t rejected[size_t(MotionVectorReject::COUNT)] = {}; // "DrawWithMotionVectors" refusals by reason ("MV_REJECT")
@@ -1384,6 +1389,8 @@ class TheWitcher2Game final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of
          // the last two frames go
          gd.mv_previous_objects.swap(gd.mv_objects);
+         gd.mv_previous_exact_objects.entries.swap(gd.mv_exact_objects.entries);
+         gd.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
          // Objects without a transform (world space vertices) match by their draw key alone: any twin has the same vertices
          gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_previous_objects, [](const auto& a, const auto& b)
@@ -1398,7 +1405,9 @@ class TheWitcher2Game final : public Game
          if (!previous_valid)
          {
             gd.mv_previous_objects.clear();
+            gd.mv_previous_exact_objects.entries.clear();
          }
+         gd.mv_previous_exact_objects.Seal();
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
@@ -1457,7 +1466,7 @@ class TheWitcher2Game final : public Game
             std::memcpy(transform.data(), object_constants->data() + transform_offset, sizeof(transform));
          }
 
-         // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
+         // The same object at the same transform by the exact index, else a linear search among the key's candidates
          const TheWitcher2GameDeviceData::MotionVectorObject* match = nullptr;
          const auto previous = gd.mv_previous_objects.find(key);
          // Without a tie-break transform (a vertex shader reading neither LocalToWorld nor bones at the rows the tie-break knows) the
@@ -1479,9 +1488,17 @@ class TheWitcher2Game final : public Game
 #endif
          if (previous != gd.mv_previous_objects.end() && !(untransformed && g_mv_untransformed_static))
          {
-            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+            match = PatchedDraws::FindNearest(previous->second, gd.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == object_constants->size(); });
             const float nearest = (match ? PatchedDraws::TransformDistance(match->transform, transform) : FLT_MAX);
+#if DEVELOPMENT
+            if (nearest != 0.f)
+            {
+               gd.mv_stats.nearest_scans++;
+               gd.mv_stats.nearest_scanned += uint32_t(previous->second.size());
+               gd.mv_stats.nearest_largest = (std::max)(gd.mv_stats.nearest_largest, uint32_t(previous->second.size()));
+            }
+#endif
             // Terrain doesn't move: a chunk not drawn last frame (the chunk set changes even with a still camera) would take its
             // nearest neighbor's position and heightmap window, all its ground moving by hundreds of pixels
             if (match && nearest != 0.f && gd.mv_last_vertex.transform_offset == TERRAIN_CHUNK_ROW * 16)
@@ -1552,7 +1569,9 @@ class TheWitcher2Game final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         gd.mv_objects[key].push_back({transform, std::move(object_constants)});
+         auto& drawn_objects = gd.mv_objects[key];
+         gd.mv_exact_objects.Add(key, transform, drawn_objects.size());
+         drawn_objects.push_back({transform, std::move(object_constants)});
       }
 #if DEVELOPMENT
       else
@@ -2672,7 +2691,7 @@ public:
       Mcp::RegisterCounters({{"mv.draws", &stats.motion_vector_draws}, {"mv.jitter_draws", &stats.jitter_draws}, {"mv.reactive_draws", &stats.reactive_draws}, {"mv.matched", &stats.matched},
                                {"mv.camera_only", &stats.camera_only}, {"mv.untransformed_ambiguous", &stats.untransformed_ambiguous}, {"mv.terrain_inexact", &stats.terrain_inexact}, {"mv.other_camera", &stats.other_camera}, {"mv.uncopied", &stats.uncopied}, {"mv.maps", &stats.maps}, {"mv.updates", &stats.updates},
                                {"mv.other_maps", &stats.other_maps}, {"mv.sr_draws", &stats.sr_draws}, {"mv.bound_state_mismatches", &stats.bound_state_mismatches}, {"mv.constants_pool", &stats.constants_pool},
-                               {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, { "mv.ended_by_hash",
+                               {"mv.tiebreak_collisions", &stats.tiebreak_collisions}, {"mv.nearest_scans", &stats.nearest_scans}, {"mv.nearest_scanned", &stats.nearest_scanned}, {"mv.nearest_largest", &stats.nearest_largest}, { "mv.ended_by_hash",
                                   &stats.ended_by }},
          &device_data);
       for (size_t i = 0; i < MOTION_VECTOR_REJECT_NAMES.size(); i++)
@@ -3015,6 +3034,8 @@ public:
             game_device_data.mv_accepted_rtv = nullptr;
             game_device_data.mv_objects.clear();
             game_device_data.mv_previous_objects.clear();
+            game_device_data.mv_exact_objects = {};
+            game_device_data.mv_previous_exact_objects = {};
             game_device_data.mv_camera.reset();
             game_device_data.mv_previous_camera.reset();
             game_device_data.mv_fill_buffer.reset();

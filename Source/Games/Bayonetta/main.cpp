@@ -663,6 +663,8 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_previous_objects;
+   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
+   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
    // The frame's camera (vc4 of its first scene depth writing view projection draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -1234,6 +1236,8 @@ class Bayonetta final : public Game
       // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the
       // last two frames go
       gd.mv_previous_objects.swap(gd.mv_objects);
+      gd.mv_previous_exact_objects.entries.swap(gd.mv_exact_objects.entries);
+      gd.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
       // Objects without a transform match by their draw key alone: any twin has the same vertices
       gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_previous_objects, [](const auto& a, const auto& b)
@@ -1248,7 +1252,9 @@ class Bayonetta final : public Game
       if (!previous_valid)
       {
          gd.mv_previous_objects.clear();
+         gd.mv_previous_exact_objects.entries.clear();
       }
+      gd.mv_previous_exact_objects.Seal();
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's helper
       // starting shows the scene as it is, antialiased with SMAA).
       const SR::InstanceData* sr_instance_data = (gd.sr_active ? device_data.GetSRInstanceData() : nullptr);
@@ -1530,11 +1536,11 @@ class Bayonetta final : public Game
          gd.mv_stats.untransformed += untransformed;
 #endif
 
-         // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
+         // The same object at the same transform by the exact index, else a linear search among the key's candidates
          const BayonettaGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end() && !untransformed)
          {
-            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+            match = PatchedDraws::FindNearest(previous->second, gd.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == constants->size(); });
          }
          const bool view_projection_shader = vertex_shader.camera_offset == VIEW_PROJECTION_OFFSET;
@@ -1580,7 +1586,13 @@ class Bayonetta final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         gd.mv_objects[key].push_back({.transform = transform, .constants = std::move(constants)});
+         auto& drawn_objects = gd.mv_objects[key];
+         // Untransformed draws are never looked up
+         if (!untransformed)
+         {
+            gd.mv_exact_objects.Add(key, transform, drawn_objects.size());
+         }
+         drawn_objects.push_back({.transform = transform, .constants = std::move(constants)});
       }
 #if DEVELOPMENT
       else
@@ -3016,6 +3028,8 @@ public:
             game_device_data.mv_scene_size = {};
             game_device_data.mv_objects.clear();
             game_device_data.mv_previous_objects.clear();
+            game_device_data.mv_exact_objects = {};
+            game_device_data.mv_previous_exact_objects = {};
             game_device_data.mv_camera.reset();
             game_device_data.mv_previous_camera.reset();
             game_device_data.mv_fill_buffer.reset();

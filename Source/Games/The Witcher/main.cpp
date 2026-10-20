@@ -177,6 +177,8 @@ struct TheWitcherGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
    std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
+   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
+   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
    // The frame's camera view projection (column vectors, from its first depth writing motion vector draw that has one, see
    // "GetViewProjection") and the previous frame's
    std::optional<Math::Matrix44D> mv_camera;
@@ -602,12 +604,18 @@ class TheWitcherGame final : public Game
          // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the
          // last two frames go
          gd.mv_previous_objects.swap(gd.mv_objects);
+         gd.mv_previous_exact_objects.entries.swap(gd.mv_exact_objects.entries);
+         gd.mv_exact_objects.entries.clear();
          std::erase_if(gd.mv_objects, [](const auto& entry)
             { return entry.second.empty(); });
          for (auto& entry : gd.mv_objects)
             entry.second.clear();
          if (!previous_valid)
+         {
             gd.mv_previous_objects.clear();
+            gd.mv_previous_exact_objects.entries.clear();
+         }
+         gd.mv_previous_exact_objects.Seal();
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
@@ -665,11 +673,11 @@ class TheWitcherGame final : public Game
             }
          }
 
-         // ponytail: linear search among the key's candidates (a handful at most); a spatial lookup if big crowds share a mesh
+         // The same object at the same transform by the exact index, else a linear search among the key's candidates
          const TheWitcherGameDeviceData::MotionVectorObject* match = nullptr;
          if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end())
          {
-            match = PatchedDraws::FindNearest(previous->second, transform, [&](const auto& candidate)
+            match = PatchedDraws::FindNearest(previous->second, gd.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == constants->size(); });
          }
          if (match)
@@ -716,7 +724,9 @@ class TheWitcherGame final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         gd.mv_objects[key].push_back({transform, constants});
+         auto& drawn_objects = gd.mv_objects[key];
+         gd.mv_exact_objects.Add(key, transform, drawn_objects.size());
+         drawn_objects.push_back({transform, constants});
       }
 #if DEVELOPMENT
       else
@@ -1345,6 +1355,8 @@ public:
             gd.mv_scene_copies.clear();
             gd.mv_objects.clear();
             gd.mv_previous_objects.clear();
+            gd.mv_exact_objects = {};
+            gd.mv_previous_exact_objects = {};
             gd.mv_camera.reset();
             gd.mv_previous_camera.reset();
          }

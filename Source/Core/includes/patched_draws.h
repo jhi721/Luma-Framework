@@ -660,6 +660,47 @@ namespace PatchedDraws
       return distance;
    }
 
+   // A draw key and an exact transform: equal transforms (operator==, so -0 as 0) hash equally. 32 bit FNV-1a over the transform (a
+   // 64 bit multiply is a call on x86), mixed into the key's hash.
+   inline uint64_t TransformHash(uint64_t key, const ObjectTransform& transform)
+   {
+      uint32_t hash = 2166136261u;
+      for (const float value : transform)
+      {
+         const float normalized = (value == 0.f ? 0.f : value);
+         uint32_t bits;
+         std::memcpy(&bits, &normalized, sizeof(bits));
+         hash = (hash ^ bits) * 16777619u;
+      }
+      return key ^ ((uint64_t(hash) << 32) | hash);
+   }
+
+   // A frame's motion vector objects by draw key and exact transform, for "FindNearest": the same object a frame later is nearly
+   // always at distance 0, found here without scanning its key's candidates. That scan is quadratic in the copies of one mesh: TW2's
+   // foliage with a long view distance (thousands of one tree) fell to 4 fps. Filled as the frame draws ("Add", the object's index
+   // in its key's list), sorted once it's last frame's ("Seal"). Reused: no allocation once grown.
+   struct ExactTransformIndex
+   {
+      std::vector<std::pair<uint64_t, uint32_t>> entries; // "TransformHash", index
+
+      void Add(uint64_t key, const ObjectTransform& transform, size_t index)
+      {
+         entries.emplace_back(TransformHash(key, transform), uint32_t(index));
+      }
+      // Sorted by hash, then index: a hash's first entry is its first drawn object, the one "FindNearest"'s scan picks at distance 0
+      void Seal()
+      {
+         std::sort(entries.begin(), entries.end());
+      }
+      // The first object drawn with this key and hash (another transform on a hash collision), UINT32_MAX if none
+      uint32_t Find(uint64_t key, const ObjectTransform& transform) const
+      {
+         const uint64_t hash = TransformHash(key, transform);
+         const auto entry = std::lower_bound(entries.begin(), entries.end(), std::pair<uint64_t, uint32_t>(hash, 0));
+         return (entry != entries.end() && entry->first == hash) ? entry->second : UINT32_MAX;
+      }
+   };
+
    // The candidate (an object of last frame with the same draw key) nearest to "transform" among those "compatible" accepts (same
    // constants layout); null if none. At distance 0 the same object, else the nearest guess.
    template <typename Object, typename Compatible>
@@ -681,23 +722,53 @@ namespace PatchedDraws
       return match;
    }
 
+   // The same, with last frame's "exact" index of the candidates (sealed): the scan only runs for objects not drawn last frame with
+   // this transform (moved, skinned, streamed in)
+   template <typename Object, typename Compatible>
+   const Object* FindNearest(const std::vector<Object>& candidates, const ExactTransformIndex& exact, uint64_t key, const ObjectTransform& transform, Compatible compatible)
+   {
+      if (const uint32_t index = exact.Find(key, transform); index < candidates.size())
+      {
+         const Object& candidate = candidates[index];
+         if (candidate.transform == transform && compatible(candidate))
+            return &candidate;
+      }
+      return FindNearest(candidates, transform, compatible);
+   }
+
    // A development check of a frame's motion vector objects by draw key: those with another object's "transform" but other
    // constants. Their previous frame match is arbitrary (a tie-break transform that isn't per object, e.g. bone rows); 0 when the
-   // tie-break works.
+   // tie-break works. Only objects of one transform hash are compared (thousands of copies of one mesh made it quadratic).
    template <typename Object, typename Hash, typename SameConstants>
    uint32_t CountTieBreakCollisions(const std::unordered_map<uint64_t, std::vector<Object>, Hash>& objects_by_key, SameConstants same_constants)
    {
       uint32_t collisions = 0;
+      std::vector<std::pair<uint64_t, uint32_t>> by_hash; // "TransformHash", index
       for (const auto& [key, objects] : objects_by_key)
       {
+         by_hash.clear();
          for (size_t i = 0; i < objects.size(); i++)
          {
-            for (size_t j = 0; j < objects.size(); j++)
+            by_hash.emplace_back(TransformHash(0, objects[i].transform), uint32_t(i));
+         }
+         std::sort(by_hash.begin(), by_hash.end());
+         for (size_t run_start = 0, run_end = 0; run_start < by_hash.size(); run_start = run_end)
+         {
+            while (run_end < by_hash.size() && by_hash[run_end].first == by_hash[run_start].first)
             {
-               if (i != j && objects[i].transform == objects[j].transform && !same_constants(objects[i], objects[j]))
+               run_end++;
+            }
+            for (size_t i = run_start; i < run_end; i++)
+            {
+               const Object& object = objects[by_hash[i].second];
+               for (size_t j = run_start; j < run_end; j++)
                {
-                  collisions++;
-                  break;
+                  const Object& other = objects[by_hash[j].second];
+                  if (i != j && object.transform == other.transform && !same_constants(object, other))
+                  {
+                     collisions++;
+                     break;
+                  }
                }
             }
          }
