@@ -175,10 +175,7 @@ struct TheWitcherGameDeviceData final : public GameDeviceData
       PatchedDraws::ObjectTransform transform; // The world matrix's translation only (the rest zero)
       ConstantsCopy constants;
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
-   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
-   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
+   PatchedDraws::FrameObjects<MotionVectorObject> mv_objects;
    // The frame's camera view projection (column vectors, from its first depth writing motion vector draw that has one, see
    // "GetViewProjection") and the previous frame's
    std::optional<Math::Matrix44D> mv_camera;
@@ -601,21 +598,7 @@ class TheWitcherGame final : public Game
          gd.mv_previous_camera = previous_valid ? gd.mv_camera : std::nullopt;
          gd.mv_camera.reset();
          gd.mv_frame_index = cb_luma_global_settings.FrameIndex;
-         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the
-         // last two frames go
-         gd.mv_previous_objects.swap(gd.mv_objects);
-         gd.mv_previous_exact_objects.entries.swap(gd.mv_exact_objects.entries);
-         gd.mv_exact_objects.entries.clear();
-         std::erase_if(gd.mv_objects, [](const auto& entry)
-            { return entry.second.empty(); });
-         for (auto& entry : gd.mv_objects)
-            entry.second.clear();
-         if (!previous_valid)
-         {
-            gd.mv_previous_objects.clear();
-            gd.mv_previous_exact_objects.entries.clear();
-         }
-         gd.mv_previous_exact_objects.Seal();
+         gd.mv_objects.EndFrame(previous_valid);
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
@@ -674,15 +657,11 @@ class TheWitcherGame final : public Game
          }
 
          // The same object at the same transform by the exact index, else a linear search among the key's candidates
-         const TheWitcherGameDeviceData::MotionVectorObject* match = nullptr;
-         if (const auto previous = gd.mv_previous_objects.find(key); previous != gd.mv_previous_objects.end())
-         {
-            match = PatchedDraws::FindNearest(previous->second, gd.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
-               { return candidate.constants->size() == constants->size(); });
-         }
+         const TheWitcherGameDeviceData::MotionVectorObject* const match = gd.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
+            { return candidate.constants->size() == constants->size(); });
          if (match)
          {
-            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
+            // Last frame's list outlives the draw (the previous objects only change at the next frame start)
             upload = &*match->constants;
 #if DEVELOPMENT
             gd.mv_stats.matched++;
@@ -724,9 +703,7 @@ class TheWitcherGame final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         auto& drawn_objects = gd.mv_objects[key];
-         gd.mv_exact_objects.Add(key, transform, drawn_objects.size());
-         drawn_objects.push_back({transform, constants});
+         gd.mv_objects.Push(key, {transform, constants});
       }
 #if DEVELOPMENT
       else
@@ -1353,10 +1330,7 @@ public:
             gd.mv_scene_color.reset();
             gd.mv_scene_rtv.reset();
             gd.mv_scene_copies.clear();
-            gd.mv_objects.clear();
-            gd.mv_previous_objects.clear();
-            gd.mv_exact_objects = {};
-            gd.mv_previous_exact_objects = {};
+            gd.mv_objects.Reset();
             gd.mv_camera.reset();
             gd.mv_previous_camera.reset();
          }

@@ -517,10 +517,7 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
       uint32_t vertex_shader = 0, pixel_shader = 0; // For the tie-break collision log
 #endif
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_previous_objects;
-   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
-   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
+   PatchedDraws::FrameObjects<MotionVectorObject, PatchedDraws::KeyHash> mv_objects;
    // The frame's camera (vc4 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -1311,7 +1308,7 @@ class Borderlands2 final : public Game
 #if DEVELOPMENT
    // "mv.tiebreak_collisions" explained: the objects of one draw key with the same transform but other constants (their previous
    // frame match is arbitrary), and the vc4 rows that differ (c<N>: the D3D9 constant, see "MotionVectorPatches")
-   static void LogTieBreakCollisions(const decltype(Borderlands2GameDeviceData::mv_objects)& objects_by_key)
+   static void LogTieBreakCollisions(const decltype(Borderlands2GameDeviceData::mv_objects)::Map& objects_by_key)
    {
       uint32_t logged = 0;
       for (const auto& [key, objects] : objects_by_key)
@@ -1481,31 +1478,15 @@ class Borderlands2 final : public Game
          gd.mv_previous_camera = previous_valid ? gd.mv_camera : nullptr;
          gd.mv_camera = nullptr;
          gd.mv_frame_index = cb_luma_global_settings.FrameIndex;
-         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the
-         // last two frames go
-         gd.mv_previous_objects.swap(gd.mv_objects);
-         gd.mv_previous_exact_objects.entries.swap(gd.mv_exact_objects.entries);
-         gd.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
-         gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_previous_objects, [](const auto& a, const auto& b)
+         gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_objects.Current(), [](const auto& a, const auto& b)
             { return PatchedDraws::SameBytes(a.constants, b.constants); });
          if (gd.mv_stats.tiebreak_collisions != 0 && Perf::g_test == 0 && cb_luma_global_settings.FrameIndex % 300 == 0)
          {
-            LogTieBreakCollisions(gd.mv_previous_objects);
+            LogTieBreakCollisions(gd.mv_objects.Current());
          }
 #endif
-         std::erase_if(gd.mv_objects, [](const auto& entry)
-            { return entry.second.empty(); });
-         for (auto& entry : gd.mv_objects)
-         {
-            entry.second.clear();
-         }
-         if (!previous_valid)
-         {
-            gd.mv_previous_objects.clear();
-            gd.mv_previous_exact_objects.entries.clear();
-         }
-         gd.mv_previous_exact_objects.Seal();
+         gd.mv_objects.EndFrame(previous_valid);
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader reads
@@ -1624,9 +1605,9 @@ class Borderlands2 final : public Game
 
          // The same object at the same transform by the exact index, else a linear search among the key's candidates
          const Borderlands2GameDeviceData::MotionVectorObject* match = nullptr;
-         if (const auto previous = gd.mv_previous_objects.find(key); g_mv_match_objects && previous != gd.mv_previous_objects.end())
+         if (g_mv_match_objects)
          {
-            match = PatchedDraws::FindNearest(previous->second, gd.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
+            match = gd.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == constants->size(); });
          }
          // "source" (only what the shader reads, at least the camera) with the view projection of "previous_camera" for this frame's
@@ -1645,7 +1626,7 @@ class Borderlands2 final : public Game
          };
          if (match)
          {
-            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start). Camera relative vertices
+            // Last frame's list outlives the draw (the previous objects only change at the next frame start). Camera relative vertices
             // are already translated by this frame's PreViewTranslation: last frame's constants, with its view projection moved to it.
             if (gd.mv_last_vertex_shader.camera_relative_vertices)
             {
@@ -1674,9 +1655,7 @@ class Borderlands2 final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         auto& drawn_objects = gd.mv_objects[key];
-         gd.mv_exact_objects.Add(key, transform, drawn_objects.size());
-         auto& object = drawn_objects.emplace_back(transform, std::move(constants));
+         auto& object = gd.mv_objects.Push(key, {transform, std::move(constants)});
 #if DEVELOPMENT
          object.vertex_shader = uint32_t(original_shader_hashes.vertex_shaders[0]);
          object.pixel_shader = uint32_t(original_shader_hashes.pixel_shaders[0]);
@@ -3384,10 +3363,7 @@ public:
             gd.mv_scene_srv.reset();
             gd.mv_scene_copy.reset();
             gd.mv_scene_copy_rtv.reset();
-            gd.mv_objects.clear();
-            gd.mv_previous_objects.clear();
-            gd.mv_exact_objects = {};
-            gd.mv_previous_exact_objects = {};
+            gd.mv_objects.Reset();
             gd.mv_camera.reset();
             gd.mv_previous_camera.reset();
             gd.mv_fill_buffer.reset();

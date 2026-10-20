@@ -736,6 +736,93 @@ namespace PatchedDraws
       return FindNearest(candidates, transform, compatible);
    }
 
+   // A game's motion vector objects (each with a "transform") by draw key, this frame's and last frame's, with their exact transform
+   // indices kept in step: the lists and the indices only change together here, so no draw falls back to the quadratic scan.
+   template <typename Object, typename Hash = std::hash<uint64_t>>
+   class FrameObjects
+   {
+   public:
+      using Map = std::unordered_map<uint64_t, std::vector<Object>, Hash>;
+
+      // Kept as drawn for the next frame. "indexed" false: never looked up by its transform (a draw without one).
+      Object& Push(uint64_t key, Object&& object, bool indexed = true)
+      {
+         auto& objects = current[key];
+         if (indexed)
+         {
+            current_exact.Add(key, object.transform, objects.size());
+         }
+         return objects.emplace_back(std::move(object));
+      }
+
+      // At frame start: this frame's objects become the previous ones, gone if "previous_valid" is false (frames without a scene came
+      // between). Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither
+      // of the last two frames go.
+      void EndFrame(bool previous_valid)
+      {
+         previous.swap(current);
+         previous_exact.entries.swap(current_exact.entries);
+         current_exact.entries.clear();
+         std::erase_if(current, [](const auto& entry)
+            { return entry.second.empty(); });
+         for (auto& entry : current)
+         {
+            entry.second.clear();
+         }
+         if (!previous_valid)
+         {
+            previous.clear();
+            previous_exact.entries.clear();
+         }
+         previous_exact.Seal();
+      }
+
+      // Forgets this frame's objects so far (a view that restarts the frame)
+      void ClearCurrent()
+      {
+         for (auto& entry : current)
+         {
+            entry.second.clear();
+         }
+         current_exact.entries.clear();
+      }
+
+      // Frees everything (device teardown, motion vectors off)
+      void Reset()
+      {
+         current.clear();
+         previous.clear();
+         current_exact = {};
+         previous_exact = {};
+      }
+
+      // Last frame's object with this key nearest to "transform", see "FindNearest". It outlives the draw: the previous objects only
+      // change at the next "EndFrame".
+      template <typename Compatible>
+      const Object* FindNearest(uint64_t key, const ObjectTransform& transform, Compatible compatible) const
+      {
+         const auto candidates = previous.find(key);
+         if (candidates == previous.end())
+            return nullptr;
+         return PatchedDraws::FindNearest(candidates->second, previous_exact, key, transform, compatible);
+      }
+
+      const Map& Current() const
+      {
+         return current;
+      }
+      const Map& Previous() const
+      {
+         return previous;
+      }
+
+   private:
+      Map current;
+      Map previous;
+      ExactTransformIndex current_exact;
+      ExactTransformIndex previous_exact; // Sealed
+   };
+
    // A development check of a frame's motion vector objects by draw key: those with another object's "transform" but other
    // constants. Their previous frame match is arbitrary (a tie-break transform that isn't per object, e.g. bone rows); 0 when the
    // tie-break works. Only objects of one transform hash are compared (thousands of copies of one mesh made it quadratic).

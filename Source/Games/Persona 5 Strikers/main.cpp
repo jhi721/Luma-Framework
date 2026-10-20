@@ -305,10 +305,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
       PatchedDraws::ObjectTransform transform;
       GlobalsCopy globals; // Never null
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
-   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
-   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
+   PatchedDraws::FrameObjects<MotionVectorObject> mv_objects;
    // This frame's projection jitter (pixels, +y down) and its VS cbuffer ("MotionVectorPatches::jitter_slot": NDC offset)
    std::array<float, 2> mv_jitter = {};
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
@@ -776,26 +773,11 @@ class Persona5Strikers final : public Game
       game_device_data.mv_previous_view_projection_valid = game_device_data.mv_view_projection_valid && game_device_data.mv_presents - game_device_data.mv_frame_present <= 1;
       game_device_data.mv_view_projection_valid = false;
       game_device_data.mv_frame_present = game_device_data.mv_presents;
-      // Last frame's objects become the previous ones; keys drawn two frames ago keep their node and capacity for this frame
-      std::swap(game_device_data.mv_objects, game_device_data.mv_previous_objects);
-      game_device_data.mv_previous_exact_objects.entries.swap(game_device_data.mv_exact_objects.entries);
-      game_device_data.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
-      g_mv_tiebreak_collisions_last_frame = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
+      g_mv_tiebreak_collisions_last_frame = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_objects.Current(), [](const auto& a, const auto& b)
          { return PatchedDraws::SameBytes(a.globals, b.globals); });
 #endif
-      std::erase_if(game_device_data.mv_objects, [](const auto& entry)
-         {
-            const auto& [key, objects] = entry;
-            return objects.empty(); });
-      for (auto& [key, objects] : game_device_data.mv_objects)
-         objects.clear();
-      if (!game_device_data.mv_previous_view_projection_valid)
-      {
-         game_device_data.mv_previous_objects.clear();
-         game_device_data.mv_previous_exact_objects.entries.clear();
-      }
-      game_device_data.mv_previous_exact_objects.Seal();
+      game_device_data.mv_objects.EndFrame(game_device_data.mv_previous_view_projection_valid);
       std::erase_if(game_device_data.mv_previous_resources, [&](const auto& entry)
          {
             const auto& [resource, previous] = entry;
@@ -1147,16 +1129,10 @@ class Persona5Strikers final : public Game
          }
 
          // The same object at the same transform by the exact index, else a linear search among the key's candidates
-         const Persona5StrikersGameDeviceData::MotionVectorObject* match = nullptr;
-         if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
-         {
-            match = PatchedDraws::FindNearest(previous->second, game_device_data.mv_previous_exact_objects, key, transform, [&](const auto& object)
-               { return object.globals->size() == globals_copy->size(); });
-         }
+         const Persona5StrikersGameDeviceData::MotionVectorObject* const match = game_device_data.mv_objects.FindNearest(key, transform, [&](const auto& object)
+            { return object.globals->size() == globals_copy->size(); });
          // Kept as drawn for the next frame
-         auto& drawn_objects = game_device_data.mv_objects[key];
-         game_device_data.mv_exact_objects.Add(key, transform, drawn_objects.size());
-         drawn_objects.push_back({transform, globals_copy});
+         game_device_data.mv_objects.Push(key, {transform, globals_copy});
          const std::vector<uint8_t>* upload_data = (match ? match->globals.get() : globals_copy.get());
          // Not found: last frame's camera, if this is the frame's view projection (others are left as is)
          if (!match && game_device_data.mv_previous_view_projection_valid && std::memcmp(view_projection, game_device_data.mv_view_projection.data(), sizeof(game_device_data.mv_view_projection)) == 0)

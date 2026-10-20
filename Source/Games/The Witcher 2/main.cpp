@@ -529,10 +529,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       PatchedDraws::ObjectTransform transform;
       ConstantsCopy constants;
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>, PatchedDraws::KeyHash> mv_previous_objects;
-   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
-   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
+   PatchedDraws::FrameObjects<MotionVectorObject, PatchedDraws::KeyHash> mv_objects;
    // The frame's camera (vc4 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -1386,28 +1383,12 @@ class TheWitcher2Game final : public Game
          gd.mv_previous_camera = (previous_valid ? gd.mv_camera : nullptr);
          gd.mv_camera = nullptr;
          gd.mv_frame_index = cb_luma_global_settings.FrameIndex;
-         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of
-         // the last two frames go
-         gd.mv_previous_objects.swap(gd.mv_objects);
-         gd.mv_previous_exact_objects.entries.swap(gd.mv_exact_objects.entries);
-         gd.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
          // Objects without a transform (world space vertices) match by their draw key alone: any twin has the same vertices
-         gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_previous_objects, [](const auto& a, const auto& b)
+         gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_objects.Current(), [](const auto& a, const auto& b)
             { return a.transform == PatchedDraws::ObjectTransform{} || PatchedDraws::SameBytes(a.constants, b.constants); });
 #endif
-         std::erase_if(gd.mv_objects, [](const auto& entry)
-            { return entry.second.empty(); });
-         for (auto& entry : gd.mv_objects)
-         {
-            entry.second.clear();
-         }
-         if (!previous_valid)
-         {
-            gd.mv_previous_objects.clear();
-            gd.mv_previous_exact_objects.entries.clear();
-         }
-         gd.mv_previous_exact_objects.Seal();
+         gd.mv_objects.EndFrame(previous_valid);
       }
 
       // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader
@@ -1468,13 +1449,13 @@ class TheWitcher2Game final : public Game
 
          // The same object at the same transform by the exact index, else a linear search among the key's candidates
          const TheWitcher2GameDeviceData::MotionVectorObject* match = nullptr;
-         const auto previous = gd.mv_previous_objects.find(key);
+         const auto previous = gd.mv_objects.Previous().find(key);
          // Without a tie-break transform (a vertex shader reading neither LocalToWorld nor bones at the rows the tie-break knows) the
          // copies of a mesh sharing a key can't be told apart, so any pick is a guess. Such a draw keeps its own constants with last
          // frame's camera (static).
          const bool untransformed = gd.mv_last_vertex.transform_offset == 0;
 #if DEVELOPMENT
-         if (untransformed && previous != gd.mv_previous_objects.end() && previous->second.size() > 1)
+         if (untransformed && previous != gd.mv_objects.Previous().end() && previous->second.size() > 1)
          {
             gd.mv_stats.untransformed_ambiguous++;
             if (cb_luma_global_settings.FrameIndex - gd.mv_logged_untransformed_frame >= 300)
@@ -1486,9 +1467,9 @@ class TheWitcher2Game final : public Game
             }
          }
 #endif
-         if (previous != gd.mv_previous_objects.end() && !(untransformed && g_mv_untransformed_static))
+         if (previous != gd.mv_objects.Previous().end() && !(untransformed && g_mv_untransformed_static))
          {
-            match = PatchedDraws::FindNearest(previous->second, gd.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
+            match = gd.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == object_constants->size(); });
             const float nearest = (match ? PatchedDraws::TransformDistance(match->transform, transform) : FLT_MAX);
 #if DEVELOPMENT
@@ -1546,7 +1527,7 @@ class TheWitcher2Game final : public Game
          }
          if (match)
          {
-            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
+            // Last frame's list outlives the draw (the previous objects only change at the next frame start)
             upload = &*match->constants;
 #if DEVELOPMENT
             gd.mv_stats.matched++;
@@ -1569,9 +1550,7 @@ class TheWitcher2Game final : public Game
          }
 #endif
          // Kept as drawn for the next frame
-         auto& drawn_objects = gd.mv_objects[key];
-         gd.mv_exact_objects.Add(key, transform, drawn_objects.size());
-         drawn_objects.push_back({transform, std::move(object_constants)});
+         gd.mv_objects.Push(key, {transform, std::move(object_constants)});
       }
 #if DEVELOPMENT
       else
@@ -3032,10 +3011,7 @@ public:
             game_device_data.mv_linear_depth_srv.reset();
             game_device_data.mv_linear_depth_rtv = nullptr;
             game_device_data.mv_accepted_rtv = nullptr;
-            game_device_data.mv_objects.clear();
-            game_device_data.mv_previous_objects.clear();
-            game_device_data.mv_exact_objects = {};
-            game_device_data.mv_previous_exact_objects = {};
+            game_device_data.mv_objects.Reset();
             game_device_data.mv_camera.reset();
             game_device_data.mv_previous_camera.reset();
             game_device_data.mv_fill_buffer.reset();

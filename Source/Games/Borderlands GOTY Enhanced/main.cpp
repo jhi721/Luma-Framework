@@ -534,10 +534,7 @@ struct BorderlandsGotyGameDeviceData final : public GameDeviceData
       bool translated = false;
 #endif
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
-   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
-   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
+   PatchedDraws::FrameObjects<MotionVectorObject> mv_objects;
    // The frame's world camera (b1 of its first motion vector draw) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -1172,18 +1169,13 @@ class BorderlandsGoty final : public Game
          game_device_data.mv_previous_camera = previous_valid ? game_device_data.mv_camera : nullptr;
          game_device_data.mv_camera = nullptr;
          game_device_data.mv_frame_index = cb_luma_global_settings.FrameIndex;
-         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
-         // two frames go
-         game_device_data.mv_previous_objects.swap(game_device_data.mv_objects);
-         game_device_data.mv_previous_exact_objects.entries.swap(game_device_data.mv_exact_objects.entries);
-         game_device_data.mv_exact_objects.entries.clear();
          game_device_data.mv_camera_moves.clear();
          game_device_data.mv_camera_move_samples = 0;
          game_device_data.mv_camera_move = {};
 #if DEVELOPMENT
          // Objects without a translation (world space and instanced geometry, placed by their vertex inputs and b1) all share one by design:
          // whichever of them matches gives the same previous position (VS 0x9B0EA126, 0xB4A05DE8: instance matrix in v4-v7)
-         game_device_data.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
+         game_device_data.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_objects.Current(), [](const auto& a, const auto& b)
             { return !a.translated || (PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones)); });
          if (std::exchange(g_mv_log_tiebreak, false))
          {
@@ -1196,7 +1188,7 @@ class BorderlandsGoty final : public Game
                   return -2;
                return std::mismatch(a->begin(), a->end(), b->begin()).first - a->begin();
             };
-            for (const auto& [key, objects] : game_device_data.mv_previous_objects)
+            for (const auto& [key, objects] : game_device_data.mv_objects.Current())
             {
                for (size_t i = 0; i < objects.size(); i++)
                {
@@ -1212,16 +1204,7 @@ class BorderlandsGoty final : public Game
             }
          }
 #endif
-         std::erase_if(game_device_data.mv_objects, [](const auto& entry)
-            { return entry.second.empty(); });
-         for (auto& entry : game_device_data.mv_objects)
-            entry.second.clear();
-         if (!previous_valid)
-         {
-            game_device_data.mv_previous_objects.clear();
-            game_device_data.mv_previous_exact_objects.entries.clear();
-         }
-         game_device_data.mv_previous_exact_objects.Seal();
+         game_device_data.mv_objects.EndFrame(previous_valid);
       }
 
       // The game's b0 / b1 / b3. The slots added past them stay bound after the draw: no game vertex shader reads a constant buffer
@@ -1278,17 +1261,13 @@ class BorderlandsGoty final : public Game
          }
 
          // The same object at the same transform by the exact index, else a linear search among the key's candidates
-         const BorderlandsGotyGameDeviceData::MotionVectorObject* match = nullptr;
-         if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
-         {
-            match = PatchedDraws::FindNearest(previous->second, game_device_data.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
-               { return copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones); });
-         }
+         const BorderlandsGotyGameDeviceData::MotionVectorObject* const match = game_device_data.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
+            { return copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones); });
          const bool world_camera = camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0);
          const bool translated = game_device_data.mv_last_vertex_shader->translation_offset != UINT_MAX;
          if (match)
          {
-            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
+            // Last frame's list outlives the draw (the previous objects only change at the next frame start)
             uploads[0] = match->object.get();
             uploads[1] = match->camera.get();
             if (skinned)
@@ -1323,14 +1302,12 @@ class BorderlandsGoty final : public Game
             uploads[1] = &game_device_data.mv_moved_camera;
          }
          // Kept as drawn for the next frame
-         auto& drawn_objects = game_device_data.mv_objects[key];
-         game_device_data.mv_exact_objects.Add(key, transform, drawn_objects.size());
-         drawn_objects.push_back({transform, object, camera, bones});
+         auto& drawn = game_device_data.mv_objects.Push(key, {transform, object, camera, bones});
 #if DEVELOPMENT
-         drawn_objects.back().vertex_shader_hash = original_shader_hashes.vertex_shaders[0];
-         drawn_objects.back().pixel_shader_hash = original_shader_hashes.pixel_shaders[0];
-         drawn_objects.back().index_count = draw_data.index_count;
-         drawn_objects.back().translated = game_device_data.mv_last_vertex_shader->translation_offset != UINT_MAX;
+         drawn.vertex_shader_hash = original_shader_hashes.vertex_shaders[0];
+         drawn.pixel_shader_hash = original_shader_hashes.pixel_shaders[0];
+         drawn.index_count = draw_data.index_count;
+         drawn.translated = game_device_data.mv_last_vertex_shader->translation_offset != UINT_MAX;
 #endif
       }
 #if DEVELOPMENT
@@ -2322,10 +2299,7 @@ public:
             gd.mv_constants.ReleaseUploads();
             gd.mv_constants.Restart();
          }
-         gd.mv_objects.clear();
-         gd.mv_previous_objects.clear();
-         gd.mv_exact_objects = {};
-         gd.mv_previous_exact_objects = {};
+         gd.mv_objects.Reset();
          gd.mv_camera.reset();
          gd.mv_previous_camera.reset();
       }

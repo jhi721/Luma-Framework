@@ -867,10 +867,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
       ConstantsCopy camera; // b1
       ConstantsCopy bones;  // b3, skinned draws only
    };
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_objects;
-   std::unordered_map<uint64_t, std::vector<MotionVectorObject>> mv_previous_objects;
-   PatchedDraws::ExactTransformIndex mv_exact_objects;          // Index of "mv_objects"
-   PatchedDraws::ExactTransformIndex mv_previous_exact_objects; // Index of "mv_previous_objects" (sealed)
+   PatchedDraws::FrameObjects<MotionVectorObject> mv_objects;
    // The frame's world camera (b1 of its first motion vector draw with a perspective) and the previous frame's
    ConstantsCopy mv_camera;
    ConstantsCopy mv_previous_camera;
@@ -1698,27 +1695,11 @@ class MassEffectLE final : public Game
          game_device_data.mv_previous_camera = (previous_valid ? game_device_data.mv_camera : nullptr);
          game_device_data.mv_camera = nullptr;
          game_device_data.mv_frame_index = cb_luma_global_settings.FrameIndex;
-         // Swapped, not rebuilt: the lists keep their nodes and capacity (an empty list matches nothing); keys drawn in neither of the last
-         // two frames go
-         game_device_data.mv_previous_objects.swap(game_device_data.mv_objects);
-         game_device_data.mv_previous_exact_objects.entries.swap(game_device_data.mv_exact_objects.entries);
-         game_device_data.mv_exact_objects.entries.clear();
 #if DEVELOPMENT
-         game_device_data.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_previous_objects, [](const auto& a, const auto& b)
+         game_device_data.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_objects.Current(), [](const auto& a, const auto& b)
             { return PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones); });
 #endif
-         std::erase_if(game_device_data.mv_objects, [](const auto& entry)
-            { return entry.second.empty(); });
-         for (auto& entry : game_device_data.mv_objects)
-         {
-            entry.second.clear();
-         }
-         if (!previous_valid)
-         {
-            game_device_data.mv_previous_objects.clear();
-            game_device_data.mv_previous_exact_objects.entries.clear();
-         }
-         game_device_data.mv_previous_exact_objects.Seal();
+         game_device_data.mv_objects.EndFrame(previous_valid);
       }
 
       // The game's b0 / b1 / b3. The slots added past them stay bound after the draw: no game vertex shader reads a constant buffer
@@ -1799,16 +1780,12 @@ class MassEffectLE final : public Game
          }
 
          // The same object at the same transform by the exact index, else a linear search among the key's candidates
-         const MassEffectGameDeviceData::MotionVectorObject* match = nullptr;
-         if (const auto previous = game_device_data.mv_previous_objects.find(key); previous != game_device_data.mv_previous_objects.end())
-         {
-            match = PatchedDraws::FindNearest(previous->second, game_device_data.mv_previous_exact_objects, key, transform, [&](const auto& candidate)
-               { return copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones); });
-         }
+         const MassEffectGameDeviceData::MotionVectorObject* const match = game_device_data.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
+            { return copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones); });
          const bool world_camera = camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0);
          if (match)
          {
-            // Last frame's list outlives the draw ("mv_previous_objects" only changes at the next frame start)
+            // Last frame's list outlives the draw (the previous objects only change at the next frame start)
             uploads[0] = match->object.get();
             uploads[1] = match->camera.get();
             if (skinned)
@@ -1869,9 +1846,7 @@ class MassEffectLE final : public Game
             uploads[1] = &camera_previous_view;
          }
          // Kept as drawn for the next frame
-         auto& drawn_objects = game_device_data.mv_objects[key];
-         game_device_data.mv_exact_objects.Add(key, transform, drawn_objects.size());
-         drawn_objects.push_back({.transform = transform, .object = std::move(object), .camera = std::move(camera), .bones = std::move(bones)});
+         game_device_data.mv_objects.Push(key, {.transform = transform, .object = std::move(object), .camera = std::move(camera), .bones = std::move(bones)});
       }
 #if DEVELOPMENT
       else
@@ -3246,11 +3221,7 @@ public:
                if (!gd.mv_frame_ended)
                {
                   gd.mv_camera = nullptr;
-                  for (auto& entry : gd.mv_objects)
-                  {
-                     entry.second.clear();
-                  }
-                  gd.mv_exact_objects.entries.clear();
+                  gd.mv_objects.ClearCurrent();
                }
 #if DEVELOPMENT
                gd.mv_stats.view_restarts++;
@@ -3395,10 +3366,7 @@ public:
             gd.mv_constants.ReleaseUploads();
             gd.mv_constants.Restart();
          }
-         gd.mv_objects.clear();
-         gd.mv_previous_objects.clear();
-         gd.mv_exact_objects = {};
-         gd.mv_previous_exact_objects = {};
+         gd.mv_objects.Reset();
          gd.mv_camera.reset();
          gd.mv_previous_camera.reset();
          gd.view_camera.reset();
