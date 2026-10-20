@@ -1559,7 +1559,7 @@ public:
    void OnInit(bool async) override
    {
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + MacLeod-Boynton hue + PsychoV31 display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended native grade + PsychoV31 display map + MacLeod-Boynton hue emulation (SDR displays keep the vanilla grade)", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -1628,6 +1628,7 @@ public:
       default_luma_global_game_settings.Contrast = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
       default_luma_global_game_settings.HighlightsDesaturation = 0.f;
+      default_luma_global_game_settings.HueEmulation = 1.f;
       default_luma_global_game_settings.ColorGradingIntensity = 1.f;
       default_luma_global_game_settings.Dithering = 1.f;
       // Bink bypasses the scene passes: without AutoHDR the movies sit flat at paper white. BL2's calibrated pair.
@@ -1816,6 +1817,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "Contrast", gs.Contrast);
       reshade::get_config_value(nullptr, NAME, "Saturation", gs.Saturation);
       reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", gs.HighlightsDesaturation);
+      reshade::get_config_value(nullptr, NAME, "HueEmulation", gs.HueEmulation);
       reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", gs.ColorGradingIntensity);
       reshade::get_config_value(nullptr, NAME, "Dithering", gs.Dithering);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", gs.VideoAutoHDREnable);
@@ -1867,6 +1869,8 @@ public:
       DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, gs_def.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
       DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightsDesaturation, gs_def.HighlightsDesaturation, 0.f, 1.f,
          "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
+      DrawSettingSlider("Hue Emulation", "HueEmulation", &gs.HueEmulation, gs_def.HueEmulation, 0.f, 1.f,
+         "How far bright colors take the hue shift of the original's clipped highlights, e.g. fire turning yellow, HDR only (1 = like the original).");
       DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, gs_def.ColorGradingIntensity, 0.f, 1.f,
          "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 

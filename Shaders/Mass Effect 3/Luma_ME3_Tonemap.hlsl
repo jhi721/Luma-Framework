@@ -9,8 +9,8 @@
 //    (Tonemap_ME3LE_LUT_Body.hlsl + Includes/Tonemap_MELE_*.hlsli): continue the filmic LUT past mid-gray, grade a
 //    bounded proxy, divide the scale back out, keep the native result's RGB ratios at the new luminance.
 //  - ALU (menus, squad, 3D previews): the classic UE3 formula grade with a hard clip and no tone curve. HDR is the UE3
-//    hard-clip canon shipped on ME1 2007 / BL GOTY: the same grade with its upper saturates lifted, a
-//    ReinhardPiecewise(5, ME3_HUE_REFERENCE_SHOULDER) hue reference and MacLeod-Boynton hue in BT.2020, then PsychoV31.
+//    hard-clip canon shipped on ME1 2007 / BL GOTY: the same grade with its upper saturates lifted, PsychoV31, then the
+//    MacLeod-Boynton hue of a ReinhardPiecewise(5, 1.5) reference in BT.2020.
 // The HDR paths run only in the HDR Display Mode; SDR and TONEMAP_TYPE 0 output the exact vanilla grade.
 // Two dgVoodoo rules hold throughout: every fetch is followed by the b3 mask pair, and the entry points declare all 13
 // interpolators, because VS->PS linkage is by register.
@@ -166,9 +166,6 @@ float3 ME3_SceneMix(float2 blurUV, float4 sceneUV)
 // Shared HDR tail pieces.
 // ---------------------------------------------------------------------------------------------------------------------
 
-// Shoulder of the ALU family's hue reference: the Reinhard donor's own, and the gate that skips the whole colour
-// stage below it. Tuned constant, not a user control; path-to-white stays with PsychoV31 at the display peak.
-#define ME3_HUE_REFERENCE_SHOULDER      1.5
 #define MELE_HDR_BRIDGE_SHOULDER        0.75 // k, the max-channel proxy shoulder, in the adapted linear domain.
 #define MELE_HDR_PIVOT                  0.18 // p, scene mid-gray, where the tone-curve continuation starts.
 #define MELE_HDR_PROBE_LO               0.16 // Sampled-fit probes, in scene-x.
@@ -262,25 +259,15 @@ float3 ME3_Grade(float3 untonemapped, bool hdr, float3 vignette)
 #endif
       const float3 extendedLinear = gamma_to_linear(GradeUE3(extendedIn, false, 1.0), GCT_POSITIVE) * vignette;
 
-      // Colour stage in BT.2020: the soft per-channel reference bends a saturated highlight the way the vanilla clip
-      // did, without its whitening; MacLeod-Boynton rebuilds that hue on the signal's own purity. Then the
-      // display map (see "PsychoVDisplayMap"): its source boundary is BT.2020 on every pixel, as the hue stage can leave
-      // BT.709, so the map does not change at the gate below.
-      //
-      // The hue stage is gated on the donor's own shoulder, ONE constant for both so they cannot drift: below it
-      // ReinhardPiecewise returns its input exactly, so the reference equals the target and the transfer is a
-      // no-op. The test is taken in BT.709, before the conversion, because every BT.2020 channel is a convex
-      // combination of the BT.709 ones (the matrix rows sum to 1) and so can never exceed their max. Worth a real
-      // branch: the model runs purity solves, some 300 instructions that most of the frame does not need.
+      // The display map, then the hue of the soft per-channel reference, which bends a saturated highlight the way the
+      // vanilla clip did, without its whitening (see "PsychoVDisplayMapWithHueReference").
       const float3 hdrColor = PsychoVDisplayMapWithHueReference(extendedLinear,
                                                                 LumaSettings.GameSettings.Contrast,
                                                                 LumaSettings.GameSettings.Saturation,
-                                                                LumaSettings.GameSettings.HighlightDechroma,
-                                                                ME3_HUE_REFERENCE_SHOULDER,
-                                                                true);
+                                                                LumaSettings.GameSettings.HighlightDechroma);
 
       // The output scale is also the engine fade: re-applied last, as the gain the vanilla chain gives it (before the
-      // gamma exponent and the display decode), so a fade matches vanilla instead of biasing the hue stage or the map.
+      // gamma exponent and the display decode), so a fade matches vanilla instead of biasing the hue emulation or the map.
       color = hdrColor * gamma_to_linear(PowUE3(GammaColorScaleAndInverse.xyz, GammaColorScaleAndInverse.www), GCT_POSITIVE);
    }
    else

@@ -52,40 +52,46 @@ float Neutwo(float x, float peak)
 #define FLT16_MAX   65504.f
 #define PI          3.141592653589793238462643383279502884197
 
-// Maps a finished grade (linear BT.709 transport, 1 = paper white) to the display peak, with the gamut compression of RenoDX's mods
+// The display peak relative to paper white. It can't go below paper white, and a 0 paper white (unset) would divide the frame into
+// NaNs.
+float PsychoVPeakRatio()
+{
+   const float paperWhite = max(GamePaperWhiteNits, 1.0);
+   return max(PeakWhiteNits, paperWhite) / paperWhite;
+}
+
+// Maps a finished BT.709 grade (linear, 1 = paper white) to the display peak, with the gamut compression of RenoDX's mods
 // (BT.2020 in HDR, BT.709 otherwise), which keeps the channels within the peak and slightly desaturates the most saturated colors.
 // PsychoV's own grading only takes the user's contrast (its cone response power), saturation (its purity) and highlights
-// desaturation (its "dechroma"), all no-ops at their defaults. "sourceBoundary" is the gamut the grade was made in: BT.709, or
-// "PSYCHO30_SOURCE_BOUNDARY_BT2020" for a grade that leaves it (e.g. a hue transfer done in BT.2020).
-float3 PsychoVDisplayMap(float3 color, float contrast = 1.0, float saturation = 1.0, float highlightsDesaturation = 0.0,
-                         int sourceBoundary = renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT709)
+// desaturation (its "dechroma"), all no-ops at their defaults.
+// HDR displays only: at an SDR peak (= paper white) it already compresses paper white (1 -> 0.68), so SDR displays take the
+// game's vanilla grade instead (Mass Effect 2 doesn't gate it yet).
+float3 PsychoVDisplayMap(float3 color, float contrast = 1.0, float saturation = 1.0, float highlightsDesaturation = 0.0)
 {
    const int targetGamut = (LumaSettings.DisplayMode == 1) ? renodx::tonemap::psychov::CUSTOM_PSYCHO31_TARGET_GAMUT_BT2020
                                                            : renodx::tonemap::psychov::CUSTOM_PSYCHO31_TARGET_GAMUT_BT709;
-   // The peak can't go below paper white, and a 0 paper white (unset) would divide the frame into NaNs
-   const float paperWhite = max(GamePaperWhiteNits, 1.0);
    return renodx::tonemap::psychov::custom_psychotm_test31(color,
-                                                           max(PeakWhiteNits, paperWhite) / paperWhite, // peak_value
-                                                           1.0,                                         // exposure
-                                                           1.0,                                         // highlights
-                                                           1.0,                                         // shadows
-                                                           contrast,                                    // contrast
-                                                           0.0,                                         // flare
-                                                           1.0,                                         // highlight_contrast
-                                                           1.0,                                         // shadow_contrast
-                                                           saturation,                                  // purity_scale
-                                                           1.0,                                         // highlight_saturation
-                                                           highlightsDesaturation,                      // dechroma
-                                                           0.18,                                        // current_adaptive_state_bt709
-                                                           0.18,                                        // current_background_state_bt709
-                                                           0.0,                                         // sdr_eotf_emulation
-                                                           1.0,                                         // gamut_compression
-                                                           targetGamut,                                 // gamut_compression_mode
-                                                           1.5,                                         // compression
-                                                           1.0,                                         // mean_a2_shadow_source_weight
-                                                           0.5,                                         // mean_a2_midgray_source_weight
-                                                           0.0,                                         // mean_a2_highlight_source_weight
-                                                           sourceBoundary);                             // source_boundary
+                                                           PsychoVPeakRatio(),                                        // peak_value
+                                                           1.0,                                                       // exposure
+                                                           1.0,                                                       // highlights
+                                                           1.0,                                                       // shadows
+                                                           contrast,                                                  // contrast
+                                                           0.0,                                                       // flare
+                                                           1.0,                                                       // highlight_contrast
+                                                           1.0,                                                       // shadow_contrast
+                                                           saturation,                                                // purity_scale
+                                                           1.0,                                                       // highlight_saturation
+                                                           highlightsDesaturation,                                    // dechroma
+                                                           0.18,                                                      // current_adaptive_state_bt709
+                                                           0.18,                                                      // current_background_state_bt709
+                                                           0.0,                                                       // sdr_eotf_emulation
+                                                           1.0,                                                       // gamut_compression
+                                                           targetGamut,                                               // gamut_compression_mode
+                                                           1.5,                                                       // compression
+                                                           1.0,                                                       // mean_a2_shadow_source_weight
+                                                           0.5,                                                       // mean_a2_midgray_source_weight
+                                                           0.0,                                                       // mean_a2_highlight_source_weight
+                                                           renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT709); // source_boundary
 }
 
 #endif // LUMA_PSYCHOV31_HLSL

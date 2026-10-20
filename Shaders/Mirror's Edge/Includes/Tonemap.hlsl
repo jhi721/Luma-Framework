@@ -31,15 +31,15 @@ float3 PowTd(float3 base, float3 exponent)
    return exp2(exponent * float3(DgVoodooLog2(b.x), DgVoodooLog2(b.y), DgVoodooLog2(b.z)));
 }
 
-// The extended (unclipped) grade, linear, to the display. The per-channel curves lean saturated highlights; the soft per-channel
-// reference keeps that lean without the clip's whitening, MacLeod-Boynton puts its hue on the extended grade's own purity (see
-// "PsychoVDisplayMapWithHueReference").
+// The extended (unclipped) grade, linear, to the display, with the hue lean of the original's per-channel clip (fire to yellow)
+// at the user's strength (see "PsychoVDisplayMapWithHueReference").
 float3 DisplayMapTd(float3 extendedLinear)
 {
    return PsychoVDisplayMapWithHueReference(extendedLinear,
                                             LumaSettings.GameSettings.Contrast,
                                             LumaSettings.GameSettings.Saturation,
-                                            LumaSettings.GameSettings.HighlightsDesaturation);
+                                            LumaSettings.GameSettings.HighlightsDesaturation,
+                                            LumaSettings.GameSettings.HueEmulation);
 }
 
 // A linear frame as the canvas holds it: gamma space (POST_PROCESS_SPACE_TYPE 0), so the HUD blends onto it like vanilla.

@@ -5,13 +5,12 @@
 //   2. Run the exact vanilla clamped grade: the SDR reference (TONEMAP_TYPE 0) and the FXAA luma source.
 //   3. HDR: the same analytic UE3 grade as an extended function (SDR clamps and floors removed, nothing else changed). It supplies
 //      range, luminance and purity (extendedLinear).
-//   4. Soft hue reference: the extended grade through a per-channel ReinhardPiecewise(5, 1.5) in BT.2020, the RenoDX BL1 hue donor,
-//      bending the way the vanilla clip bent without its whitening.
-//   5. MacLeod–Boynton hue emulation in BT.2020: the reference's hue direction on the target's own purity (Hue Shift 100%, Blowout 0,
-//      the RenoDX BL1 contract), before the display map as RenoDX applies it.
-//   6. RenoDX's PsychoV31 maps the result to the user's peak and paper white, with the user's contrast, saturation and highlights
+//   4. RenoDX's PsychoV31 maps it to the user's peak and paper white, with the user's contrast, saturation and highlights
 //      desaturation.
-// The RenoDX donor and its MacLeod–Boynton emulation are ported exactly.
+//   5. MacLeod–Boynton hue emulation: the hue of the RenoDX BL1 donor, the extended grade through a per-channel
+//      ReinhardPiecewise(5, 1.5) in BT.2020 that bends the way the vanilla clip bent without its whitening, replaces the mapped hue
+//      (see "PsychoVDisplayMapWithHueReference").
+// SDR displays (and TONEMAP_TYPE 0) get the vanilla clamped grade.
 //
 // Output is stored gamma-encoded (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white) so the game's gamma SDR HUD blends on top as in
 // vanilla (a linear buffer washes it out). With UI_DRAW_TYPE >= 2 the scene is also pre-scaled by GamePaperWhite / UIPaperWhite so
@@ -107,24 +106,28 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    outLuma = 0.25 * log2(dot(postMidtones, float3(0.212670997, 0.715160012, 0.0721689984)) * 15.0 + 1.0);
 
 #if TONEMAP_TYPE >= 1
-   // 3. The extended HDR grade (clampSDR false), computed once: the hue reference and the display map both start
-   // from it.
-   const float3 extendedLinear = gamma_to_linear(GradeUE3_FromPostMidtones(GradeUE3_PostMidtones(untonemapped, false), false));
+   [branch] if (LumaSettings.DisplayMode == 1)
+   {
+      // 3. The extended HDR grade (clampSDR false), computed once: the hue reference and the display map both start from it.
+      const float3 extendedLinear = gamma_to_linear(GradeUE3_FromPostMidtones(GradeUE3_PostMidtones(untonemapped, false), false));
 
-   // 4-6. The RenoDX BL1 colour stage (common.hlsli, ApplyCustomGrading; its hue reference is the only hue source), then the
-   // display map: see "PsychoVDisplayMapWithHueReference". The output is linear BT.709, 1.0 = paper white.
-   outColor = PsychoVDisplayMapWithHueReference(extendedLinear,
-                                                LumaSettings.GameSettings.Contrast,
-                                                LumaSettings.GameSettings.Saturation,
-                                                LumaSettings.GameSettings.HighlightDechroma);
-#else
-   // Vanilla reference: the exact clamped SDR grade (gamma-encoded), linearized.
-   outColor = gamma_to_linear(saturate(GradeUE3_FromPostMidtones(postMidtones, true)));
+      // 4-5. The display map, then the RenoDX BL1 hue (common.hlsli, ApplyCustomGrading: its reference is the only hue source):
+      // see "PsychoVDisplayMapWithHueReference". The output is linear BT.709, 1.0 = paper white.
+      outColor = PsychoVDisplayMapWithHueReference(extendedLinear,
+                                                   LumaSettings.GameSettings.Contrast,
+                                                   LumaSettings.GameSettings.Saturation,
+                                                   LumaSettings.GameSettings.HighlightDechroma);
+   }
+   else
 #endif
+   {
+      // Vanilla reference (and SDR displays, see "PsychoVDisplayMap"): the exact clamped SDR grade (gamma-encoded), linearized.
+      outColor = gamma_to_linear(saturate(GradeUE3_FromPostMidtones(postMidtones, true)));
+   }
 
    // --- Common tail: the UI paper white pre-scale and the post-process space encode ---
    outColor *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
-   // The extended grade and the MacLeod-Boynton hue stage can emit NaN or negatives (the scene carries small negative/WCG values):
+   // The extended grade and the MacLeod-Boynton hue emulation can emit NaN or negatives (the scene carries small negative/WCG values):
    // none may reach the swapchain.
    outColor = (outColor == outColor) ? outColor : 0.0; // NaN -> 0 (NaN != NaN)
    outColor = max(0.0, outColor);

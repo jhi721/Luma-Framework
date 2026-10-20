@@ -3,8 +3,8 @@
 // then encodes with the brightness slider's gamma (c13.w, 0.5 at default) and applies per-channel curves: 16 point
 // sampled (slope, offset) segments, R/G in t1, B in t2, picked at saturate(x * 15/16). Above 1 the saturate keeps the
 // last segment, so the curve continues linearly there. HDR: the same grade with both upper clips as max(0) is the
-// signal; the hue follows a soft ReinhardPiecewise reference (MacLeod-Boynton), RenoDX's PsychoV31 maps to the
-// display (the Medal of Honor Airborne scheme, same UE3 grade family).
+// signal, RenoDX's PsychoV31 maps it to the display and the hue emulation then takes the hue of a soft ReinhardPiecewise
+// reference (MacLeod-Boynton, see "DisplayMapTd"). SDR displays keep the vanilla grade.
 #include "Includes/Common.hlsl"
 #include "Includes/Tonemap.hlsl"
 
@@ -49,11 +49,13 @@ void main(DGV_MAIN_SIGNATURE)
    const float exposure = ApplyDgvMask(ExposureTexture.Sample(ExposureSampler, 0.5), DgvConstants[50], DgvConstants[51]).x * 64.0;
    const float3 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorSampler, v5.xy), DgvConstants[44], DgvConstants[45]).xyz * LumaSettings.GameSettings.Exposure;
 
-#if TONEMAP_TYPE >= 1
-   const float3 displayLinear = DisplayMapTd(gamma_to_linear(GradeTd(scene, exposure, false)));
-#else
-   const float3 displayLinear = gamma_to_linear(GradeTd(scene, exposure, true));
-#endif
+   // SDR displays keep the vanilla grade (see "PsychoVDisplayMap")
+   const bool hdr = TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1;
+   float3 displayLinear = gamma_to_linear(GradeTd(scene, exposure, !hdr));
+   [branch] if (hdr)
+   {
+      displayLinear = DisplayMapTd(displayLinear);
+   }
    float3 outColor = EncodeTdCanvas(displayLinear, v5.xy);
 
 #if DEVELOPMENT

@@ -241,25 +241,19 @@ void main(DGV_MAIN_SIGNATURE)
       if (LumaSettings.DisplayMode == 1) // HDR
       {
          // Highlight hue: the colour stage of the other hard-clip ports (Borderlands GOTY, Medal of Honor Airborne,
-         // Mass Effect 2007 and 2010) and of RenoDX's BL1 template. Vanilla clipped per channel twice, in the glow blend
+         // Mass Effect 2007) and of RenoDX's BL1 template. Vanilla clipped per channel twice, in the glow blend
          // before this grade and in the 8-bit present blit after it, which bends a bright saturated source toward
-         // yellow-white; Luma removes both clips. This stage bends the hue the same way, partway and without the
-         // whitening: a per-channel ReinhardPiecewise(5, 1.5) of the colour itself in BT.2020 supplies a hue DIRECTION,
-         // and MacLeod-Boynton rebuilds it on the colour's own purity and T = L + M, before the display map so PsychoV31 maps
-         // the bent colour. Full hue strength and no purity transfer (the RenoDX ports' Hue Shift 100% and Blowout 0),
+         // yellow-white; Luma removes both clips. After the display map the hue is bent the same way, partway and
+         // without the whitening: a per-channel ReinhardPiecewise(5, 1.5) of the colour in BT.2020 supplies a hue
+         // DIRECTION, and MacLeod-Boynton puts it on the mapped colour's purity and T = L + M, replacing PsychoV31's own
+         // highlight lean. Full hue strength and no purity transfer (the RenoDX ports' Hue Shift 100% and Blowout 0),
          // fixed rather than exposed. The clip colour itself is no reference: a fully clipped one is achromatic, with no
          // MacLeod-Boynton direction at all.
-         // The gate sits at the reference's shoulder: below it ReinhardPiecewise returns its input exactly, and the
-         // BT.2020 channels of a BT.709 colour never exceed its max, so the reference equals the colour, the stage is a
-         // no-op up to float rounding, and those pixels skip the MacLeod-Boynton solve. One constant for both keeps them
-         // from drifting apart.
          // See "PsychoVDisplayMapWithHueReference".
          postProcessedColor = PsychoVDisplayMapWithHueReference(lin,
                                                                 LumaSettings.GameSettings.Contrast,
                                                                 LumaSettings.GameSettings.Saturation,
-                                                                LumaSettings.GameSettings.HighlightDechroma,
-                                                                1.5,
-                                                                true);
+                                                                LumaSettings.GameSettings.HighlightDechroma);
       }
       else // SDR (still presented through the scRGB swapchain)
       {

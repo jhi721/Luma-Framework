@@ -8,10 +8,10 @@
 // and sanitize.
 // HDR pipeline (analytic in-shader, no LUT; the Borderlands GOTY / MoH Airborne production pipeline): reconstruct the
 // scene mix exactly as the game does -> untonemapped; keep the game's own clamped grade as the exact SDR reference;
-// run that same grade with its upper saturate()s as max(0), decoded to display-linear -> the HDR signal; in BT.2020 a
-// soft per-channel ReinhardPiecewise(5, 1.5) hue reference, whose hue direction MacLeodBoynton::HueOnlyBT2020 rebuilds
-// on the signal's own purity; PsychoV31 maps it to the user's peak/paper white (see "PsychoVDisplayMap"); the engine
-// fade last, through the vanilla curve.
+// run that same grade with its upper saturate()s as max(0), decoded to display-linear -> the HDR signal; PsychoV31 maps
+// it to the user's peak/paper white, then MacLeod-Boynton replaces the mapped hue with that of a soft per-channel
+// ReinhardPiecewise(5, 1.5) reference in BT.2020 (see "PsychoVDisplayMapWithHueReference"); the engine fade last,
+// through the vanilla curve. SDR displays keep the vanilla grade in both passes.
 // The engine SKIPS the uber in elevators and some loading scenes; main.cpp reports that through
 // LumaData.GameData.UberRanThisFrame and the gamma replacement then runs the HDR block itself off the ungraded scene
 // (DoF and the Luma glow composited by the standalone DOFAndBloom blend 0x218D4AE2 when that chain has one).
@@ -30,8 +30,8 @@
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3, DoFBlurAmount
 
-// HDR / vanilla. 1 = extended native grade + MacLeod-Boynton hue + PsychoV31 display map (default). 0 = vanilla clamped SDR
-// reference.
+// HDR / vanilla. 1 = extended native grade + PsychoV31 display map + MacLeod-Boynton hue emulation (default, HDR displays).
+// 0 = vanilla clamped SDR reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
 #endif
@@ -85,7 +85,7 @@ float3 GradeUE3(float3 scene, bool clampSDR, float3 outputScale)
    return UE3Grade(scene, clampSDR, outputScale, SceneShadowsAndDesat, SceneInverseHighLights.xyz, SceneMidTones.xyz, SceneLuminanceWeights.xyz, GammaOverlayColor.xyz, GammaColorScaleAndInverse.w);
 }
 
-// Sanitize anything stored in fp16 or the canvas: the extended grade, the hue stage, encode and dither can each emit
+// Sanitize anything stored in fp16 or the canvas: the extended grade, the hue emulation, encode and dither can each emit
 // NaN, which reads back black in a unorm target. Bit test, not "x != x" (optimized away). Covers -nan(ind) on a fade.
 float3 Sanitize(float3 c)
 {
@@ -94,21 +94,16 @@ float3 Sanitize(float3 c)
 }
 
 #if TONEMAP_TYPE >= 1
-// Shared HDR back half: extended grade -> BT.2020 -> soft hue reference -> MacLeod-Boynton hue -> BT.709 -> PsychoV31
-// display map, which takes the user's contrast, saturation and highlights desaturation. Takes and returns LINEAR light,
+// Shared HDR back half: extended grade -> PsychoV31 display map, which takes the user's contrast, saturation and highlights
+// desaturation -> MacLeod-Boynton hue emulation. Takes and returns LINEAR light,
 // 1.0 = paper white, NO engine fade (the caller re-applies it: contrast pivots on mid-gray, so a fade before it would
 // never reach black). `color` is the pass's own grade with its upper saturate()s as max(0), decoded to display-linear:
 // vanilla-exact below the clip and its own analytic continuation above it, so range, luminance and chromaticity all
 // come from the game's math.
 float3 FinishME1HDR(float3 color)
 {
-   // 3. Colour stage, in a BT.2020 working space (round-tripped back to BT.709 before the display map: gamut-correct
-   // handling of saturated highlights, not a display-gamut expansion). Soft hue reference: ReinhardPiecewise(x, 5, 1.5)
-   // per channel, where the RenoDX BL1 port builds it. Linear below 1.5 and rolling toward 5 above, it compresses a
-   // saturated highlight's strong channel before its weak ones, so the hue leans the way the vanilla clip leaned it,
-   // without the clip's whitening. MacLeod-Boynton then rebuilds that reference's hue direction on the target's own
-   // purity and T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it.
-   // 4. The display map (see "PsychoVDisplayMapWithHueReference" for both).
+   // 3-4. The display map, then the hue of the RenoDX BL1 soft per-channel reference, which leans a saturated highlight the
+   // way the vanilla clip did without its whitening (see "PsychoVDisplayMapWithHueReference").
    return PsychoVDisplayMapWithHueReference(color,
                                             LumaSettings.GameSettings.Contrast,
                                             LumaSettings.GameSettings.Saturation,
@@ -149,24 +144,28 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
    untonemapped *= LumaSettings.GameSettings.Exposure;
 
    // The output scale doubles as the engine FADE. Held OUT of the extended grade and re-applied as a gain at the end,
-   // after the display map, so it cannot bias the hue stage or the rolloff.
+   // after the display map, so it cannot bias the rolloff or the hue emulation.
    const float3 outputScale = GammaColorScaleAndInverse.xyz;
 
-   // 2. The game's grade, vanilla-exact, fade included. THE output on TONEMAP_TYPE 0; on the HDR path only the DEV
-   // bisect reads it (fxc dead-strips it there, measured).
-   const float3 sdr_vanilla = GradeUE3(untonemapped, true, outputScale);
-
+   float3 outColor;
 #if TONEMAP_TYPE >= 1
-   // The extended grade carries no fade (outputScale = 1) and is decoded through the DOWNSTREAM display gamma
-   // (VanillaToLinear, not a plain gamma decode): the direct continuation of the full vanilla chain is the HDR signal.
-   float3 hdr = FinishME1HDR(VanillaToLinear(GradeUE3(untonemapped, false, 1.0)));
-   // Re-apply the engine fade LAST, after the creative sliders, as the gain vanilla's chain gives it: the scale sits
-   // before this pass's exponent and the display gamma, so in linear it is scale^(w * DisplayGamma), not scale. At
-   // rest (scale 1) it is a no-op; mid-fade it matches the vanilla curve instead of running brighter.
-   float3 outColor = hdr * VanillaToLinear(PowUE3(outputScale, GammaColorScaleAndInverse.www)); // LINEAR, 1.0 = paper white
-#else
-   float3 outColor = sdr_vanilla; // vanilla encoding, whatever this pass's exponent is
+   [branch] if (LumaSettings.DisplayMode == 1)
+   {
+      // The extended grade carries no fade (outputScale = 1) and is decoded through the DOWNSTREAM display gamma
+      // (VanillaToLinear, not a plain gamma decode): the direct continuation of the full vanilla chain is the HDR signal.
+      const float3 hdr = FinishME1HDR(VanillaToLinear(GradeUE3(untonemapped, false, 1.0)));
+      // Re-apply the engine fade LAST, after the creative sliders, as the gain vanilla's chain gives it: the scale sits
+      // before this pass's exponent and the display gamma, so in linear it is scale^(w * DisplayGamma), not scale. At
+      // rest (scale 1) it is a no-op; mid-fade it matches the vanilla curve instead of running brighter.
+      outColor = hdr * VanillaToLinear(PowUE3(outputScale, GammaColorScaleAndInverse.www)); // LINEAR, 1.0 = paper white
+   }
+   else
 #endif
+   {
+      // 2. The game's grade, vanilla-exact, fade included, in the vanilla encoding (whatever this pass's exponent is): the
+      // output on TONEMAP_TYPE 0 and SDR displays (see "PsychoVDisplayMap"; RunME1GammaCorrection matches).
+      outColor = GradeUE3(untonemapped, true, outputScale);
+   }
 
    outColor = Sanitize(outColor);
 
@@ -177,7 +176,7 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
    if (LumaSettings.DevSetting02 > 0.5)
       return saturate(untonemapped);
    if (LumaSettings.DevSetting03 > 0.5)
-      return saturate(sdr_vanilla);
+      return saturate(GradeUE3(untonemapped, true, outputScale));
 #endif
 
    return outColor;
@@ -189,9 +188,11 @@ float3 RunME1Tonemap(float2 blurUV, float2 sceneUV, out float sceneDepth)
 #define GcOverlayColor PsConstants[10] // .xyz OverlayColor, .w its blend weight (this pass's fade)
 #define GcInverseGamma PsConstants[11] // .x inverse display gamma (measured 0.625 = 1/1.6, the game's DisplayGamma default)
 
-// Vanilla-exact: saturate(lerp(scene * ColorScale, Overlay.rgb, Overlay.a)) then the inverse-gamma pow.
+// Vanilla-exact: saturate(lerp(scene * ColorScale, Overlay.rgb, Overlay.a)) then the inverse-gamma pow, so both frame shapes come
+// out vanilla-exact. Exposure only on gamma-only frames: when the uber ran, its output already carries it.
 float3 GradeGCVanilla(float3 scene)
 {
+   scene *= LumaData.GameData.UberRanThisFrame > 0.5 ? 1.0 : LumaSettings.GameSettings.Exposure;
    float3 c = lerp(scene * GcColorScale.xyz, GcOverlayColor.xyz, GcOverlayColor.w);
    return PowUE3(saturate(c), GcInverseGamma.xxx);
 }
@@ -212,6 +213,11 @@ float3 RunME1GammaCorrection(float2 sceneUV)
    float4 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorTextureSampler_s, sceneUV), DgvMaskT0, DgvFillT0);
 
 #if TONEMAP_TYPE >= 1
+   // SDR displays: the uber left the vanilla grade too
+   [branch] if (LumaSettings.DisplayMode != 1)
+   {
+      return Sanitize(GradeGCVanilla(scene.xyz));
+   }
    // The post-load flash (0.35 s re-graded frame: mids x0.10, highlights x2.25, peak 222 -> 953 nits) is NOT a stale
    // graded buffer - gating this on the intermediate's alpha changed nothing in game; do not re-add it.
    float3 outColor; // linear, 1.0 = paper white
@@ -254,10 +260,7 @@ float3 RunME1GammaCorrection(float2 sceneUV)
    }
 #endif
 #else
-   // Vanilla: this pass's saturate and pow are the original's, so both frame shapes come out vanilla-exact. Exposure
-   // only on gamma-only frames: when the uber ran, its output already carries it.
-   const float exposure = LumaData.GameData.UberRanThisFrame > 0.5 ? 1.0 : LumaSettings.GameSettings.Exposure;
-   float3 outColor = GradeGCVanilla(scene.xyz * exposure);
+   float3 outColor = GradeGCVanilla(scene.xyz);
 #endif
 
    return Sanitize(outColor);

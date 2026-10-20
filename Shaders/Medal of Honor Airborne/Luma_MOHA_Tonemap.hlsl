@@ -4,10 +4,10 @@
 // and its TWO saturate()s clip 19.4% of a bright frame — highlight detail the engine computes and drops. Strategy
 // (analytic in-shader TM, no LUT; the Borderlands GOTY production pipeline): reconstruct the scene mix exactly as the
 // game does -> untonemapped; keep the game's own clamped grade as the exact SDR reference; run that same grade with
-// its two upper saturate()s as max(0) -> extendedLinear, the HDR signal (range, luminance, chroma); in BT.2020 build
-// a soft per-channel ReinhardPiecewise(5, 1.5) hue reference and let MacLeod-Boynton rebuild its hue direction on the
-// target's own purity (Hue 1, Blowout 0); PsychoV31 maps it to the user's peak/paper white with the user's grade
-// (see "PsychoVDisplayMap") -> hdr; the engine fade last. Output is GAMMA space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper
+// its two upper saturate()s as max(0) -> extendedLinear, the HDR signal (range, luminance, chroma); PsychoV31 maps it
+// to the user's peak/paper white with the user's grade, then MacLeod-Boynton replaces the mapped hue with that of a
+// soft per-channel ReinhardPiecewise(5, 1.5) reference in BT.2020 (see "PsychoVDisplayMapWithHueReference") -> hdr;
+// the engine fade last. SDR displays keep the clamped grade. Output is GAMMA space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper
 // white) because the HUD blends src-alpha onto this same canvas right after and a linear buffer washes it out;
 // UI_DRAW_TYPE 2 pre-scales by GamePaperWhite/UIPaperWhite. Two transcription rules hold throughout: every texture fetch
 // in a dgVoodoo-translated shader is followed by an `and`/`or` pair against b3 (its D3D9 format emulation), and the
@@ -25,8 +25,8 @@
 
 #include "Includes/GameBindings.hlsl" // b3/b4, the dgVoodoo masks, ApplyDgvMask, PowUE3
 
-// HDR / vanilla. 1 = extended native grade + MacLeod-Boynton hue + PsychoV31 display map (default). 0 = vanilla clamped SDR
-// reference.
+// HDR / vanilla. 1 = extended native grade + PsychoV31 display map + MacLeod-Boynton hue emulation (default, HDR displays).
+// 0 = vanilla clamped SDR reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
 #endif
@@ -70,9 +70,8 @@ float3 GradeUE3(float3 scene, bool clampSDR, float3 outputScale)
    return UE3Grade(scene, clampSDR, outputScale, SceneShadowsAndDesat, SceneInverseHighLights.xyz, SceneMidTones.xyz, SceneLuminanceWeights.xyz, GammaOverlayColor.xyz, GammaColorScaleAndInverse.w);
 }
 
-// Shared HDR back half, used by both replaced passes: extended grade -> contrast -> BT.2020 -> soft hue reference ->
-// MacLeod-Boynton hue -> display rolloff (dechroma inside it) -> saturation -> engine fade -> paper white -> encode ->
-// sanitize.
+// Shared back half, used by both replaced passes: extended grade -> display map (the user's contrast, saturation and
+// dechroma inside it) -> MacLeod-Boynton hue emulation -> engine fade -> paper white -> encode -> sanitize.
 //
 // Both grades are GAMMA-space outputs of the pass's own grade over the same `untonemapped`:
 //   `sdrVanillaGamma`    exactly as the original computes it, clamped, fade included (the TONEMAP_TYPE 0 output)
@@ -83,32 +82,31 @@ float3 GradeUE3(float3 scene, bool clampSDR, float3 outputScale)
 // (UberPostProcessBlend scales, GammaCorrection lerps toward a colour). fadeScale 1 / overlay.w 0 disables either.
 float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGradeGamma, float3 fadeScale, float4 overlay, float2 sceneUV)
 {
+   float3 outColor;
 #if TONEMAP_TYPE >= 1
-   // 3. The extended grade is the HDR signal: range, luminance and chroma all come from the game's own math.
-   float3 extendedLinear = gamma_to_linear(extendedGradeGamma);
+   [branch] if (LumaSettings.DisplayMode == 1)
+   {
+      // 3. The extended grade is the HDR signal: range, luminance and chroma all come from the game's own math.
+      const float3 extendedLinear = gamma_to_linear(extendedGradeGamma);
 
-   // 4. Colour stage, in a BT.2020 working space (converted back to BT.709 before the display map: gamut-correct
-   // handling of saturated highlights, not a display-gamut expansion). Soft hue reference: ReinhardPiecewise(x, 5, 1.5)
-   // per channel, where the RenoDX BL1 port builds it. Linear below 1.5 and rolling toward 5 above, it compresses a
-   // saturated highlight's strong channel before its weak ones, so the hue leans the way the vanilla clip leaned it,
-   // without the clip's whitening. MacLeod-Boynton then rebuilds that reference's hue direction on the target's own
-   // purity and T = L + M anchor (hue strength 1, chrominance 0), before the display map as RenoDX applies it.
-   // 5. The display map (see "PsychoVDisplayMapWithHueReference" for both).
-   float3 hdr = PsychoVDisplayMapWithHueReference(extendedLinear,
-                                                  LumaSettings.GameSettings.Contrast,
-                                                  LumaSettings.GameSettings.Saturation,
-                                                  LumaSettings.GameSettings.HighlightsDesaturation);
+      // 4-5. The display map, then the hue of the RenoDX BL1 soft per-channel reference, which leans a saturated highlight the
+      // way the vanilla clip did without its whitening (see "PsychoVDisplayMapWithHueReference").
+      float3 hdr = PsychoVDisplayMapWithHueReference(extendedLinear,
+                                                     LumaSettings.GameSettings.Contrast,
+                                                     LumaSettings.GameSettings.Saturation,
+                                                     LumaSettings.GameSettings.HighlightsDesaturation);
 
-   // Re-apply the engine fade linearly, LAST, after the display map: its contrast pivots on mid-gray, so a fade
-   // before it would never reach black. At rest both are no-ops.
-   hdr *= fadeScale;
-   hdr = lerp(hdr, overlay.xyz, overlay.w);
-
-   float3 outColor = hdr; // linear, 1.0 = paper white
-#else
-   // Vanilla reference: linearize the clamped SDR grade.
-   float3 outColor = gamma_to_linear(sdrVanillaGamma);
+      // Re-apply the engine fade linearly, LAST, after the display map: its contrast pivots on mid-gray, so a fade
+      // before it would never reach black. At rest both are no-ops.
+      hdr *= fadeScale;
+      outColor = lerp(hdr, overlay.xyz, overlay.w); // linear, 1.0 = paper white
+   }
+   else
 #endif
+   {
+      // Vanilla reference (and SDR displays, see "PsychoVDisplayMap"): linearize the clamped SDR grade.
+      outColor = gamma_to_linear(sdrVanillaGamma);
+   }
 
    // --- Common tail: UI paper-white pre-scale + post-process-space encode ---
    outColor *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true);
@@ -124,7 +122,7 @@ float3 FinishMOHA(float3 untonemapped, float3 sdrVanillaGamma, float3 extendedGr
    }
 #endif
 #endif
-   // Sanitize LAST: the extended grade, the hue stage, encode and dither can each emit NaN, and a NaN in a unorm target reads
+   // Sanitize LAST: the extended grade, the hue emulation, encode and dither can each emit NaN, and a NaN in a unorm target reads
    // back black. Also covers cb4[15] (-nan(ind) on a load fade), which vanilla's saturate flushes to 0.
    outColor = IsNaN_Strict(outColor) ? 0.0 : outColor; // explicit exponent/mantissa bit test
    outColor = max(0.0, outColor);
@@ -169,7 +167,7 @@ float3 RunMOHATonemap(float2 blurUV, float2 sceneUV)
    untonemapped *= LumaSettings.GameSettings.Exposure;
 
    // The grade's output scale doubles as the engine FADE (level start, cutscenes). It stays OUT of the extended grade
-   // and is re-applied as a gain at the end, after the display map, so it cannot bias the hue stage or the rolloff.
+   // and is re-applied as a gain at the end, after the display map, so it cannot bias the rolloff or the hue emulation.
    const float3 outputScale = GammaColorScaleAndInverse.xyz;
 
    // 2. The game's own grade (artistic intent), gamma-encoded SDR: vanilla-exact, fade included. The extended grade

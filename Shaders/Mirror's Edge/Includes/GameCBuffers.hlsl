@@ -21,6 +21,7 @@ struct LumaGameSettings
    float Dithering;              // 0/1. Output dither against banding (8 bit SDR, 10 bit PQ HDR).
    float VideoAutoHDREnable;     // 0/1. PumboAutoHDR on the Bink passes (Video_0xE41621CF.ps_5_0.hlsl).
    float VideoAutoHDRBoost;      // 0..1. Video peak = lerp(SDR white, 250 nits, boost).
+   float HueEmulation;           // 0..1, 1 = the clip's hue lean. Weight of the reference hue after the HDR display map (Tonemap.hlsl).
 };
 
 struct LumaGameData

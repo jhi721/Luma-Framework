@@ -59,14 +59,17 @@ float3 SR_DisplayMap(float3 hdrLinear, float2 uv)
    return encoded;
 }
 
-// The pass result: the vanilla SDR reference (TONEMAP_TYPE 0), or the HDR recovery of it through PsychoV31.
+// The pass result: the vanilla SDR reference (TONEMAP_TYPE 0, SDR displays), or the HDR recovery of it through PsychoV31.
 float4 SR_Output(float3 vanillaLinear, float recoveryGain, float2 uv, float alpha)
 {
-#if TONEMAP_TYPE <= 0
-   return float4(SR_EncodeOutput(vanillaLinear), alpha);
-#else
-   return float4(SR_DisplayMap(vanillaLinear * recoveryGain, uv), alpha);
+#if TONEMAP_TYPE >= 1
+   // SDR displays keep the vanilla reference (see "PsychoVDisplayMap")
+   [branch] if (LumaSettings.DisplayMode == 1)
+   {
+      return float4(SR_DisplayMap(vanillaLinear * recoveryGain, uv), alpha);
+   }
 #endif
+   return float4(SR_EncodeOutput(vanillaLinear), alpha);
 }
 
 // HDR brightness recovery: how much brighter the clamped vanilla output gets, one scalar for all channels.

@@ -19,19 +19,17 @@
 // The zone weights (shadow/mid/highlight) always come from the mean of the stage input color. Every stage is
 // transcribed operand-for-operand from the disassembly (ps_ccr_* in the games' sh_* shader archives).
 //
-// SDR path: the exact vanilla grade on the saturated scene (the UNORM RT clamp, emulated).
+// SDR path (TONEMAP_TYPE 0 and SDR displays): the exact vanilla grade on the saturated scene (the UNORM RT clamp, emulated).
 // HDR path (canon for hard-clip games, BL GOTY precedent): the same grade as an extended function (upper clamps
 // become max(0); HLS runs on the color normalized by its max channel since HLS is undefined above 1; zone weights
-// from the saturated mean) -> linear -> soft ReinhardPiecewise hue reference in BT.2020 (Y5R: the gated vanilla SDR) -> MacLeod-Boynton hue
-// emulation -> PsychoV31 to peak. The user grade (Exposure, and Contrast, Saturation and Highlights Desaturation inside
+// from the saturated mean) -> linear -> PsychoV31 to peak -> MacLeod-Boynton hue emulation from a soft ReinhardPiecewise reference
+// in BT.2020 (Y5R: the gated vanilla SDR). The user grade (Exposure, and Contrast, Saturation and Highlights Desaturation inside
 // PsychoV31) is HDR only. Output stays in gamma space (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white) so the HUD,
 // the AA (CMAA2/FXAA or Luma's SMAA), CAS and render_fb downstream behave as in vanilla.
 
 // clang-format off
 #include "Common.hlsl"
-#include "../../Includes/Reinhard.hlsl"
-#include "../../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
-#include "../../Includes/PsychoV31.hlsl"     // PsychoVDisplayMap
+#include "../../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference / WithHueEmulation
 // clang-format on
 
 #ifndef CCR_HLS
@@ -229,47 +227,58 @@ float4 ColorCorrect(float colorAlpha, float4 uv)
    const float3 sceneSDR = saturate(scene);
 #endif
    const float3 w = ZoneWeights(sceneSDR);
-   float3 gradedSDR = Grade(sceneSDR, w, true);
 #if CCR_MASK
    const float maskWeight = t2.Sample(s2_s, uv.zw).r * cb4[0].x;
-   gradedSDR = (gradedSDR - sceneSDR) * maskWeight + sceneSDR;
 #endif
-
-#if TONEMAP_TYPE >= 1
-   const float3 sceneHDR = max(0.0, scene);
-   float3 gradedHDR = Grade(sceneHDR, w, false);
+   // SDR displays keep the vanilla grade (see "PsychoVDisplayMap"); only they and Y5R's hue reference read it
+   const bool hdr = TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1;
+   float3 gradedSDR = 0.0;
+   [branch] if (!hdr || CCR_MATERIAL_CURVE)
+   {
+      gradedSDR = Grade(sceneSDR, w, true);
 #if CCR_MASK
-   gradedHDR = (gradedHDR - sceneHDR) * maskWeight + sceneHDR;
+      gradedSDR = (gradedSDR - sceneSDR) * maskWeight + sceneSDR;
 #endif
-   // D3D min returns the non-NaN operand: a leftover NaN or inf lands at peak like vanilla's white store, not at black.
-   gradedHDR = min(gradedHDR, 1e4);
-   float3 extendedLinear = gamma_to_linear(gradedHDR, GCT_POSITIVE) * LumaSettings.GameSettings.Exposure;
-   float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
+   }
+
+   float3 color;
+#if TONEMAP_TYPE >= 1
+   [branch] if (hdr)
+   {
+      const float3 sceneHDR = max(0.0, scene);
+      float3 gradedHDR = Grade(sceneHDR, w, false);
+#if CCR_MASK
+      gradedHDR = (gradedHDR - sceneHDR) * maskWeight + sceneHDR;
+#endif
+      // D3D min returns the non-NaN operand: a leftover NaN or inf lands at peak like vanilla's white store, not at black.
+      gradedHDR = min(gradedHDR, 1e4);
+      const float3 extendedLinear = gamma_to_linear(gradedHDR, GCT_POSITIVE) * LumaSettings.GameSettings.Exposure;
 
 #if CCR_MATERIAL_CURVE
-   // Y5R's highlights never clipped: its materials bend each channel through the soft vanilla curve, so the vanilla graded
-   // SDR is the exact hue reference. Where it whitens its hue is unstable, so it fades to this color's own hue by its HSV
-   // saturation coordinate, (max - min) / max of the gamma-encoded color (0.05..0.3, a BotW-style gate); both are
-   // max-normalized so the lerp blends hues, not magnitudes.
-   const float3 vanillaSDR = max(0.0, gradedSDR);
-   const float vanillaMax = max3(vanillaSDR);
-   const float hueGate = smoothstep(0.05, 0.3, vanillaMax > 0.0 ? (vanillaMax - min3(vanillaSDR)) / vanillaMax : 0.0);
-   const float3 vanillaBT2020 = BT709_To_BT2020(gamma_to_linear(vanillaSDR, GCT_POSITIVE));
-   float3 hueReferenceBT2020 = lerp(extendedBT2020 / max(max3(extendedBT2020), 1e-6), vanillaBT2020 / max(max3(vanillaBT2020), 1e-6), hueGate);
+      // Y5R's highlights never clipped: its materials bend each channel through the soft vanilla curve, so the vanilla graded
+      // SDR is the exact hue reference. Where it whitens its hue is unstable, so it fades to this color's own hue by its HSV
+      // saturation coordinate, (max - min) / max of the gamma-encoded color (0.05..0.3, a BotW-style gate); both are
+      // max-normalized so the lerp blends hues, not magnitudes.
+      const float3 vanillaSDR = max(0.0, gradedSDR);
+      const float vanillaMax = max3(vanillaSDR);
+      const float hueGate = smoothstep(0.05, 0.3, vanillaMax > 0.0 ? (vanillaMax - min3(vanillaSDR)) / vanillaMax : 0.0);
+      const float3 extendedBT2020 = BT709_To_BT2020(extendedLinear);
+      const float3 vanillaBT2020 = BT709_To_BT2020(gamma_to_linear(vanillaSDR, GCT_POSITIVE));
+      const float3 hueReferenceBT2020 = lerp(extendedBT2020 / max(max3(extendedBT2020), 1e-6), vanillaBT2020 / max(max3(vanillaBT2020), 1e-6), hueGate);
+      // See "PsychoVDisplayMapWithHueEmulation": the reference's hue replaces the mapped one.
+      color = PsychoVDisplayMapWithHueEmulation(extendedLinear, hueReferenceBT2020, LumaSettings.GameSettings.Contrast,
+                                                LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightDechroma);
 #else
-   // Soft hue reference: per-channel ReinhardPiecewise(5, 1.5) in BT.2020 bends saturated highlights the way the
-   // vanilla per-channel clip did, without its whitening; MacLeod-Boynton keeps only its hue direction.
-   float3 hueReferenceBT2020 = Reinhard::ReinhardPiecewise(extendedBT2020, 5.0, 1.5);
+      // The per-channel clip's soft hue reference (see "PsychoVDisplayMapWithHueReference")
+      color = PsychoVDisplayMapWithHueReference(extendedLinear, LumaSettings.GameSettings.Contrast, LumaSettings.GameSettings.Saturation,
+                                                LumaSettings.GameSettings.HighlightDechroma);
 #endif
-   const float3 hueTransferredBT709 = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(extendedBT2020, hueReferenceBT2020));
-
-   // See "PsychoVDisplayMap". The hue transfer above works in BT.2020, so its colors can leave BT.709.
-   float3 color = PsychoVDisplayMap(hueTransferredBT709, LumaSettings.GameSettings.Contrast,
-                                    LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightDechroma,
-                                    renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT2020);
-#else
-   float3 color = gamma_to_linear(gradedSDR);
+   }
+   else
 #endif
+   {
+      color = gamma_to_linear(gradedSDR);
+   }
 
    // max also turns NaN into 0 (D3D10+ min/max return the non-NaN operand).
    return float4(YRC_EncodeOutput(max(0.0, color)), colorAlpha);

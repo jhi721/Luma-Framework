@@ -330,82 +330,88 @@ float3 GradeMOH(float3 tonemapped)
 // carries no fade, so folding the fade into the reference makes the ratio blow up as the screen darkens.
 float3 FinishMOH(float3 untonemapped, float3 graded_sdr, float3 vanilla_sdr, float2 sceneUV)
 {
+   float3 outColor;
 #if TONEMAP_TYPE >= 1
-   // Linearized with the SHARED transfer function, not with the inverse of the game's own pow(x, 0.4).
-   // The engine encodes at gamma 2.5 but was authored on ~2.2 displays, so the light the player actually saw is
-   // pow(sdr, 2.2) — that, not the engine's nominal intent, is the reference the recovery has to build on, and it
-   // is what makes the TONEMAP_TYPE 0 path round-trip to a vanilla-identical image (Settings.hlsl: a game that
-   // fuses tonemap and encoding into one formula selects Gamma 2.2).
-   float3 ungraded_sdr = gamma_to_linear(graded_sdr); // linear SDR reference (1.0 = white)
+   [branch] if (LumaSettings.DisplayMode == 1)
+   {
+      // Linearized with the SHARED transfer function, not with the inverse of the game's own pow(x, 0.4).
+      // The engine encodes at gamma 2.5 but was authored on ~2.2 displays, so the light the player actually saw is
+      // pow(sdr, 2.2) — that, not the engine's nominal intent, is the reference the recovery has to build on, and it
+      // is what makes the TONEMAP_TYPE 0 path round-trip to a vanilla-identical image (Settings.hlsl: a game that
+      // fuses tonemap and encoding into one formula selects Gamma 2.2).
+      float3 ungraded_sdr = gamma_to_linear(graded_sdr); // linear SDR reference (1.0 = white)
 
-   // Uncompress by the max channel: one scalar, applied to the graded SDR. See MOH_FilmicMaxChannelExpand.
-   float3 recovered = ungraded_sdr * MOH_FilmicMaxChannelExpand(untonemapped);
+      // Uncompress by the max channel: one scalar, applied to the graded SDR. See MOH_FilmicMaxChannelExpand.
+      float3 recovered = ungraded_sdr * MOH_FilmicMaxChannelExpand(untonemapped);
 
 #if DEVELOPMENT
-   // A/B against the path this replaced, for the calibration pass only. DevSetting04 = 1 selects the legacy
-   // additive recovery plus its explicit hue restoration; 0 (the default, and the only thing Publishing compiles)
-   // selects the max-channel wrap above. DELETE both this branch and everything it reaches once the comparison is
-   // settled -- this game's sources are untracked, so there is no commit to fall back to in the meantime.
-   [branch] if (LumaSettings.DevSetting04 > 0.5)
-   {
-      // Recover the highlight luminance the SDR chain clipped, on top of the graded look.
-      float3 neutral_sdr = NeutralSDR(untonemapped);
-      recovered = UpgradeToneMap(untonemapped, neutral_sdr, ungraded_sdr);
+      // A/B against the path this replaced, for the calibration pass only. DevSetting04 = 1 selects the legacy
+      // additive recovery plus its explicit hue restoration; 0 (the default, and the only thing Publishing compiles)
+      // selects the max-channel wrap above. DELETE both this branch and everything it reaches once the comparison is
+      // settled -- this game's sources are untracked, so there is no commit to fall back to in the meantime.
+      [branch] if (LumaSettings.DevSetting04 > 0.5)
+      {
+         // Recover the highlight luminance the SDR chain clipped, on top of the graded look.
+         float3 neutral_sdr = NeutralSDR(untonemapped);
+         recovered = UpgradeToneMap(untonemapped, neutral_sdr, ungraded_sdr);
 
 #if ENABLE_HUE_RESTORATION
-      // --- vanilla highlight-hue emulation ---
-      // The vanilla ceiling here is a per-channel `saturate` feeding a [0,1] LUT: on a bright saturated source R
-      // reaches 1 first, then G, so the hue skews toward yellow-white approaching the clip, and the recovery above
-      // removes that skew along with the clip. `ungraded_sdr` IS that clipped grade, so it is the faithful reference
-      // and needs no synthetic stand-in (BL2 builds a ReinhardPiecewise one only because its wrap makes the grade
-      // invertible; Airborne and BL GOTY re-run their analytic grades UNCLAMPED and lock hue at strength 1.0 AFTER
-      // the display map instead — neither is constructible here: the filmic curve is only valid on [0,1] and the LUT
-      // is a [0,1] lookup, so no un-blown grade exists).
-      //
-      // Placement is therefore the clipped-reference one: BEFORE the display map, so PsychoV31 maps a colour that
-      // already carries the vanilla skew, rather than being pulled back afterwards.
-      //
-      // The gate is exact, not conservative: below 1.0 nothing clipped, `recovered` is `ungraded_sdr` and the restore
-      // provably does nothing, sparing two Oklab round trips on the overwhelming majority of pixels.
-      //
-      // HAZARD: hue strength must stay BELOW 1.0. Once every channel clips the reference is (1,1,1), whose
-      // chrominance is 1.7e-4 rather than 0, so the helper misses its safe-division fallback and its renormalization
-      // goes near-singular — the hue runs away while chroma stays put, and a white-hot pixel comes out CYAN. The
-      // measured margins are in The Witcher 2's FinalGrade_0xDE5CF9CD.ps_5_0.hlsl, which restores against the same
-      // kind of reference: +0.87 deg at 0.80, +4.49 at 0.95, +143.9 at 1.00. 0.90 is the hard ceiling.
-      [branch] if (max(recovered.r, max(recovered.g, recovered.b)) > 1.0)
-      {
-         // Only the CHROMA argument can whiten: the helper transfers hue, then restores the target's chrominance.
-         recovered = RestoreHueAndChrominance(recovered, ungraded_sdr, saturate(LumaSettings.GameSettings.HighlightsHueStrength), saturate(LumaSettings.GameSettings.HighlightsHueChroma));
-      }
+         // --- vanilla highlight-hue emulation ---
+         // The vanilla ceiling here is a per-channel `saturate` feeding a [0,1] LUT: on a bright saturated source R
+         // reaches 1 first, then G, so the hue skews toward yellow-white approaching the clip, and the recovery above
+         // removes that skew along with the clip. `ungraded_sdr` IS that clipped grade, so it is the faithful reference
+         // and needs no synthetic stand-in (BL2 builds a ReinhardPiecewise one only because its wrap makes the grade
+         // invertible; Airborne and BL GOTY re-run their analytic grades UNCLAMPED and lock hue at strength 1.0 AFTER
+         // the display map instead — neither is constructible here: the filmic curve is only valid on [0,1] and the LUT
+         // is a [0,1] lookup, so no un-blown grade exists).
+         //
+         // Placement is therefore the clipped-reference one: BEFORE the display map, so PsychoV31 maps a colour that
+         // already carries the vanilla skew, rather than being pulled back afterwards.
+         //
+         // The gate is exact, not conservative: below 1.0 nothing clipped, `recovered` is `ungraded_sdr` and the restore
+         // provably does nothing, sparing two Oklab round trips on the overwhelming majority of pixels.
+         //
+         // HAZARD: hue strength must stay BELOW 1.0. Once every channel clips the reference is (1,1,1), whose
+         // chrominance is 1.7e-4 rather than 0, so the helper misses its safe-division fallback and its renormalization
+         // goes near-singular — the hue runs away while chroma stays put, and a white-hot pixel comes out CYAN. The
+         // measured margins are in The Witcher 2's FinalGrade_0xDE5CF9CD.ps_5_0.hlsl, which restores against the same
+         // kind of reference: +0.87 deg at 0.80, +4.49 at 0.95, +143.9 at 1.00. 0.90 is the hard ceiling.
+         [branch] if (max(recovered.r, max(recovered.g, recovered.b)) > 1.0)
+         {
+            // Only the CHROMA argument can whiten: the helper transfers hue, then restores the target's chrominance.
+            recovered = RestoreHueAndChrominance(recovered, ungraded_sdr, saturate(LumaSettings.GameSettings.HighlightsHueStrength), saturate(LumaSettings.GameSettings.HighlightsHueChroma));
+         }
 #endif // ENABLE_HUE_RESTORATION
-   }
+      }
 #endif // DEVELOPMENT
 
-   // See "PsychoVDisplayMap".
-   float3 hdr = PsychoVDisplayMap(recovered, LumaSettings.GameSettings.Contrast,
-                                  LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightDechroma);
+      // See "PsychoVDisplayMap".
+      float3 hdr = PsychoVDisplayMap(recovered, LumaSettings.GameSettings.Contrast,
+                                     LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightDechroma);
 
-   // Engine fade (level start, cutscene transitions), re-applied LAST and in the GAME'S OWN encoding, because that
-   // is where the original applies it: `out = (lut * .z + .w) * .x` runs on the pow(x, 0.4) result, so doing it in
-   // linear would bend the fade curve and mistint the frame whenever the offset is non-zero. It also has to come
-   // after the display map and the user's contrast inside it, which would otherwise bend the fade.
-   // Uniform branch — at rest (.z = 1, .w = 0, .x = 1) this is a no-op and the two pows are skipped entirely.
-   [branch] if (GradeParams.z != 1.0 || GradeParams.w != 0.0 || GradeParams.x != 1.0)
-   {
-      float3 gameEncoded = PowMOH(hdr, 0.4);
-      gameEncoded = gameEncoded * GradeParams.z + GradeParams.w;
-      gameEncoded *= GradeParams.x;
-      hdr = PowMOH(max(0.0, gameEncoded), 2.5); // exact inverse of the pow(x, 0.4) above, so the round trip is lossless
+      // Engine fade (level start, cutscene transitions), re-applied LAST and in the GAME'S OWN encoding, because that
+      // is where the original applies it: `out = (lut * .z + .w) * .x` runs on the pow(x, 0.4) result, so doing it in
+      // linear would bend the fade curve and mistint the frame whenever the offset is non-zero. It also has to come
+      // after the display map and the user's contrast inside it, which would otherwise bend the fade.
+      // Uniform branch — at rest (.z = 1, .w = 0, .x = 1) this is a no-op and the two pows are skipped entirely.
+      [branch] if (GradeParams.z != 1.0 || GradeParams.w != 0.0 || GradeParams.x != 1.0)
+      {
+         float3 gameEncoded = PowMOH(hdr, 0.4);
+         gameEncoded = gameEncoded * GradeParams.z + GradeParams.w;
+         gameEncoded *= GradeParams.x;
+         hdr = PowMOH(max(0.0, gameEncoded), 2.5); // exact inverse of the pow(x, 0.4) above, so the round trip is lossless
+      }
+
+      outColor = hdr; // linear, 1.0 = paper white
    }
-
-   float3 outColor = hdr; // linear, 1.0 = paper white
-#else
-   // Vanilla reference: linearize the exact SDR output.
-   // Decoded and re-encoded with the same shared transfer function, so the canvas ends up holding the vanilla
-   // bytes and the composition emits the vanilla image.
-   float3 outColor = gamma_to_linear(saturate(vanilla_sdr));
+   else
 #endif
+   {
+      // Vanilla reference (and SDR displays, see "PsychoVDisplayMap"): linearize the exact SDR output. Decoded and re-encoded
+      // with the same shared transfer function, so the canvas ends up holding the vanilla bytes and the composition emits the
+      // vanilla image.
+      outColor = gamma_to_linear(saturate(vanilla_sdr));
+   }
 
    // --- Common tail: UI paper-white pre-scale + post-process-space encode ---
    // Pre-scale so the gamma-SDR HUD on this same canvas lands at UIPaperWhite after composition rescales by it.
