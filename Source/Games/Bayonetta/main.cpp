@@ -1517,7 +1517,7 @@ class Bayonetta final : public Game
          gd.mv_stats.untransformed += untransformed;
 #endif
 
-         // The same object at the same transform by the exact index, else a linear search among the key's candidates
+         // The same object at the same transform by its draw order or the exact index, else a linear search among the key's candidates
          const BayonettaGameDeviceData::MotionVectorObject* match = nullptr;
          if (!untransformed)
          {

@@ -1779,7 +1779,7 @@ class MassEffectLE final : public Game
             }
          }
 
-         // The same object at the same transform by the exact index, else a linear search among the key's candidates
+         // The same object at the same transform by its draw order or the exact index, else a linear search among the key's candidates
          const MassEffectGameDeviceData::MotionVectorObject* const match = game_device_data.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
             { return copy_size(candidate.object) == object->size() && copy_size(candidate.camera) == camera->size() && copy_size(candidate.bones) == copy_size(bones); });
          const bool world_camera = camera == game_device_data.mv_camera || (copy_size(game_device_data.mv_camera) == camera->size() && std::memcmp(camera->data(), game_device_data.mv_camera->data(), camera->size()) == 0);

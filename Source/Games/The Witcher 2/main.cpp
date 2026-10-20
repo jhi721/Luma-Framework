@@ -1447,7 +1447,7 @@ class TheWitcher2Game final : public Game
             std::memcpy(transform.data(), object_constants->data() + transform_offset, sizeof(transform));
          }
 
-         // The same object at the same transform by the exact index, else a linear search among the key's candidates
+         // The same object at the same transform by its draw order or the exact index, else a linear search among the key's candidates
          const TheWitcher2GameDeviceData::MotionVectorObject* match = nullptr;
          const auto previous = gd.mv_objects.Previous().find(key);
          // Without a tie-break transform (a vertex shader reading neither LocalToWorld nor bones at the rows the tie-break knows) the

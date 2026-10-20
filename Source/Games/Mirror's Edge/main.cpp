@@ -1048,7 +1048,7 @@ class MirrorsEdge final : public Game
          const size_t translation_offset = (constants->size() >= vertex_shader.translation_offset + 16 ? vertex_shader.translation_offset : TRANSLATION_OFFSET);
          const PatchedDraws::ObjectTransform transform = PatchedDraws::ReadRowVectorTransform(constants->data() + translation_offset - 3 * 16);
 
-         // The same object at the same transform by the exact index, else a linear search among the key's candidates
+         // The same object at the same transform by its draw order or the exact index, else a linear search among the key's candidates
          const MirrorsEdgeGameDeviceData::MotionVectorObject* const match = gd.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
             { return candidate.constants->size() == constants->size(); });
          if (match)

@@ -1128,7 +1128,7 @@ class Persona5Strikers final : public Game
             std::memcpy(transform.data(), globals_copy->data() + layout.world, sizeof(transform));
          }
 
-         // The same object at the same transform by the exact index, else a linear search among the key's candidates
+         // The same object at the same transform by its draw order or the exact index, else a linear search among the key's candidates
          const Persona5StrikersGameDeviceData::MotionVectorObject* const match = game_device_data.mv_objects.FindNearest(key, transform, [&](const auto& object)
             { return object.globals->size() == globals_copy->size(); });
          // Kept as drawn for the next frame

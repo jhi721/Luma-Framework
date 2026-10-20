@@ -678,23 +678,32 @@ namespace PatchedDraws
    // A frame's motion vector objects by draw key and exact transform, for "FindNearest": the same object a frame later is nearly
    // always at distance 0, found here without scanning its key's candidates. That scan is quadratic in the copies of one mesh: TW2's
    // foliage with a long view distance (thousands of one tree) fell to 4 fps. Filled as the frame draws ("Add", the object's index
-   // in its key's list), sorted once it's last frame's ("Seal"). Reused: no allocation once grown.
+   // in its key's list), sorted once it's last frame's ("Seal", deferred to the first "Find": a frame whose draws all match by their
+   // draw order never sorts). Reused: no allocation once grown.
    struct ExactTransformIndex
    {
-      std::vector<std::pair<uint64_t, uint32_t>> entries; // "TransformHash", index
+      // Sorted on demand by the const "Find" (one thread: the draws')
+      mutable std::vector<std::pair<uint64_t, uint32_t>> entries; // "TransformHash", index
+      mutable bool sorted = true;
 
       void Add(uint64_t key, const ObjectTransform& transform, size_t index)
       {
          entries.emplace_back(TransformHash(key, transform), uint32_t(index));
+         sorted = false;
       }
       // Sorted by hash, then index: a hash's first entry is its first drawn object, the one "FindNearest"'s scan picks at distance 0
       void Seal()
       {
-         std::sort(entries.begin(), entries.end());
+         sorted = false;
       }
       // The first object drawn with this key and hash (another transform on a hash collision), UINT32_MAX if none
       uint32_t Find(uint64_t key, const ObjectTransform& transform) const
       {
+         if (!sorted)
+         {
+            std::sort(entries.begin(), entries.end());
+            sorted = true;
+         }
          const uint64_t hash = TransformHash(key, transform);
          const auto entry = std::lower_bound(entries.begin(), entries.end(), std::pair<uint64_t, uint32_t>(hash, 0));
          return (entry != entries.end() && entry->first == hash) ? entry->second : UINT32_MAX;
@@ -734,6 +743,28 @@ namespace PatchedDraws
             return &candidate;
       }
       return FindNearest(candidates, transform, compatible);
+   }
+
+   // The same, trying first the candidates drawn at this draw's place in its key's order ("order": the key's draws before it this
+   // frame) and its neighbors (an object streamed in or out shifts the rest by one): a game draws a key's copies in the same order
+   // every frame, so the index (its sort) is only needed for a long list. Among copies with identical transforms (an ambiguous
+   // tie-break) this picks the one at the draw's place, not the first.
+   template <typename Object, typename Compatible>
+   const Object* FindNearest(const std::vector<Object>& candidates, size_t order, const ExactTransformIndex& exact, uint64_t key, const ObjectTransform& transform, Compatible compatible)
+   {
+      for (const size_t place : {order, order + 1, order - 1}) // order - 1 wraps past the end at 0
+      {
+         if (place >= candidates.size())
+            continue;
+         const Object& candidate = candidates[place];
+         if (candidate.transform == transform && compatible(candidate))
+            return &candidate;
+      }
+      // ponytail: short lists scan, as fast as the index without its sort
+      constexpr size_t SCAN_LIMIT = 32;
+      if (candidates.size() <= SCAN_LIMIT)
+         return FindNearest(candidates, transform, compatible);
+      return FindNearest(candidates, exact, key, transform, compatible);
    }
 
    // A game's motion vector objects (each with a "transform") by draw key, this frame's and last frame's, with their exact transform
@@ -796,15 +827,17 @@ namespace PatchedDraws
          previous_exact = {};
       }
 
-      // Last frame's object with this key nearest to "transform", see "FindNearest". It outlives the draw: the previous objects only
-      // change at the next "EndFrame".
+      // Last frame's object with this key nearest to "transform", see "FindNearest" (by draw order: called before this draw's "Push").
+      // It outlives the draw: the previous objects only change at the next "EndFrame".
       template <typename Compatible>
       const Object* FindNearest(uint64_t key, const ObjectTransform& transform, Compatible compatible) const
       {
          const auto candidates = previous.find(key);
          if (candidates == previous.end())
             return nullptr;
-         return PatchedDraws::FindNearest(candidates->second, previous_exact, key, transform, compatible);
+         const auto drawn = current.find(key);
+         const size_t order = (drawn != current.end() ? drawn->second.size() : 0);
+         return PatchedDraws::FindNearest(candidates->second, order, previous_exact, key, transform, compatible);
       }
 
       const Map& Current() const

@@ -1336,7 +1336,7 @@ class SaintsRowIV final : public Game
          PatchedDraws::ObjectTransform transform;
          std::memcpy(transform.data(), object->data() + 16 * 16, sizeof(transform));
 
-         // The same object at the same transform by the exact index, else a linear search among the key's candidates
+         // The same object at the same transform by its draw order or the exact index, else a linear search among the key's candidates
          const SaintsRowIVGameDeviceData::MotionVectorObject* const match = game_device_data.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
             { return copy_size(candidate.object) == object->size() && copy_size(candidate.bones) == copy_size(bones); });
          // Draws with another projTM than the frame's camera (sky, windows at infinity) are left as is and not tracked
