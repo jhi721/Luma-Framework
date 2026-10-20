@@ -135,6 +135,14 @@
 #elif !defined(ENABLE_REFLEX)
 #define ENABLE_REFLEX 1
 #endif // ENABLE_REFLEX
+// scRGB games (the fp16 back buffer the game, ReShade and Luma see) present HDR10 PQ through a proxy back buffer (see "includes/swapchain_proxy.hpp").
+// Needs MinHook; without it the swapchain stays fp16 scRGB.
+#if !ENABLE_MINHOOK
+#undef ENABLE_SWAPCHAIN_PROXY
+#define ENABLE_SWAPCHAIN_PROXY 0
+#elif !defined(ENABLE_SWAPCHAIN_PROXY)
+#define ENABLE_SWAPCHAIN_PROXY 1
+#endif // ENABLE_SWAPCHAIN_PROXY
 #ifndef PROJECT_NAME
 // Matches "Globals::MOD_NAME"
 #define PROJECT_NAME "Luma"
@@ -221,6 +229,7 @@
 #include "includes/instance_data.h"
 #include "includes/game.h"
 #include "includes/com_ptr.h"
+#include "includes/swapchain_proxy.hpp" // see "ENABLE_SWAPCHAIN_PROXY"
 #if DEVELOPMENT
 #include "includes/perf_test.h" // Also "luma_perf" in "includes/mcp_server.inl"
 #endif // DEVELOPMENT
@@ -683,6 +692,8 @@ namespace
       { CompileTimeStringHash("Scale PS"), { "Luma_Scale_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
 
       { CompileTimeStringHash("Display Composition"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader } },
+      // Encodes the scRGB proxy back buffer into the real HDR10 PQ (or SDR sRGB) one, see "ENABLE_SWAPCHAIN_PROXY"
+      { CompileTimeStringHash("Swapchain Encode"), { "Luma_SwapchainEncode", reshade::api::pipeline_subobject_type::pixel_shader } },
       
       { CompileTimeStringHash("Copy RGB Max 0 A Sat"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
       { CompileTimeStringHash("Copy RGB Max 0 A Sat MS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "MS", "1" }, { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
@@ -3319,13 +3330,37 @@ namespace
       if (swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type > SwapchainUpgradeType::None)
       {
          ASSERT_ONCE(desc.back_buffer.texture.format == reshade::api::format::r10g10b10a2_unorm || desc.back_buffer.texture.format == reshade::api::format::r8g8b8a8_unorm || desc.back_buffer.texture.format == reshade::api::format::r8g8b8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::b8g8r8a8_unorm || desc.back_buffer.texture.format == reshade::api::format::b8g8r8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::r16g16b16a16_float); // Just a bunch of formats we encountered and we are sure we can upgrade (or that have already been upgraded)
-         // DXGI_FORMAT_R16G16B16A16_FLOAT will automatically pick DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 on first creation
-         desc.back_buffer.texture.format = swapchain_upgrade_type == SwapchainUpgradeType::scRGB ? reshade::api::format::r16g16b16a16_float : reshade::api::format::r10g10b10a2_unorm;
+         // DXGI_FORMAT_R16G16B16A16_FLOAT will automatically pick DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 on first creation.
+         // With "ENABLE_SWAPCHAIN_PROXY" scRGB games still see fp16, but through a proxy, the real buffer is HDR10 (10 bit SDR on SDR displays).
+         desc.back_buffer.texture.format = (swapchain_upgrade_type == SwapchainUpgradeType::scRGB && !ENABLE_SWAPCHAIN_PROXY) ? reshade::api::format::r16g16b16a16_float : reshade::api::format::r10g10b10a2_unorm;
          changed = true;
       }
 
       return changed;
    }
+
+#if ENABLE_SWAPCHAIN_PROXY
+   // Whether scRGB swapchains are proxied: the real buffer is HDR10 PQ (HDR display) or sRGB (SDR display), written at the end of the frame
+   bool IsSwapchainProxyEnabled()
+   {
+      return swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type == SwapchainUpgradeType::scRGB;
+   }
+
+   // Sets the real buffer's color space from the window's display state and restarts the display state tracking (it's stale after "IDXGIFactory1::IsCurrent()" turns false)
+   void UpdateSwapchainProxyOutput(IDXGISwapChain3* native_swapchain3, SwapchainProxy::Entry* entry, bool hdr_enabled_window_display)
+   {
+      entry->encode_pq = hdr_enabled_window_display;
+      entry->factory = nullptr;
+      CreateDXGIFactory1(IID_PPV_ARGS(&entry->factory));
+
+      HRESULT hr = native_swapchain3->SetColorSpace1(hdr_enabled_window_display ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+      ASSERT_ONCE(SUCCEEDED(hr));
+      // SpecialK and ReShade use this private data GUID to track the current swap chain color space. ReShade must keep treating the proxy as scRGB.
+      constexpr GUID SKID_SwapChainColorSpace = {0x18b57e4, 0x1493, 0x4953, {0xad, 0xf2, 0xde, 0x6d, 0x99, 0xcc, 0x5, 0xe5}}; // {018B57E4-1493-4953-ADF2-DE6D99CC05E5}
+      constexpr DXGI_COLOR_SPACE_TYPE proxy_color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+      native_swapchain3->SetPrivateData(SKID_SwapChainColorSpace, sizeof(proxy_color_space), &proxy_color_space);
+   }
+#endif
 
    void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize)
    {
@@ -3334,6 +3369,16 @@ namespace
       OverlayLog::PauseMessages(); // Pause messages until the swapchain has finished resizing, it might take a while
 
       IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
+#if ENABLE_SWAPCHAIN_PROXY
+      // Before anything gets the back buffers, so Core's handles are the proxy's
+      const bool swapchain_proxied = IsSwapchainProxyEnabled() && SwapchainProxy::Register(native_swapchain);
+      if (IsSwapchainProxyEnabled() && !swapchain_proxied)
+      {
+         reshade::log::message(reshade::log::level::error, "Failed to hook the swapchain, HDR will look wrong (the game is writing scRGB into a 10 bit buffer)");
+      }
+#else
+      constexpr bool swapchain_proxied = false;
+#endif
 #if 0
       DXGI_SWAP_CHAIN_DESC desc;
       native_swapchain->GetDesc(&desc);
@@ -3521,10 +3566,16 @@ namespace
 #endif
          }
 
+#if ENABLE_SWAPCHAIN_PROXY
+         if (swapchain_proxied)
+         {
+            UpdateSwapchainProxyOutput(native_swapchain3, SwapchainProxy::Find(native_swapchain), hdr_enabled_display);
+         }
+#endif
 #if !GAME_PREY
          DXGI_COLOR_SPACE_TYPE color_space;
          bool set_color_space = false;
-         if (swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type > SwapchainUpgradeType::None)
+         if (swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type > SwapchainUpgradeType::None && !swapchain_proxied)
          {
 #if !GAME_FF7_REMAKE
             if (swapchain_upgrade_type == SwapchainUpgradeType::scRGB)
@@ -3617,6 +3668,10 @@ namespace
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       ASSERT_ONCE(&device_data != nullptr); // Hacky nullptr check (should ever be able to happen)
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
+#if ENABLE_SWAPCHAIN_PROXY
+      // Also when resizing: the real buffer can't have views left, the proxy is recreated at the new size by the next "GetBuffer()"
+      SwapchainProxy::Unregister((IDXGISwapChain*)(swapchain->get_native()));
+#endif
       {
          const std::shared_lock lock_swapchain(swapchain_data.mutex);
 
@@ -5928,11 +5983,15 @@ namespace
       }
    }
 
-#if ENABLE_REFLEX
+#if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
    void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
    {
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
+#if ENABLE_SWAPCHAIN_PROXY
+      SwapchainProxy::real_buffer_visible = false;
+#endif
+#if ENABLE_REFLEX
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
       // Only the device's first swapchain (the only one expected), so there's one sleep per frame
       if (device_data.reflex.swapchain != swapchain)
@@ -5946,6 +6005,7 @@ namespace
          reshade::log::message(reshade::log::level::info, std::format("[Reflex] mode {} state {}{}{}: latency {:.2f} ms, GPU {:.2f} ms, GPU frame {:.2f} ms ({} frames, {} markers), Luma sleep {:.2f} ms/frame, driver low latency {} game sleep {}", int(reflex_mode), Reflex::state_names[int(device_data.reflex.state)], device_data.reflex.other_reason ? " - " : "", device_data.reflex.other_reason ? device_data.reflex.other_reason : "", stats.latency_ms, stats.gpu_ms, stats.gpu_frame_ms, stats.frames, stats.other_markers ? "other" : "Luma's", stats.sleep_ms, int(stats.driver_low_latency), int(stats.driver_game_sleep)).c_str());
       }
 #endif
+#endif // ENABLE_REFLEX
    }
 #endif
 
@@ -6041,6 +6101,91 @@ namespace
 #include "includes/mcp_server.inl"
 #endif // DEVELOPMENT
 
+#if ENABLE_SWAPCHAIN_PROXY
+   // Encodes the scRGB proxy into the real HDR10 PQ (or SDR sRGB) back buffer, the last thing drawn in the frame:
+   // after the game, the display composition and ReShade's effects and GUI wrote the proxy.
+   // Independent of "force_disable_display_composition", nothing else writes the real buffer.
+   void DrawSwapchainEncode(reshade::api::device* device, reshade::api::command_list* cmd_list, IDXGISwapChain* native_swapchain, HWND hwnd)
+   {
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      if (SwapchainProxy::Entry* const entry = SwapchainProxy::Find(native_swapchain))
+      {
+         // The window's display changed (HDR toggled, moved to another display...)
+         if (!entry->factory || !entry->factory->IsCurrent())
+         {
+            com_ptr<IDXGISwapChain3> native_swapchain3;
+            if (SUCCEEDED(native_swapchain->QueryInterface(&native_swapchain3)))
+            {
+               bool hdr_supported_window_display = false;
+               bool hdr_enabled_window_display = false;
+               Display::IsHDRSupportedAndEnabled(hwnd, hdr_supported_window_display, hdr_enabled_window_display, native_swapchain3.get());
+               UpdateSwapchainProxyOutput(native_swapchain3.get(), entry, hdr_enabled_window_display);
+            }
+         }
+
+         // The proxy might not have been requested yet (this creates it)
+         com_ptr<ID3D11Texture2D> proxy;
+         native_swapchain->GetBuffer(0, IID_PPV_ARGS(&proxy));
+         const com_ptr<ID3D11Texture2D> real_buffer = SwapchainProxy::GetRealBackBuffer(native_swapchain);
+         ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
+         if (real_buffer && entry->real_buffer.get() != real_buffer.get())
+         {
+            entry->real_rtv = nullptr;
+            entry->real_buffer = real_buffer;
+            HRESULT hr = native_device->CreateRenderTargetView(real_buffer.get(), nullptr, &entry->real_rtv);
+            ASSERT_ONCE(SUCCEEDED(hr));
+         }
+
+         const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+         ID3D11VertexShader* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+         ID3D11PixelShader* const encode_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Swapchain Encode"));
+         if (copy_vs && encode_ps && entry->proxy_srv && entry->real_rtv)
+         {
+            ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(cmd_list->get_native());
+            CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+
+            D3D11_TEXTURE2D_DESC real_buffer_desc;
+            real_buffer->GetDesc(&real_buffer_desc);
+
+            DrawStateStack<DrawStateStackType::SimpleGraphics> draw_state_stack;
+            draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, entry->encode_pq ? 0u : 1u);
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, encode_ps, entry->proxy_srv.get(), entry->real_rtv.get(), real_buffer_desc.Width, real_buffer_desc.Height, false);
+            draw_state_stack.Restore(native_device_context);
+         }
+         else if (device_data.created_native_shaders)
+         {
+            static std::atomic<bool> warning_sent;
+            if (!warning_sent.exchange(true))
+            {
+               ADD_OVERLAY_WARNING(std::format("The \"Luma_SwapchainEncode\" shader is missing from the \"{}\" folder or failed to compile, the image will be black.", NAME));
+            }
+         }
+
+         // Overlays hooking "Present()" (and the rest of this present call) get the real buffer
+         SwapchainProxy::real_buffer_visible = true;
+      }
+   }
+
+   // ReShade only fires "reshade_present" for swapchains with an initialized effect runtime (e.g. not for ones smaller than 160x120)
+   void OnInitEffectRuntime(reshade::api::effect_runtime* runtime)
+   {
+      if (SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(runtime->get_native())))
+      {
+         entry->has_effect_runtime = true;
+      }
+   }
+
+   void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime)
+   {
+      if (SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(runtime->get_native())))
+      {
+         entry->has_effect_runtime = false;
+      }
+   }
+#endif
+
    void OnPresent(
       reshade::api::command_queue* queue,
       reshade::api::swapchain* swapchain,
@@ -6057,6 +6202,11 @@ namespace
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
+
+#if ENABLE_SWAPCHAIN_PROXY
+      // "finish_present" doesn't run if the previous present failed
+      SwapchainProxy::real_buffer_visible = false;
+#endif
 
 #if ENABLE_REFLEX
       if (device_data.reflex.markers && device_data.reflex.swapchain == swapchain)
@@ -6577,6 +6727,13 @@ namespace
       device_data.resource_upgrades.FlushPendingDestructions(queue->get_device(), device_data.mutex);
 
       game->OnPresent(native_device, device_data);
+
+#if ENABLE_SWAPCHAIN_PROXY
+      if (const SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(swapchain->get_native())); entry && !entry->has_effect_runtime)
+      {
+         DrawSwapchainEncode(queue->get_device(), queue->get_immediate_command_list(), (IDXGISwapChain*)(swapchain->get_native()), (HWND)(swapchain->get_hwnd()));
+      }
+#endif
 
 #if DEVELOPMENT
       // Luma passes the game drew at present (or outside its draw hooks) on this thread
@@ -10896,6 +11053,10 @@ namespace
       {
          if (!block_draw_until_device_custom_shaders_creation) s_mutex_shader_objects.unlock_shared();
       }
+
+#if ENABLE_SWAPCHAIN_PROXY
+      DrawSwapchainEncode(runtime->get_device(), runtime->get_command_queue()->get_immediate_command_list(), (IDXGISwapChain*)(runtime->get_native()), (HWND)(runtime->get_hwnd()));
+#endif
    }
 
    void ForceToggleShaders(reshade::api::effect_runtime* runtime, bool enabled)
@@ -17391,11 +17552,15 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
-#if ENABLE_REFLEX
+#if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
       reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
 #endif
 
       reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
+#if ENABLE_SWAPCHAIN_PROXY
+      reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+      reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+#endif
 
 #if DEVELOPMENT || TEST // Currently Dev only as we don't need the average user to compare the mod on/off
       reshade::register_event<reshade::addon_event::reshade_set_effects_state>(OnReShadeSetEffectsState);
@@ -17521,11 +17686,15 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
-#if ENABLE_REFLEX
+#if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
       reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
 #endif
 
       reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
+#if ENABLE_SWAPCHAIN_PROXY
+      reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+      reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+#endif
 
 #if DEVELOPMENT || TEST
       reshade::unregister_event<reshade::addon_event::reshade_set_effects_state>(OnReShadeSetEffectsState);
@@ -17542,6 +17711,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       // The game's and Core's hooks are removed by now (see "includes/minhook.h"), this frees its heap. Not needed at process exit.
       if (lpv_reserved == nullptr)
       {
+#if ENABLE_SWAPCHAIN_PROXY
+         SwapchainProxy::RemoveHooks();
+#endif
          UninitializeMinHook();
       }
 #endif

@@ -82,9 +82,11 @@ public:
    {
       // keep the original one, SDR or whatnot
       None,
-      // scRGB linear HDR (16 bit float)
+      // The game renders scRGB linear HDR into a 16 bit float back buffer. With "ENABLE_SWAPCHAIN_PROXY" that buffer is a proxy texture
+      // (what the game, ReShade and Luma's display composition see) and the presented one is R10G10B10A2_UNORM: BT.2020 PQ HDR10 on HDR
+      // displays, sRGB 10 bit on SDR ones, written at the end of the frame. Without it, the real swapchain is the 16 bit float one.
       scRGB,
-      // BT.2020 PQ HDR (10 bit UNORM)
+      // The game itself writes BT.2020 PQ HDR (10 bit UNORM) into the real back buffer (e.g. FF7 Remake, Project Diva)
       HDR10
    };
    // Initialize freshly created mirrors with the original's current content (converted when needed).
