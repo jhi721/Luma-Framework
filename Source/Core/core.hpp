@@ -5286,6 +5286,25 @@ namespace
       D3D12Trace::AddTraceDrawCallData(&cmd_list_data.trace_draw_calls_data, cmd_list->get_device()->get_private_data<DeviceData>(), cmd_list, cmd_list_data.d3d12_state, shader_cache, draw_dispatch_data);
    }
 
+   // Records a copy, resolve or clear on the command list's capture: "fill" sets the entry up ("D3D12Trace::FillCopy()" and "FillClear()") and
+   // only runs during a capture. Copies into buffers are dropped with "trace_ignore_buffer_writes": games upload thousands per frame, and an
+   // entry takes ~20 KB.
+   void TraceCopyOrClear(reshade::api::command_list* cmd_list, auto&& fill)
+   {
+      const auto lock_trace = LockTraceIfRunning();
+      if (!lock_trace || !trace_running)
+         return;
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
+      TraceDrawCallData& entry = cmd_list_data.trace_draw_calls_data.emplace_back();
+      entry.command_list = cmd_list;
+      fill(&entry);
+      if (trace_ignore_buffer_writes && entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource && entry.rt_type_name[0] == "Buffer")
+      {
+         cmd_list_data.trace_draw_calls_data.pop_back();
+      }
+   }
+
    // The dev MCP's readbacks ("includes/d3d12_readback.hpp"): copies the view a job asked for at its target draw. Returns true when it
    // re-issued the draw to copy its output after it, then the original call must be skipped.
    bool ReadbackDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12Readback::Command command)
@@ -5596,6 +5615,108 @@ namespace
       const DrawDispatchData draw_dispatch_data = {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true};
       TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
       return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Other);
+   }
+
+   // The copies, uploads, resolves and clears of the frame capture
+   bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
+      return false;
+   }
+
+   bool OnCopyBufferRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = true, .box = {.left = uint32_t(source_offset), .right = uint32_t(source_offset + size), .bottom = 1, .back = 1}}); });
+      return false;
+   }
+
+   // ReShade only passes the footprint's offset and size (no row pitch), so uploads can't be re-issued from this event
+   bool OnCopyBufferToTexture(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, uint32_t row_length, uint32_t slice_height, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferToTexture, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = dest_box != nullptr, .box = (dest_box ? D3D12_BOX{.right = dest_box->width(), .bottom = dest_box->height(), .back = dest_box->depth()} : D3D12_BOX{})}); });
+      return false;
+   }
+
+   // "dest_box" is only there when the destination offset isn't zero
+   bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
+      return false;
+   }
+
+   bool OnCopyTextureToBuffer(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint64_t dest_offset, uint32_t row_length, uint32_t slice_height)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::TextureToBuffer, .source_subresource = source_subresource, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
+      return false;
+   }
+
+   bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
+      return false;
+   }
+
+   // The clear values go in the entry's blend factor like on D3D11 (depth and stencil in the first two)
+   bool OnClearDepthStencilView(reshade::api::command_list* cmd_list, reshade::api::resource_view dsv, const float* depth, const uint8_t* stencil, uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, dsv);
+            entry->blend_factor[0] = (depth ? *depth : 0.f);
+            entry->blend_factor[1] = (stencil ? float(*stencil) : 0.f);
+            if (depth)
+            {
+               entry->depth_state = TraceDrawCallData::DepthStateType::WriteOnly;
+            }
+            if (stencil)
+            {
+               entry->stencil_state = TraceDrawCallData::DepthStateType::WriteOnly;
+            } });
+      return false;
+   }
+
+   bool OnClearRenderTargetView(reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, const float color[4], uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, rtv);
+            std::copy_n(color, 4, entry->blend_factor); });
+      return false;
+   }
+
+   bool OnClearUnorderedAccessViewUInt(reshade::api::command_list* cmd_list, reshade::api::resource_view uav, const uint32_t values[4], uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav);
+            std::transform(values, values + 4, entry->blend_factor, [](uint32_t value)
+               { return float(value); }); });
+      return false;
+   }
+
+   bool OnClearUnorderedAccessViewFloat(reshade::api::command_list* cmd_list, reshade::api::resource_view uav, const float values[4], uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav);
+            std::copy_n(values, 4, entry->blend_factor); });
+      return false;
    }
 
    void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list)
@@ -14922,10 +15043,8 @@ namespace
                                     if (has_target_resource || has_source_resource)
                                        ImGui::Text(""); // Empty line for spacing
 
-#if DX11 // D3D12 clears aren't captured yet
                                     // TODO: split between uint uav and rt float and have special cases depth/stencil
                                     ImGui::Text("Clear Color: %f %f %f %f", draw_call_data.blend_factor[0], draw_call_data.blend_factor[1], draw_call_data.blend_factor[2], draw_call_data.blend_factor[3]);
-#endif
                                  }
                               }
                               ImGui::EndChild(); // Settings and Info
@@ -18217,6 +18336,16 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
       reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
+      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
+      reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
+      reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
+      reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::register_event<reshade::addon_event::copy_texture_to_buffer>(OnCopyTextureToBuffer);
+      reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+      reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+      reshade::register_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+      reshade::register_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUInt);
+      reshade::register_event<reshade::addon_event::clear_unordered_access_view_float>(OnClearUnorderedAccessViewFloat);
 #endif
 #if DX11
 
@@ -18394,6 +18523,16 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
       reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
+      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
+      reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::unregister_event<reshade::addon_event::copy_texture_to_buffer>(OnCopyTextureToBuffer);
+      reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+      reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+      reshade::unregister_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+      reshade::unregister_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUInt);
+      reshade::unregister_event<reshade::addon_event::clear_unordered_access_view_float>(OnClearUnorderedAccessViewFloat);
 #endif
 #if DX11
 

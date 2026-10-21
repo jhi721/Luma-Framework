@@ -478,7 +478,7 @@ namespace Mcp
 
    // In "TraceDrawCallData::TraceDrawCallType" and "TraceDrawCallData::CopyKind" order
    constexpr const char* trace_type_names[] = {"shader", "copy", "clear", "bind_pipeline", "bind_resource", "cpu_read", "cpu_write", "present", "create_command_list", "append_command_list", "reset_command_list", "flush_command_list", "custom"};
-   constexpr const char* copy_kind_names[] = {"resource", "region", "resolve", "buffer_region"};
+   constexpr const char* copy_kind_names[] = {"resource", "region", "resolve", "buffer_region", "buffer_to_texture", "texture_to_buffer"};
 
    const Shader::CachedPipeline* FindPipeline(const DeviceData& device_data, uint64_t pipeline_handle)
    {
@@ -747,6 +747,12 @@ namespace Mcp
       w->Field("alpha_to_coverage", bool(entry.blend_desc.AlphaToCoverageEnable));
       // Clear entries store the clear values there (depth and stencil in the first two for depth clears)
       w->Key(entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource ? "clear_values" : "blend_factor").BeginArray().Value(entry.blend_factor[0]).Value(entry.blend_factor[1]).Value(entry.blend_factor[2]).Value(entry.blend_factor[3]).EndArray();
+#else
+      // D3D12 captures no blend factor, only the clear entries have values there
+      if (entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
+      {
+         w->Key("clear_values").BeginArray().Value(entry.blend_factor[0]).Value(entry.blend_factor[1]).Value(entry.blend_factor[2]).Value(entry.blend_factor[3]).EndArray();
+      }
 #endif
 
       WriteViews(w, "srvs", TraceDrawCallData::srvs_size, [&](size_t i)

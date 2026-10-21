@@ -178,8 +178,9 @@ struct TraceDrawCallData
 #if DX11
    // Already includes all the render targets
    D3D11_BLEND_DESC1 blend_desc = {};
-   FLOAT blend_factor[4] = { 1.f, 1.f, 1.f, 1.f };
 #endif
+   // The blend factor (D3D11 draws), or the clear values of clear entries (depth and stencil in the first two for depth clears)
+   FLOAT blend_factor[4] = {1.f, 1.f, 1.f, 1.f};
 
    bool cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
    std::string cb_hash[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {}; // Ptr hash (not content hash)
@@ -274,11 +275,14 @@ struct TraceDrawCallData
    };
    std::vector<TableDescriptor> table_descriptors;
    // What readbacks copy, which the hashes above can't give back: the render target, unordered access and depth stencil views, and the
-   // buffers of constant buffer views (root constants have none)
+   // buffers of constant buffer views (root constants have none). Copy, resolve and clear entries have no views: their "rt_view[0]" is
+   // what they wrote (the cleared view, else the whole resource or the destination subresource's mip and layer) and "copy_source" is
+   // the resource a copy read
    D3D12State::ViewInfo rt_view[rtvs_size] = {};
    D3D12State::ViewInfo ua_view[uavs_size] = {};
    D3D12State::ViewInfo ds_view = {};
    uint64_t cb_resource[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+   uint64_t copy_source = 0;
 #endif
 
 #if DX11
@@ -301,6 +305,9 @@ struct TraceDrawCallData
       Region,
       Resolve,
       BufferRegion,
+      // D3D12 only
+      BufferToTexture, // An upload: "box" is the written size in texels, from the origin
+      TextureToBuffer,
    };
    struct CopyInfo
    {
@@ -309,7 +316,7 @@ struct TraceDrawCallData
       UINT dest_subresource = 0;
       uint3 dest_offset = {}; // Bytes in "x" for buffer copies
       bool has_box = false;
-      // Source region (bytes in "left"/"right" for buffer copies)
+      // Source region (bytes in "left"/"right" for buffer copies, but the written size in texels for D3D12 uploads)
 #if DX11
       D3D11_BOX box = {};
 #else

@@ -526,4 +526,48 @@ namespace D3D12Trace
          }
       }
    }
+
+   // Empty without a box ("subresource_box" has the same layout)
+   D3D12_BOX ToD3D12Box(const reshade::api::subresource_box* box)
+   {
+      if (!box)
+         return {};
+      return {.left = box->left, .top = box->top, .front = box->front, .right = box->right, .bottom = box->bottom, .back = box->back};
+   }
+
+   // Fills a copy, upload or resolve entry like the D3D11 capture does, with whole resources and no views ("IsRTVValid()" stays false, so
+   // the entry isn't taken for a draw's output): the source in "sr_*[0]" and "copy_source", the resource it wrote in "rt_*[0]".
+   // "rt_view[0]" is what it wrote there: everything for "CopyKind::Resource", else the mip and layer of "copy_info.dest_subresource"
+   // (the plane, that index divided by mips * layers, is only in "copy_info"). Buffers have no subresources.
+   void FillCopy(reshade::api::device* device, TraceDrawCallData* entry, reshade::api::resource source, reshade::api::resource dest, const TraceDrawCallData::CopyInfo& copy_info)
+   {
+      entry->type = TraceDrawCallData::TraceDrawCallType::CopyResource;
+      entry->copy_info = copy_info;
+      entry->copy_source = source.handle;
+      FillView(device, entry, 't', 0, false, 0, {.resource = source.handle});
+
+      D3D12State::ViewInfo written = {.resource = dest.handle};
+      if (const reshade::api::resource_desc desc = device->get_resource_desc(dest); desc.type != reshade::api::resource_type::buffer)
+      {
+         written.format = desc.texture.format;
+         if (copy_info.kind != TraceDrawCallData::CopyKind::Resource)
+         {
+            // The subresource index is mip + layer * mips + plane * mips * layers, 3D textures have no layers
+            const uint32_t mips = (std::max)(uint32_t(desc.texture.levels), 1u); // Zero when unknown
+            const uint32_t layers = ((desc.type == reshade::api::resource_type::texture_3d) ? 1u : (std::max)(uint32_t(desc.texture.depth_or_layers), 1u));
+            written.first_level = copy_info.dest_subresource % mips;
+            written.first_layer = (copy_info.dest_subresource / mips) % layers;
+            written.layer_count = 1;
+         }
+      }
+      FillView(device, entry, 'r', 0, false, 0, written);
+   }
+
+   // Fills a clear entry like the D3D11 capture does: the cleared resource in "rt_*[0]" (no view, see "FillCopy()") and the cleared view in
+   // "rt_view[0]". The clear values are up to the caller ("TraceDrawCallData::blend_factor").
+   void FillClear(reshade::api::device* device, TraceDrawCallData* entry, reshade::api::resource_view view)
+   {
+      entry->type = TraceDrawCallData::TraceDrawCallType::ClearResource;
+      FillView(device, entry, 'r', 0, false, 0, D3D12State::GetViewInfo(device, view));
+   }
 } // namespace D3D12Trace
