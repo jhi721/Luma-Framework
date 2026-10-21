@@ -150,6 +150,7 @@ namespace Mcp
       }
    };
 
+#if DX11 // The D3D12 readbacks are "docs/DX12-Support-Plan.md" A4
    // The dev UI's debug draw pass selection, overwritten by a readback and restored once the job finishes
    struct DebugDrawSelection
    {
@@ -199,6 +200,7 @@ namespace Mcp
          track_buffer_index = index;
       }
    };
+#endif // DX11
 
    struct Job
    {
@@ -228,6 +230,7 @@ namespace Mcp
          std::vector<uint32_t> per_frame;
       };
       std::unordered_map<uint32_t, HashCounts> hash_counts; // Draws per shader hash over consecutive captures
+#if DX11
       struct PerfState
       {
          Perf::TimestampRing<2> timestamps;
@@ -239,6 +242,7 @@ namespace Mcp
       std::unique_ptr<PerfState> perf;
       std::optional<DebugDrawSelection> saved_debug_draw;
       std::optional<TrackBufferSelection> saved_track_buffer;
+#endif // DX11
 
       Job()
       {
@@ -308,7 +312,11 @@ namespace Mcp
    // into the shader settings, a mode switch). Returns an error, or nothing.
    using DevValueSetter = std::function<std::string(DeviceData& device_data, double value)>;
    // Returns a texture, or a view of it, borrowed (null while it isn't allocated), see "MCP_GAME_TEXTURE"
+#if DX11
    using DevTextureGetter = ID3D11DeviceChild* (*)(DeviceData & device_data);
+#else
+   using DevTextureGetter = ID3D12Resource* (*)(DeviceData & device_data); // Not read back yet ("docs/DX12-Support-Plan.md" A4)
+#endif
    struct DevValue
    {
       std::string name;
@@ -395,6 +403,7 @@ namespace Mcp
    }
 // A "RegisterTextures" entry for a member of the game's device data (a texture or a view of it), from where "GetGameDeviceData" is visible
 #define MCP_GAME_TEXTURE(name, member) {name, [](DeviceData& device_data) -> ID3D11DeviceChild* { return GetGameDeviceData(device_data).member.get(); }}
+#if DX11
    com_ptr<ID3D11Resource> GetTexture(const DevValue& dev_value, DeviceData& device_data)
    {
       com_ptr<ID3D11Resource> resource;
@@ -407,6 +416,7 @@ namespace Mcp
       }
       return resource;
    }
+#endif // DX11
    void Unregister(const void* owner)
    {
       const std::lock_guard lock(s_mutex_dev_values);
@@ -459,6 +469,16 @@ namespace Mcp
 
    // In "Shader::CachedPipeline::Replacement" order
    constexpr const char* replacement_names[] = {"none", "file", "patch_inplace", "patch_sync", "patch_async"};
+   // The stage of "shader_hash" in "pipeline" (a D3D12 PSO has several)
+   const char* StageName(const Shader::CachedPipeline& pipeline, uint32_t shader_hash)
+   {
+#if DX12
+      if (const auto it = std::ranges::find(pipeline.shader_hashes, shader_hash); it != pipeline.shader_hashes.end())
+         return Shader::CachedPipeline::StageName(pipeline.shader_types[it - pipeline.shader_hashes.begin()]);
+#endif
+      return pipeline.StageName();
+   }
+
    const char* ReplacementName(const Shader::CachedPipeline& pipeline)
    {
       return replacement_names[size_t(pipeline.GetReplacement())];
@@ -490,7 +510,11 @@ namespace Mcp
 
    bool IsDeferred(const TraceDrawCallData& entry)
    {
+#if DX11
       return entry.command_list && entry.command_list->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED;
+#else
+      return false; // D3D12 entries are already in submission order
+#endif
    }
 
    // Needs "s_mutex_generic" and "s_mutex_loading" (shared)
@@ -508,6 +532,12 @@ namespace Mcp
          {
             w->Field("stage", pipeline->StageName());
             w->Hash("hash", pipeline->shader_hashes[0]);
+#if DX12 // One entry per draw: every stage of the PSO
+            w->Key("shaders").BeginObject();
+            for (size_t i = 0; i < pipeline->shader_hashes.size(); i++)
+               w->Hash(Shader::CachedPipeline::StageName(pipeline->shader_types[i]), pipeline->shader_hashes[i]);
+            w->EndObject();
+#endif
             w->Field("replaced", ReplacementName(*pipeline));
             if (!pipeline->custom_name.empty() && pipeline->custom_name[0] != '\0')
                w->Field("name", pipeline->custom_name.c_str());
@@ -543,6 +573,7 @@ namespace Mcp
          w->Field("note", entry.note);
    }
 
+#if DX11 // D3D12 PSO states aren't captured yet
    constexpr const char* comparison_func_names[] = {"", "NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS"};
    constexpr const char* stencil_op_names[] = {"", "KEEP", "ZERO", "REPLACE", "INCR_SAT", "DECR_SAT", "INVERT", "INCR", "DECR"};
    constexpr const char* cull_mode_names[] = {"", "NONE", "FRONT", "BACK"};
@@ -594,6 +625,7 @@ namespace Mcp
       }
       w->EndArray();
    }
+#endif // DX11
 
    void WriteViews(JsonWriter* w, const char* key, size_t count, auto is_valid, auto write)
    {
@@ -633,13 +665,20 @@ namespace Mcp
       w->Field("topology", uint32_t(entry.primitive_topology));
       w->EndObject();
 
+#if DX11
       const D3D11_VIEWPORT& viewport_0 = entry.viewports[0]; // Zeroed if none
       w->Key("viewport0").BeginArray().Value(viewport_0.TopLeftX).Value(viewport_0.TopLeftY).Value(viewport_0.Width).Value(viewport_0.Height).EndArray();
       w->Field("scissors", entry.scissor_count >= 1);
+#endif
       w->Field("depth_state", EnumName(TraceDrawCallData::depth_state_names, size_t(entry.depth_state)));
       w->Field("stencil_state", EnumName(TraceDrawCallData::depth_state_names, size_t(entry.stencil_state)));
+#if DX11
       if (pipeline && pipeline->HasPixelShader())
          WriteRenderState(w, entry);
+#else
+      if (entry.uses_descriptor_heap)
+         w->Field("uses_descriptor_heap", true).Field("descriptor_heap_note", "Indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices are usually in the root constants");
+#endif
       if (entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource)
       {
          const auto& copy = entry.copy_info;
@@ -662,30 +701,72 @@ namespace Mcp
             w->Field("debug_name", debug_name);
       };
 
+#if DX12
+      // The SRV, UAV and constant buffer entries are packed in binding order (the first "*_count"), with their register. "bound" false
+      // is a descriptor the shader references, null or never written.
+      const auto write_register = [w](char type, const TraceDrawCallData::ShaderRegister& shader_register)
+      {
+         w->Field("register", std::format("{}{}", type, shader_register.index)).Field("space", shader_register.space);
+      };
+#endif
+
       WriteViews(w, "rtvs", TraceDrawCallData::rtvs_size, [&](size_t i)
          { return entry.IsRTVValid(i); }, [&](size_t i)
          {
          write_resource(entry.rt_format[i], entry.rtv_format[i], entry.rt_size[i], entry.rtv_size[i], entry.rtv_mip[i], entry.rt_type_name[i], entry.rt_hash[i], entry.rt_debug_name[i]);
          if (entry.rt_is_swapchain[i]) w->Field("swapchain", true);
+#if DX11
          const auto& blend = entry.blend_desc.RenderTarget[entry.blend_desc.IndependentBlendEnable ? i : 0];
          w->Field("write_mask", uint32_t(blend.RenderTargetWriteMask));
          if (blend.BlendEnable)
          {
             w->Field("blend", std::format("{} {} {} / alpha {} {} {}", GetBlendName(blend.SrcBlend), GetBlendOpName(blend.BlendOp), GetBlendName(blend.DestBlend), GetBlendName(blend.SrcBlendAlpha), GetBlendOpName(blend.BlendOpAlpha), GetBlendName(blend.DestBlendAlpha)));
-         } });
+         }
+#endif
+         });
+#if DX11
       w->Field("alpha_to_coverage", bool(entry.blend_desc.AlphaToCoverageEnable));
       // Clear entries store the clear values there (depth and stencil in the first two for depth clears)
       w->Key(entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource ? "clear_values" : "blend_factor").BeginArray().Value(entry.blend_factor[0]).Value(entry.blend_factor[1]).Value(entry.blend_factor[2]).Value(entry.blend_factor[3]).EndArray();
+#endif
 
       WriteViews(w, "srvs", TraceDrawCallData::srvs_size, [&](size_t i)
-         { return entry.IsSRVValid(i); }, [&](size_t i)
          {
+#if DX12
+         return i < entry.srv_count;
+#else
+         return entry.IsSRVValid(i);
+#endif
+         }, [&](size_t i)
+         {
+#if DX12
+         write_register('t', entry.sr_register[i]);
+         if (entry.srv_format[i] == DXGI_FORMAT(-1))
+         {
+            w->Field("bound", false);
+            return;
+         }
+#endif
          write_resource(entry.sr_format[i], entry.srv_format[i], entry.sr_size[i], entry.srv_size[i], entry.srv_mip[i], entry.sr_type_name[i], entry.sr_hash[i], entry.sr_debug_name[i]);
          if (entry.sr_is_rt[i]) w->Field("is_rt", true);
          if (entry.sr_is_ua[i]) w->Field("is_ua", true); });
       WriteViews(w, "uavs", TraceDrawCallData::uavs_size, [&](size_t i)
-         { return entry.IsUAVValid(i); }, [&](size_t i)
          {
+#if DX12
+         return i < entry.uav_count;
+#else
+         return entry.IsUAVValid(i);
+#endif
+         }, [&](size_t i)
+         {
+#if DX12
+         write_register('u', entry.ua_register[i]);
+         if (entry.uav_format[i] == DXGI_FORMAT(-1))
+         {
+            w->Field("bound", false);
+            return;
+         }
+#endif
          write_resource(entry.ua_format[i], entry.uav_format[i], entry.ua_size[i], entry.uav_size[i], entry.uav_mip[i], entry.ua_type_name[i], entry.ua_hash[i], entry.ua_debug_name[i]);
          if (entry.ua_is_rt[i]) w->Field("is_rt", true); });
       if (entry.IsDSVValid())
@@ -700,8 +781,32 @@ namespace Mcp
       WriteViews(w, "cbs", D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, [&](size_t i)
          { return entry.cbs[i]; }, [&](size_t i)
          {
+#if DX12 // Root constants have no buffer, a CBV is a range of any buffer (root CBVs have no size)
+         write_register('b', entry.cb_register[i]);
+         if (const std::vector<uint32_t>& root_constants = entry.cb_root_constants[i]; !root_constants.empty())
+         {
+            w->Key("root_constants").BeginArray();
+            for (const uint32_t value : root_constants)
+               w->Value(value);
+            w->EndArray().Key("root_constants_float").BeginArray();
+            for (const uint32_t value : root_constants)
+               w->Value(double(std::bit_cast<float>(value)));
+            w->EndArray();
+            return;
+         }
+         if (entry.cb_hash[i].empty())
+         {
+            w->Field("bound", false);
+            return;
+         }
+         w->Field("resource", entry.cb_hash[i]).Field("offset_bytes", entry.cb_first_constant[i] * 16);
+         if (entry.cb_num_constants[i] != 0) w->Field("size_bytes", entry.cb_num_constants[i] * 16);
+#else
          w->Field("resource", entry.cb_hash[i]);
-         if (entry.cb_num_constants[i] != 0) w->Field("first_constant", entry.cb_first_constant[i]).Field("num_constants", entry.cb_num_constants[i]); });
+         if (entry.cb_num_constants[i] != 0) w->Field("first_constant", entry.cb_first_constant[i]).Field("num_constants", entry.cb_num_constants[i]);
+#endif
+         });
+#if DX11 // D3D12 samplers aren't captured yet
       WriteViews(w, "samplers", D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, [&](size_t i)
          { return entry.samplers_filter[i] != static_cast<D3D11_FILTER>(-1); }, [&](size_t i)
          {
@@ -709,6 +814,7 @@ namespace Mcp
          w->Field("address", std::format("{} {} {}", GetTextureAddressModeName(entry.samplers_address_u[i]), GetTextureAddressModeName(entry.samplers_address_v[i]), GetTextureAddressModeName(entry.samplers_address_w[i])));
          w->Key("address_ids").BeginArray().Value(uint32_t(entry.samplers_address_u[i])).Value(uint32_t(entry.samplers_address_v[i])).Value(uint32_t(entry.samplers_address_w[i])).EndArray();
          w->Field("mip_lod_bias", entry.samplers_mip_lod_bias[i]); });
+#endif
 
       if (!entry.input_layout_hash.empty())
       {
@@ -751,9 +857,23 @@ namespace Mcp
       {
          using Type = TraceDrawCallData::TraceDrawCallType;
          const Shader::CachedPipeline* pipeline = entry.type == Type::Shader ? FindPipeline(device_data, entry.pipeline_handle) : nullptr;
-         if ((pipeline && pipeline->HasVertexShader() && !include_vs) || ((entry.type == Type::BindPipeline || entry.type == Type::BindResource) && !include_bindings) || (entry.type == Type::CPUWrite && entry.rt_type_name[0] == "Buffer" && !include_buffer_writes))
+#if DX11 // D3D12 entries are per draw, with their VS
+         if (pipeline && pipeline->HasVertexShader() && !include_vs)
             return false;
-         if ((type && *type != EnumName(trace_type_names, size_t(entry.type))) || (hash && (!pipeline || pipeline->shader_hashes[0] != *hash)) || (stage && (!pipeline || _stricmp(stage->c_str(), pipeline->StageName()) != 0)) || (replaced_only && (!pipeline || !IsReplaced(*pipeline))))
+#endif
+         if (((entry.type == Type::BindPipeline || entry.type == Type::BindResource) && !include_bindings) || (entry.type == Type::CPUWrite && entry.rt_type_name[0] == "Buffer" && !include_buffer_writes))
+            return false;
+         // Any stage of a D3D12 PSO
+         const auto has_stage = [&]
+         {
+#if DX12
+            return std::ranges::any_of(pipeline->shader_types, [&](reshade::api::pipeline_subobject_type shader_type)
+               { return _stricmp(stage->c_str(), Shader::CachedPipeline::StageName(shader_type)) == 0; });
+#else
+            return _stricmp(stage->c_str(), pipeline->StageName()) == 0;
+#endif
+         };
+         if ((type && *type != EnumName(trace_type_names, size_t(entry.type))) || (hash && (!pipeline || std::ranges::find(pipeline->shader_hashes, *hash) == pipeline->shader_hashes.end())) || (stage && (!pipeline || !has_stage())) || (replaced_only && (!pipeline || !IsReplaced(*pipeline))))
             return false;
          const auto has_resource = [&](const auto& hashes)
          { return std::ranges::find(hashes, *resource) != std::end(hashes); };
@@ -761,6 +881,7 @@ namespace Mcp
       }
    };
 
+#if DX11
    // Picks the pass a readback targets ("job.pipeline_handle", "shader_hash", "stage", "instance", "thread"), either from the last
    // capture ("index") or by "hash" + "instance" (Nth draw with that shader in a frame). Instances are counted like the runtime counter
    // the debug draw and constant buffer tracking use: across threads, except deferred passes, filtered by their recording thread.
@@ -955,7 +1076,9 @@ namespace Mcp
       job->files.emplace_back(std::move(path), std::move(bytes));
       return true;
    }
+#endif // DX11
 
+#if DX11
    // Super resolution tap: wraps every "sr_implementations" entry (see "Init()") to record what games feed the upscalers
    constexpr const char* sr_resource_names[] = {"source_color", "motion_vectors", "depth_buffer", "exposure", "bias_mask", "transparency_alpha", "output_color"};
    constexpr size_t sr_history_size = 256;
@@ -1155,6 +1278,7 @@ namespace Mcp
       uint32_t failures = 0;
       uint32_t resets = 0;
    };
+#endif // DX11
 
    // Where readbacks go ("out_dir" can only pick a subfolder): an elevated game must not write where a non elevated client asks.
    // Not under the game's "Luma" folder, a non empty one there would shadow the repository shaders.
@@ -1285,7 +1409,7 @@ namespace Mcp
             {
                const auto& entry = cmd_list_data.trace_draw_calls_data[i];
                const auto* pipeline = entry.type == TraceDrawCallData::TraceDrawCallType::Shader ? FindPipeline(device_data, entry.pipeline_handle) : nullptr;
-               if (pipeline && pipeline->shader_hashes[0] == *trigger)
+               if (pipeline && std::ranges::find(pipeline->shader_hashes, *trigger) != pipeline->shader_hashes.end())
                   trigger_indices.push_back(i);
             }
          }
@@ -1311,9 +1435,12 @@ namespace Mcp
                const auto* pipeline = entry.type == TraceDrawCallData::TraceDrawCallType::Shader ? FindPipeline(device_data, entry.pipeline_handle) : nullptr;
                if (!pipeline)
                   continue;
-               auto& counts = job->hash_counts.try_emplace(pipeline->shader_hashes[0], Job::HashCounts{pipeline->StageName(), {}}).first->second.per_frame;
-               counts.resize(job->frames, 0); // Zeroes for the captures that didn't draw it
-               counts.back()++;
+               for (const uint32_t shader_hash : pipeline->shader_hashes)
+               {
+                  auto& counts = job->hash_counts.try_emplace(shader_hash, Job::HashCounts{StageName(*pipeline, shader_hash), {}}).first->second.per_frame;
+                  counts.resize(job->frames, 0); // Zeroes for the captures that didn't draw it
+                  counts.back()++;
+               }
             }
          }
          if (job->frames < frames)
@@ -1412,6 +1539,7 @@ namespace Mcp
       return true;
    }
 
+#if DX11
    bool RunReadResource(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, ID3D11DeviceContext* native_device_context, reshade::api::swapchain* swapchain)
    {
       const std::string* view = job->Arg("view");
@@ -1561,6 +1689,7 @@ namespace Mcp
       data.Clear();
       return true;
    }
+#endif // DX11
 
    bool RunDevValues(Job* job, DeviceData& device_data)
    {
@@ -1592,6 +1721,7 @@ namespace Mcp
          case DevValueKind::Texture:
          {
             w.Field("kind", "texture");
+#if DX11
             const com_ptr<ID3D11Resource> resource = GetTexture(dev_value, device_data);
             w.Field("allocated", bool(resource));
             if (resource)
@@ -1601,6 +1731,7 @@ namespace Mcp
                GetResourceInfo(resource.get(), size, format);
                w.Format("format", format).Key("size").BeginArray().Value(size.x).Value(size.y).Value(size.z).Value(size.w).EndArray();
             }
+#endif
             break;
          }
          }
@@ -1695,6 +1826,7 @@ namespace Mcp
       return true;
    }
 
+#if DX11
    bool RunSrCapture(Job* job, ID3D11DeviceContext* native_device_context)
    {
       if (job->phase == 0)
@@ -1736,6 +1868,7 @@ namespace Mcp
       w.EndArray();
       return true;
    }
+#endif // DX11
 
    bool RunShaderList(Job* job, DeviceData& device_data)
    {
@@ -1757,12 +1890,33 @@ namespace Mcp
          const auto* cached = cached_it != shader_cache.end() ? cached_it->second : nullptr;
          w.BeginObject().Hash("hash", hash);
          if (pipeline)
-            w.Field("stage", pipeline->StageName()).Field("pipelines", pipelines).Field("replaced", ReplacementName(*pipeline));
+            w.Field("stage", StageName(*pipeline, hash)).Field("pipelines", pipelines).Field("replaced", ReplacementName(*pipeline));
          else
             w.Field("live", false);
          if (cached)
          {
             w.Field("version", cached->type_and_version).Field("bytes", cached->size);
+#if DX12 // The per slot reflections have no register spaces, and can't read DXIL
+            if (cached->found_bindings)
+            {
+               // As the "HLSL Bind" column of the disassembly, plus the count of arrays
+               w.Key("bindings").BeginArray();
+               for (const CachedShader::ResourceBinding& binding : cached->bindings)
+               {
+                  std::string text = std::format("{}{}", binding.type, binding.index);
+                  if (binding.space != 0)
+                     std::format_to(std::back_inserter(text), ",space{}", binding.space);
+                  if (binding.count == UINT32_MAX)
+                     text += "[unbounded]";
+                  else if (binding.count != 1)
+                     std::format_to(std::back_inserter(text), "[{}]", binding.count);
+                  w.Value(text);
+               }
+               w.EndArray();
+            }
+            if (cached->uses_descriptor_heap)
+               w.Field("uses_descriptor_heap", true);
+#else
             if (cached->found_reflections)
             {
                const auto write_slots = [&](const char* key, const bool* slots, size_t count)
@@ -1779,6 +1933,7 @@ namespace Mcp
                write_slots("rtvs", cached->rtvs, std::size(cached->rtvs));
                write_slots("samplers", cached->samplers, std::size(cached->samplers));
             }
+#endif
          }
          w.EndObject();
       };
@@ -1790,7 +1945,7 @@ namespace Mcp
             continue;
          live++;
          const auto* pipeline = *pipelines.begin();
-         if ((stage && _stricmp(stage->c_str(), pipeline->StageName()) != 0) || (replaced_only && !IsReplaced(*pipeline)))
+         if ((stage && _stricmp(stage->c_str(), StageName(*pipeline, hash)) != 0) || (replaced_only && !IsReplaced(*pipeline)))
             continue;
          write_shader(hash, pipeline, pipelines.size());
       }
@@ -1808,6 +1963,9 @@ namespace Mcp
          }
       }
       w.EndArray().Field("live", live).Field("loaded", shader_cache.size());
+#if DX12
+      w.Field("bindings_note", "A shader's bindings are read at its first frame capture (luma_trace_capture)");
+#endif
       w.Field("matched", matched).Field("offset", offset).Field("returned", matched > offset ? (std::min)(matched - offset, limit) : 0);
       return true;
    }
@@ -1846,7 +2004,7 @@ namespace Mcp
          {
             for (const auto* pipeline : it->second)
             {
-               w.BeginObject().Field("stage", pipeline->StageName()).Field("replaced", ReplacementName(*pipeline)).Field("cloned", pipeline->cloned);
+               w.BeginObject().Field("stage", StageName(*pipeline, *hash)).Field("replaced", ReplacementName(*pipeline)).Field("cloned", pipeline->cloned);
                w.Field("replace_draw_type", Shader::CachedPipeline::shader_replace_draw_type_names[size_t(pipeline->replace_draw_type)]).EndObject();
             }
          }
@@ -2007,6 +2165,7 @@ namespace Mcp
       return true;
    }
 
+#if DX11
    // Frame times over a window: CPU present to present, and the GPU timestamp span between the same two points (it includes GPU
    // idle time when the game is CPU bound). A frame cap or vsync lowers the GPU clocks and bounds both.
    bool RunPerf(Job* job, DeviceData& device_data, ID3D11DeviceContext* native_device_context)
@@ -2055,26 +2214,38 @@ namespace Mcp
 #endif
       return true;
    }
+#endif // DX11
 
-   bool RunJob(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, ID3D11DeviceContext* native_device_context, reshade::api::swapchain* swapchain)
+   // "native_command_list" is the immediate context on D3D11, null on D3D12 (it has no readbacks yet)
+   bool RunJob(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, [[maybe_unused]] NativeCommandList* native_command_list, [[maybe_unused]] reshade::api::swapchain* swapchain)
    {
       const std::string& tool = job->tool;
       if (tool == "status")
          return RunStatus(job, device_data);
       if (tool == "wait_frames")
          return RunWaitFrames(job);
+#if DX11
       if (tool == "perf")
-         return RunPerf(job, device_data, native_device_context);
+         return RunPerf(job, device_data, native_command_list);
+      if (tool == "read_resource")
+         return RunReadResource(job, device_data, cmd_list_data, native_command_list, swapchain);
+      if (tool == "read_cbuffer")
+         return RunReadConstantBuffer(job, device_data, cmd_list_data, native_command_list);
+      if (tool == "sr_capture")
+         return RunSrCapture(job, native_command_list);
+#else
+      if (tool == "perf" || tool == "read_resource" || tool == "read_cbuffer" || tool == "sr_capture")
+      {
+         job->error = tool + " is D3D11 only for now (D3D12 readbacks and timestamps are \"docs/DX12-Support-Plan.md\" A4 and phase 7)";
+         return true;
+      }
+#endif
       if (tool == "trace_capture")
          return RunTraceCapture(job, device_data, cmd_list_data);
       if (tool == "trace_list")
          return RunTraceList(job, device_data, cmd_list_data);
       if (tool == "trace_get")
          return RunTraceGet(job, device_data, cmd_list_data);
-      if (tool == "read_resource")
-         return RunReadResource(job, device_data, cmd_list_data, native_device_context, swapchain);
-      if (tool == "read_cbuffer")
-         return RunReadConstantBuffer(job, device_data, cmd_list_data, native_device_context);
       if (tool == "shader_state")
          return RunShaderState(job, device_data);
       if (tool == "reload_shaders")
@@ -2089,8 +2260,6 @@ namespace Mcp
          return RunSetDevValue(job, device_data);
       if (tool == "sr_state")
          return RunSrState(job, device_data);
-      if (tool == "sr_capture")
-         return RunSrCapture(job, native_device_context);
       if (tool == "shader_list")
          return RunShaderList(job, device_data);
       if (tool == "dump_shader")
@@ -2338,9 +2507,11 @@ namespace Mcp
       RegisterToggles({{"core.hide_ui", &hide_ui}, {"core.force_disable_display_composition", &force_disable_display_composition}, {"core.ignore_upgraded_samplers", &ignore_upgraded_samplers},
          {"core.enable_upgraded_texture_resource_copy_redirection", &enable_upgraded_texture_resource_copy_redirection}});
       RegisterInts({{"core.frame_sleep_ms", &frame_sleep_ms, 0, 100}, {"core.frame_sleep_interval", &frame_sleep_interval, 1, 30}});
+#if DX11
       RegisterCounters({{"core.shader_creates_game", &Perf::g_shader_creates.game_count}, {"core.shader_creates_game_ms", &Perf::g_shader_creates.game_ms},
          {"core.shader_creates_game_max_us", &Perf::g_shader_creates.game_max_us}, {"core.shader_creates_luma", &Perf::g_shader_creates.luma_count},
          {"core.shader_creates_luma_ms", &Perf::g_shader_creates.luma_ms}});
+#endif
 #if ENABLE_FIDELITY_SK && DEVELOPMENT && !defined(NDEBUG) // As "FidelityFX::draw_debug_view"
       RegisterToggles({{"core.fsr_debug_view", &FidelityFX::draw_debug_view}});
 #endif
@@ -2366,6 +2537,7 @@ namespace Mcp
             device_data.sr_type_selected = type;
             return std::string(); }}});
 #endif
+#if DX11
       // "DrawSMAA" and "DrawBloom"'s intermediates, the bloom's mips through "mip"
       RegisterTextures({{"core.smaa_edges", [](DeviceData& device_data) -> ID3D11DeviceChild*
                            { return device_data.managed_resources.shader_resource_views["smaa_edge_detection"_h].get(); }},
@@ -2373,6 +2545,7 @@ namespace Mcp
             { return device_data.managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].get(); }},
          {"core.bloom", [](DeviceData&) -> ID3D11DeviceChild*
             { return draw_bloom_mips.srv_mips_y.empty() ? nullptr : draw_bloom_mips.srv_mips_y[0]; }}});
+#endif
 
       // "Init()" runs again when ReShade re-inits the addon without unloading it (The Witcher creates a probe D3D9 device first):
       // assigning over the first run's joinable thread would call std::terminate. Keep that server, or restart one that has exited.
@@ -2387,8 +2560,8 @@ namespace Mcp
       server_thread = std::thread(ServerThread);
    }
 
-   // Called from "OnPresent" on the render thread, before display composition
-   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, ID3D11DeviceContext* native_device_context, reshade::api::swapchain* swapchain)
+   // Called from "OnPresent" on the render thread, before display composition. "cmd_list_data" holds the frame capture.
+   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, NativeCommandList* native_command_list, reshade::api::swapchain* swapchain)
    {
       last_present_ms = GetTickCount64();
       last_frame_index = cb_luma_global_settings.FrameIndex;
@@ -2410,8 +2583,9 @@ namespace Mcp
       active_job->device_data = &device_data;
 
       Job& job = *active_job;
-      if (!RunJob(&job, device_data, cmd_list_data, native_device_context, swapchain))
+      if (!RunJob(&job, device_data, cmd_list_data, native_command_list, swapchain))
          return;
+#if DX11
       if (job.saved_debug_draw)
       {
          job.saved_debug_draw->Apply();
@@ -2419,6 +2593,7 @@ namespace Mcp
       }
       if (job.saved_track_buffer)
          job.saved_track_buffer->Apply();
+#endif
       if (!job.error.empty())
       {
          job.result = {};

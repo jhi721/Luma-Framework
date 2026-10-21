@@ -6400,9 +6400,9 @@ namespace
    }
 #endif // ENABLE_SR
 
-#if DEVELOPMENT && DX11 // Its readbacks and traces are D3D11 ("docs/DX12-Support-Plan.md" phase 7)
+#if DEVELOPMENT
 #include "includes/mcp_server.inl"
-#endif // DEVELOPMENT && DX11
+#endif // DEVELOPMENT
 
 #if ENABLE_SWAPCHAIN_PROXY
    // Encodes the scRGB proxy into the real HDR10 PQ (or SDR sRGB) back buffer, the last thing drawn in the frame:
@@ -6526,7 +6526,11 @@ namespace
 #if DX11
       // Before display composition, so a debug draw copy requested over MCP is read back and cleared before it's drawn
       Mcp::OnPresent(device_data, cmd_list_data, native_device_context, swapchain);
+#else
+      Mcp::OnPresent(device_data, device_data.trace_command_list_data, nullptr, swapchain);
+#endif
 
+#if DX11
       {
          auto& creates = Perf::g_shader_creates;
          const auto now = std::chrono::steady_clock::now();
@@ -17448,7 +17452,7 @@ void Init(bool async)
 #if ENABLE_LUMA_TAA
    sr_implementations[SR::Type::LumaTAA] = std::make_unique<LumaTAA::TAA>();
 #endif
-#if DEVELOPMENT && DX11
+#if DEVELOPMENT
    Mcp::Start();
 #if ENABLE_SR
    // Games call through these pointers, so the MCP tap sees every settings update and draw
@@ -18033,9 +18037,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
    case DLL_PROCESS_DETACH:
    {
 #if DEVELOPMENT
-#if DX11
       Mcp::Shutdown();
-#endif
       if (game_window_original_proc && game_window != NULL && IsWindow(game_window))
       {
          SetWindowLongPtr(game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(game_window_original_proc));
