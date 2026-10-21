@@ -32,24 +32,24 @@ public:
       luma_data_cbuffer_index = 12;
    }
 
-   void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
+   void OnCreateDevice(NativeDevice* native_device, DeviceData& device_data) override
    {
       device_data.game = new GraphicsAnalyzerDeviceData;
    }
 
-   DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
+   DrawOrDispatchOverrideType OnDrawOrDispatch(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
       return DrawOrDispatchOverrideType::None; // Don't cancel the original draw call
    }
-   void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
+   void OnPresent(NativeDevice* native_device, DeviceData& device_data) override
    {
    }
 
    void PrintImGuiAbout() override
    {
-      ImGui::Text("DX11 Graphics Analyzer - Developed by Pumbo", "");
+      ImGui::Text("%s Graphics Analyzer - Developed by Pumbo", supported_graphics_api_name);
    }
 };
 
@@ -57,7 +57,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 {
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
+#if DX12
+      Globals::SetGlobals(PROJECT_NAME, "Luma DX12 Graphics Analyzer", "https://github.com/Filoppi/Luma-Framework/");
+#else
       Globals::SetGlobals(PROJECT_NAME, "Luma DX11 Graphics Analyzer", "https://github.com/Filoppi/Luma-Framework/");
+#endif
 
       // Don't automatically dump game shaders
       auto_dump = false;

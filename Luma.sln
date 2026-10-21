@@ -43,6 +43,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "_Generic Mod DX12", "Source
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Graphics Analyzer", "Source\Graphics Analyzer\Graphics Analyzer.vcxproj", "{08143144-3ABB-D7B3-815C-7C798924E8E6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Graphics Analyzer DX12", "Source\Graphics Analyzer DX12\Graphics Analyzer DX12.vcxproj", "{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SR Bridge Helper", "Source\Tools\SR Bridge Helper\SR Bridge Helper.vcxproj", "{1A1AC095-1247-455C-8FF4-D8D6051AA52A}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "D3D9 VA Fix", "Source\Tools\D3D9 VA Fix\D3D9 VA Fix.vcxproj", "{B74BC74A-D4CD-4381-8248-2F518387420B}"
@@ -1195,6 +1197,18 @@ Global
 		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Test-Release|Win32.ActiveCfg = Test-Release|x64
 		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Test-Release|x64.ActiveCfg = Test-Release|x64
 		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Test-Release|x64.Build.0 = Test-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Development-Debug|x64.Build.0 = Development-Debug|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Development-Release|Win32.ActiveCfg = Development-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Development-Release|x64.ActiveCfg = Development-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Development-Release|x64.Build.0 = Development-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Publishing-Release|x64.ActiveCfg = Publishing-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Publishing-Release|x64.Build.0 = Publishing-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Test-Release|Win32.ActiveCfg = Test-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Test-Release|x64.ActiveCfg = Test-Release|x64
+		{DDB9CF9A-9146-43AD-9991-5CBCA5BA76DD}.Test-Release|x64.Build.0 = Test-Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
