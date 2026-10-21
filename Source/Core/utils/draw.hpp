@@ -951,14 +951,15 @@ void DrawCustomPixelShader(ID3D11DeviceContext* device_context, ID3D11DepthStenc
    viewport.MinDepth = 0;
    viewport.MaxDepth = 1;
    device_context->RSSetViewports(1, &viewport); // Viewport is always needed
+   // The targets before the source: D3D11 binds a resource still bound as an output (e.g. the game's render target) as a null SRV
+   ID3D11RenderTargetView* const target_resource_texture_views[] = { target_resource_texture_view, second_target_resource_texture_view };
+   device_context->OMSetRenderTargets(second_target_resource_texture_view ? 2 : 1, target_resource_texture_views, nullptr);
    device_context->PSSetShaderResources(0, 1, &source_resource_texture_view);
    device_context->OMSetDepthStencilState(depth_stencil_state, 0);
    if (sampler_state) // Optional
    {
       device_context->PSSetSamplers(0, 1, &sampler_state);
    }
-   ID3D11RenderTargetView* const target_resource_texture_views[] = { target_resource_texture_view, second_target_resource_texture_view };
-   device_context->OMSetRenderTargets(second_target_resource_texture_view ? 2 : 1, target_resource_texture_views, nullptr);
    device_context->VSSetShader(vs, nullptr, 0);
    device_context->PSSetShader(ps, nullptr, 0);
    device_context->IASetInputLayout(nullptr);
