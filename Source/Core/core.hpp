@@ -5250,6 +5250,13 @@ namespace
       return false;
    }
 
+   bool OnEndRenderPass(reshade::api::command_list* cmd_list)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      cmd_list->get_private_data<CommandListData>()->d3d12_state.in_render_pass = false;
+      return false;
+   }
+
    // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer
    void OnInitResource(reshade::api::device* device, const reshade::api::resource_desc& desc, const reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state, reshade::api::resource resource)
    {
@@ -5279,32 +5286,305 @@ namespace
       D3D12Trace::AddTraceDrawCallData(&cmd_list_data.trace_draw_calls_data, cmd_list->get_device()->get_private_data<DeviceData>(), cmd_list, cmd_list_data.d3d12_state, shader_cache, draw_dispatch_data);
    }
 
+   // The dev MCP's readbacks ("includes/d3d12_readback.hpp"): copies the view a job asked for at its target draw. Returns true when it
+   // re-issued the draw to copy its output after it, then the original call must be skipped.
+   bool ReadbackDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12Readback::Command command)
+   {
+      if (!D3D12Readback::armed)
+         return false;
+      reshade::api::device* device = cmd_list->get_device();
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12Readback::State& readback = device_data.readback;
+      D3D12Readback::Target target;
+      {
+         const std::unique_lock lock(readback.mutex);
+         if (!readback.target || std::ranges::find(readback.target->pipelines, cmd_list_data.d3d12_state.pipeline.handle) == readback.target->pipelines.end() || (readback.target->thread != std::thread::id() && readback.target->thread != std::this_thread::get_id()))
+            return false;
+         if (readback.instances++ != readback.target->instance)
+            return false;
+         target = std::move(*readback.target);
+         readback.target.reset();
+         D3D12Readback::armed = false;
+      }
+
+      // The bindings in the frame capture's order, so slots mean what "luma_trace_get" lists
+      std::vector<TraceDrawCallData> entries;
+      bool writes_render_target = false; // "target.slot", a render target the pipeline doesn't write can be in any state
+      {
+         const std::shared_lock lock_generic(s_mutex_generic);
+         {
+            const std::lock_guard<std::recursive_mutex> lock_dumping(s_mutex_dumping);
+            D3D12Trace::AddTraceDrawCallData(&entries, &device_data, cmd_list, cmd_list_data.d3d12_state, shader_cache, draw_dispatch_data);
+         }
+         const auto it = device_data.pipeline_cache_by_pipeline_handle.find(cmd_list_data.d3d12_state.pipeline.handle);
+         if (target.kind == D3D12Readback::Kind::RenderTarget && target.slot < TraceDrawCallData::rtvs_size && it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second)
+         {
+            uint32_t format_count = 0;
+            const reshade::api::format* formats = nullptr;
+            uint8_t write_mask = 0xF; // The D3D12 default without a blend state
+            for (uint32_t i = 0; i < it->second->subobject_count; i++)
+            {
+               const reshade::api::pipeline_subobject& subobject = it->second->subobjects_cache[i];
+               if (subobject.type == reshade::api::pipeline_subobject_type::render_target_formats)
+               {
+                  format_count = subobject.count;
+                  formats = static_cast<const reshade::api::format*>(subobject.data);
+               }
+               else if (subobject.type == reshade::api::pipeline_subobject_type::blend_state && subobject.data)
+               {
+                  write_mask = static_cast<const reshade::api::blend_desc*>(subobject.data)->render_target_write_mask[target.slot];
+               }
+            }
+            writes_render_target = formats && target.slot < format_count && formats[target.slot] != reshade::api::format::unknown && write_mask != 0;
+         }
+      }
+      D3D12Trace::ResolveTableDescriptors(&entries, &device_data);
+      const TraceDrawCallData& entry = entries.back();
+
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      D3D12Readback::Copy copy = {.cmd_list = cmd_list};
+      D3D12State::ViewInfo view; // Textures
+      D3D12_RESOURCE_STATES draw_state = D3D12_RESOURCE_STATE_COMMON;
+      uint32_t plane = 0;
+      ID3D12Resource* buffer = nullptr; // Constant buffers
+      using Kind = D3D12Readback::Kind;
+      if (native_list->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE)
+      {
+         copy.error = "The draw is recorded in a bundle, which can't hold copies";
+      }
+      else if (cmd_list_data.d3d12_state.in_render_pass)
+      {
+         copy.error = "The draw is inside a render pass, which can't hold copies";
+      }
+      else if (target.kind != Kind::ConstantBuffer && command == D3D12Readback::Command::Other)
+      {
+         copy.error = "Indirect and mesh draws can't be re-issued to copy their output";
+      }
+      else
+      {
+         switch (target.kind)
+         {
+         case Kind::RenderTarget:
+         {
+            if (target.slot >= TraceDrawCallData::rtvs_size || !entry.IsRTVValid(target.slot))
+            {
+               copy.error = std::format("The draw has no render target at slot {}", target.slot);
+            }
+            else if (!writes_render_target)
+            {
+               copy.error = std::format("The pipeline doesn't write render target {}, its state isn't known", target.slot);
+            }
+            else
+            {
+               view = entry.rt_view[target.slot];
+               draw_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+               copy.data_format = entry.rtv_format[target.slot];
+            }
+            break;
+         }
+         case Kind::UnorderedAccess:
+         {
+            if (target.slot >= entry.uav_count || entry.ua_view[target.slot].resource == 0)
+            {
+               copy.error = std::format("The draw has no unordered access view at slot {}", target.slot);
+            }
+            else
+            {
+               view = entry.ua_view[target.slot];
+               draw_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+               copy.data_format = entry.uav_format[target.slot];
+            }
+            break;
+         }
+         case Kind::Depth:
+         case Kind::Stencil:
+         {
+            // A writable depth stencil view is in DEPTH_READ when the pipeline doesn't write that plane
+            using DepthStateType = TraceDrawCallData::DepthStateType;
+            const bool is_stencil = target.kind == Kind::Stencil;
+            const DepthStateType plane_state = is_stencil ? entry.stencil_state : entry.depth_state;
+            if (!entry.IsDSVValid())
+            {
+               copy.error = "The draw has no depth stencil view";
+            }
+            else if (plane_state != DepthStateType::TestAndWrite && plane_state != DepthStateType::WriteOnly)
+            {
+               copy.error = std::format("The pipeline doesn't write {0}, so its state isn't known: read it at a draw that writes {0}", is_stencil ? "stencil" : "depth");
+            }
+            else
+            {
+               view = entry.ds_view;
+               draw_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+               plane = is_stencil ? 1 : 0;
+               // The planes copy as R32 (D24's top 8 bits zeroed) and R8, typed here for the readers
+               switch (entry.dsv_format)
+               {
+               case DXGI_FORMAT_D24_UNORM_S8_UINT:
+                  copy.data_format = (is_stencil ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
+                  break;
+               case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+                  copy.data_format = (is_stencil ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R32_FLOAT);
+                  break;
+               case DXGI_FORMAT_D32_FLOAT:
+                  copy.data_format = DXGI_FORMAT_R32_FLOAT;
+                  break;
+               case DXGI_FORMAT_D16_UNORM:
+                  copy.data_format = DXGI_FORMAT_R16_UNORM;
+                  break;
+               default:
+                  copy.data_format = entry.dsv_format;
+                  break;
+               }
+            }
+            break;
+         }
+         case Kind::ConstantBuffer:
+         {
+            if (target.slot >= entry.cb_count)
+            {
+               copy.error = std::format("The draw has no constant buffer at slot {}", target.slot);
+               break;
+            }
+            copy.register_index = entry.cb_register[target.slot].index;
+            copy.register_space = entry.cb_register[target.slot].space;
+            copy.resource = entry.cb_hash[target.slot];
+            if (!entry.cb_root_constants[target.slot].empty())
+            {
+               copy.root_constants = entry.cb_root_constants[target.slot];
+               copy.status = D3D12Readback::Copy::Status::Ready;
+               break;
+            }
+            buffer = reinterpret_cast<ID3D12Resource*>(entry.cb_resource[target.slot]);
+            D3D12_HEAP_PROPERTIES heap = {};
+            if (!buffer)
+            {
+               copy.error = "The constant buffer view is null";
+            }
+            else if (FAILED(buffer->GetHeapProperties(&heap, nullptr)) || heap.Type != D3D12_HEAP_TYPE_UPLOAD)
+            {
+               copy.error = "The constant buffer isn't in an UPLOAD heap, its state at the draw isn't known";
+               buffer = nullptr;
+            }
+            else
+            {
+               const uint64_t buffer_size = buffer->GetDesc().Width;
+               copy.buffer_offset = (std::min)(uint64_t(entry.cb_first_constant[target.slot]) * 16, buffer_size);
+               // Root constant buffer views have no size: up to what a view can address
+               const uint64_t size = (entry.cb_num_constants[target.slot] != 0) ? uint64_t(entry.cb_num_constants[target.slot]) * 16 : uint64_t(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT) * 16;
+               copy.size = (std::min)(size, buffer_size - copy.buffer_offset);
+            }
+            break;
+         }
+         }
+      }
+
+      // The subresources the view covers, one mip
+      std::vector<uint32_t> subresources;
+      ID3D12Resource* resource = reinterpret_cast<ID3D12Resource*>(view.resource);
+      if (copy.error.empty() && resource)
+      {
+         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+         const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+         const uint32_t array_size = is_3d ? 1 : desc.DepthOrArraySize;
+         copy.mip = view.first_level;
+         copy.first_layer = is_3d ? 0 : view.first_layer;
+         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+         {
+            copy.error = "Buffer views aren't read back (like on D3D11), only textures";
+         }
+         else if (desc.SampleDesc.Count > 1 && target.kind != Kind::RenderTarget)
+         {
+            copy.error = "Multisampled depth can't be resolved for readback";
+         }
+         else if (copy.first_layer >= array_size || copy.mip >= desc.MipLevels)
+         {
+            copy.error = "The view is out of its resource's range";
+         }
+         else
+         {
+            const uint32_t layers = is_3d ? 1 : (std::min)(view.layer_count, array_size - copy.first_layer);
+            for (uint32_t layer = copy.first_layer; layer < copy.first_layer + layers; layer++)
+            {
+               subresources.push_back(copy.mip + layer * desc.MipLevels + plane * desc.MipLevels * array_size);
+            }
+         }
+      }
+
+      const DrawDispatchData& dd = draw_dispatch_data;
+      const auto reissue = [&]
+      {
+         switch (command)
+         {
+         case D3D12Readback::Command::Draw:
+            native_list->DrawInstanced(dd.vertex_count, dd.instance_count, dd.first_vertex, dd.first_instance);
+            break;
+         case D3D12Readback::Command::DrawIndexed:
+            native_list->DrawIndexedInstanced(dd.index_count, dd.instance_count, dd.first_index, dd.vertex_offset, dd.first_instance);
+            break;
+         case D3D12Readback::Command::Dispatch:
+            native_list->Dispatch(dd.dispatch_count.x, dd.dispatch_count.y, dd.dispatch_count.z);
+            break;
+         case D3D12Readback::Command::Other:
+            break; // Refused above
+         }
+      };
+      bool reissued = false;
+      const std::unique_lock lock(readback.mutex);
+      if (copy.error.empty() && copy.status == D3D12Readback::Copy::Status::Recorded)
+      {
+         auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+         // Before the draw for constant buffers, it doesn't write them
+         const bool recorded = buffer ? D3D12Readback::RecordBufferCopy(&readback, native_device, native_list, buffer, copy.buffer_offset, copy.size, &copy) : D3D12Readback::RecordTextureCopy(&readback, native_device, native_list, resource, draw_state, subresources, copy.data_format, &copy, reissue);
+         reissued = recorded && !buffer;
+         if (!recorded)
+         {
+            copy.error = "Failed to create the readback resources";
+         }
+      }
+      if (!copy.error.empty())
+      {
+         copy.status = D3D12Readback::Copy::Status::Failed;
+      }
+      else if (copy.status == D3D12Readback::Copy::Status::Recorded)
+      {
+         D3D12Readback::recorded_copies++;
+      }
+      D3D12Readback::Retire(&readback);
+      readback.copy = std::move(copy);
+      return reissued;
+   }
+
    bool OnDraw(reshade::api::command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      TraceDrawOrDispatch(cmd_list, {.vertex_count = vertex_count, .instance_count = instance_count, .first_vertex = first_vertex, .first_instance = first_instance});
-      return false;
+      const DrawDispatchData draw_dispatch_data = {.vertex_count = vertex_count, .instance_count = instance_count, .first_vertex = first_vertex, .first_instance = first_instance};
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Draw);
    }
 
    bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      TraceDrawOrDispatch(cmd_list, {.instance_count = instance_count, .first_instance = first_instance, .index_count = index_count, .first_index = first_index, .vertex_offset = vertex_offset, .indexed = true});
-      return false;
+      const DrawDispatchData draw_dispatch_data = {.instance_count = instance_count, .first_instance = first_instance, .index_count = index_count, .first_index = first_index, .vertex_offset = vertex_offset, .indexed = true};
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::DrawIndexed);
    }
 
    bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      TraceDrawOrDispatch(cmd_list, {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}});
-      return false;
+      const DrawDispatchData draw_dispatch_data = {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}};
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Dispatch);
    }
 
    bool OnDispatchMesh(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      TraceDrawOrDispatch(cmd_list, {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}});
-      return false;
+      const DrawDispatchData draw_dispatch_data = {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}};
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Other);
    }
 
    // "ExecuteIndirect()" comes as "indirect_command::unknown", the bound pipeline tells draws and dispatches apart. Its command signature
@@ -5313,13 +5593,18 @@ namespace
    bool OnDrawOrDispatchIndirect(reshade::api::command_list* cmd_list, reshade::api::indirect_command type, reshade::api::resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      TraceDrawOrDispatch(cmd_list, {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true});
-      return false;
+      const DrawDispatchData draw_dispatch_data = {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true};
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Other);
    }
 
    void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      if (D3D12Readback::recorded_copies != 0)
+      {
+         D3D12Readback::OnExecute(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list, queue);
+      }
       CommandListData* cmd_list_data = cmd_list->get_private_data<CommandListData>(); // Null for ReShade's own immediate command list
       const auto lock_trace = LockTraceIfRunning();
       if (!cmd_list_data || !lock_trace || !trace_running)
@@ -6098,6 +6383,12 @@ namespace
 #if DX11
       if (ShaderWarmup::g_is_warmup_thread) return;
 #endif
+#if DX12 && DEVELOPMENT
+      if (D3D12Readback::recorded_copies != 0)
+      {
+         D3D12Readback::OnReset(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list);
+      }
+#endif
 
       cmd_list->destroy_private_data<CommandListData>();
    }
@@ -6157,8 +6448,12 @@ namespace
 
       cmd_list_data.temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 
-#if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state. The capture entries of a list reset before its execution never ran.
+#if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state. The capture entries and readback copies of a list reset before its execution never ran.
       cmd_list_data.d3d12_state = {};
+      if (D3D12Readback::recorded_copies != 0)
+      {
+         D3D12Readback::OnReset(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list);
+      }
       const std::unique_lock lock_trace(cmd_list_data.mutex_trace);
       cmd_list_data.trace_draw_calls_data.clear();
 #else
@@ -6525,9 +6820,9 @@ namespace
 
 #if DX11
       // Before display composition, so a debug draw copy requested over MCP is read back and cleared before it's drawn
-      Mcp::OnPresent(device_data, cmd_list_data, native_device_context, swapchain);
+      Mcp::OnPresent(device_data, cmd_list_data, queue, swapchain);
 #else
-      Mcp::OnPresent(device_data, device_data.trace_command_list_data, nullptr, swapchain);
+      Mcp::OnPresent(device_data, device_data.trace_command_list_data, queue, swapchain);
 #endif
 
 #if DX11
@@ -17910,6 +18205,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::register_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
       reshade::register_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
       reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
@@ -18086,6 +18382,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::unregister_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
       reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
       reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);

@@ -94,6 +94,10 @@ namespace D3D12State
       uint64_t resource = 0; // Null for a null descriptor
       reshade::api::format format = reshade::api::format::unknown;
       uint32_t first_level = 0;
+      // The array layers (W slices of 3D render targets) the view covers, UINT32_MAX for all the remaining ones: readbacks only
+      // transition the subresources a view covers, the others can be in any state
+      uint32_t first_layer = 0;
+      uint32_t layer_count = UINT32_MAX;
    };
 
    ViewInfo GetViewInfo(reshade::api::device* device, reshade::api::resource_view view)
@@ -101,7 +105,8 @@ namespace D3D12State
       if (view.handle == 0)
          return {};
       const reshade::api::resource_view_desc desc = device->get_resource_view_desc(view);
-      return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (desc.type != reshade::api::resource_view_type::buffer) ? desc.texture.first_level : 0};
+      const bool is_texture = desc.type != reshade::api::resource_view_type::buffer;
+      return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (is_texture ? desc.texture.first_level : 0), .first_layer = (is_texture ? desc.texture.first_layer : 0), .layer_count = (is_texture ? desc.texture.layers : UINT32_MAX)};
    }
 
    // A bound index or vertex buffer: ReShade resolves their GPU virtual address to the buffer
@@ -124,6 +129,7 @@ namespace D3D12State
       std::vector<ViewInfo> render_target_views;
       reshade::api::resource_view depth_stencil = {};
       ViewInfo depth_stencil_view;
+      bool in_render_pass = false; // Copies and barriers are invalid between "BeginRenderPass()" and "EndRenderPass()"
    };
 
    // Setting a different root signature invalidates all root arguments, setting the same one keeps them
@@ -249,6 +255,7 @@ namespace D3D12State
       }
       state->depth_stencil = ds ? ds->view : reshade::api::resource_view{};
       state->depth_stencil_view = GetViewInfo(device, state->depth_stencil);
+      state->in_render_pass = true;
    }
 
    // What a game wrote into a descriptor heap slot

@@ -230,19 +230,38 @@ namespace Mcp
          std::vector<uint32_t> per_frame;
       };
       std::unordered_map<uint32_t, HashCounts> hash_counts; // Draws per shader hash over consecutive captures
-#if DX11
       struct PerfState
       {
+#if DX11
          Perf::TimestampRing<2> timestamps;
+#else
+         // A timestamp per present on the present queue, resolved into "readback", read once "fence" passed it. Recorded on Luma's own
+         // command list: ReShade only flushes its immediate one when its own API recorded into it.
+         static constexpr size_t slots = 8;
+         std::array<com_ptr<ID3D12CommandAllocator>, slots> allocators; // Reset once their slot was read
+         com_ptr<ID3D12GraphicsCommandList> list;
+         com_ptr<ID3D12QueryHeap> query_heap;
+         com_ptr<ID3D12Resource> readback;
+         com_ptr<ID3D12Fence> fence;
+         uint64_t fence_value = 0;
+         uint64_t frequency = 0;
+         uint64_t presents = 0;
+         std::array<uint64_t, slots> slot_fence_values = {}; // 0 for a free slot
+         std::array<uint64_t, slots> slot_presents = {};
+         std::optional<std::pair<uint64_t, uint64_t>> last_read; // The present and the ticks of the last read timestamp
+#endif
          std::vector<double> cpu_frame_ms;
          std::vector<double> gpu_frame_ms;
          uint32_t disjoint = 0;
          std::chrono::steady_clock::time_point last_present;
       };
       std::unique_ptr<PerfState> perf;
+#if DX11
       std::optional<DebugDrawSelection> saved_debug_draw;
       std::optional<TrackBufferSelection> saved_track_buffer;
-#endif // DX11
+#else
+      std::optional<D3D12Readback::Target> readback_target; // Armed again for "frames" series and for copies whose command list was reset unexecuted
+#endif
 
       Job()
       {
@@ -881,6 +900,56 @@ namespace Mcp
       }
    };
 
+   // How a texture readback's file is laid out: rows of "row_pitch" bytes, ordered [slice][z][row]
+   struct TextureFile
+   {
+      const char* dimension = "2d";
+      uint32_t width = 1;
+      uint32_t height = 1;
+      uint32_t depth = 1;
+      uint32_t slices = 1;
+      uint32_t mip = 0;
+      uint32_t mips = 1;
+      uint32_t samples = 1;
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN; // How to interpret the data
+      uint32_t row_pitch = 0;
+      uint32_t rows = 0;
+   };
+
+   bool IsBlockCompressed(DXGI_FORMAT format)
+   {
+      return (format >= DXGI_FORMAT_BC1_TYPELESS && format <= DXGI_FORMAT_BC5_SNORM) || (format >= DXGI_FORMAT_BC6H_TYPELESS && format <= DXGI_FORMAT_BC7_UNORM_SRGB);
+   }
+
+   // Describes a texture readback in "job.result", and queues its file for the pipe thread
+   void AddTextureFile(Job* job, std::filesystem::path path, const TextureFile& file, std::vector<char> bytes)
+   {
+      auto& w = job->result;
+      w.Path("path", path);
+      w.Field("dimension", file.dimension);
+      w.Field("width", file.width).Field("height", file.height).Field("depth", file.depth).Field("slices", file.slices);
+      w.Field("mip", file.mip).Field("mips", file.mips).Field("samples", file.samples);
+      w.Format("format", file.format).Field("format_id", uint32_t(file.format));
+      w.Format("view_format", file.view_format).Field("view_format_id", uint32_t(file.view_format));
+      w.Field("row_pitch", file.row_pitch).Field("rows", file.rows).Field("block_compressed", IsBlockCompressed(file.format));
+      job->files.emplace_back(std::move(path), std::move(bytes));
+   }
+
+   // "luma_read_cbuffer"'s "hex_dwords": each little endian dword as 8 hex digits
+   std::string HexDwords(const void* data, size_t size)
+   {
+      std::string hex;
+      hex.reserve(size * 2);
+      for (size_t offset = 0; offset + sizeof(uint32_t) <= size; offset += sizeof(uint32_t))
+      {
+         uint32_t dword = 0;
+         std::memcpy(&dword, static_cast<const char*>(data) + offset, sizeof(dword));
+         std::format_to(std::back_inserter(hex), "{:08X}", dword);
+      }
+      return hex;
+   }
+
 #if DX11
    // Picks the pass a readback targets ("job.pipeline_handle", "shader_hash", "stage", "instance", "thread"), either from the last
    // capture ("index") or by "hash" + "instance" (Nth draw with that shader in a frame). Instances are counted like the runtime counter
@@ -1039,8 +1108,7 @@ namespace Mcp
       const UINT mip_width = (std::max)(layout.width >> mip, 1u);
       const UINT mip_height = (std::max)(layout.height >> mip, 1u);
       const UINT mip_depth = (std::max)(layout.depth >> mip, 1u);
-      const bool block_compressed = (layout.format >= DXGI_FORMAT_BC1_TYPELESS && layout.format <= DXGI_FORMAT_BC5_SNORM) || (layout.format >= DXGI_FORMAT_BC6H_TYPELESS && layout.format <= DXGI_FORMAT_BC7_UNORM_SRGB);
-      const UINT rows = block_compressed ? (mip_height + 3) / 4 : mip_height;
+      const UINT rows = IsBlockCompressed(layout.format) ? (mip_height + 3) / 4 : mip_height;
 
       std::vector<char> bytes;
       UINT row_pitch = 0;
@@ -1065,15 +1133,8 @@ namespace Mcp
          native_device_context->Unmap(staging.get(), D3D11CalcSubresource(mip, slice, layout.mips));
       }
 
-      auto& w = job->result;
-      w.Path("path", path);
-      w.Field("dimension", dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D ? "3d" : (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? "1d" : "2d"));
-      w.Field("width", mip_width).Field("height", mip_height).Field("depth", mip_depth).Field("slices", layout.slices);
-      w.Field("mip", mip).Field("mips", layout.mips).Field("samples", samples);
-      w.Format("format", layout.format).Field("format_id", uint32_t(layout.format));
-      w.Format("view_format", view_format).Field("view_format_id", uint32_t(view_format));
-      w.Field("row_pitch", row_pitch).Field("rows", rows).Field("block_compressed", block_compressed);
-      job->files.emplace_back(std::move(path), std::move(bytes));
+      const char* dimension_name = ((dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D) ? "3d" : ((dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D) ? "1d" : "2d"));
+      AddTextureFile(job, std::move(path), {.dimension = dimension_name, .width = mip_width, .height = mip_height, .depth = mip_depth, .slices = layout.slices, .mip = mip, .mips = layout.mips, .samples = samples, .format = layout.format, .view_format = view_format, .row_pitch = row_pitch, .rows = rows}, std::move(bytes));
       return true;
    }
 #endif // DX11
@@ -1658,10 +1719,7 @@ namespace Mcp
       }
       if (!data.data_valid)
          return !KeepWaiting(job, "constant buffer");
-      std::string hex;
-      hex.reserve(data.data.size() * 8);
-      for (const float value : data.data)
-         std::format_to(std::back_inserter(hex), "{:08X}", std::bit_cast<uint32_t>(value));
+      const std::string hex = HexDwords(data.data.data(), data.data.size() * sizeof(float));
       auto& w = job->result;
       // Multi frame series: keep the tracking armed and collect one read per frame
       const uint32_t frames = uint32_t(job->IntArg("frames", 1, 1, 600));
@@ -1687,6 +1745,374 @@ namespace Mcp
          w.Field("hex_dwords", hex);
       }
       data.Clear();
+      return true;
+   }
+#else
+   // The D3D12 counterpart of the D3D11 "ResolveTarget()": the draw a readback copies, the entry "index" of the last capture or the
+   // "instance"th draw with "hash". A capture entry gives its pipeline, its recording thread and its instance among that thread's draws
+   // with it: every D3D12 command list is like a D3D11 deferred context.
+   bool ResolveTarget(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, std::optional<size_t> index, D3D12Readback::Target* target)
+   {
+      const std::shared_lock lock_generic(s_mutex_generic);
+      const Shader::CachedPipeline* pipeline = nullptr;
+      if (index)
+      {
+         const std::shared_lock lock_trace(cmd_list_data.mutex_trace);
+         const std::vector<TraceDrawCallData>& entries = cmd_list_data.trace_draw_calls_data;
+         if (trace_running || *index >= entries.size())
+         {
+            job->error = std::format("Trace index {} is out of range (captured {}), run luma_trace_capture first", *index, entries.size());
+            return false;
+         }
+         const TraceDrawCallData& entry = entries[*index];
+         pipeline = (entry.type == TraceDrawCallData::TraceDrawCallType::Shader) ? FindPipeline(device_data, entry.pipeline_handle) : nullptr;
+         if (!pipeline)
+         {
+            job->error = std::format("Trace index {} is not a shader pass with a live pipeline", *index);
+            return false;
+         }
+         target->pipelines = {entry.pipeline_handle};
+         target->thread = entry.thread_id;
+         target->instance = int32_t(std::count_if(entries.begin(), entries.begin() + *index, [&](const TraceDrawCallData& other)
+            { return other.pipeline_handle == entry.pipeline_handle && other.thread_id == entry.thread_id; }));
+         // Named after the shader that writes the outputs
+         const auto output_shader = std::ranges::find_if(pipeline->shader_types, [](reshade::api::pipeline_subobject_type type)
+            { return type == reshade::api::pipeline_subobject_type::pixel_shader || type == reshade::api::pipeline_subobject_type::compute_shader; });
+         job->shader_hash = pipeline->shader_hashes[(output_shader != pipeline->shader_types.end()) ? (output_shader - pipeline->shader_types.begin()) : 0];
+      }
+      else if (const auto hash = job->HashArg("hash"))
+      {
+         const auto it = device_data.pipeline_caches_by_shader_hash.find(*hash);
+         if (it == device_data.pipeline_caches_by_shader_hash.end() || it->second.empty())
+         {
+            job->error = std::format("Shader {} has no live pipeline", Shader::Hash_NumToStr(*hash, true));
+            return false;
+         }
+         for (const Shader::CachedPipeline* other : it->second)
+         {
+            target->pipelines.push_back(other->pipeline.handle);
+         }
+         pipeline = *it->second.begin();
+         target->instance = int32_t(job->IntArg("instance", 0));
+         job->shader_hash = *hash;
+      }
+      else
+      {
+         job->error = "Pass either \"index\" (from luma_trace_list) or \"hash\" (+ optional \"instance\")";
+         return false;
+      }
+      job->stage = StageName(*pipeline, job->shader_hash);
+      job->instance = target->instance;
+      return true;
+   }
+
+   // Arms "job->readback_target" for the draws of the next frames
+   void ArmReadback(Job* job, DeviceData& device_data)
+   {
+      D3D12Readback::State& readback = device_data.readback;
+      const std::unique_lock lock(readback.mutex);
+      D3D12Readback::Retire(&readback);
+      readback.target = job->readback_target;
+      readback.instances = 0;
+      D3D12Readback::armed = true;
+   }
+
+   enum class ReadbackPoll : uint8_t
+   {
+      Wait, // Again at the next present
+      Done,
+      Failed, // See "job->error"
+   };
+
+   // Follows the job's copy at a present until the GPU ran it: drawn ("job->phase" 1), then executed and read (2), each with its own budget
+   ReadbackPoll PollReadback(Job* job, DeviceData& device_data, D3D12Readback::Copy* copy, std::vector<char>* bytes)
+   {
+      using Status = D3D12Readback::Copy::Status;
+      D3D12Readback::State& readback = device_data.readback;
+      reshade::api::command_queue* queue = nullptr;
+      {
+         const std::unique_lock lock(readback.mutex);
+         readback.instances = 0; // Instances count from the last present
+         if (!readback.copy)
+         {
+            if (++job->frames < readback_max_frames)
+               return ReadbackPoll::Wait;
+            job->error = std::format("The pass was not drawn in {} frames (check \"instance\": a capture entry counts it among its recording thread's draws)", readback_max_frames);
+            return ReadbackPoll::Failed;
+         }
+         if (job->phase == 1)
+         {
+            job->phase = 2;
+            job->frames = 0;
+         }
+         switch (readback.copy->status)
+         {
+         case Status::Failed:
+            job->error = readback.copy->error;
+            return ReadbackPoll::Failed;
+         case Status::Ready:
+            *copy = std::move(*readback.copy);
+            readback.copy.reset();
+            return ReadbackPoll::Done;
+         case Status::Discarded:
+            // Its command list was reset unexecuted: copy a later draw
+            readback.copy.reset();
+            readback.target = job->readback_target;
+            D3D12Readback::armed = true;
+            job->phase = 1;
+            return ReadbackPoll::Wait;
+         case Status::Recorded:
+            if (++job->frames < readback_max_frames)
+               return ReadbackPoll::Wait;
+            job->error = std::format("The pass's command list was not executed in {} frames", readback_max_frames);
+            return ReadbackPoll::Failed;
+         case Status::Executed:
+            queue = readback.copy->queue;
+            break;
+         }
+      }
+      queue->wait_idle(); // Not under the lock, the game's submissions take it ("OnExecuteCommandList()")
+      const std::unique_lock lock(readback.mutex);
+      if (std::optional<std::vector<char>> data = D3D12Readback::TryRead(*readback.copy))
+      {
+         *bytes = std::move(*data);
+         *copy = std::move(*readback.copy);
+         readback.copy.reset();
+         return ReadbackPoll::Done;
+      }
+      if (++job->frames < readback_max_frames)
+         return ReadbackPoll::Wait;
+      job->error = "The copy didn't run: its command list wasn't submitted, or the game's predication skipped it";
+      return ReadbackPoll::Failed;
+   }
+
+   bool RunReadResource(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
+   {
+      const auto add_texture_file = [job](std::string_view stem, const D3D12Readback::Copy& copy, std::vector<char> bytes)
+      {
+         const D3D12_RESOURCE_DESC& desc = copy.desc;
+         const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+         const char* dimension = (is_3d ? "3d" : ((desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ? "1d" : "2d"));
+         const uint32_t depth = (is_3d ? (std::max)(uint32_t(desc.DepthOrArraySize) >> copy.mip, 1u) : 1u);
+         const uint32_t slices = (is_3d ? 1u : uint32_t(copy.footprints.size()));
+         AddTextureFile(job, ReadbackPath(*job, stem), {.dimension = dimension, .width = (std::max)(uint32_t(desc.Width >> copy.mip), 1u), .height = (std::max)(desc.Height >> copy.mip, 1u), .depth = depth, .slices = slices, .mip = copy.mip, .mips = desc.MipLevels, .samples = desc.SampleDesc.Count, .format = desc.Format, .view_format = copy.data_format, .row_pitch = copy.footprints[0].Footprint.RowPitch, .rows = copy.rows}, std::move(bytes));
+         if (copy.first_layer != 0)
+         {
+            job->result.Field("first_slice", copy.first_layer);
+         }
+      };
+
+      const std::string* view = job->Arg("view");
+      if (job->phase == 0)
+      {
+         if (view && *view == "swapchain")
+         {
+            // On a command list of Luma's own: ReShade only flushes its queue's immediate command list when its own API recorded into it,
+            // native commands there could run any time later
+            auto* back_buffer = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
+            auto* native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
+            com_ptr<ID3D12CommandAllocator> allocator;
+            com_ptr<ID3D12GraphicsCommandList> native_list;
+            if (!back_buffer || FAILED(native_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) || FAILED(native_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr, IID_PPV_ARGS(&native_list))))
+            {
+               job->error = "The swapchain has no current back buffer, or the command list for the copy couldn't be created";
+               return true;
+            }
+            // At present the back buffer is in PRESENT (COMMON), after the game's command lists on this queue
+            D3D12Readback::Copy copy = {.data_format = back_buffer->GetDesc().Format};
+            const uint32_t subresource = 0;
+            const std::unique_lock lock(device_data.readback.mutex);
+            const bool recorded = D3D12Readback::RecordTextureCopy(&device_data.readback, native_device, native_list.get(), back_buffer, D3D12_RESOURCE_STATE_PRESENT, std::span(&subresource, 1), copy.data_format, &copy, [] {});
+            native_list->Close();
+            if (!recorded)
+            {
+               job->error = "Failed to create the readback resources";
+               return true;
+            }
+            ID3D12CommandList* const lists[] = {native_list.get()};
+            reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())->ExecuteCommandLists(1, lists);
+            queue->wait_idle();
+            std::optional<std::vector<char>> bytes = D3D12Readback::TryRead(copy);
+            if (!bytes)
+            {
+               job->error = "The back buffer copy didn't run";
+               return true;
+            }
+            add_texture_file("swapchain", copy, std::move(*bytes));
+            job->result.Field("view", "swapchain").Field("note", "Read at present, before ReShade's effects (D3D12 has no display composition yet)");
+            return true;
+         }
+
+         using Kind = D3D12Readback::Kind;
+         static const std::unordered_map<std::string, Kind> kinds = {{"rtv", Kind::RenderTarget}, {"srv", Kind::RenderTarget}, {"uav", Kind::UnorderedAccess}, {"depth", Kind::Depth}, {"stencil", Kind::Stencil}};
+         const auto kind = kinds.find(view ? *view : "rtv");
+         if (kind == kinds.end())
+         {
+            job->error = "\"view\" must be one of rtv, srv, uav, depth, stencil, swapchain (D3D12 has no UI texture or registered textures yet)";
+            return true;
+         }
+         D3D12Readback::Target target = {.kind = kind->second, .slot = uint32_t(job->IntArg("slot", 0, 0, INT32_MAX))};
+         std::optional<size_t> index;
+         if (job->Arg("index"))
+         {
+            index = size_t(job->IntArg("index", 0));
+         }
+         if (kind->first == "srv")
+         {
+            // Its state at the draw isn't known (any read only combination): read it after the last pass of the capture that wrote it
+            if (!index)
+            {
+               job->error = "D3D12 SRVs are read after the pass that wrote them, pass \"index\" (from luma_trace_list)";
+               return true;
+            }
+            const std::shared_lock lock_trace(cmd_list_data.mutex_trace);
+            const std::vector<TraceDrawCallData>& entries = cmd_list_data.trace_draw_calls_data;
+            if (trace_running || *index >= entries.size())
+            {
+               job->error = std::format("Trace index {} is out of range (captured {}), run luma_trace_capture first", *index, entries.size());
+               return true;
+            }
+            if (target.slot >= entries[*index].srv_count || entries[*index].sr_hash[target.slot].empty())
+            {
+               job->error = std::format("Trace entry {} has no bound SRV at slot {}", *index, target.slot);
+               return true;
+            }
+            const std::string& resource = entries[*index].sr_hash[target.slot];
+            const uint32_t srv_slot = target.slot;
+            // A depth stencil SRV reads one plane, its producer must write that one
+            const DXGI_FORMAT srv_format = entries[*index].srv_format[target.slot];
+            const bool reads_stencil = srv_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || srv_format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            std::optional<size_t> producer;
+            for (size_t i = *index; i-- > 0 && !producer;)
+            {
+               const TraceDrawCallData& entry = entries[i];
+               for (uint32_t slot = 0; slot < TraceDrawCallData::rtvs_size && !producer; slot++)
+               {
+                  if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource)
+                  {
+                     producer = i;
+                     target.kind = Kind::RenderTarget;
+                     target.slot = slot;
+                  }
+               }
+               for (uint32_t slot = 0; slot < entry.uav_count && !producer; slot++)
+               {
+                  if (entry.ua_hash[slot] == resource)
+                  {
+                     producer = i;
+                     target.kind = Kind::UnorderedAccess;
+                     target.slot = slot;
+                  }
+               }
+               using DepthStateType = TraceDrawCallData::DepthStateType;
+               const DepthStateType plane_state = (reads_stencil ? entry.stencil_state : entry.depth_state);
+               if (!producer && entry.IsDSVValid() && entry.ds_hash == resource && (plane_state == DepthStateType::TestAndWrite || plane_state == DepthStateType::WriteOnly))
+               {
+                  producer = i;
+                  target.kind = (reads_stencil ? Kind::Stencil : Kind::Depth);
+                  target.slot = 0;
+               }
+            }
+            if (!producer)
+            {
+               job->error = std::format("No entry before {} wrote its resource as a render target, UAV or {} target (D3D12 captures don't list copies, uploads or clears yet)", *index, reads_stencil ? "stencil" : "depth");
+               return true;
+            }
+            job->result.Field("producer_index", *producer).Field("note", std::format("SRV {} of entry {} read after entry {} wrote it, unless a copy wrote it in between (D3D12 captures don't list copies yet)", srv_slot, *index, *producer));
+            index = producer;
+         }
+         if (!ResolveTarget(job, device_data, cmd_list_data, index, &target))
+            return true;
+         job->readback_target = std::move(target);
+         ArmReadback(job, device_data);
+         job->result.Hash("hash", job->shader_hash).Field("instance", job->instance).Field("view", kind->first).Field("slot", job->readback_target->slot);
+         job->phase = 1;
+         return false;
+      }
+
+      D3D12Readback::Copy copy;
+      std::vector<char> bytes;
+      const ReadbackPoll poll = PollReadback(job, device_data, &copy, &bytes);
+      if (poll == ReadbackPoll::Wait)
+         return false;
+      if (poll == ReadbackPoll::Done)
+      {
+         add_texture_file(std::format("{:08X}_{}_{}{}", job->shader_hash, job->instance, view ? *view : "rtv", job->readback_target->slot), copy, std::move(bytes));
+      }
+      return true;
+   }
+
+   bool RunReadConstantBuffer(Job* job, DeviceData& device_data, CommandListData& cmd_list_data)
+   {
+      if (job->phase == 0)
+      {
+         const int64_t slot = job->IntArg("slot", 0);
+         if (slot < 0 || slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+         {
+            job->error = "\"slot\" is out of range";
+            return true;
+         }
+         D3D12Readback::Target target = {.kind = D3D12Readback::Kind::ConstantBuffer, .slot = uint32_t(slot)};
+         std::optional<size_t> index;
+         if (job->Arg("index"))
+         {
+            index = size_t(job->IntArg("index", 0));
+         }
+         if (!ResolveTarget(job, device_data, cmd_list_data, index, &target))
+            return true;
+         job->readback_target = std::move(target);
+         ArmReadback(job, device_data);
+         job->result.Hash("hash", job->shader_hash).Field("stage", job->stage).Field("instance", job->instance).Field("slot", slot);
+         job->phase = 1;
+         return false;
+      }
+
+      D3D12Readback::Copy copy;
+      std::vector<char> bytes;
+      const ReadbackPoll poll = PollReadback(job, device_data, &copy, &bytes);
+      if (poll == ReadbackPoll::Wait)
+         return false;
+      if (poll == ReadbackPoll::Failed)
+         return true;
+      const bool is_root_constants = !copy.root_constants.empty();
+      if (is_root_constants)
+      {
+         bytes.assign(reinterpret_cast<const char*>(copy.root_constants.data()), reinterpret_cast<const char*>(copy.root_constants.data() + copy.root_constants.size()));
+      }
+      const std::string hex = HexDwords(bytes.data(), bytes.size());
+      auto& w = job->result;
+      // Multi frame series: one read per frame, armed again after each
+      const uint32_t frames = uint32_t(job->IntArg("frames", 1, 1, 600));
+      if (frames > 1)
+      {
+         job->series.push_back(std::format("{}:{}", cb_luma_global_settings.FrameIndex, hex));
+         if (job->series.size() < frames)
+         {
+            job->phase = 1;
+            job->frames = 0;
+            ArmReadback(job, device_data);
+            return false;
+         }
+         w.Key("series").BeginArray();
+         for (const std::string& entry : job->series)
+         {
+            w.Value(entry);
+         }
+         w.EndArray().Field("series_format", "luma_frame:hex_dwords");
+      }
+      else
+      {
+         w.Field("bytes", bytes.size()).Field("hex_dwords", hex);
+      }
+      w.Field("register", std::format("b{}", copy.register_index)).Field("space", copy.register_space);
+      if (is_root_constants)
+      {
+         w.Field("root_constants", true);
+      }
+      else
+      {
+         w.Field("resource", copy.resource).Field("offset_bytes", copy.buffer_offset);
+      }
       return true;
    }
 #endif // DX11
@@ -2165,10 +2591,9 @@ namespace Mcp
       return true;
    }
 
-#if DX11
    // Frame times over a window: CPU present to present, and the GPU timestamp span between the same two points (it includes GPU
    // idle time when the game is CPU bound). A frame cap or vsync lowers the GPU clocks and bounds both.
-   bool RunPerf(Job* job, DeviceData& device_data, ID3D11DeviceContext* native_device_context)
+   bool RunPerf(Job* job, DeviceData& device_data, reshade::api::command_queue* queue)
    {
       const uint32_t frames = uint32_t(job->IntArg("frames", 120, 10, 3600));
       const uint32_t settle = uint32_t(job->IntArg("settle", 30, 0, 600));
@@ -2181,6 +2606,8 @@ namespace Mcp
          perf.cpu_frame_ms.push_back(std::chrono::duration<double, std::milli>(present - perf.last_present).count());
       perf.last_present = present;
       job->frames++;
+#if DX11
+      auto* native_device_context = reinterpret_cast<ID3D11DeviceContext*>(queue->get_immediate_command_list()->get_native());
       perf.disjoint += perf.timestamps.Collect(native_device_context, measuring, [&perf](const Perf::TimestampReadback<2>& readback)
          { perf.gpu_frame_ms.push_back(readback.Ms(Perf::FRAME_START, Perf::FRAME_END)); });
       perf.timestamps.Close(native_device_context);
@@ -2191,6 +2618,85 @@ namespace Mcp
          perf.timestamps.Open(native_device.get(), native_device_context);
          return false;
       }
+#else
+      auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+      if (!perf.query_heap)
+      {
+         auto* native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
+         for (com_ptr<ID3D12CommandAllocator>& allocator : perf.allocators)
+         {
+            native_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+         }
+         if (perf.allocators[0] && SUCCEEDED(native_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, perf.allocators[0].get(), nullptr, IID_PPV_ARGS(&perf.list))))
+         {
+            perf.list->Close();
+         }
+         const D3D12_QUERY_HEAP_DESC heap_desc = {.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP, .Count = UINT(Job::PerfState::slots)};
+         native_device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&perf.query_heap));
+         perf.readback = D3D12Readback::CreateBuffer(native_device, D3D12_HEAP_TYPE_READBACK, Job::PerfState::slots * sizeof(uint64_t));
+         native_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&perf.fence));
+         native_queue->GetTimestampFrequency(&perf.frequency);
+      }
+      const bool created_allocators = std::ranges::none_of(perf.allocators, [](const com_ptr<ID3D12CommandAllocator>& allocator)
+         { return !allocator; });
+      if (!perf.query_heap || !perf.readback || !perf.fence || !perf.list || !created_allocators || perf.frequency == 0)
+      {
+         job->error = "Failed to create the D3D12 timestamp queries";
+         return true;
+      }
+      // The timestamps the GPU passed, in present order
+      const uint64_t completed = perf.fence->GetCompletedValue();
+      std::vector<size_t> passed;
+      for (size_t slot = 0; slot < Job::PerfState::slots; slot++)
+      {
+         if (perf.slot_fence_values[slot] != 0 && perf.slot_fence_values[slot] <= completed)
+         {
+            passed.push_back(slot);
+         }
+      }
+      std::sort(passed.begin(), passed.end(), [&perf](size_t a, size_t b)
+         { return perf.slot_presents[a] < perf.slot_presents[b]; });
+      for (const size_t slot : passed)
+      {
+         uint64_t ticks = 0;
+         const D3D12_RANGE read_range = {.Begin = slot * sizeof(uint64_t), .End = (slot + 1) * sizeof(uint64_t)};
+         void* data = nullptr;
+         if (SUCCEEDED(perf.readback->Map(0, &read_range, &data)))
+         {
+            std::memcpy(&ticks, static_cast<const char*>(data) + read_range.Begin, sizeof(ticks));
+            const D3D12_RANGE nothing_written = {};
+            perf.readback->Unmap(0, &nothing_written);
+         }
+         if (measuring && perf.last_read && perf.last_read->first + 1 == perf.slot_presents[slot])
+         {
+            perf.gpu_frame_ms.push_back(1000.0 * double(ticks - perf.last_read->second) / double(perf.frequency));
+         }
+         perf.last_read = {perf.slot_presents[slot], ticks};
+         perf.slot_fence_values[slot] = 0;
+      }
+      if (perf.cpu_frame_ms.size() < frames)
+      {
+         // Skipped while the GPU is a whole ring behind, then the pair around it isn't measured
+         const size_t slot = perf.presents % Job::PerfState::slots;
+         if (perf.slot_fence_values[slot] == 0)
+         {
+            perf.allocators[slot]->Reset();
+            perf.list->Reset(perf.allocators[slot].get(), nullptr);
+            perf.list->EndQuery(perf.query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(slot));
+            perf.list->ResolveQueryData(perf.query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(slot), 1, perf.readback.get(), slot * sizeof(uint64_t));
+            perf.list->Close();
+            ID3D12CommandList* const lists[] = {perf.list.get()};
+            native_queue->ExecuteCommandLists(1, lists);
+            native_queue->Signal(perf.fence.get(), ++perf.fence_value);
+            perf.slot_fence_values[slot] = perf.fence_value;
+            perf.slot_presents[slot] = perf.presents;
+         }
+         perf.presents++;
+         return false;
+      }
+      // The readback buffer is released with the job, after the resolves recorded into it (a null event blocks until then)
+      perf.fence->SetEventOnCompletion(perf.fence_value, nullptr);
+#endif
 
       auto& w = job->result;
       // The GPU sets read back a few frames late, so a few less of them
@@ -2214,29 +2720,32 @@ namespace Mcp
 #endif
       return true;
    }
-#endif // DX11
 
-   // "native_command_list" is the immediate context on D3D11, null on D3D12 (it has no readbacks yet)
-   bool RunJob(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, [[maybe_unused]] NativeCommandList* native_command_list, [[maybe_unused]] reshade::api::swapchain* swapchain)
+   bool RunJob(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
    {
       const std::string& tool = job->tool;
       if (tool == "status")
          return RunStatus(job, device_data);
       if (tool == "wait_frames")
          return RunWaitFrames(job);
-#if DX11
       if (tool == "perf")
-         return RunPerf(job, device_data, native_command_list);
+         return RunPerf(job, device_data, queue);
+#if DX11
+      auto* native_device_context = reinterpret_cast<ID3D11DeviceContext*>(queue->get_immediate_command_list()->get_native());
       if (tool == "read_resource")
-         return RunReadResource(job, device_data, cmd_list_data, native_command_list, swapchain);
+         return RunReadResource(job, device_data, cmd_list_data, native_device_context, swapchain);
       if (tool == "read_cbuffer")
-         return RunReadConstantBuffer(job, device_data, cmd_list_data, native_command_list);
+         return RunReadConstantBuffer(job, device_data, cmd_list_data, native_device_context);
       if (tool == "sr_capture")
-         return RunSrCapture(job, native_command_list);
+         return RunSrCapture(job, native_device_context);
 #else
-      if (tool == "perf" || tool == "read_resource" || tool == "read_cbuffer" || tool == "sr_capture")
+      if (tool == "read_resource")
+         return RunReadResource(job, device_data, cmd_list_data, queue, swapchain);
+      if (tool == "read_cbuffer")
+         return RunReadConstantBuffer(job, device_data, cmd_list_data);
+      if (tool == "sr_capture")
       {
-         job->error = tool + " is D3D11 only for now (D3D12 readbacks and timestamps are \"docs/DX12-Support-Plan.md\" A4 and phase 7)";
+         job->error = "sr_capture is D3D11 only (no super resolution on D3D12 yet)";
          return true;
       }
 #endif
@@ -2561,10 +3070,13 @@ namespace Mcp
    }
 
    // Called from "OnPresent" on the render thread, before display composition. "cmd_list_data" holds the frame capture.
-   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, NativeCommandList* native_command_list, reshade::api::swapchain* swapchain)
+   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
    {
       last_present_ms = GetTickCount64();
       last_frame_index = cb_luma_global_settings.FrameIndex;
+#if DX12
+      D3D12Readback::CollectRetired(&device_data.readback);
+#endif
       if (!active_job && !has_pending_jobs) // Unlocked early out, every present comes through here
          return;
       if (!active_job)
@@ -2583,7 +3095,7 @@ namespace Mcp
       active_job->device_data = &device_data;
 
       Job& job = *active_job;
-      if (!RunJob(&job, device_data, cmd_list_data, native_command_list, swapchain))
+      if (!RunJob(&job, device_data, cmd_list_data, queue, swapchain))
          return;
 #if DX11
       if (job.saved_debug_draw)
@@ -2593,6 +3105,15 @@ namespace Mcp
       }
       if (job.saved_track_buffer)
          job.saved_track_buffer->Apply();
+#else
+      if (job.readback_target)
+      {
+         // Disarmed if its draw never came, and its copy kept until the GPU is done with it
+         const std::unique_lock lock(device_data.readback.mutex);
+         device_data.readback.target.reset();
+         D3D12Readback::armed = false;
+         D3D12Readback::Retire(&device_data.readback);
+      }
 #endif
       if (!job.error.empty())
       {

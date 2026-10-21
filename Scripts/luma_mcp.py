@@ -751,7 +751,7 @@ def postprocess_cbuffer(result, rows_spec):
         for entry in result.pop("series"):
             frame, hex_string = entry.split(":", 1)
             frames.append((int(frame),) + dword_views(hex_string))
-        row_count = min(len(f[2]) for f in frames) // 4
+        row_count = (min(len(f[2]) for f in frames) + 3) // 4  # D3D12 root constants can end mid row
         changing = [r for r in range(row_count) if len({f[2][r * 4:r * 4 + 4] for f in frames}) > 1]
         shown = sorted(parse_rows(rows_spec)) if rows_spec else changing[:32]
         result["frames"] = len(frames)
@@ -761,8 +761,9 @@ def postprocess_cbuffer(result, rows_spec):
         return
     floats, uints = dword_views(result.pop("hex_dwords"))
     first = result.get("first_constant", 0)
-    last = first + result["num_constants"] if result.get("num_constants") else len(floats) // 4
-    result["rows"] = [f"c{r}: {format_row(floats, uints, r)}" + ("" if first <= r < last else " (outside bound range)") for r in range(len(floats) // 4)]
+    row_count = (len(floats) + 3) // 4
+    last = first + result["num_constants"] if result.get("num_constants") else row_count
+    result["rows"] = [f"c{r}: {format_row(floats, uints, r)}" + ("" if first <= r < last else " (outside bound range)") for r in range(row_count)]
 
 
 TRACE_DIR = os.path.join(tempfile.gettempdir(), "luma-mcp", "traces")

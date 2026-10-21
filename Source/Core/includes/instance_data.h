@@ -22,6 +22,9 @@
 #include "managed_resources.h"
 #else
 #include "d3d12_state.h"
+#if DEVELOPMENT
+#include "d3d12_readback.hpp"
+#endif
 #endif
 #include "patch.hpp"
 #include "debug.h"
@@ -270,6 +273,12 @@ struct TraceDrawCallData
       uint32_t index = 0;   // In the packed SRV, UAV or constant buffer entries
    };
    std::vector<TableDescriptor> table_descriptors;
+   // What readbacks copy, which the hashes above can't give back: the render target, unordered access and depth stencil views, and the
+   // buffers of constant buffer views (root constants have none)
+   D3D12State::ViewInfo rt_view[rtvs_size] = {};
+   D3D12State::ViewInfo ua_view[uavs_size] = {};
+   D3D12State::ViewInfo ds_view = {};
+   uint64_t cb_resource[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
 #endif
 
 #if DX11
@@ -683,6 +692,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    D3D12State::BufferAddresses buffer_addresses;
    // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)
    CommandListData trace_command_list_data;
+   D3D12Readback::State readback; // The dev MCP's GPU copies
 #endif
 
 #if DX11

@@ -231,6 +231,7 @@ namespace D3D12Trace
       std::string* debug_name = &entry->ds_debug_name;
       bool* render_target_flag = nullptr;
       bool* unordered_access_flag = nullptr;
+      D3D12State::ViewInfo* view_info = &entry->ds_view; // For readbacks, SRVs are read at the pass that wrote them
       switch (type)
       {
       case 't':
@@ -238,18 +239,25 @@ namespace D3D12Trace
          view_format = &entry->srv_format[index], format = &entry->sr_format[index], size = &entry->sr_size[index], view_size = &entry->srv_size[index], view_mip = &entry->srv_mip[index];
          type_name = &entry->sr_type_name[index], hash = &entry->sr_hash[index], debug_name = &entry->sr_debug_name[index];
          render_target_flag = &entry->sr_is_rt[index], unordered_access_flag = &entry->sr_is_ua[index];
+         view_info = nullptr;
          break;
       case 'u':
          entry->uavs[index] = view;
          view_format = &entry->uav_format[index], format = &entry->ua_format[index], size = &entry->ua_size[index], view_size = &entry->uav_size[index], view_mip = &entry->uav_mip[index];
          type_name = &entry->ua_type_name[index], hash = &entry->ua_hash[index], debug_name = &entry->ua_debug_name[index];
          render_target_flag = &entry->ua_is_rt[index];
+         view_info = &entry->ua_view[index];
          break;
       case 'r':
          entry->rtvs[index] = view;
          view_format = &entry->rtv_format[index], format = &entry->rt_format[index], size = &entry->rt_size[index], view_size = &entry->rtv_size[index], view_mip = &entry->rtv_mip[index];
          type_name = &entry->rt_type_name[index], hash = &entry->rt_hash[index], debug_name = &entry->rt_debug_name[index];
+         view_info = &entry->rt_view[index];
          break;
+      }
+      if (view_info)
+      {
+         *view_info = info;
       }
       if (is_descriptor)
       {
@@ -279,6 +287,7 @@ namespace D3D12Trace
             }
             else if (descriptor && descriptor->handle != 0)
             {
+               entry.cb_resource[table_descriptor.index] = descriptor->handle;
                entry.cb_hash[table_descriptor.index] = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(descriptor->handle)));
                entry.cb_first_constant[table_descriptor.index] = UINT(descriptor->offset / 16);
                entry.cb_num_constants[table_descriptor.index] = UINT((descriptor->size + 15) / 16);
@@ -470,6 +479,7 @@ namespace D3D12Trace
             {
                if (const uint32_t i = IsDeclared('b', shader_register) ? AddEntry('b', shader_register) : UINT32_MAX; i != UINT32_MAX)
                {
+                  trace_draw_call_data.cb_resource[i] = binding.descriptor;
                   trace_draw_call_data.cb_hash[i] = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(binding.descriptor)));
                   trace_draw_call_data.cb_first_constant[i] = UINT(binding.descriptor_offset / 16);
                }
