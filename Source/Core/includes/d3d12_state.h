@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
+#include <d3d12.h>
 #include <include/reshade.hpp>
 
 namespace D3D12State
@@ -217,6 +219,18 @@ namespace D3D12State
       return &descriptors;
    }
 
+   // What a table slot holds, nullptr if the game never wrote it. Expects "heaps.mutex" to be locked (shared is enough).
+   const Descriptor* FindDescriptor(const DescriptorHeaps& heaps, reshade::api::device* device, reshade::api::descriptor_table table, uint32_t binding)
+   {
+      reshade::api::descriptor_heap heap = {};
+      uint32_t offset = 0;
+      device->get_descriptor_heap_offset(table, binding, 0, &heap, &offset);
+      const auto it = heaps.descriptors_by_heap.find(heap.handle);
+      if (it == heaps.descriptors_by_heap.end() || offset >= it->second.size())
+         return nullptr;
+      return &it->second[offset];
+   }
+
    void UpdateDescriptors(DescriptorHeaps* heaps, reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_update* updates)
    {
       const std::unique_lock lock(heaps->mutex);
@@ -269,5 +283,50 @@ namespace D3D12State
          std::vector<Descriptor> copied(source->begin() + source_offset, source->begin() + source_offset + copy.count);
          std::copy(copied.begin(), copied.end(), dest->begin() + dest_offset);
       }
+   }
+
+   // Buffers by GPU virtual address: ReShade passes root SRVs and UAVs as one
+   struct BufferAddress
+   {
+      uint64_t resource = 0;
+      uint64_t size = 0;
+   };
+
+   struct BufferAddresses
+   {
+      std::shared_mutex mutex;
+      std::map<uint64_t, BufferAddress> buffers_by_address;
+   };
+
+   void AddBuffer(BufferAddresses* addresses, reshade::api::resource buffer, uint64_t size)
+   {
+      const D3D12_GPU_VIRTUAL_ADDRESS address = reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress();
+      if (address == 0)
+         return;
+      const std::unique_lock lock(addresses->mutex);
+      addresses->buffers_by_address[address] = {.resource = buffer.handle, .size = size};
+   }
+
+   // Textures have no address. Placed buffers aliasing the same memory share one: only the last created is kept.
+   void RemoveBuffer(BufferAddresses* addresses, reshade::api::resource resource)
+   {
+      const D3D12_GPU_VIRTUAL_ADDRESS address = reinterpret_cast<ID3D12Resource*>(resource.handle)->GetGPUVirtualAddress();
+      if (address == 0)
+         return;
+      const std::unique_lock lock(addresses->mutex);
+      if (const auto it = addresses->buffers_by_address.find(address); it != addresses->buffers_by_address.end() && it->second.resource == resource.handle)
+      {
+         addresses->buffers_by_address.erase(it);
+      }
+   }
+
+   // The buffer holding "address", none if unknown. Expects "addresses.mutex" to be locked (shared is enough).
+   BufferAddress FindBuffer(const BufferAddresses& addresses, uint64_t address)
+   {
+      auto it = addresses.buffers_by_address.upper_bound(address);
+      if (it == addresses.buffers_by_address.begin())
+         return {};
+      --it;
+      return (address - it->first < it->second.size) ? it->second : BufferAddress{};
    }
 } // namespace D3D12State

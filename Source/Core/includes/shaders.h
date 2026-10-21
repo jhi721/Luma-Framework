@@ -86,6 +86,7 @@ namespace Shader
       // Any value is valid and possible, including 0
 #if DX12
       std::vector<uint32_t> shader_hashes;
+      std::vector<reshade::api::pipeline_subobject_type> shader_types; // The stage of each of "shader_hashes"
 #else
       std::array<uint32_t, 1> shader_hashes;
 #endif
@@ -153,6 +154,22 @@ namespace Shader
          }
          return false;
       }
+      // The stage of a shader in the frame capture, "XS" if unknown
+      static const char* StageName(reshade::api::pipeline_subobject_type type)
+      {
+         switch (type)
+         {
+         case reshade::api::pipeline_subobject_type::vertex_shader: return "VS";
+         case reshade::api::pipeline_subobject_type::hull_shader: return "HS";
+         case reshade::api::pipeline_subobject_type::domain_shader: return "DS";
+         case reshade::api::pipeline_subobject_type::geometry_shader: return "GS";
+         case reshade::api::pipeline_subobject_type::amplification_shader: return "AS";
+         case reshade::api::pipeline_subobject_type::mesh_shader: return "MS";
+         case reshade::api::pipeline_subobject_type::pixel_shader: return "PS";
+         case reshade::api::pipeline_subobject_type::compute_shader: return "CS";
+         default: return "XS";
+         }
+      }
       // The stage the frame capture shows, "XS" if none
       const char* StageName() const
       {
@@ -217,6 +234,22 @@ namespace Shader
       std::vector<uint8_t> live_patched_owned_data;
       const void* live_patched_data = nullptr; // Usually nullptr. Valid if we edited the byte code of the shader live when it was created (including shader debug data stripped)
       size_t live_patched_size = 0;
+
+#if DX12
+      // The registers the shader declares, read lazily by the frame capture ("D3D12Trace::ParseResourceBindings()"). The per slot
+      // reflections above have no register spaces.
+      struct ResourceBinding
+      {
+         char type = 0; // 'b', 't', 'u' or 's'
+         uint32_t index = 0;
+         uint32_t space = 0;
+         uint32_t count = 1;
+      };
+      std::vector<ResourceBinding> bindings;
+      bool parsed_bindings = false;
+      bool found_bindings = false; // If not, the capture doesn't filter by "bindings"
+      bool uses_descriptor_heap = false; // SM 6.6 "ResourceDescriptorHeap[]" or "SamplerDescriptorHeap[]", which "bindings" can't list
+#endif
 #endif
 
 #if ALLOW_SHADERS_DUMPING || DEVELOPMENT

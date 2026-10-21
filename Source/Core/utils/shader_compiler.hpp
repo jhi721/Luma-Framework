@@ -47,6 +47,9 @@ namespace Shader
       HullShader = 3,
       DomainShader = 4,
       ComputeShader = 5,
+      // DXIL only ("DXIL::ShaderKind")
+      MeshShader = 13,
+      AmplificationShader = 14,
    };
    struct DXBCHeader
    {
@@ -116,6 +119,8 @@ namespace Shader
       case DXBCProgramType::HullShader: type = "hs"; break;
       case DXBCProgramType::DomainShader: type = "ds"; break;
       case DXBCProgramType::ComputeShader: type = "cs"; break;
+      case DXBCProgramType::MeshShader: type = "ms"; break;
+      case DXBCProgramType::AmplificationShader: type = "as"; break;
       default: return {};
       }
       return std::format("{}_{}_{}", type, program->version_major_and_minor >> 4, program->version_major_and_minor & 0xF);

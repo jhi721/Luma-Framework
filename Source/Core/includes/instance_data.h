@@ -244,6 +244,24 @@ struct TraceDrawCallData
    std::string ds_hash = {}; // Ptr hash (not content hash)
    std::string ds_debug_name = {}; // Debug name of the texture or the view
 
+#if DX12
+   // D3D12 binds by root signature, not by slot: the SRV, UAV and constant buffer entries above are packed in binding order, the
+   // first "*_count" are valid, and these are their registers
+   struct ShaderRegister
+   {
+      uint32_t index = 0;
+      uint32_t space = 0;
+   };
+   uint32_t srv_count = 0;
+   uint32_t uav_count = 0;
+   uint32_t cb_count = 0;
+   ShaderRegister sr_register[srvs_size] = {};
+   ShaderRegister ua_register[uavs_size] = {};
+   ShaderRegister cb_register[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+   std::vector<uint32_t> cb_root_constants[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]; // The values of root constants (they have no "cb_hash")
+   bool uses_descriptor_heap = false; // A shader indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices usually are in the constants
+#endif
+
 #if DX11
    // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults.
    bool has_depth_stencil_state = false;
@@ -652,6 +670,9 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 #if DX12 && DEVELOPMENT // For the frame capture, for now
    D3D12State::PipelineLayouts pipeline_layouts;
    D3D12State::DescriptorHeaps descriptor_heaps;
+   D3D12State::BufferAddresses buffer_addresses;
+   // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)
+   CommandListData trace_command_list_data;
 #endif
 
 #if DX11
