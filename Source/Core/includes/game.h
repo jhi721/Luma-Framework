@@ -10,7 +10,9 @@ struct GameDeviceData
 {
    virtual ~GameDeviceData() = default; // Games derive from this and own resources; Core deletes through the base pointer
 
+#if DX11
    ManagedResources managed_resources;
+#endif
 };
 
 struct GameInfo
@@ -35,10 +37,10 @@ public:
    virtual void OnLoad(std::filesystem::path& file_path, bool failed = false) {}
    // The mod initialized. Avoid locking mutexes in here.
    virtual void OnInit(bool async) {}
-   virtual void OnInitDevice(ID3D11Device* native_device, DeviceData& device_data) {}
+   virtual void OnInitDevice(NativeDevice* native_device, DeviceData& device_data) {}
    virtual void OnInitSwapchain(reshade::api::swapchain* swapchain) {}
    // You can create and "append" your custom device data here
-   virtual void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data)
+   virtual void OnCreateDevice(NativeDevice* native_device, DeviceData& device_data)
    {
       // Example data
       device_data.game = new GameDeviceData;
@@ -50,11 +52,13 @@ public:
       device_data.game = nullptr;
    }
 
+#if DX11
    virtual bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) { return false; }
    // A whole-resource MSAA resolve after the indirect upgrade substitution ("dst_resource"/"src_resource" are the mirrors, "format" the
    // mirrors' format). True if the game resolved it itself.
    virtual bool OverrideResolveTextureRegion(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, uint64_t dst_resource, uint64_t src_resource, DXGI_FORMAT format) { return false; }
    virtual bool OverrideCopyTextureRegion(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const D3D11_BOX* dst_box, uint64_t& src_resource, uint32_t src_subresource, const D3D11_BOX* src_box) { return false; }
+#endif // DX11
 
    // ============================================================================
    // Shader patching providers. Select which ones a game uses with the
@@ -91,7 +95,7 @@ public:
    // Return true to cancel the original call.
    // Use "original_draw_dispatch_func" to call the original draw/dispatch within your function (you have to cancel it manually if you do so, as that's not tracked). This is useful if you want to add any post draw/dispatch behaviour. "ENABLE_POST_DRAW_DISPATCH_CALLBACK" is required for the it to work. Note that some advanced debugging behaviours might conflict if you replace the draw call.
    // Not called for draws/dispatches that matched a callback in "draw_callbacks_by_shader_hashes"/"dispatch_callbacks_by_shader_hashes" (which have this same signature).
-   virtual DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func = nullptr) { return DrawOrDispatchOverrideType::None; }
+   virtual DrawOrDispatchOverrideType OnDrawOrDispatch(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func = nullptr) { return DrawOrDispatchOverrideType::None; }
    // Called at bind time for patch-cloned pipelines to decide whether to use the
    // patched variant (true) or the original (false). Default is true (patch ON).
    // Requires "LUMA_PATCH_PROVIDERS".
@@ -104,7 +108,7 @@ public:
    virtual void OnPatchedShadersPublished(DeviceData& device_data, const std::vector<uint32_t>& published_shader_hashes) {}
    // This is called every frame just before sending out the final image to the display (the swapchain).
    // You can reliable reset any per frame setting here.
-   virtual void OnPresent(ID3D11Device* native_device, DeviceData& device_data) {}
+   virtual void OnPresent(NativeDevice* native_device, DeviceData& device_data) {}
    virtual void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData& cmd_list_data, DeviceData& device_data) {}
    // Retrieves the game's "global" (main, per view, ...) cbuffer data
    virtual bool UpdateGlobalCB(const void* global_buffer_data_ptr, reshade::api::device* device) { return false; }

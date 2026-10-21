@@ -39,6 +39,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Deus Ex Human Revolution Di
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "_Generic Mod", "Source\Games\_Generic Mod\Generic Mod.vcxproj", "{08143144-3ABB-D7B3-815C-7B798924E8E6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "_Generic Mod DX12", "Source\Games\_Generic Mod DX12\Generic Mod DX12.vcxproj", "{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Graphics Analyzer", "Source\Graphics Analyzer\Graphics Analyzer.vcxproj", "{08143144-3ABB-D7B3-815C-7C798924E8E6}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SR Bridge Helper", "Source\Tools\SR Bridge Helper\SR Bridge Helper.vcxproj", "{1A1AC095-1247-455C-8FF4-D8D6051AA52A}"
@@ -1181,6 +1183,18 @@ Global
 		{3A6C5692-A5DE-46AE-8E7A-1838642DDC30}.Test-Release|Win32.ActiveCfg = Test-Release|x64
 		{3A6C5692-A5DE-46AE-8E7A-1838642DDC30}.Test-Release|x64.ActiveCfg = Test-Release|x64
 		{3A6C5692-A5DE-46AE-8E7A-1838642DDC30}.Test-Release|x64.Build.0 = Test-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Development-Debug|x64.Build.0 = Development-Debug|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Development-Release|Win32.ActiveCfg = Development-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Development-Release|x64.ActiveCfg = Development-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Development-Release|x64.Build.0 = Development-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Publishing-Release|x64.ActiveCfg = Publishing-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Publishing-Release|x64.Build.0 = Publishing-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Test-Release|Win32.ActiveCfg = Test-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Test-Release|x64.ActiveCfg = Test-Release|x64
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E}.Test-Release|x64.Build.0 = Test-Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -1263,6 +1277,7 @@ Global
 		{E2E5E8F0-64B9-474E-B672-6E62061F55D4} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{CCADC877-1FC5-40A0-84FF-D96476C6580D} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{3A6C5692-A5DE-46AE-8E7A-1838642DDC30} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {8B799422-BA66-3174-B21F-B9FA07C4B2E3}

@@ -34,8 +34,26 @@
 #define ImTextureID ImU64
 #endif
 
+#if DX12
+#include <d3d12.h>
+// Shader model register limits that size Core's API agnostic per-slot data (shader reflections, draw traces). D3D12 has the same values.
+#define D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT D3D12_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+#define D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT
+#define D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
+#define D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
+#define D3D11_1_UAV_SLOT_COUNT D3D12_UAV_SLOT_COUNT
+#define D3D11_PS_CS_UAV_REGISTER_COUNT D3D12_PS_CS_UAV_REGISTER_COUNT
+#define D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT
+#define D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
+// The native objects the "Game" interface receives
+using NativeDevice = ID3D12Device;
+using NativeCommandList = ID3D12GraphicsCommandList;
+#else
 #include <d3d11.h>
 #include <d3d11_4.h>
+using NativeDevice = ID3D11Device;
+using NativeCommandList = ID3D11DeviceContext;
+#endif
 #include <dxgi.h>
 #include <dxgi1_6.h>
 #include <Windows.h>
@@ -128,16 +146,16 @@
 #define ENABLE_MINHOOK 0
 #endif // ENABLE_MINHOOK
 // NVIDIA Reflex injected at present (see "includes/reflex.h"). Needs NVAPI and MinHook; a game can define it to 0 to leave latency
-// to the game
-#if !ENABLE_NVAPI || !ENABLE_MINHOOK
+// to the game. D3D11 only for now.
+#if !ENABLE_NVAPI || !ENABLE_MINHOOK || DX12
 #undef ENABLE_REFLEX
 #define ENABLE_REFLEX 0
 #elif !defined(ENABLE_REFLEX)
 #define ENABLE_REFLEX 1
 #endif // ENABLE_REFLEX
 // scRGB games (the fp16 back buffer the game, ReShade and Luma see) present HDR10 PQ through a proxy back buffer (see "includes/swapchain_proxy.hpp").
-// Needs MinHook; without it the swapchain stays fp16 scRGB.
-#if !ENABLE_MINHOOK
+// Needs MinHook; without it the swapchain stays fp16 scRGB. D3D11 only.
+#if !ENABLE_MINHOOK || DX12
 #undef ENABLE_SWAPCHAIN_PROXY
 #define ENABLE_SWAPCHAIN_PROXY 0
 #elif !defined(ENABLE_SWAPCHAIN_PROXY)
@@ -181,6 +199,9 @@
 
 #if !DX12
 #define DX11 1
+#elif ENABLE_SR || ENABLE_SMAA || ENABLE_RCAS
+// Not ported to D3D12 yet, see "docs/DX12-Support-Plan.md"
+#error "Super resolution, SMAA and RCAS are D3D11 only"
 #endif
 
 // This might not disable all shaders dumping related code, but it disables enough to remove any performance cost
@@ -229,20 +250,29 @@
 #include "includes/instance_data.h"
 #include "includes/game.h"
 #include "includes/com_ptr.h"
+#include "includes/callbacks.h"
 #include "includes/swapchain_proxy.hpp" // see "ENABLE_SWAPCHAIN_PROXY"
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
 #include "includes/perf_test.h" // Also "luma_perf" in "includes/mcp_server.inl"
-#endif // DEVELOPMENT
+#endif // DEVELOPMENT && DX11
 
 #include "utils/format.hpp"
 #include "utils/pipeline.hpp"
 #include "utils/shader_compiler.hpp"
 #include "utils/display.hpp"
+#if DX11 // Native D3D11 helpers
 #include "utils/resource.hpp"
 #include "utils/draw.hpp"
+#endif
 #include "utils/system.h"
+#if DX11
 #include "includes/shader_warmup.h"
+#endif
 #include "taa/LumaTAA.hpp" // see "ENABLE_LUMA_TAA"
+
+#if DX12 && defined(__d3d11_h__)
+#error "A D3D11 header reached a D3D12 build, gate its include with \"DX11\""
+#endif
 
 #define ICON_FK_CANCEL reinterpret_cast<const char*>(u8"\uf00d")
 #define ICON_FK_OK reinterpret_cast<const char*>(u8"\uf00c")
@@ -881,7 +911,7 @@ namespace
    // There's only one swapchain and one device in most games (e.g. Prey), but the game changes its configuration from different threads.
    // A new device+swapchain can be created if the user resets the settings as the old one is still rendering (or is it?).
    // These are raw pointers that did not add a reference to the counter.
-   std::vector<ID3D11Device*> global_native_devices; // Possibly unused
+   std::vector<NativeDevice*> global_native_devices; // Possibly unused
    std::vector<DeviceData*> global_devices_data;
    HWND game_window = 0; // This is fixed forever (in almost all games (e.g. Prey))
 #if DEVELOPMENT
@@ -1037,6 +1067,7 @@ namespace
 
    thread_local reshade::api::command_list* thread_local_cmd_list = nullptr; // Hacky global variable (possibly not cleared, stale), only use to quickly tell the command list of the thread
 
+#if DX11
    // Textures debug drawing
    namespace
    {
@@ -1059,6 +1090,7 @@ namespace
       bool debug_draw_replaced_pass = false; // Whether we print the debugging of the original or replaced pass (the resources bindings etc might be different, though this won't forcefully run the original pass if it was skipped by the game's mod custom code, so this isn't fully reliable)
       bool debug_draw_auto_gamma = true;
    }
+#endif // DX11
 
    // Constant Buffers tracking
    namespace
@@ -1517,6 +1549,7 @@ namespace
       }
    }
 
+#if DX11 // Luma's own D3D12 shaders need their own root signature and PSOs ("docs/DX12-Support-Plan.md" phase 4)
    // Expects "s_mutex_loading" and "s_mutex_shader_objects"
    template<typename T = ID3D11DeviceChild>
    void CreateShaderObject(ID3D11Device* native_device, uint32_t native_shader_hash, com_ptr<T>& shader_object, bool force_delete_previous = !(bool)FORCE_KEEP_CUSTOM_SHADERS_LOADED, bool trigger_assert = false)
@@ -1637,6 +1670,7 @@ namespace
       device_data.created_native_shaders = true; // Some of the shader object creations above might have failed due to filtering, but they will likely be compiled soon after anyway
       if (lock) s_mutex_shader_objects.unlock();
    }
+#endif // DX11
 
    // Compiles all the "custom" shaders we have in our shaders folder
    void CompileCustomShaders(DeviceData* optional_device_data = nullptr, bool warn_about_duplicates = false, const std::unordered_set<uint64_t>& pipelines_filter = std::unordered_set<uint64_t>())
@@ -2481,11 +2515,13 @@ namespace
          ShaderDefineData::Save(shader_defines_data, NAME_ADVANCED_SETTINGS);
       }
 
+#if DX11
       // Refresh the persistent custom shaders we have.
       if (optional_device_data)
       {
          CreateDeviceNativeShaders(*optional_device_data, &changed_luma_native_shaders_hashes);
       }
+#endif
    }
 
    void LoadCustomShaders(DeviceData& device_data, const std::unordered_set<uint64_t>& pipelines_filter = std::unordered_set<uint64_t>(), bool recompile_shaders = true)
@@ -2748,16 +2784,25 @@ namespace
       game->OnDisplayModeChanged();
    }
 
+   // The API is fixed per build ("DX12"). Other devices are ignored, e.g. the D3D11 device ReShade creates over a D3D12 game's one for its 11on12 layer.
+#if DX12
+   constexpr reshade::api::device_api supported_graphics_api = reshade::api::device_api::d3d12;
+   constexpr const char* supported_graphics_api_name = "DirectX 12";
+#else
+   constexpr reshade::api::device_api supported_graphics_api = reshade::api::device_api::d3d11;
+   constexpr const char* supported_graphics_api_name = "DirectX 11";
+#endif
+
    bool IsSupportedGraphicsAPI(reshade::api::device_api api)
    {
-      return api == reshade::api::device_api::d3d11;
+      return api == supported_graphics_api;
    }
 
    bool OnCreateDevice(reshade::api::device_api api, uint32_t& api_version)
    {
 #if !CHECK_GRAPHICS_API_COMPATIBILITY
 #if DEVELOPMENT || TEST
-      ASSERT_ONCE_MSG(api == reshade::api::device_api::d3d11, "Luma only supports DirectX 11 at the moment, add \"CHECK_GRAPHICS_API_COMPATIBILITY\" to ignore calls from other APIs");
+      ASSERT_ONCE_MSG(IsSupportedGraphicsAPI(api), "This Luma mod only supports one graphics API, add \"CHECK_GRAPHICS_API_COMPATIBILITY\" to ignore calls from other APIs");
 #else
       static bool skip_api_compatibility_check = false;
       if (!skip_api_compatibility_check)
@@ -2765,9 +2810,10 @@ namespace
          const std::shared_lock lock(s_mutex_reshade);
          reshade::get_config_value(nullptr, NAME, "SkipAPICompatibilityCheck", skip_api_compatibility_check);
       }
-      if (api != reshade::api::device_api::d3d11 && !skip_api_compatibility_check)
+      if (!IsSupportedGraphicsAPI(api) && !skip_api_compatibility_check)
       {
-         int ret = MessageBoxA(NULL, "The application tried to create a non DirectX 11 device. Luma currently only supports DirectX 11, the application might crash.\nPress \"OK\" to continue.\nPress \"Cancel\" to skip this message in the future.", NAME, MB_SETFOREGROUND | MB_OKCANCEL);
+         const std::string message = std::format("The application tried to create a non {0} device. This Luma mod only supports {0}, the application might crash.\nPress \"OK\" to continue.\nPress \"Cancel\" to skip this message in the future.", supported_graphics_api_name);
+         int ret = MessageBoxA(NULL, message.c_str(), NAME, MB_SETFOREGROUND | MB_OKCANCEL);
          if (ret == IDCANCEL)
          {
             const std::unique_lock lock(s_mutex_reshade);
@@ -2797,6 +2843,7 @@ namespace
       return false;
    }
 
+#if DX11 // The warm-up creates D3D11 shader objects on a second device
    // The shader warm-up's "Expand": the bytecode "OnCreatePipeline" hands the driver for a game shader (stripped, bytecode patch; not the
    // recipe patches), and the game's own variants of it. On the warm-up thread, so the game's patch functions must be thread safe (they
    // already run on any thread that creates shaders).
@@ -2855,18 +2902,21 @@ namespace
       }
       return entries;
    }
+#endif // DX11
 
    void OnInitDevice(reshade::api::device* device)
    {
       // Always skip this one, don't use "SKIP_UNSUPPORTED_DEVICE_API", some games create devices of other graphics API without actually doing anything with them (e.g. Deus Ex HR)
       if (!IsSupportedGraphicsAPI(device->get_api())) return;
 
-      ID3D11Device* native_device = (ID3D11Device*)(device->get_native()); // This is the unproxied device, the one the game tried to natively create was instead created as a proxy by reshade, but we don't want that one, as that will pass all our calls through ReShade too, while we want to keep that layer only for stuff coming from the game
+      NativeDevice* native_device = (NativeDevice*)(device->get_native()); // This is the unproxied device, the one the game tried to natively create was instead created as a proxy by reshade, but we don't want that one, as that will pass all our calls through ReShade too, while we want to keep that layer only for stuff coming from the game
+#if DX11
       if (ShaderWarmup::g_is_warmup_thread)
       {
          ShaderWarmup::g_warmup_native_device = native_device;
          return;
       }
+#endif
       DeviceData& device_data = *device->create_private_data<DeviceData>();
       device_data.native_device = native_device;
       device_data.reshade_device = device;
@@ -2875,9 +2925,11 @@ namespace
       device_data.recipes.SetRootPath(shaders_path);
 #endif
 
+#if DX11
       device_data.uav_max_count = (native_device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1) ? D3D11_1_UAV_SLOT_COUNT : D3D11_PS_CS_UAV_REGISTER_COUNT;
 
       native_device->GetImmediateContext(&device_data.primary_command_list);
+#endif
 
       {
          const std::unique_lock lock(s_mutex_device);
@@ -2912,6 +2964,7 @@ namespace
 
       HRESULT hr;
 
+#if DX11
       D3D11_BUFFER_DESC buffer_desc = {};
       // From MS docs: you must set the ByteWidth value of D3D11_BUFFER_DESC in multiples of 16, and less than or equal to D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT.
       buffer_desc.ByteWidth = sizeof(CB::LumaGlobalSettingsPadded);
@@ -2991,10 +3044,13 @@ namespace
       assert(SUCCEEDED(hr));
 #endif
 
+#endif // DX11
+
 #if ENABLE_NVAPI
       Display::NVAPI::Init();
 #endif
 
+#if DX11 // D3D12 devices aren't DXGI devices, their frame latency is set on the swapchain
       com_ptr<IDXGIDevice1> native_dxgi_device;
       hr = native_device->QueryInterface(&native_dxgi_device);
       assert(SUCCEEDED(hr));
@@ -3004,6 +3060,7 @@ namespace
       // We should possibly link this to the "DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT" flag.
       HRESULT hr2 = native_dxgi_device->SetMaximumFrameLatency(1);
       assert(SUCCEEDED(hr2));
+#endif // DX11
 
 #if ENABLE_SR
       com_ptr<IDXGIAdapter> native_adapter;
@@ -3061,6 +3118,9 @@ namespace
 
       game->OnInitDevice(native_device, device_data);
 
+#if DX12
+      reshade::log::message(reshade::log::level::info, "Initialized the D3D12 device");
+#else
       LoadTexture2DArrays(native_device, device_data);
 
       // If we upgrade textures, make sure that MSAA DXGI_FORMAT_R16G16B16A16_FLOAT is supported on our GPU, given that it's optional.
@@ -3104,16 +3164,19 @@ namespace
 #endif
 
       ShaderWarmup::Start(native_device, shaders_path / Globals::GAME_NAME / "Warmup", GetShaderWarmupCodes, GetLumaShaderWarmupEntries);
+#endif // DX12
    }
 
    void OnDestroyDevice(reshade::api::device* device)
    {
       if (!IsSupportedGraphicsAPI(device->get_api())) return;
+#if DX11
       if (ShaderWarmup::g_is_warmup_thread) return;
 
       ShaderWarmup::Stop();
+#endif
 
-      ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
+      NativeDevice* native_device = (NativeDevice*)(device->get_native());
       DeviceData& device_data = *device->get_private_data<DeviceData>(); // No need to lock the data mutex here, it could be concurrently used at this point
 
       game->OnDestroyDeviceData(device_data);
@@ -3125,6 +3188,7 @@ namespace
       }
 #endif
 
+#if DX11 // No pipelines are cached in D3D12 yet
       // It can apparently happen that in DX11 the device destructor callback is sent before its pipelines, so make sure we empty the memory before.
       // Note: ReShade has fixed this bug now, but as of 6.6 it simply skips ever calling the destroy event for these.
       {
@@ -3140,10 +3204,11 @@ namespace
             OnDestroyPipeline(device, reshade::api::pipeline{ pipeline_pair.first });
          }
       }
+#endif // DX11
 
       {
          const std::unique_lock lock(s_mutex_device);
-         if (std::vector<ID3D11Device*>::iterator position = std::find(global_native_devices.begin(), global_native_devices.end(), native_device); position != global_native_devices.end())
+         if (std::vector<NativeDevice*>::iterator position = std::find(global_native_devices.begin(), global_native_devices.end(), native_device); position != global_native_devices.end())
          {
             global_native_devices.erase(position);
          }
@@ -3177,6 +3242,7 @@ namespace
       }
 #endif
 
+#if DX11
       assert(device_data.cb_per_view_global_buffer_map_data == nullptr); // It's fine (but not great) if we map wasn't unmapped before destruction (not our fault anyway)
 
       if (enable_samplers_upgrade)
@@ -3190,6 +3256,7 @@ namespace
             device_data.custom_sampler_by_original_sampler.clear();
          }
       }
+#endif // DX11
 
 #if ENABLE_SR
       // Every supported type was initialized at device creation, not just the selected one (see "OnInitDevice()")
@@ -3387,7 +3454,9 @@ namespace
       const size_t back_buffer_count = swapchain->get_back_buffer_count();
 #endif
       auto* device = swapchain->get_device();
+#if DX11
       ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
+#endif
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       SwapchainData& swapchain_data = *swapchain->create_private_data<SwapchainData>();
       ASSERT_ONCE(&device_data != nullptr); // Hacky nullptr check (should ever be able to happen)
@@ -3417,6 +3486,7 @@ namespace
             auto buffer = swapchain->get_back_buffer(index);
             swapchain_data.back_buffers.emplace(buffer.handle);
 
+#if DX11
             com_ptr<ID3D11RenderTargetView> display_composition_rtv;
             if (force_create_swapchain_rtvs)
             {
@@ -3426,6 +3496,7 @@ namespace
             }
 
             swapchain_data.display_composition_rtvs.push_back(display_composition_rtv);
+#endif
          }
       }
 
@@ -3466,6 +3537,7 @@ namespace
          device_data.cb_luma_global_settings_dirty = true;
       }
 
+#if DX11
 		device_data.ui_texture = nullptr;
       device_data.ui_texture_rtv = nullptr;
       device_data.ui_texture_srv = nullptr;
@@ -3477,6 +3549,9 @@ namespace
          native_device->CreateRenderTargetView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_rtv);
          native_device->CreateShaderResourceView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_srv);
       }
+#else
+      reshade::log::message(reshade::log::level::info, std::format("Initialized the D3D12 swapchain ({}x{}, {} back buffers{})", device_data.output_resolution.x, device_data.output_resolution.y, back_buffer_count, resize ? ", resized" : "").c_str());
+#endif
 
       IDXGISwapChain3* native_swapchain3;
       // The cast pointer is actually the same, we are just making sure the type is right.
@@ -3692,6 +3767,7 @@ namespace
             }
          }
 
+#if DX11
          // Before resizing the swapchain, we need to make sure any of its resources/views are not bound to any state.
          // The swapchain data will be destroyed below anyway, so we are leaving no references to them.
          if (resize && !swapchain_data.display_composition_rtvs.empty())
@@ -3718,6 +3794,7 @@ namespace
                device_data.primary_command_list->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_const, depth_stencil_view.get());
             }
          }
+#endif // DX11
       }
 
       swapchain->destroy_private_data<SwapchainData>();
@@ -3801,6 +3878,7 @@ namespace
       return prevent_fullscreen_state;
    }
 
+#if DX11 // Pipeline tracking, shader replacement and Luma cbuffers aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 2 and 3)
 #if DEVELOPMENT
    // "Perf::ShaderCreates": registered before "OnCreatePipeline", so the time includes Luma's work on the bytecode
    thread_local std::chrono::steady_clock::time_point shader_create_start = {};
@@ -5137,21 +5215,12 @@ namespace
 
          if (cached_pipeline)
          {
-#if DX12
-            // Note: this makes no sense, the shader hashes should be split by stage. Only one per stage can be bound in either DX11 and 12!
-            cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders = std::unordered_set<uint32_t>(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end());
-#else
             cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders[0] = cached_pipeline->shader_hashes[0];
-#endif
             cmd_list_data.pipeline_state_has_custom_compute_shader = cached_pipeline->cloned;
          }
          else
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders.clear();
-#else
             cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders[0] = SHADER_HASH_NONE;
-#endif
             cmd_list_data.pipeline_state_has_custom_compute_shader = false;
          }
       }
@@ -5174,20 +5243,12 @@ namespace
 
          if (cached_pipeline)
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders = std::unordered_set<uint32_t>(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end());
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders[0] = cached_pipeline->shader_hashes[0];
-#endif
             cmd_list_data.pipeline_state_has_custom_vertex_shader = cached_pipeline->cloned;
          }
          else
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders.clear();
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders[0] = SHADER_HASH_NONE;
-#endif
             cmd_list_data.pipeline_state_has_custom_vertex_shader = false;
          }
          cmd_list_data.pipeline_state_has_custom_graphics_shader = cmd_list_data.pipeline_state_has_custom_pixel_shader || cmd_list_data.pipeline_state_has_custom_vertex_shader;
@@ -5215,20 +5276,12 @@ namespace
 
          if (cached_pipeline)
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders = std::unordered_set<uint32_t>(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end());
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0] = cached_pipeline->shader_hashes[0];
-#endif
             cmd_list_data.pipeline_state_has_custom_pixel_shader = cached_pipeline->cloned;
          }
          else
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders.clear();
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0] = SHADER_HASH_NONE;
-#endif
             cmd_list_data.pipeline_state_has_custom_pixel_shader = false;
          }
          cmd_list_data.pipeline_state_has_custom_graphics_shader = cmd_list_data.pipeline_state_has_custom_pixel_shader || cmd_list_data.pipeline_state_has_custom_vertex_shader;
@@ -5745,15 +5798,19 @@ namespace
       }
       }
    }
+#endif // DX11
 
    // Mapped to the creation of "D3D11DeviceContext" and "D3D11CommandList". If this is a "D3D11CommandList", we can't know what "D3D11DeviceContext" it was generated form.
    void OnInitCommandList(reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+#if DX11
       if (ShaderWarmup::g_is_warmup_thread) return;
+#endif
 
       CommandListData& cmd_list_data = *cmd_list->create_private_data<CommandListData>();
 
+#if DX11 // D3D12 has no immediate command list for games, they are all equal (ReShade's own immediate list doesn't fire this)
 #if ENABLE_AUTO_CBUFFER_RESTORATION
       cmd_list_data.ClearOriginalConstantBuffers();
 #endif
@@ -5797,12 +5854,15 @@ namespace
             ASSERT_ONCE(false);
          }
       }
+#endif // DX11
    }
 
    void OnDestroyCommandList(reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+#if DX11
       if (ShaderWarmup::g_is_warmup_thread) return;
+#endif
 
       cmd_list->destroy_private_data<CommandListData>();
    }
@@ -5862,6 +5922,7 @@ namespace
 
       cmd_list_data.temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 
+#if DX11
       const auto lock_trace = LockTraceIfRunning();
       if (lock_trace && trace_running)
       {
@@ -5871,9 +5932,11 @@ namespace
          trace_draw_call_data.command_list = (ID3D11DeviceContext*)(cmd_list->get_native());
          cmd_list_data.trace_draw_calls_data.push_back(trace_draw_call_data);
       }
-#endif
+#endif // DX11
+#endif // DEVELOPMENT
    }
 
+#if DX11
 #if DEVELOPMENT
    // "queue" and "cmd_list" both point to the device context in DX11
    // For DX11, this is only called on the immediately device context, for "D3D11DeviceContext::Flush()" and similar.
@@ -5982,6 +6045,7 @@ namespace
          cmd_list_data.write_finished.store(true, std::memory_order_release);
       }
    }
+#endif // DX11
 
 #if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
    void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
@@ -6097,9 +6161,9 @@ namespace
    }
 #endif // ENABLE_SR
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11 // Its readbacks and traces are D3D11 ("docs/DX12-Support-Plan.md" phase 7)
 #include "includes/mcp_server.inl"
-#endif // DEVELOPMENT
+#endif // DEVELOPMENT && DX11
 
 #if ENABLE_SWAPCHAIN_PROXY
    // Encodes the scRGB proxy into the real HDR10 PQ (or SDR sRGB) back buffer, the last thing drawn in the frame:
@@ -6197,11 +6261,13 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
-      ID3D11Device* native_device = (ID3D11Device*)(queue->get_device()->get_native());
-      ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(queue->get_immediate_command_list()->get_native());
+      NativeDevice* native_device = (NativeDevice*)(queue->get_device()->get_native());
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
+#if DX11 // On D3D12 the queue's immediate command list is ReShade's own, it has no "CommandListData"
+      ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(queue->get_immediate_command_list()->get_native());
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
+#endif
 
 #if ENABLE_SWAPCHAIN_PROXY
       // "finish_present" doesn't run if the previous present failed
@@ -6218,6 +6284,7 @@ namespace
       if (frame_sleep_ms > 0 && cb_luma_global_settings.FrameIndex % frame_sleep_interval == 0)
          Sleep(frame_sleep_ms);
 
+#if DX11
       // Before display composition, so a debug draw copy requested over MCP is read back and cleared before it's drawn
       Mcp::OnPresent(device_data, cmd_list_data, native_device_context, swapchain);
 
@@ -6246,8 +6313,10 @@ namespace
          }
          creates.last_present = now;
       }
+#endif // DX11
 #endif  // DEVELOPMENT
 
+#if DX11 // The D3D12 display composition is "docs/DX12-Support-Plan.md" phase 4
       // If there are no shaders being currently replaced in the game,
       // we can assume that we either missed replacing some shaders, or that we have unloaded all of our shaders.
       bool mod_active = IsModActive(device_data);
@@ -6708,6 +6777,7 @@ namespace
 #endif
       track_buffer_pipeline_instance = 0;
 #endif // DEVELOPMENT
+#endif // DX11
 
       device_data.has_drawn_main_post_processing_previous = device_data.has_drawn_main_post_processing;
       // Per frame: the game's draws set it again (a game that always has a scene sets it in its "OnPresent", as "_Template" does; reads in
@@ -6735,7 +6805,7 @@ namespace
       }
 #endif
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
       // Luma passes the game drew at present (or outside its draw hooks) on this thread
       {
          const auto lock_trace = LockTraceIfRunning();
@@ -6775,7 +6845,7 @@ namespace
       }
 #endif
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
       {
          const auto lock_trace = LockTraceIfRunning();
          if (lock_trace && trace_running)
@@ -6796,6 +6866,7 @@ namespace
 
    //TODOFT3: merge all the shader permutations that use the same code in Prey (and then move shader binaries to bin folder? Add shader files to VS project?)
 
+#if DX11 // Draw, copy, clear, sampler and resource hooks aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 3 to 5)
    // Expects "s_mutex_samplers" to already be locked
    com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
    {
@@ -10912,13 +10983,14 @@ namespace
       ASSERT_ONCE(false);
       return false;
    }
+#endif // DX11
 
    void OnReShadePresent(reshade::api::effect_runtime* runtime)
    {
       SKIP_UNSUPPORTED_DEVICE_API(runtime->get_device()->get_api());
 
       DeviceData& device_data = *runtime->get_device()->get_private_data<DeviceData>();
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
       {
          // Some games fail to capture input on boot, so use a special key to force a graphics capture
          static bool graphics_capture_key_down = false; // "static" is fine, games usually only have one present call per frame
@@ -10957,7 +11029,7 @@ namespace
             trace_running = true;
          }
       }
-#endif // DEVELOPMENT
+#endif // DEVELOPMENT && DX11
 
       // Dump new shaders (checking the "shaders_to_dump" count is theoretically not thread safe but it should work nonetheless as this is run every frame)
       if (auto_dump && !thread_auto_dumping_running && !shaders_to_dump.empty())
@@ -11033,7 +11105,12 @@ namespace
 
       if (!block_draw_until_device_custom_shaders_creation) s_mutex_shader_objects.lock_shared();
       // Force re-load shaders (which will also end up re-creating the custom device shaders) if async shaders loading on boot finished without being able to create custom shaders
-      if (needs_load_shaders || (!block_draw_until_device_custom_shaders_creation && !thread_auto_compiling_running && !device_data.created_native_shaders))
+#if DX11
+      const bool created_native_shaders = device_data.created_native_shaders;
+#else
+      constexpr bool created_native_shaders = true; // There are none yet
+#endif
+      if (needs_load_shaders || (!block_draw_until_device_custom_shaders_creation && !thread_auto_compiling_running && !created_native_shaders))
       {
          if (!block_draw_until_device_custom_shaders_creation) s_mutex_shader_objects.unlock_shared();
          // Cache the defines at compilation time
@@ -12150,6 +12227,7 @@ namespace
          open_settings_tab = trace_count_changed && trace_count <= 0; // Fall back on settings (and also default to it in the first frame)
          prev_trace_count = trace_count;
 
+#if DX11 // The frame capture is D3D11 only ("docs/DX12-Support-Plan.md" phase 7)
          ImGui::PushID("##CaptureTab");
          bool handle_shader_tab = trace_count > 0 && ImGui::BeginTabItem(std::format("Captured Commands ({})", trace_count).c_str(), nullptr, open_capture_tab ? ImGuiTabItemFlags_SetSelected : 0); // No need for "s_mutex_trace" here
          ImGui::PopID();
@@ -14475,6 +14553,7 @@ namespace
 
             ImGui::EndTabItem(); // Captured Commands
          }
+#endif // DX11
 
 #if !GRAPHICS_ANALYZER
          // Show even if "custom_shaders_cache" was empty
@@ -14729,6 +14808,7 @@ namespace
             ImGui::EndTabItem(); // Custom Shaders
          }
 
+#if DX11
          if (ImGui::BeginTabItem("Upgraded Textures"))
          {
             static int32_t resources_selected_index = -1;
@@ -15020,6 +15100,7 @@ namespace
 
             ImGui::EndTabItem(); // Upgraded Textures
          }
+#endif // DX11
 #endif // !GRAPHICS_ANALYZER
 #endif // DEVELOPMENT
 
@@ -15726,7 +15807,9 @@ namespace
 
             game->DrawImGuiSettings(device_data);
             device_data.cb_luma_global_settings_dirty = true; // Again after the game's settings, so their edits are never missed by an upload that ran in between
+#if DX11
             ShaderWarmup::DrawImGuiSection(device_data.native_device);
+#endif
 
 #if DEVELOPMENT || TEST
             ImGui::SetNextItemOpen(true, ImGuiCond_Once);
@@ -15865,6 +15948,7 @@ namespace
                   defines_need_recompilation = true;
                }
 
+#if DX11 // Debug draw
                ImGui::NewLine();
                ImGuiInputTextFlags text_flags = ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_AlwaysOverwrite | ImGuiInputTextFlags_NoUndoRedo;
                if (ImGui::InputTextWithHint("Debug Draw Shader Hash", "12345678", debug_draw_shader_hash_string, HASH_CHARACTERS_LENGTH + 1, text_flags))
@@ -16246,6 +16330,8 @@ namespace
                   }
                }
 
+#endif // DX11
+
 #if !GRAPHICS_ANALYZER // Graphics Analyzer doesn't want upgrades
                ImGui::NewLine();
                // Requires a change in resolution to (~fully) apply (no texture cloning yet)
@@ -16268,8 +16354,10 @@ namespace
                      static_assert(sizeof(enable_chain_indirect_texture_format_upgrades) == sizeof(int));
                      if (ImGui::SliderInt("Chain Indirect Texture Format Upgrades Types", reinterpret_cast<int*>(&enable_chain_indirect_texture_format_upgrades), 0, (int)ChainTextureFormatUpgradesType::DirectAndIndirectDependencies, chain_texture_format_upgrades_type_strings[(size_t)enable_chain_indirect_texture_format_upgrades], ImGuiSliderFlags_NoInput))
                      {
+#if DX11
                         // Reset the state to avoid pollutation at least in the primary command list (safe during present), in the others it might matter a lot less because they are constantly reset
                         device_data.primary_command_list_data->ResetUpgradedViews();
+#endif
                      }
                      ImGui::Checkbox("Ignore Indirect Upgraded Textures", &ignore_indirect_upgraded_textures);
                      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -16400,6 +16488,7 @@ namespace
 
                         {
                            const std::shared_lock lock_swapchain(swapchain_data.mutex);
+#if DX11
                            // Before resizing the swapchain, we need to make sure any of its resources/views are not bound to any state (at least from our side, we can't control the game side here)
                            if (!swapchain_data.display_composition_rtvs.empty())
                            {
@@ -16428,6 +16517,7 @@ namespace
                                  primary_command_list->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_const, depth_stencil_view.get());
                               }
                            }
+#endif // DX11
                         }
 
                         native_swapchain->ResizeBuffers(0, new_width, new_height, DXGI_FORMAT_UNKNOWN, swap_chain_flags);
@@ -16467,6 +16557,7 @@ namespace
                {
                   enable_ui_separation = !enable_ui_separation;
 
+#if DX11
                   device_data.ui_texture = nullptr;
                   device_data.ui_texture_rtv = nullptr;
                   device_data.ui_texture_srv = nullptr;
@@ -16482,6 +16573,7 @@ namespace
                         native_device->CreateShaderResourceView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_srv);
                      }
                   }
+#endif // DX11
                }
                if (enable_ui_separation || !shader_hashes_UI.Empty())
                   ImGui::Checkbox(enable_ui_separation ? "Hide Gameplay UI" : "Hide UI", &hide_ui);
@@ -16506,6 +16598,7 @@ namespace
                      const std::unique_lock lock_samplers(s_mutex_samplers);
                      samplers_changed |= ImGui::SliderFloat("Texture Samplers Mip LOD Bias", &device_data.texture_mip_lod_bias_offset, -8.f, +8.f);
                   }
+#if DX11
                   if (samplers_changed)
                   {
                      std::unique_lock lock_samplers(s_mutex_samplers);
@@ -16521,6 +16614,7 @@ namespace
                         samplers_handle.second[device_data.texture_mip_lod_bias_offset] = custom_sampler;
                      }
                   }
+#endif // DX11
                }
 
                ImGui::TreePop();
@@ -16887,9 +16981,11 @@ namespace
 
                ImGui::NewLine();
 
+#if DX11
                ImGui::Text("Upgraded Samplers: ", "");
                text = std::to_string((int)device_data.custom_sampler_by_original_sampler.size());
                ImGui::Text(text.c_str(), "");
+#endif
 #endif // !GRAPHICS_ANALYZER
             }
 
@@ -17023,7 +17119,7 @@ void Init(bool async)
 #if ENABLE_LUMA_TAA
    sr_implementations[SR::Type::LumaTAA] = std::make_unique<LumaTAA::TAA>();
 #endif
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
    Mcp::Start();
 #if ENABLE_SR
    // Games call through these pointers, so the MCP tap sees every settings update and draw
@@ -17305,6 +17401,7 @@ void Init(bool async)
             // Create custom device shaders if the device has already been created before custom shaders were loaded on boot, independently of "block_draw_until_device_custom_shaders_creation".
             // Note that this might be unsafe if "global_devices_data" was already being destroyed in "OnDestroyDevice()" (I'm not sure you can create device resources anymore at that point).
             // TODO: can this even ever happen? Having devices already created/added here? I don't think so... however, "async_shader_compilation_semaphore" below will hang in some games
+#if DX11
             for (auto global_device_data : global_devices_data)
             {
                const std::unique_lock lock_shader_objects(s_mutex_shader_objects);
@@ -17313,6 +17410,7 @@ void Init(bool async)
                   CreateDeviceNativeShaders(*global_device_data, nullptr, false);
                }
             }
+#endif
             thread_auto_compiling_running = false;
          });
       async_shader_compilation_semaphore.acquire();
@@ -17458,6 +17556,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
+#if DX11 // D3D12 only tracks the device, swapchain and command list lifetimes for now
 #if DEVELOPMENT
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreatePipelineStartTimer);
 #endif // DEVELOPMENT
@@ -17542,14 +17641,17 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          reshade::register_event<reshade::addon_event::init_sampler>(OnInitSampler);
          reshade::register_event<reshade::addon_event::destroy_sampler>(OnDestroySampler);
       }
+#endif // DX11
 
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+#if DX11
 #if DEVELOPMENT
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
 #endif // DEVELOPMENT
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
+#endif // DX11
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
 #if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
@@ -17577,7 +17679,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
    case DLL_PROCESS_DETACH:
    {
 #if DEVELOPMENT
+#if DX11
       Mcp::Shutdown();
+#endif
       if (game_window_original_proc && game_window != NULL && IsWindow(game_window))
       {
          SetWindowLongPtr(game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(game_window_original_proc));
@@ -17605,6 +17709,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
+#if DX11
 #if DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreatePipelineStartTimer);
 #endif // DEVELOPMENT
@@ -17676,14 +17781,17 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          reshade::unregister_event<reshade::addon_event::init_sampler>(OnInitSampler);
          reshade::unregister_event<reshade::addon_event::destroy_sampler>(OnDestroySampler);
       }
+#endif // DX11
 
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+#if DX11
 #if DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
 #endif // DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
+#endif // DX11
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
 #if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
@@ -17751,7 +17859,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
             global_device_data->thread_auto_loading.detach();
          }
       }
+#if DX11
       ShaderWarmup::Detach();
+#endif
 
       break;
    }

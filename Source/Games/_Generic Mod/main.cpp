@@ -35,18 +35,18 @@ public:
       luma_data_cbuffer_index = 12;
    }
 
-   void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
+   void OnCreateDevice(NativeDevice* native_device, DeviceData& device_data) override
    {
       device_data.game = new GenericGameDeviceData;
    }
 
-   DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
+   DrawOrDispatchOverrideType OnDrawOrDispatch(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
 
       return DrawOrDispatchOverrideType::None; // Don't cancel the original draw call
    }
-   void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
+   void OnPresent(NativeDevice* native_device, DeviceData& device_data) override
    {
    }
 
@@ -125,7 +125,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          file_name.erase(0, std::string(Globals::MOD_NAME).length() + 1);
          if (file_name.starts_with('_'))
             file_name.erase(0, 1);
-         if (file_name != "Generic" && file_name != "Generic Mod" && file_name != "GenericMod")
+         if (file_name != "Generic" && file_name != "Generic Mod" && file_name != "GenericMod" && file_name != "Generic Mod DX12")
             use_custom_game_name = true;
       }
 
@@ -147,6 +147,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       uint32_t mod_version = 1;
       Globals::SetGlobals(game_name, mod_description.c_str(), "https://github.com/Filoppi/Luma-Framework/", mod_version);
 
+#if DX11 // On D3D12, the upgrades need the display composition and placed resource clones (see "docs/DX12-Support-Plan.md" phases 4 and 5)
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
@@ -175,6 +176,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_upgrade_formats.insert(toggleable_texture_upgrade_formats.begin(), toggleable_texture_upgrade_formats.end());
       texture_upgrade_formats.erase(reshade::api::format::r16g16b16a16_unorm); // This might be more likely to cause damage than not generally, so remove by default
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
+#endif
 
       game = new GenericGame();
    }

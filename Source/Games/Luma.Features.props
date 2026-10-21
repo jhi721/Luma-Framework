@@ -55,6 +55,10 @@
       <!-- MinHook is compiled below. UNICODE as in the feature blocks: this metadata overrides the CharacterSet-derived defines. -->
       <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_MINHOOK=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <!-- Core's graphics API is fixed per project at build time ("DX12" in Core "core.hpp"); D3D11 is the default. -->
+    <ClCompile Condition="'$(LumaGraphicsAPI)'=='D3D12'">
+      <PreprocessorDefinitions>UNICODE;_UNICODE;DX12=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Condition="'$(UseLumaDXP)'=='true'">
       <!-- PreprocessorDefinitions metadata overrides the CharacterSet-derived
            UNICODE defines, so restore them explicitly. -->

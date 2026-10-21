@@ -1042,6 +1042,7 @@ namespace
       return name ? name : "Unknown";
    }
 
+#if DX11
    const char* GetBlendName(D3D11_BLEND blend, bool numerical = false)
    {
       switch (blend)
@@ -1173,4 +1174,5 @@ namespace
       default: return "UNKNOWN";
       }
    }
+#endif // DX11
 }

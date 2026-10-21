@@ -18,7 +18,9 @@
 #include <utility>
 #include <vector>
 
+#if DX11
 #include "managed_resources.h"
+#endif
 #include "patch.hpp"
 #include "debug.h"
 #include "resource_upgrades.hpp"
@@ -47,7 +49,7 @@ enum class DrawOrDispatchOverrideType
 };
 
 // Same signature as "Game::OnDrawOrDispatch()". See "draw_callbacks_by_shader_hashes" and "dispatch_callbacks_by_shader_hashes".
-using DrawOrDispatchCallback = DrawOrDispatchOverrideType(*)(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const Shader::ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func);
+using DrawOrDispatchCallback = DrawOrDispatchOverrideType(*)(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const Shader::ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func);
 
 enum class ShaderReplaceDrawType
 {
@@ -88,6 +90,7 @@ struct DrawDispatchData
    bool indirect = false;
 };
 
+#if DX11 // The frame capture reads D3D11 state
 struct TraceDrawCallData
 {
    TraceDrawCallData()
@@ -275,6 +278,7 @@ struct TraceDrawCallData
 
    const char* custom_name = "Unknown";
 };
+#endif // DX11
 
 // Applies to command lists and command queue (DirectX 11 command list and deferred or immediate contexts, though usually it's for "ID3D11DeviceContext").
 // All runtime states are thread safe as long as they were in the original implementation.
@@ -331,6 +335,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    // Patch variant API (game-facing). Per-context/per-bind state.
    // ============================================================================
 
+#if DX11
    // Switch between original and patched shader for a given hash.
    // "stages" selects which original handle to use (vertex/pixel/compute).
    void UseShaderVariant(ID3D11DeviceContext* native_device_context, uint32_t shader_hash,
@@ -361,6 +366,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       else if ((stages & reshade::api::shader_stage::compute) != 0)
          native_device_context->CSSetShader(reinterpret_cast<ID3D11ComputeShader*>(handle), nullptr, 0);
    }
+#endif // DX11
 
    enum ViewState
    {
@@ -430,6 +436,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       any_upgraded_cs_uavs = std::any_of(cs_uavs_state.begin(), cs_uavs_state.end(), [](auto v) { return v == ViewState::SetAndUpgraded; });
    }
 
+#if DX11
    static void SetConstantBuffers(ID3D11DeviceContext* device_context, reshade::api::shader_stage stages, uint32_t slot, ID3D11Buffer* const buffers, uint32_t num = 1)
    {
       if ((stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
@@ -441,6 +448,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
          device_context->CSSetConstantBuffers(slot, num, &buffers);
    }
+#endif // DX11
 
 #if ENABLE_AUTO_CBUFFER_RESTORATION
    com_ptr<ID3D11Buffer> original_constant_buffers[(uint8_t)Shader::Stage::Count][D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
@@ -500,10 +508,12 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 #endif // ENABLE_AUTO_CBUFFER_RESTORATION
 
 #if DEVELOPMENT
+#if DX11
    std::shared_mutex mutex_trace;
    std::vector<TraceDrawCallData> trace_draw_calls_data;
 
    void AddGraphicsCaptureCustomDrawCall(const char* name, class ID3D11DeviceContext* native_device_context, class ID3D11Resource* resource = nullptr, class ID3D11View* view = nullptr);
+#endif // DX11
 
    bool requires_join = false;
 
@@ -579,10 +589,12 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    Reflex::DeviceData reflex; // For the first swapchain (the only one expected)
 #endif
    std::unordered_set<uint64_t> back_buffers; // From all the swapchains (whether they are upgraded or not)
-   ID3D11Device* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
+   NativeDevice* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
    reshade::api::device* reshade_device = nullptr; // Always valid as it's our parent. Not owned by this.
+#if DX11
    com_ptr<ID3D11DeviceContext> primary_command_list; // The immediate/primary command list is always valid
    CommandListData* primary_command_list_data = nullptr; // The immediate/primary command list is always valid
+#endif
 
    UINT uav_max_count = D3D11_1_UAV_SLOT_COUNT; // DX11.1. Use "D3D11_PS_CS_UAV_REGISTER_COUNT" for DX11.
 
@@ -614,8 +626,10 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::unordered_set<uint64_t> pipelines_to_reload;
    static_assert(sizeof(reshade::api::pipeline::handle) == sizeof(uint64_t));
 
+#if DX11
    // Custom samplers mapped to original ones by texture LOD bias
    std::unordered_map<uint64_t, std::unordered_map<float, com_ptr<ID3D11SamplerState>>> custom_sampler_by_original_sampler;
+#endif
 
 #if ENABLE_SR
    SR::Type sr_type = SR::Type::None; // If active, the SR tech enabled by the user and supported+initialized correctly on this device
@@ -639,6 +653,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    float sr_exposure_texture_value = 1.f;
 #endif // ENABLE_SR
 
+#if DX11 // The D3D12 Luma passes, cbuffers and UI resources are not ported yet (see "docs/DX12-Support-Plan.md")
    // Native Shaders (from "native_shaders_definitions")
    bool created_native_shaders = false;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> native_vertex_shaders;
@@ -662,9 +677,11 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    com_ptr<ID3D11Buffer> luma_global_settings;
    com_ptr<ID3D11Buffer> luma_instance_data;
    com_ptr<ID3D11Buffer> luma_ui_data;
+#endif // DX11
    CB::LumaUIDataPadded cb_luma_ui_data = {};
    std::atomic<bool> cb_luma_global_settings_dirty = true;
 
+#if DX11
    // UI
    com_ptr<ID3D11Texture2D> ui_texture;
    com_ptr<ID3D11RenderTargetView> ui_texture_rtv;
@@ -687,7 +704,8 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::unordered_set<ID3D11Buffer*> cb_per_view_global_buffers;
 #endif
    void* cb_per_view_global_buffer_map_data = nullptr;
-#if DEVELOPMENT
+#endif // DX11
+#if DEVELOPMENT && DX11
    std::shared_ptr<void> debug_draw_frozen_draw_state_stack;
    com_ptr<ID3D11Resource> debug_draw_texture;
    DXGI_FORMAT debug_draw_texture_format = DXGI_FORMAT_UNKNOWN; // The view format, not the texture format
@@ -766,6 +784,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Per game custom data
    GameDeviceData* game = nullptr;
 
+#if DX11
    std::vector<ID3D11Buffer*> GetLumaCBuffers() const
    {
       std::vector<ID3D11Buffer*> buffers;
@@ -779,6 +798,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    }
 
    ManagedResources managed_resources;
+#endif // DX11
 };
 
 // A Luma native shader ("native_*_shaders") by name, null until compiled. Looked up with "find": "operator[]" would insert on a miss,
@@ -804,7 +824,9 @@ struct __declspec(uuid("c5805458-2c02-4ebf-b139-38b85118d971")) SwapchainData
 
    std::unordered_set<uint64_t> back_buffers;
 
+#if DX11
    std::vector<com_ptr<ID3D11RenderTargetView>> display_composition_rtvs;
+#endif
 
    // Whether the original SDR (vanilla) swapchain was linear space (e.g. sRGB formats)
     bool vanilla_was_linear_space = false;
