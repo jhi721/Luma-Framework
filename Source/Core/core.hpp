@@ -5225,6 +5225,24 @@ namespace
       D3D12State::BindRenderTargets(&cmd_list->get_private_data<CommandListData>()->d3d12_state, cmd_list->get_device(), count, rtvs, dsv);
    }
 
+   void OnBindPipelineStates(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::dynamic_state* states, const uint32_t* values)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::BindPipelineStates(&cmd_list->get_private_data<CommandListData>()->d3d12_state, count, states, values);
+   }
+
+   void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      cmd_list->get_private_data<CommandListData>()->d3d12_state.index_buffer = {.buffer = buffer.handle, .offset = offset, .stride = index_size};
+   }
+
+   void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::BindVertexBuffers(&cmd_list->get_private_data<CommandListData>()->d3d12_state, first, count, buffers, offsets, strides);
+   }
+
    bool OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds, reshade::api::render_pass_flags flags)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
@@ -13569,16 +13587,18 @@ namespace
                                        for (size_t i = 0; i < draw_call_data.vertex_buffer_hashes.size(); i++)
                                        {
                                           ImGui::NewLine();
-                                          ImGui::Text("Vertex Buffer %u: %s", i, draw_call_data.vertex_buffer_hashes[i].c_str());
-                                          ImGui::Text("Input Layout %u Format: %s", i, GetFormatNameSafe(draw_call_data.input_layouts_formats[i]));
+                                          ImGui::Text("Vertex Buffer %zu: %s", i, draw_call_data.vertex_buffer_hashes[i].c_str());
+                                          ImGui::Text("Input Layout %zu Format: %s", i, GetFormatNameSafe(draw_call_data.input_layouts_formats[i]));
                                        }
 
                                        ImGui::NewLine();
-                                       ImGui::Text("Input Buffer: %s", draw_call_data.input_layout_hash.c_str());
-                                       ImGui::Text("Input Buffer Format: %s", GetFormatNameSafe(draw_call_data.index_buffer_format));
-                                       ImGui::Text("Input Buffer Offset: %u", draw_call_data.index_buffer_offset);
+                                       ImGui::Text("Index Buffer: %s", draw_call_data.index_buffer_hash.c_str());
+                                       ImGui::Text("Index Buffer Format: %s", GetFormatNameSafe(draw_call_data.index_buffer_format));
+                                       ImGui::Text("Index Buffer Offset: %u", draw_call_data.index_buffer_offset);
 
-                                       ImGui::Text("Input Layout: %s", draw_call_data.index_buffer_hash.c_str());
+#if DX11 // D3D12 input layouts are part of the PSO
+                                       ImGui::Text("Input Layout: %s", draw_call_data.input_layout_hash.c_str());
+#endif
                                        is_first_draw = false;
                                     }
 
@@ -14457,12 +14477,21 @@ namespace
                                              ImGui::Text("CB Index: %u", i);
 #endif
                                              ImGui::Text("CB Hash: %s", draw_call_data.cb_hash[i].c_str());
+#if DX12 // A CBV is a range of any buffer, root CBVs have no size
+                                             if (draw_call_data.cb_root_constants[i].empty())
+                                             {
+                                                ImGui::Text("CB Offset: %u bytes", draw_call_data.cb_first_constant[i] * 16);
+                                                if (draw_call_data.cb_num_constants[i] != 0)
+                                                   ImGui::Text("CB Size: %u bytes", draw_call_data.cb_num_constants[i] * 16);
+                                             }
+#else
                                              if (draw_call_data.cb_num_constants[i] != 0)
                                              {
                                                 const bool is_partial = draw_call_data.cb_first_constant[i] != 0 || draw_call_data.cb_num_constants[i] != D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT;
                                                 ImGui::Text("CB First Constant: %u%s", draw_call_data.cb_first_constant[i], is_partial ? " (partial)" : "");
                                                 ImGui::Text("CB Num Constants: %u", draw_call_data.cb_num_constants[i]);
                                              }
+#endif
                                              const bool is_highlighted_resource = highlighted_resource == draw_call_data.cb_hash[i];
                                              if (is_highlighted_resource ? ImGui::Button("Unhighlight Resource") : ImGui::Button("Highlight Resource"))
                                              {
@@ -17877,6 +17906,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::register_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
+      reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
@@ -18052,6 +18084,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
+      reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::draw>(OnDraw);

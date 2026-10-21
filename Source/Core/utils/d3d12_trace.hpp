@@ -343,6 +343,26 @@ namespace D3D12Trace
       // Render targets and the depth stencil as they were bound, CPU descriptors are read at that time
       if (!is_dispatch)
       {
+         trace_draw_call_data.primitive_topology = D3D_PRIMITIVE_TOPOLOGY(state.primitive_topology); // ReShade keeps the D3D values
+         auto BufferHash = [](uint64_t buffer)
+         { return std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(buffer))); };
+         trace_draw_call_data.index_buffer_hash = BufferHash(state.index_buffer.buffer);
+         trace_draw_call_data.index_buffer_format = (state.index_buffer.stride == 2) ? DXGI_FORMAT_R16_UINT : ((state.index_buffer.stride == 4) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_UNKNOWN);
+         trace_draw_call_data.index_buffer_offset = UINT(state.index_buffer.offset);
+         // Like the D3D11 capture, one entry per input element, with the vertex buffer bound to its slot
+         for (uint32_t i = 0; pipeline && i < pipeline->subobject_count; i++)
+         {
+            if (pipeline->subobjects_cache[i].type != reshade::api::pipeline_subobject_type::input_layout)
+               continue;
+            const auto* elements = static_cast<const reshade::api::input_element*>(pipeline->subobjects_cache[i].data);
+            for (uint32_t j = 0; j < pipeline->subobjects_cache[i].count; j++)
+            {
+               const uint32_t slot = elements[j].buffer_binding;
+               trace_draw_call_data.input_layouts_formats.push_back(DXGI_FORMAT(elements[j].format));
+               trace_draw_call_data.vertex_buffer_hashes.push_back(BufferHash((slot < state.vertex_buffers.size()) ? state.vertex_buffers[slot].buffer : 0));
+            }
+         }
+
          for (size_t i = 0; i < state.render_targets.size() && i < TraceDrawCallData::rtvs_size; i++)
          {
             if (state.render_targets[i].handle == 0)

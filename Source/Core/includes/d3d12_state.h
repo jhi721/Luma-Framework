@@ -104,11 +104,22 @@ namespace D3D12State
       return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (desc.type != reshade::api::resource_view_type::buffer) ? desc.texture.first_level : 0};
    }
 
+   // A bound index or vertex buffer: ReShade resolves their GPU virtual address to the buffer
+   struct BufferBinding
+   {
+      uint64_t buffer = 0;
+      uint64_t offset = 0;
+      uint32_t stride = 0; // The index size for index buffers
+   };
+
    struct CommandListState
    {
       reshade::api::pipeline pipeline = {};
       RootState graphics;
       RootState compute;
+      reshade::api::primitive_topology primitive_topology = reshade::api::primitive_topology::undefined;
+      BufferBinding index_buffer;
+      std::vector<BufferBinding> vertex_buffers; // By slot
       std::vector<reshade::api::resource_view> render_targets;
       std::vector<ViewInfo> render_target_views;
       reshade::api::resource_view depth_stencil = {};
@@ -189,6 +200,30 @@ namespace D3D12State
             RootBinding* binding = GetRootBinding(root, layout, param);
             binding->constants.resize((std::max)(binding->constants.size(), size_t(first) + count));
             std::memcpy(binding->constants.data() + first, values, count * sizeof(uint32_t)); });
+   }
+
+   // "IASetPrimitiveTopology()" arrives as a dynamic state
+   void BindPipelineStates(CommandListState* state, uint32_t count, const reshade::api::dynamic_state* states, const uint32_t* values)
+   {
+      for (uint32_t i = 0; i < count; i++)
+      {
+         if (states[i] == reshade::api::dynamic_state::primitive_topology)
+         {
+            state->primitive_topology = static_cast<reshade::api::primitive_topology>(values[i]);
+         }
+      }
+   }
+
+   void BindVertexBuffers(CommandListState* state, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
+   {
+      if (state->vertex_buffers.size() < size_t(first) + count)
+      {
+         state->vertex_buffers.resize(size_t(first) + count);
+      }
+      for (uint32_t i = 0; i < count; i++)
+      {
+         state->vertex_buffers[first + i] = {.buffer = buffers[i].handle, .offset = offsets[i], .stride = strides[i]};
+      }
    }
 
    void BindRenderTargets(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
