@@ -3188,7 +3188,6 @@ namespace
       }
 #endif
 
-#if DX11 // No pipelines are cached in D3D12 yet
       // It can apparently happen that in DX11 the device destructor callback is sent before its pipelines, so make sure we empty the memory before.
       // Note: ReShade has fixed this bug now, but as of 6.6 it simply skips ever calling the destroy event for these.
       {
@@ -3204,7 +3203,6 @@ namespace
             OnDestroyPipeline(device, reshade::api::pipeline{ pipeline_pair.first });
          }
       }
-#endif // DX11
 
       {
          const std::unique_lock lock(s_mutex_device);
@@ -3797,6 +3795,33 @@ namespace
 #endif // DX11
       }
 
+#if DX12 && DEVELOPMENT // While the game objects are still alive, unlike at device destruction
+      if (!resize)
+      {
+         const std::shared_lock lock_layouts(device_data.pipeline_layouts.mutex);
+         const std::shared_lock lock_heaps(device_data.descriptor_heaps.mutex);
+         size_t views = 0;
+         size_t constant_buffers = 0;
+         for (const auto& [heap, heap_descriptors] : device_data.descriptor_heaps.descriptors_by_heap)
+         {
+            for (const D3D12State::Descriptor& descriptor : heap_descriptors)
+            {
+               if (descriptor.handle == 0)
+                  continue;
+               if (descriptor.type == reshade::api::descriptor_type::constant_buffer)
+               {
+                  constant_buffers++;
+               }
+               else
+               {
+                  views++;
+               }
+            }
+         }
+         reshade::log::message(reshade::log::level::info, std::format("Destroying the D3D12 swapchain: {} root signatures alive, {} descriptor heaps tracked ({} views and samplers, {} constant buffers), {} pipelines cached",
+            device_data.pipeline_layouts.parameters_by_layout.size(), device_data.descriptor_heaps.descriptors_by_heap.size(), views, constant_buffers, device_data.pipeline_cache_by_pipeline_handle.size()).c_str());
+      }
+#endif
       swapchain->destroy_private_data<SwapchainData>();
    }
 
@@ -3878,8 +3903,7 @@ namespace
       return prevent_fullscreen_state;
    }
 
-#if DX11 // Pipeline tracking, shader replacement and Luma cbuffers aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 2 and 3)
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
    // "Perf::ShaderCreates": registered before "OnCreatePipeline", so the time includes Luma's work on the bytecode
    thread_local std::chrono::steady_clock::time_point shader_create_start = {};
    bool OnCreatePipelineStartTimer(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects)
@@ -3894,7 +3918,7 @@ namespace
 // patch is applied to the shader description so D3D compiles the patched shader
 // directly (no pipeline clone, zero latency). In CLONE mode this function is
 // not compiled and sync providers run in OnInitPipeline instead.
-#if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
+#if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE && DX11 // D3D12 patching is "docs/DX12-Support-Plan.md" phase 2
    bool OnCreatePipeline(
       reshade::api::device* device,
       reshade::api::pipeline_layout layout,
@@ -4222,7 +4246,7 @@ namespace
          const auto& subobject = subobjects[i];
          switch (subobject.type)
          {
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
          case reshade::api::pipeline_subobject_type::input_layout:
          {
             DeviceData& device_data = *device->get_private_data<DeviceData>();
@@ -4272,7 +4296,7 @@ namespace
             ASSERT_ONCE(subobject_count == 1 || subobject_count == 2); // input layouts have two subobjects (input layout and vertex shader)
 #endif
             ASSERT_ONCE(subobject.count == 1);
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
             if (shader_create_start != std::chrono::steady_clock::time_point{})
             {
                Perf::g_shader_creates.AddGame(std::chrono::steady_clock::now() - std::exchange(shader_create_start, {}));
@@ -4321,7 +4345,11 @@ namespace
          }
          default:
          {
+#if DX12 // Graphics PSOs also carry their states, input layout and render target formats
+            break;
+#else
             return; // Nothing to do here, we don't want to clone the pipeline
+#endif
          }
          }
       }
@@ -4542,6 +4570,12 @@ namespace
                   }
 #endif // DEVELOPMENT && LUMA_PATCH_PROVIDERS != 0
 
+#if DX12 // D3D11 reflections can't read DXIL or SM5.1, and disassembling every shader just for its model would be slow
+                  if (cached_shader->type_and_version.empty())
+                  {
+                     cached_shader->type_and_version = Shader::GetShaderTypeAndVersion(cached_shader->data, cached_shader->size);
+                  }
+#endif
                   // Try with native DX11 reflections first, they are much faster than disassembly
                   if (!found_reflections)
                   {
@@ -4976,6 +5010,7 @@ namespace
       }
 #endif // CLONE sync mode
 
+#if DX11 // D3D12 clones would never be bound until "docs/DX12-Support-Plan.md" phase 2
       // Automatically load any custom shaders that might have been bound to this pipeline.
       // To avoid this slowing down everything, we only do it if we detect the user already had a matching shader in its custom shaders folder.
       if (auto_load && !last_pressed_unload && found_custom_shader_file)
@@ -4995,6 +5030,7 @@ namespace
          LoadCustomShaders(device_data, { pipeline.handle }, !precompile_custom_shaders);
 #endif
       }
+#endif // DX11
 
 #if LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_ASYNC | LUMA_PATCH_PROVIDER_RECIPE_ASYNC)
       // Patches are automatic: queueing must not depend on the "Auto Load
@@ -5083,7 +5119,7 @@ namespace
             pipeline_cache_generation++;
          }
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
          {
             // Note: this is optional, we don't need to remove them because they are "read only", with no strong references
             const std::unique_lock lock_device(device_data.mutex);
@@ -5102,6 +5138,76 @@ namespace
       }
    }
 
+#if DX12 && DEVELOPMENT // State tracking for the frame capture (later also the Luma cbuffers injection, "docs/DX12-Support-Plan.md" phase 3)
+   void OnInitPipelineLayout(reshade::api::device* device, uint32_t param_count, const reshade::api::pipeline_layout_param* params, reshade::api::pipeline_layout layout)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+      D3D12State::AddPipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout, param_count, params);
+   }
+
+   void OnDestroyPipelineLayout(reshade::api::device* device, reshade::api::pipeline_layout layout)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+      D3D12State::RemovePipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout);
+   }
+
+   bool OnUpdateDescriptorTables(reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_update* updates)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
+      D3D12State::UpdateDescriptors(&device->get_private_data<DeviceData>()->descriptor_heaps, device, count, updates);
+      return false;
+   }
+
+   bool OnCopyDescriptorTables(reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_copy* copies)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
+      D3D12State::CopyDescriptors(&device->get_private_data<DeviceData>()->descriptor_heaps, device, count, copies);
+      return false;
+   }
+
+   // Command lists are recorded by one thread at a time, so their state needs no lock
+   void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      if (stages != reshade::api::pipeline_stage::all_ray_tracing)
+      {
+         cmd_list->get_private_data<CommandListData>()->d3d12_state.pipeline = pipeline;
+      }
+   }
+
+   void OnBindDescriptorTables(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table* tables, uint32_t dynamic_offset_count, const uint32_t* dynamic_offsets)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::BindDescriptorTables(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, first, count, tables);
+   }
+
+   void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::PushDescriptors(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, layout_param, update);
+   }
+
+   void OnPushConstants(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, uint32_t first, uint32_t count, const void* values)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::PushConstants(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, layout_param, first, count, values);
+   }
+
+   void OnBindRenderTargetsAndDepthStencil(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::BindRenderTargets(&cmd_list->get_private_data<CommandListData>()->d3d12_state, count, rtvs, dsv);
+   }
+
+   bool OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds, reshade::api::render_pass_flags flags)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      D3D12State::BeginRenderPass(&cmd_list->get_private_data<CommandListData>()->d3d12_state, count, rts, ds);
+      return false;
+   }
+#endif // DX12 && DEVELOPMENT
+
+#if DX11 // Pipeline binding, shader replacement and Luma cbuffers aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 2 and 3)
    void OnBindPipeline(
       reshade::api::command_list* cmd_list,
       reshade::api::pipeline_stage stages,
@@ -5922,7 +6028,9 @@ namespace
 
       cmd_list_data.temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 
-#if DX11
+#if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state
+      cmd_list_data.d3d12_state = {};
+#else
       const auto lock_trace = LockTraceIfRunning();
       if (lock_trace && trace_running)
       {
@@ -17556,15 +17664,29 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
-#if DX11 // D3D12 only tracks the device, swapchain and command list lifetimes for now
+#if DX11 // D3D12 only tracks lifetimes and pipelines for now
 #if DEVELOPMENT
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreatePipelineStartTimer);
 #endif // DEVELOPMENT
 #if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
 #endif
+#endif // DX11
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+#if DX12 && DEVELOPMENT
+      reshade::register_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
+      reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
+      reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
+      reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+#endif
+#if DX11
 
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
 
@@ -17716,8 +17838,22 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
       reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
 #endif
+#endif // DX11
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+#if DX12 && DEVELOPMENT
+      reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
+      reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+#endif
+#if DX11
 
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
 

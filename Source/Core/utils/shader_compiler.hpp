@@ -4,6 +4,7 @@
 #include <d3dcompiler.h>
 #include <dxcapi.h>
 
+#include <format>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -75,6 +76,50 @@ namespace Shader
 
       uint8_t byte_code[];
    };
+
+   // The program chunk of a shader container: "SHDR"/"SHEX" (DXBC, SM4-5.1) or "DXIL" (SM6). Both start with the same version token
+   // (the DXIL program header is laid out like "DXBCByteCodeChunk", with the same program type numbers up to compute shaders).
+   const DXBCByteCodeChunk* FindProgramChunk(const void* code, size_t size, bool* is_dxil = nullptr)
+   {
+      const auto* header = static_cast<const DXBCHeader*>(code);
+      if (code == nullptr || size < sizeof(DXBCHeader) || memcmp(header->format_name, "DXBC", 4) != 0 || header->file_size != size)
+         return nullptr;
+      for (uint32_t i = 0; i < header->chunk_count; i++)
+      {
+         const uint32_t offset = header->chunk_offsets[i];
+         if (size_t(offset) + sizeof(DXBCChunk) + sizeof(DXBCByteCodeChunk) > size)
+            return nullptr;
+         const auto* chunk = reinterpret_cast<const DXBCChunk*>(static_cast<const uint8_t*>(code) + offset);
+         const bool dxil = memcmp(&chunk->type_name, "DXIL", 4) == 0;
+         if (dxil || memcmp(&chunk->type_name, "SHEX", 4) == 0 || memcmp(&chunk->type_name, "SHDR", 4) == 0)
+         {
+            if (is_dxil)
+               *is_dxil = dxil;
+            return reinterpret_cast<const DXBCByteCodeChunk*>(chunk->chunk_data);
+         }
+      }
+      return nullptr;
+   }
+
+   // E.g. "ps_5_1" or "cs_6_6", empty if the container has no (known) program
+   std::string GetShaderTypeAndVersion(const void* code, size_t size)
+   {
+      const DXBCByteCodeChunk* program = FindProgramChunk(code, size);
+      if (!program)
+         return {};
+      const char* type = nullptr;
+      switch (program->program_type)
+      {
+      case DXBCProgramType::PixelShader: type = "ps"; break;
+      case DXBCProgramType::VertexShader: type = "vs"; break;
+      case DXBCProgramType::GeometryShader: type = "gs"; break;
+      case DXBCProgramType::HullShader: type = "hs"; break;
+      case DXBCProgramType::DomainShader: type = "ds"; break;
+      case DXBCProgramType::ComputeShader: type = "cs"; break;
+      default: return {};
+      }
+      return std::format("{}_{}_{}", type, program->version_major_and_minor >> 4, program->version_major_and_minor & 0xF);
+   }
 
    // Only call this once from one thread
    // Needs to be called before calling any shader compiler function
@@ -416,11 +461,9 @@ namespace Shader
 
    std::optional<std::string> DisassembleShader(const void* code, size_t size)
    {
-#if DX12
-      return DisassembleShaderDXC(code, size);
-#else
-      return DisassembleShaderFXC(code, size);
-#endif
+      bool is_dxil = false;
+      FindProgramChunk(code, size, &is_dxil);
+      return is_dxil ? DisassembleShaderDXC(code, size) : DisassembleShaderFXC(code, size);
    }
 
    void FillDefines(const std::vector<std::string>& in_defines, std::vector<D3D_SHADER_MACRO>& out_defines)

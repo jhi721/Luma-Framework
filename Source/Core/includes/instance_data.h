@@ -20,6 +20,8 @@
 
 #if DX11
 #include "managed_resources.h"
+#else
+#include "d3d12_state.h"
 #endif
 #include "patch.hpp"
 #include "debug.h"
@@ -522,6 +524,10 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 
    ShaderCustomDepthStencilType temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 #endif
+
+#if DX12 && DEVELOPMENT // For the frame capture, for now
+   D3D12State::CommandListState d3d12_state;
+#endif
 };
 
 struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
@@ -625,6 +631,11 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 
    std::unordered_set<uint64_t> pipelines_to_reload;
    static_assert(sizeof(reshade::api::pipeline::handle) == sizeof(uint64_t));
+
+#if DX12 && DEVELOPMENT // For the frame capture, for now
+   D3D12State::PipelineLayouts pipeline_layouts;
+   D3D12State::DescriptorHeaps descriptor_heaps;
+#endif
 
 #if DX11
    // Custom samplers mapped to original ones by texture LOD bias
