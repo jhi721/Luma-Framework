@@ -87,13 +87,32 @@ namespace D3D12State
       std::vector<RootBinding> bindings; // By root parameter index
    };
 
+   // What a view descriptor held when it was written or bound. D3D12 copies descriptors by value and reads CPU descriptors (render
+   // targets) when they are bound, while ReShade's view handles are descriptor addresses, which games rewrite right after.
+   struct ViewInfo
+   {
+      uint64_t resource = 0; // Null for a null descriptor
+      reshade::api::format format = reshade::api::format::unknown;
+      uint32_t first_level = 0;
+   };
+
+   ViewInfo GetViewInfo(reshade::api::device* device, reshade::api::resource_view view)
+   {
+      if (view.handle == 0)
+         return {};
+      const reshade::api::resource_view_desc desc = device->get_resource_view_desc(view);
+      return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (desc.type != reshade::api::resource_view_type::buffer) ? desc.texture.first_level : 0};
+   }
+
    struct CommandListState
    {
       reshade::api::pipeline pipeline = {};
       RootState graphics;
       RootState compute;
       std::vector<reshade::api::resource_view> render_targets;
+      std::vector<ViewInfo> render_target_views;
       reshade::api::resource_view depth_stencil = {};
+      ViewInfo depth_stencil_view;
    };
 
    // Setting a different root signature invalidates all root arguments, setting the same one keeps them
@@ -172,20 +191,29 @@ namespace D3D12State
             std::memcpy(binding->constants.data() + first, values, count * sizeof(uint32_t)); });
    }
 
-   void BindRenderTargets(CommandListState* state, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
+   void BindRenderTargets(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
    {
       state->render_targets.assign(rtvs, rtvs + count);
+      state->render_target_views.resize(count);
+      for (uint32_t i = 0; i < count; i++)
+      {
+         state->render_target_views[i] = GetViewInfo(device, rtvs[i]);
+      }
       state->depth_stencil = dsv;
+      state->depth_stencil_view = GetViewInfo(device, dsv);
    }
 
-   void BeginRenderPass(CommandListState* state, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds)
+   void BeginRenderPass(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds)
    {
       state->render_targets.resize(count);
+      state->render_target_views.resize(count);
       for (uint32_t i = 0; i < count; i++)
       {
          state->render_targets[i] = rts[i].view;
+         state->render_target_views[i] = GetViewInfo(device, rts[i].view);
       }
       state->depth_stencil = ds ? ds->view : reshade::api::resource_view{};
+      state->depth_stencil_view = GetViewInfo(device, state->depth_stencil);
    }
 
    // What a game wrote into a descriptor heap slot
@@ -195,6 +223,7 @@ namespace D3D12State
       uint64_t handle = 0; // The view or sampler, or the buffer of a constant buffer view
       uint64_t offset = 0; // Constant buffer view range in its buffer
       uint64_t size = 0;
+      ViewInfo view; // Views only, resolved when written as the copies of a descriptor outlive what its address holds next
    };
 
    // By heap (CPU only and shader visible ones), indexed by descriptor
@@ -258,9 +287,14 @@ namespace D3D12State
             }
             case reshade::api::descriptor_type::sampler_with_resource_view:
                descriptor.handle = static_cast<const reshade::api::sampler_with_resource_view*>(update.descriptors)[j].view.handle;
+               descriptor.view = GetViewInfo(device, {descriptor.handle});
                break;
-            default: // Samplers and views are all a single handle
+            case reshade::api::descriptor_type::sampler:
                descriptor.handle = static_cast<const uint64_t*>(update.descriptors)[j];
+               break;
+            default: // Views are a single handle
+               descriptor.handle = static_cast<const uint64_t*>(update.descriptors)[j];
+               descriptor.view = GetViewInfo(device, {descriptor.handle});
                break;
             }
          }

@@ -260,6 +260,16 @@ struct TraceDrawCallData
    ShaderRegister cb_register[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
    std::vector<uint32_t> cb_root_constants[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]; // The values of root constants (they have no "cb_hash")
    bool uses_descriptor_heap = false; // A shader indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices usually are in the constants
+   // The table descriptors of the entries above, read when the command list executes: until it's submitted, games can still write
+   // them (root signature 1.0 and "DESCRIPTORS_VOLATILE" ranges)
+   struct TableDescriptor
+   {
+      reshade::api::descriptor_table table = {};
+      uint32_t binding = 0; // Offset from the table start
+      char type = 0;        // 't', 'u' or 'b'
+      uint32_t index = 0;   // In the packed SRV, UAV or constant buffer entries
+   };
+   std::vector<TableDescriptor> table_descriptors;
 #endif
 
 #if DX11

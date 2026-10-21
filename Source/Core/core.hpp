@@ -5221,13 +5221,13 @@ namespace
    void OnBindRenderTargetsAndDepthStencil(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
-      D3D12State::BindRenderTargets(&cmd_list->get_private_data<CommandListData>()->d3d12_state, count, rtvs, dsv);
+      D3D12State::BindRenderTargets(&cmd_list->get_private_data<CommandListData>()->d3d12_state, cmd_list->get_device(), count, rtvs, dsv);
    }
 
    bool OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds, reshade::api::render_pass_flags flags)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      D3D12State::BeginRenderPass(&cmd_list->get_private_data<CommandListData>()->d3d12_state, count, rts, ds);
+      D3D12State::BeginRenderPass(&cmd_list->get_private_data<CommandListData>()->d3d12_state, cmd_list->get_device(), count, rts, ds);
       return false;
    }
 
@@ -5288,7 +5288,9 @@ namespace
       return false;
    }
 
-   // "ExecuteIndirect()" comes as "indirect_command::unknown", the bound pipeline tells draws and dispatches apart
+   // "ExecuteIndirect()" comes as "indirect_command::unknown", the bound pipeline tells draws and dispatches apart. Its command signature
+   // can also set root constants and root views per command (and resets them after), ReShade doesn't pass it: these entries show
+   // the command list's bindings.
    bool OnDrawOrDispatchIndirect(reshade::api::command_list* cmd_list, reshade::api::indirect_command type, reshade::api::resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
@@ -5303,11 +5305,13 @@ namespace
       const auto lock_trace = LockTraceIfRunning();
       if (!cmd_list_data || !lock_trace || !trace_running)
          return;
-      CommandListData& trace_cmd_list_data = cmd_list->get_device()->get_private_data<DeviceData>()->trace_command_list_data;
+      DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+      CommandListData& trace_cmd_list_data = device_data.trace_command_list_data;
       const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
       const std::unique_lock lock_trace_3(cmd_list_data->mutex_trace);
       // ponytail: moved, so a list executed again without a reset is only captured once
       auto& entries = cmd_list_data->trace_draw_calls_data;
+      D3D12Trace::ResolveTableDescriptors(&entries, &device_data);
       trace_cmd_list_data.trace_draw_calls_data.insert(trace_cmd_list_data.trace_draw_calls_data.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
       entries.clear();
    }

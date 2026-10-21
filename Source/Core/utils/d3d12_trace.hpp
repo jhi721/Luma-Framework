@@ -79,7 +79,8 @@ namespace D3D12Trace
 {
    // Reads the "Resource Bindings" table that both the FXC and the DXC disassemblies print, e.g. "// source  texture  float4  2d  T0
    // t0,space1  1". FXC prints none for shaders that bind nothing, and neither does it for stripped reflections, so DXBC falls back on its
-   // "dcl_*" declarations. False if the bindings are unknown (e.g. DXIL with stripped reflections).
+   // "dcl_*" declarations. DXC prints it from the DXIL module's metadata when the reflection part is stripped, so false means
+   // the disassembly failed.
    bool ParseResourceBindings(CachedShader* shader)
    {
       const bool is_dxbc = shader->type_and_version.size() > 3 && shader->type_and_version[3] < '6';
@@ -212,7 +213,83 @@ namespace D3D12Trace
       return false;
    }
 
-   // Expects "s_mutex_generic" (shared), "s_mutex_dumping" and the command list's "mutex_trace" to be locked
+   // Fills the capture's 't' (SRV), 'u' (UAV), 'r' (render target) or 'd' (depth stencil) entry at "index". Root SRVs and UAVs have no
+   // descriptor, only the buffer in "info"; a descriptor without a resource is a null one (or a slot never written), shown as
+   // referenced but not bound.
+   void FillView(reshade::api::device* device, TraceDrawCallData* entry, char type, uint32_t index, bool is_descriptor, uint64_t view, const D3D12State::ViewInfo& info)
+   {
+      uint4 ds_size = {};
+      uint3 dsv_size = {};
+      UINT dsv_mip = 0;
+      DXGI_FORMAT* view_format = &entry->dsv_format;
+      DXGI_FORMAT* format = &entry->ds_format;
+      uint4* size = &ds_size;
+      uint3* view_size = &dsv_size;
+      UINT* view_mip = &dsv_mip;
+      std::string* type_name = nullptr;
+      std::string* hash = &entry->ds_hash;
+      std::string* debug_name = &entry->ds_debug_name;
+      bool* render_target_flag = nullptr;
+      bool* unordered_access_flag = nullptr;
+      switch (type)
+      {
+      case 't':
+         entry->srvs[index] = view;
+         view_format = &entry->srv_format[index], format = &entry->sr_format[index], size = &entry->sr_size[index], view_size = &entry->srv_size[index], view_mip = &entry->srv_mip[index];
+         type_name = &entry->sr_type_name[index], hash = &entry->sr_hash[index], debug_name = &entry->sr_debug_name[index];
+         render_target_flag = &entry->sr_is_rt[index], unordered_access_flag = &entry->sr_is_ua[index];
+         break;
+      case 'u':
+         entry->uavs[index] = view;
+         view_format = &entry->uav_format[index], format = &entry->ua_format[index], size = &entry->ua_size[index], view_size = &entry->uav_size[index], view_mip = &entry->uav_mip[index];
+         type_name = &entry->ua_type_name[index], hash = &entry->ua_hash[index], debug_name = &entry->ua_debug_name[index];
+         render_target_flag = &entry->ua_is_rt[index];
+         break;
+      case 'r':
+         entry->rtvs[index] = view;
+         view_format = &entry->rtv_format[index], format = &entry->rt_format[index], size = &entry->rt_size[index], view_size = &entry->rtv_size[index], view_mip = &entry->rtv_mip[index];
+         type_name = &entry->rt_type_name[index], hash = &entry->rt_hash[index], debug_name = &entry->rt_debug_name[index];
+         break;
+      }
+      if (is_descriptor)
+      {
+         *view_format = (info.resource != 0) ? DXGI_FORMAT(info.format) : DXGI_FORMAT(-1);
+         *view_mip = info.first_level;
+      }
+      GetResourceInfo(device, {info.resource}, *size, *format, type_name, hash, debug_name, render_target_flag, unordered_access_flag); // D3D12 views are descriptors, they have no names
+      const bool is_3d = type_name && *type_name == "Texture 3D";
+      *view_size = uint3{(std::max)(size->x >> *view_mip, size->x ? 1u : 0u), (std::max)(size->y >> *view_mip, size->y ? 1u : 0u), is_3d ? (std::max)(size->z >> *view_mip, 1u) : size->z};
+      if (type == 'd')
+         entry->ds_size = uint2{ds_size.x, ds_size.y};
+   }
+
+   // Reads the table descriptors of a command list's entries ("TraceDrawCallData::table_descriptors"), at its execution
+   void ResolveTableDescriptors(std::vector<TraceDrawCallData>* entries, DeviceData* device_data)
+   {
+      reshade::api::device* device = device_data->reshade_device;
+      const std::shared_lock lock_heaps(device_data->descriptor_heaps.mutex);
+      for (TraceDrawCallData& entry : *entries)
+      {
+         for (const TraceDrawCallData::TableDescriptor& table_descriptor : entry.table_descriptors)
+         {
+            const D3D12State::Descriptor* descriptor = D3D12State::FindDescriptor(device_data->descriptor_heaps, device, table_descriptor.table, table_descriptor.binding);
+            if (table_descriptor.type != 'b')
+            {
+               FillView(device, &entry, table_descriptor.type, table_descriptor.index, true, descriptor ? descriptor->handle : 0, descriptor ? descriptor->view : D3D12State::ViewInfo{});
+            }
+            else if (descriptor && descriptor->handle != 0)
+            {
+               entry.cb_hash[table_descriptor.index] = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(descriptor->handle)));
+               entry.cb_first_constant[table_descriptor.index] = UINT(descriptor->offset / 16);
+               entry.cb_num_constants[table_descriptor.index] = UINT((descriptor->size + 15) / 16);
+            }
+         }
+         entry.table_descriptors.clear();
+      }
+   }
+
+   // Expects "s_mutex_generic" (shared), "s_mutex_dumping" and the command list's "mutex_trace" to be locked. The table descriptors are
+   // read later, by "ResolveTableDescriptors()".
    void AddTraceDrawCallData(std::vector<TraceDrawCallData>* trace_draw_calls_data, DeviceData* device_data, const reshade::api::command_list* cmd_list, const D3D12State::CommandListState& state,
       std::unordered_map<uint32_t, CachedShader*>& shader_cache, const DrawDispatchData& draw_dispatch_data)
    {
@@ -263,39 +340,20 @@ namespace D3D12Trace
                                              { return binding.type == type && binding.space == shader_register.space && shader_register.index >= binding.index && shader_register.index - binding.index < binding.count; });
       };
 
-      auto AddView = [&](reshade::api::resource_view view, reshade::api::resource resource, DXGI_FORMAT* view_format, DXGI_FORMAT* format, uint4* size, uint3* view_size, UINT* view_mip, std::string* type_name, std::string* hash, std::string* debug_name, bool* render_target_flag = nullptr, bool* unordered_access_flag = nullptr)
-      {
-         if (view.handle != 0)
-         {
-            resource = device->get_resource_from_view(view);
-            const reshade::api::resource_view_desc view_desc = device->get_resource_view_desc(view);
-            *view_format = DXGI_FORMAT(view_desc.format);
-            *view_mip = (view_desc.type != reshade::api::resource_view_type::buffer) ? view_desc.texture.first_level : 0;
-         }
-         GetResourceInfo(device, resource, *size, *format, type_name, hash, debug_name, render_target_flag, unordered_access_flag); // D3D12 views are descriptors, they have no names
-         const bool is_3d = type_name && *type_name == "Texture 3D";
-         *view_size = uint3{(std::max)(size->x >> *view_mip, size->x ? 1u : 0u), (std::max)(size->y >> *view_mip, size->y ? 1u : 0u), is_3d ? (std::max)(size->z >> *view_mip, 1u) : size->z};
-      };
-
+      // Render targets and the depth stencil as they were bound, CPU descriptors are read at that time
       if (!is_dispatch)
       {
          for (size_t i = 0; i < state.render_targets.size() && i < TraceDrawCallData::rtvs_size; i++)
          {
-            const reshade::api::resource_view rtv = state.render_targets[i];
-            if (rtv.handle == 0)
+            if (state.render_targets[i].handle == 0)
                continue;
-            trace_draw_call_data.rtvs[i] = rtv.handle;
-            AddView(rtv, {}, &trace_draw_call_data.rtv_format[i], &trace_draw_call_data.rt_format[i], &trace_draw_call_data.rt_size[i], &trace_draw_call_data.rtv_size[i], &trace_draw_call_data.rtv_mip[i], &trace_draw_call_data.rt_type_name[i], &trace_draw_call_data.rt_hash[i], &trace_draw_call_data.rt_debug_name[i]);
-            trace_draw_call_data.rt_is_swapchain[i] = device_data->back_buffers.contains(device->get_resource_from_view(rtv).handle);
+            FillView(device, &trace_draw_call_data, 'r', uint32_t(i), true, state.render_targets[i].handle, state.render_target_views[i]);
+            trace_draw_call_data.rt_is_swapchain[i] = device_data->back_buffers.contains(state.render_target_views[i].resource);
          }
 
          if (state.depth_stencil.handle != 0)
          {
-            uint4 ds_size = {};
-            uint3 dsv_size = {};
-            UINT dsv_mip = 0;
-            AddView(state.depth_stencil, {}, &trace_draw_call_data.dsv_format, &trace_draw_call_data.ds_format, &ds_size, &dsv_size, &dsv_mip, nullptr, &trace_draw_call_data.ds_hash, &trace_draw_call_data.ds_debug_name);
-            trace_draw_call_data.ds_size = uint2{ds_size.x, ds_size.y};
+            FillView(device, &trace_draw_call_data, 'd', 0, true, state.depth_stencil.handle, state.depth_stencil_view);
 
             // The D3D12 defaults if the PSO had no depth stencil state (depth test and write, no stencil)
             reshade::api::depth_stencil_desc desc = {};
@@ -328,44 +386,23 @@ namespace D3D12Trace
          }
       }
 
-      auto AddShaderResourceView = [&](const TraceDrawCallData::ShaderRegister& shader_register, reshade::api::resource_view view, reshade::api::resource resource)
+      // The next packed SRV, UAV or constant buffer entry, UINT32_MAX if they are all taken
+      auto AddEntry = [&](char type, const TraceDrawCallData::ShaderRegister& shader_register) -> uint32_t
       {
-         const uint32_t i = trace_draw_call_data.srv_count;
-         ASSERT_ONCE(i < TraceDrawCallData::srvs_size);
-         if (i >= TraceDrawCallData::srvs_size)
-            return;
-         trace_draw_call_data.srv_count++;
-         trace_draw_call_data.sr_register[i] = shader_register;
-         trace_draw_call_data.srvs[i] = view.handle;
-         AddView(view, resource, &trace_draw_call_data.srv_format[i], &trace_draw_call_data.sr_format[i], &trace_draw_call_data.sr_size[i], &trace_draw_call_data.srv_size[i], &trace_draw_call_data.srv_mip[i], &trace_draw_call_data.sr_type_name[i], &trace_draw_call_data.sr_hash[i], &trace_draw_call_data.sr_debug_name[i], &trace_draw_call_data.sr_is_rt[i], &trace_draw_call_data.sr_is_ua[i]);
-      };
-      auto AddUnorderedAccessView = [&](const TraceDrawCallData::ShaderRegister& shader_register, reshade::api::resource_view view, reshade::api::resource resource)
-      {
-         const uint32_t i = trace_draw_call_data.uav_count;
-         ASSERT_ONCE(i < TraceDrawCallData::uavs_size);
-         if (i >= TraceDrawCallData::uavs_size)
-            return;
-         trace_draw_call_data.uav_count++;
-         trace_draw_call_data.ua_register[i] = shader_register;
-         trace_draw_call_data.uavs[i] = view.handle;
-         AddView(view, resource, &trace_draw_call_data.uav_format[i], &trace_draw_call_data.ua_format[i], &trace_draw_call_data.ua_size[i], &trace_draw_call_data.uav_size[i], &trace_draw_call_data.uav_mip[i], &trace_draw_call_data.ua_type_name[i], &trace_draw_call_data.ua_hash[i], &trace_draw_call_data.ua_debug_name[i], &trace_draw_call_data.ua_is_rt[i]);
-      };
-      // "buffer" is null for root constants, whose values are kept instead
-      auto AddConstantBuffer = [&](const TraceDrawCallData::ShaderRegister& shader_register, uint64_t buffer, uint64_t offset, uint64_t size, const std::vector<uint32_t>* root_constants)
-      {
-         const uint32_t i = trace_draw_call_data.cb_count;
-         ASSERT_ONCE(i < std::size(trace_draw_call_data.cbs));
-         if (i >= std::size(trace_draw_call_data.cbs))
-            return;
-         trace_draw_call_data.cb_count++;
-         trace_draw_call_data.cb_register[i] = shader_register;
-         trace_draw_call_data.cbs[i] = true;
-         if (buffer != 0)
-            trace_draw_call_data.cb_hash[i] = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(buffer)));
-         trace_draw_call_data.cb_first_constant[i] = UINT(offset / 16);
-         trace_draw_call_data.cb_num_constants[i] = UINT((size + 15) / 16);
-         if (root_constants)
-            trace_draw_call_data.cb_root_constants[i] = *root_constants;
+         uint32_t* count = &trace_draw_call_data.cb_count;
+         TraceDrawCallData::ShaderRegister* registers = trace_draw_call_data.cb_register;
+         uint32_t max_count = uint32_t(std::size(trace_draw_call_data.cbs));
+         if (type == 't')
+            count = &trace_draw_call_data.srv_count, registers = trace_draw_call_data.sr_register, max_count = uint32_t(TraceDrawCallData::srvs_size);
+         else if (type == 'u')
+            count = &trace_draw_call_data.uav_count, registers = trace_draw_call_data.ua_register, max_count = uint32_t(TraceDrawCallData::uavs_size);
+         ASSERT_ONCE(*count < max_count);
+         if (*count >= max_count)
+            return UINT32_MAX;
+         registers[*count] = shader_register;
+         if (type == 'b')
+            trace_draw_call_data.cbs[*count] = true;
+         return (*count)++;
       };
 
       auto IsShaderResourceView = [](reshade::api::descriptor_type type)
@@ -382,7 +419,6 @@ namespace D3D12Trace
       const auto layout_it = device_data->pipeline_layouts.parameters_by_layout.find(root.layout.handle);
       if (layout_it == device_data->pipeline_layouts.parameters_by_layout.end())
          return;
-      const std::shared_lock lock_heaps(device_data->descriptor_heaps.mutex);
       const std::shared_lock lock_buffers(device_data->buffer_addresses.mutex);
       for (size_t param_index = 0; param_index < layout_it->second.size() && param_index < root.bindings.size(); param_index++)
       {
@@ -393,35 +429,41 @@ namespace D3D12Trace
          case reshade::api::pipeline_layout_param_type::push_constants:
          {
             const TraceDrawCallData::ShaderRegister shader_register = {.index = parameter.constants.dx_register_index, .space = parameter.constants.dx_register_space};
-            if (!binding.constants.empty() && IsDeclared('b', shader_register))
+            if (binding.constants.empty() || !IsDeclared('b', shader_register))
+               break;
+            if (const uint32_t i = AddEntry('b', shader_register); i != UINT32_MAX)
             {
-               AddConstantBuffer(shader_register, 0, 0, binding.constants.size() * sizeof(uint32_t), &binding.constants);
+               trace_draw_call_data.cb_num_constants[i] = UINT((binding.constants.size() + 3) / 4);
+               trace_draw_call_data.cb_root_constants[i] = binding.constants;
             }
             break;
          }
          case reshade::api::pipeline_layout_param_type::push_descriptors:
          case reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges_and_flags:
          {
-            // Root descriptors (static samplers come as sampler ranges)
+            // Root descriptors (static samplers come as sampler ranges). Their GPU virtual address is recorded with the command.
             if (parameter.ranges.size() != 1 || binding.descriptor == 0)
                break;
             const reshade::api::descriptor_range& range = parameter.ranges[0];
             const TraceDrawCallData::ShaderRegister shader_register = {.index = range.dx_register_index, .space = range.dx_register_space};
             if (range.type == reshade::api::descriptor_type::constant_buffer)
             {
-               if (IsDeclared('b', shader_register))
-                  AddConstantBuffer(shader_register, binding.descriptor, binding.descriptor_offset, 0, nullptr);
+               if (const uint32_t i = IsDeclared('b', shader_register) ? AddEntry('b', shader_register) : UINT32_MAX; i != UINT32_MAX)
+               {
+                  trace_draw_call_data.cb_hash[i] = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(binding.descriptor)));
+                  trace_draw_call_data.cb_first_constant[i] = UINT(binding.descriptor_offset / 16);
+               }
                break;
             }
-            // Root SRVs and UAVs are a GPU virtual address in a buffer
+            // Root SRVs and UAVs are only buffers (and acceleration structures), as a GPU virtual address in them
             const bool is_srv = IsShaderResourceView(range.type);
-            if ((!is_srv && !IsUnorderedAccessView(range.type)) || !IsDeclared(is_srv ? 't' : 'u', shader_register))
+            if (!is_srv && !IsUnorderedAccessView(range.type))
                break;
-            const reshade::api::resource buffer = {D3D12State::FindBuffer(device_data->buffer_addresses, binding.descriptor).resource};
-            if (is_srv)
-               AddShaderResourceView(shader_register, {}, buffer);
-            else
-               AddUnorderedAccessView(shader_register, {}, buffer);
+            const char type = is_srv ? 't' : 'u';
+            if (const uint32_t i = IsDeclared(type, shader_register) ? AddEntry(type, shader_register) : UINT32_MAX; i != UINT32_MAX)
+            {
+               FillView(device, &trace_draw_call_data, type, i, false, 0, {.resource = D3D12State::FindBuffer(device_data->buffer_addresses, binding.descriptor).resource});
+            }
             break;
          }
          case reshade::api::pipeline_layout_param_type::descriptor_table:
@@ -433,25 +475,20 @@ namespace D3D12Trace
             {
                const bool is_srv = IsShaderResourceView(range.type);
                const bool is_uav = IsUnorderedAccessView(range.type);
-               const bool is_cbv = range.type == reshade::api::descriptor_type::constant_buffer;
-               if (!is_srv && !is_uav && !is_cbv)
+               if (!is_srv && !is_uav && range.type != reshade::api::descriptor_type::constant_buffer)
                   continue;
+               const char type = is_srv ? 't' : (is_uav ? 'u' : 'b');
                // ponytail: bindless (unbounded) ranges stop at the per type limit, reading "ResourceDescriptorHeap" is out of the capture's scope
                const uint32_t count = (std::min)(range.count, uint32_t(TraceDrawCallData::srvs_size));
                for (uint32_t i = 0; i < count; i++)
                {
                   const TraceDrawCallData::ShaderRegister shader_register = {.index = range.dx_register_index + i, .space = range.dx_register_space};
-                  if (!IsDeclared(is_srv ? 't' : (is_uav ? 'u' : 'b'), shader_register))
+                  if (!IsDeclared(type, shader_register))
                      continue;
-                  const D3D12State::Descriptor* descriptor = D3D12State::FindDescriptor(device_data->descriptor_heaps, device, binding.table, range.binding + i);
-                  if (!descriptor || descriptor->handle == 0)
-                     continue;
-                  if (is_cbv)
-                     AddConstantBuffer(shader_register, descriptor->handle, descriptor->offset, descriptor->size, nullptr);
-                  else if (is_srv)
-                     AddShaderResourceView(shader_register, {descriptor->handle}, {});
-                  else
-                     AddUnorderedAccessView(shader_register, {descriptor->handle}, {});
+                  if (const uint32_t index = AddEntry(type, shader_register); index != UINT32_MAX)
+                  {
+                     trace_draw_call_data.table_descriptors.push_back({.table = binding.table, .binding = range.binding + i, .type = type, .index = index});
+                  }
                }
             }
             break;
