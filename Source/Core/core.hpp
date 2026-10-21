@@ -4967,10 +4967,11 @@ namespace
             {
                device_data.pipeline_caches_by_shader_hash[shader_hash] = { cached_pipeline };
             }
-
-            ASSERT_ONCE(device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle) == device_data.pipeline_cache_by_pipeline_handle.end());
-            device_data.pipeline_cache_by_pipeline_handle[pipeline.handle] = cached_pipeline;
          }
+
+         // Once per pipeline, D3D12 PSOs have a hash per stage
+         ASSERT_ONCE(device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle) == device_data.pipeline_cache_by_pipeline_handle.end());
+         device_data.pipeline_cache_by_pipeline_handle[pipeline.handle] = cached_pipeline;
       }
 
       // Clone pipeline with injected sync patches (if any found)
