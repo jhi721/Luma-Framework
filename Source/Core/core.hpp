@@ -13511,7 +13511,7 @@ namespace
 
                                                    ImGui::Text("R Original Format: %s", GetFormatName(DXGI_FORMAT(upgraded_resource_pair.second)));
 
-                                                   if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(reinterpret_cast<uint64_t>(draw_call_data.srvs[i])); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
+                                                   if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(draw_call_data.srvs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                                                    {
                                                       const auto& [native_resource, original_view_format] = it->second;
                                                       ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?
@@ -13647,7 +13647,7 @@ namespace
 
                                                    ImGui::Text("R Original Format: %s", GetFormatName(DXGI_FORMAT(upgraded_resource_pair.second)));
 
-                                                   if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(reinterpret_cast<uint64_t>(draw_call_data.uavs[i])); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
+                                                   if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(draw_call_data.uavs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                                                    {
                                                       const auto& [native_resource, original_view_format] = it->second;
                                                       ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?
@@ -13814,7 +13814,7 @@ namespace
                                                    ImGui::Text("R Original Format: %s", GetFormatName(DXGI_FORMAT(upgraded_resource_pair.second)));
 
                                                    // TODO: why does this flicker on and off in Deux Ex HR when it writes on the swapchain for material draws?
-                                                   if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(reinterpret_cast<uint64_t>(draw_call_data.rtvs[i])); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
+                                                   if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(draw_call_data.rtvs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                                                    {
                                                       const auto& [native_resource, original_view_format] = it->second;
                                                       ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?

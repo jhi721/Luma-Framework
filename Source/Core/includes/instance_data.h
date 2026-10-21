@@ -92,14 +92,16 @@ struct DrawDispatchData
    bool indirect = false;
 };
 
-#if DX11 // The frame capture reads D3D11 state
+// A frame capture entry. The D3D11 states without a D3D12 equivalent yet (blend, depth stencil, rasterizer, viewports, samplers) are D3D11 only.
 struct TraceDrawCallData
 {
    TraceDrawCallData()
    {
       thread_id = std::this_thread::get_id();
 
+#if DX11
       std::fill_n(samplers_filter, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, static_cast<D3D11_FILTER>(-1)); // Default to no sampler
+#endif
    }
 
    enum class TraceDrawCallType
@@ -135,8 +137,13 @@ struct TraceDrawCallData
    Shader::ShaderVariant clone_variant = Shader::ShaderVariant::Original;
    bool patch_enabled = false;
 
+#if DX11
    // The original command list (can be useful to have later)
    com_ptr<ID3D11DeviceContext> command_list = nullptr;
+#else
+   // The command list that recorded this call. It only identifies it, it might be destroyed by now.
+   const reshade::api::command_list* command_list = nullptr;
+#endif
    // The thread this call was made on (usually 1:1 with deferred (async) command lists)
    std::thread::id thread_id = {};
 
@@ -155,7 +162,7 @@ struct TraceDrawCallData
    DrawDispatchData draw_dispatch_data = {};
 
    // Vertex shader
-   D3D11_PRIMITIVE_TOPOLOGY primitive_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+   D3D_PRIMITIVE_TOPOLOGY primitive_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
    std::vector<std::string> vertex_buffer_hashes;
    std::string input_layout_hash;
    std::string index_buffer_hash;
@@ -165,9 +172,11 @@ struct TraceDrawCallData
 
    DepthStateType depth_state = DepthStateType::Disabled;
    DepthStateType stencil_state = DepthStateType::Disabled;
+#if DX11
    // Already includes all the render targets
    D3D11_BLEND_DESC1 blend_desc = {};
    FLOAT blend_factor[4] = { 1.f, 1.f, 1.f, 1.f };
+#endif
 
    bool cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
    std::string cb_hash[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {}; // Ptr hash (not content hash)
@@ -175,15 +184,17 @@ struct TraceDrawCallData
    UINT cb_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
    UINT cb_num_constants[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
 
+#if DX11
    D3D11_FILTER samplers_filter[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
    D3D11_TEXTURE_ADDRESS_MODE samplers_address_u[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
    D3D11_TEXTURE_ADDRESS_MODE samplers_address_v[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
    D3D11_TEXTURE_ADDRESS_MODE samplers_address_w[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
    float samplers_mip_lod_bias[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+#endif
 
    // Render Target (Resource+Views)
    static constexpr size_t rtvs_size = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; // Max size (we can lower it if needed) // TODO: allocate these as a vector of structs
-   const ID3D11RenderTargetView* rtvs[rtvs_size] = {};                  // TODO.. find a better way, this is very hacky (though safe, as long as we read/compare it)
+   uint64_t rtvs[rtvs_size] = {};                                       // View handles, only compared and looked up
    DXGI_FORMAT rt_format[rtvs_size] = {};                               // The format of the resource
    DXGI_FORMAT rtv_format[rtvs_size] = {};                              // The format of the view
    uint4 rt_size[rtvs_size] = {};                                       // 3th and 4th channels are Array, MS and Mips
@@ -199,7 +210,7 @@ struct TraceDrawCallData
 #else
    static constexpr size_t srvs_size = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 #endif
-   const ID3D11ShaderResourceView* srvs[srvs_size] = {};
+   uint64_t srvs[srvs_size] = {};
    DXGI_FORMAT srv_format[srvs_size] = {};                                   // The format of the view
    DXGI_FORMAT sr_format[srvs_size] = {};                            // The format of the resource
    uint4 sr_size[srvs_size] = {};                                            // 3th and 4th channels are Array, MS and Mips
@@ -216,7 +227,7 @@ struct TraceDrawCallData
 #else
    static constexpr size_t uavs_size = D3D11_1_UAV_SLOT_COUNT;
 #endif
-   const ID3D11UnorderedAccessView* uavs[uavs_size] = {};
+   uint64_t uavs[uavs_size] = {};
    DXGI_FORMAT ua_format[uavs_size] = {};               // The format of the resource
    DXGI_FORMAT uav_format[uavs_size] = {};     // The format of the view
    uint4 ua_size[uavs_size] = {};                       // 3th and 4th channels are Array, MS and Mips
@@ -233,6 +244,7 @@ struct TraceDrawCallData
    std::string ds_hash = {}; // Ptr hash (not content hash)
    std::string ds_debug_name = {}; // Debug name of the texture or the view
 
+#if DX11
    // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults.
    bool has_depth_stencil_state = false;
    D3D11_DEPTH_STENCIL_DESC depth_stencil_desc = {};
@@ -243,6 +255,7 @@ struct TraceDrawCallData
    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
    UINT scissor_count = 0;
    D3D11_RECT scissor_rects[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+#endif // DX11
 
    // Copy entries (source in "sr_*[0]", destination in "rt_*[0]")
    enum class CopyKind : uint8_t
@@ -259,7 +272,12 @@ struct TraceDrawCallData
       UINT dest_subresource = 0;
       uint3 dest_offset = {}; // Bytes in "x" for buffer copies
       bool has_box = false;
-      D3D11_BOX box = {}; // Source region (bytes in "left"/"right" for buffer copies)
+      // Source region (bytes in "left"/"right" for buffer copies)
+#if DX11
+      D3D11_BOX box = {};
+#else
+      D3D12_BOX box = {};
+#endif
       DXGI_FORMAT resolve_format = DXGI_FORMAT_UNKNOWN;
    };
    CopyInfo copy_info;
@@ -280,7 +298,6 @@ struct TraceDrawCallData
 
    const char* custom_name = "Unknown";
 };
-#endif // DX11
 
 // Applies to command lists and command queue (DirectX 11 command list and deferred or immediate contexts, though usually it's for "ID3D11DeviceContext").
 // All runtime states are thread safe as long as they were in the original implementation.
@@ -510,10 +527,10 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 #endif // ENABLE_AUTO_CBUFFER_RESTORATION
 
 #if DEVELOPMENT
-#if DX11
    std::shared_mutex mutex_trace;
    std::vector<TraceDrawCallData> trace_draw_calls_data;
 
+#if DX11
    void AddGraphicsCaptureCustomDrawCall(const char* name, class ID3D11DeviceContext* native_device_context, class ID3D11Resource* resource = nullptr, class ID3D11View* view = nullptr);
 #endif // DX11
 
