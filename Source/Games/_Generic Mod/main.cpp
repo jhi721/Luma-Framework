@@ -178,10 +178,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
-#if DX11 // On D3D12 the swapchain upgrade runs (display composition, pipeline variants and the view fix), the texture upgrades need the creation hooks
+      // On D3D12 the texture upgrades are direct and only for the textures the game creates committed (the placed ones are cloned in a later phase, which also adds the mirrors
+      // of the indirect and chain upgrades)
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
+#if DX11
       enable_indirect_texture_format_upgrades = true; // This is generally safer so enable it in the generic mod
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies; // Indirect dependencies are probably not needed as they'd already be upgraded too
+#endif
       toggleable_texture_upgrade_formats = {
             reshade::api::format::r8g8b8a8_unorm,
             reshade::api::format::r8g8b8a8_unorm_srgb,
@@ -205,7 +208,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_upgrade_formats.insert(toggleable_texture_upgrade_formats.begin(), toggleable_texture_upgrade_formats.end());
       texture_upgrade_formats.erase(reshade::api::format::r16g16b16a16_unorm); // This might be more likely to cause damage than not generally, so remove by default
       texture_format_upgrades_2d_size_filters = 0 | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
-#endif
 
       game = new GenericGame();
    }
