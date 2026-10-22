@@ -941,6 +941,10 @@ namespace
    WNDPROC game_window_custom_proc = nullptr;
 #endif
    thread_local bool last_swapchain_linear_space = false;
+#if DX12
+   // Set by "OnCreateSwapchain()" for "OnInitSwapchain()": the swapchain upgrade changed the format family of the swapchain (the game made it with another one)
+   thread_local bool last_swapchain_format_upgraded = false;
+#endif
 #if GAME_FF7_REMAKE
    thread_local reshade::api::format last_swapchain_format = reshade::api::format::r10g10b10a2_unorm;
 #endif
@@ -3633,7 +3637,7 @@ namespace
          static std::atomic_flag logged_creation_failure;
          if (!logged_creation_failure.test_and_set())
          {
-            reshade::log::message(reshade::log::level::warning, "[Resource creation] The game's creates of resources aren't all hooked, so they can't be told committed from placed (no ReShade device proxy, or MinHook failed)");
+            reshade::log::message(reshade::log::level::warning, "[Resource creation] The game's creates of resources aren't all hooked, so they can't be told committed from placed (no ReShade device proxy, or MinHook failed): the textures made by the creates that aren't hooked are not upgraded");
          }
       }
       // The game's root signatures get Luma's cbuffers at the indexes the game picked (see "includes/d3d12_root_signatures.h"), LumaData only if it has one
@@ -3880,6 +3884,10 @@ namespace
 
       // There's only one swapchain so it's fine if this is global ("OnInitSwapchain()" will always be called later anyway)
       bool changed = false;
+#if DX12
+      // ReShade tells the format the game asked for, also when it resized with DXGI_FORMAT_UNKNOWN (it keeps the game's description, the add-ons' changes are not in it)
+      const reshade::api::format game_back_buffer_format = desc.back_buffer.texture.format;
+#endif
 
 #if DEVELOPMENT
       ASSERT_ONCE(desc.back_buffer.texture.format != reshade::api::format::unknown); // With the latest ReShade changes, this should never be set to Unknown, even if the game did a swapchain buffer resize and preserved the previous format.
@@ -3952,6 +3960,9 @@ namespace
          changed = true;
       }
 
+#if DX12
+      last_swapchain_format_upgraded = (GetTypelessFormat(DXGI_FORMAT(game_back_buffer_format)) != GetTypelessFormat(DXGI_FORMAT(desc.back_buffer.texture.format)));
+#endif
       return changed;
    }
 
@@ -4062,6 +4073,12 @@ namespace
          {
             auto buffer = swapchain->get_back_buffer(index);
             device_data.back_buffers.emplace(buffer.handle);
+#if DX12
+            if (last_swapchain_format_upgraded)
+            {
+               device_data.upgraded_back_buffers.emplace(buffer.handle);
+            }
+#endif
          }
       }
 
@@ -4310,6 +4327,9 @@ namespace
             for (const uint64_t handle : swapchain_data.back_buffers)
             {
                device_data.back_buffers.erase(handle);
+#if DX12
+               device_data.upgraded_back_buffers.erase(handle);
+#endif
 #if DEVELOPMENT
                device_data.resource_upgrades.original_upgraded_resources_formats.erase(handle);
 #endif // DEVELOPMENT
@@ -6162,36 +6182,6 @@ namespace
    }
 
 #if DEVELOPMENT
-   // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer. Textures are kept with how the game created them, for
-   // the MCP: ReShade fires this inside the game's create call (see "includes/d3d12_resource_creation.h").
-   void OnInitResource(reshade::api::device* device, const reshade::api::resource_desc& desc, const reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state, reshade::api::resource resource)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
-      if (desc.type == reshade::api::resource_type::buffer)
-      {
-         D3D12State::AddBuffer(&device->get_private_data<DeviceData>()->buffer_addresses, resource, desc.buffer.size);
-      }
-#if ENABLE_MINHOOK
-      else
-      {
-         D3D12ResourceCreation::TextureKinds& texture_kinds = device->get_private_data<DeviceData>()->texture_kinds;
-         const std::unique_lock lock(texture_kinds.mutex);
-         texture_kinds.by_resource[resource.handle] = D3D12ResourceCreation::KindOf(desc);
-      }
-#endif
-   }
-
-   void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
-      D3D12State::RemoveBuffer(&device->get_private_data<DeviceData>()->buffer_addresses, resource);
-#if ENABLE_MINHOOK
-      D3D12ResourceCreation::TextureKinds& texture_kinds = device->get_private_data<DeviceData>()->texture_kinds;
-      const std::unique_lock lock(texture_kinds.mutex);
-      texture_kinds.by_resource.erase(resource.handle);
-#endif
-   }
-
    // Command lists record their own capture entries, "OnExecuteCommandList()" joins them in submission order
    void TraceDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data)
    {
@@ -6857,9 +6847,22 @@ namespace
       return OnDrawOrDispatchD3D12(cmd_list, {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true}, D3D12DrawCommand::Other);
    }
 
-   // D3D12 can't copy between a texture Luma upgraded (a back buffer with the swapchain upgrade, or one of "resource_upgrades.upgraded_resources") and a resource of another format family (it tells by the
-   // typeless formats: R16G16B16A16 FLOAT against R8G8B8A8 UNORM). The uploads and readbacks through a buffer are never valid for an upgraded texture: ReShade doesn't pass the footprint's format,
-   // and the game's is the texture's original one. A later phase converts these copies instead, until then they're skipped, with a warning once for each kind and pair of formats.
+   // Whether Luma changed the format of a texture: one of "resource_upgrades.upgraded_resources", or a back buffer whose format family the swapchain upgrade changed ("device_data.mutex" must be held)
+   bool IsUpgradedTexture(const DeviceData& device_data, reshade::api::resource resource)
+   {
+      return device_data.resource_upgrades.upgraded_resources.contains(resource.handle) || device_data.upgraded_back_buffers.contains(resource.handle);
+   }
+
+   // The format of a texture as the device has it (the upgraded one), unknown for a buffer
+   DXGI_FORMAT GetTextureFormat(reshade::api::device* device, reshade::api::resource resource)
+   {
+      const reshade::api::resource_desc desc = device->get_resource_desc(resource);
+      return (desc.type == reshade::api::resource_type::buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(desc.texture.format));
+   }
+
+   // D3D12 can't copy between a texture Luma upgraded and a resource of another format family (it tells by the typeless formats: R16G16B16A16 FLOAT against R8G8B8A8 UNORM). The uploads and readbacks through
+   // a buffer are never valid for an upgraded texture: ReShade doesn't pass the footprint's format, and the game's is the texture's original one. A later phase converts these copies
+   // instead, until then they're skipped, with a warning once for each kind and pair of formats. The resolves between textures of the same family only name the game's format: see "OnResolveTextureRegion()".
    // Returns true to skip the copy.
    bool SkipUpgradedFormatCopy(reshade::api::command_list* cmd_list, const char* copy_kind, reshade::api::resource source, reshade::api::resource dest, bool through_buffer = false)
    {
@@ -6868,34 +6871,17 @@ namespace
          return false;
       }
       reshade::api::device* const device = cmd_list->get_device();
-      DeviceData& device_data = *device->get_private_data<DeviceData>();
-      bool source_upgraded = false;
-      bool dest_upgraded = false;
       {
+         DeviceData& device_data = *device->get_private_data<DeviceData>();
          const std::shared_lock lock(device_data.mutex);
-         const auto is_upgraded = [&](reshade::api::resource resource)
-         { return device_data.resource_upgrades.upgraded_resources.contains(resource.handle) || (swapchain_upgrade_type > SwapchainUpgradeType::None && device_data.back_buffers.contains(resource.handle)); };
-         source_upgraded = is_upgraded(source);
-         dest_upgraded = is_upgraded(dest);
+         if (!IsUpgradedTexture(device_data, source) && !IsUpgradedTexture(device_data, dest))
+         {
+            return false;
+         }
       }
-      if (!source_upgraded && !dest_upgraded)
-      {
-         return false;
-      }
-      const auto texture_format = [&](reshade::api::resource resource)
-      {
-         const reshade::api::resource_desc desc = device->get_resource_desc(resource);
-         return (desc.type == reshade::api::resource_type::buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(desc.texture.format));
-      };
-      const DXGI_FORMAT source_format = texture_format(source);
-      const DXGI_FORMAT dest_format = texture_format(dest);
+      const DXGI_FORMAT source_format = GetTextureFormat(device, source);
+      const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
       if (!through_buffer && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
-      {
-         return false;
-      }
-      // Only the formats an upgrade outputs: a texture in another one was left alone (the swapchain upgrade can be off while the back buffers are the game's), and its footprint copies are valid
-      const DXGI_FORMAT buffer_texture_format = (source_format != DXGI_FORMAT_UNKNOWN ? source_format : dest_format);
-      if (through_buffer && buffer_texture_format != DXGI_FORMAT_R16G16B16A16_FLOAT && !(buffer_texture_format == DXGI_FORMAT_R10G10B10A2_UNORM && swapchain_upgrade_type == SwapchainUpgradeType::HDR10))
       {
          return false;
       }
@@ -6987,6 +6973,10 @@ namespace
       return SkipUpgradedFormatCopy(cmd_list, "copy_texture_to_buffer", source, dest, true);
    }
 
+   // A resolve names the format to resolve in, which the game took from the textures it created: once Luma upgraded them it is the wrong one, and D3D12 rejects it. When the two textures are of the same format
+   // family (an upgraded multisampled target resolved into an upgraded target or back buffer: both R16G16B16A16 FLOAT now) only the format is wrong, and the resolve is re-issued with the textures' own, like
+   // the D3D11 path does. ReShade's event doesn't carry the mode of a "ResolveSubresourceRegion()": the re-issue averages (the mode of "ResolveSubresource()"), so a MIN or MAX region resolve of a color texture
+   // comes out averaged. Textures of other families can't be resolved into each other, "SkipUpgradedFormatCopy()" skips those (a later phase converts them).
    bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
@@ -6994,29 +6984,65 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
 #endif
-      if (SkipUpgradedFormatCopy(cmd_list, "resolve_texture_region", source, dest))
+      DXGI_FORMAT resolve_format = DXGI_FORMAT(format);
+      bool format_corrected = false;
+      if (swapchain_format_upgrade_type > TextureFormatUpgradesType::None || texture_format_upgrades_type > TextureFormatUpgradesType::None) // Optimization
+      {
+         reshade::api::device* const device = cmd_list->get_device();
+         bool any_upgraded = false;
+         {
+            DeviceData& device_data = *device->get_private_data<DeviceData>();
+            const std::shared_lock lock(device_data.mutex);
+            any_upgraded = IsUpgradedTexture(device_data, source) || IsUpgradedTexture(device_data, dest);
+         }
+         if (any_upgraded)
+         {
+            const DXGI_FORMAT source_format = GetTextureFormat(device, source);
+            const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
+            const DXGI_FORMAT textures_format = (IsTypelessFormat(source_format) ? dest_format : source_format); // The upgraded ones are never typeless
+            format_corrected = (GetTypelessFormat(source_format) == GetTypelessFormat(dest_format) && GetTypelessFormat(resolve_format) != GetTypelessFormat(textures_format) && !IsTypelessFormat(textures_format));
+            if (format_corrected)
+            {
+               resolve_format = textures_format;
+            }
+         }
+      }
+      if (!format_corrected && SkipUpgradedFormatCopy(cmd_list, "resolve_texture_region", source, dest))
       {
          return true;
       }
-#if DEVELOPMENT
-      return ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::Resolve, .subresource = dest_subresource, .resolve_format = DXGI_FORMAT(format)}, {}, [&](ID3D12GraphicsCommandList* native_list)
+      const auto resolve = [&](ID3D12GraphicsCommandList* native_list)
+      {
+         auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
+         auto* native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
+         if (!source_box && dest_x == 0 && dest_y == 0)
          {
-            auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
-            auto* native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
-            if (!source_box && dest_x == 0 && dest_y == 0)
+            native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, resolve_format);
+         }
+         else
+         {
+            com_ptr<ID3D12GraphicsCommandList1> native_list_1;
+            native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
+            if (native_list_1)
             {
-               native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, DXGI_FORMAT(format));
-            }
-            else
-            {
-               com_ptr<ID3D12GraphicsCommandList1> native_list_1;
-               native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
                D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
-               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), DXGI_FORMAT(format), D3D12_RESOLVE_MODE_AVERAGE);
-            } });
-#else
-      return false;
+               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, D3D12_RESOLVE_MODE_AVERAGE);
+            }
+         }
+      };
+#if DEVELOPMENT
+      // The readback's target is the command as the game gave it (with its format), what it re-issues is the corrected one
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::Resolve, .subresource = dest_subresource, .resolve_format = DXGI_FORMAT(format)}, {}, resolve))
+      {
+         return true;
+      }
 #endif
+      if (format_corrected)
+      {
+         resolve(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+         return true;
+      }
+      return false;
    }
 
 #if DEVELOPMENT
@@ -11210,7 +11236,7 @@ namespace
 #endif // DX11
 
    // The resource view hook and the helpers it needs (until "OnCreateResourceView()") are shared with D3D12: the swapchain upgrade fixes the views of the back buffers there too,
-   // and the texture upgrades will
+   // and so do the texture upgrades, for the committed textures "OnCreateResource()" upgrades there
 
    // Takes a view desc the game would have tried to use with a resource we upgraded (directly or indirectly),
    // and returns the best suitable format for an upgraded view.
@@ -11366,7 +11392,9 @@ namespace
       }
       return false;
    }
+#endif // DX11
 
+   // Shared with D3D12, where the textures the game creates directly are upgraded the same way (see "OnCreateResource()" for its rules there)
    void OnInitResource(
       reshade::api::device* device,
       const reshade::api::resource_desc& desc,
@@ -11377,6 +11405,28 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
 
       DeviceData& device_data = *device->get_private_data<DeviceData>();
+#if DX12 && DEVELOPMENT
+      // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer. Textures are kept with how the game created them, for the MCP: ReShade fires this inside the
+      // game's create call (see "includes/d3d12_resource_creation.h")
+      if (desc.type == reshade::api::resource_type::buffer)
+      {
+         D3D12State::AddBuffer(&device_data.buffer_addresses, resource, desc.buffer.size);
+      }
+#if ENABLE_MINHOOK
+      else
+      {
+         const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+         device_data.texture_kinds.by_resource[resource.handle] = D3D12ResourceCreation::KindOf(desc);
+      }
+#endif
+#endif
+#if DX12
+      // D3D12 fires this right after the "OnCreateResource()" of the same call. The shared resources the game opens come without one (and are never upgraded)
+      if (!waiting_on_upgraded_resource_init || (desc.flags & reshade::api::resource_flags::shared) != 0)
+      {
+         return;
+      }
+#endif
       std::unique_lock lock(device_data.mutex);
 
       if (waiting_on_upgraded_resource_init)
@@ -11401,6 +11451,7 @@ namespace
             upgraded_resource_init_data = nullptr; // optional, avoid dangling pointer
          }
 
+#if DX11
          if (enable_indirect_texture_format_upgrades)
          {
             // The "desc" we got as input is not upgraded in this case
@@ -11433,6 +11484,7 @@ namespace
                delete[] static_cast<uint8_t*>(new_initial_data_ptr->data);
          }
          else
+#endif // DX11
          {
             device_data.resource_upgrades.upgraded_resources.emplace(resource.handle);
 #if DEVELOPMENT
@@ -11441,6 +11493,7 @@ namespace
          }
          waiting_on_upgraded_resource_init = false;
       }
+#if DX11
       else
       {
          // Code mirrored from "OnCreateResource()" (though some filter cases are still missing)
@@ -11454,10 +11507,13 @@ namespace
             }
          }
       }
+#endif // DX11
    }
 
-   // This is called before "OnInitResource()"
+   // This is called before "OnInitResource()". D3D12 fires both inside the call of the game, and ReShade can't tell its committed resources from the placed ones: the hooks of
+   // "includes/d3d12_resource_creation.h" do (so without MinHook D3D12 upgrades nothing, and nothing registers this)
    // Note that swapchain textures (backbuffer) don't pass through here!
+#if DX11 || ENABLE_MINHOOK
    bool OnCreateResource(
       reshade::api::device* device,
       reshade::api::resource_desc& desc,
@@ -11466,12 +11522,23 @@ namespace
    {
 #if CHECK_GRAPHICS_API_COMPATIBILITY
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
-#else // Check this one anyway
+#elif DX11 // Check this one anyway
       ASSERT_ONCE(device->get_api() == reshade::api::device_api::d3d11);
+#else
+      ASSERT_ONCE(device->get_api() == reshade::api::device_api::d3d12);
 #endif
 
       // No need to clear "upgraded_resource_init_desc"/"upgraded_resource_init_data" from its last value
       waiting_on_upgraded_resource_init = false; // If the same thread called another "OnCreateResource()" before we got a "OnInitResource()", it implies the resource creation has failed and we didn't get that event (we have to do it by thread as device objects creation is thread safe and can be done by multiple threads concurrently)
+
+#if DX12
+      // D3D12 games create thousands of buffers, none of them is a texture. Only the textures of the default heap are candidates (a reserved one has no heap, the custom ones are for the CPU: the filters
+      // below assert on those)
+      if (desc.type == reshade::api::resource_type::buffer || desc.heap != reshade::api::memory_heap::default_)
+      {
+         return false;
+      }
+#endif
 
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       std::shared_lock lock(device_data.mutex); // Note: we possibly don't even need this (or well, we might want to use a different mutex)
@@ -11480,15 +11547,62 @@ namespace
       {
          lock.unlock();
 
+#if DX11
+         const bool upgrade_directly = !enable_indirect_texture_format_upgrades;
          const reshade::api::resource_desc original_desc = desc;
+#else
+         constexpr bool upgrade_directly = true; // D3D12 has no mirrors yet, "enable_indirect_texture_format_upgrades" is ignored there
+#endif
 
 #if DEVELOPMENT
          last_attempted_upgraded_resource_creation_format = desc.texture.format;
 #endif
 
+#if DX12
+         // The D3D12 rules, on top of the filters: a texture is only upgraded if the game creates it committed (it owns its memory, whereas a placed one is in a heap the game sized and shares with other
+         // resources, so a bigger one would overflow it or alias them, and a reserved one has none until the game maps tiles to it: a later phase clones them), not as a depth
+         // texture (the DSV variants aren't made), not shared (another process or API opens it) and without castable formats (ReShade passes them on as the game gave them, and the upgraded format
+         // isn't one of the formats they can be cast to)
+         if (std::memcmp(&upgraded_desc.value(), &desc, sizeof(desc)) == 0)
+         {
+            return false; // The filters chose a texture the upgrade leaves as it is
+         }
+         const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
+         const char* refusal = nullptr;
+         if (creation_kind != D3D12ResourceCreation::Kind::Committed)
+         {
+            refusal = "only the committed ones are upgraded for now (the placed and reserved ones are cloned in a later phase)";
+         }
+         else if ((desc.usage & reshade::api::resource_usage::depth_stencil) != 0)
+         {
+            refusal = "depth textures aren't upgraded on D3D12 yet";
+         }
+         else if ((desc.flags & reshade::api::resource_flags::shared) != 0)
+         {
+            refusal = "it is shared";
+         }
+         else if (D3D12ResourceCreation::current_castable_format_count != 0)
+         {
+            refusal = "it takes castable formats, which ReShade passes on as the game gave them and the upgraded format isn't one of";
+         }
+         if (refusal)
+         {
+#if DEVELOPMENT
+            static std::mutex refused_mutex;
+            static std::set<std::tuple<D3D12ResourceCreation::Kind, reshade::api::format, std::string_view>> refused_textures;
+            const std::unique_lock lock_refused(refused_mutex);
+            if (refused_textures.emplace(creation_kind, desc.texture.format, refusal).second)
+            {
+               reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] A {} {} texture matched the upgrade filters but isn't upgraded: {}", D3D12ResourceCreation::KIND_NAMES[size_t(creation_kind)], GetFormatNameSafe(DXGI_FORMAT(desc.texture.format)), refusal).c_str());
+            }
+#endif
+            return false;
+         }
+#endif
+
          // Direct upgrade (inline).
          // Note that upgrading typeless texture could have unforeseen consequences in some games, especially when the textures are then used as unsigned int or signed int etc (e.g. Trine 5)
-         if (!enable_indirect_texture_format_upgrades)
+         if (upgrade_directly)
          {
             desc = upgraded_desc.value();
          }
@@ -11496,9 +11610,10 @@ namespace
          waiting_on_upgraded_resource_init = true;
          upgraded_resource_init_desc = desc; // Purposely left to the original value if "enable_indirect_texture_format_upgrades" is true, because we need to compare it against the direct upgraded desc we get back from reshade
          forced_upgraded_resource_init_desc = upgraded_desc.value();
+#if DX11
          bool converted_initial_data = false;
          // We need to convert the initial data to the new format
-         if (initial_data != nullptr && !enable_indirect_texture_format_upgrades)
+         if (initial_data != nullptr && upgrade_directly)
          {
             reshade::api::subresource_data new_initial_data = *initial_data;
             assert(original_desc.texture.width == upgraded_desc.value().texture.width && original_desc.texture.height == upgraded_desc.value().texture.height); // TODO: handle resizing too...
@@ -11510,12 +11625,17 @@ namespace
          }
          // Note: this expects a "uint8_t" c array
          upgraded_resource_init_data = converted_initial_data ? initial_data->data : nullptr;
+#else
+         upgraded_resource_init_data = nullptr; // D3D12 creates come with no initial data
+#endif
 
-         return !enable_indirect_texture_format_upgrades;
+         return upgrade_directly;
       }
       return false;
    }
+#endif // DX11 || ENABLE_MINHOOK
 
+   // Shared with D3D12, where the development builds' capture forgets the buffers and textures here too
    void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
@@ -11530,18 +11650,38 @@ namespace
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       if (&device_data == nullptr)
          return;
+#if DX12 && DEVELOPMENT
+      D3D12State::RemoveBuffer(&device_data.buffer_addresses, resource);
+#if ENABLE_MINHOOK
+      {
+         const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+         device_data.texture_kinds.by_resource.erase(resource.handle);
+      }
+#endif
+#endif
+#if DX12
+      // D3D12 engines destroy transient resources (often placed ones) every frame, while the draw threads read these sets under the shared lock (the copy and view hooks): only an upgraded texture needs the
+      // exclusive one
+      {
+         const std::shared_lock lock_read(device_data.mutex);
+         if (!device_data.resource_upgrades.upgraded_resources.contains(resource.handle))
+         {
+            return;
+         }
+      }
+#endif
       std::unique_lock lock(device_data.mutex);
       // Unlinks its mirror (and the mirror views) and defers their destruction to the next present, as they may still be in flight in hooks or bound on recorded lists
       device_data.resource_upgrades.OnResourceDestroyed(resource.handle);
 
+#if DX11
       // TODO: thread safe
       int count = 0;
 #if DEVELOPMENT
       count = device_data.cb_per_view_global_buffers.erase(reinterpret_cast<ID3D11Buffer*>(resource.handle));
 #endif
+#endif
    }
-
-#endif // DX11
 
    bool OnCreateResourceView(
       reshade::api::device* device,
@@ -19987,6 +20127,21 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       if (texture_format_upgrades_type > TextureFormatUpgradesType::None || swapchain_format_upgrade_type > TextureFormatUpgradesType::None)
       {
          reshade::register_event<reshade::addon_event::create_resource_view>(OnCreateResourceView);
+#if ENABLE_MINHOOK
+         // The textures are upgraded as the game creates them (the development builds registered "init_resource" and "destroy_resource" above, for their capture)
+         if (texture_format_upgrades_type > TextureFormatUpgradesType::None)
+         {
+            reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
+#if !DEVELOPMENT
+            reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
+            reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+#endif
+            if (enable_indirect_texture_format_upgrades)
+            {
+               reshade::log::message(reshade::log::level::warning, "[Texture upgrades] Indirect upgrades (mirrors) aren't supported on D3D12 yet: its textures are upgraded directly");
+            }
+         }
+#endif
 #if !DEVELOPMENT
          reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
          reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
@@ -20190,6 +20345,16 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       if (texture_format_upgrades_type > TextureFormatUpgradesType::None || swapchain_format_upgrade_type > TextureFormatUpgradesType::None)
       {
          reshade::unregister_event<reshade::addon_event::create_resource_view>(OnCreateResourceView);
+#if ENABLE_MINHOOK
+         if (texture_format_upgrades_type > TextureFormatUpgradesType::None)
+         {
+            reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
+#if !DEVELOPMENT
+            reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
+            reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+#endif
+         }
+#endif
 #if !DEVELOPMENT
          reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
          reshade::unregister_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);

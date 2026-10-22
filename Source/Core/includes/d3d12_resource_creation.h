@@ -8,6 +8,9 @@
 // description for the three and only flag the reserved ones ("sparse_binding"). So the game's committed and placed creates are hooked on
 // ReShade's device proxy (one function per method for every proxy), where each detour sets a thread local for the length of the call:
 // ReShade fires its events inside the call, on the same thread, and "KindOf()" reads the thread local from there.
+// The creates that take castable formats (the ones of "ID3D12Device10") are noted the same way, as ReShade passes them on unchanged when an
+// add-on changes the format of the resource: a resource can only be cast to formats of its own family, so an upgraded one would make the
+// game's call fail.
 // It also holds what the root signature hook ("d3d12_root_signatures.h") shares with it: finding ReShade's device proxy, and hooking and
 // unhooking one function of it.
 
@@ -15,8 +18,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -115,22 +121,35 @@ namespace D3D12ResourceCreation
 
    // The kind of the resource the game call this thread is in creates, unknown outside of one
    inline thread_local Kind current_kind = Kind::Unknown;
+   // The number of castable formats that call passes, 0 for the ones that can't (or outside of a call)
+   inline thread_local UINT current_castable_format_count = 0;
+
+   // For the creates that have no castable formats
+   constexpr size_t NO_CASTABLE_FORMATS = (std::numeric_limits<size_t>::max)();
 
    // A function of the proxy that creates resources of a "kind", hooked once per process. "Method" is its declaration in d3d12.h, so the
-   // detour has the interface's own signature.
-   template <typename Method, size_t vtable_slot, Kind kind>
+   // detour has the interface's own signature. "castable_count_argument" is the index of its "NumCastableFormats" argument, if it has one.
+   template <typename Method, size_t vtable_slot, Kind kind, size_t castable_count_argument = NO_CASTABLE_FORMATS>
    struct Creation;
 
-   template <typename Interface, typename... Arguments, size_t vtable_slot, Kind kind>
-   struct Creation<HRESULT (STDMETHODCALLTYPE Interface::*)(Arguments...), vtable_slot, kind>
+   template <typename Interface, typename... Arguments, size_t vtable_slot, Kind kind, size_t castable_count_argument>
+   struct Creation<HRESULT (STDMETHODCALLTYPE Interface::*)(Arguments...), vtable_slot, kind, castable_count_argument>
    {
       using Function = HRESULT(STDMETHODCALLTYPE*)(Interface*, Arguments...);
       static inline D3D12ProxyHook::HookedFunction<Function> hooked;
 
       static HRESULT STDMETHODCALLTYPE Detour(Interface* device, Arguments... arguments)
       {
+         UINT castable_format_count = 0;
+         if constexpr (castable_count_argument != NO_CASTABLE_FORMATS)
+         {
+            static_assert(std::is_same_v<std::tuple_element_t<castable_count_argument, std::tuple<Arguments...>>, UINT32>, "The argument isn't a count");
+            castable_format_count = std::get<castable_count_argument>(std::tie(arguments...));
+         }
          const Kind outer_kind = std::exchange(current_kind, kind);
+         const UINT outer_castable_format_count = std::exchange(current_castable_format_count, castable_format_count);
          const HRESULT result = hooked.original(device, arguments...);
+         current_castable_format_count = outer_castable_format_count;
          current_kind = outer_kind;
          return result;
       }
@@ -151,10 +170,10 @@ namespace D3D12ResourceCreation
    using CommittedResource = Creation<decltype(&ID3D12Device::CreateCommittedResource), CREATE_COMMITTED_RESOURCE_SLOT, Kind::Committed>;
    using CommittedResource1 = Creation<decltype(&ID3D12Device4::CreateCommittedResource1), CREATE_COMMITTED_RESOURCE1_SLOT, Kind::Committed>;
    using CommittedResource2 = Creation<decltype(&ID3D12Device8::CreateCommittedResource2), CREATE_COMMITTED_RESOURCE2_SLOT, Kind::Committed>;
-   using CommittedResource3 = Creation<decltype(&ID3D12Device10::CreateCommittedResource3), CREATE_COMMITTED_RESOURCE3_SLOT, Kind::Committed>;
+   using CommittedResource3 = Creation<decltype(&ID3D12Device10::CreateCommittedResource3), CREATE_COMMITTED_RESOURCE3_SLOT, Kind::Committed, 6>;
    using PlacedResource = Creation<decltype(&ID3D12Device::CreatePlacedResource), CREATE_PLACED_RESOURCE_SLOT, Kind::Placed>;
    using PlacedResource1 = Creation<decltype(&ID3D12Device8::CreatePlacedResource1), CREATE_PLACED_RESOURCE1_SLOT, Kind::Placed>;
-   using PlacedResource2 = Creation<decltype(&ID3D12Device10::CreatePlacedResource2), CREATE_PLACED_RESOURCE2_SLOT, Kind::Placed>;
+   using PlacedResource2 = Creation<decltype(&ID3D12Device10::CreatePlacedResource2), CREATE_PLACED_RESOURCE2_SLOT, Kind::Placed, 5>;
 
    struct Hook
    {

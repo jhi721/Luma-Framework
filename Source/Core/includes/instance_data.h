@@ -698,6 +698,10 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    Reflex::DeviceData reflex; // For the first swapchain (the only one expected)
 #endif
    std::unordered_set<uint64_t> back_buffers; // From all the swapchains (whether they are upgraded or not)
+#if DX12
+   // The ones of "back_buffers" whose format family the swapchain upgrade changed (see "OnCreateSwapchain()"): only these can't take the game's copies through a buffer
+   std::unordered_set<uint64_t> upgraded_back_buffers;
+#endif
    NativeDevice* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
    reshade::api::device* reshade_device = nullptr; // Always valid as it's our parent. Not owned by this.
 #if DX11
