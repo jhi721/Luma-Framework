@@ -10,6 +10,7 @@
 // takes the copy. The creates nobody takes (ReShade's own, the ones other add-ons rebuild, other IIDs, 9on12/11on12 devices) are
 // replaced by the next one, and "Take()" never matches them to another pipeline.
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstddef>
@@ -225,24 +226,33 @@ namespace D3D12PsoCapture
    // "ID3D12Device2::CreatePipelineState" follows IUnknown (3 methods), ID3D12Object (4), ID3D12Device (37) and ID3D12Device1 (3)
    constexpr size_t CREATE_PIPELINE_STATE_SLOT = 47;
 
-   // Shared by the devices, hooked once per process
    struct Hook
    {
-      std::shared_mutex mutex;
       void* target = nullptr;
       CreatePipelineStateFunction original = nullptr;
       // The target's start right after our hook went in: different later means another module hooked over it
       std::array<uint8_t, 8> hooked_prologue = {};
    };
-   inline Hook hook;
-   // The last pipeline this thread created through the hook, if it could be copied
+   // The functions the devices' vtables lead "CreatePipelineState" to, each hooked once per process. Another device class has its own
+   // (a debug layer's, another D3D12Core's), and so does a module that patches the runtime's vtable after we hooked the function in it.
+   // Such a patch calls the function it replaced, so its creates are captured twice, the outer capture (the stream ReShade passed) last.
+   constexpr size_t MAX_HOOKS = 4;
+   struct Hooks
+   {
+      std::shared_mutex mutex;
+      std::array<Hook, MAX_HOOKS> slots;
+   };
+   inline Hooks hooks;
+   // The last pipeline this thread created through a hook, if it could be copied
    inline thread_local std::unique_ptr<Stream> pending;
    // Set while this thread creates a pipeline of ours, which isn't to be captured
    inline thread_local bool creating_own = false;
 
-   inline HRESULT STDMETHODCALLTYPE Detour(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pipeline)
+   // One per hook, as each calls its own trampoline
+   template <size_t Index>
+   HRESULT STDMETHODCALLTYPE Detour(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pipeline)
    {
-      const HRESULT result = hook.original(device, desc, riid, pipeline);
+      const HRESULT result = hooks.slots[Index].original(device, desc, riid, pipeline);
       if (SUCCEEDED(result) && desc && pipeline && *pipeline && !creating_own)
       {
          pending = Copy(*desc);
@@ -253,9 +263,13 @@ namespace D3D12PsoCapture
       }
       return result;
    }
+   constexpr auto DETOURS = []<size_t... Indices>(std::index_sequence<Indices...>)
+   {
+      return std::array<CreatePipelineStateFunction, MAX_HOOKS>{&Detour<Indices>...};
+   }(std::make_index_sequence<MAX_HOOKS>());
 
-   // True if the hook covers the device's pipelines. It's put on the function of the first device's class, once per process: a device
-   // of another class has its own function, which isn't covered (and its pipelines get no capture).
+   // True if the device's pipelines are captured: its function is hooked, by now or for an earlier device. False if MinHook failed or
+   // the hooks are all taken.
    inline bool Install(ID3D12Device* native_device)
    {
       com_ptr<ID3D12Device2> device2;
@@ -264,12 +278,13 @@ namespace D3D12PsoCapture
          return false;
       }
       void* const target = (*reinterpret_cast<void***>(device2.get()))[CREATE_PIPELINE_STATE_SLOT];
-      const std::unique_lock lock(hook.mutex);
-      if (hook.target)
+      const std::unique_lock lock(hooks.mutex);
+      if (std::ranges::find(hooks.slots, target, &Hook::target) != hooks.slots.end())
       {
-         return hook.target == target;
+         return true;
       }
-      if (!InitializeMinHook() || MH_CreateHook(target, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&hook.original)) != MH_OK)
+      const auto hook = std::ranges::find(hooks.slots, nullptr, &Hook::target);
+      if (hook == hooks.slots.end() || !InitializeMinHook() || MH_CreateHook(target, reinterpret_cast<void*>(DETOURS[hook - hooks.slots.begin()]), reinterpret_cast<void**>(&hook->original)) != MH_OK)
       {
          return false;
       }
@@ -278,29 +293,37 @@ namespace D3D12PsoCapture
          MH_RemoveHook(target);
          return false;
       }
-      std::memcpy(hook.hooked_prologue.data(), target, hook.hooked_prologue.size());
-      hook.target = target;
+      std::memcpy(hook->hooked_prologue.data(), target, hook->hooked_prologue.size());
+      hook->target = target;
       return true;
    }
 
-   // Only Luma's hook (see "includes/minhook.h"). False if another module hooked over it: Luma's then stays, as the other hook's
-   // trampoline jumps to "Detour", and the addon is pinned like "Reflex::SleepHook::Remove()" does (too late if "DllMain" is unloading it)
+   // Only Luma's hooks (see "includes/minhook.h"). False if another module hooked over one: Luma's then stays, as the other hook's
+   // trampoline jumps to its detour, and the addon is pinned like "Reflex::SleepHook::Remove()" does (too late if "DllMain" is unloading it)
    inline bool Remove()
    {
-      const std::unique_lock lock(hook.mutex);
-      if (!hook.target)
+      const std::unique_lock lock(hooks.mutex);
+      bool removed_all = true;
+      for (Hook& hook : hooks.slots)
       {
-         return true;
+         if (!hook.target)
+         {
+            continue;
+         }
+         if (std::memcmp(hook.target, hook.hooked_prologue.data(), hook.hooked_prologue.size()) != 0)
+         {
+            removed_all = false;
+            continue;
+         }
+         MH_RemoveHook(hook.target);
+         hook.target = nullptr;
       }
-      if (std::memcmp(hook.target, hook.hooked_prologue.data(), hook.hooked_prologue.size()) != 0)
+      if (!removed_all)
       {
          HMODULE module = nullptr;
-         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&Detour), &module);
-         return false;
+         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(DETOURS[0]), &module);
       }
-      MH_RemoveHook(hook.target);
-      hook.target = nullptr;
-      return true;
+      return removed_all;
    }
 
    // The capture of the pipeline this thread created last, if it's "pipeline" (a capture of another one is left for the next create
@@ -315,7 +338,7 @@ namespace D3D12PsoCapture
    }
 
    // Creates a pipeline of ours from a stream (a clone's, from a copy of "Stream::bytes"), which isn't captured. It calls through the
-   // device, not the hook's trampoline, as the trampoline only fits the class of the device that was hooked.
+   // device, not a trampoline: a trampoline is one hooked function's, which can be another device class's or the one a vtable patch calls.
    inline HRESULT Create(ID3D12Device2* device, std::span<std::byte> stream, ID3D12PipelineState** pipeline)
    {
       const D3D12_PIPELINE_STATE_STREAM_DESC desc = {.SizeInBytes = stream.size(), .pPipelineStateSubobjectStream = stream.data()};
