@@ -6,8 +6,9 @@
 #if ENABLE_LUMA_TAA
 namespace LumaTAA
 {
-   // "TAA_QUALITY" of the resolve: 0 Low, 1 Medium (adds the flickering analysis), 2 High (adds the 2x history), 3 Ultra (adds a depth
-   // clip, with a previous depth reconstruction pass). Core's UI sets it (saved as "LumaTAAQuality"); "UpdateSettings()" applies it.
+   // "TAA_QUALITY" of the resolve: 0 Low, 1 Medium (adds the flickering analysis and a depth clip against the previous frame's depth),
+   // 2 High (adds the 2x history), 3 Ultra (adds a depth clip with a previous depth reconstruction pass). Core's UI sets it (saved as
+   // "LumaTAAQuality"); "UpdateSettings()" applies it.
    inline std::atomic<int> quality = 2;
    constexpr const char* quality_names[] = {"Low", "Medium", "High", "Ultra"};
    constexpr uint32_t resolve_shader_hashes[] = {Math::CompileTimeStringHash("Luma TAA Low CS"), Math::CompileTimeStringHash("Luma TAA Medium CS"), Math::CompileTimeStringHash("Luma TAA High CS"), Math::CompileTimeStringHash("Luma TAA Ultra CS")};
@@ -60,8 +61,9 @@ namespace LumaTAA
       com_ptr<ID3D11Texture2D> reconstructed_depth; // Ultra only, R32_UINT
       com_ptr<ID3D11ShaderResourceView> reconstructed_depth_srv;
       com_ptr<ID3D11UnorderedAccessView> reconstructed_depth_uav;
-      // Thin feature lock frames left, or a moving pixel's speed for the flickering analysis (R8_UINT; R16_UINT from Medium, whose high
-      // byte holds the flickering analysis' darkest luminance average), alternating with the history
+      // Thin feature lock frames left, or a moving pixel's speed for the flickering analysis (R8_UINT; R32_UINT from Medium, whose second
+      // byte holds the flickering analysis' darkest luminance average and high 16 bits the depth clip's farthest depth), alternating with
+      // the history
       com_ptr<ID3D11Texture2D> locks[2];
       com_ptr<ID3D11ShaderResourceView> lock_srvs[2];
       com_ptr<ID3D11UnorderedAccessView> lock_uavs[2];
@@ -170,7 +172,7 @@ namespace LumaTAA
          const CD3D11_TEXTURE2D_DESC history_desc(DXGI_FORMAT_R16G16B16A16_FLOAT, settings_data.output_width * history_scale, settings_data.output_height * history_scale, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          const CD3D11_TEXTURE2D_DESC reconstructed_depth_desc(DXGI_FORMAT_R32_UINT, settings_data.render_width, settings_data.render_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          const CD3D11_TEXTURE2D_DESC flicker_desc(DXGI_FORMAT_R11G11B10_FLOAT, settings_data.output_width, settings_data.output_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         const CD3D11_TEXTURE2D_DESC lock_desc((level >= flicker_quality ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R8_UINT), settings_data.output_width, settings_data.output_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         const CD3D11_TEXTURE2D_DESC lock_desc((level >= flicker_quality ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8_UINT), settings_data.output_width, settings_data.output_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          const CD3D11_BUFFER_DESC cbuffer_desc(sizeof(CBData), D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
          bool created = SUCCEEDED(device->CreateBuffer(&cbuffer_desc, nullptr, &taa_data->cbuffer));
          for (int i = 0; i < 2 && created; i++)
