@@ -135,12 +135,8 @@
 #elif !defined(ENABLE_REFLEX)
 #define ENABLE_REFLEX 1
 #endif // ENABLE_REFLEX
-// scRGB games (the fp16 back buffer the game, ReShade and Luma see) present HDR10 PQ through a proxy back buffer (see "includes/swapchain_proxy.hpp").
-// Needs MinHook; without it the swapchain stays fp16 scRGB.
-#if !ENABLE_MINHOOK
-#undef ENABLE_SWAPCHAIN_PROXY
-#define ENABLE_SWAPCHAIN_PROXY 0
-#elif !defined(ENABLE_SWAPCHAIN_PROXY)
+// scRGB games (the fp16 back buffer the game draws into) present HDR10 PQ through a proxy back buffer (see "includes/swapchain_proxy.hpp")
+#ifndef ENABLE_SWAPCHAIN_PROXY
 #define ENABLE_SWAPCHAIN_PROXY 1
 #endif // ENABLE_SWAPCHAIN_PROXY
 #ifndef PROJECT_NAME
@@ -3353,14 +3349,31 @@ namespace
       entry->factory = nullptr;
       CreateDXGIFactory1(IID_PPV_ARGS(&entry->factory));
 
-      HRESULT hr = native_swapchain3->SetColorSpace1(hdr_enabled_window_display ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+      const DXGI_COLOR_SPACE_TYPE color_space = (hdr_enabled_window_display ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+      const reshade::api::color_space runtime_color_space = (hdr_enabled_window_display ? reshade::api::color_space::hdr10_st2084 : reshade::api::color_space::srgb_nonlinear);
+      HRESULT hr = native_swapchain3->SetColorSpace1(color_space);
       ASSERT_ONCE(SUCCEEDED(hr));
-      // SpecialK and ReShade use this private data GUID to track the current swap chain color space. ReShade must keep treating the proxy as scRGB.
+      // SpecialK and ReShade use this private data GUID to track the current swap chain color space (ReShade's effect runtime reads it when it initializes)
       constexpr GUID SKID_SwapChainColorSpace = {0x18b57e4, 0x1493, 0x4953, {0xad, 0xf2, 0xde, 0x6d, 0x99, 0xcc, 0x5, 0xe5}}; // {018B57E4-1493-4953-ADF2-DE6D99CC05E5}
-      constexpr DXGI_COLOR_SPACE_TYPE proxy_color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-      native_swapchain3->SetPrivateData(SKID_SwapChainColorSpace, sizeof(proxy_color_space), &proxy_color_space);
+      native_swapchain3->SetPrivateData(SKID_SwapChainColorSpace, sizeof(color_space), &color_space);
+      if (entry->runtime)
+      {
+         entry->runtime->set_color_space(runtime_color_space);
+      }
    }
 #endif
+
+   // The back buffer the game draws into: the proxy of a proxied swapchain (see "ENABLE_SWAPCHAIN_PROXY")
+   com_ptr<ID3D11Texture2D> GetGameBackBuffer(IDXGISwapChain* native_swapchain)
+   {
+      com_ptr<ID3D11Texture2D> back_buffer;
+#if ENABLE_SWAPCHAIN_PROXY
+      if (SwapchainProxy::QueryProxy(native_swapchain, IID_PPV_ARGS(&back_buffer)))
+         return back_buffer;
+#endif
+      native_swapchain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+      return back_buffer;
+   }
 
    void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize)
    {
@@ -3370,7 +3383,7 @@ namespace
 
       IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
 #if ENABLE_SWAPCHAIN_PROXY
-      // Before anything gets the back buffers, so Core's handles are the proxy's
+      // Before the game gets the back buffer
       const bool swapchain_proxied = IsSwapchainProxyEnabled() && SwapchainProxy::Register(native_swapchain);
       if (IsSwapchainProxyEnabled() && !swapchain_proxied)
       {
@@ -3379,13 +3392,9 @@ namespace
 #else
       constexpr bool swapchain_proxied = false;
 #endif
-#if 0
-      DXGI_SWAP_CHAIN_DESC desc;
-      native_swapchain->GetDesc(&desc);
-      const size_t back_buffer_count = desc.BufferCount;
-#else // Always 1 on DX10/11, even if the swapchain desc says 2...
-      const size_t back_buffer_count = swapchain->get_back_buffer_count();
-#endif
+      // What the game draws into (DX10/11 have one back buffer, even if the swapchain desc says 2)
+      const com_ptr<ID3D11Texture2D> game_back_buffer = GetGameBackBuffer(native_swapchain);
+      const uint64_t game_back_buffer_handle = reinterpret_cast<uintptr_t>(game_back_buffer.get());
       auto* device = swapchain->get_device();
       ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
       DeviceData& device_data = *device->get_private_data<DeviceData>();
@@ -3393,14 +3402,11 @@ namespace
       ASSERT_ONCE(&device_data != nullptr); // Hacky nullptr check (should ever be able to happen)
 
 #if DEVELOPMENT
-      const reshade::api::resource_desc resource_desc = device->get_resource_desc(swapchain->get_back_buffer(0));
+      const reshade::api::resource_desc resource_desc = device->get_resource_desc({game_back_buffer_handle});
       if (last_attempted_upgraded_resource_creation_format != resource_desc.texture.format) // Upgraded
       {
          const std::unique_lock lock(device_data.mutex);
-         for (uint32_t index = 0; index < back_buffer_count; index++)
-         {
-            device_data.resource_upgrades.original_upgraded_resources_formats[swapchain->get_back_buffer(index).handle] = last_attempted_upgraded_resource_creation_format;
-         }
+         device_data.resource_upgrades.original_upgraded_resources_formats[game_back_buffer_handle] = last_attempted_upgraded_resource_creation_format;
       }
 #endif
 
@@ -3412,21 +3418,16 @@ namespace
 
       {
          const std::unique_lock lock(swapchain_data.mutex); // Not much need to lock this on its own creation, but let's do it anyway...
-         for (uint32_t index = 0; index < back_buffer_count; index++)
+         swapchain_data.back_buffers.emplace(game_back_buffer_handle);
+
+         com_ptr<ID3D11RenderTargetView> display_composition_rtv;
+         if (force_create_swapchain_rtvs)
          {
-            auto buffer = swapchain->get_back_buffer(index);
-            swapchain_data.back_buffers.emplace(buffer.handle);
-
-            com_ptr<ID3D11RenderTargetView> display_composition_rtv;
-            if (force_create_swapchain_rtvs)
-            {
-               ID3D11Texture2D* back_buffer = (ID3D11Texture2D*)buffer.handle;
-               HRESULT hr = native_device->CreateRenderTargetView(back_buffer, nullptr, &display_composition_rtv);
-               ASSERT_ONCE(SUCCEEDED(hr));
-            }
-
-            swapchain_data.display_composition_rtvs.push_back(display_composition_rtv);
+            HRESULT hr = native_device->CreateRenderTargetView(game_back_buffer.get(), nullptr, &display_composition_rtv);
+            ASSERT_ONCE(SUCCEEDED(hr));
          }
+
+         swapchain_data.display_composition_rtvs.push_back(display_composition_rtv);
       }
 
       {
@@ -3438,11 +3439,7 @@ namespace
          device_data.reflex.swapchain.compare_exchange_strong(expected, swapchain);
 #endif
 
-         for (uint32_t index = 0; index < back_buffer_count; index++)
-         {
-            auto buffer = swapchain->get_back_buffer(index);
-            device_data.back_buffers.emplace(buffer.handle);
-         }
+         device_data.back_buffers.emplace(game_back_buffer_handle);
       }
 
       // We assume there's only one swapchain (there is!), given that the resolution would theoretically be by swapchain and not device.
@@ -3473,7 +3470,7 @@ namespace
       // so we don't support changing this shader define live, but if needed, we could always move these allocations
       if (GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 3)
       {
-         device_data.ui_texture = CloneTexture<ID3D11Texture2D>(native_device, (ID3D11Texture2D*)swapchain->get_back_buffer(0).handle, ui_separation_format, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, true, false, nullptr); // Unordered Access is not needed until proven otherwise
+         device_data.ui_texture = CloneTexture<ID3D11Texture2D>(native_device, game_back_buffer.get(), ui_separation_format, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, true, false, nullptr); // Unordered Access is not needed until proven otherwise
          native_device->CreateRenderTargetView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_rtv);
          native_device->CreateShaderResourceView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_srv);
       }
@@ -3669,7 +3666,7 @@ namespace
       ASSERT_ONCE(&device_data != nullptr); // Hacky nullptr check (should ever be able to happen)
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
 #if ENABLE_SWAPCHAIN_PROXY
-      // Also when resizing: the real buffer can't have views left, the proxy is recreated at the new size by the next "GetBuffer()"
+      // Also when resizing: the real buffer can't have views left, "Register()" recreates the proxy at the new size
       SwapchainProxy::Unregister((IDXGISwapChain*)(swapchain->get_native()));
 #endif
       {
@@ -5983,15 +5980,11 @@ namespace
       }
    }
 
-#if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_REFLEX
    void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
    {
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
-#if ENABLE_SWAPCHAIN_PROXY
-      SwapchainProxy::real_buffer_visible = false;
-#endif
-#if ENABLE_REFLEX
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
       // Only the device's first swapchain (the only one expected), so there's one sleep per frame
       if (device_data.reflex.swapchain != swapchain)
@@ -6005,7 +5998,6 @@ namespace
          reshade::log::message(reshade::log::level::info, std::format("[Reflex] mode {} state {}{}{}: latency {:.2f} ms, GPU {:.2f} ms, GPU frame {:.2f} ms ({} frames, {} markers), Luma sleep {:.2f} ms/frame, driver low latency {} game sleep {}", int(reflex_mode), Reflex::state_names[int(device_data.reflex.state)], device_data.reflex.other_reason ? " - " : "", device_data.reflex.other_reason ? device_data.reflex.other_reason : "", stats.latency_ms, stats.gpu_ms, stats.gpu_frame_ms, stats.frames, stats.other_markers ? "other" : "Luma's", stats.sleep_ms, int(stats.driver_low_latency), int(stats.driver_game_sleep)).c_str());
       }
 #endif
-#endif // ENABLE_REFLEX
    }
 #endif
 
@@ -6102,9 +6094,9 @@ namespace
 #endif // DEVELOPMENT
 
 #if ENABLE_SWAPCHAIN_PROXY
-   // Encodes the scRGB proxy into the real HDR10 PQ (or SDR sRGB) back buffer, the last thing drawn in the frame:
-   // after the game, the display composition and ReShade's effects and GUI wrote the proxy.
-   // Independent of "force_disable_display_composition", nothing else writes the real buffer.
+   // Encodes the scRGB proxy into the real HDR10 PQ (or SDR sRGB) back buffer, the last thing Luma draws in the frame: after the game
+   // and the display composition wrote the proxy, before ReShade's effects and overlay, which draw on the real buffer.
+   // Independent of "force_disable_display_composition", nothing else writes the real buffer before ReShade.
    void DrawSwapchainEncode(reshade::api::device* device, reshade::api::command_list* cmd_list, IDXGISwapChain* native_swapchain, HWND hwnd)
    {
       DeviceData& device_data = *device->get_private_data<DeviceData>();
@@ -6123,10 +6115,8 @@ namespace
             }
          }
 
-         // The proxy might not have been requested yet (this creates it)
-         com_ptr<ID3D11Texture2D> proxy;
-         native_swapchain->GetBuffer(0, IID_PPV_ARGS(&proxy));
-         const com_ptr<ID3D11Texture2D> real_buffer = SwapchainProxy::GetRealBackBuffer(native_swapchain);
+         com_ptr<ID3D11Texture2D> real_buffer;
+         native_swapchain->GetBuffer(0, IID_PPV_ARGS(&real_buffer));
          ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
          if (real_buffer && entry->real_buffer.get() != real_buffer.get())
          {
@@ -6162,18 +6152,15 @@ namespace
                ADD_OVERLAY_WARNING(std::format("The \"Luma_SwapchainEncode\" shader is missing from the \"{}\" folder or failed to compile, the image will be black.", NAME));
             }
          }
-
-         // Overlays hooking "Present()" (and the rest of this present call) get the real buffer
-         SwapchainProxy::real_buffer_visible = true;
       }
    }
 
-   // ReShade only fires "reshade_present" for swapchains with an initialized effect runtime (e.g. not for ones smaller than 160x120)
+   // ReShade's effect runtime draws on the real buffer, so it's told when its color space changes (see "UpdateSwapchainProxyOutput()")
    void OnInitEffectRuntime(reshade::api::effect_runtime* runtime)
    {
       if (SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(runtime->get_native())))
       {
-         entry->has_effect_runtime = true;
+         entry->runtime = runtime;
       }
    }
 
@@ -6181,7 +6168,7 @@ namespace
    {
       if (SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(runtime->get_native())))
       {
-         entry->has_effect_runtime = false;
+         entry->runtime = nullptr;
       }
    }
 #endif
@@ -6202,11 +6189,6 @@ namespace
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
-
-#if ENABLE_SWAPCHAIN_PROXY
-      // "finish_present" doesn't run if the previous present failed
-      SwapchainProxy::real_buffer_visible = false;
-#endif
 
 #if ENABLE_REFLEX
       if (device_data.reflex.markers && device_data.reflex.swapchain == swapchain)
@@ -6296,16 +6278,8 @@ namespace
          {
             IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
 
-            UINT back_buffer_index = 0;
-            com_ptr<IDXGISwapChain3> native_swapchain3;
-            // The cast pointer is actually the same, we are just making sure the type is right (it should always be).
-            // This would always be 1 in DX11, even if two buffers were requested.
-            if (SUCCEEDED(native_swapchain->QueryInterface(&native_swapchain3)))
-            {
-               back_buffer_index = native_swapchain3->GetCurrentBackBufferIndex();
-            }
-            com_ptr<ID3D11Texture2D> back_buffer;
-            native_swapchain->GetBuffer(back_buffer_index, IID_PPV_ARGS(&back_buffer));
+            constexpr UINT back_buffer_index = 0; // See "GetGameBackBuffer()"
+            com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain);
             assert(back_buffer != nullptr && swapchain_data.back_buffers.size() >= back_buffer_index + 1);
             assert(swapchain_data.display_composition_rtvs.size() >= back_buffer_index + 1);
 
@@ -6729,10 +6703,7 @@ namespace
       game->OnPresent(native_device, device_data);
 
 #if ENABLE_SWAPCHAIN_PROXY
-      if (const SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(swapchain->get_native())); entry && !entry->has_effect_runtime)
-      {
-         DrawSwapchainEncode(queue->get_device(), queue->get_immediate_command_list(), (IDXGISwapChain*)(swapchain->get_native()), (HWND)(swapchain->get_hwnd()));
-      }
+      DrawSwapchainEncode(queue->get_device(), queue->get_immediate_command_list(), (IDXGISwapChain*)(swapchain->get_native()), (HWND)(swapchain->get_hwnd()));
 #endif
 
 #if DEVELOPMENT
@@ -11053,10 +11024,6 @@ namespace
       {
          if (!block_draw_until_device_custom_shaders_creation) s_mutex_shader_objects.unlock_shared();
       }
-
-#if ENABLE_SWAPCHAIN_PROXY
-      DrawSwapchainEncode(runtime->get_device(), runtime->get_command_queue()->get_immediate_command_list(), (IDXGISwapChain*)(runtime->get_native()), (HWND)(runtime->get_hwnd()));
-#endif
    }
 
    void ForceToggleShaders(reshade::api::effect_runtime* runtime, bool enabled)
@@ -12673,9 +12640,7 @@ namespace
                               // Not fully safe, but it should do for almost all cases
                               reshade::api::swapchain* swapchain = *device_data.swapchains.begin();
                               IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
-                              UINT back_buffer_index = swapchain->get_current_back_buffer_index();
-                              com_ptr<ID3D11Texture2D> back_buffer;
-                              native_swapchain->GetBuffer(back_buffer_index, IID_PPV_ARGS(&back_buffer));
+                              const com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain);
 
                               std::string backbuffer_hash = std::to_string(std::hash<void*>{}(back_buffer.get()));
                               if (highlighted_resource == backbuffer_hash)
@@ -16474,8 +16439,7 @@ namespace
                   {
                      if (auto native_swapchain = device_data.GetMainNativeSwapchain())
                      {
-                        com_ptr<ID3D11Texture2D> back_buffer;
-                        native_swapchain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+                        const com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain.get());
                         ID3D11Device* native_device = (ID3D11Device*)runtime->get_device()->get_native();
                         device_data.ui_texture = CloneTexture<ID3D11Texture2D>(native_device, back_buffer.get(), ui_separation_format, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, true, false, nullptr);
                         native_device->CreateRenderTargetView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_rtv);
@@ -17552,7 +17516,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
-#if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_REFLEX
       reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
 #endif
 
@@ -17686,7 +17650,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
-#if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_REFLEX
       reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
 #endif
 
@@ -17707,16 +17671,17 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 
       reshade::unregister_addon(h_module);
 
-#if ENABLE_MINHOOK
-      // The game's and Core's hooks are removed by now (see "includes/minhook.h"), this frees its heap. Not needed at process exit.
+      // Not needed at process exit
       if (lpv_reserved == nullptr)
       {
 #if ENABLE_SWAPCHAIN_PROXY
          SwapchainProxy::RemoveHooks();
 #endif
+#if ENABLE_MINHOOK
+         // The game's and Core's hooks are removed by now (see "includes/minhook.h"), this frees its heap
          UninitializeMinHook();
-      }
 #endif
+      }
 
       // In case our threads are still not joined, detach them and safely do a busy loop
       // until they finished running, so we don't risk them reading/writing to stale memory.

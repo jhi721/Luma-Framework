@@ -1421,7 +1421,9 @@ namespace Mcp
          if (view && (*view == "swapchain" || *view == "ui"))
          {
             const bool back_buffer = *view == "swapchain";
-            ID3D11Resource* resource = back_buffer ? reinterpret_cast<ID3D11Resource*>(swapchain->get_current_back_buffer().handle) : device_data.ui_texture.get();
+            // What the game drew into (the proxy of a proxied swapchain)
+            const com_ptr<ID3D11Texture2D> texture = (back_buffer ? GetGameBackBuffer((IDXGISwapChain*)(swapchain->get_native())) : device_data.ui_texture);
+            ID3D11Resource* resource = texture.get();
             if (!resource)
             {
                job->error = back_buffer ? "The swapchain has no current back buffer" : "There's no separate UI texture (UI separation is off, or the UI hasn't drawn yet)";
