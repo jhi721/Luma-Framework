@@ -1430,25 +1430,6 @@ namespace
       constexpr bool has_serialized_root_signature = false;
 #endif
 
-      // The device logs an error if asked to make a root signature from a shader that doesn't embed one (a "RTS0" chunk)
-      const auto embeds_root_signature = [](const reshade::api::shader_desc& shader)
-      {
-         const auto* header = static_cast<const Shader::DXBCHeader*>(shader.code);
-         if (shader.code_size < sizeof(Shader::DXBCHeader) || memcmp(header->format_name, "DXBC", 4) != 0 || sizeof(Shader::DXBCHeader) + header->chunk_count * sizeof(uint32_t) > shader.code_size)
-         {
-            return false;
-         }
-         for (uint32_t i = 0; i < header->chunk_count; ++i)
-         {
-            const uint32_t offset = header->chunk_offsets[i];
-            if (size_t(offset) + sizeof(Shader::DXBCChunk) <= shader.code_size && memcmp(&reinterpret_cast<const Shader::DXBCChunk*>(static_cast<const uint8_t*>(shader.code) + offset)->type_name, "RTS0", 4) == 0)
-            {
-               return true;
-            }
-         }
-         return false;
-      };
-
       // A pipeline whose shaders embed their root signature has no object for it, and the replacements (compiled from HLSL) don't carry it:
       // its clone needs one, made from the game's shaders and kept for the next clones. A serialized root signature in the stream is its own.
       if (cached_pipeline->layout.handle == 0 && !has_serialized_root_signature && !cached_pipeline->root_signature)
@@ -1457,7 +1438,8 @@ namespace
          {
             const reshade::api::pipeline_subobject& subobject = cached_pipeline->subobjects_cache[i];
             const auto* original = static_cast<const reshade::api::shader_desc*>(subobject.data);
-            if (!ToStreamShaderType(subobject.type) || !embeds_root_signature(*original))
+            // The device logs an error if asked to make a root signature from a shader that doesn't embed one (a "RTS0" chunk)
+            if (!ToStreamShaderType(subobject.type) || Shader::FindChunk(original->code, original->code_size, "RTS0") == nullptr)
             {
                continue;
             }
