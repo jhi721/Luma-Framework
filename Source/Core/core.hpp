@@ -3210,17 +3210,21 @@ namespace
       // It can apparently happen that in DX11 the device destructor callback is sent before its pipelines, so make sure we empty the memory before.
       // Note: ReShade has fixed this bug now, but as of 6.6 it simply skips ever calling the destroy event for these.
       {
-         std::unordered_map<uint64_t, Shader::CachedPipeline*> pipeline_cache_by_pipeline_handle;
+         std::vector<uint64_t> pipeline_handles;
          {
-            const std::unique_lock lock(s_mutex_generic); // Nobody should be accessing our device data at this point but who knows
-            pipeline_cache_by_pipeline_handle = device_data.pipeline_cache_by_pipeline_handle;
-            device_data.pipeline_cache_by_pipeline_handle.clear(); // Redundant but, let's do it anyway (change the mutex lock to shared if you change this)
-            pipeline_cache_generation++;
+            const std::shared_lock lock(s_mutex_generic); // Nobody should be accessing our device data at this point but who knows
+            for (const uint64_t pipeline_handle : device_data.pipeline_cache_by_pipeline_handle | std::views::keys)
+            {
+               pipeline_handles.push_back(pipeline_handle);
+            }
          }
-         for (auto& pipeline_pair : pipeline_cache_by_pipeline_handle)
+         // "OnDestroyPipeline()" tears down what we cache for a pipeline (its subobjects, clones and references) and removes it from the maps, so it needs it in them
+         for (const uint64_t pipeline_handle : pipeline_handles)
          {
-            OnDestroyPipeline(device, reshade::api::pipeline{ pipeline_pair.first });
+            OnDestroyPipeline(device, reshade::api::pipeline{pipeline_handle});
          }
+         const std::unique_lock lock(s_mutex_generic);
+         pipeline_cache_generation++;
       }
 
       {
