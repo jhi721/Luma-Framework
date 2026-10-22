@@ -261,6 +261,7 @@ namespace Mcp
       std::optional<TrackBufferSelection> saved_track_buffer;
 #else
       std::optional<D3D12Readback::Target> readback_target; // Armed again for "frames" series and for copies whose command list was reset unexecuted
+      std::string written_resource;                         // Copy, resolve and clear targets: the frame capture's hash of the resource they wrote
 #endif
 
       Job()
@@ -479,6 +480,8 @@ namespace Mcp
    // In "TraceDrawCallData::TraceDrawCallType" and "TraceDrawCallData::CopyKind" order
    constexpr const char* trace_type_names[] = {"shader", "copy", "clear", "bind_pipeline", "bind_resource", "cpu_read", "cpu_write", "present", "create_command_list", "append_command_list", "reset_command_list", "flush_command_list", "custom"};
    constexpr const char* copy_kind_names[] = {"resource", "region", "resolve", "buffer_region", "buffer_to_texture", "texture_to_buffer"};
+   // In "TraceDrawCallData::ClearKind" order (D3D12)
+   constexpr const char* clear_kind_names[] = {"render_target", "depth_stencil", "unordered_access"};
 
    const Shader::CachedPipeline* FindPipeline(const DeviceData& device_data, uint64_t pipeline_handle)
    {
@@ -751,6 +754,7 @@ namespace Mcp
       // D3D12 captures no blend factor, only the clear entries have values there
       if (entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
       {
+         w->Field("clear_kind", EnumName(clear_kind_names, size_t(entry.clear_kind)));
          w->Key("clear_values").BeginArray().Value(entry.blend_factor[0]).Value(entry.blend_factor[1]).Value(entry.blend_factor[2]).Value(entry.blend_factor[3]).EndArray();
       }
 #endif
@@ -1754,9 +1758,24 @@ namespace Mcp
       return true;
    }
 #else
-   // The D3D12 counterpart of the D3D11 "ResolveTarget()": the draw a readback copies, the entry "index" of the last capture or the
-   // "instance"th draw with "hash". A capture entry gives its pipeline, its recording thread and its instance among that thread's draws
-   // with it: every D3D12 command list is like a D3D11 deferred context.
+   // Why a copy or clear entry can't be read back (it goes after "Trace entry <index> "), null if it can
+   const char* UnreadableWrite(const TraceDrawCallData& entry)
+   {
+      if (entry.rt_type_name[0] == "Buffer")
+         return "wrote a buffer, and buffers aren't read back (like on D3D11), only textures";
+      if (entry.copy_info.kind == TraceDrawCallData::CopyKind::BufferToTexture)
+         return "is an upload, and uploads can't be read back: ReShade doesn't pass their row pitch, so they can't be re-issued";
+      if (entry.clear_kind == TraceDrawCallData::ClearKind::UnorderedAccess)
+         return "is an unordered access view clear, and those can't be read back: ReShade passes no GPU descriptor handle, so they can't be re-issued";
+      return nullptr;
+   }
+
+   // In "D3D12Readback::WriteKind" order, what a copy, resolve or clear target is named in the result ("written_by")
+   constexpr const char* written_by_names[] = {"copy", "region copy", "resolve", "render target clear", "depth stencil clear"};
+
+   // The D3D12 counterpart of the D3D11 "ResolveTarget()": the command a readback copies the output of, the entry "index" of the last capture or
+   // the "instance"th draw with "hash". A capture entry gives its pipeline (or, for a copy, resolve or clear, what it did), its recording thread
+   // and its instance among that thread's commands equal to it: every D3D12 command list is like a D3D11 deferred context.
    bool ResolveTarget(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, std::optional<size_t> index, D3D12Readback::Target* target)
    {
       const std::shared_lock lock_generic(s_mutex_generic);
@@ -1771,6 +1790,64 @@ namespace Mcp
             return false;
          }
          const TraceDrawCallData& entry = entries[*index];
+         if ((entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource || entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource) && target->kind != D3D12Readback::Kind::ConstantBuffer)
+         {
+            // What an entry did as "ReadbackCopyOrClear()" sees the command, nothing for the entries that aren't read back
+            const auto write_of = [](const TraceDrawCallData& other) -> D3D12Readback::Write
+            {
+               using WriteKind = D3D12Readback::WriteKind;
+               using DepthStateType = TraceDrawCallData::DepthStateType;
+               const D3D12State::ViewInfo& written = other.rt_view[0];
+               if (other.type == TraceDrawCallData::TraceDrawCallType::ClearResource && !UnreadableWrite(other))
+               {
+                  const bool is_depth_clear = other.clear_kind == TraceDrawCallData::ClearKind::DepthStencil;
+                  const uint8_t planes = (is_depth_clear ? ((other.depth_state == DepthStateType::WriteOnly ? 1 : 0) | (other.stencil_state == DepthStateType::WriteOnly ? 2 : 0)) : 0);
+                  return {.resource = written.resource, .kind = (is_depth_clear ? WriteKind::ClearDepthStencil : WriteKind::ClearRenderTarget), .level = written.first_level, .layer = written.first_layer, .planes = planes};
+               }
+               if (other.type == TraceDrawCallData::TraceDrawCallType::CopyResource && !UnreadableWrite(other))
+               {
+                  switch (other.copy_info.kind)
+                  {
+                  case TraceDrawCallData::CopyKind::Resource:
+                     return {.resource = written.resource, .source = other.copy_source, .kind = WriteKind::CopyResource};
+                  case TraceDrawCallData::CopyKind::Region:
+                     return {.resource = written.resource, .source = other.copy_source, .kind = WriteKind::CopyRegion, .subresource = other.copy_info.dest_subresource};
+                  case TraceDrawCallData::CopyKind::Resolve:
+                     return {.resource = written.resource, .source = other.copy_source, .kind = WriteKind::Resolve, .subresource = other.copy_info.dest_subresource, .resolve_format = other.copy_info.resolve_format};
+                  default:
+                     break; // Buffer copies and uploads, refused above
+                  }
+               }
+               return {};
+            };
+            if (const char* refusal = UnreadableWrite(entry))
+            {
+               job->error = std::format("Trace entry {} {}", *index, refusal);
+               return false;
+            }
+            if (target->kind == D3D12Readback::Kind::UnorderedAccess || target->slot != 0)
+            {
+               job->error = std::format("Trace entry {} is a copy, resolve or clear: it has one target (slot 0), read as rtv, depth or stencil, and no unordered access view", *index);
+               return false;
+            }
+            const D3D12Readback::Write write = write_of(entry);
+            // The planes a depth stencil clear didn't clear are left in a state that isn't known
+            const bool reads_stencil = target->kind == D3D12Readback::Kind::Stencil;
+            if (write.kind == D3D12Readback::WriteKind::ClearDepthStencil && (write.planes & (reads_stencil ? 2 : 1)) == 0)
+            {
+               job->error = std::format("Trace entry {} didn't clear {}, so its state after the clear isn't known: pass view {}", *index, (reads_stencil ? "stencil" : "depth"), (reads_stencil ? "depth" : "stencil"));
+               return false;
+            }
+            target->write = write;
+            target->thread = entry.thread_id;
+            target->instance = int32_t(std::count_if(entries.begin(), entries.begin() + *index, [&](const TraceDrawCallData& other)
+               { return other.thread_id == entry.thread_id && write_of(other) == write; }));
+            job->shader_hash = 0;
+            job->stage = written_by_names[size_t(write.kind)];
+            job->written_resource = entry.rt_hash[0];
+            job->instance = target->instance;
+            return true;
+         }
          pipeline = (entry.type == TraceDrawCallData::TraceDrawCallType::Shader) ? FindPipeline(device_data, entry.pipeline_handle) : nullptr;
          if (!pipeline)
          {
@@ -1830,65 +1907,68 @@ namespace Mcp
       Failed, // See "job->error"
    };
 
-   // Follows the job's copy at a present until the GPU ran it: drawn ("job->phase" 1), then executed and read (2), each with its own budget
+   // The GPU can run frames behind the render thread, and a copy's fence is only polled at each present
+   constexpr uint32_t readback_max_gpu_frames = 30;
+
+   // Follows the job's copy at a present until the GPU ran it: drawn ("job->phase" 1), then executed and read (2), each with its own budget.
+   // Never waits for a queue: it can wait on a fence the game signals after present ("D3D12Readback::Advance()").
    ReadbackPoll PollReadback(Job* job, DeviceData& device_data, D3D12Readback::Copy* copy, std::vector<char>* bytes)
    {
       using Status = D3D12Readback::Copy::Status;
       D3D12Readback::State& readback = device_data.readback;
-      reshade::api::command_queue* queue = nullptr;
-      {
-         const std::unique_lock lock(readback.mutex);
-         readback.instances = 0; // Instances count from the last present
-         if (!readback.copy)
-         {
-            if (++job->frames < readback_max_frames)
-               return ReadbackPoll::Wait;
-            job->error = std::format("The pass was not drawn in {} frames (check \"instance\": a capture entry counts it among its recording thread's draws)", readback_max_frames);
-            return ReadbackPoll::Failed;
-         }
-         if (job->phase == 1)
-         {
-            job->phase = 2;
-            job->frames = 0;
-         }
-         switch (readback.copy->status)
-         {
-         case Status::Failed:
-            job->error = readback.copy->error;
-            return ReadbackPoll::Failed;
-         case Status::Ready:
-            *copy = std::move(*readback.copy);
-            readback.copy.reset();
-            return ReadbackPoll::Done;
-         case Status::Discarded:
-            // Its command list was reset unexecuted: copy a later draw
-            readback.copy.reset();
-            readback.target = job->readback_target;
-            D3D12Readback::armed = true;
-            job->phase = 1;
-            return ReadbackPoll::Wait;
-         case Status::Recorded:
-            if (++job->frames < readback_max_frames)
-               return ReadbackPoll::Wait;
-            job->error = std::format("The pass's command list was not executed in {} frames", readback_max_frames);
-            return ReadbackPoll::Failed;
-         case Status::Executed:
-            queue = readback.copy->queue;
-            break;
-         }
-      }
-      queue->wait_idle(); // Not under the lock, the game's submissions take it ("OnExecuteCommandList()")
       const std::unique_lock lock(readback.mutex);
-      if (std::optional<std::vector<char>> data = D3D12Readback::TryRead(*readback.copy))
+      readback.instances = 0; // Instances count from the last present
+      if (!readback.copy)
       {
-         *bytes = std::move(*data);
+         if (++job->frames < readback_max_frames)
+            return ReadbackPoll::Wait;
+         job->error = std::format("The pass was not drawn in {} frames (check \"instance\": a capture entry counts it among its recording thread's commands)", readback_max_frames);
+         return ReadbackPoll::Failed;
+      }
+      if (job->phase == 1)
+      {
+         job->phase = 2;
+         job->frames = 0;
+      }
+      switch (readback.copy->status)
+      {
+      case Status::Failed:
+         job->error = readback.copy->error;
+         return ReadbackPoll::Failed;
+      case Status::Ready:
          *copy = std::move(*readback.copy);
          readback.copy.reset();
          return ReadbackPoll::Done;
-      }
-      if (++job->frames < readback_max_frames)
+      case Status::Discarded:
+         // Its command list was reset unexecuted: copy a later draw
+         readback.copy.reset();
+         readback.target = job->readback_target;
+         D3D12Readback::armed = true;
+         job->phase = 1;
          return ReadbackPoll::Wait;
-      job->error = "The copy didn't run: its command list wasn't submitted, or the game's predication skipped it";
+      case Status::Recorded:
+         if (++job->frames < readback_max_frames)
+            return ReadbackPoll::Wait;
+         job->error = std::format("The pass's command list was not executed in {} frames", readback_max_frames);
+         return ReadbackPoll::Failed;
+      case Status::Executed:
+         break;
+      }
+      switch (D3D12Readback::Advance(&*readback.copy, bytes))
+      {
+      case D3D12Readback::Completion::Ran:
+         *copy = std::move(*readback.copy);
+         readback.copy.reset();
+         return ReadbackPoll::Done;
+      case D3D12Readback::Completion::NotRun:
+         job->error = "The copy didn't run: the game's predication skipped it, or its command list wasn't submitted";
+         return ReadbackPoll::Failed;
+      case D3D12Readback::Completion::Pending:
+         break;
+      }
+      if (++job->frames < readback_max_gpu_frames)
+         return ReadbackPoll::Wait;
+      job->error = std::format("The GPU didn't get to the copy in {} frames: its queue waits for something the game signals later", readback_max_gpu_frames);
       return ReadbackPoll::Failed;
    }
 
@@ -1985,16 +2065,53 @@ namespace Mcp
             }
             const std::string& resource = entries[*index].sr_hash[target.slot];
             const uint32_t srv_slot = target.slot;
-            // A depth stencil SRV reads one plane, its producer must write that one
-            const DXGI_FORMAT srv_format = entries[*index].srv_format[target.slot];
+            // The producer must write the mip the SRV reads, and for a depth stencil SRV the plane
+            const uint32_t srv_mip = entries[*index].srv_mip[srv_slot];
+            const DXGI_FORMAT srv_format = entries[*index].srv_format[srv_slot];
             const bool reads_stencil = srv_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || srv_format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
             std::optional<size_t> producer;
             for (size_t i = *index; i-- > 0 && !producer;)
             {
                const TraceDrawCallData& entry = entries[i];
+               if (entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource || entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
+               {
+                  // The planes it wrote (bit 0 depth, bit 1 stencil): a resource copy both and a depth stencil clear the ones it cleared, the
+                  // others the plane of their destination subresource (the index is mip + layer * mips + plane * mips * layers)
+                  const bool is_clear = entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource;
+                  const bool is_resource_copy = !is_clear && entry.copy_info.kind == TraceDrawCallData::CopyKind::Resource;
+                  uint32_t planes = 1;
+                  if (is_resource_copy)
+                  {
+                     planes = 3;
+                  }
+                  else if (is_clear && entry.clear_kind == TraceDrawCallData::ClearKind::DepthStencil)
+                  {
+                     planes = ((entry.depth_state == TraceDrawCallData::DepthStateType::WriteOnly ? 1 : 0) | (entry.stencil_state == TraceDrawCallData::DepthStateType::WriteOnly ? 2 : 0));
+                  }
+                  else if (!is_clear)
+                  {
+                     const uint32_t mips = (entry.rt_type_name[0].find("MS") != std::string::npos ? 1 : (std::max)(entry.rt_size[0].w, 1u));
+                     const uint32_t layers = (entry.rt_type_name[0] == "Texture 3D" ? 1 : (std::max)(entry.rt_size[0].z, 1u));
+                     planes = 1u << (entry.copy_info.dest_subresource / (mips * layers));
+                  }
+                  if (entry.rt_hash[0] == resource && (is_resource_copy || entry.rt_view[0].first_level == srv_mip) && (planes & (reads_stencil ? 2u : 1u)) != 0)
+                  {
+                     if (const char* refusal = UnreadableWrite(entry))
+                     {
+                        job->error = std::format("Trace entry {} {}", i, refusal);
+                        return true;
+                     }
+                     producer = i;
+                     target.kind = (reads_stencil ? Kind::Stencil : Kind::RenderTarget); // Depth for the depth stencil resources
+                     target.slot = 0;
+                     target.mip = srv_mip;
+                     target.format = srv_format;
+                  }
+                  continue;
+               }
                for (uint32_t slot = 0; slot < TraceDrawCallData::rtvs_size && !producer; slot++)
                {
-                  if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource)
+                  if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource && entry.rt_view[slot].first_level == srv_mip)
                   {
                      producer = i;
                      target.kind = Kind::RenderTarget;
@@ -2003,7 +2120,7 @@ namespace Mcp
                }
                for (uint32_t slot = 0; slot < entry.uav_count && !producer; slot++)
                {
-                  if (entry.ua_hash[slot] == resource)
+                  if (entry.ua_hash[slot] == resource && entry.ua_view[slot].first_level == srv_mip)
                   {
                      producer = i;
                      target.kind = Kind::UnorderedAccess;
@@ -2012,7 +2129,7 @@ namespace Mcp
                }
                using DepthStateType = TraceDrawCallData::DepthStateType;
                const DepthStateType plane_state = (reads_stencil ? entry.stencil_state : entry.depth_state);
-               if (!producer && entry.IsDSVValid() && entry.ds_hash == resource && (plane_state == DepthStateType::TestAndWrite || plane_state == DepthStateType::WriteOnly))
+               if (!producer && entry.IsDSVValid() && entry.ds_hash == resource && entry.ds_view.first_level == srv_mip && (plane_state == DepthStateType::TestAndWrite || plane_state == DepthStateType::WriteOnly))
                {
                   producer = i;
                   target.kind = (reads_stencil ? Kind::Stencil : Kind::Depth);
@@ -2021,17 +2138,29 @@ namespace Mcp
             }
             if (!producer)
             {
-               job->error = std::format("No entry before {} wrote its resource as a render target, UAV or {} target (D3D12 captures don't list copies, uploads or clears yet)", *index, reads_stencil ? "stencil" : "depth");
+               job->error = std::format("No entry before {} wrote its resource as a render target, UAV or {} target, or by a copy, resolve or clear (the capture misses writes from before the captured frame, CopyTiles and DiscardResource)", *index, reads_stencil ? "stencil" : "depth");
                return true;
             }
-            job->result.Field("producer_index", *producer).Field("note", std::format("SRV {} of entry {} read after entry {} wrote it, unless a copy wrote it in between (D3D12 captures don't list copies yet)", srv_slot, *index, *producer));
+            job->result.Field("producer_index", *producer).Field("note", std::format("SRV {} of entry {} read after entry {} wrote it (the capture misses writes from before the captured frame, CopyTiles and DiscardResource)", srv_slot, *index, *producer));
             index = producer;
          }
          if (!ResolveTarget(job, device_data, cmd_list_data, index, &target))
             return true;
          job->readback_target = std::move(target);
          ArmReadback(job, device_data);
-         job->result.Hash("hash", job->shader_hash).Field("instance", job->instance).Field("view", kind->first).Field("slot", job->readback_target->slot);
+         if (job->readback_target->write.resource != 0)
+         {
+            job->result.Field("written_by", job->stage).Field("resource", job->written_resource);
+            if (job->readback_target->write.kind == D3D12Readback::WriteKind::Resolve)
+            {
+               job->result.Field("resolve_mode", "average: re-issued so, ReShade drops a ResolveSubresourceRegion's MIN or MAX mode");
+            }
+         }
+         else
+         {
+            job->result.Hash("hash", job->shader_hash);
+         }
+         job->result.Field("instance", job->instance).Field("view", kind->first).Field("slot", job->readback_target->slot);
          job->phase = 1;
          return false;
       }
@@ -2043,7 +2172,10 @@ namespace Mcp
          return false;
       if (poll == ReadbackPoll::Done)
       {
-         add_texture_file(std::format("{:08X}_{}_{}{}", job->shader_hash, job->instance, view ? *view : "rtv", job->readback_target->slot), copy, std::move(bytes));
+         // Named after the shader of a draw, or the command and the resource of a copy, resolve or clear
+         std::string stem = (job->readback_target->write.resource != 0) ? std::format("{}_{}", job->stage, job->written_resource) : std::format("{:08X}", job->shader_hash);
+         std::ranges::replace(stem, ' ', '_');
+         add_texture_file(std::format("{}_{}_{}{}", stem, job->instance, view ? *view : "rtv", job->readback_target->slot), copy, std::move(bytes));
       }
       return true;
    }

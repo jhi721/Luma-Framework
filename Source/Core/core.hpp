@@ -5305,6 +5305,74 @@ namespace
       }
    }
 
+   // Finishes a readback at its target command: "reissue" re-issues the command on the native list, then the "plane" of one mip of the layers
+   // "view" covers is copied, where "draw_state" is the state the command left it in (a constant buffer's "buffer" range is copied before its
+   // draw instead). "is_color" is false for depth planes, which multisampled textures can't resolve. Returns true when it re-issued the command
+   // to copy its output after it, then the original call must be skipped.
+   bool RecordReadback(reshade::api::command_list* cmd_list, D3D12Readback::Copy copy, const D3D12State::ViewInfo& view, D3D12_RESOURCE_STATES draw_state, uint32_t plane, ID3D12Resource* buffer, bool is_color, auto&& reissue)
+   {
+      reshade::api::device* device = cmd_list->get_device();
+      D3D12Readback::State& readback = device->get_private_data<DeviceData>()->readback;
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+
+      // The subresources the view covers, one mip
+      std::vector<uint32_t> subresources;
+      ID3D12Resource* resource = reinterpret_cast<ID3D12Resource*>(view.resource);
+      if (copy.error.empty() && resource)
+      {
+         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+         const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+         const uint32_t array_size = (is_3d ? 1 : desc.DepthOrArraySize);
+         copy.mip = view.first_level;
+         copy.first_layer = (is_3d ? 0 : view.first_layer);
+         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+         {
+            copy.error = "Buffer views aren't read back (like on D3D11), only textures";
+         }
+         else if (desc.SampleDesc.Count > 1 && !is_color)
+         {
+            copy.error = "Multisampled depth can't be resolved for readback";
+         }
+         else if (copy.first_layer >= array_size || copy.mip >= desc.MipLevels)
+         {
+            copy.error = "The view is out of its resource's range";
+         }
+         else
+         {
+            const uint32_t layers = (is_3d ? 1 : (std::min)(view.layer_count, array_size - copy.first_layer));
+            for (uint32_t layer = copy.first_layer; layer < copy.first_layer + layers; layer++)
+            {
+               subresources.push_back(copy.mip + layer * desc.MipLevels + plane * desc.MipLevels * array_size);
+            }
+         }
+      }
+
+      bool reissued = false;
+      const std::unique_lock lock(readback.mutex);
+      if (copy.error.empty() && copy.status == D3D12Readback::Copy::Status::Recorded)
+      {
+         auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+         // Before the draw for constant buffers, it doesn't write them
+         const bool recorded = buffer ? D3D12Readback::RecordBufferCopy(&readback, native_device, native_list, buffer, copy.buffer_offset, copy.size, &copy) : D3D12Readback::RecordTextureCopy(&readback, native_device, native_list, resource, draw_state, subresources, copy.data_format, &copy, reissue);
+         reissued = recorded && !buffer;
+         if (!recorded)
+         {
+            copy.error = "Failed to create the readback resources";
+         }
+      }
+      if (!copy.error.empty())
+      {
+         copy.status = D3D12Readback::Copy::Status::Failed;
+      }
+      else if (copy.status == D3D12Readback::Copy::Status::Recorded)
+      {
+         D3D12Readback::recorded_copies++;
+      }
+      D3D12Readback::Retire(&readback);
+      readback.copy = std::move(copy);
+      return reissued;
+   }
+
    // The dev MCP's readbacks ("includes/d3d12_readback.hpp"): copies the view a job asked for at its target draw. Returns true when it
    // re-issued the draw to copy its output after it, then the original call must be skipped.
    bool ReadbackDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12Readback::Command command)
@@ -5437,24 +5505,7 @@ namespace
                draw_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
                plane = is_stencil ? 1 : 0;
                // The planes copy as R32 (D24's top 8 bits zeroed) and R8, typed here for the readers
-               switch (entry.dsv_format)
-               {
-               case DXGI_FORMAT_D24_UNORM_S8_UINT:
-                  copy.data_format = (is_stencil ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
-                  break;
-               case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-                  copy.data_format = (is_stencil ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R32_FLOAT);
-                  break;
-               case DXGI_FORMAT_D32_FLOAT:
-                  copy.data_format = DXGI_FORMAT_R32_FLOAT;
-                  break;
-               case DXGI_FORMAT_D16_UNORM:
-                  copy.data_format = DXGI_FORMAT_R16_UNORM;
-                  break;
-               default:
-                  copy.data_format = entry.dsv_format;
-                  break;
-               }
+               copy.data_format = D3D12Readback::PlaneFormat(entry.dsv_format, is_stencil);
             }
             break;
          }
@@ -5498,38 +5549,6 @@ namespace
          }
       }
 
-      // The subresources the view covers, one mip
-      std::vector<uint32_t> subresources;
-      ID3D12Resource* resource = reinterpret_cast<ID3D12Resource*>(view.resource);
-      if (copy.error.empty() && resource)
-      {
-         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-         const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-         const uint32_t array_size = is_3d ? 1 : desc.DepthOrArraySize;
-         copy.mip = view.first_level;
-         copy.first_layer = is_3d ? 0 : view.first_layer;
-         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-         {
-            copy.error = "Buffer views aren't read back (like on D3D11), only textures";
-         }
-         else if (desc.SampleDesc.Count > 1 && target.kind != Kind::RenderTarget)
-         {
-            copy.error = "Multisampled depth can't be resolved for readback";
-         }
-         else if (copy.first_layer >= array_size || copy.mip >= desc.MipLevels)
-         {
-            copy.error = "The view is out of its resource's range";
-         }
-         else
-         {
-            const uint32_t layers = is_3d ? 1 : (std::min)(view.layer_count, array_size - copy.first_layer);
-            for (uint32_t layer = copy.first_layer; layer < copy.first_layer + layers; layer++)
-            {
-               subresources.push_back(copy.mip + layer * desc.MipLevels + plane * desc.MipLevels * array_size);
-            }
-         }
-      }
-
       const DrawDispatchData& dd = draw_dispatch_data;
       const auto reissue = [&]
       {
@@ -5548,30 +5567,124 @@ namespace
             break; // Refused above
          }
       };
-      bool reissued = false;
-      const std::unique_lock lock(readback.mutex);
-      if (copy.error.empty() && copy.status == D3D12Readback::Copy::Status::Recorded)
+      return RecordReadback(cmd_list, std::move(copy), view, draw_state, plane, buffer, target.kind == Kind::RenderTarget, reissue);
+   }
+
+   // The counterpart of "ReadbackDrawOrDispatch()" for copies, resolves and clears: "write" says which command this is (a clear's "view" completes
+   // it with the resource, mip and first layer it cleared), "reissue" re-issues it on the native list. Copies what the command wrote, in the state
+   // it left it in. Returns true when it re-issued the command to copy its output after it, then the original call must be skipped.
+   bool ReadbackCopyOrClear(reshade::api::command_list* cmd_list, D3D12Readback::Write write, reshade::api::resource_view view, auto&& reissue)
+   {
+      if (!D3D12Readback::armed)
+         return false;
+      reshade::api::device* device = cmd_list->get_device();
+      D3D12Readback::State& readback = device->get_private_data<DeviceData>()->readback;
+      D3D12State::ViewInfo view_info;
+      if (view.handle != 0)
       {
-         auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
-         // Before the draw for constant buffers, it doesn't write them
-         const bool recorded = buffer ? D3D12Readback::RecordBufferCopy(&readback, native_device, native_list, buffer, copy.buffer_offset, copy.size, &copy) : D3D12Readback::RecordTextureCopy(&readback, native_device, native_list, resource, draw_state, subresources, copy.data_format, &copy, reissue);
-         reissued = recorded && !buffer;
-         if (!recorded)
-         {
-            copy.error = "Failed to create the readback resources";
-         }
+         view_info = D3D12State::GetViewInfo(device, view);
+         write.resource = view_info.resource;
+         write.level = view_info.first_level;
+         write.layer = view_info.first_layer;
       }
-      if (!copy.error.empty())
+      D3D12Readback::Target target;
       {
-         copy.status = D3D12Readback::Copy::Status::Failed;
+         const std::unique_lock lock(readback.mutex);
+         if (!readback.target || write.resource == 0 || readback.target->write != write || (readback.target->thread != std::thread::id() && readback.target->thread != std::this_thread::get_id()))
+            return false;
+         if (readback.instances++ != readback.target->instance)
+            return false;
+         target = std::move(*readback.target);
+         readback.target.reset();
+         D3D12Readback::armed = false;
       }
-      else if (copy.status == D3D12Readback::Copy::Status::Recorded)
+
+      using Kind = D3D12Readback::Kind;
+      using WriteKind = D3D12Readback::WriteKind;
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      const D3D12_RESOURCE_DESC desc = reinterpret_cast<ID3D12Resource*>(write.resource)->GetDesc();
+      const uint32_t array_size = ((desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 1 : desc.DepthOrArraySize);
+      // Depth stencil resources have a depth plane, and a stencil one in the combined formats
+      const bool is_depth = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 || desc.Format == DXGI_FORMAT_D16_UNORM || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || desc.Format == DXGI_FORMAT_D32_FLOAT || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS;
+      const uint32_t plane = (target.kind == Kind::Stencil ? 1 : 0);
+      const bool is_resolve = write.kind == WriteKind::Resolve;
+
+      D3D12State::ViewInfo written = view_info; // What the command wrote, as much as is copied
+      D3D12_RESOURCE_STATES draw_state = D3D12_RESOURCE_STATE_COPY_DEST;
+      DXGI_FORMAT view_format = target.format;
+      switch (write.kind)
       {
-         D3D12Readback::recorded_copies++;
+      case WriteKind::CopyResource:
+         written = {.resource = write.resource, .first_level = target.mip};
+         break;
+      case WriteKind::CopyRegion:
+      case WriteKind::Resolve:
+         // The subresource index is mip + layer * mips + plane * mips * layers
+         written = {.resource = write.resource, .first_level = write.subresource % desc.MipLevels, .first_layer = (write.subresource / desc.MipLevels) % array_size, .layer_count = 1};
+         draw_state = (is_resolve ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST);
+         break;
+      case WriteKind::ClearRenderTarget:
+         draw_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+         view_format = DXGI_FORMAT(view_info.format);
+         break;
+      case WriteKind::ClearDepthStencil:
+         draw_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+         break;
       }
-      D3D12Readback::Retire(&readback);
-      readback.copy = std::move(copy);
-      return reissued;
+
+      D3D12Readback::Copy copy = {.cmd_list = cmd_list};
+      if (is_depth)
+      {
+         copy.data_format = D3D12Readback::PlaneFormat(desc.Format, plane == 1);
+      }
+      else
+      {
+         copy.data_format = ((view_format != DXGI_FORMAT_UNKNOWN && view_format != DXGI_FORMAT(-1)) ? view_format : desc.Format);
+      }
+      const uint32_t written_plane = write.subresource / (desc.MipLevels * array_size);
+      if (cmd_list->get_private_data<CommandListData>()->d3d12_state.in_render_pass)
+      {
+         copy.error = "The command is inside a render pass, which can't hold copies";
+      }
+      else if (native_list->GetType() == D3D12_COMMAND_LIST_TYPE_COPY)
+      {
+         // The copy queue works on resources in the COMMON layout only, the debug layer rejects the barrier to COPY_SOURCE
+         copy.error = "The command is on a copy queue's command list, which can't move what it wrote to COPY_SOURCE for the readback copy";
+      }
+      else if (!is_depth && target.kind != Kind::RenderTarget)
+      {
+         copy.error = "The command wrote a color texture, which has no depth or stencil plane";
+      }
+      else if (plane == 1 && D3D12Readback::PlaneFormat(desc.Format, true) != DXGI_FORMAT_R8_UINT)
+      {
+         copy.error = "The command wrote a depth texture without a stencil plane";
+      }
+      else if ((write.kind == WriteKind::CopyRegion || is_resolve) && written_plane != plane)
+      {
+         copy.error = std::format("The command wrote the {0} plane, not the {1} one: pass view {0}", (written_plane == 0 ? "depth" : "stencil"), (plane == 0 ? "depth" : "stencil"));
+      }
+      else if (is_resolve && desc.SampleDesc.Count > 1)
+      {
+         // Only a DECOMPRESS "ResolveSubresourceRegion()" writes a multisampled resource, and ReShade drops the mode
+         copy.error = "The resolve wrote a multisampled resource (a DECOMPRESS), which can't be re-issued: ReShade drops the resolve mode";
+      }
+      else if (is_resolve && (write.source == write.resource || is_depth || write.resolve_format == DXGI_FORMAT_UNKNOWN || IsTypelessFormat(write.resolve_format) || IsIntFormat(write.resolve_format) || write.resolve_format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE || write.resolve_format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE))
+      {
+         // ReShade drops the mode of "ResolveSubresourceRegion()", so resolves are re-issued with AVERAGE, the only mode of
+         // "ResolveSubresource()": depth, integer and sampler feedback formats can't use it. A MIN or MAX region resolve of a color format
+         // (both work with any render target format) reads, and draws that frame, averaged.
+         copy.error = "Only resolves of color float, unorm and snorm formats are re-issued, not depth, integer, typeless or sampler feedback ones, nor a resource resolved into itself";
+      }
+      else if (desc.SampleDesc.Count > 1 && !is_depth && native_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+      {
+         copy.error = "Multisampled textures are resolved for readback, which only graphics command lists can do";
+      }
+      else if (desc.SampleDesc.Count > 1 && !is_depth && (IsTypelessFormat(copy.data_format) || IsIntFormat(copy.data_format)))
+      {
+         copy.error = "Multisampled typeless and integer textures can't be resolved for readback";
+      }
+      return RecordReadback(cmd_list, std::move(copy), written, draw_state, plane, nullptr, !is_depth, [&]
+         { reissue(native_list); });
    }
 
    bool OnDraw(reshade::api::command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
@@ -5617,13 +5730,15 @@ namespace
       return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Other);
    }
 
-   // The copies, uploads, resolves and clears of the frame capture
+   // The copies, uploads, resolves and clears of the frame capture, and the readbacks at the copies, resolves and render target and depth
+   // stencil clears: their handlers return true when "ReadbackCopyOrClear()" re-issued them
    bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
-      return false;
+      return ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyResource}, {}, [&](ID3D12GraphicsCommandList* native_list)
+         { native_list->CopyResource(reinterpret_cast<ID3D12Resource*>(dest.handle), reinterpret_cast<ID3D12Resource*>(source.handle)); });
    }
 
    bool OnCopyBufferRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
@@ -5649,7 +5764,11 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
-      return false;
+      return ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyRegion, .subresource = dest_subresource}, {}, [&](ID3D12GraphicsCommandList* native_list)
+         {
+            const D3D12_TEXTURE_COPY_LOCATION destination = {.pResource = reinterpret_cast<ID3D12Resource*>(dest.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = dest_subresource};
+            const D3D12_TEXTURE_COPY_LOCATION source_location = {.pResource = reinterpret_cast<ID3D12Resource*>(source.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = source_subresource};
+            native_list->CopyTextureRegion(&destination, (dest_box ? dest_box->left : 0), (dest_box ? dest_box->top : 0), (dest_box ? dest_box->front : 0), &source_location, reinterpret_cast<const D3D12_BOX*>(source_box)); });
    }
 
    bool OnCopyTextureToBuffer(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint64_t dest_offset, uint32_t row_length, uint32_t slice_height)
@@ -5665,7 +5784,21 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
-      return false;
+      return ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::Resolve, .subresource = dest_subresource, .resolve_format = DXGI_FORMAT(format)}, {}, [&](ID3D12GraphicsCommandList* native_list)
+         {
+            auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
+            auto* native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
+            if (!source_box && dest_x == 0 && dest_y == 0)
+            {
+               native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, DXGI_FORMAT(format));
+            }
+            else
+            {
+               com_ptr<ID3D12GraphicsCommandList1> native_list_1;
+               native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
+               D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
+               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), DXGI_FORMAT(format), D3D12_RESOLVE_MODE_AVERAGE);
+            } });
    }
 
    // The clear values go in the entry's blend factor like on D3D11 (depth and stencil in the first two)
@@ -5674,7 +5807,7 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          {
-            D3D12Trace::FillClear(cmd_list->get_device(), entry, dsv);
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, dsv, TraceDrawCallData::ClearKind::DepthStencil);
             entry->blend_factor[0] = (depth ? *depth : 0.f);
             entry->blend_factor[1] = (stencil ? float(*stencil) : 0.f);
             if (depth)
@@ -5685,7 +5818,8 @@ namespace
             {
                entry->stencil_state = TraceDrawCallData::DepthStateType::WriteOnly;
             } });
-      return false;
+      return ReadbackCopyOrClear(cmd_list, {.kind = D3D12Readback::WriteKind::ClearDepthStencil, .planes = uint8_t((depth ? 1 : 0) | (stencil ? 2 : 0))}, dsv, [&](ID3D12GraphicsCommandList* native_list)
+         { native_list->ClearDepthStencilView({.ptr = SIZE_T(dsv.handle)}, D3D12_CLEAR_FLAGS((depth ? D3D12_CLEAR_FLAG_DEPTH : 0) | (stencil ? D3D12_CLEAR_FLAG_STENCIL : 0)), (depth ? *depth : 0.f), (stencil ? *stencil : uint8_t(0)), rect_count, reinterpret_cast<const D3D12_RECT*>(rects)); });
    }
 
    bool OnClearRenderTargetView(reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, const float color[4], uint32_t rect_count, const reshade::api::rect* rects)
@@ -5693,9 +5827,10 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          {
-            D3D12Trace::FillClear(cmd_list->get_device(), entry, rtv);
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, rtv, TraceDrawCallData::ClearKind::RenderTarget);
             std::copy_n(color, 4, entry->blend_factor); });
-      return false;
+      return ReadbackCopyOrClear(cmd_list, {.kind = D3D12Readback::WriteKind::ClearRenderTarget}, rtv, [&](ID3D12GraphicsCommandList* native_list)
+         { native_list->ClearRenderTargetView({.ptr = SIZE_T(rtv.handle)}, color, rect_count, reinterpret_cast<const D3D12_RECT*>(rects)); });
    }
 
    bool OnClearUnorderedAccessViewUInt(reshade::api::command_list* cmd_list, reshade::api::resource_view uav, const uint32_t values[4], uint32_t rect_count, const reshade::api::rect* rects)
@@ -5703,7 +5838,7 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          {
-            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav);
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav, TraceDrawCallData::ClearKind::UnorderedAccess);
             std::transform(values, values + 4, entry->blend_factor, [](uint32_t value)
                { return float(value); }); });
       return false;
@@ -5714,7 +5849,7 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          {
-            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav);
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav, TraceDrawCallData::ClearKind::UnorderedAccess);
             std::copy_n(values, 4, entry->blend_factor); });
       return false;
    }

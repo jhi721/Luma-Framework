@@ -106,7 +106,8 @@ namespace D3D12State
          return {};
       const reshade::api::resource_view_desc desc = device->get_resource_view_desc(view);
       const bool is_texture = desc.type != reshade::api::resource_view_type::buffer;
-      return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (is_texture ? desc.texture.first_level : 0), .first_layer = (is_texture ? desc.texture.first_layer : 0), .layer_count = (is_texture ? desc.texture.layers : UINT32_MAX)};
+      // ReShade leaves the layer count at 0 for the views of textures that aren't layered: they cover their one layer
+      return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (is_texture ? desc.texture.first_level : 0), .first_layer = (is_texture ? desc.texture.first_layer : 0), .layer_count = (is_texture ? (std::max)(desc.texture.layers, 1u) : UINT32_MAX)};
    }
 
    // A bound index or vertex buffer: ReShade resolves their GPU virtual address to the buffer

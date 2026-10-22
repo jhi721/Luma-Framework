@@ -283,6 +283,14 @@ struct TraceDrawCallData
    D3D12State::ViewInfo ds_view = {};
    uint64_t cb_resource[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
    uint64_t copy_source = 0;
+   // The view a clear entry cleared: readbacks re-issue render target and depth stencil clears, not unordered access ones
+   enum class ClearKind : uint8_t
+   {
+      RenderTarget,
+      DepthStencil,
+      UnorderedAccess,
+   };
+   ClearKind clear_kind = ClearKind::RenderTarget;
 #endif
 
 #if DX11

@@ -1,11 +1,15 @@
 #pragma once
 
 // D3D12 readbacks for the dev MCP ("luma_read_resource", "luma_read_cbuffer"), see "docs/DX12-Support-Plan.md" A4. A readback is a GPU copy
-// recorded into the game's command list at the target draw, into a READBACK buffer that is read once that list ran.
-// D3D12 has no state queries and Core doesn't track resource states (ReShade's "barrier" event drops subresources), so only views whose state
-// at the draw is certain are copied: render targets and unordered access views right after the draw, a depth or stencil plane after a draw
-// whose pipeline writes it, constant buffers in UPLOAD heaps (always GENERIC_READ). The barriers are legacy ones: textures a game manages
+// recorded into the game's command list at the target command, into a READBACK buffer that is read once that list ran. The target is a draw
+// or dispatch, or a copy, resolve or clear: the command is re-issued natively right before the copy, and the original call is skipped.
+// D3D12 has no state queries and Core doesn't track resource states (ReShade's "barrier" event drops subresources), so only what is
+// certain is copied: render targets and unordered access views right after the draw, a depth or stencil plane after a draw whose
+// pipeline writes it, what a copy left in COPY_DEST, a resolve in RESOLVE_DEST, a render target clear in RENDER_TARGET and a depth stencil
+// clear in DEPTH_WRITE, constant buffers in UPLOAD heaps (always GENERIC_READ). The barriers are legacy ones: textures a game manages
 // with enhanced barrier layouts are outside their interop rules.
+// Completion never waits for a queue inside present (the game can have it wait on a fence it signals after present): a copy gets its own
+// fence, signaled on its queue at a present, and its buffer is read at a later present once that fence passed ("Advance()").
 
 #include <algorithm>
 #include <atomic>
@@ -44,7 +48,35 @@ namespace D3D12Readback
       Other,
    };
 
-   // The draw a readback copies: the "instance"th draw since the last present with one of "pipelines", recorded on "thread" (any if none)
+   // What re-issuable copies, resolves and clears do to a resource. Unordered access view clears and uploads aren't here: ReShade passes no
+   // GPU descriptor handle or row pitch for them, so they can't be re-issued.
+   enum class WriteKind : uint8_t
+   {
+      CopyResource,
+      CopyRegion,
+      Resolve,
+      ClearRenderTarget,
+      ClearDepthStencil,
+   };
+
+   // A copy, resolve or clear command as its ReShade event gives it, and as its frame capture entry records it: a target and an event are
+   // the same command when they are equal
+   struct Write
+   {
+      uint64_t resource = 0; // What it wrote, null for a draw target
+      uint64_t source = 0;   // What a copy or resolve read
+      WriteKind kind = WriteKind::CopyResource;
+      uint32_t subresource = 0; // Region copies and resolves: the destination subresource
+      uint32_t level = 0;       // Clears: the cleared view's mip and first layer
+      uint32_t layer = 0;
+      uint8_t planes = 0;                               // Depth stencil clears: the cleared planes (bit 0 depth, bit 1 stencil)
+      DXGI_FORMAT resolve_format = DXGI_FORMAT_UNKNOWN; // Resolves
+      bool operator==(const Write&) const = default;
+   };
+
+   // The command a readback copies the output of, recorded on "thread" (any if none): the "instance"th draw since the last present with one of
+   // "pipelines", or, with a "write.resource", the "instance"th copy, resolve or clear equal to "write". Those have no view: "kind" only picks
+   // the plane of a depth resource (stencil, else depth).
    struct Target
    {
       std::vector<uint64_t> pipelines;
@@ -52,6 +84,9 @@ namespace D3D12Readback
       int32_t instance = 0;
       Kind kind = Kind::RenderTarget;
       uint32_t slot = 0; // The render target slot, or the packed UAV or constant buffer entry (as the frame capture lists them)
+      Write write;
+      uint32_t mip = 0;                         // Resource copies: the mip to read, they wrote all of them
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; // Copies and resolves: how to read the data of a color texture (an SRV's view format), its own if unknown
    };
 
    struct Copy
@@ -59,20 +94,25 @@ namespace D3D12Readback
       enum class Status : uint8_t
       {
          Recorded,  // In a command list not executed yet
-         Executed,  // Its list went to "queue". ReShade unlocks the queue before the native call, "TryRead()" checks the token.
+         Executed,  // Its list went to "queue". ReShade's event comes before the native call, "Advance()" checks the token.
          Discarded, // Its list was reset or destroyed unexecuted, the GPU never ran it
          Ready,     // Root constants, read on the CPU
-         Failed,    // The target draw can't be copied, see "error"
+         Failed,    // The target command can't be copied, see "error"
       };
       Status status = Status::Recorded;
       std::string error;
       const reshade::api::command_list* cmd_list = nullptr;
-      reshade::api::command_queue* queue = nullptr;
+      com_ptr<ID3D12CommandQueue> queue; // Where its list went (kept alive for the fence, games can release their queues)
 
       com_ptr<ID3D12Resource> buffer;   // READBACK, in COPY_DEST for its whole life
       com_ptr<ID3D12Resource> resolved; // Multisampled render targets are resolved into it first
       uint64_t token = 0;               // The GPU copies it into the buffer's last 8 bytes, proof that the list ran
       uint64_t token_offset = 0;
+
+      // Completion, see "Advance()": "fence" is signaled on "queue" up to "fence_value", "signals" times
+      com_ptr<ID3D12Fence> fence;
+      uint64_t fence_value = 0;
+      uint32_t signals = 0;
 
       // Textures: one mip of the layers the view covers, each subresource laid out by its footprint
       D3D12_RESOURCE_DESC desc = {}; // The source texture's (the data of multisampled ones is resolved)
@@ -95,8 +135,8 @@ namespace D3D12Readback
    struct State
    {
       std::shared_mutex mutex;        // Guards everything below
-      std::optional<Target> target;   // Armed by an MCP job, taken by the target draw
-      int32_t instances = 0;          // Draws matching "target" since the last present
+      std::optional<Target> target;   // Armed by an MCP job, taken by the target command
+      int32_t instances = 0;          // Commands matching "target" since the last present
       std::optional<Copy> copy;       // The MCP job's
       std::vector<Copy> retired;      // Copies a job gave up on, whose buffer the GPU may still write
       com_ptr<ID3D12Resource> tokens; // UPLOAD, mapped for its whole life
@@ -104,12 +144,35 @@ namespace D3D12Readback
       uint64_t next_token = 1;
    };
 
-   // Checked without a lock by every draw: a "State::target" is armed (rechecked under its lock)
+   // Checked without a lock by every draw, copy, resolve and clear: a "State::target" is armed (rechecked under its lock)
    std::atomic<bool> armed = false;
    // Checked without a lock by every command list execution, reset and destruction: copies in "Status::Recorded"
    std::atomic<uint32_t> recorded_copies = 0;
 
    constexpr uint32_t token_slots = 64; // Each copy takes its token from its own slot, the GPU reads it when the list runs
+
+   // How a plane of a depth stencil resource copies: "format" is the resource's or a view's. The planes of the combined formats copy as
+   // textures of their own, the depth of D24 with its top 8 bits zeroed and the stencil as R8. The typeless R32 and R16 only come here as depth.
+   DXGI_FORMAT PlaneFormat(DXGI_FORMAT format, bool is_stencil)
+   {
+      switch (format)
+      {
+      case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      case DXGI_FORMAT_R24G8_TYPELESS:
+         return (is_stencil ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
+      case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      case DXGI_FORMAT_R32G8X24_TYPELESS:
+         return (is_stencil ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R32_FLOAT);
+      case DXGI_FORMAT_D32_FLOAT:
+      case DXGI_FORMAT_R32_TYPELESS:
+         return DXGI_FORMAT_R32_FLOAT;
+      case DXGI_FORMAT_D16_UNORM:
+      case DXGI_FORMAT_R16_TYPELESS:
+         return DXGI_FORMAT_R16_UNORM;
+      default:
+         return format;
+      }
+   }
 
    // UPLOAD buffers start (and stay) in GENERIC_READ, READBACK ones in COPY_DEST
    com_ptr<ID3D12Resource> CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heap_type, uint64_t size)
@@ -250,8 +313,9 @@ namespace D3D12Readback
       return true;
    }
 
-   // The copied bytes once the GPU ran the copy (wait for its queue first), nothing if it didn't yet: the list wasn't natively submitted
-   // yet, or the game's predication skipped the copy. Textures are their subresources' rows of "RowPitch" bytes, ordered [layer][z][row].
+   // The copied bytes once the GPU ran the copy (a fence of its queue passed first, see "Advance()"), nothing if it didn't: the list wasn't
+   // natively submitted yet, or the game's predication skipped the copy. Textures are their subresources' rows of "RowPitch" bytes, ordered
+   // [layer][z][row].
    std::optional<std::vector<char>> TryRead(const Copy& copy)
    {
       void* data = nullptr;
@@ -279,6 +343,46 @@ namespace D3D12Readback
       return result;
    }
 
+   enum class Completion : uint8_t
+   {
+      Pending, // The last fence didn't pass yet
+      Ran,     // The token is there
+      NotRun,  // Still no token after two passed fences: the game's predication skipped the copy, or its list was never submitted
+   };
+
+   constexpr uint32_t max_signals = 2;
+
+   // Advances an executed copy at a present, without waiting for its queue (it can wait on something the game signals after present): the
+   // copy's fence is signaled on the queue behind the lists submitted to it so far, and the token is read once that passed. ReShade's
+   // execute event comes before the native submission, so that first signal can pass before the copy's list was submitted: signal once
+   // more, a token still missing then isn't coming. "bytes" gets the copied bytes when it ran. Expects "state->mutex" (exclusive).
+   Completion Advance(Copy* copy, std::vector<char>* bytes)
+   {
+      if (copy->signals != 0)
+      {
+         if (copy->fence->GetCompletedValue() < copy->fence_value)
+            return Completion::Pending;
+         if (std::optional<std::vector<char>> data = TryRead(*copy))
+         {
+            *bytes = std::move(*data);
+            return Completion::Ran;
+         }
+         if (copy->signals == max_signals)
+            return Completion::NotRun;
+      }
+      if (!copy->fence)
+      {
+         com_ptr<ID3D12Device> device;
+         if (FAILED(copy->queue->GetDevice(IID_PPV_ARGS(&device))) || FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy->fence))))
+            return Completion::NotRun;
+      }
+      if (FAILED(copy->queue->Signal(copy->fence.get(), copy->fence_value + 1)))
+         return Completion::NotRun;
+      copy->fence_value++;
+      copy->signals++;
+      return Completion::Pending;
+   }
+
    template <typename Function>
    void ForEachCopy(State* state, Function&& function)
    {
@@ -301,7 +405,7 @@ namespace D3D12Readback
             if (copy->status == Copy::Status::Recorded && copy->cmd_list == cmd_list)
             {
                copy->status = Copy::Status::Executed;
-               copy->queue = queue;
+               copy->queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
                recorded_copies--;
             } });
    }
@@ -331,34 +435,27 @@ namespace D3D12Readback
       state->copy.reset();
    }
 
-   // Frees the retired copies the GPU is done with, waiting for the queues of executed ones (rare: a job gave up on them)
+   // Frees the retired copies the GPU is done with (rare: a job gave up on them): executed ones once "Advance()" has no more to wait for,
+   // those in lists not executed or reset yet stay
    void CollectRetired(State* state)
    {
-      std::vector<std::pair<uint64_t, reshade::api::command_queue*>> executed; // Token, queue
       {
          const std::shared_lock lock(state->mutex);
-         for (const Copy& copy : state->retired)
-         {
-            if (copy.status == Copy::Status::Executed)
-            {
-               executed.emplace_back(copy.token, copy.queue);
-            }
-         }
-      }
-      if (executed.empty())
-         return;
-      std::vector<reshade::api::command_queue*> waited;
-      for (const auto& [token, queue] : executed)
-      {
-         if (std::ranges::find(waited, queue) == waited.end())
-         {
-            queue->wait_idle();
-            waited.push_back(queue);
-         }
+         if (state->retired.empty())
+            return;
       }
       const std::unique_lock lock(state->mutex);
-      std::erase_if(state->retired, [&](const Copy& copy)
-         { return std::ranges::any_of(executed, [&](const auto& item)
-              { return item.first == copy.token; }); });
+      std::vector<char> unused; // The bytes of a copy nobody waits for
+      for (auto it = state->retired.begin(); it != state->retired.end();)
+      {
+         if (it->status == Copy::Status::Executed && Advance(&*it, &unused) != Completion::Pending)
+         {
+            it = state->retired.erase(it);
+         }
+         else
+         {
+            ++it;
+         }
+      }
    }
 } // namespace D3D12Readback

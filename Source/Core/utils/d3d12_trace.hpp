@@ -565,9 +565,10 @@ namespace D3D12Trace
 
    // Fills a clear entry like the D3D11 capture does: the cleared resource in "rt_*[0]" (no view, see "FillCopy()") and the cleared view in
    // "rt_view[0]". The clear values are up to the caller ("TraceDrawCallData::blend_factor").
-   void FillClear(reshade::api::device* device, TraceDrawCallData* entry, reshade::api::resource_view view)
+   void FillClear(reshade::api::device* device, TraceDrawCallData* entry, reshade::api::resource_view view, TraceDrawCallData::ClearKind kind)
    {
       entry->type = TraceDrawCallData::TraceDrawCallType::ClearResource;
+      entry->clear_kind = kind;
       FillView(device, entry, 'r', 0, false, 0, D3D12State::GetViewInfo(device, view));
    }
 } // namespace D3D12Trace
