@@ -58,6 +58,7 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 	}
 	// TODO: add better support for depth stencil formats? uint?
 	// Skip if there's no texture. It might be undefined behaviour, but it seems to work on Nvidia
+	bool drawn = false; // Returned once at the end: returning from inside the branch makes fxc warn X4000 (potentially uninitialized "DrawDebugTexture")
 	if (debugWidth != 0.0)
 	{
 		float2 resolutionScale = 1.0;
@@ -235,10 +236,10 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 		if (validTexel || !backgroundPassthrough)
 		{
 			outColor = color * gamePaperWhite; // Scale by user paper white brightness just to make it more visible
-			return true;
+			drawn = true;
 		}
     }
-	return false;
+	return drawn;
 }
 #endif
 
