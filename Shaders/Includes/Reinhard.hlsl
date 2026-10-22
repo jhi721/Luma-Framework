@@ -56,7 +56,7 @@ namespace Reinhard
       possibleOutValue = min(possibleOutValue, Out_Peak);
       Color = max(Color, 0.0);
     }
-    return (Color <= ShoulderStart) ? Color : possibleOutValue;
+    return select(Color <= ShoulderStart, Color, possibleOutValue);
   }
 
   // Reinhard highlight compression that is identity up to ShoulderStart, then smoothly compresses toward PeakOut (never exceeding it).

@@ -163,7 +163,7 @@ float3 FakeHDR(float3 Color, float NormalizationPoint = 0.02, float FakeHDRInten
     float3 normalizedColor = Color / NormalizationPoint;
     // Expand highlights with a power curve
     // Branching or Max would be faster depending on how many pixels pass the test. We don't really even need to anymore with "blendIntensity".
-    normalizedColor = normalizedColor > 1.0 ? pow(normalizedColor, 1.0 + FakeHDRIntensity) : normalizedColor;
+    normalizedColor = select(normalizedColor > 1.0, pow(normalizedColor, 1.0 + FakeHDRIntensity), normalizedColor);
     float3 alteredColor = lerp(Color, normalizedColor * NormalizationPoint, blendIntensity);
     Color = lerp(RestoreLuminance(Color, alteredColor, true, ColorSpace), alteredColor, SaturationExpansionIntensity);
   }
@@ -498,7 +498,7 @@ float2 RemapUV(float2 UV, float2 sourceResolution, float2 targetResolution)
 float2 RemapUVFromScale(float2 UV, float2 resolutionScale /*= CV_HPosScale.xy*/, float2 sourceResolution /*= CV_ScreenSize.xy*/)
 {
   // Avoid "degrading" the quality if the resolution scale is 1
-  return resolutionScale == 1 ? UV : RemapUV(UV, sourceResolution, sourceResolution / resolutionScale);
+  return select(resolutionScale == 1, UV, RemapUV(UV, sourceResolution, sourceResolution / resolutionScale));
 }
 
 #endif // SRC_COMMON_HLSL
