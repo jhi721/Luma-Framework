@@ -21,6 +21,7 @@
 #if DX11
 #include "managed_resources.h"
 #else
+#include "d3d12_passes.h"
 #include "d3d12_state.h"
 #include "d3d12_upload_ring.h"
 #include "d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
@@ -803,6 +804,24 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> settings_address = 0; // The newest copy, 0 before the first
    // The ring frees its pages by the fences it signals with this count at each present
    std::atomic<uint64_t> present_count = 0;
+
+   // Bumped when any of Luma's native shaders changes (see "CompileCustomShaders()"): the pipelines made of them are made again
+   std::atomic<uint32_t> native_shaders_generation = 0;
+
+   // What the D3D12 display composition makes when it first draws (see "DrawDisplayCompositionD3D12()"). "mutex" serializes the device's compositions and guards the rest
+   struct DisplayCompositionD3D12
+   {
+      std::shared_mutex mutex;
+      D3D12Passes::Context passes;                 // Its command list, run on the present queue
+      com_ptr<ID3D12RootSignature> root_signature; // Its CBVs are at the registers the natives were compiled with
+      com_ptr<ID3D12PipelineState> pipeline;       // Null if the last attempt to make it for the format and generation below failed
+      DXGI_FORMAT pipeline_format = DXGI_FORMAT_UNKNOWN;
+      uint32_t pipeline_generation = 0;
+      com_ptr<ID3D12Resource> source;         // A copy of the back buffer, which the shader reads while it writes the back buffer
+      std::vector<com_ptr<IUnknown>> retired; // What it replaced, which the GPU can still use: the next frame it submits keeps it alive
+      CommandListData cmd_list_data;          // Owns the memory of its root CBVs (root parameters 0 and 1), for "SetLumaConstantBuffers()"
+      uint32_t drawn_frame = UINT32_MAX;      // The "FrameIndex" of the last present it drew in, for the dev MCP
+   } display_composition;
 #endif
 
 #if DX11

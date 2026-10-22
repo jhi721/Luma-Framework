@@ -718,6 +718,12 @@ namespace
    uint32_t luma_data_cbuffer_index = -1; // Needed, unless "POST_PROCESS_SPACE_TYPE" is 0 and we don't need the final display composition pass
 	uint32_t luma_ui_cbuffer_index = -1; // Optional, for "UI_DRAW_TYPE" 1
 
+   // The registers Luma's native shaders are compiled with ("LUMA_*_CB_INDEX"): the game's indices above, else the first free ones (see "CompileCustomShaders()", which writes them
+   // with the same values every time). The D3D12 passes bind their cbuffers there.
+   uint32_t luma_settings_cbuffer_define_index = 0;
+   uint32_t luma_data_cbuffer_define_index = 0;
+   uint32_t luma_ui_cbuffer_define_index = 0;
+
    // A list of luma native shader definitions, to be later compiled in the device data. The hash can be used globally to identify and retrieve them (they need to be unique!).
    // We define the shader name and the file shader because we can make different permutations out of the same code file.
    // Games can add shaders to this list, though they should generally not remove from it.
@@ -726,13 +732,15 @@ namespace
    std::unordered_map<uint32_t, ShaderDefinition> native_shaders_definitions =
    {
       { CompileTimeStringHash("Copy VS"), { "Luma_Copy_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
+      { CompileTimeStringHash("Display Composition"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader } },
+
+#if DX11 // The D3D12 builds only have the natives of their display composition, "Copy VS" and "Display Composition": the passes of the others aren't ported to D3D12 yet
       { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
 
       // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
       { CompileTimeStringHash("Scale VS"), { "Luma_Scale_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
       { CompileTimeStringHash("Scale PS"), { "Luma_Scale_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
 
-      { CompileTimeStringHash("Display Composition"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader } },
       // Encodes the scRGB proxy back buffer into the real HDR10 PQ (or SDR sRGB) one, see "ENABLE_SWAPCHAIN_PROXY"
       { CompileTimeStringHash("Swapchain Encode"), { "Luma_SwapchainEncode", reshade::api::pipeline_subobject_type::pixel_shader } },
       
@@ -792,6 +800,7 @@ namespace
       { CompileTimeStringHash("Luma TAA Ultra Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "3" }, { "TAA_UPSCALE", "1" } } } },
       { CompileTimeStringHash("Luma TAA Reconstruct Depth CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "reconstruct_previous_depth_cs", { { "TAA_QUALITY", "3" } } } },
 #endif
+#endif // DX11
    };
 
    // TODO: make the data in these a unique ptr for easier handling, and the shader binary data contained inside of "CachedShader" too.
@@ -1993,7 +2002,6 @@ namespace
          // This is because in case the users disabled some of them, we don't want them to bother to
          // define unique indexes for each of them, but the shader compiler fails if two cbuffers have the same value,
          // so we have to find the "next" unique one.
-         uint32_t luma_settings_cbuffer_define_index, luma_data_cbuffer_define_index, luma_ui_cbuffer_define_index;
          std::unordered_set<uint32_t> excluded_values;
          if (luma_settings_cbuffer_index <= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT - 1)
             luma_settings_cbuffer_define_index = luma_settings_cbuffer_index;
@@ -2413,7 +2421,11 @@ namespace
                   }
                   else // DX11 default (5_1 doesn't add any features we might need)
                   {
+#if DX12 // DXC's lowest shader model: DXIL, like the shaders of the game's pipelines (a pipeline can't mix it with DXBC). Plain registers, in space 0: the passes bind them
+                     local_shader_target += "6_0";
+#else
                      local_shader_target += "5_0";
+#endif
                   }
                }
                else
@@ -2824,6 +2836,12 @@ namespace
       if (optional_device_data)
       {
          CreateDeviceNativeShaders(*optional_device_data, &changed_luma_native_shaders_hashes);
+      }
+#else
+      // The set holds the natives that were loaded from the cache, compiled (even if they failed) or deleted. The pipelines made of them are rebuilt at their next use
+      if (optional_device_data && !changed_luma_native_shaders_hashes.empty())
+      {
+         optional_device_data->native_shaders_generation.fetch_add(1, std::memory_order_release);
       }
 #endif
    }
@@ -3658,6 +3676,18 @@ namespace
 #endif
 
 #if DX12
+      {
+         // Waits for the GPU to be done with the composition's command lists, then lets go of what they used
+         auto& composition = device_data.display_composition;
+         const std::unique_lock lock(composition.mutex);
+         D3D12Passes::Destroy(&composition.passes);
+         composition.retired.clear();
+         composition.pipeline.reset();
+         composition.root_signature.reset();
+         composition.source.reset();
+         D3D12UploadRing::Retire(composition.cmd_list_data.upload_ring.get(), &composition.cmd_list_data.upload_pages);
+         composition.cmd_list_data.upload_ring.reset();
+      }
       device_data.upload_ring.reset(); // The command lists that outlive the device's data keep the pool through their own pointer
 #endif
       device->destroy_private_data<DeviceData>();
@@ -7930,6 +7960,198 @@ namespace
    }
 #endif
 
+#if DX12
+   // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its debug draw and UI composition aren't ported yet): copies the back buffer, then draws
+   // the "Display Composition" shader over it with "Copy VS", on a command list of Luma's own that runs on the present queue (see "includes/d3d12_passes.h"). What it needs is the device's
+   // ("DeviceData::display_composition"), made when it first draws. Each reason it doesn't draw is logged once.
+   void DrawDisplayCompositionD3D12(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, DeviceData& device_data, uint32_t custom_data_1, float custom_data_4)
+   {
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
+      auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+      auto* const back_buffer = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
+      if (!back_buffer)
+      {
+         return;
+      }
+      const auto fail = [](std::atomic_flag* logged, const char* message)
+      {
+         if (!logged->test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, message);
+         }
+      };
+
+      auto& composition = device_data.display_composition;
+      const std::unique_lock lock(composition.mutex);
+      if (!composition.passes.fence)
+      {
+         static std::atomic_flag no_passes;
+         if (!D3D12Passes::Create(&composition.passes, native_device))
+         {
+            return fail(&no_passes, "[Display composition] The device refused the fence and the descriptor heaps of its command list, so the image isn't composed");
+         }
+         composition.cmd_list_data.upload_ring = device_data.upload_ring;
+         composition.cmd_list_data.luma_settings_param = 0;
+         composition.cmd_list_data.luma_data_param = 1;
+      }
+      // The GPU can still run the commands that use what is replaced here: the next frame that is submitted keeps it alive
+      const auto retire = [&](IUnknown* object)
+      {
+         if (object)
+         {
+            composition.retired.emplace_back(object);
+         }
+      };
+
+      // The pipeline is made again for a new back buffer format and when the natives changed, one attempt each: nothing draws if it fails
+      const D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
+      const uint32_t natives_generation = device_data.native_shaders_generation.load(std::memory_order_acquire);
+      if (composition.pipeline_format != back_buffer_desc.Format || composition.pipeline_generation != natives_generation)
+      {
+         retire(composition.pipeline.get());
+         retire(composition.root_signature.get());
+         composition.pipeline.reset();
+         composition.root_signature.reset();
+         composition.pipeline_format = back_buffer_desc.Format;
+         composition.pipeline_generation = natives_generation;
+         bool natives_found = false;
+         {
+            // The DXIL of the natives, from the cache the D3D11 shader objects are made of. Its lock holds for as long as the pipeline needs the code
+            const std::shared_lock lock_loading(s_mutex_loading);
+            const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+            const auto vertex_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(CompileTimeStringHash("Copy VS")));
+            const auto pixel_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(CompileTimeStringHash("Display Composition")));
+            natives_found = vertex_shader != custom_shaders_cache.end() && vertex_shader->second && !vertex_shader->second->code.empty() && pixel_shader != custom_shaders_cache.end() && pixel_shader->second && !pixel_shader->second->code.empty();
+            if (natives_found)
+            {
+               // LumaSettings, LumaData and the shader's SRVs t0 to t8 (the source, the UI texture and the debug draw ones, see below), at the registers the natives were compiled with. The sampler is for the debug draw
+               const D3D12_DESCRIPTOR_RANGE1 srv_range = {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV, .NumDescriptors = 9, .OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+               const D3D12_ROOT_PARAMETER1 parameters[] = {
+                  {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, .Descriptor = {.ShaderRegister = luma_settings_cbuffer_define_index}, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
+                  {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, .Descriptor = {.ShaderRegister = luma_data_cbuffer_define_index}, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
+                  {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = {.NumDescriptorRanges = 1, .pDescriptorRanges = &srv_range}, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
+               };
+               const D3D12_STATIC_SAMPLER_DESC linear_clamp_sampler = {.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR, .AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .MaxAnisotropy = 1, .ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER, .MaxLOD = D3D12_FLOAT32_MAX, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL};
+               composition.root_signature = D3D12Passes::CreateRootSignature(native_device, {.Version = D3D_ROOT_SIGNATURE_VERSION_1_1, .Desc_1_1 = {.NumParameters = UINT(std::size(parameters)), .pParameters = parameters, .NumStaticSamplers = 1, .pStaticSamplers = &linear_clamp_sampler}});
+               if (composition.root_signature)
+               {
+                  const std::vector<uint8_t>& vertex_code = vertex_shader->second->code;
+                  const std::vector<uint8_t>& pixel_code = pixel_shader->second->code;
+                  composition.pipeline = D3D12Passes::CreateFullscreenPipeline(native_device, composition.root_signature.get(), {vertex_code.data(), vertex_code.size()}, {pixel_code.data(), pixel_code.size()}, back_buffer_desc.Format);
+               }
+            }
+         }
+         if (!natives_found)
+         {
+            static std::atomic_flag warned;
+            if (!warned.test_and_set())
+            {
+               const std::string warn_message = "Some of the shader files are missing from the \"" + std::string(NAME) + "\" folder, or failed to compile for some unknown reason (D3D12 compiles them with DXC: dxcompiler.dll may be missing from that folder too), please re-install the mod.";
+               reshade::log::message(reshade::log::level::error, warn_message.c_str());
+#if DEVELOPMENT
+               ASSERT_MSG(false, warn_message);
+#else
+               MessageBoxA(nullptr, warn_message.c_str(), NAME, MB_SETFOREGROUND);
+#endif
+            }
+         }
+         else if (!composition.pipeline)
+         {
+            static std::atomic_flag no_pipeline;
+            fail(&no_pipeline, "[Display composition] The device refused the root signature or the pipeline of the composition (the debug layer says why), so the image isn't composed");
+         }
+         else
+         {
+            reshade::log::message(reshade::log::level::info, std::format("[Display composition] Made its pipeline for {} (natives generation {})", GetFormatNameSafe(back_buffer_desc.Format), natives_generation).c_str());
+         }
+      }
+      if (!composition.pipeline)
+      {
+         return;
+      }
+
+      // The shader reads a copy of the back buffer while it writes the back buffer
+      const D3D12_RESOURCE_DESC source_desc = {.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D, .Width = back_buffer_desc.Width, .Height = back_buffer_desc.Height, .DepthOrArraySize = 1, .MipLevels = 1, .Format = back_buffer_desc.Format, .SampleDesc = {.Count = 1}};
+      const D3D12_RESOURCE_DESC current_source_desc = (composition.source ? composition.source->GetDesc() : D3D12_RESOURCE_DESC{});
+      if (current_source_desc.Width != source_desc.Width || current_source_desc.Height != source_desc.Height || current_source_desc.Format != source_desc.Format)
+      {
+         retire(composition.source.get());
+         composition.source.reset();
+         const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+         if (FAILED(native_device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &source_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&composition.source))))
+         {
+            static std::atomic_flag no_source;
+            return fail(&no_source, "[Display composition] The device refused the copy of the back buffer, so the image isn't composed");
+         }
+      }
+
+      static std::atomic_flag no_frame;
+      const std::optional<D3D12Passes::Recording> recording = D3D12Passes::Begin(&composition.passes);
+      if (!recording)
+      {
+         return fail(&no_frame, "[Display composition] No frame of its command list is free (the GPU is 16 presents behind), or the device refused it, so the image isn't composed at this present");
+      }
+
+      // The table's SRVs: the source, then null views of the dimensions the shader declares for the others (t1 the UI texture, t2 to t8 the debug draw ones), the runtime checks the descriptors against them
+      native_device->CreateRenderTargetView(back_buffer, nullptr, recording->rtv_cpu);
+      const D3D12_SHADER_RESOURCE_VIEW_DESC source_srv = {.Format = back_buffer_desc.Format, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}};
+      const D3D12_SHADER_RESOURCE_VIEW_DESC null_srvs[] = {
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2DMS = {}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2DArray = {.MipLevels = 1, .ArraySize = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2DMSArray = {.ArraySize = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture3D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture1D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture1DArray = {.MipLevels = 1, .ArraySize = 1}},
+      };
+      D3D12_CPU_DESCRIPTOR_HANDLE srv = recording->srv_cpu;
+      native_device->CreateShaderResourceView(composition.source.get(), &source_srv, srv);
+      for (const D3D12_SHADER_RESOURCE_VIEW_DESC& null_srv : null_srvs)
+      {
+         srv.ptr += recording->srv_increment;
+         native_device->CreateShaderResourceView(nullptr, &null_srv, srv);
+      }
+
+      // The back buffer is in PRESENT at present, after the game's command lists on this queue
+      ID3D12GraphicsCommandList* const list = recording->list;
+      D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      D3D12Passes::Transition(list, composition.source.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+      list->CopyResource(composition.source.get(), back_buffer);
+      D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      D3D12Passes::Transition(list, composition.source.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      list->SetGraphicsRootSignature(composition.root_signature.get());
+      list->SetPipelineState(composition.pipeline.get());
+      // Every present resets the composition's LumaData: the pages of the previous one are free once the GPU ran it
+      D3D12UploadRing::Retire(composition.cmd_list_data.upload_ring.get(), &composition.cmd_list_data.upload_pages);
+      composition.cmd_list_data.luma_data_address = 0;
+      SetLumaConstantBuffers(list, composition.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+      SetLumaConstantBuffers(list, composition.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, custom_data_1, 0, 0.f, custom_data_4);
+      list->SetGraphicsRootDescriptorTable(2, recording->srv_gpu);
+      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      const D3D12_VIEWPORT viewport = {0.f, 0.f, float(back_buffer_desc.Width), float(back_buffer_desc.Height), 0.f, 1.f};
+      const D3D12_RECT scissor = {0, 0, LONG(back_buffer_desc.Width), LONG(back_buffer_desc.Height)};
+      list->RSSetViewports(1, &viewport);
+      list->RSSetScissorRects(1, &scissor);
+      list->OMSetRenderTargets(1, &recording->rtv_cpu, FALSE, nullptr);
+      list->DrawInstanced(4, 1, 0, 0);
+      D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+
+      for (const com_ptr<IUnknown>& object : composition.retired)
+      {
+         D3D12Passes::KeepAlive(&composition.passes, object.get());
+      }
+      composition.retired.clear();
+      if (!D3D12Passes::Submit(&composition.passes, native_queue))
+      {
+         static std::atomic_flag no_submit;
+         return fail(&no_submit, "[Display composition] Its command list failed to close (a command it recorded is invalid, the debug layer says which), so the image isn't composed");
+      }
+      D3D12UploadRing::OnExecute(&composition.cmd_list_data.upload_pages, native_queue, device_data.present_count);
+      composition.drawn_frame = cb_luma_global_settings.FrameIndex;
+   }
+#endif // DX12
+
    void OnPresent(
       reshade::api::command_queue* queue,
       reshade::api::swapchain* swapchain,
@@ -7943,9 +8165,9 @@ namespace
 
       NativeDevice* native_device = (NativeDevice*)(queue->get_device()->get_native());
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
+      SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
 #if DX11 // On D3D12 the queue's immediate command list is ReShade's own, it has no "CommandListData"
       ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(queue->get_immediate_command_list()->get_native());
-      SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
 #endif
 
@@ -8000,7 +8222,6 @@ namespace
 #endif // DX11
 #endif  // DEVELOPMENT
 
-#if DX11 // The D3D12 display composition is "docs/DX12-Support-Plan.md" phase 4
       // If there are no shaders being currently replaced in the game,
       // we can assume that we either missed replacing some shaders, or that we have unloaded all of our shaders.
       bool mod_active = IsModActive(device_data);
@@ -8032,21 +8253,36 @@ namespace
       bool ui_needs_scaling = mod_active && GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) == 2;
       // If this is true, the UI was drawn on a separate buffer and needs to be composed onto the scene (which allows for UI background tonemapping, for increased visibility in HDR)
       // Note: we could skip this if "device_data.has_drawn_main_post_processing" is false and our scene and UI paper whites are matching, however, let's not make it any more complicated.
+#if DX11
       bool ui_needs_composition = mod_active && enable_ui_separation && GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 3 && device_data.ui_texture.get();
+#else
+      constexpr bool ui_needs_composition = false; // The UI separation isn't ported to D3D12 yet
+#endif
       bool needs_gamut_mapping = mod_active && GetShaderDefineCompiledNumericalValue(GAMUT_MAPPING_TYPE_HASH) != 0;
 
-#if DEVELOPMENT
+      // The debug draw isn't ported to D3D12 yet
+#if DEVELOPMENT && DX11
       bool needs_debug_draw_texture = device_data.debug_draw_texture.get() != nullptr; // Note that this might look wrong if "output_linear" is false
 #else
       constexpr bool needs_debug_draw_texture = false;
 #endif
       // TODO: add "TEST_SDR_HDR_SPLIT_VIEW_MODE" and "TEST_2X_ZOOM" as drawing conditions etc
 
+      // Force a custom display mode in case we have no game custom shaders loaded, so the custom linearization shader can linearize anyway, independently of "POST_PROCESS_SPACE_TYPE"
+      uint32_t custom_const_buffer_data_1 = 0;
+      if (!mod_active) // We ignore "s_mutex_generic", it doesn't matter
+      {
+         // No need for "s_mutex_reshade" here, given that they are generally only also changed by the user manually changing the settings in ImGUI, which runs at the very end of the frame
+         custom_const_buffer_data_1 = input_linear ? 2 : 1;
+      }
+      const float custom_const_buffer_data_4 = (ui_needs_composition && device_data.has_drawn_main_post_processing) ? 1.f : 0.f;
+
       // The composition shader writes linear (scRGB) or PQ values: a swapchain left in gamma space (not upgraded) already shows the
       // vanilla image, so only the debug draw goes there
       const bool output_composable = output_linear || output_pq_bt2020;
       if (!force_disable_display_composition && (needs_debug_draw_texture || (output_composable && (needs_reencoding || needs_gamma_correction || ui_needs_scaling || ui_needs_composition || needs_gamut_mapping))))
       {
+#if DX11
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          if (device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")] && device_data.native_pixel_shaders[CompileTimeStringHash("Display Composition")])
          {
@@ -8071,7 +8307,6 @@ namespace
             // For now we only support these formats, nothing else wouldn't really make sense (other swapchains only get the debug draw)
             ASSERT_ONCE(!output_composable || target_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || target_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
 
-            uint32_t custom_const_buffer_data_1 = 0;
             uint32_t custom_const_buffer_data_2 = 0;
             float custom_const_buffer_data_3 = 0.f;
 
@@ -8357,14 +8592,6 @@ namespace
             {
                DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
                const std::shared_lock lock(s_mutex_reshade); // TODO: why is this locked here? It could cause a deadlock with the device below!
-               // Force a custom display mode in case we have no game custom shaders loaded, so the custom linearization shader can linearize anyway, independently of "POST_PROCESS_SPACE_TYPE"
-               bool force_reencoding_or_gamma_correction = !mod_active; // We ignore "s_mutex_generic", it doesn't matter
-               if (force_reencoding_or_gamma_correction)
-               {
-                  // No need for "s_mutex_reshade" here or above, given that they are generally only also changed by the user manually changing the settings in ImGUI, which runs at the very end of the frame
-                  custom_const_buffer_data_1 = input_linear ? 2 : 1;
-               }
-               float custom_const_buffer_data_4 = (ui_needs_composition && device_data.has_drawn_main_post_processing) ? 1.f : 0.f;
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, custom_const_buffer_data_1, custom_const_buffer_data_2, custom_const_buffer_data_3, custom_const_buffer_data_4);
             }
@@ -8433,7 +8660,11 @@ namespace
             }
 #endif // DEVELOPMENT
          }
+#else
+         DrawDisplayCompositionD3D12(queue, swapchain, device_data, custom_const_buffer_data_1, custom_const_buffer_data_4);
+#endif // DX11
       }
+#if DX11
       else
       {
          device_data.display_composition_texture = nullptr;
@@ -8465,6 +8696,11 @@ namespace
       track_buffer_pipeline_instance = 0;
 #endif // DEVELOPMENT
 #endif // DX11
+
+#if DEVELOPMENT && DX12
+      // The jobs that read the composed back buffer run here, the others ran before the composition
+      Mcp::OnPresent(device_data, device_data.trace_command_list_data, queue, swapchain, true);
+#endif
 
       device_data.has_drawn_main_post_processing_previous = device_data.has_drawn_main_post_processing;
       // Per frame: the game's draws set it again (a game that always has a scene sets it in its "OnPresent", as "_Template" does; reads in

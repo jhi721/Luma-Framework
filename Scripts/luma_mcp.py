@@ -57,6 +57,7 @@ READ_TARGET = {
     "slot": {"type": "integer", "description": "View slot (default 0); on D3D12 srv/uav slots are the packed entries luma_trace_get lists (with register/space)"},
     "mip": {"type": "integer", "description": "Mip level (default 0)"},
     "replaced": {"type": "boolean", "description": "Read the bindings of Luma's replaced pass (default true) or the original ones"},
+    "composed": {"type": "boolean", "description": "D3D12, with view=swapchain: read the back buffer after Luma's display composition instead of before it (an error if the composition doesn't draw)"},
 }
 COMPARE_OPTIONS = {
     "region": ANALYSIS["region"],
@@ -143,7 +144,7 @@ TOOLS = [
         "Read back a view of a pass right after it drew (the frame after the call, not a stale live read). Works for any format, including depth/stencil, "
         "3D LUTs, arrays, MSAA (resolved), BC, r16/rg16, r11g11b10. Writes the raw .bin + .json meta, returns per-channel stats (min/max/mean/percentiles, "
         "NaN/Inf/negative/above 1/exact zero) and a PNG preview path. PS and CS passes only (use the PS entry of a draw; D3D12 entries are whole draws). "
-        "view=swapchain or ui reads the back buffer or Luma's UI texture at present (before display composition), no pass needed. view=registered:<name> "
+        "view=swapchain or ui reads the back buffer or Luma's UI texture at present (before display composition; D3D12: composed=true reads the swapchain after it), no pass needed. view=registered:<name> "
         "reads one of Luma's own textures (SMAA input/predication mask/output, GTAO depth mips, motion vectors, core.bloom with mip=, core.smaa_edges...; "
         "see luma_dev_values kind texture) at present: its last content, usually this frame's. "
         "D3D12: view=srv needs index and reads the resource right after the entry that last wrote it (draw, dispatch, copy, resolve or clear; "

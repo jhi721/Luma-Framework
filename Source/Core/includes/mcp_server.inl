@@ -286,6 +286,14 @@ namespace Mcp
          const auto it = args.find(key);
          return it != args.end() && !it->second.empty() ? &it->second : nullptr;
       }
+      // D3D12: whether the job reads the back buffer after Luma's display composition ("composed"), which "OnPresent()" runs in its call after the composition
+      bool ReadsComposedBackBuffer() const
+      {
+         if (tool != "read_resource")
+            return false;
+         const std::string* view = Arg("view");
+         return view && *view == "swapchain" && BoolArg("composed", false);
+      }
       int64_t IntArg(const char* key, int64_t default_value) const
       {
          const std::string* value = Arg(key);
@@ -1661,6 +1669,11 @@ namespace Mcp
       const std::string* view = job->Arg("view");
       if (job->phase == 0)
       {
+         if (job->BoolArg("composed", false))
+         {
+            job->error = "composed=true is D3D12 only: the D3D11 views are read before Luma's display composition";
+            return true;
+         }
          // Final targets, read right away at present
          if (view && (*view == "swapchain" || *view == "ui"))
          {
@@ -2038,6 +2051,13 @@ namespace Mcp
       {
          if (view && *view == "swapchain")
          {
+            // "OnPresent()" runs the jobs that read the composed back buffer after Luma's display composition
+            const bool composed = job->BoolArg("composed", false);
+            if (composed && device_data.display_composition.drawn_frame != cb_luma_global_settings.FrameIndex)
+            {
+               job->error = "Luma's display composition didn't draw at this present: it is off, the output needs none with the current settings and defines, or its shaders are missing (see luma_log)";
+               return true;
+            }
             // On a command list of Luma's own: ReShade only flushes its queue's immediate command list when its own API recorded into it,
             // native commands there could run any time later
             auto* back_buffer = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
@@ -2073,7 +2093,7 @@ namespace Mcp
 #if ENABLE_MINHOOK
             job->result.Field("creation", "swapchain");
 #endif
-            job->result.Field("view", "swapchain").Field("note", "Read at present, before ReShade's effects (D3D12 has no display composition yet)");
+            job->result.Field("view", "swapchain").Field("note", composed ? "Read at present, after Luma's display composition and before ReShade's effects" : "Read at present, before Luma's display composition and ReShade's effects");
             return true;
          }
 
@@ -3296,8 +3316,13 @@ namespace Mcp
    }
 
    // Called from "OnPresent" on the render thread, before display composition. "cmd_list_data" holds the frame capture.
-   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
+   // D3D12: called again after the composition ("after_composition"), where only the job that reads the composed back buffer runs.
+   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, bool after_composition = false)
    {
+#if DX12
+      if (after_composition && (!active_job || !active_job->ReadsComposedBackBuffer()))
+         return;
+#endif
       last_present_ms = GetTickCount64();
       last_frame_index = cb_luma_global_settings.FrameIndex;
 #if DX12
@@ -3319,6 +3344,11 @@ namespace Mcp
       if (active_job->device_data && active_job->device_data != &device_data)
          return;
       active_job->device_data = &device_data;
+#if DX12
+      // The jobs that read the composed back buffer wait for the call after the composition, the others run in the first one
+      if (active_job->ReadsComposedBackBuffer() != after_composition)
+         return;
+#endif
 
       Job& job = *active_job;
       if (!RunJob(&job, device_data, cmd_list_data, queue, swapchain))
