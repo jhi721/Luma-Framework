@@ -176,9 +176,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       uint32_t mod_version = 1;
       Globals::SetGlobals(game_name, mod_description.c_str(), "https://github.com/Filoppi/Luma-Framework/", mod_version);
 
-#if DX11 // On D3D12, the upgrades need the display composition and placed resource clones (see "docs/DX12-Support-Plan.md" phases 4 and 5)
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
+#if DX11 // On D3D12 the swapchain upgrade runs (display composition, pipeline variants and the view fix), the texture upgrades need the creation hooks
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       enable_indirect_texture_format_upgrades = true; // This is generally safer so enable it in the generic mod
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies; // Indirect dependencies are probably not needed as they'd already be upgraded too
