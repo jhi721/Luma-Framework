@@ -1301,6 +1301,25 @@ namespace
       return false;
    }
 
+   // Empties a custom shader as if its file never existed (the entry stays in the cache). Needs "s_mutex_loading"
+   void ResetCustomShader(CachedCustomShader* custom_shader)
+   {
+      custom_shader->code.clear();
+      custom_shader->is_hlsl = false;
+      custom_shader->is_luma_native = false;
+      custom_shader->file_path.clear();
+      custom_shader->preprocessed_hash = 0;
+      custom_shader->compilation_errors.clear();
+#if DEVELOPMENT || TEST
+      custom_shader->compilation_error = false;
+      custom_shader->preprocessed_code.clear();
+      custom_shader->disasm.clear();
+#if DEVELOPMENT
+      custom_shader->definition = {};
+#endif
+#endif
+   }
+
    void ClearCustomShader(uint64_t shader_hash)
    {
       const std::unique_lock lock(s_mutex_loading);
@@ -1308,20 +1327,7 @@ namespace
       // TODO: why not just remove it from the array or call the default initializer?
       if (custom_shader != custom_shaders_cache.end() && custom_shader->second != nullptr)
       {
-         custom_shader->second->code.clear();
-         custom_shader->second->is_hlsl = false;
-         custom_shader->second->is_luma_native = false;
-         custom_shader->second->file_path.clear();
-         custom_shader->second->preprocessed_hash = 0;
-         custom_shader->second->compilation_errors.clear();
-#if DEVELOPMENT || TEST
-         custom_shader->second->compilation_error = false;
-         custom_shader->second->preprocessed_code.clear();
-         custom_shader->second->disasm.clear();
-#if DEVELOPMENT
-         custom_shader->second->definition = {};
-#endif
-#endif
+         ResetCustomShader(custom_shader->second);
       }
    }
 
@@ -1383,9 +1389,7 @@ namespace
          const reshade::api::pipeline_subobject_type type = cached_pipeline.shader_types[i];
          const std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> stream_type = ToStreamShaderType(type);
          const auto original_subobject = std::ranges::find(subobjects, type, &reshade::api::pipeline_subobject::type);
-         // A shader file that was deleted stays in the cache until the shaders are unloaded, but it stops replacing as soon as it's gone
-         std::error_code file_error;
-         if (custom_shader.is_luma_native || custom_shader.code.empty() || !stream_type || original_subobject == subobjects.end() || !std::filesystem::exists(custom_shader.file_path, file_error))
+         if (custom_shader.is_luma_native || custom_shader.code.empty() || !stream_type || original_subobject == subobjects.end())
          {
             continue;
          }
@@ -2752,6 +2756,25 @@ namespace
                {
                }
             }
+         }
+      }
+
+      // A shader file that was deleted or renamed stops replacing: its cache entry would otherwise keep its code, and its errors, for as long as the game runs.
+      // The device objects of the native ones (D3D11) are created again below, like the changed ones.
+      {
+         const std::unique_lock lock(s_mutex_loading);
+         for (const auto& [shader_hash, custom_shader] : custom_shaders_cache)
+         {
+            std::error_code file_error;
+            if (custom_shader == nullptr || custom_shader->file_path.empty() || std::filesystem::exists(custom_shader->file_path, file_error))
+            {
+               continue;
+            }
+            if (custom_shader->is_luma_native)
+            {
+               changed_luma_native_shaders_hashes.emplace(uint32_t(shader_hash >> 32));
+            }
+            ResetCustomShader(custom_shader);
          }
       }
 
