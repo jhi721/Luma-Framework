@@ -4,12 +4,14 @@
 
 // Luma TAA: temporal anti-aliasing resolve, native or upscaling ("TAA_UPSCALE"), for games without usable TAA or as a
 // vendor-agnostic alternative to DLAA and FSR Native AA. Components and the sources of their ideas:
-// - 5-tap bicubic history (MJP's Catmull-Rom with the 5 taps of Jimenez, SIGGRAPH 2016)
+// - bicubic history: MJP's Catmull-Rom with the 5 taps of Jimenez (SIGGRAPH 2016), renormalized; an exact 4x4 for the
+//   2x2 history
 // - motion vector of the closest 3x3 depth (Karis, SIGGRAPH 2014)
 // - rounded 3x3 + cross box, history clipped toward its clamped average (Playdead's INSIDE)
 // - linear blend, which keeps the energy of HDR highlights, optionally with Reinhard around it (Godot 4)
 // - accumulated weight 1 / (2 - w) (MiniEngine), capped by the resampling blur (Yang et al., SIGGRAPH Asia 2009)
-// - thin feature lock, reactive mask, and at Ultra a depth clip against the reconstructed previous depth (AMD FSR 2)
+// - thin feature lock, reactive mask, deringing of the 2x2 history, and at Ultra a depth clip against the reconstructed
+//   previous depth (AMD FSR 2)
 // - flickering analysis and the 2x2 history (Unreal Engine's TSR, ideas only, no Unreal Engine code)
 //
 // Inputs follow "SR::SuperResolutionImpl::DrawData": device depth, motion vectors that "MotionVectorScale" turns into
@@ -17,7 +19,7 @@
 // rgb is linear color, alpha the accumulated weight; 2x2 the render resolution from High quality.
 //
 // MIT License. Copyright (c) 2026 Hlib Omelchenko. Parts are derived from third party code, also under the MIT License:
-// - "SampleHistory": MJP's "SampleTextureCatmullRom". Copyright (c) 2019 MJP
+// - "SampleHistory" and "BicubicWeights": MJP's "SampleTextureCatmullRom". Copyright (c) 2019 MJP
 // - "ClipToBox" and the rounded box: Playdead's "temporal". Copyright (c) 2015 Playdead
 // - the weight rcp(2 - w): Microsoft MiniEngine's "TemporalBlendCS.hlsl". Copyright (c) 2015 Microsoft
 // - "reconstruct_previous_depth_cs" and the depth clip: AMD FidelityFX FSR 2. Copyright (c) 2022-2023 Advanced Micro
@@ -78,7 +80,8 @@
 // locks for TAA_LOCK_FRAMES frames (the jitter period: a highlight hit once per cycle stays locked), reprojected with the
 // history, and locked history isn't clipped. Only on nearly static pixels (under TAA_LOCK_MAX_SPEED pixels per frame,
 // both to create and to use a lock): a moving feature uncovers background whose reprojection lands on its old lock, and
-// unclipped history would trail behind it.
+// unclipped history would trail behind it. A pixel that moves that fast ends its lock at once (its slot stores its speed,
+// see TAA_LOCK_SPEED_STEPS).
 #ifndef TAA_LOCK
 #define TAA_LOCK 1
 #endif
@@ -93,6 +96,13 @@
 #endif
 #ifndef TAA_LOCK_MAX_SPEED
 #define TAA_LOCK_MAX_SPEED 0.1
+#endif
+// The lock texture's low byte also carries the speed of pixels that moved at least TAA_LOCK_MAX_SPEED (they hold no lock),
+// for the flickering analysis: TAA_LOCK_FRAMES + 1 + the speed in steps of 1 / TAA_LOCK_SPEED_STEPS pixels per frame.
+// Without TAA_LOCK nothing is stored, and the flickering range restarts wherever a pixel moves faster than
+// TAA_FLICKER_MOTION_CHANGE.
+#ifndef TAA_LOCK_SPEED_STEPS
+#define TAA_LOCK_SPEED_STEPS 16.0
 #endif
 // Temporal upscaling (TAAU): the inputs are at "RenderResolution", while the history, the per pixel states and the
 // output are at "OutputResolution", with one thread per output pixel. Each output pixel takes this frame's sample only
@@ -149,25 +159,32 @@
 // reprojection blurs it far less. Each thread resolves its pixel's 4 history texels and outputs their mean. A texel
 // takes this frame's sample only when it fell in its quarter pixel. This is a box splat, so the mean of the 4 texels
 // converges to the pixel's box filter. A texel without a sample falls back to a jitter-aware Gaussian of the 3x3 (sigma
-// "TAA_HISTORY_2X_SIGMA" render pixels), but only where its history is rejected or under the reactive mask. The mean of
+// "TAA_HISTORY_2X_SIGMA" render pixels), but only where its history is rejected or under the reactive mask. Where the
+// pixel's own sample is under the mask, its 4 texels move toward that Gaussian around the pixel center, as much as the
+// mask: content without motion vectors makes per texel estimates from neighboring samples flicker. The mean of
 // the 4 history texels is clipped, and the texels keep their deviations from it (the sub-pixel detail), scaled by the
 // mean's clip factor. The history textures must match Core's "LumaTAA::history_2x_quality".
 #ifndef TAA_HISTORY_2X
 #define TAA_HISTORY_2X (TAA_QUALITY >= 2 && !TAA_UPSCALE)
 #endif
-// Bicubic history sharpness c (Catmull-Rom is 0.5). The 2x history resamples at a higher frequency, where 0.4 rings less
-// and measured better in the lab; TAAU measured better at 0.5.
+// Bicubic history sharpness c (Catmull-Rom is 0.5). A 2x history texel gets a sample every 4th frame but is resampled
+// every frame, so it compounds its filter's response about 4x: there 0.6 kept the most texture detail in a pan but rang
+// on alpha tested cutouts and sliding highlights in motion, and 0.4 lost detail.
 #ifndef TAA_HISTORY_SHARPNESS
-#if TAA_HISTORY_2X
-#define TAA_HISTORY_SHARPNESS 0.4
-#else
 #define TAA_HISTORY_SHARPNESS 0.5
-#endif
 #endif
 // The 2x history's resampling blur tolerance, in history texels. This is the lab optimum, the render resolution history
 // uses "TAA_RESAMPLING_BLUR_TOLERANCE".
 #ifndef TAA_HISTORY_2X_BLUR_TOLERANCE
 #define TAA_HISTORY_2X_BLUR_TOLERANCE 0.2
+#endif
+// Where the closest depth's motion (the one the history is reprojected with) isn't the pixel's own, one side's history is
+// moved with the other side's motion, and the bicubic's overshoot there rings around HDR highlights. Such texels are
+// clamped to their 2x2 nearest history texels (deringing, as AMD FSR 2 does for its Lanczos), fully from this motion
+// difference in pixels per frame. The other histories don't need it: they clip each pixel, while the 2x one clips its
+// texels' mean and keeps their deviations.
+#ifndef TAA_HISTORY_2X_DERING_MOTION
+#define TAA_HISTORY_2X_DERING_MOTION 0.1
 #endif
 // Share of frames in which a history texel receives a sample (1/4 for the box splat). The history weight caps are
 // defined for a texel sampled every frame, so they are scaled by this to keep the same time constant for every texel.
@@ -182,6 +199,18 @@
 // keep its history in full ("history / (history + 0)" is 1) until a sample lands in it, every 4th frame on average.
 #ifndef TAA_HISTORY_2X_REACTIVE_FALLBACK
 #define TAA_HISTORY_2X_REACTIVE_FALLBACK 0.25
+#endif
+// Deferred accumulation (AMD FSR 3.1's "fMinDisocclusionAccumulation" idea): a texel without a sample this frame whose
+// history this frame holds less than "TAA_HISTORY_2X_DEFERRED_SAMPLES" samples (fresh after a rejection, such as content
+// entering at the screen edge) also takes the Gaussian, with a weight of this value times the Gaussian's peak tap, fading
+// out as its history reaches that many samples: the Gaussians of a few frames average out before its first samples land.
+// Above ~0.25 samples it also fires in motion (the resampling cap goes down to 0.2 samples there) and blurs it. It costs
+// a little FLIP around sub-pixel HDR glints on a dark background (their energy stays). 0 disables it.
+#ifndef TAA_HISTORY_2X_DEFERRED
+#define TAA_HISTORY_2X_DEFERRED 0.05
+#endif
+#ifndef TAA_HISTORY_2X_DEFERRED_SAMPLES
+#define TAA_HISTORY_2X_DEFERRED_SAMPLES 0.25
 #endif
 // Flickering analysis (after UE TSR's): the 3x3 clip against a current frame that aliases (detail near the Nyquist
 // limit, sub-pixel shading, alpha tested cutouts) throws away the history that would average the aliasing out, and the
@@ -200,25 +229,53 @@
 #endif
 // The range starts over where the lighting changed, which a range alone can't tell from aliasing. That is when the
 // luminance of the 3x3 neighborhood's darkest sample changes by more than "TAA_FLICKER_RESET_CHANGE" (relative) against
-// its own exponential average ("TAA_FLICKER_RESET_SMOOTHING" per frame). 0 disables the test. A cutout or sub-pixel detail
-// moves the 3x3 mean and max by up to 30x as it appears and vanishes, but the background around it keeps the min, while a
-// lighting change moves the min too.
+// its own exponential average ("TAA_FLICKER_RESET_SMOOTHING" per frame), and its mean luminance by more than
+// "TAA_FLICKER_RESET_MEAN_CHANGE" the same way. "TAA_FLICKER_RESET_CHANGE" 0 disables the test. A bright cutout or sub-pixel detail moves the 3x3 mean
+// and max by up to 30x as it appears and vanishes, but the background around it keeps the min. A dark one (a black seam or
+// gap, a hole over a dark void) moves the min as much, which made static pixels lose their range at the jitter's period,
+// but the mean far less. A lighting change moves both, the same way.
 #ifndef TAA_FLICKER_RESET_CHANGE
 #define TAA_FLICKER_RESET_CHANGE 0.9
 #endif
 #ifndef TAA_FLICKER_RESET_SMOOTHING
 #define TAA_FLICKER_RESET_SMOOTHING 0.25
 #endif
-// The range also starts over where the pixel moved faster than this (pixels per frame) in the previous frame, so an object
-// that passed over a static background leaves no trace in its range.
-#ifndef TAA_FLICKER_MOTION_RESET_SPEED
-#define TAA_FLICKER_MOTION_RESET_SPEED 0.5
+#ifndef TAA_FLICKER_RESET_MEAN_CHANGE
+#define TAA_FLICKER_RESET_MEAN_CHANGE 0.5
 #endif
-// The widening fades out with motion, reaching none at this speed (pixels per frame): moving content uncovers and
-// reprojects history whose clip must stay tight, or it trails (UE TSR disables its analysis on moving pixels too).
+// The range also starts over where the pixel's speed differs by more than this (pixels per frame) from the speed its
+// reprojected state was written with: the state then belongs to another surface (an object that passed over the
+// background, or the background it uncovered). A surface that keeps moving (a camera pan) keeps its range. At least
+// 2 / TAA_LOCK_SPEED_STEPS: speeds under TAA_LOCK_MAX_SPEED read back as 0, and 0.1 is stored as 0.125.
+// Sub-pixel highlights (HDR glints) are the exception: one that moves sets the 3x3's closest depth, and so the speed,
+// only on the frames the jitter hits it, and restarting its range on the others clipped its history (the 1080p
+// drifting glints kept 86% of their energy). Where the history is a highlight (the lock's criterion against the 3x3),
+// a speed drop from under "TAA_FLICKER_DROP_SPEED" keeps the range; instead the range restarts on static pixels next
+// to a moving highlight brighter than them, where the history lags behind the highlight or rings around it.
+#ifndef TAA_FLICKER_MOTION_CHANGE
+#define TAA_FLICKER_MOTION_CHANGE 0.125
+#endif
+#ifndef TAA_FLICKER_DROP_SPEED
+#define TAA_FLICKER_DROP_SPEED 0.5
+#endif
+// The widening fades out with motion, reaching none at this speed (pixels per frame): fast content reprojects history the
+// resampling blurred, which a tight clip keeps correcting (UE TSR disables its analysis on fast parallax too).
 // 0 disables the fade.
 #ifndef TAA_FLICKER_MAX_SPEED
-#define TAA_FLICKER_MAX_SPEED 0.5
+#define TAA_FLICKER_MAX_SPEED 1.0
+#endif
+// A step (other content under a static pixel without a reset: a camera cut, a particle without motion vectors) takes this
+// frame's sample out of the range, which then spans both contents and widens the box around the old history. A cutout the
+// range forgot between two hits (one per jitter cycle) does the same, but its average is still in the history, outside
+// the forgotten range, while the history of a step is the old content, inside the range. So where the history is inside
+// the previous frame's range (give or take "TAA_FLICKER_STEP_MARGIN" of it), this frame widens the box by at most
+// "TAA_FLICKER_STEP_GROWTH" times that range, and beyond twice that the range starts over at this frame's sample. 0
+// disables both. Not with "TAA_UPSCALE" (not measured there).
+#ifndef TAA_FLICKER_STEP_GROWTH
+#define TAA_FLICKER_STEP_GROWTH 2.0
+#endif
+#ifndef TAA_FLICKER_STEP_MARGIN
+#define TAA_FLICKER_STEP_MARGIN 0.25
 #endif
 // Reactive mask input (AMD FSR 2 semantics, t7), drawn for example by a game's alpha blended particles. Where it is set,
 // the history weight cap is scaled by 1 - mask (with the mask capped at "TAA_REACTIVE_MAX"), the flickering range starts
@@ -254,7 +311,10 @@ Texture2D<float2> MotionVectors : register(t2);
 Texture2D<float4> History : register(t3);
 // Linear depth bits (asuint), written by "reconstruct_previous_depth_cs" and read by the Ultra quality resolve.
 Texture2D<uint> ReconstructedPreviousDepth : register(t4);
-Texture2D<uint> PreviousLock : register(t5); // Thin feature lock frames left (R8_UINT, alternating like the history)
+// Alternating like the history, R16_UINT from Medium quality (R8_UINT at Low): the thin feature lock frames left or a moving
+// pixel's speed in the low byte (see "TAA_LOCK_SPEED_STEPS"), the flickering analysis' darkest luminance average in the
+// high byte (see "OutputFlicker" in "main")
+Texture2D<uint> PreviousLock : register(t5);
 // Flickering analysis state (R11G11B10_FLOAT, alternating like the history), see "OutputFlicker" in "main"
 Texture2D<float3> PreviousFlicker : register(t6);
 // Optional reactive mask (AMD FSR 2's): 1 where the color has no matching motion vectors (particles, VFX). See
@@ -297,21 +357,47 @@ float ResamplingBlurCap(float2 displacement, float tolerance)
    return tolerance / (tolerance + resampling_blur);
 }
 
+// Per axis weights of the 4 taps of a bicubic with sharpness "TAA_HISTORY_SHARPNESS" (a Keys cubic, a = -c), for a
+// position "f" past the second tap (0-1)
+void BicubicWeights(float2 f, out float2 w0, out float2 w1, out float2 w2, out float2 w3)
+{
+   const float c = TAA_HISTORY_SHARPNESS;
+   w0 = f * (-c + f * (2.0 * c - c * f));
+   w1 = 1.0 + f * f * (-(3.0 - c) + (2.0 - c) * f);
+   w2 = f * (c + f * ((3.0 - 2.0 * c) - (2.0 - c) * f));
+   w3 = f * f * (-c + c * f);
+}
+
+#if TAA_HISTORY_2X
+// Jitter-aware Gaussian (sigma "TAA_HISTORY_2X_SIGMA" render pixels) of the 3x3 samples around "center" (render pixels),
+// and its peak tap weight
+float3 NeighborhoodGaussian(float3 neighborhood[9], int2 pixel, float2 center, out float peak)
+{
+   float3 sum = 0.0;
+   float weight = 0.0;
+   peak = 0.0;
+   [unroll] for (int n = 0; n < 9; n++)
+   {
+      const float2 offset = pixel + float2(n % 3 - 1, n / 3 - 1) + 0.5 + Jitter - center;
+      const float gauss = exp(-0.5 * dot(offset, offset) / (TAA_HISTORY_2X_SIGMA * TAA_HISTORY_2X_SIGMA));
+      sum += neighborhood[n] * gauss;
+      weight += gauss;
+      peak = max(peak, gauss);
+   }
+   return sum / weight;
+}
+#endif
+
 // Bilinear at Low quality, otherwise the 5-tap bicubic: MJP's 9-tap bilinear formulation without its 4 corner taps,
-// weights not renormalized (see the license notice at the top). "position" is in pixels, with texel centers at
-// integer + 0.5.
+// renormalized (see the license notice at the top). "position" is in pixels, with texel centers at integer + 0.5.
 float4 SampleHistory(float2 position, float2 inv_resolution)
 {
 #if TAA_QUALITY == 0
    return History.SampleLevel(LinearClampSampler, position * inv_resolution, 0);
 #else
    const float2 texel_center = floor(position - 0.5) + 0.5;
-   const float2 f = position - texel_center;
-   const float c = TAA_HISTORY_SHARPNESS;
-   const float2 w0 = f * (-c + f * (2.0 * c - c * f));
-   const float2 w1 = 1.0 + f * f * (-(3.0 - c) + (2.0 - c) * f);
-   const float2 w2 = f * (c + f * ((3.0 - 2.0 * c) - (2.0 - c) * f));
-   const float2 w3 = f * f * (-c + c * f);
+   float2 w0, w1, w2, w3;
+   BicubicWeights(position - texel_center, w0, w1, w2, w3);
    const float2 w12 = w1 + w2;
    const float2 uv0 = (texel_center - 1.0) * inv_resolution;
    const float2 uv3 = (texel_center + 2.0) * inv_resolution;
@@ -321,7 +407,12 @@ float4 SampleHistory(float2 position, float2 inv_resolution)
    history += History.SampleLevel(LinearClampSampler, uv12, 0) * (w12.x * w12.y);
    history += History.SampleLevel(LinearClampSampler, float2(uv3.x, uv12.y), 0) * (w3.x * w12.y);
    history += History.SampleLevel(LinearClampSampler, float2(uv12.x, uv3.y), 0) * (w12.x * w3.y);
-   // The negative lobes can take the weight below 0 next to texels without history (2x2 history and upscaling)
+   // Without the corners the weights sum to 1 - (w0 + w3).x * (w0 + w3).y, 1.6% short at half a texel on both axes
+   // (Catmull-Rom). Moving history loses that again every frame, in a pattern that follows the fractional position
+   // (moire under a dolly) wherever the clip doesn't pull it back. The sum is 1 at whole texel offsets: static pixels
+   // don't change.
+   history /= 1.0 - (w0.x + w3.x) * (w0.y + w3.y);
+   // The negative lobes can take the weight below 0 next to texels without history (upscaling)
    history.a = max(history.a, 0.0);
    return history;
 #endif
@@ -342,6 +433,14 @@ void FindClosestDepth(int2 pixel, int2 max_pixel, bool inverted_depth, bool cros
 {
    closest_depth = (inverted_depth ? 0.0 : 1.0);
    closest_pixel = pixel;
+   // Four 2x2 gathers (the 4x4 texels around the 3x3) instead of 9 loads: one texture instruction per 4 texels. Quad q's top
+   // left texel is at offset -1 + 2 * (q & 1, q >> 1); clamp addressing returns the same edge texels as the clamped loads.
+   // The cross doesn't reach the bottom right quad.
+   float4 quads[4];
+   [unroll] for (int quad = 0; quad < 4; quad++)
+   {
+      quads[quad] = ((cross_only && quad == 3) ? 0.0 : DeviceDepth.GatherRed(LinearClampSampler, (pixel + int2(quad & 1, quad >> 1) * 2) * InvRenderResolution));
+   }
    [unroll] for (int y = -1; y <= 1; y++)
    {
       [unroll] for (int x = -1; x <= 1; x++)
@@ -351,7 +450,11 @@ void FindClosestDepth(int2 pixel, int2 max_pixel, bool inverted_depth, bool cros
             continue;
          }
          const int2 sample_pixel = clamp(pixel + int2(x, y), 0, max_pixel);
-         const float depth = DeviceDepth.Load(int3(sample_pixel, 0));
+         // Gather order: x bottom left, y bottom right, z top right, w top left
+         const int2 offset = int2(x, y) + 1;
+         const int2 in_quad = offset & 1;
+         const float4 texels = quads[(offset.x >> 1) + (offset.y >> 1) * 2];
+         const float depth = (in_quad.y ? (in_quad.x ? texels.y : texels.x) : (in_quad.x ? texels.z : texels.w));
          const bool closer = (inverted_depth ? (depth > closest_depth) : (depth < closest_depth));
          if (closer)
          {
@@ -366,6 +469,34 @@ void FindClosestDepth(int2 pixel, int2 max_pixel, bool inverted_depth, bool cros
 #define TAA_GROUP_SIZE   8
 #define RECONSTRUCT_TILE 16
 groupshared uint reconstruct_tile[RECONSTRUCT_TILE * RECONSTRUCT_TILE];
+
+#if TAA_HISTORY_2X
+// The 2x history texels of a group's 5x5 blocks (see "main"). Pixels that share the group center's motion span 19 texels
+// per axis (2 per pixel, plus the block); the rest is slack for motion that differs within the group. A larger tile was
+// no faster: it takes L1 cache away (groupshared memory and L1 share the same storage).
+#define HISTORY_TILE 20
+groupshared float4 history_tile[HISTORY_TILE * HISTORY_TILE];
+// This frame's colors of the group's pixels and their 3x3 neighborhoods
+#define COLOR_TILE (TAA_GROUP_SIZE + 2)
+groupshared float3 color_tile[COLOR_TILE * COLOR_TILE];
+
+// A 2x history texel, clamped to the texture: from the group's tile when the pixel's whole block is in it. A branch per
+// texel ran faster on D3D11 than one branch around two copies of the block (fewer registers).
+float4 LoadHistory2x(bool from_tile, int2 texel, int2 tile_origin, int2 max_texel)
+{
+   float4 value;
+   [branch] if (from_tile)
+   {
+      const int2 tile_texel = texel - tile_origin;
+      value = history_tile[tile_texel.y * HISTORY_TILE + tile_texel.x];
+   }
+   else
+   {
+      value = History.Load(int3(clamp(texel, 0, max_texel), 0));
+   }
+   return value;
+}
+#endif
 
 [numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)] void reconstruct_previous_depth_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
    // Ultra quality first pass (AMD FSR 2 "reconstruct previous depth"): every pixel's closest 3x3 depth is scattered
@@ -432,7 +563,7 @@ groupshared uint reconstruct_tile[RECONSTRUCT_TILE * RECONSTRUCT_TILE];
 
 // clang-format parses a second "[numthreads] void f() {}" in a file as a lambda and indents it.
 [numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)]
-void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex)
 // clang-format on
 {
 #if TAA_UPSCALE
@@ -443,6 +574,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    // The output pixel's center in render pixels, and the render pixel it falls in
    const float2 sample_center = (output_pixel + 0.5) / render_scale;
    const int2 pixel = min(int2(sample_center), int2(RenderResolution) - 1);
+#elif TAA_HISTORY_2X
+   // The group shares its history texels, so every thread reaches the barrier: threads past the edge resolve the edge
+   // pixel again and write the same values
+   const int2 pixel = min(int2(dispatch_thread_id.xy), int2(RenderResolution) - 1);
 #else
    const int2 pixel = dispatch_thread_id.xy;
    if (any(pixel >= int2(RenderResolution)))
@@ -452,77 +587,45 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    const int2 max_pixel = int2(RenderResolution) - 1;
    const bool inverted_depth = (Flags & TAA_FLAG_INVERTED_DEPTH) != 0;
 
-   // 3x3 neighborhood color box (the 3x3 and the cross, averaged into a "rounded" box)
-   float3 current = 0.0;
-   float3 min_3x3 = FLT_MAX;
-   float3 max_3x3 = -FLT_MAX;
-   float3 sum_3x3 = 0.0;
-   float3 min_cross = FLT_MAX;
-   float3 max_cross = -FLT_MAX;
-   float3 sum_cross = 0.0;
-   float max_neighbor_luminance = 0.0; // For the thin feature lock
-   // The flickering analysis uses the darkest sample's luminance. The luminance of the per channel min would be ~0 wherever
-   // the samples have near-zero channels in different places, and hide lighting changes there.
-   float min_luminance = FLT_MAX;
-   float reactive = 0.0;
-#if TAA_HISTORY_2X || TAA_UPSCALE
-   float3 neighborhood[9];
-#endif
-   [unroll] for (int y = -1; y <= 1; y++)
+#if TAA_HISTORY_2X
+   // The 5x5 blocks of the 2x history read below overlap, and their 25 loads per pixel go through the texture pipe that
+   // bounds High and Ultra: the group loads their usual area once (one load per texel) into "history_tile", from where
+   // the block of the group's center pixel starts (2 texels per pixel after its first pixel's), minus half the slack.
+   const int2 max_texel = int2(RenderResolution) * 2 - 1;
+   const int2 group_center = min(int2(group_id.xy) * TAA_GROUP_SIZE + TAA_GROUP_SIZE / 2, max_pixel);
+   int2 center_block_base;
+   float2 center_block_fraction;
+   BilinearFootprint((group_center + 0.25 + MotionVectors.Load(int3(group_center, 0)) * MotionVectorScale) * 2.0, center_block_base, center_block_fraction);
+   const int2 tile_origin = center_block_base - 1 - TAA_GROUP_SIZE - (HISTORY_TILE - 19) / 2;
+   [unroll] for (uint tile_load = 0; tile_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE < HISTORY_TILE * HISTORY_TILE; tile_load++)
    {
-      [unroll] for (int x = -1; x <= 1; x++)
+      const uint tile_index = group_index + tile_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE;
+      if (tile_index < HISTORY_TILE * HISTORY_TILE)
       {
-         const int2 sample_pixel = clamp(pixel + int2(x, y), 0, max_pixel);
-         const float3 color = SourceColor.Load(int3(sample_pixel, 0));
-         const float luminance = dot(color, Rec709_Luminance);
-         min_luminance = min(min_luminance, luminance);
-#if TAA_LOCK
-         if (x != 0 || y != 0)
-         {
-            max_neighbor_luminance = max(max_neighbor_luminance, luminance);
-         }
-#endif
-         min_3x3 = min(min_3x3, color);
-         max_3x3 = max(max_3x3, color);
-         sum_3x3 += color;
-         if (x == 0 || y == 0)
-         {
-            min_cross = min(min_cross, color);
-            max_cross = max(max_cross, color);
-            sum_cross += color;
-         }
-         if (x == 0 && y == 0)
-         {
-            current = color;
-         }
-#if TAA_HISTORY_2X || TAA_UPSCALE
-         neighborhood[(y + 1) * 3 + (x + 1)] = color;
-#endif
+         history_tile[tile_index] = History.Load(int3(clamp(tile_origin + int2(tile_index % HISTORY_TILE, tile_index / HISTORY_TILE), 0, max_texel), 0));
       }
    }
+   // The same for this frame's 3x3 neighborhoods (9 loads per pixel), which the 2x resolve also reads again from the
+   // tile rather than keeping them in registers through the history block
+   const int2 group_origin = int2(group_id.xy) * TAA_GROUP_SIZE;
+   [unroll] for (uint color_load = 0; color_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE < COLOR_TILE * COLOR_TILE; color_load++)
+   {
+      const uint color_index = group_index + color_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE;
+      if (color_index < COLOR_TILE * COLOR_TILE)
+      {
+         color_tile[color_index] = SourceColor.Load(int3(clamp(group_origin - 1 + int2(color_index % COLOR_TILE, color_index / COLOR_TILE), 0, max_pixel), 0));
+      }
+   }
+   const int color_tile_center = (pixel.y - group_origin.y + 1) * COLOR_TILE + (pixel.x - group_origin.x + 1);
+#endif
+
    float closest_depth;
    int2 closest_pixel;
    // At Low quality only the cross is searched
    FindClosestDepth(pixel, max_pixel, inverted_depth, TAA_QUALITY == 0, closest_depth, closest_pixel);
-#if TAA_REACTIVE
-   [branch] if (Flags & TAA_FLAG_REACTIVE_MASK)
-   {
-      [unroll] for (int y = -1; y <= 1; y++)
-      {
-         [unroll] for (int x = -1; x <= 1; x++)
-         {
-            reactive = max(reactive, ReactiveMask.Load(int3(clamp(pixel + int2(x, y), 0, max_pixel), 0)));
-         }
-      }
-   }
-#endif
-   float3 box_min = 0.5 * (min_3x3 + min_cross);
-   float3 box_max = 0.5 * (max_3x3 + max_cross);
-   const float3 box_average = 0.5 * (sum_3x3 / 9.0 + sum_cross / 5.0);
-   const float current_luminance = dot(current, Rec709_Luminance);
-
    const float2 motion = MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
    const float speed = length(motion);
+   const float2 own_motion = MotionVectors.Load(int3(pixel, 0)) * MotionVectorScale; // "motion" may be a neighbor's
 #if TAA_UPSCALE
    const float2 history_position = sample_center + motion;
 #else
@@ -542,68 +645,13 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 #endif
    const bool has_previous_state = !state_offscreen && !(Flags & TAA_FLAG_RESET);
    const int2 previous_pixel = int2(floor(state_history_position));
-
-   // Without the flickering analysis there's no lighting change test, so TAAU doesn't widen the static clip box
-   bool lighting_changed_or_new = !TAA_FLICKER;
-#if TAA_FLICKER
-   {
-      // The state is R11G11B10_FLOAT, half the bytes of RGBA16F. It's unsigned with ~1.5% precision, which the range and
-      // the 0.9 relative reset tolerate. x and y are the current sample luminance's range, where x > y means the pixel
-      // moved faster than "TAA_FLICKER_MOTION_RESET_SPEED" and the range starts over. z is the average luminance of the 3x3
-      // darkest sample, at least 2^-14 (the smallest normal), so the 0 of a cleared texture means no state. Values are
-      // stored as they are, because D3D11 rounds float conversions toward zero and an offset (like "+ 1") would lose
-      // small values.
-      const float3 previous_state = (has_previous_state ? PreviousFlicker.Load(int3(previous_pixel, 0)) : 0.0);
-      const bool has_state = previous_state.z > 0.0;
-      const float lighting_tolerance = TAA_FLICKER_RESET_CHANGE * max(max(abs(min_luminance), abs(previous_state.z)), 1e-4);
-      const bool lighting_changed = TAA_FLICKER_RESET_CHANGE > 0.0 && abs(min_luminance - previous_state.z) > lighting_tolerance;
-      lighting_changed_or_new = lighting_changed || !has_state;
-      const bool moved = previous_state.x > previous_state.y;
-      float range_min = current_luminance;
-      float range_max = current_luminance;
-      if (has_state && !lighting_changed && !moved && reactive <= 0.0)
-      {
-         range_min = min(current_luminance, lerp(previous_state.x, current_luminance, TAA_FLICKER_ENVELOPE_DECAY));
-         range_max = max(current_luminance, lerp(previous_state.y, current_luminance, TAA_FLICKER_ENVELOPE_DECAY));
-      }
-      const float min_luminance_ema = lerp(previous_state.z, min_luminance, TAA_FLICKER_RESET_SMOOTHING);
-      const float min_luminance_average = max((has_state ? min_luminance_ema : min_luminance), 6.103515625e-5);
-      const float3 range_state = float3(max(range_min, 0.0), max(range_max, 0.0), min_luminance_average);
-      // A range min above any max (R11G11B10 holds up to 65024) marks the pixel as moved
-      OutputFlicker[state_pixel] = ((speed > TAA_FLICKER_MOTION_RESET_SPEED) ? float3(65000.0, 0.0, min_luminance_average) : range_state);
-      float widening = TAA_FLICKER_GAMMA * (range_max - range_min);
-      if (TAA_FLICKER_MAX_SPEED > 0.0)
-      {
-         widening *= saturate(1.0 - speed / TAA_FLICKER_MAX_SPEED);
-      }
-      box_min -= widening;
-      box_max += widening;
-   }
-#endif
-   const float max_history_weight = TAA_MAX_HISTORY_WEIGHT * (1.0 - min(reactive, TAA_REACTIVE_MAX));
-   // Clipping into the current neighborhood also removes the bicubic's ringing.
-   const float3 clip_target = clamp(box_average, box_min, box_max);
-
-#if TAA_LOCK
-   const bool lock_static = speed < TAA_LOCK_MAX_SPEED && reactive <= 0.0;
-   uint lock_frames = 0;
-   if (lock_static && current_luminance > TAA_LOCK_MIN_LUMINANCE && current_luminance > TAA_LOCK_RATIO * max_neighbor_luminance)
-   {
-      lock_frames = TAA_LOCK_FRAMES;
-   }
-   else if (has_previous_state)
-   {
-      const uint previous_lock = PreviousLock.Load(int3(previous_pixel, 0));
-      lock_frames = ((previous_lock > 0) ? (previous_lock - 1) : 0);
-   }
-   const bool locked = lock_static && lock_frames > 0;
-#else
-   const bool locked = false;
-#endif
+   const uint previous_lock_word = (((TAA_LOCK || TAA_FLICKER) && has_previous_state) ? PreviousLock.Load(int3(previous_pixel, 0)) : 0);
+   const uint previous_lock_code = (TAA_LOCK ? (previous_lock_word & 0xFFu) : 0);
 
 #if TAA_QUALITY >= 3
    // Depth clip (AMD FSR 2): both depths come from this frame, so a camera moving along its view axis, which changes
-   // every depth, can't make the test fail.
+   // every depth, can't make the test fail. It runs before the history read, so its taps don't keep the 2x history
+   // texels live (that made Ultra 15-30% slower).
    const float current_linear_depth = LinearizeDepth(closest_depth);
    int2 footprint_base;
    float2 footprint_fraction;
@@ -629,13 +677,256 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    const float depth_clip = 1.0;
 #endif
 
+#if TAA_HISTORY_2X
+   GroupMemoryBarrierWithGroupSync(); // The tiles are loaded
+#endif
+
+   // The history is read before the flickering analysis, which compares its luminance to the range (see
+   // "TAA_FLICKER_STEP_GROWTH")
+#if TAA_UPSCALE
+   const float4 history_sample = SampleHistory(state_history_position, InvOutputResolution);
+   const float history_luminance = dot(history_sample.rgb, Rec709_Luminance);
+#elif TAA_HISTORY_2X
+   // The 4 history texels are 1 history texel apart, so they share their position past the taps and the bicubic weights:
+   // each is an exact separable 4x4 bicubic of one 5x5 block of texels. "SampleHistory"'s 5 bilinear taps drop the 4
+   // corner taps, an approximation that texels resampled every frame compound.
+   int2 block_base;
+   float2 block_fraction;
+   BilinearFootprint((pixel + 0.25 + motion) * 2.0, block_base, block_fraction); // The top left texel's, in history texels
+   const int2 block_origin = block_base - 1;
+   float2 bicubic_weights[4];
+   BicubicWeights(block_fraction, bicubic_weights[0], bicubic_weights[1], bicubic_weights[2], bicubic_weights[3]);
+   const float dering = saturate(length(own_motion - motion) / TAA_HISTORY_2X_DERING_MOTION);
+   // A block outside the tile (motion that differs within the group) is read from the texture
+   const int2 tile_offset = block_origin - tile_origin;
+   const bool in_tile = all(tile_offset >= 0) && all(tile_offset <= HISTORY_TILE - 5);
+   float4 history_samples_2x[4];
+   [unroll] for (uint block_texel = 0; block_texel < 4; block_texel++)
+   {
+      history_samples_2x[block_texel] = 0.0;
+   }
+   [unroll] for (int row = 0; row < 5; row++)
+   {
+      float4 row_texels[5];
+      [unroll] for (int column = 0; column < 5; column++)
+      {
+         row_texels[column] = LoadHistory2x(in_tile, block_origin + int2(column, row), tile_origin, max_texel);
+      }
+      [unroll] for (uint row_texel = 0; row_texel < 4; row_texel++)
+      {
+         const int2 offset = int2(row_texel & 1, row_texel >> 1);
+         const int tap = row - offset.y; // Of the texel's 4 rows
+         if (tap < 0 || tap > 3)
+         {
+            continue;
+         }
+         float4 row_sum = 0.0;
+         [unroll] for (int column_tap = 0; column_tap < 4; column_tap++)
+         {
+            row_sum += row_texels[offset.x + column_tap] * bicubic_weights[column_tap].x;
+         }
+         history_samples_2x[row_texel] += row_sum * bicubic_weights[tap].y;
+      }
+   }
+   float3 history_mean = 0.0;
+   [unroll] for (uint texel = 0; texel < 4; texel++)
+   {
+      // The deringing bounds are loaded again rather than tracked through the block, which kept 8 more vectors live there,
+      // and only where there is deringing to do
+      if (dering > 0.0)
+      {
+         const int2 nearest_origin = block_origin + 1 + int2(texel & 1, texel >> 1);
+         float4 nearest_min = FLT_MAX;
+         float4 nearest_max = -FLT_MAX;
+         [unroll] for (uint nearest = 0; nearest < 4; nearest++)
+         {
+            const float4 nearest_texel = LoadHistory2x(in_tile, nearest_origin + int2(nearest & 1, nearest >> 1), tile_origin, max_texel);
+            nearest_min = min(nearest_min, nearest_texel);
+            nearest_max = max(nearest_max, nearest_texel);
+         }
+         history_samples_2x[texel] = lerp(history_samples_2x[texel], clamp(history_samples_2x[texel], nearest_min, nearest_max), dering);
+      }
+      // The negative lobes can take the weight below 0 next to texels without history
+      history_samples_2x[texel].a = max(history_samples_2x[texel].a, 0.0);
+      history_mean += history_samples_2x[texel].rgb * 0.25;
+   }
+   const float history_luminance = dot(history_mean, Rec709_Luminance);
+#else
+   const float4 history_sample = SampleHistory(history_position, InvRenderResolution);
+   const float history_luminance = dot(history_sample.rgb, Rec709_Luminance);
+#endif
+
+   // 3x3 neighborhood color box (the 3x3 and the cross, averaged into a "rounded" box)
+   float3 current = 0.0;
+   float3 min_3x3 = FLT_MAX;
+   float3 max_3x3 = -FLT_MAX;
+   float3 sum_3x3 = 0.0;
+   float3 min_cross = FLT_MAX;
+   float3 max_cross = -FLT_MAX;
+   float3 sum_cross = 0.0;
+   float max_neighbor_luminance = 0.0; // For the thin feature lock
+   // The flickering analysis uses the darkest sample's luminance. The luminance of the per channel min would be ~0 wherever
+   // the samples have near-zero channels in different places, and hide lighting changes there.
+   float min_luminance = FLT_MAX;
+   float reactive = 0.0;
+   float reactive_center = 0.0; // This pixel's own mask value (the 3x3 max is "reactive")
+#if TAA_UPSCALE
+   float3 neighborhood[9];
+#endif
+   [unroll] for (int y = -1; y <= 1; y++)
+   {
+      [unroll] for (int x = -1; x <= 1; x++)
+      {
+#if TAA_HISTORY_2X
+         const float3 color = color_tile[color_tile_center + y * COLOR_TILE + x];
+#else
+         const float3 color = SourceColor.Load(int3(clamp(pixel + int2(x, y), 0, max_pixel), 0));
+#endif
+         const float luminance = dot(color, Rec709_Luminance);
+         min_luminance = min(min_luminance, luminance);
+#if TAA_LOCK
+         if (x != 0 || y != 0)
+         {
+            max_neighbor_luminance = max(max_neighbor_luminance, luminance);
+         }
+#endif
+         min_3x3 = min(min_3x3, color);
+         max_3x3 = max(max_3x3, color);
+         sum_3x3 += color;
+         if (x == 0 || y == 0)
+         {
+            min_cross = min(min_cross, color);
+            max_cross = max(max_cross, color);
+            sum_cross += color;
+         }
+         if (x == 0 && y == 0)
+         {
+            current = color;
+         }
+#if TAA_UPSCALE
+         neighborhood[(y + 1) * 3 + (x + 1)] = color;
+#endif
+      }
+   }
+#if TAA_REACTIVE
+   [branch] if (Flags & TAA_FLAG_REACTIVE_MASK)
+   {
+      [unroll] for (int y = -1; y <= 1; y++)
+      {
+         [unroll] for (int x = -1; x <= 1; x++)
+         {
+            const float mask = ReactiveMask.Load(int3(clamp(pixel + int2(x, y), 0, max_pixel), 0));
+            reactive = max(reactive, mask);
+            if (x == 0 && y == 0)
+            {
+               reactive_center = mask;
+            }
+         }
+      }
+   }
+#endif
+   float3 box_min = 0.5 * (min_3x3 + min_cross);
+   float3 box_max = 0.5 * (max_3x3 + max_cross);
+   const float3 box_average = 0.5 * (sum_3x3 / 9.0 + sum_cross / 5.0);
+   const float current_luminance = dot(current, Rec709_Luminance);
+   const float mean_luminance = dot(sum_3x3, Rec709_Luminance) / 9.0; // For the flickering analysis' lighting test
+
+   // Without the flickering analysis there's no lighting change test, so TAAU doesn't widen the static clip box
+   bool lighting_changed_or_new = !TAA_FLICKER;
+   uint min_luminance_code = 0; // Stored with the lock, see below
+#if TAA_FLICKER
+   {
+      // x and y are the current sample luminance's range (at least 0), z and w the average luminances of the 3x3 darkest
+      // sample and of the 3x3 mean (at least 2^-14, the smallest normal). x, y and w are in "PreviousFlicker" (R11G11B10:
+      // 6, 6 and 5 bit mantissas, ~1.6% and 3% steps, see the store), z in the lock's high byte as a log2 code, 1 to 255
+      // over 2^-14 to 2^18 (0, a cleared texture: no state). z only feeds the lighting test, a 10x change, so its 9% steps
+      // are fine there; w's test is a 2x change.
+      const uint previous_min_code = previous_lock_word >> 8;
+      const float3 previous_range_mean = (has_previous_state ? PreviousFlicker.Load(int3(previous_pixel, 0)) : 0.0);
+      const float previous_min_average = ((previous_min_code > 0) ? exp2((previous_min_code - 1.0) * (32.0 / 254.0) - 14.0) : 0.0);
+      const float4 previous_state = float4(previous_range_mean.xy, previous_min_average, previous_range_mean.z);
+      const bool has_state = previous_min_code > 0;
+      const float2 luminances = float2(min_luminance, mean_luminance);
+      const float2 luminance_change = luminances - previous_state.zw;
+      const float2 reset_change = float2(TAA_FLICKER_RESET_CHANGE, TAA_FLICKER_RESET_MEAN_CHANGE);
+      const bool2 changed = abs(luminance_change) > reset_change * max(max(abs(luminances), abs(previous_state.zw)), 1e-4);
+      const bool lighting_changed = TAA_FLICKER_RESET_CHANGE > 0.0 && all(changed) && luminance_change.x * luminance_change.y > 0.0;
+      lighting_changed_or_new = lighting_changed || !has_state;
+      const float previous_speed = ((previous_lock_code > TAA_LOCK_FRAMES) ? ((previous_lock_code - (TAA_LOCK_FRAMES + 1)) / TAA_LOCK_SPEED_STEPS) : 0.0);
+      const bool highlight_history = history_luminance > TAA_LOCK_MIN_LUMINANCE && history_luminance > TAA_LOCK_RATIO * max(max_neighbor_luminance, current_luminance);
+      const bool slowed = previous_speed - speed > TAA_FLICKER_MOTION_CHANGE && (previous_speed > TAA_FLICKER_DROP_SPEED || !highlight_history);
+      const bool next_to_moving_highlight = speed > TAA_FLICKER_MOTION_CHANGE && length(own_motion) < TAA_LOCK_MAX_SPEED && length(own_motion - motion) > TAA_FLICKER_MOTION_CHANGE &&
+                                            max_neighbor_luminance > TAA_LOCK_MIN_LUMINANCE && max_neighbor_luminance > TAA_LOCK_RATIO * current_luminance;
+      const bool motion_changed = speed - previous_speed > TAA_FLICKER_MOTION_CHANGE || slowed || next_to_moving_highlight;
+      const bool keeps_range = has_state && !lighting_changed && !motion_changed && reactive <= 0.0;
+      float range_min = current_luminance;
+      float range_max = current_luminance;
+      if (keeps_range)
+      {
+         range_min = min(current_luminance, lerp(previous_state.x, current_luminance, TAA_FLICKER_ENVELOPE_DECAY));
+         range_max = max(current_luminance, lerp(previous_state.y, current_luminance, TAA_FLICKER_ENVELOPE_DECAY));
+      }
+      const float2 luminance_average = max((has_state ? lerp(previous_state.zw, luminances, TAA_FLICKER_RESET_SMOOTHING) : luminances), 6.103515625e-5);
+      float4 range_state = float4(max(range_min, 0.0), max(range_max, 0.0), luminance_average);
+      float widening = TAA_FLICKER_GAMMA * (range_max - range_min);
+#if !TAA_UPSCALE
+      const float previous_range = previous_state.y - previous_state.x;
+      const float step_margin = TAA_FLICKER_STEP_MARGIN * previous_range + 0.01 * abs(history_luminance);
+      const bool history_in_range = abs(history_luminance - clamp(history_luminance, previous_state.x, previous_state.y)) <= step_margin;
+      if (TAA_FLICKER_STEP_GROWTH > 0.0 && keeps_range && history_in_range)
+      {
+         widening = min(widening, TAA_FLICKER_GAMMA * TAA_FLICKER_STEP_GROWTH * previous_range);
+         // Beyond twice the limit the range starts over, so the step doesn't widen the next frames either
+         if (range_max - range_min > 2.0 * TAA_FLICKER_STEP_GROWTH * previous_range)
+         {
+            range_state.xy = max(current_luminance, 0.0);
+         }
+      }
+#endif
+      // D3D11 converts toward zero, which moves both range bounds down by up to a step. Rounded to the nearest (unbiased),
+      // the 2x history's lab scores match the RGBA16F state's within 0.13% (rotation_fan's FLIP is 1.3-1.8% worse when
+      // truncated); with the render resolution history the nearest made MV-less particles ghost 8% more, so it truncates.
+      // Rounding up the min and down the max (a range that stops changing collapses) made static High and Ultra 15% slower.
+#if TAA_HISTORY_2X
+      OutputFlicker[state_pixel] = asfloat((asuint(range_state.xyw) + uint3(1u << 16, 1u << 16, 1u << 17)) & ~uint3(0x1FFFFu, 0x1FFFFu, 0x3FFFFu));
+#else
+      OutputFlicker[state_pixel] = range_state.xyw;
+#endif
+      min_luminance_code = 1 + uint(round((clamp(log2(range_state.z), -14.0, 18.0) + 14.0) * (254.0 / 32.0)));
+      if (TAA_FLICKER_MAX_SPEED > 0.0)
+      {
+         widening *= saturate(1.0 - speed / TAA_FLICKER_MAX_SPEED);
+      }
+      box_min -= widening;
+      box_max += widening;
+   }
+#endif
+   const float max_history_weight = TAA_MAX_HISTORY_WEIGHT * (1.0 - min(reactive, TAA_REACTIVE_MAX));
+   // Clipping into the current neighborhood also removes the bicubic's ringing.
+   const float3 clip_target = clamp(box_average, box_min, box_max);
+
+#if TAA_LOCK
+   const bool lock_static = speed < TAA_LOCK_MAX_SPEED && reactive <= 0.0;
+   uint lock_frames = 0;
+   if (lock_static && current_luminance > TAA_LOCK_MIN_LUMINANCE && current_luminance > TAA_LOCK_RATIO * max_neighbor_luminance)
+   {
+      lock_frames = TAA_LOCK_FRAMES;
+   }
+   else if (previous_lock_code > 0 && previous_lock_code <= TAA_LOCK_FRAMES)
+   {
+      lock_frames = previous_lock_code - 1;
+   }
+   const bool locked = lock_static && lock_frames > 0;
+#else
+   const bool locked = false;
+#endif
+
 #if TAA_UPSCALE
    const float cap_fraction = min(ResamplingBlurCap(motion * render_scale, TAA_UPSCALE_BLUR_TOLERANCE), max_history_weight);
    const float sparse = TAA_UPSCALE_SPARSE * saturate((render_scale.x - TAA_UPSCALE_SPARSE_START) / (TAA_UPSCALE_SPARSE_FULL - TAA_UPSCALE_SPARSE_START));
    const float moving = saturate(length(motion * render_scale) / TAA_UPSCALE_STATIC_SPEED);
    const float sample_rate = render_scale.x * render_scale.y;
    const float cap_samples = cap_fraction / (1.0 - cap_fraction) / pow(abs(sample_rate), lerp(1.0, moving, sparse));
-   const float4 history_sample = SampleHistory(state_history_position, InvOutputResolution);
    const bool keep_box = lighting_changed_or_new || reactive > 0.0;
    const float static_box_scale = (keep_box ? 1.0 : lerp(lerp(1.0, TAA_UPSCALE_STATIC_BOX, sparse), 1.0, moving));
    const float3 box_center = 0.5 * (box_min + box_max);
@@ -683,58 +974,60 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
    const float3 resolved = lerp(current_output, history, blend);
    const float accumulated = history_weight_output + sample_weight;
    OutputHistory[output_pixel] = float4(resolved, accumulated / (accumulated + 1.0));
-#if TAA_LOCK
-   OutputLock[output_pixel] = ((history_weight_output > 0.0) ? lock_frames : 0);
-#endif
    OutputColor[output_pixel] = float4(resolved, 1.0);
+   const bool any_history = history_weight_output > 0.0;
 #elif TAA_HISTORY_2X
    const float cap_fraction = min(ResamplingBlurCap(motion * 2.0, TAA_HISTORY_2X_BLUR_TOLERANCE), max_history_weight);
    const float cap_samples = cap_fraction / (1.0 - cap_fraction) * TAA_HISTORY_2X_RATE;
-   float2 history_positions_2x[4];
-   float4 history_samples_2x[4];
-   float3 history_mean = 0.0;
-   [unroll] for (uint texel = 0; texel < 4; texel++)
-   {
-      history_positions_2x[texel] = (pixel + 0.25 + 0.5 * int2(texel & 1, texel >> 1) + motion) * 2.0;
-      history_samples_2x[texel] = SampleHistory(history_positions_2x[texel], 0.5 * InvRenderResolution);
-      history_mean += history_samples_2x[texel].rgb * 0.25;
-   }
    const float3 clipped_mean = ClipToBox(history_mean, clip_target, box_min, box_max);
    const float3 mean_delta = history_mean - clip_target;
    const float mean_clip_ratio = saturate(length(clipped_mean - clip_target) / max(length(mean_delta), 1e-8));
    const float mean_clip_scale = ((dot(abs(mean_delta), 1.0) > 1e-8) ? mean_clip_ratio : 1.0);
+   float3 neighborhood[9];
+   [unroll] for (int neighbor = 0; neighbor < 9; neighbor++)
+   {
+      neighborhood[neighbor] = color_tile[color_tile_center + (neighbor / 3 - 1) * COLOR_TILE + (neighbor % 3 - 1)];
+   }
+   // The masked pixel's Gaussian around its center (see "TAA_HISTORY_2X")
+   float3 pixel_gauss = 0.0;
+   [branch] if (reactive_center > 0.0)
+   {
+      float pixel_gauss_peak;
+      pixel_gauss = NeighborhoodGaussian(neighborhood, pixel, pixel + 0.5, pixel_gauss_peak);
+   }
    float3 output_sum = 0.0;
    bool any_history = false;
    [unroll] for (uint sub = 0; sub < 4; sub++)
    {
       const int2 sub_offset = int2(sub & 1, sub >> 1);
       const float2 center = pixel + 0.25 + 0.5 * sub_offset; // Render pixels
-      const bool offscreen_2x = any(history_positions_2x[sub] < 0.0) || any(history_positions_2x[sub] >= RenderResolution * 2.0);
+      const float2 history_center = center + motion;
+      const bool offscreen_2x = any(history_center < 0.0) || any(history_center >= RenderResolution);
       const float4 history_sample_2x = history_samples_2x[sub];
       const float3 history_2x_clipped = clipped_mean + (history_sample_2x.rgb - history_mean) * mean_clip_scale;
       const float3 history_2x = (locked ? history_sample_2x.rgb : history_2x_clipped);
       float3 current_sum = 0.0;
       float current_weight = 0.0;
-      float3 gauss_sum = 0.0;
-      float gauss_weight = 0.0;
-      float gauss_max = 0.0;
       [unroll] for (int n = 0; n < 9; n++)
       {
          const float2 offset = pixel + float2(n % 3 - 1, n / 3 - 1) + 0.5 + Jitter - center;
          const float box_weight = (all(abs(offset) < 0.25) ? 1.0 : 0.0);
          current_sum += neighborhood[n] * box_weight;
          current_weight += box_weight;
-         const float gauss = exp(-0.5 * dot(offset, offset) / (TAA_HISTORY_2X_SIGMA * TAA_HISTORY_2X_SIGMA));
-         gauss_sum += neighborhood[n] * gauss;
-         gauss_weight += gauss;
-         gauss_max = max(gauss_max, gauss);
       }
-      const float3 current_2x = ((current_weight > 0.0) ? (current_sum / current_weight) : (gauss_sum / gauss_weight));
+      float gauss_max;
+      const float3 gauss_estimate = NeighborhoodGaussian(neighborhood, pixel, center, gauss_max);
+      const float3 texel_estimate = ((current_weight > 0.0) ? (current_sum / current_weight) : gauss_estimate);
+      const float3 current_2x = lerp(texel_estimate, pixel_gauss, reactive_center);
       const float reactive_fallback_weight = reactive * TAA_HISTORY_2X_REACTIVE_FALLBACK * gauss_max;
-      const float sample_weight = ((current_weight > 0.0) ? min(current_weight, 1.0) : reactive_fallback_weight);
+      float sample_weight = ((current_weight > 0.0) ? min(current_weight, 1.0) : reactive_fallback_weight);
       const float history_samples = min(history_sample_2x.a / max(1.0 - history_sample_2x.a, 1e-4), cap_samples);
       const float history_validity = ((offscreen_2x || (Flags & TAA_FLAG_RESET)) ? 0.0 : depth_clip);
       const float history_weight_2x = history_samples * history_validity;
+      if (TAA_HISTORY_2X_DEFERRED > 0.0 && current_weight <= 0.0)
+      {
+         sample_weight = max(sample_weight, TAA_HISTORY_2X_DEFERRED * gauss_max * saturate(1.0 - history_weight_2x / TAA_HISTORY_2X_DEFERRED_SAMPLES));
+      }
       // Rejected history (depth clip, offscreen) is replaced even in texels that got no sample this frame
       const float blend = ((history_samples > 0.0) ? (history_samples / (history_samples + sample_weight)) : 0.0) * history_validity;
       const float3 resolved_2x = lerp(current_2x, history_2x, blend);
@@ -743,12 +1036,8 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
       output_sum += resolved_2x;
       any_history = any_history || (history_weight_2x > 0.0);
    }
-#if TAA_LOCK
-   OutputLock[pixel] = (any_history ? lock_frames : 0);
-#endif
    OutputColor[pixel] = float4(output_sum * 0.25, 1.0);
 #else
-   const float4 history_sample = SampleHistory(history_position, InvRenderResolution);
    const float3 history = (locked ? history_sample.rgb : ClipToBox(history_sample.rgb, clip_target, box_min, box_max));
    const float history_weight_cap = min(ResamplingBlurCap(motion, TAA_RESAMPLING_BLUR_TOLERANCE), max_history_weight);
    const float history_weight = (has_previous_state ? (min(history_sample.a, history_weight_cap) * depth_clip) : 0.0);
@@ -765,10 +1054,19 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 #endif
 
    OutputHistory[pixel] = float4(resolved, accumulated_weight);
-#if TAA_LOCK
-   OutputLock[pixel] = ((history_weight > 0.0) ? lock_frames : 0);
-#endif
    // Written separately so the output can be the game's own texture (any format), while the history stays RGBA16F.
    OutputColor[pixel] = float4(resolved, 1.0);
+   const bool any_history = history_weight > 0.0;
+#endif
+
+#if TAA_LOCK || TAA_FLICKER
+#if TAA_LOCK
+   // A moving pixel holds no lock: its slot stores its speed for the flickering analysis (see "TAA_LOCK_SPEED_STEPS")
+   const uint speed_code = (TAA_LOCK_FRAMES + 1) + uint(min(round(speed * TAA_LOCK_SPEED_STEPS), 254.0 - TAA_LOCK_FRAMES));
+   const uint lock_code = ((speed >= TAA_LOCK_MAX_SPEED) ? speed_code : (any_history ? lock_frames : 0));
+#else
+   const uint lock_code = 0;
+#endif
+   OutputLock[state_pixel] = lock_code | (min_luminance_code << 8);
 #endif
 }
