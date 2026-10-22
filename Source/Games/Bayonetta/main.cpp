@@ -10,7 +10,7 @@
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
 // Luma TAA among the upscalers (in process; DLSS and FSR 3 run in the SR bridge's x64 helper, "UseLumaSRBridge"). Off: the floor
 // flickers under it on a static frame (DLAA and FSR don't).
-#define ENABLE_LUMA_TAA 0
+#define ENABLE_LUMA_TAA 1
 // The game has MSAA but no shader AA: SMAA is added on the canvas after the scene copy (see "DrawSMAAOnCanvas")
 #define ENABLE_SMAA 1
 // SMAA's area texture without the U-shape smoothing (see "SMAA_AreaTex_SharpU.h"), as TW1 and ME1
