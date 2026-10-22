@@ -24,7 +24,7 @@ static const float NativeAspectRatioHeight = 9.0;
 static const float NativeAspectRatio = NativeAspectRatioWidth / NativeAspectRatioHeight;
 
 // Luma per pass/instance data, this can be customized and sent at any time
-cbuffer LumaData : register(LUMA_DATA_CB_INDEX)
+cbuffer LumaData : LUMA_CB_REGISTER(LUMA_DATA_CB_INDEX)
 {
   // GPU has "32 32 32 32 | break" bits alignment on memory, so to not break any "float2", we need all the float/uint/int before them to be in groups of 2 (because we are using a unified struct).
   struct
