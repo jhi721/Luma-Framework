@@ -235,6 +235,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #if ENABLE_MINHOOK
 #include "includes/minhook.h"
 #endif
+#include "includes/d3d12_pso_capture.h" // see "DX12" and "ENABLE_MINHOOK"
 
 #include "includes/containers.h"
 #include "includes/globals.h"
@@ -3143,6 +3144,12 @@ namespace
       game->OnInitDevice(native_device, device_data);
 
 #if DX12
+#if ENABLE_MINHOOK
+      if (!D3D12PsoCapture::Install(native_device))
+      {
+         reshade::log::message(reshade::log::level::warning, "[PSO capture] ID3D12Device2::CreatePipelineState isn't hooked for this device, so shader replacements will rebuild its pipelines through ReShade");
+      }
+#endif
       reshade::log::message(reshade::log::level::info, "Initialized the D3D12 device");
 #else
       LoadTexture2DArrays(native_device, device_data);
@@ -4254,6 +4261,33 @@ namespace
    }
 #endif // INPLACE sync providers
 
+#if DX12 && ENABLE_MINHOOK
+   // The stream subobject of a ReShade shader subobject, none for any other (ray tracing shaders are in state objects, which aren't captured)
+   std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> ToStreamShaderType(reshade::api::pipeline_subobject_type type)
+   {
+      switch (type)
+      {
+      case reshade::api::pipeline_subobject_type::vertex_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+      case reshade::api::pipeline_subobject_type::hull_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS;
+      case reshade::api::pipeline_subobject_type::domain_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS;
+      case reshade::api::pipeline_subobject_type::geometry_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
+      case reshade::api::pipeline_subobject_type::pixel_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+      case reshade::api::pipeline_subobject_type::compute_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+      case reshade::api::pipeline_subobject_type::amplification_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+      case reshade::api::pipeline_subobject_type::mesh_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+      default:
+         return std::nullopt;
+      }
+   }
+#endif // DX12 && ENABLE_MINHOOK
 
    void OnInitPipeline(
       reshade::api::device* device,
@@ -4263,6 +4297,11 @@ namespace
       reshade::api::pipeline pipeline)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+
+#if DX12 && ENABLE_MINHOOK
+      // Always taken, so a capture never outlives its pipeline's creation (even if there's nothing in it to replace)
+      std::unique_ptr<D3D12PsoCapture::Stream> pso_capture = D3D12PsoCapture::Take(reinterpret_cast<ID3D12PipelineState*>(pipeline.handle));
+#endif
 
       const void* live_patched_shader_code = nullptr;
       size_t live_patched_shader_size = 0;
@@ -4968,6 +5007,46 @@ namespace
          return;
       }
 
+#if DX12
+      // The layout of a D3D12 pipeline is its root signature, null if the shaders embed it
+      cached_pipeline->root_signature = reinterpret_cast<ID3D12RootSignature*>(layout.handle);
+#if ENABLE_MINHOOK
+      // The stream is this pipeline's if its shaders are the ones ReShade reports (a stale capture, or one of an address reused after the
+      // original was destroyed, wouldn't have them). Its bytecode then points at our copies, as the game's memory can be gone when a clone is created.
+      uint32_t matched_shader_count = 0;
+      for (uint32_t i = 0; pso_capture && i < subobject_count; ++i)
+      {
+         const std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> stream_type = ToStreamShaderType(subobjects[i].type);
+         if (!stream_type)
+         {
+            continue;
+         }
+         const auto* original_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects[i].data);
+         D3D12_SHADER_BYTECODE* const captured_shader = pso_capture->Find<D3D12_SHADER_BYTECODE>(*stream_type);
+         if (captured_shader == nullptr || captured_shader->pShaderBytecode != original_shader_desc->code || captured_shader->BytecodeLength != original_shader_desc->code_size)
+         {
+            pso_capture.reset();
+            break;
+         }
+         const auto* cached_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects_cache[i].data);
+         *captured_shader = {.pShaderBytecode = cached_shader_desc->code, .BytecodeLength = cached_shader_desc->code_size};
+         matched_shader_count++;
+      }
+      if (pso_capture && pso_capture->shader_count == matched_shader_count)
+      {
+         cached_pipeline->capture = std::move(pso_capture);
+      }
+      else
+      {
+         static std::atomic_flag logged_missing_capture;
+         if (!logged_missing_capture.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[PSO capture] A pipeline has no captured stream (ReShade's or another add-on's rebuild, or a device the hook doesn't cover), so its shader replacements will rebuild it through ReShade");
+         }
+      }
+#endif // ENABLE_MINHOOK
+#endif // DX12
+
       {
          const std::unique_lock lock(s_mutex_generic);
          for (const auto shader_hash : cached_pipeline->shader_hashes)
@@ -5109,6 +5188,9 @@ namespace
          }
          
          std::vector<uint64_t> pipelines_to_destroy; // TODO: define a pointer size for ReShade handles, given they are just a pointer 64bit in x64 and 32bit in x32
+#if DX12
+         com_ptr<ID3D12RootSignature> root_signature; // Declared before the locks, so it's released after them
+#endif
          
          std::unique_lock lock_pipeline_destroy(device_data.pipeline_cache_destruction_mutex);
          std::unique_lock lock(s_mutex_generic);
@@ -5152,6 +5234,20 @@ namespace
 #endif
                   device_data.cloned_pipelines_changed = true;
                }
+#if DX12
+               // The clones the DX12 path keeps besides "pipeline_clone": the active one (which "pipeline_clone" can mirror) and the retired ones
+               if (const uint64_t active_clone = cached_pipeline->active_clone.exchange(0); active_clone != 0 && active_clone != cached_pipeline->pipeline_clone.handle)
+               {
+                  pipelines_to_destroy.push_back(active_clone);
+                  device_data.pipeline_cache_by_pipeline_clone_handle.erase(active_clone);
+               }
+               for (const auto& retired_clone : cached_pipeline->retired_clones)
+               {
+                  pipelines_to_destroy.push_back(retired_clone.clone.handle);
+                  device_data.pipeline_cache_by_pipeline_clone_handle.erase(retired_clone.clone.handle);
+               }
+               root_signature = std::move(cached_pipeline->root_signature);
+#endif
                delete cached_pipeline;
                cached_pipeline = nullptr;
             }
@@ -18790,6 +18886,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       // The game's and Core's hooks are removed by now (see "includes/minhook.h"), this frees its heap. Not needed at process exit.
       if (lpv_reserved == nullptr)
       {
+#if DX12
+         D3D12PsoCapture::Remove();
+#endif
 #if ENABLE_SWAPCHAIN_PROXY
          SwapchainProxy::RemoveHooks();
 #endif

@@ -2,6 +2,12 @@
 
 #include "shader_define.h"
 
+#include <atomic>
+#include <memory>
+#if DX12 && ENABLE_MINHOOK
+#include "d3d12_pso_capture.h"
+#endif
+
 // Forward declarations
 enum class ShaderReplaceDrawType;
 enum class ShaderCustomDepthStencilType;
@@ -89,6 +95,27 @@ namespace Shader
       std::vector<reshade::api::pipeline_subobject_type> shader_types; // The stage of each of "shader_hashes"
 #else
       std::array<uint32_t, 1> shader_hashes;
+#endif
+
+#if DX12
+      // The root signature of "layout", referenced by us so a clone can use it after the game released it. Null if the shaders embed it
+      com_ptr<ID3D12RootSignature> root_signature;
+#if ENABLE_MINHOOK
+      // The stream the game created the pipeline with (see "includes/d3d12_pso_capture.h"), its shader bytecode pointing at the copies in
+      // "subobjects_cache". Null if the create wasn't captured: clones are then rebuilt by ReShade
+      std::unique_ptr<D3D12PsoCapture::Stream> capture;
+#endif
+      // The clone bound in place of the original, 0 if none. Read without a lock by the bind callback. Owned like "pipeline_clone", which it
+      // can mirror: destroyed once, with the original
+      std::atomic<uint64_t> active_clone = 0;
+      // The clones that were replaced, built from the code of "code_hash". A command list can still hold one, so they live as long as the
+      // original, and a reload reuses the one with the same hash
+      struct RetiredClone
+      {
+         uint64_t code_hash = 0;
+         reshade::api::pipeline clone = {};
+      };
+      std::vector<RetiredClone> retired_clones;
 #endif
 
 #if DEVELOPMENT
