@@ -5646,8 +5646,10 @@ namespace
 #endif // DX12 && DEVELOPMENT
 
 #if DX12
-   // Binds the clone in place of the pipeline the game sets (on every build). The runtime sets the game's pipeline before this event, and "bind_pipeline()" sets the
-   // clone over it. Never with "all_graphics": it would also replay the topology and blend factor ReShade stores for the pipelines it creates.
+   // Tracks the pipeline a command list binds (on every build) like the D3D11 binds do: the hashes of its shaders, whether it runs custom ones, and the draw or dispatch callback they match.
+   // Then binds the clone in place of the pipeline the game sets. The runtime sets the game's pipeline before this event, and "bind_pipeline()" sets the clone over it.
+   // Never with "all_graphics": it would also replay the topology and blend factor ReShade stores for the pipelines it creates.
+   // Not ported: patch clones (no patch providers on D3D12), the known UI shader (UI separation) and the automatic texture format upgrades, nothing on D3D12 uses them yet.
    void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
@@ -5655,11 +5657,24 @@ namespace
       {
          return;
       }
-#if DEVELOPMENT
       // Command lists are recorded by one thread at a time, so their state needs no lock. It follows the game's pipeline, not our clone
-      cmd_list->get_private_data<CommandListData>()->d3d12_state.pipeline = pipeline;
-#endif
-      if (pipeline.handle == 0 || !custom_shaders_enabled)
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      cmd_list_data.d3d12_state.pipeline = pipeline;
+
+      // ReShade passes "all" stages for every PSO and a command list has one pipeline: a compute one replaces a graphics one and the other way around, so nothing stays bound.
+      // That's also what handle 0 (clearing the state, a reset without an initial pipeline) and the pipelines we don't track leave.
+      cmd_list_data.pipeline_state_original_vertex_shader = {};
+      cmd_list_data.pipeline_state_original_pixel_shader = {};
+      cmd_list_data.pipeline_state_original_compute_shader = {};
+      cmd_list_data.pipeline_state_original_graphics_shader_hashes.Clear();
+      cmd_list_data.pipeline_state_original_compute_shader_hashes.Clear();
+      cmd_list_data.pipeline_state_has_custom_vertex_shader = false;
+      cmd_list_data.pipeline_state_has_custom_pixel_shader = false;
+      cmd_list_data.pipeline_state_has_custom_graphics_shader = false;
+      cmd_list_data.pipeline_state_has_custom_compute_shader = false;
+      cmd_list_data.draw_callback = nullptr;
+      cmd_list_data.dispatch_callback = nullptr;
+      if (pipeline.handle == 0)
       {
          return;
       }
@@ -5668,21 +5683,79 @@ namespace
       {
          return;
       }
-      // No lock: a clone retired since this read is still alive, as long as the original (which the game keeps alive for the command lists using it)
-      if (const uint64_t clone_handle = cached_pipeline->active_clone.load(std::memory_order_acquire); clone_handle != 0)
+      // No lock: a clone retired since this read is still alive, as long as the original (which the game keeps alive for the command lists using it).
+      // Disabling the custom shaders only stops the swap, the hashes and callbacks are still tracked.
+      const uint64_t clone_handle = (custom_shaders_enabled ? cached_pipeline->active_clone.load(std::memory_order_acquire) : 0);
+      const bool has_clone = clone_handle != 0;
+      for (size_t i = 0; i < cached_pipeline->shader_hashes.size(); i++)
+      {
+         const uint32_t shader_hash = cached_pipeline->shader_hashes[i];
+         switch (cached_pipeline->shader_types[i])
+         {
+         case reshade::api::pipeline_subobject_type::vertex_shader:
+            cmd_list_data.pipeline_state_original_vertex_shader = pipeline;
+            cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders[0] = shader_hash;
+            cmd_list_data.pipeline_state_has_custom_vertex_shader = has_clone;
+            break;
+         case reshade::api::pipeline_subobject_type::pixel_shader:
+            cmd_list_data.pipeline_state_original_pixel_shader = pipeline;
+            cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0] = shader_hash;
+            cmd_list_data.pipeline_state_has_custom_pixel_shader = has_clone;
+            break;
+#if GEOMETRY_SHADER_SUPPORT
+         case reshade::api::pipeline_subobject_type::geometry_shader:
+            cmd_list_data.pipeline_state_original_graphics_shader_hashes.geometry_shaders[0] = shader_hash;
+            break;
+#endif
+         case reshade::api::pipeline_subobject_type::compute_shader:
+            cmd_list_data.pipeline_state_original_compute_shader = pipeline;
+            cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders[0] = shader_hash;
+            cmd_list_data.pipeline_state_has_custom_compute_shader = has_clone;
+            break;
+         default: // Hull, domain, amplification and mesh shaders have no slot in "ShaderHashesList", so no callback matches them
+            break;
+         }
+      }
+      const auto find_callback = [](const auto& callbacks_by_shader_hashes, const auto& original_shader_hashes) -> DrawOrDispatchCallback
+      {
+         for (const auto& [shader_hashes, callback] : callbacks_by_shader_hashes)
+         {
+            if (original_shader_hashes.ContainsAll(shader_hashes))
+            {
+               ASSERT(callback); // Game won't crash, this is just useless and weird
+               return callback;
+            }
+         }
+         return nullptr;
+      };
+      if (cmd_list_data.pipeline_state_original_compute_shader.handle != 0)
+      {
+         cmd_list_data.dispatch_callback = find_callback(dispatch_callbacks_by_shader_hashes, cmd_list_data.pipeline_state_original_compute_shader_hashes);
+      }
+      else
+      {
+         cmd_list_data.pipeline_state_has_custom_graphics_shader = has_clone;
+         cmd_list_data.draw_callback = find_callback(draw_callbacks_by_shader_hashes, cmd_list_data.pipeline_state_original_graphics_shader_hashes);
+      }
+      if (has_clone)
       {
          cmd_list->bind_pipeline(stages, reshade::api::pipeline{clone_handle});
       }
    }
-#endif // DX12
 
-#if DX12 && DEVELOPMENT
    void OnBindDescriptorTables(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table* tables, uint32_t dynamic_offset_count, const uint32_t* dynamic_offsets)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+#if !DEVELOPMENT
+      if (count != 0) // Release builds only track the root signature ("Set*RootSignature()" binds no tables), not what is bound to it
+      {
+         return;
+      }
+#endif
       D3D12State::BindDescriptorTables(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, first, count, tables);
    }
 
+#if DEVELOPMENT
    void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
@@ -5694,6 +5767,7 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
       D3D12State::PushConstants(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, layout_param, first, count, values);
    }
+#endif
 
    void OnBindRenderTargetsAndDepthStencil(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
    {
@@ -5701,6 +5775,7 @@ namespace
       D3D12State::BindRenderTargets(&cmd_list->get_private_data<CommandListData>()->d3d12_state, cmd_list->get_device(), count, rtvs, dsv);
    }
 
+#if DEVELOPMENT
    void OnBindPipelineStates(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::dynamic_state* states, const uint32_t* values)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
@@ -5718,6 +5793,7 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
       D3D12State::BindVertexBuffers(&cmd_list->get_private_data<CommandListData>()->d3d12_state, first, count, buffers, offsets, strides);
    }
+#endif
 
    bool OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds, reshade::api::render_pass_flags flags)
    {
@@ -5733,6 +5809,26 @@ namespace
       return false;
    }
 
+   // Re-issues the native command of a draw event, nothing for the ones that can't be re-issued. For the "original_draw_dispatch_func" of the callbacks and the readbacks.
+   void ReissueDrawOrDispatch(ID3D12GraphicsCommandList* native_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command)
+   {
+      switch (command)
+      {
+      case D3D12DrawCommand::Draw:
+         native_list->DrawInstanced(draw_dispatch_data.vertex_count, draw_dispatch_data.instance_count, draw_dispatch_data.first_vertex, draw_dispatch_data.first_instance);
+         break;
+      case D3D12DrawCommand::DrawIndexed:
+         native_list->DrawIndexedInstanced(draw_dispatch_data.index_count, draw_dispatch_data.instance_count, draw_dispatch_data.first_index, draw_dispatch_data.vertex_offset, draw_dispatch_data.first_instance);
+         break;
+      case D3D12DrawCommand::Dispatch:
+         native_list->Dispatch(draw_dispatch_data.dispatch_count.x, draw_dispatch_data.dispatch_count.y, draw_dispatch_data.dispatch_count.z);
+         break;
+      case D3D12DrawCommand::Other:
+         break;
+      }
+   }
+
+#if DEVELOPMENT
    // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer
    void OnInitResource(reshade::api::device* device, const reshade::api::resource_desc& desc, const reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state, reshade::api::resource resource)
    {
@@ -5850,8 +5946,9 @@ namespace
    }
 
    // The dev MCP's readbacks ("includes/d3d12_readback.hpp"): copies the view a job asked for at its target draw. Returns true when it
-   // re-issued the draw to copy its output after it, then the original call must be skipped.
-   bool ReadbackDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12Readback::Command command)
+   // re-issued the draw to copy its output after it, then the original call must be skipped. The game's draw callback can have replaced the draw
+   // (it is not re-issued, the copy follows what the game drew) or skipped it (the readback is refused).
+   bool ReadbackDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command, DrawOrDispatchOverrideType override_type)
    {
       if (!D3D12Readback::armed)
          return false;
@@ -5920,7 +6017,11 @@ namespace
       {
          copy.error = "The draw is inside a render pass, which can't hold copies";
       }
-      else if (target.kind != Kind::ConstantBuffer && command == D3D12Readback::Command::Other)
+      else if (override_type == DrawOrDispatchOverrideType::Skip)
+      {
+         copy.error = "The game's draw callback skipped this draw";
+      }
+      else if (target.kind != Kind::ConstantBuffer && command == D3D12DrawCommand::Other && override_type == DrawOrDispatchOverrideType::None)
       {
          copy.error = "Indirect and mesh draws can't be re-issued to copy their output";
       }
@@ -6025,22 +6126,12 @@ namespace
          }
       }
 
-      const DrawDispatchData& dd = draw_dispatch_data;
       const auto reissue = [&]
       {
-         switch (command)
+         // The game's callback already drew in place of a replaced draw
+         if (override_type == DrawOrDispatchOverrideType::None)
          {
-         case D3D12Readback::Command::Draw:
-            native_list->DrawInstanced(dd.vertex_count, dd.instance_count, dd.first_vertex, dd.first_instance);
-            break;
-         case D3D12Readback::Command::DrawIndexed:
-            native_list->DrawIndexedInstanced(dd.index_count, dd.instance_count, dd.first_index, dd.vertex_offset, dd.first_instance);
-            break;
-         case D3D12Readback::Command::Dispatch:
-            native_list->Dispatch(dd.dispatch_count.x, dd.dispatch_count.y, dd.dispatch_count.z);
-            break;
-         case D3D12Readback::Command::Other:
-            break; // Refused above
+            ReissueDrawOrDispatch(native_list, draw_dispatch_data, command);
          }
       };
       return RecordReadback(cmd_list, std::move(copy), view, draw_state, plane, buffer, target.kind == Kind::RenderTarget, reissue);
@@ -6162,37 +6253,100 @@ namespace
       return RecordReadback(cmd_list, std::move(copy), written, draw_state, plane, nullptr, !is_depth, [&]
          { reissue(native_list); });
    }
+#endif // DEVELOPMENT
+
+   // The D3D11 draw callback contract on D3D12 ("Game::OnDrawOrDispatch()", "draw_callbacks_by_shader_hashes" and "dispatch_callbacks_by_shader_hashes"), for the draws, dispatches
+   // and "ExecuteIndirect()" calls the game records, on the threads recording them. Returns true to skip the native call: the game's callback replaced or skipped it, or a readback re-issued it.
+   bool OnDrawOrDispatchD3D12(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command)
+   {
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      // A command list has one pipeline, so the bound one also tells "ExecuteIndirect()" draws and dispatches apart ("DispatchMesh()" runs a graphics pipeline)
+      const bool is_dispatch = command == D3D12DrawCommand::Dispatch || (command == D3D12DrawCommand::Other && cmd_list_data.pipeline_state_original_compute_shader.handle != 0);
+      const auto& original_shader_hashes = (is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader_hashes : cmd_list_data.pipeline_state_original_graphics_shader_hashes);
+
+#if DEVELOPMENT
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+#endif
+
+      DrawOrDispatchOverrideType override_type = DrawOrDispatchOverrideType::None;
+      if (!original_shader_hashes.Empty()) // Like on D3D11, nothing is called for the pipelines we don't track
+      {
+         reshade::api::device* device = cmd_list->get_device();
+         auto* native_device = reinterpret_cast<NativeDevice*>(device->get_native());
+         auto* native_list = reinterpret_cast<NativeCommandList*>(cmd_list->get_native());
+         DeviceData& device_data = *device->get_private_data<DeviceData>();
+
+         reshade::api::shader_stage stages = reshade::api::shader_stage(0); // None
+         if (is_dispatch)
+         {
+            stages = reshade::api::shader_stage::compute;
+         }
+         else
+         {
+            if (original_shader_hashes.HasAny(reshade::api::shader_stage::vertex))
+            {
+               stages = reshade::api::shader_stage::vertex;
+            }
+            if (original_shader_hashes.HasAny(reshade::api::shader_stage::pixel))
+            {
+               stages |= reshade::api::shader_stage::pixel;
+            }
+         }
+         const bool is_custom_pass = (is_dispatch ? cmd_list_data.pipeline_state_has_custom_compute_shader : cmd_list_data.pipeline_state_has_custom_graphics_shader);
+
+         std::function<void()>* original_draw_dispatch_func = nullptr;
+#if DEVELOPMENT || ENABLE_POST_DRAW_DISPATCH_CALLBACK
+         std::function<void()> reissue_function;
+         if (command != D3D12DrawCommand::Other) // Indirect and mesh draws can't be re-issued
+         {
+            reissue_function = [&]
+            { ReissueDrawOrDispatch(native_list, draw_dispatch_data, command); };
+            original_draw_dispatch_func = &reissue_function;
+         }
+#endif
+
+         bool updated_cbuffers = false;
+         // Use the specific callback if there's one, and fall back on the generic one otherwise
+         if (const DrawOrDispatchCallback draw_or_dispatch_callback = (is_dispatch ? cmd_list_data.dispatch_callback : cmd_list_data.draw_callback))
+         {
+            override_type = draw_or_dispatch_callback(native_device, native_list, cmd_list_data, device_data, stages, original_shader_hashes, is_custom_pass, updated_cbuffers, original_draw_dispatch_func);
+         }
+         else
+         {
+            override_type = game->OnDrawOrDispatch(native_device, native_list, cmd_list_data, device_data, stages, original_shader_hashes, is_custom_pass, updated_cbuffers, original_draw_dispatch_func);
+         }
+      }
+
+#if DEVELOPMENT
+      // The readback also runs for the draws the game replaced or skipped
+      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, command, override_type) || override_type != DrawOrDispatchOverrideType::None;
+#else
+      return override_type != DrawOrDispatchOverrideType::None;
+#endif
+   }
 
    bool OnDraw(reshade::api::command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      const DrawDispatchData draw_dispatch_data = {.vertex_count = vertex_count, .instance_count = instance_count, .first_vertex = first_vertex, .first_instance = first_instance};
-      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
-      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Draw);
+      return OnDrawOrDispatchD3D12(cmd_list, {.vertex_count = vertex_count, .instance_count = instance_count, .first_vertex = first_vertex, .first_instance = first_instance}, D3D12DrawCommand::Draw);
    }
 
    bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      const DrawDispatchData draw_dispatch_data = {.instance_count = instance_count, .first_instance = first_instance, .index_count = index_count, .first_index = first_index, .vertex_offset = vertex_offset, .indexed = true};
-      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
-      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::DrawIndexed);
+      return OnDrawOrDispatchD3D12(cmd_list, {.instance_count = instance_count, .first_instance = first_instance, .index_count = index_count, .first_index = first_index, .vertex_offset = vertex_offset, .indexed = true}, D3D12DrawCommand::DrawIndexed);
    }
 
    bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      const DrawDispatchData draw_dispatch_data = {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}};
-      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
-      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Dispatch);
+      return OnDrawOrDispatchD3D12(cmd_list, {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}}, D3D12DrawCommand::Dispatch);
    }
 
    bool OnDispatchMesh(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      const DrawDispatchData draw_dispatch_data = {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}};
-      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
-      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Other);
+      return OnDrawOrDispatchD3D12(cmd_list, {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}}, D3D12DrawCommand::Other);
    }
 
    // "ExecuteIndirect()" comes as "indirect_command::unknown", the bound pipeline tells draws and dispatches apart. Its command signature
@@ -6201,11 +6355,10 @@ namespace
    bool OnDrawOrDispatchIndirect(reshade::api::command_list* cmd_list, reshade::api::indirect_command type, reshade::api::resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      const DrawDispatchData draw_dispatch_data = {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true};
-      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
-      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, D3D12Readback::Command::Other);
+      return OnDrawOrDispatchD3D12(cmd_list, {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true}, D3D12DrawCommand::Other);
    }
 
+#if DEVELOPMENT
    // The copies, uploads, resolves and clears of the frame capture, and the readbacks at the copies, resolves and render target and depth
    // stencil clears: their handlers return true when "ReadbackCopyOrClear()" re-issued them
    bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
@@ -6351,7 +6504,8 @@ namespace
       trace_cmd_list_data.trace_draw_calls_data.insert(trace_cmd_list_data.trace_draw_calls_data.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
       entries.clear();
    }
-#endif // DX12 && DEVELOPMENT
+#endif // DEVELOPMENT
+#endif // DX12
 
 #if DX11 // D3D12 binds its clones in its own "OnBindPipeline()" above, and doesn't have the Luma cbuffers yet (see "docs/DX12-Support-Plan.md" phase 3)
    void OnBindPipeline(
@@ -7062,6 +7216,9 @@ namespace
          }
       }
 #endif // DX11
+#if DX12
+      cmd_list_data.is_bundle = reinterpret_cast<NativeCommandList*>(cmd_list->get_native())->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+#endif
    }
 
    void OnDestroyCommandList(reshade::api::command_list* cmd_list)
@@ -7101,6 +7258,9 @@ namespace
       cmd_list_data.draw_callback = nullptr;
       cmd_list_data.dispatch_callback = nullptr;
 
+#if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state
+      cmd_list_data.d3d12_state = {};
+#endif
       cmd_list_data.is_known_ui_shader_bound = false;
 
       cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
@@ -7135,8 +7295,7 @@ namespace
 
       cmd_list_data.temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 
-#if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state. The capture entries and readback copies of a list reset before its execution never ran.
-      cmd_list_data.d3d12_state = {};
+#if DX12 // The capture entries and readback copies of a list reset before its execution never ran
       if (D3D12Readback::recorded_copies != 0)
       {
          D3D12Readback::OnReset(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list);
@@ -7267,6 +7426,41 @@ namespace
       }
    }
 #endif // DX11
+
+#if DX12
+   // What a bundle bound carries over into the command list that executes it (its draws ran their callbacks while it was recorded)
+   void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      const CommandListData& bundle_data = *secondary_cmd_list->get_private_data<CommandListData>();
+      if (bundle_data.d3d12_state.pipeline.handle == 0) // It bound no pipeline, the executing command list keeps its own
+      {
+         return;
+      }
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      cmd_list_data.d3d12_state.pipeline = bundle_data.d3d12_state.pipeline;
+      // A bundle that set no root signature uses the one of the command list executing it
+      if (bundle_data.d3d12_state.graphics.layout.handle != 0)
+      {
+         D3D12State::SetRootSignature(&cmd_list_data.d3d12_state.graphics, bundle_data.d3d12_state.graphics.layout);
+      }
+      if (bundle_data.d3d12_state.compute.layout.handle != 0)
+      {
+         D3D12State::SetRootSignature(&cmd_list_data.d3d12_state.compute, bundle_data.d3d12_state.compute.layout);
+      }
+      cmd_list_data.pipeline_state_original_vertex_shader = bundle_data.pipeline_state_original_vertex_shader;
+      cmd_list_data.pipeline_state_original_pixel_shader = bundle_data.pipeline_state_original_pixel_shader;
+      cmd_list_data.pipeline_state_original_compute_shader = bundle_data.pipeline_state_original_compute_shader;
+      cmd_list_data.pipeline_state_original_graphics_shader_hashes = bundle_data.pipeline_state_original_graphics_shader_hashes;
+      cmd_list_data.pipeline_state_original_compute_shader_hashes = bundle_data.pipeline_state_original_compute_shader_hashes;
+      cmd_list_data.pipeline_state_has_custom_vertex_shader = bundle_data.pipeline_state_has_custom_vertex_shader;
+      cmd_list_data.pipeline_state_has_custom_pixel_shader = bundle_data.pipeline_state_has_custom_pixel_shader;
+      cmd_list_data.pipeline_state_has_custom_graphics_shader = bundle_data.pipeline_state_has_custom_graphics_shader;
+      cmd_list_data.pipeline_state_has_custom_compute_shader = bundle_data.pipeline_state_has_custom_compute_shader;
+      cmd_list_data.draw_callback = bundle_data.draw_callback;
+      cmd_list_data.dispatch_callback = bundle_data.dispatch_callback;
+   }
+#endif // DX12
 
 #if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
    void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
@@ -18885,28 +19079,28 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
 #if DX12
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::register_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
+      reshade::register_event<reshade::addon_event::draw>(OnDraw);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::register_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
+      reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
 #endif
 #if DX12 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
-      reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
-      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
-      reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
-      reshade::register_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
       reshade::register_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
       reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
-      reshade::register_event<reshade::addon_event::draw>(OnDraw);
-      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-      reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
-      reshade::register_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
-      reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
@@ -19001,12 +19195,10 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
-#if DX11
-#if DEVELOPMENT
+#if DX11 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
-#endif // DEVELOPMENT
+#endif // DX11 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
-#endif // DX11
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
 #if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY
@@ -19074,28 +19266,28 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
 #if DX12
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::unregister_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
+      reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
+      reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::unregister_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
+      reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
 #endif
 #if DX12 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
-      reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
-      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
-      reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
-      reshade::unregister_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
       reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
       reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
-      reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
-      reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-      reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
-      reshade::unregister_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
-      reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
@@ -19177,12 +19369,10 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
-#if DX11
-#if DEVELOPMENT
+#if DX11 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
-#endif // DEVELOPMENT
+#endif // DX11 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
-#endif // DX11
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
 #if ENABLE_REFLEX || ENABLE_SWAPCHAIN_PROXY

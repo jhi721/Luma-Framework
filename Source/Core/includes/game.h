@@ -95,6 +95,8 @@ public:
    // Return true to cancel the original call.
    // Use "original_draw_dispatch_func" to call the original draw/dispatch within your function (you have to cancel it manually if you do so, as that's not tracked). This is useful if you want to add any post draw/dispatch behaviour. "ENABLE_POST_DRAW_DISPATCH_CALLBACK" is required for the it to work. Note that some advanced debugging behaviours might conflict if you replace the draw call.
    // Not called for draws/dispatches that matched a callback in "draw_callbacks_by_shader_hashes"/"dispatch_callbacks_by_shader_hashes" (which have this same signature).
+   // On D3D12 it's called while the game records its command lists, on the threads it records them on: concurrently, so lock whatever "device_data" state you access.
+   // "native_device_context" is the command list being recorded (a bundle too), and "original_draw_dispatch_func" is null for indirect and mesh draws there.
    virtual DrawOrDispatchOverrideType OnDrawOrDispatch(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func = nullptr) { return DrawOrDispatchOverrideType::None; }
    // Called at bind time for patch-cloned pipelines to decide whether to use the
    // patched variant (true) or the original (false). Default is true (patch ON).

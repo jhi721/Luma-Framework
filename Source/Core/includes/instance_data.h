@@ -95,6 +95,18 @@ struct DrawDispatchData
    bool indirect = false;
 };
 
+#if DX12
+// The command a D3D12 draw event stands for, to re-issue it natively. "ExecuteIndirect()" comes without its command signature, and ReShade passes
+// "DispatchMesh()" with X as Y: those ("Other") can't be re-issued.
+enum class D3D12DrawCommand : uint8_t
+{
+   Draw,
+   DrawIndexed,
+   Dispatch,
+   Other,
+};
+#endif
+
 // A frame capture entry. The D3D11 states without a D3D12 equivalent yet (blend, depth stencil, rasterizer, viewports, samplers) are D3D11 only.
 struct TraceDrawCallData
 {
@@ -594,8 +606,11 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    ShaderCustomDepthStencilType temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 #endif
 
-#if DX12 && DEVELOPMENT // For the frame capture, for now
+#if DX12
+   // What the command list bound, as far as game code can query it on release builds too (see "d3d12_state.h")
    D3D12State::CommandListState d3d12_state;
+   // A bundle (secondary command list): the command list that executes it inherits what it bound
+   bool is_bundle = false;
 #endif
 };
 

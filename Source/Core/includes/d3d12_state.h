@@ -2,6 +2,8 @@
 
 // D3D12 state Core tracks from ReShade events, given that D3D12 has no state queries ("docs/DX12-Support-Plan.md" decision D3):
 // the root signatures, what each command list binds, and a shadow copy of the descriptor heaps to resolve bound tables to descriptors.
+// Release builds only track what game code can query (the pipeline, the root signatures, the render targets and the depth stencil), the rest is
+// for the frame capture (DEVELOPMENT).
 
 #include <algorithm>
 #include <cstdint>
@@ -70,6 +72,7 @@ namespace D3D12State
       layouts->parameters_by_layout.erase(layout.handle);
    }
 
+#if DEVELOPMENT
    // What a command list bound to a root parameter
    struct RootBinding
    {
@@ -79,12 +82,15 @@ namespace D3D12State
       uint64_t descriptor_offset = 0;                                                                 // Root CBV offset in its buffer
       std::vector<uint32_t> constants;                                                                // Root constants
    };
+#endif
 
    // Graphics and compute have their own root signature and root arguments
    struct RootState
    {
       reshade::api::pipeline_layout layout = {};
+#if DEVELOPMENT
       std::vector<RootBinding> bindings; // By root parameter index
+#endif
    };
 
    // What a view descriptor held when it was written or bound. D3D12 copies descriptors by value and reads CPU descriptors (render
@@ -110,6 +116,7 @@ namespace D3D12State
       return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (is_texture ? desc.texture.first_level : 0), .first_layer = (is_texture ? desc.texture.first_layer : 0), .layer_count = (is_texture ? (std::max)(desc.texture.layers, 1u) : UINT32_MAX)};
    }
 
+#if DEVELOPMENT
    // A bound index or vertex buffer: ReShade resolves their GPU virtual address to the buffer
    struct BufferBinding
    {
@@ -117,15 +124,18 @@ namespace D3D12State
       uint64_t offset = 0;
       uint32_t stride = 0; // The index size for index buffers
    };
+#endif
 
    struct CommandListState
    {
       reshade::api::pipeline pipeline = {};
       RootState graphics;
       RootState compute;
+#if DEVELOPMENT
       reshade::api::primitive_topology primitive_topology = reshade::api::primitive_topology::undefined;
       BufferBinding index_buffer;
       std::vector<BufferBinding> vertex_buffers; // By slot
+#endif
       std::vector<reshade::api::resource_view> render_targets;
       std::vector<ViewInfo> render_target_views;
       reshade::api::resource_view depth_stencil = {};
@@ -139,10 +149,13 @@ namespace D3D12State
       if (root->layout != layout)
       {
          root->layout = layout;
+#if DEVELOPMENT
          root->bindings.clear();
+#endif
       }
    }
 
+#if DEVELOPMENT
    RootBinding* GetRootBinding(RootState* root, reshade::api::pipeline_layout layout, uint32_t param)
    {
       SetRootSignature(root, layout);
@@ -152,6 +165,7 @@ namespace D3D12State
       }
       return &root->bindings[param];
    }
+#endif
 
    // ReShade passes "all_graphics" for the graphics root signature and arguments, "all_compute" (with ray tracing) for the compute ones
    template <typename Function>
@@ -167,18 +181,22 @@ namespace D3D12State
       }
    }
 
-   // "Set*RootSignature()" arrives here with no tables
+   // "Set*RootSignature()" arrives here with no tables, which is all release builds track
    void BindDescriptorTables(CommandListState* state, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table* tables)
    {
       ForEachRootState(state, stages, [&](RootState* root)
          {
             SetRootSignature(root, layout);
+#if DEVELOPMENT
             for (uint32_t i = 0; i < count; i++)
             {
                GetRootBinding(root, layout, first + i)->table = tables[i];
-            } });
+            }
+#endif
+         });
    }
 
+#if DEVELOPMENT
    void PushDescriptors(CommandListState* state, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t param, const reshade::api::descriptor_table_update& update)
    {
       if (update.count == 0)
@@ -232,6 +250,7 @@ namespace D3D12State
          state->vertex_buffers[first + i] = {.buffer = buffers[i].handle, .offset = offsets[i], .stride = strides[i]};
       }
    }
+#endif
 
    void BindRenderTargets(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
    {
