@@ -1325,6 +1325,236 @@ namespace
       }
    }
 
+#if DX12
+   // The stream subobject of a ReShade shader subobject, none for any other (ray tracing shaders are in state objects, which aren't captured)
+   std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> ToStreamShaderType(reshade::api::pipeline_subobject_type type)
+   {
+      switch (type)
+      {
+      case reshade::api::pipeline_subobject_type::vertex_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+      case reshade::api::pipeline_subobject_type::hull_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS;
+      case reshade::api::pipeline_subobject_type::domain_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS;
+      case reshade::api::pipeline_subobject_type::geometry_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
+      case reshade::api::pipeline_subobject_type::pixel_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+      case reshade::api::pipeline_subobject_type::compute_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+      case reshade::api::pipeline_subobject_type::amplification_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+      case reshade::api::pipeline_subobject_type::mesh_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+      default:
+         return std::nullopt;
+      }
+   }
+
+   // A custom shader replacing a stage of a D3D12 pipeline
+   struct D3D12StageReplacement
+   {
+      reshade::api::pipeline_subobject_type type;
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE stream_type;
+      // Of the game's shader
+      uint32_t shader_hash;
+      // The game's shader, in "CachedPipeline::subobjects_cache"
+      const reshade::api::shader_desc* original;
+      // The custom shader's: valid for as long as the lock it was found under is held (or the copy it points to is)
+      std::span<const uint8_t> code;
+   };
+
+   // The custom shaders replacing stages of a D3D12 pipeline, none if no stage has a usable one. Needs "s_mutex_loading" locked, for as long as the code is used.
+   // A file whose container (DXIL or DXBC) isn't its stage's is refused, as a pipeline can't mix them.
+   std::vector<D3D12StageReplacement> FindD3D12StageReplacements(const CachedPipeline& cached_pipeline)
+   {
+      const std::span<const reshade::api::pipeline_subobject> subobjects(cached_pipeline.subobjects_cache, cached_pipeline.subobject_count);
+      std::vector<D3D12StageReplacement> replacements;
+      for (size_t i = 0; i < cached_pipeline.shader_hashes.size(); ++i)
+      {
+         const uint32_t shader_hash = cached_pipeline.shader_hashes[i];
+         const auto custom_shader_pair = custom_shaders_cache.find(shader_hash);
+         if (custom_shader_pair == custom_shaders_cache.end() || custom_shader_pair->second == nullptr)
+         {
+            continue;
+         }
+         const CachedCustomShader& custom_shader = *custom_shader_pair->second;
+         const reshade::api::pipeline_subobject_type type = cached_pipeline.shader_types[i];
+         const std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> stream_type = ToStreamShaderType(type);
+         const auto original_subobject = std::ranges::find(subobjects, type, &reshade::api::pipeline_subobject::type);
+         // A shader file that was deleted stays in the cache until the shaders are unloaded, but it stops replacing as soon as it's gone
+         std::error_code file_error;
+         if (custom_shader.is_luma_native || custom_shader.code.empty() || !stream_type || original_subobject == subobjects.end() || !std::filesystem::exists(custom_shader.file_path, file_error))
+         {
+            continue;
+         }
+
+         const auto* original = static_cast<const reshade::api::shader_desc*>(original_subobject->data);
+         bool original_is_dxil = false;
+         bool replacement_is_dxil = false;
+         Shader::FindProgramChunk(original->code, original->code_size, &original_is_dxil);
+         Shader::FindProgramChunk(custom_shader.code.data(), custom_shader.code.size(), &replacement_is_dxil);
+         if (original_is_dxil != replacement_is_dxil)
+         {
+            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused \"{}\" for the shader {:08X}: it's {} but the game's is {}, and a pipeline can't mix them", custom_shader.file_path.string(), shader_hash, replacement_is_dxil ? "DXIL" : "DXBC", original_is_dxil ? "DXIL" : "DXBC").c_str());
+            continue;
+         }
+         replacements.push_back({.type = type, .stream_type = *stream_type, .shader_hash = shader_hash, .original = original, .code = custom_shader.code});
+      }
+      return replacements;
+   }
+
+   // Identifies the code (and stages) a clone is built from, to tell the versions of a pipeline's clone apart. 64 bits (x64 only, like the D3D12 builds),
+   // so a collision can't bring back a stale version
+   uint64_t HashD3D12Replacements(std::span<const D3D12StageReplacement> replacements)
+   {
+      uint64_t hash = 0;
+      for (const D3D12StageReplacement& replacement : replacements)
+      {
+         const uint64_t code_hash = std::hash<std::string_view>()(std::string_view(reinterpret_cast<const char*>(replacement.code.data()), replacement.code.size()));
+         hash = (hash ^ (code_hash + static_cast<uint64_t>(replacement.type))) * 0x100000001b3ull;
+      }
+      return hash;
+   }
+
+   // Creates the clone of a D3D12 pipeline with the code of "replacements" in place of its stages', a null handle if it failed (logged).
+   // Calls the device: no Luma lock may be held, but the one keeping the code alive. The clone is destroyed with the original, retired or not.
+   reshade::api::pipeline CreateD3D12Clone(CachedPipeline* cached_pipeline, std::span<const D3D12StageReplacement> replacements)
+   {
+      ID3D12Device* const native_device = reinterpret_cast<ID3D12Device*>(cached_pipeline->device->get_native());
+#if ENABLE_MINHOOK
+      D3D12PsoCapture::Stream* const capture = cached_pipeline->capture.get();
+      const bool has_serialized_root_signature = capture && capture->Find<D3D12PsoCapture::SerializedRootSignatureDesc>(D3D12PsoCapture::SERIALIZED_ROOT_SIGNATURE);
+#else
+      constexpr bool has_serialized_root_signature = false;
+#endif
+
+      // The device logs an error if asked to make a root signature from a shader that doesn't embed one (a "RTS0" chunk)
+      const auto embeds_root_signature = [](const reshade::api::shader_desc& shader)
+      {
+         const auto* header = static_cast<const Shader::DXBCHeader*>(shader.code);
+         if (shader.code_size < sizeof(Shader::DXBCHeader) || memcmp(header->format_name, "DXBC", 4) != 0 || sizeof(Shader::DXBCHeader) + header->chunk_count * sizeof(uint32_t) > shader.code_size)
+         {
+            return false;
+         }
+         for (uint32_t i = 0; i < header->chunk_count; ++i)
+         {
+            const uint32_t offset = header->chunk_offsets[i];
+            if (size_t(offset) + sizeof(Shader::DXBCChunk) <= shader.code_size && memcmp(&reinterpret_cast<const Shader::DXBCChunk*>(static_cast<const uint8_t*>(shader.code) + offset)->type_name, "RTS0", 4) == 0)
+            {
+               return true;
+            }
+         }
+         return false;
+      };
+
+      // A pipeline whose shaders embed their root signature has no object for it, and the replacements (compiled from HLSL) don't carry it:
+      // its clone needs one, made from the game's shaders and kept for the next clones. A serialized root signature in the stream is its own.
+      if (cached_pipeline->layout.handle == 0 && !has_serialized_root_signature && !cached_pipeline->root_signature)
+      {
+         for (uint32_t i = 0; i < cached_pipeline->subobject_count && !cached_pipeline->root_signature; ++i)
+         {
+            const reshade::api::pipeline_subobject& subobject = cached_pipeline->subobjects_cache[i];
+            const auto* original = static_cast<const reshade::api::shader_desc*>(subobject.data);
+            if (!ToStreamShaderType(subobject.type) || !embeds_root_signature(*original))
+            {
+               continue;
+            }
+            com_ptr<ID3D12RootSignature> root_signature;
+            if (SUCCEEDED(native_device->CreateRootSignature(0, original->code, original->code_size, IID_PPV_ARGS(&root_signature))))
+            {
+               cached_pipeline->root_signature = std::move(root_signature);
+            }
+         }
+      }
+
+#if ENABLE_MINHOOK
+      if (capture)
+      {
+         std::vector<std::byte> stream = capture->bytes;
+         for (const D3D12StageReplacement& replacement : replacements)
+         {
+            D3D12_SHADER_BYTECODE* const bytecode = capture->Find<D3D12_SHADER_BYTECODE>(replacement.stream_type, stream.data());
+            ASSERT_ONCE(bytecode != nullptr); // "OnInitPipeline()" only keeps a capture that has all the shaders of its pipeline
+            if (bytecode)
+            {
+               *bytecode = {.pShaderBytecode = replacement.code.data(), .BytecodeLength = replacement.code.size()};
+            }
+         }
+         if (cached_pipeline->layout.handle == 0 && cached_pipeline->root_signature)
+         {
+            if (ID3D12RootSignature** const stream_root_signature = capture->Find<ID3D12RootSignature*>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, stream.data()))
+            {
+               *stream_root_signature = cached_pipeline->root_signature.get();
+            }
+            else
+            {
+               const D3D12PsoCapture::Subobject<ID3D12RootSignature*> root_signature_subobject = {.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, .data = cached_pipeline->root_signature.get()};
+               const auto* root_signature_bytes = reinterpret_cast<const std::byte*>(&root_signature_subobject);
+               stream.insert(stream.end(), root_signature_bytes, root_signature_bytes + sizeof(root_signature_subobject));
+            }
+         }
+
+         com_ptr<ID3D12Device2> device2;
+         ID3D12PipelineState* pipeline = nullptr;
+         HRESULT result = native_device->QueryInterface(&device2);
+         if (SUCCEEDED(result))
+         {
+            result = D3D12PsoCapture::Create(device2.get(), stream, &pipeline);
+         }
+         if (FAILED(result))
+         {
+            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the clone of pipeline {:x} failed with HRESULT {:#010x}", cached_pipeline->pipeline.handle, static_cast<uint32_t>(result)).c_str());
+            return {};
+         }
+         return {reinterpret_cast<uint64_t>(pipeline)};
+      }
+#endif // ENABLE_MINHOOK
+
+      static std::atomic_flag logged_fallback;
+      if (!logged_fallback.test_and_set())
+      {
+         reshade::log::message(reshade::log::level::warning, "[Shader replacement] A pipeline without a captured stream is rebuilt through ReShade, which doesn't model all of its state (like the strip cut value and view instancing)");
+      }
+      const reshade::api::pipeline clone = Patch::ClonePipelineWithPatches(
+         cached_pipeline->device, {reinterpret_cast<uint64_t>(cached_pipeline->root_signature.get())},
+         cached_pipeline->subobjects_cache, cached_pipeline->subobject_count,
+         [replacements](const reshade::api::shader_desc*, const reshade::api::shader_desc* original) -> std::optional<std::pair<const uint8_t*, uint32_t>>
+         {
+            const auto replacement = std::ranges::find(replacements, original, &D3D12StageReplacement::original);
+            if (replacement == replacements.end())
+            {
+               return std::nullopt;
+            }
+            return std::make_pair(replacement->code.data(), static_cast<uint32_t>(replacement->code.size()));
+         }).first;
+      if (clone.handle == 0)
+      {
+         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the clone of pipeline {:x} through ReShade failed", cached_pipeline->pipeline.handle).c_str());
+      }
+      return clone;
+   }
+
+   // A clone becomes the replacement of its pipeline, the way "ClearCustomShader()" undoes. Needs "s_mutex_generic" locked, unless the pipeline isn't shared yet.
+   void ActivateD3D12Clone(DeviceData& device_data, CachedPipeline* cached_pipeline, reshade::api::pipeline clone, uint64_t code_hash)
+   {
+      assert(!cached_pipeline->cloned && cached_pipeline->pipeline_clone.handle == 0);
+      // A clone that was retired is reactivated
+      if (const auto retired_clone = std::ranges::find(cached_pipeline->retired_clones, clone, &CachedPipeline::RetiredClone::clone); retired_clone != cached_pipeline->retired_clones.end())
+      {
+         cached_pipeline->retired_clones.erase(retired_clone);
+      }
+      cached_pipeline->pipeline_clone = clone;
+      cached_pipeline->cloned = true;
+      cached_pipeline->active_clone_code_hash = code_hash;
+      cached_pipeline->active_clone.store(clone.handle, std::memory_order_release);
+      device_data.pipeline_cache_by_pipeline_clone_handle[clone.handle] = cached_pipeline;
+      device_data.cloned_pipeline_count++;
+      device_data.cloned_pipelines_changed = true;
+   }
+#endif // DX12
+
    // Ambiguous name but this one clears the pipeline. "destroy_clone" keeps the
    // clone object alive (patch-only clones survive unloads); the caller is then
    // responsible for its lifetime (OnDestroyPipeline destroys it).
@@ -1345,6 +1575,13 @@ namespace
       device_data.cloned_pipelines_changed = true;
       if (destroy_clone)
       {
+#if DX12
+         // A D3D12 clone is never destroyed while its original lives, as a command list can still use it. It's retired: the bind callback stops
+         // using it, and a load of the same code reactivates it. The caller has nothing to destroy.
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(cached_pipeline->pipeline_clone.handle);
+         cached_pipeline->active_clone.store(0, std::memory_order_release);
+         cached_pipeline->retired_clones.push_back({.code_hash = std::exchange(cached_pipeline->active_clone_code_hash, 0), .clone = cached_pipeline->pipeline_clone});
+#endif
          cached_pipeline->pipeline_clone = {0};
       }
       return true;
@@ -1367,6 +1604,9 @@ namespace
             Shader::CachedPipeline* cached_pipeline = pair.second;
             if (cached_pipeline == nullptr || (!pipelines_filter.empty() && !pipelines_filter.contains(cached_pipeline->pipeline.handle))) continue;
 
+#if DX12
+            ClearCustomShader(device_data, cached_pipeline, clean_custom_shader); // Retires the clone, nothing is destroyed
+#else
             auto pipeline_clone_handle = cached_pipeline->pipeline_clone.handle;
             // "Unload Shaders" keeps its original semantics: destroy every clone
             // (files and patches); patches have their own preserving "Unload Patches".
@@ -1385,6 +1625,7 @@ namespace
                pipelines_to_destroy[pipeline_clone_handle] = cached_pipeline->device;
                cached_pipeline->pipeline_clone = {0};
             }
+#endif // DX12
          }
       }
 
@@ -2610,6 +2851,9 @@ namespace
             if (!iterated_pipelines.emplace(cached_pipeline->pipeline.handle).second) continue;
             pipelines_to_clone.emplace_back(cached_pipeline);
 
+#if DX12
+            ClearCustomShader(device_data, cached_pipeline, false); // Retires the clone, nothing is destroyed
+#else
             // Force clear this pipeline's clone in case it was already cloned. This
             // full reload re-clones everything, so preserved patch clones are released here too.
             auto pipeline_clone_handle = cached_pipeline->pipeline_clone.handle;
@@ -2624,6 +2868,7 @@ namespace
                pipelines_to_destroy[pipeline_clone_handle] = cached_pipeline->device;
                cached_pipeline->pipeline_clone = {0};
             }
+#endif // DX12
          }
       }
 
@@ -2673,7 +2918,11 @@ namespace
          pair.second->destroy_pipeline(reshade::api::pipeline{pair.first}); // TODO: verify the device is the same as the "device_data" we passed in here? Otherwise it might not properly support two devices. Theoretically we should pass in a device filter to the funcs to unload cloned pipelines
       }
 
+#if DX12
+      std::vector<std::tuple<CachedPipeline*, reshade::api::pipeline, uint64_t>> cloned_pipelines_data; // And the hash of the code each was built from
+#else
       std::vector<std::tuple<CachedPipeline*, reshade::api::pipeline>> cloned_pipelines_data;
+#endif
 
        // "s_mutex_loading" is expected to still be locked
        for (CachedPipeline* cached_pipeline : pipelines_to_clone)
@@ -2706,6 +2955,34 @@ namespace
           }
 #endif
 
+#if DX12
+          const std::vector<D3D12StageReplacement> replacements = FindD3D12StageReplacements(*cached_pipeline);
+          if (replacements.empty())
+          {
+             continue;
+          }
+          cached_pipeline->clone_origin = Shader::CloneOrigin::File;
+
+          // A reload of the same code reuses the clone it made, which was retired above
+          const uint64_t code_hash = HashD3D12Replacements(replacements);
+          reshade::api::pipeline pipeline_clone = {};
+          {
+             const std::shared_lock lock_retired(s_mutex_generic);
+             const auto retired_clone = std::ranges::find(cached_pipeline->retired_clones, code_hash, &CachedPipeline::RetiredClone::code_hash);
+             if (retired_clone != cached_pipeline->retired_clones.end())
+             {
+                pipeline_clone = retired_clone->clone;
+             }
+          }
+          if (pipeline_clone.handle == 0)
+          {
+             pipeline_clone = CreateD3D12Clone(cached_pipeline, replacements);
+          }
+          if (pipeline_clone.handle != 0)
+          {
+             cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone, code_hash));
+          }
+#else
           auto [pipeline_clone, injected] = Patch::ClonePipelineWithPatches(
              cached_pipeline->device, cached_pipeline->layout,
              subobjects, subobject_count,
@@ -2775,6 +3052,7 @@ namespace
           {
              cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone));
           }
+#endif // DX12
 
        }
 
@@ -2784,6 +3062,9 @@ namespace
       {
          CachedPipeline* cached_pipeline = std::get<0>(cloned_pipeline_data);
          reshade::api::pipeline pipeline_clone = std::get<1>(cloned_pipeline_data);
+#if DX12
+         ActivateD3D12Clone(device_data, cached_pipeline, pipeline_clone, std::get<2>(cloned_pipeline_data));
+#else
 
          assert(!cached_pipeline->cloned && cached_pipeline->pipeline_clone.handle == 0); // We destroy the potential previous one above in "UnloadCustomShaders"
          cached_pipeline->pipeline_clone = pipeline_clone;
@@ -2798,6 +3079,7 @@ namespace
          device_data.pipeline_cache_by_pipeline_clone_handle[pipeline_clone.handle] = cached_pipeline;
          device_data.cloned_pipeline_count++;
          device_data.cloned_pipelines_changed = true;
+#endif // DX12
       }
    }
 
@@ -4261,34 +4543,6 @@ namespace
    }
 #endif // INPLACE sync providers
 
-#if DX12 && ENABLE_MINHOOK
-   // The stream subobject of a ReShade shader subobject, none for any other (ray tracing shaders are in state objects, which aren't captured)
-   std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> ToStreamShaderType(reshade::api::pipeline_subobject_type type)
-   {
-      switch (type)
-      {
-      case reshade::api::pipeline_subobject_type::vertex_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
-      case reshade::api::pipeline_subobject_type::hull_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS;
-      case reshade::api::pipeline_subobject_type::domain_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS;
-      case reshade::api::pipeline_subobject_type::geometry_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
-      case reshade::api::pipeline_subobject_type::pixel_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
-      case reshade::api::pipeline_subobject_type::compute_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
-      case reshade::api::pipeline_subobject_type::amplification_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
-      case reshade::api::pipeline_subobject_type::mesh_shader:
-         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
-      default:
-         return std::nullopt;
-      }
-   }
-#endif // DX12 && ENABLE_MINHOOK
-
    void OnInitPipeline(
       reshade::api::device* device,
       reshade::api::pipeline_layout layout,
@@ -5047,6 +5301,34 @@ namespace
 #endif // ENABLE_MINHOOK
 #endif // DX12
 
+#if DX12
+      // The replacements of a D3D12 pipeline are created with it, as its clones are only bound from here on, and before it's shared with the other threads.
+      // Not through "LoadCustomShaders()": it holds locks across device calls that "OnDestroyPipeline()" needs, inside the runtime's final release of a pipeline.
+      reshade::api::pipeline creation_clone = {};
+      uint64_t creation_clone_code_hash = 0;
+      if (auto_load && !last_pressed_unload && found_custom_shader_file)
+      {
+         // The code is copied, to create the clone without holding the lock
+         std::vector<std::vector<uint8_t>> replacement_codes;
+         std::vector<D3D12StageReplacement> replacements;
+         {
+            const std::shared_lock lock_loading(s_mutex_loading);
+            replacements = FindD3D12StageReplacements(*cached_pipeline);
+            replacement_codes.reserve(replacements.size());
+            for (D3D12StageReplacement& replacement : replacements)
+            {
+               replacement.code = replacement_codes.emplace_back(replacement.code.begin(), replacement.code.end());
+            }
+         }
+         if (!replacements.empty())
+         {
+            cached_pipeline->clone_origin = Shader::CloneOrigin::File;
+            creation_clone_code_hash = HashD3D12Replacements(replacements);
+            creation_clone = CreateD3D12Clone(cached_pipeline, replacements);
+         }
+      }
+#endif // DX12
+
       {
          const std::unique_lock lock(s_mutex_generic);
          for (const auto shader_hash : cached_pipeline->shader_hashes)
@@ -5066,6 +5348,12 @@ namespace
          // Once per pipeline, D3D12 PSOs have a hash per stage
          ASSERT_ONCE(device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle) == device_data.pipeline_cache_by_pipeline_handle.end());
          device_data.pipeline_cache_by_pipeline_handle[pipeline.handle] = cached_pipeline;
+#if DX12
+         if (creation_clone.handle != 0)
+         {
+            ActivateD3D12Clone(device_data, cached_pipeline, creation_clone, creation_clone_code_hash);
+         }
+#endif
       }
 
       // Clone pipeline with injected sync patches (if any found)
@@ -5130,7 +5418,7 @@ namespace
       }
 #endif // CLONE sync mode
 
-#if DX11 // D3D12 clones would never be bound until "docs/DX12-Support-Plan.md" phase 2
+#if DX11 // The D3D12 clones are created above, before the pipeline is shared
       // Automatically load any custom shaders that might have been bound to this pipeline.
       // To avoid this slowing down everything, we only do it if we detect the user already had a matching shader in its custom shaders folder.
       if (auto_load && !last_pressed_unload && found_custom_shader_file)
@@ -5275,6 +5563,54 @@ namespace
       }
    }
 
+   // The cached pipeline of an original pipeline a command list binds, null if it isn't tracked. Called on every pipeline bind
+   const Shader::CachedPipeline* FindCachedPipelineToBind(reshade::api::command_list* cmd_list, uint64_t pipeline_handle)
+   {
+      // Direct-mapped per-thread cache of the lookup below, so binds (every VS/PS/CS set) skip "s_mutex_generic". A handle can only be reused after its pipeline is destroyed,
+      // which bumps the generation and flushes every thread's cache, so a hit never returns a stale pipeline. Colliding handles fall back to the locked lookup.
+      struct BindCacheEntry
+      {
+         uint64_t pipeline_handle = 0;
+         const Shader::CachedPipeline* cached_pipeline = nullptr;
+      };
+      static thread_local std::array<BindCacheEntry, 256> bind_cache = {};
+      static thread_local uint32_t bind_cache_generation = 0;
+      if (const uint32_t generation = pipeline_cache_generation; bind_cache_generation != generation)
+      {
+         bind_cache = {};
+         bind_cache_generation = generation;
+      }
+      BindCacheEntry& bind_cache_entry = bind_cache[(pipeline_handle >> 4) % bind_cache.size()]; // Native objects are at least 16 byte aligned
+      if (bind_cache_entry.pipeline_handle == pipeline_handle)
+      {
+         return bind_cache_entry.cached_pipeline;
+      }
+
+      const DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+      const std::shared_lock lock(s_mutex_generic);
+      const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
+      if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end())
+      {
+         ASSERT_ONCE(pipeline_pair->second != nullptr); // Shouldn't usually happen but if it did, it's supported anyway and innocuous
+         // This is guaranteed to not be destroyed while it's bound
+         if (pipeline_pair->second != nullptr)
+         {
+            bind_cache_entry = {.pipeline_handle = pipeline_handle, .cached_pipeline = pipeline_pair->second};
+         }
+         return pipeline_pair->second;
+      }
+#if ENABLE_GAME_PIPELINE_STATE_READBACK // Allow either game engines or other mods between the game and ReShade to read back states we had changed
+      // "Deus Ex: Human Revolution" with the golden filter restoration mod sets back customized shaders to the pipeline,
+      // as it also read back the state of DX etc, so make sure to search it from the cloned shaders list too!
+      const auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_clone_handle.find(pipeline_handle);
+      if (pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_clone_handle.end())
+      {
+         return pipeline_pair_2->second;
+      }
+#endif
+      return nullptr;
+   }
+
 #if DX12 && DEVELOPMENT // State tracking for the frame capture (later also the Luma cbuffers injection, "docs/DX12-Support-Plan.md" phase 3)
    void OnInitPipelineLayout(reshade::api::device* device, uint32_t param_count, const reshade::api::pipeline_layout_param* params, reshade::api::pipeline_layout layout)
    {
@@ -5302,16 +5638,40 @@ namespace
       return false;
    }
 
-   // Command lists are recorded by one thread at a time, so their state needs no lock
+#endif // DX12 && DEVELOPMENT
+
+#if DX12
+   // Binds the clone in place of the pipeline the game sets (on every build). The runtime sets the game's pipeline before this event, and "bind_pipeline()" sets the
+   // clone over it. Never with "all_graphics": it would also replay the topology and blend factor ReShade stores for the pipelines it creates.
    void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
-      if (stages != reshade::api::pipeline_stage::all_ray_tracing)
+      if (stages == reshade::api::pipeline_stage::all_ray_tracing) // State objects aren't replaced
       {
-         cmd_list->get_private_data<CommandListData>()->d3d12_state.pipeline = pipeline;
+         return;
+      }
+#if DEVELOPMENT
+      // Command lists are recorded by one thread at a time, so their state needs no lock. It follows the game's pipeline, not our clone
+      cmd_list->get_private_data<CommandListData>()->d3d12_state.pipeline = pipeline;
+#endif
+      if (pipeline.handle == 0 || !custom_shaders_enabled)
+      {
+         return;
+      }
+      const Shader::CachedPipeline* cached_pipeline = FindCachedPipelineToBind(cmd_list, pipeline.handle);
+      if (cached_pipeline == nullptr)
+      {
+         return;
+      }
+      // No lock: a clone retired since this read is still alive, as long as the original (which the game keeps alive for the command lists using it)
+      if (const uint64_t clone_handle = cached_pipeline->active_clone.load(std::memory_order_acquire); clone_handle != 0)
+      {
+         cmd_list->bind_pipeline(stages, reshade::api::pipeline{clone_handle});
       }
    }
+#endif // DX12
 
+#if DX12 && DEVELOPMENT
    void OnBindDescriptorTables(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table* tables, uint32_t dynamic_offset_count, const uint32_t* dynamic_offsets)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
@@ -5988,7 +6348,7 @@ namespace
    }
 #endif // DX12 && DEVELOPMENT
 
-#if DX11 // Pipeline binding, shader replacement and Luma cbuffers aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 2 and 3)
+#if DX11 // D3D12 binds its clones in its own "OnBindPipeline()" above, and doesn't have the Luma cbuffers yet (see "docs/DX12-Support-Plan.md" phase 3)
    void OnBindPipeline(
       reshade::api::command_list* cmd_list,
       reshade::api::pipeline_stage stages,
@@ -6013,53 +6373,8 @@ namespace
 
       if (pipeline.handle != 0)
       {
-         // Direct-mapped per-thread cache of the lookup below, so binds (every VS/PS/CS set) skip "s_mutex_generic". A handle can only be reused after its pipeline is destroyed,
-         // which bumps the generation and flushes every thread's cache, so a hit never returns a stale pipeline. Colliding handles fall back to the locked lookup.
-         struct BindCacheEntry
-         {
-            uint64_t pipeline_handle = 0;
-            const Shader::CachedPipeline* cached_pipeline = nullptr;
-         };
-         static thread_local std::array<BindCacheEntry, 256> bind_cache = {};
-         static thread_local uint32_t bind_cache_generation = 0;
-         if (const uint32_t generation = pipeline_cache_generation; bind_cache_generation != generation)
-         {
-            bind_cache = {};
-            bind_cache_generation = generation;
-         }
-         BindCacheEntry& bind_cache_entry = bind_cache[(pipeline.handle >> 4) % bind_cache.size()]; // Native objects are at least 16 byte aligned
-         if (bind_cache_entry.pipeline_handle == pipeline.handle)
-         {
-            cached_pipeline = bind_cache_entry.cached_pipeline;
-         }
-         else
-         {
-            const DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
-            const std::shared_lock lock(s_mutex_generic);
-            auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle);
-            if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end())
-            {
-               ASSERT_ONCE(pipeline_pair->second != nullptr); // Shouldn't usually happen but if it did, it's supported anyway and innocuous
-               cached_pipeline = pipeline_pair->second; // This is guaranteed to not be destroyed while it's bound
-               if (cached_pipeline != nullptr)
-               {
-                  bind_cache_entry = {.pipeline_handle = pipeline.handle, .cached_pipeline = cached_pipeline};
-               }
-            }
-            else
-            {
-#if ENABLE_GAME_PIPELINE_STATE_READBACK // Allow either game engines or other mods between the game and ReShade to read back states we had changed
-               // "Deus Ex: Human Revolution" with the golden filter restoration mod sets back customized shaders to the pipeline,
-               // as it also read back the state of DX etc, so make sure to search it from the cloned shaders list too!
-               auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_clone_handle.find(pipeline.handle);
-               if (pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_clone_handle.end())
-               {
-                  cached_pipeline = pipeline_pair_2->second;
-               }
-#endif
-               ASSERT_ONCE(cached_pipeline != nullptr); // Why can't we find the shader?
-            }
-         }
+         cached_pipeline = FindCachedPipelineToBind(cmd_list, pipeline.handle);
+         ASSERT_ONCE(cached_pipeline != nullptr); // Why can't we find the shader?
 
          if (cached_pipeline != nullptr)
          {
@@ -18563,12 +18878,14 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #endif // DX11
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+#if DX12
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+#endif
 #if DX12 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
-      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
@@ -18750,12 +19067,14 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #endif // DX11
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+#if DX12
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+#endif
 #if DX12 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
-      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);

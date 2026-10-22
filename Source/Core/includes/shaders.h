@@ -108,6 +108,8 @@ namespace Shader
       // The clone bound in place of the original, 0 if none. Read without a lock by the bind callback. Owned like "pipeline_clone", which it
       // can mirror: destroyed once, with the original
       std::atomic<uint64_t> active_clone = 0;
+      // The hash of the code the clone in "pipeline_clone" was built from, kept with it when it's retired. Under "s_mutex_generic", like "pipeline_clone"
+      uint64_t active_clone_code_hash = 0;
       // The clones that were replaced, built from the code of "code_hash". A command list can still hold one, so they live as long as the
       // original, and a reload reuses the one with the same hash
       struct RetiredClone
