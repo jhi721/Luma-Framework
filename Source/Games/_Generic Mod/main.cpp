@@ -13,7 +13,13 @@
 namespace
 {
    std::set<reshade::api::format> toggleable_texture_upgrade_formats;
-}
+#if DX12 && DEVELOPMENT
+   // Driven by the D3D12 smoke test ("_tools/d3d12_smoke/replace_check.py") through the dev MCP, to exercise the game callback paths of Core: pixel shader hashes (written as signed ints), 0 is off
+   int test_skip_hash = 0;        // The draw is skipped
+   int test_custom_data_hash = 0; // The draw gets Luma's cbuffers set by the callback, with CustomData1 = 7
+   int test_replaced_hash = 0;    // The callback draws it itself and reports it replaced
+#endif
+} // namespace
 
 struct GenericGameDeviceData final : public GameDeviceData
 {
@@ -33,6 +39,9 @@ public:
    {
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
+#if DX12 && DEVELOPMENT
+      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}});
+#endif
    }
 
    void OnCreateDevice(NativeDevice* native_device, DeviceData& device_data) override
@@ -43,6 +52,26 @@ public:
    DrawOrDispatchOverrideType OnDrawOrDispatch(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+
+#if DX12 && DEVELOPMENT
+      const auto is_test_hash = [&](int test_hash)
+      { return test_hash != 0 && original_shader_hashes.Contains(static_cast<uint32_t>(test_hash), reshade::api::shader_stage::pixel); };
+      if (is_test_hash(test_skip_hash))
+      {
+         return DrawOrDispatchOverrideType::Skip;
+      }
+      if (is_custom_pass && is_test_hash(test_custom_data_hash))
+      {
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 7);
+         updated_cbuffers = true;
+      }
+      if (original_draw_dispatch_func && is_test_hash(test_replaced_hash))
+      {
+         (*original_draw_dispatch_func)();
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+#endif
 
       return DrawOrDispatchOverrideType::None; // Don't cancel the original draw call
    }
