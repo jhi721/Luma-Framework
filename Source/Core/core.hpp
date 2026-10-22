@@ -837,6 +837,7 @@ namespace
    }
 
    std::string shaders_compilation_errors; // errors and warning log
+   bool shaders_compilation_failed = false; // Whether "shaders_compilation_errors" has errors, not only warnings
 #if DEVELOPMENT
    std::vector<std::string> custom_shaders_compile_defines; // Name/value pairs of the last "CompileCustomShaders()", for "luma_get_settings" (offline replays)
 #endif
@@ -1777,6 +1778,7 @@ namespace
       {
          const std::unique_lock lock(s_mutex_loading);
          shaders_compilation_errors.clear();
+         shaders_compilation_failed = false;
 #if DEVELOPMENT
          custom_shaders_compile_defines = shader_defines;
 #endif
@@ -1791,6 +1793,7 @@ namespace
          {
             const std::unique_lock lock(s_mutex_loading);
             shaders_compilation_errors = "Cannot find nor create shaders directory";
+            shaders_compilation_failed = true;
             return;
          }
          shaders_directory_created_or_empty = true; // Largely redundant
@@ -2357,6 +2360,7 @@ namespace
                      shaders_compilation_errors.append(filename_no_extension_string);
                      shaders_compilation_errors.append(": ");
                      shaders_compilation_errors.append(compilation_errors);
+                     shaders_compilation_failed |= error;
                   }
                }
                // Print out the same (last) compilation errors again if the shader still needs to be compiled but hasn't changed.
@@ -2368,6 +2372,7 @@ namespace
                   shaders_compilation_errors.append(filename_no_extension_string);
                   shaders_compilation_errors.append(": ");
                   shaders_compilation_errors.append(custom_shader->compilation_errors);
+                  shaders_compilation_failed = true;
                }
 
                if (compile_from_current_path)
@@ -2464,6 +2469,7 @@ namespace
                      shaders_compilation_errors.append(filename_no_extension_string);
                      shaders_compilation_errors.append(": ");
                      shaders_compilation_errors.append(custom_shader->compilation_errors);
+                     shaders_compilation_failed |= error;
                   }
                }
 
@@ -11865,6 +11871,7 @@ namespace
          {
             const std::unique_lock lock_loading(s_mutex_loading);
             shaders_compilation_errors.clear();
+            shaders_compilation_failed = false;
          }
          UnloadCustomShaders(device_data);
 #if 1 // Optionally unload all custom shaders data

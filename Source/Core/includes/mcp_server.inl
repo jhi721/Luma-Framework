@@ -1410,7 +1410,7 @@ namespace Mcp
       w.Field("file_clones", CountFileClones(device_data));
       {
          const std::shared_lock lock_loading(s_mutex_loading);
-         w.Field("has_compilation_errors", !shaders_compilation_errors.empty());
+         w.Field("has_compilation_errors", shaders_compilation_failed);
       }
       w.Field("trace_count", trace_count);
       w.Field("swapchain_upgrade_type", uint32_t(swapchain_upgrade_type));
