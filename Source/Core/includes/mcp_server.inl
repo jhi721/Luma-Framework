@@ -2070,6 +2070,9 @@ namespace Mcp
                return true;
             }
             add_texture_file("swapchain", copy, std::move(*bytes));
+#if ENABLE_MINHOOK
+            job->result.Field("creation", "swapchain");
+#endif
             job->result.Field("view", "swapchain").Field("note", "Read at present, before ReShade's effects (D3D12 has no display composition yet)");
             return true;
          }
@@ -2221,6 +2224,21 @@ namespace Mcp
          std::string stem = (job->readback_target->write.resource != 0) ? std::format("{}_{}", job->stage, job->written_resource) : std::format("{:08X}", job->shader_hash);
          std::ranges::replace(stem, ' ', '_');
          add_texture_file(std::format("{}_{}_{}{}", stem, job->instance, view ? *view : "rtv", job->readback_target->slot), copy, std::move(bytes));
+#if ENABLE_MINHOOK
+         // How the game created the texture: a back buffer is the swapchain's (ReShade fires no "init_resource" for those, so the map has none),
+         // the hooks of "includes/d3d12_resource_creation.h" tag the rest, unknown for a resource they didn't see
+         const char* creation = "swapchain";
+         {
+            const std::shared_lock lock_device(device_data.mutex);
+            if (!device_data.back_buffers.contains(copy.texture))
+            {
+               const std::shared_lock lock_kinds(device_data.texture_kinds.mutex);
+               const auto found = device_data.texture_kinds.by_resource.find(copy.texture);
+               creation = D3D12ResourceCreation::KIND_NAMES[size_t(found != device_data.texture_kinds.by_resource.end() ? found->second : D3D12ResourceCreation::Kind::Unknown)];
+            }
+         }
+         job->result.Field("creation", creation);
+#endif
       }
       return true;
    }

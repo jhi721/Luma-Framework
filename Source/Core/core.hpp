@@ -260,6 +260,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #include "utils/format.hpp"
 #include "utils/pipeline.hpp"
 #include "utils/shader_compiler.hpp"
+#include "includes/d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "includes/d3d12_root_signatures.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "utils/display.hpp"
 #if DX11 // Native D3D11 helpers
@@ -3469,6 +3470,15 @@ namespace
       {
          reshade::log::message(reshade::log::level::warning, "[PSO capture] ID3D12Device2::CreatePipelineState isn't hooked for this device, so shader replacements will rebuild its pipelines through ReShade");
       }
+      // Which of the game's resources are committed, placed or reserved (see "includes/d3d12_resource_creation.h")
+      if (!D3D12ResourceCreation::Install(native_device))
+      {
+         static std::atomic_flag logged_creation_failure;
+         if (!logged_creation_failure.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Resource creation] The game's creates of resources aren't all hooked, so they can't be told committed from placed (no ReShade device proxy, or MinHook failed)");
+         }
+      }
       // The game's root signatures get Luma's cbuffers at the indexes the game picked (see "includes/d3d12_root_signatures.h"), LumaData only if it has one
       if (luma_settings_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
       {
@@ -5937,7 +5947,8 @@ namespace
    }
 
 #if DEVELOPMENT
-   // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer
+   // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer. Textures are kept with how the game created them, for
+   // the MCP: ReShade fires this inside the game's create call (see "includes/d3d12_resource_creation.h").
    void OnInitResource(reshade::api::device* device, const reshade::api::resource_desc& desc, const reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state, reshade::api::resource resource)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
@@ -5945,12 +5956,25 @@ namespace
       {
          D3D12State::AddBuffer(&device->get_private_data<DeviceData>()->buffer_addresses, resource, desc.buffer.size);
       }
+#if ENABLE_MINHOOK
+      else
+      {
+         D3D12ResourceCreation::TextureKinds& texture_kinds = device->get_private_data<DeviceData>()->texture_kinds;
+         const std::unique_lock lock(texture_kinds.mutex);
+         texture_kinds.by_resource[resource.handle] = D3D12ResourceCreation::KindOf(desc);
+      }
+#endif
    }
 
    void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
       D3D12State::RemoveBuffer(&device->get_private_data<DeviceData>()->buffer_addresses, resource);
+#if ENABLE_MINHOOK
+      D3D12ResourceCreation::TextureKinds& texture_kinds = device->get_private_data<DeviceData>()->texture_kinds;
+      const std::unique_lock lock(texture_kinds.mutex);
+      texture_kinds.by_resource.erase(resource.handle);
+#endif
    }
 
    // Command lists record their own capture entries, "OnExecuteCommandList()" joins them in submission order
@@ -19652,6 +19676,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #if DX12
          D3D12PsoCapture::Remove();
          D3D12RootSignatures::Remove();
+         D3D12ResourceCreation::Remove();
 #endif
 #if ENABLE_SWAPCHAIN_PROXY
          SwapchainProxy::RemoveHooks();

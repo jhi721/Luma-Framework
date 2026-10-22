@@ -106,6 +106,7 @@ namespace D3D12Readback
 
       // Textures: one mip of the layers the view covers, each subresource laid out by its footprint
       D3D12_RESOURCE_DESC desc = {}; // The source texture's (the data of multisampled ones is resolved)
+      uint64_t texture = 0;          // The source texture's "ID3D12Resource" (a "reshade::api::resource" handle), for the MCP's report of how it was created
       uint32_t mip = 0;
       uint32_t first_layer = 0;
       DXGI_FORMAT data_format = DXGI_FORMAT_UNKNOWN; // How to read the data: the view's format, or the depth stencil plane's
@@ -227,6 +228,7 @@ namespace D3D12Readback
       }
 
       copy->desc = source_desc;
+      copy->texture = reinterpret_cast<uint64_t>(resource);
       const D3D12_RESOURCE_DESC copied_desc = copy_source->GetDesc();
       copy->footprints.resize(copy_subresources.size());
       uint64_t offset = 0;

@@ -16,7 +16,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <format>
 #include <mutex>
 #include <shared_mutex>
@@ -33,7 +32,7 @@
 #include <d3d12.h>
 #include <source/com_ptr.hpp>
 
-#include "minhook.h"
+#include "d3d12_resource_creation.h" // The hook of a function of ReShade's device proxy
 #include "../utils/shader_compiler.hpp"
 
 namespace D3D12RootSignatures
@@ -41,8 +40,6 @@ namespace D3D12RootSignatures
    // The register space of Luma's CBVs, "space51" in HLSL
    constexpr uint32_t LUMA_CB_REGISTER_SPACE = 51;
 
-   // ReShade keeps its device proxy in the native device's private data, under the proxy's class UUID ("D3D12Device" in "d3d12_device.hpp")
-   constexpr GUID RESHADE_DEVICE_PROXY = {0x2523AFF4, 0x978B, 0x4939, {0xBA, 0x16, 0x8E, 0xE8, 0x76, 0xA4, 0xCB, 0x2A}};
    // "ID3D12Device::CreateRootSignature" follows IUnknown (3 methods), ID3D12Object (4) and the 9 methods of ID3D12Device before it
    constexpr size_t CREATE_ROOT_SIGNATURE_SLOT = 16;
 
@@ -89,13 +86,9 @@ namespace D3D12RootSignatures
    // Writes a line to the log. The header doesn't call ReShade's, as offline tests have no ReShade runtime
    using LogFunction = void (*)(const char* message);
 
-   struct Hook
+   struct Hook : D3D12ProxyHook::HookedFunction<CreateRootSignatureFunction>
    {
       std::shared_mutex mutex; // For "Install()" and "Remove()". The detour reads the rest without it, as it only runs between them
-      void* target = nullptr;
-      CreateRootSignatureFunction original = nullptr;
-      // The target's start right after our hook went in: different later means another module hooked over it
-      std::array<uint8_t, 8> hooked_prologue = {};
 
       // Set before the hook goes in
       uint32_t settings_register = 0;
@@ -319,13 +312,11 @@ namespace D3D12RootSignatures
    // "settings_register" and "data_register" (-1: no LumaData) are the CBVs' registers in "LUMA_CB_REGISTER_SPACE".
    inline bool Install(ID3D12Device* native_device, uint32_t settings_register, int32_t data_register, LogFunction log)
    {
-      void* proxy = nullptr;
-      UINT proxy_size = sizeof(proxy);
-      if (FAILED(native_device->GetPrivateData(RESHADE_DEVICE_PROXY, &proxy_size, &proxy)) || proxy_size != sizeof(proxy) || !proxy)
+      void** const proxy_vtable = D3D12ProxyHook::FindProxyVtable(native_device);
+      if (!proxy_vtable)
       {
          return false;
       }
-      void* const target = (*reinterpret_cast<void***>(proxy))[CREATE_ROOT_SIGNATURE_SLOT];
       const std::unique_lock lock(hook.mutex);
       if (hook.target)
       {
@@ -341,38 +332,14 @@ namespace D3D12RootSignatures
       hook.settings_register = settings_register;
       hook.data_register = data_register;
       hook.log = log;
-      if (!hook.create_deserializer || !hook.serialize || !InitializeMinHook() || MH_CreateHook(target, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&hook.original)) != MH_OK)
-      {
-         return false;
-      }
-      if (MH_EnableHook(target) != MH_OK)
-      {
-         MH_RemoveHook(target);
-         return false;
-      }
-      std::memcpy(hook.hooked_prologue.data(), target, hook.hooked_prologue.size());
-      hook.target = target;
-      return true;
+      return hook.create_deserializer && hook.serialize && D3D12ProxyHook::Attach(&hook, proxy_vtable[CREATE_ROOT_SIGNATURE_SLOT], &Detour);
    }
 
-   // Only Luma's hook (see "includes/minhook.h"). False if another module hooked over it: Luma's then stays, as the other hook's
-   // trampoline jumps to "Detour", and the addon is pinned like "Reflex::SleepHook::Remove()" does (too late if "DllMain" is unloading it)
+   // See "D3D12ProxyHook::Detach()"
    inline bool Remove()
    {
       const std::unique_lock lock(hook.mutex);
-      if (!hook.target)
-      {
-         return true;
-      }
-      if (std::memcmp(hook.target, hook.hooked_prologue.data(), hook.hooked_prologue.size()) != 0)
-      {
-         HMODULE module = nullptr;
-         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&Detour), &module);
-         return false;
-      }
-      MH_RemoveHook(hook.target);
-      hook.target = nullptr;
-      return true;
+      return D3D12ProxyHook::Detach(&hook);
    }
 
    // The CBVs of a root signature ("ID3D12RootSignature" pointer), all -1 if the hook didn't add any (with the reason, if it saw it)

@@ -23,6 +23,7 @@
 #else
 #include "d3d12_state.h"
 #include "d3d12_upload_ring.h"
+#include "d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
 #if DEVELOPMENT
 #include "d3d12_readback.hpp"
 #endif
@@ -732,6 +733,9 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)
    CommandListData trace_command_list_data;
    D3D12Readback::State readback; // The dev MCP's GPU copies
+#if ENABLE_MINHOOK
+   D3D12ResourceCreation::TextureKinds texture_kinds; // How the game created each live texture, for the dev MCP's "creation" (see "includes/d3d12_resource_creation.h")
+#endif
 #endif
 
 #if DX11
