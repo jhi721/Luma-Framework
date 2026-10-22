@@ -260,6 +260,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #include "utils/format.hpp"
 #include "utils/pipeline.hpp"
 #include "utils/shader_compiler.hpp"
+#include "includes/d3d12_root_signatures.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "utils/display.hpp"
 #if DX11 // Native D3D11 helpers
 #include "utils/resource.hpp"
@@ -1427,6 +1428,29 @@ namespace
    reshade::api::pipeline CreateD3D12Clone(CachedPipeline* cached_pipeline, std::span<const D3D12StageReplacement> replacements)
    {
       ID3D12Device* const native_device = reinterpret_cast<ID3D12Device*>(cached_pipeline->device->get_native());
+      // The runtime only answers E_INVALIDARG when a replacement reads Luma's constant buffers that the pipeline's root signature doesn't hold: names the likely causes
+      const auto luma_cbuffers_hint = [&]
+      {
+         std::string hint;
+#if ENABLE_MINHOOK
+         if (cached_pipeline->luma_settings_param < 0)
+         {
+            const D3D12RootSignatures::Skip skip = (cached_pipeline->layout.handle == 0 ? D3D12RootSignatures::Skip::ShaderContainer : D3D12RootSignatures::Find(cached_pipeline->layout.handle).skip);
+            hint = std::format(" (if the replacement reads Luma's constant buffers: its root signature has none because {})", (skip != D3D12RootSignatures::Skip::None ? D3D12RootSignatures::SKIP_NAMES[static_cast<size_t>(skip)] : "it wasn't created through Luma's hook"));
+         }
+#endif
+         // Shader model 5.0 and older have no register spaces, where the constant buffers are
+         for (const D3D12StageReplacement& replacement : replacements)
+         {
+            const Shader::DXBCByteCodeChunk* const program = Shader::FindProgramChunk(replacement.code.data(), replacement.code.size());
+            if (program && program->version_major_and_minor < 0x51)
+            {
+               hint += " (a *_5_0 replacement has no register space for Luma's constant buffers)";
+               break;
+            }
+         }
+         return hint;
+      };
 #if ENABLE_MINHOOK
       D3D12PsoCapture::Stream* const capture = cached_pipeline->capture.get();
       const bool has_serialized_root_signature = capture && capture->Find<D3D12PsoCapture::SerializedRootSignatureDesc>(D3D12PsoCapture::SERIALIZED_ROOT_SIGNATURE);
@@ -1491,7 +1515,7 @@ namespace
          }
          if (FAILED(result))
          {
-            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the clone of pipeline {:x} failed with HRESULT {:#010x}", cached_pipeline->pipeline.handle, static_cast<uint32_t>(result)).c_str());
+            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the clone of pipeline {:x} failed with HRESULT {:#010x}{}", cached_pipeline->pipeline.handle, static_cast<uint32_t>(result), luma_cbuffers_hint()).c_str());
             return {};
          }
          return {reinterpret_cast<uint64_t>(pipeline)};
@@ -1517,7 +1541,7 @@ namespace
          }).first;
       if (clone.handle == 0)
       {
-         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the clone of pipeline {:x} through ReShade failed", cached_pipeline->pipeline.handle).c_str());
+         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the clone of pipeline {:x} through ReShade failed{}", cached_pipeline->pipeline.handle, luma_cbuffers_hint()).c_str());
       }
       return clone;
    }
@@ -2409,6 +2433,14 @@ namespace
                local_shader_defines.push_back("_" + hash_string);
                local_shader_defines.push_back("1");
             }
+#if DX12 && ENABLE_MINHOOK
+            // The game replacements read Luma's cbuffers from the root CBVs that live in a register space of their own. Shader model 5.0 and older have none, so they keep the plain registers
+            if (!is_luma_native && is_hlsl && std::string_view(local_shader_target).substr(3) >= "5_1")
+            {
+               local_shader_defines.push_back("LUMA_CB_SPACE");
+               local_shader_defines.push_back(std::format("space{}", D3D12RootSignatures::LUMA_CB_REGISTER_SPACE));
+            }
+#endif
             // Add the shader target type to (e.g.) allow unifying a PS and CS under the same file
             if (shader_definition_and_hash.second)
             {
@@ -3431,10 +3463,25 @@ namespace
       game->OnInitDevice(native_device, device_data);
 
 #if DX12
+      device_data.upload_ring = std::make_shared<D3D12UploadRing::Pool>(native_device);
 #if ENABLE_MINHOOK
       if (!D3D12PsoCapture::Install(native_device))
       {
          reshade::log::message(reshade::log::level::warning, "[PSO capture] ID3D12Device2::CreatePipelineState isn't hooked for this device, so shader replacements will rebuild its pipelines through ReShade");
+      }
+      // The game's root signatures get Luma's cbuffers at the indexes the game picked (see "includes/d3d12_root_signatures.h"), LumaData only if it has one
+      if (luma_settings_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+      {
+         const int32_t data_register = (luma_data_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT ? static_cast<int32_t>(luma_data_cbuffer_index) : -1);
+         if (!D3D12RootSignatures::Install(native_device, luma_settings_cbuffer_index, data_register, [](const char* message)
+                { reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] {}", message).c_str()); }))
+         {
+            static std::atomic_flag logged_install_failure;
+            if (!logged_install_failure.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] The game's root signatures won't get Luma's constant buffers: the hook couldn't be installed (no ReShade device proxy, no root signature serializer in the D3D12 runtime, or MinHook failed)");
+            }
+         }
       }
 #endif
       reshade::log::message(reshade::log::level::info, "Initialized the D3D12 device");
@@ -3600,6 +3647,9 @@ namespace
       Display::NVAPI::DeInit();
 #endif
 
+#if DX12
+      device_data.upload_ring.reset(); // The command lists that outlive the device's data keep the pool through their own pointer
+#endif
       device->destroy_private_data<DeviceData>();
    }
 
@@ -5270,6 +5320,31 @@ namespace
       // The layout of a D3D12 pipeline is its root signature, null if the shaders embed it
       cached_pipeline->root_signature = reinterpret_cast<ID3D12RootSignature*>(layout.handle);
 #if ENABLE_MINHOOK
+      const D3D12RootSignatures::LumaParams luma_params = D3D12RootSignatures::Find(layout.handle);
+      cached_pipeline->luma_settings_param = luma_params.settings_index;
+      cached_pipeline->luma_data_param = luma_params.data_index;
+      // A pipeline without a root signature takes the one its shaders embed. If that is the original of a root signature Luma added CBVs to, the game binds the
+      // rewritten one for this pipeline's draws, which D3D12 doesn't accept with a pipeline built on the original
+      if (layout.handle == 0)
+      {
+         for (uint32_t i = 0; i < subobject_count; ++i)
+         {
+            const auto* embedding_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects[i].data);
+            if (!ToStreamShaderType(subobjects[i].type) || !D3D12RootSignatures::IsInjectedOriginal(embedding_shader_desc->code, embedding_shader_desc->code_size))
+            {
+               continue;
+            }
+            // Once per shader: a game can create thousands of pipelines with it
+            static std::shared_mutex warned_shaders_mutex;
+            static std::unordered_set<uint32_t> warned_shader_hashes;
+            const uint32_t embedding_shader_hash = Shader::BinToHash(static_cast<const uint8_t*>(embedding_shader_desc->code), embedding_shader_desc->code_size);
+            const std::unique_lock lock_warned_shaders(warned_shaders_mutex);
+            if (warned_shader_hashes.insert(embedding_shader_hash).second)
+            {
+               reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] The shader {:08X} of pipeline {:x} embeds the root signature of one Luma added constant buffers to: the pipeline is built on the original, while the game binds the rewritten one for its draws", embedding_shader_hash, pipeline.handle).c_str());
+            }
+         }
+      }
       // The stream is this pipeline's if its shaders are the ones ReShade reports (a stale capture, or one of an address reused after the
       // original was destroyed, wouldn't have them). Its bytecode then points at our copies, as the game's memory can be gone when a clone is created.
       uint32_t matched_shader_count = 0;
@@ -5616,19 +5691,29 @@ namespace
       return nullptr;
    }
 
-#if DX12 && DEVELOPMENT // State tracking for the frame capture (later also the Luma cbuffers injection, "docs/DX12-Support-Plan.md" phase 3)
+#if DX12 && DEVELOPMENT // State tracking for the frame capture
    void OnInitPipelineLayout(reshade::api::device* device, uint32_t param_count, const reshade::api::pipeline_layout_param* params, reshade::api::pipeline_layout layout)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
       D3D12State::AddPipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout, param_count, params);
    }
+#endif // DX12 && DEVELOPMENT
 
+#if DX12
+   // All builds forget the root signatures Luma added CBVs to when they are destroyed, development builds also the layouts of the frame capture
    void OnDestroyPipelineLayout(reshade::api::device* device, reshade::api::pipeline_layout layout)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+#if ENABLE_MINHOOK
+      D3D12RootSignatures::Forget(layout.handle);
+#endif
+#if DEVELOPMENT
       D3D12State::RemovePipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout);
+#endif
    }
+#endif // DX12
 
+#if DX12 && DEVELOPMENT
    bool OnUpdateDescriptorTables(reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_update* updates)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
@@ -5644,6 +5729,15 @@ namespace
    }
 
 #endif // DX12 && DEVELOPMENT
+
+   enum class LumaConstantBufferType
+   {
+      // Global/frame settings
+      LumaSettings,
+      // Per draw/instance data
+      LumaData,
+      LumaUIData
+   };
 
 #if DX12
    // Tracks the pipeline a command list binds (on every build) like the D3D11 binds do: the hashes of its shaders, whether it runs custom ones, and the draw or dispatch callback they match.
@@ -5674,6 +5768,8 @@ namespace
       cmd_list_data.pipeline_state_has_custom_compute_shader = false;
       cmd_list_data.draw_callback = nullptr;
       cmd_list_data.dispatch_callback = nullptr;
+      cmd_list_data.luma_settings_param = -1;
+      cmd_list_data.luma_data_param = -1;
       if (pipeline.handle == 0)
       {
          return;
@@ -5685,7 +5781,17 @@ namespace
       }
       // No lock: a clone retired since this read is still alive, as long as the original (which the game keeps alive for the command lists using it).
       // Disabling the custom shaders only stops the swap, the hashes and callbacks are still tracked.
-      const uint64_t clone_handle = (custom_shaders_enabled ? cached_pipeline->active_clone.load(std::memory_order_acquire) : 0);
+      uint64_t clone_handle = (custom_shaders_enabled ? cached_pipeline->active_clone.load(std::memory_order_acquire) : 0);
+      // A bundle can't set root arguments without setting a root signature of its own, and what it would allocate for them outlives the upload ring's frame margin: it keeps the original
+      if (clone_handle != 0 && cmd_list_data.is_bundle && cached_pipeline->luma_settings_param >= 0)
+      {
+         static std::atomic_flag logged_bundle;
+         if (!logged_bundle.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] A bundle binds a pipeline whose replacement can read Luma's constant buffers, which a bundle can't set: it keeps the game's pipeline");
+         }
+         clone_handle = 0;
+      }
       const bool has_clone = clone_handle != 0;
       for (size_t i = 0; i < cached_pipeline->shader_hashes.size(); i++)
       {
@@ -5739,6 +5845,8 @@ namespace
       }
       if (has_clone)
       {
+         cmd_list_data.luma_settings_param = cached_pipeline->luma_settings_param;
+         cmd_list_data.luma_data_param = cached_pipeline->luma_data_param;
          cmd_list->bind_pipeline(stages, reshade::api::pipeline{clone_handle});
       }
    }
@@ -6255,6 +6363,97 @@ namespace
    }
 #endif // DEVELOPMENT
 
+   // The counterpart of the D3D11 function further down. The Luma cbuffers are root CBVs that Luma's hook added to the game's root signatures (see "includes/d3d12_root_signatures.h"),
+   // set here at the root parameters of the pipeline the command list bound with a replacement. Their memory comes from the upload ring (see "includes/d3d12_upload_ring.h"): one copy of the
+   // settings per change, for all the command lists, and the data per command list. There is no UI data cbuffer on D3D12, nor "is_primary", deferred contexts or "do_safety_checks".
+   void SetLumaConstantBuffers(NativeCommandList* native_command_list, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, LumaConstantBufferType type, uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0, float custom_data_3 = 0.f, float custom_data_4 = 0.f, bool do_safety_checks = true)
+   {
+      if (type == LumaConstantBufferType::LumaUIData)
+      {
+         ASSERT_ONCE_MSG(false, "Luma UI Data is not implemented (yet?)");
+         return;
+      }
+      const bool is_settings = (type == LumaConstantBufferType::LumaSettings);
+      const int32_t root_parameter = (is_settings ? cmd_list_data.luma_settings_param : cmd_list_data.luma_data_param);
+      if (root_parameter < 0)
+      {
+         static std::atomic_flag logged_no_root_parameter;
+         if (!logged_no_root_parameter.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] The bound pipeline's root signature has no Luma constant buffers (or the pipeline isn't replaced), so they weren't set");
+         }
+         return;
+      }
+
+      D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+      if (is_settings)
+      {
+         address = device_data.settings_address.load(std::memory_order_acquire);
+         if (device_data.cb_luma_global_settings_dirty.exchange(false) || address == 0)
+         {
+            // ponytail: a thread recording while another one uploads reads the previous copy for that draw, the new one is published once it's written
+            const std::unique_lock lock_settings(device_data.settings_mutex);
+            const D3D12UploadRing::Allocation upload = D3D12UploadRing::Allocate(device_data.upload_ring.get(), &device_data.settings_pages, sizeof(cb_luma_global_settings), device_data.present_count);
+            if (upload.cpu)
+            {
+               {
+                  const std::shared_lock lock_reshade(s_mutex_reshade);
+                  std::memcpy(upload.cpu, &cb_luma_global_settings, sizeof(cb_luma_global_settings));
+               }
+               address = upload.gpu;
+               device_data.settings_address.store(address, std::memory_order_release);
+            }
+         }
+      }
+      else
+      {
+         CB::LumaInstanceDataPadded cb_luma_instance_data = {};
+         cb_luma_instance_data.CustomData1 = custom_data_1;
+         cb_luma_instance_data.CustomData2 = custom_data_2;
+         cb_luma_instance_data.CustomData3 = custom_data_3;
+         cb_luma_instance_data.CustomData4 = custom_data_4;
+         cb_luma_instance_data.RenderResolutionScale.x = device_data.render_resolution.x / device_data.output_resolution.x;
+         cb_luma_instance_data.RenderResolutionScale.y = device_data.render_resolution.y / device_data.output_resolution.y;
+         cb_luma_instance_data.PreviousRenderResolutionScale.x = device_data.previous_render_resolution.x / device_data.output_resolution.x;
+         cb_luma_instance_data.PreviousRenderResolutionScale.y = device_data.previous_render_resolution.y / device_data.output_resolution.y;
+         // "RenderScaleActive" stays 0: there is no render scale on D3D12 until its resource upgrades are ported (phase 5), which the scale chain test of the D3D11 path needs
+
+         game->UpdateLumaInstanceDataCB(cb_luma_instance_data, cmd_list_data, device_data);
+
+         address = cmd_list_data.luma_data_address;
+         if (address == 0 || cmd_list_data.force_cb_luma_instance_data_dirty || std::memcmp(&cmd_list_data.cb_luma_instance_data, &cb_luma_instance_data, sizeof(cb_luma_instance_data)) != 0)
+         {
+            const D3D12UploadRing::Allocation upload = D3D12UploadRing::Allocate(cmd_list_data.upload_ring.get(), &cmd_list_data.upload_pages, sizeof(cb_luma_instance_data), device_data.present_count);
+            address = upload.gpu;
+            if (upload.cpu)
+            {
+               std::memcpy(upload.cpu, &cb_luma_instance_data, sizeof(cb_luma_instance_data));
+               cmd_list_data.cb_luma_instance_data = cb_luma_instance_data;
+               cmd_list_data.luma_data_address = address;
+               cmd_list_data.force_cb_luma_instance_data_dirty = false;
+            }
+         }
+      }
+
+      if (address == 0)
+      {
+         static std::atomic_flag logged_no_memory;
+         if (!logged_no_memory.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] The upload ring couldn't grow, so a Luma constant buffer wasn't set");
+         }
+         return;
+      }
+      if ((stages & reshade::api::shader_stage::compute) != 0)
+      {
+         native_command_list->SetComputeRootConstantBufferView(root_parameter, address);
+      }
+      else
+      {
+         native_command_list->SetGraphicsRootConstantBufferView(root_parameter, address);
+      }
+   }
+
    // The D3D11 draw callback contract on D3D12 ("Game::OnDrawOrDispatch()", "draw_callbacks_by_shader_hashes" and "dispatch_callbacks_by_shader_hashes"), for the draws, dispatches
    // and "ExecuteIndirect()" calls the game records, on the threads recording them. Returns true to skip the native call: the game's callback replaced or skipped it, or a readback re-issued it.
    bool OnDrawOrDispatchD3D12(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command)
@@ -6263,6 +6462,21 @@ namespace
       // A command list has one pipeline, so the bound one also tells "ExecuteIndirect()" draws and dispatches apart ("DispatchMesh()" runs a graphics pipeline)
       const bool is_dispatch = command == D3D12DrawCommand::Dispatch || (command == D3D12DrawCommand::Other && cmd_list_data.pipeline_state_original_compute_shader.handle != 0);
       const auto& original_shader_hashes = (is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader_hashes : cmd_list_data.pipeline_state_original_graphics_shader_hashes);
+      const bool is_custom_pass = (is_dispatch ? cmd_list_data.pipeline_state_has_custom_compute_shader : cmd_list_data.pipeline_state_has_custom_graphics_shader);
+
+      // The replaced shader's root CBVs come before anything else records: a game callback can re-issue the draw itself ("original_draw_dispatch_func"), which must never run a replaced
+      // shader with unset root CBVs. They aren't reported with "updated_cbuffers", as games test "is_custom_pass && !updated_cbuffers" to set their own (which then replace these)
+      if (is_custom_pass && cmd_list_data.luma_settings_param >= 0)
+      {
+         DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+         auto* native_list = reinterpret_cast<NativeCommandList*>(cmd_list->get_native());
+         const reshade::api::shader_stage stages = (is_dispatch ? reshade::api::shader_stage::compute : (reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel));
+         SetLumaConstantBuffers(native_list, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         if (cmd_list_data.luma_data_param >= 0)
+         {
+            SetLumaConstantBuffers(native_list, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData);
+         }
+      }
 
 #if DEVELOPMENT
       TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
@@ -6292,7 +6506,6 @@ namespace
                stages |= reshade::api::shader_stage::pixel;
             }
          }
-         const bool is_custom_pass = (is_dispatch ? cmd_list_data.pipeline_state_has_custom_compute_shader : cmd_list_data.pipeline_state_has_custom_graphics_shader);
 
          std::function<void()>* original_draw_dispatch_func = nullptr;
 #if DEVELOPMENT || ENABLE_POST_DRAW_DISPATCH_CALLBACK
@@ -6483,14 +6696,23 @@ namespace
       return false;
    }
 
+#endif // DEVELOPMENT
+
+   // The upload ring needs the executions on all builds: the pages of a command list are free once the queues that ran it passed their fences. Development builds also start
+   // the readback copies the list recorded and join its frame capture into the device's
    void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      CommandListData* cmd_list_data = cmd_list->get_private_data<CommandListData>(); // Null for ReShade's own immediate command list
+      if (cmd_list_data && !cmd_list_data->upload_pages.used.empty())
+      {
+         D3D12UploadRing::OnExecute(&cmd_list_data->upload_pages, reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), cmd_list->get_device()->get_private_data<DeviceData>()->present_count);
+      }
+#if DEVELOPMENT
       if (D3D12Readback::recorded_copies != 0)
       {
          D3D12Readback::OnExecute(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list, queue);
       }
-      CommandListData* cmd_list_data = cmd_list->get_private_data<CommandListData>(); // Null for ReShade's own immediate command list
       const auto lock_trace = LockTraceIfRunning();
       if (!cmd_list_data || !lock_trace || !trace_running)
          return;
@@ -6503,11 +6725,11 @@ namespace
       D3D12Trace::ResolveTableDescriptors(&entries, &device_data);
       trace_cmd_list_data.trace_draw_calls_data.insert(trace_cmd_list_data.trace_draw_calls_data.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
       entries.clear();
-   }
 #endif // DEVELOPMENT
+   }
 #endif // DX12
 
-#if DX11 // D3D12 binds its clones in its own "OnBindPipeline()" above, and doesn't have the Luma cbuffers yet (see "docs/DX12-Support-Plan.md" phase 3)
+#if DX11 // D3D12 has its own "OnBindPipeline()" and "SetLumaConstantBuffers()" above
    void OnBindPipeline(
       reshade::api::command_list* cmd_list,
       reshade::api::pipeline_stage stages,
@@ -6968,15 +7190,6 @@ namespace
       cmd_list_data.scissors_scaled = false;
    }
 
-   enum class LumaConstantBufferType
-   {
-      // Global/frame settings
-      LumaSettings,
-      // Per draw/instance data
-      LumaData,
-      LumaUIData
-   };
-
    // True when the hash-upgrade scale chain is active this frame: a scale-enabled seed exists and SR
    // upscaled early. Everything scale-specific (the shader flag probe and scaled copies) is gated on this.
    bool IsScaleChainActive(const DeviceData& device_data)
@@ -7218,6 +7431,7 @@ namespace
 #endif // DX11
 #if DX12
       cmd_list_data.is_bundle = reinterpret_cast<NativeCommandList*>(cmd_list->get_native())->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+      cmd_list_data.upload_ring = cmd_list->get_device()->get_private_data<DeviceData>()->upload_ring;
 #endif
    }
 
@@ -7234,6 +7448,13 @@ namespace
       }
 #endif
 
+#if DX12
+      // The pages of the list are free once its queues are done with them. Through the list's pool pointer: the device's data can be gone, command lists don't keep their device alive
+      if (CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>())
+      {
+         D3D12UploadRing::Retire(cmd_list_data->upload_ring.get(), &cmd_list_data->upload_pages);
+      }
+#endif
       cmd_list->destroy_private_data<CommandListData>();
    }
 
@@ -7260,6 +7481,11 @@ namespace
 
 #if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state
       cmd_list_data.d3d12_state = {};
+      // The root arguments are gone, and the pages they pointed at are free once the executions of the list finished
+      D3D12UploadRing::Retire(cmd_list_data.upload_ring.get(), &cmd_list_data.upload_pages);
+      cmd_list_data.luma_data_address = 0;
+      cmd_list_data.luma_settings_param = -1;
+      cmd_list_data.luma_data_param = -1;
 #endif
       cmd_list_data.is_known_ui_shader_bound = false;
 
@@ -7459,6 +7685,21 @@ namespace
       cmd_list_data.pipeline_state_has_custom_compute_shader = bundle_data.pipeline_state_has_custom_compute_shader;
       cmd_list_data.draw_callback = bundle_data.draw_callback;
       cmd_list_data.dispatch_callback = bundle_data.dispatch_callback;
+      cmd_list_data.luma_settings_param = bundle_data.luma_settings_param;
+      cmd_list_data.luma_data_param = bundle_data.luma_data_param;
+   }
+
+   // The upload ring signals a fence on each queue that can run lists setting root CBVs, to know when the GPU is done with a page
+   void OnInitCommandQueue(reshade::api::command_queue* queue)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(queue->get_device()->get_api());
+      D3D12UploadRing::RegisterQueue(queue->get_device()->get_private_data<DeviceData>()->upload_ring.get(), reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+   }
+
+   void OnDestroyCommandQueue(reshade::api::command_queue* queue)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(queue->get_device()->get_api());
+      D3D12UploadRing::UnregisterQueue(queue->get_device()->get_private_data<DeviceData>()->upload_ring.get(), reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
    }
 #endif // DX12
 
@@ -8282,6 +8523,10 @@ namespace
       }
 #endif // DEVELOPMENT
 
+#if DX12
+      // The upload ring frees its pages by the fences it signals with this count on the queues
+      D3D12UploadRing::Present(device_data.upload_ring.get(), ++device_data.present_count);
+#endif
       cb_luma_global_settings.FrameIndex++;
       device_data.cb_luma_global_settings_dirty = true;
    }
@@ -19088,10 +19333,13 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::register_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
       reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
+      reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
+      reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::register_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
 #endif
 #if DX12 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
-      reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
@@ -19101,7 +19349,6 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
-      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
       reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
@@ -19275,10 +19522,13 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::unregister_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
       reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
+      reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::unregister_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
 #endif
 #if DX12 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
-      reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
@@ -19288,7 +19538,6 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
-      reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
       reshade::unregister_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
@@ -19402,6 +19651,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       {
 #if DX12
          D3D12PsoCapture::Remove();
+         D3D12RootSignatures::Remove();
 #endif
 #if ENABLE_SWAPCHAIN_PROXY
          SwapchainProxy::RemoveHooks();

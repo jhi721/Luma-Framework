@@ -100,6 +100,9 @@ namespace Shader
 #if DX12
       // The root signature of "layout", referenced by us so a clone can use it after the game released it. Null if the shaders embed it
       com_ptr<ID3D12RootSignature> root_signature;
+      // The root parameters of Luma's CBVs in it, -1 for the CBVs it doesn't have (see "D3D12RootSignatures::LumaParams"). Plain integers: builds without MinHook have no root signature hook
+      int32_t luma_settings_param = -1;
+      int32_t luma_data_param = -1;
 #if ENABLE_MINHOOK
       // The stream the game created the pipeline with (see "includes/d3d12_pso_capture.h"), its shader bytecode pointing at the copies in
       // "subobjects_cache". Null if the create wasn't captured: clones are then rebuilt by ReShade

@@ -22,6 +22,7 @@
 #include "managed_resources.h"
 #else
 #include "d3d12_state.h"
+#include "d3d12_upload_ring.h"
 #if DEVELOPMENT
 #include "d3d12_readback.hpp"
 #endif
@@ -611,6 +612,14 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    D3D12State::CommandListState d3d12_state;
    // A bundle (secondary command list): the command list that executes it inherits what it bound
    bool is_bundle = false;
+   // The memory of the root CBVs Luma sets on this command list (see "d3d12_upload_ring.h"). The pool is the device's, held here too: this data can outlive the device's
+   std::shared_ptr<D3D12UploadRing::Pool> upload_ring;
+   D3D12UploadRing::Pages upload_pages;
+   D3D12_GPU_VIRTUAL_ADDRESS luma_data_address = 0; // Of the last upload of "cb_luma_instance_data", 0 since the last reset
+   // The root parameters of Luma's CBVs in the root signature of the bound pipeline, when the bind swapped in a replacement (-1 for the CBVs it doesn't have, see
+   // "D3D12RootSignatures::LumaParams"). Plain integers: builds without MinHook have no root signature hook
+   int32_t luma_settings_param = -1;
+   int32_t luma_data_param = -1;
 #endif
 };
 
@@ -752,7 +761,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    float sr_exposure_texture_value = 1.f;
 #endif // ENABLE_SR
 
-#if DX11 // The D3D12 Luma passes, cbuffers and UI resources are not ported yet (see "docs/DX12-Support-Plan.md")
+#if DX11 // The D3D12 Luma passes and UI resources are not ported yet (see "docs/DX12-Support-Plan.md"), its cbuffers are in the upload ring below
    // Native Shaders (from "native_shaders_definitions")
    bool created_native_shaders = false;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> native_vertex_shaders;
@@ -779,6 +788,18 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 #endif // DX11
    CB::LumaUIDataPadded cb_luma_ui_data = {};
    std::atomic<bool> cb_luma_global_settings_dirty = true;
+
+#if DX12
+   // The memory of the root CBVs Luma adds to the game's root signatures (see "d3d12_upload_ring.h"). Command lists hold the pool too, their data can outlive this
+   std::shared_ptr<D3D12UploadRing::Pool> upload_ring;
+   // The copies of the Luma settings, one per change: a command list keeps pointing at the one it recorded. Every command list may use the newest, so "settings_mutex"
+   // serializes the uploads into these pages
+   D3D12UploadRing::Pages settings_pages = {.shared = true};
+   std::shared_mutex settings_mutex;
+   std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> settings_address = 0; // The newest copy, 0 before the first
+   // The ring frees its pages by the fences it signals with this count at each present
+   std::atomic<uint64_t> present_count = 0;
+#endif
 
 #if DX11
    // UI

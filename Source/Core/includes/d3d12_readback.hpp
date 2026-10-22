@@ -38,16 +38,6 @@ namespace D3D12Readback
       ConstantBuffer,
    };
 
-   // The command a draw event stands for, re-issued to copy its output after it. "ExecuteIndirect()" comes without its command signature,
-   // and ReShade passes "DispatchMesh()" with X as Y (its "D3D12GraphicsCommandList::DispatchMesh"): those can't be re-issued.
-   enum class Command : uint8_t
-   {
-      Draw,
-      DrawIndexed,
-      Dispatch,
-      Other,
-   };
-
    // What re-issuable copies, resolves and clears do to a resource. Unordered access view clears and uploads aren't here: ReShade passes no
    // GPU descriptor handle or row pitch for them, so they can't be re-issued.
    enum class WriteKind : uint8_t
