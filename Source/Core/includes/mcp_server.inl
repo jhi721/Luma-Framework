@@ -68,6 +68,13 @@ namespace Mcp
          comma = true;
          return *this;
       }
+      JsonWriter& Null()
+      {
+         Separate();
+         out += "null";
+         comma = true;
+         return *this;
+      }
       JsonWriter& Value(double value)
       {
          Separate();
@@ -510,16 +517,16 @@ namespace Mcp
       return pipeline.GetReplacement() != Shader::CachedPipeline::Replacement::None;
    }
 
-   // Needs "s_mutex_loading" (shared)
+   // The custom shader file of a shader, null if it has none (the cache keeps an empty entry for a file that was deleted). Needs "s_mutex_loading" (shared)
    const Shader::CachedCustomShader* FindCustomShader(uint32_t shader_hash)
    {
       const auto it = custom_shaders_cache.find(shader_hash);
-      return it != custom_shaders_cache.end() ? it->second : nullptr;
+      return (it != custom_shaders_cache.end() && it->second != nullptr && !it->second->file_path.empty()) ? it->second : nullptr;
    }
 
-   void WriteCustomShader(JsonWriter* w, const Shader::CachedCustomShader& custom_shader, bool with_disasm)
+   // The fields of a custom shader object
+   void WriteCustomShaderFields(JsonWriter* w, const Shader::CachedCustomShader& custom_shader, bool with_disasm)
    {
-      w->Key("custom_shader").BeginObject();
       w->Path("file", custom_shader.file_path);
       w->Field("is_hlsl", custom_shader.is_hlsl);
       w->Field("is_luma_native", custom_shader.is_luma_native);
@@ -527,6 +534,12 @@ namespace Mcp
       w->Field("compilation_errors", custom_shader.compilation_errors);
       if (with_disasm)
          w->Field("disasm", custom_shader.disasm);
+   }
+
+   void WriteCustomShader(JsonWriter* w, const Shader::CachedCustomShader& custom_shader, bool with_disasm)
+   {
+      w->Key("custom_shader").BeginObject();
+      WriteCustomShaderFields(w, custom_shader, with_disasm);
       w->EndObject();
    }
 
@@ -561,11 +574,29 @@ namespace Mcp
             w->EndObject();
 #endif
             w->Field("replaced", ReplacementName(*pipeline));
+#if DX12 // The shaders of a replaced pipeline that are custom ones (the others of its stages are the game's)
+            if (IsReplaced(*pipeline))
+            {
+               w->Key("replaced_shaders").BeginObject();
+               for (const uint32_t shader_hash : pipeline->shader_hashes)
+               {
+                  if (const auto* custom_shader = FindCustomShader(shader_hash); custom_shader && !custom_shader->code.empty())
+                     w->Hash(StageName(*pipeline, shader_hash), shader_hash);
+               }
+               w->EndObject();
+            }
+#endif
             if (!pipeline->custom_name.empty() && pipeline->custom_name[0] != '\0')
                w->Field("name", pipeline->custom_name.c_str());
-            const auto* custom_shader = FindCustomShader(pipeline->shader_hashes[0]);
-            if (custom_shader && !custom_shader->compilation_errors.empty())
-               w->Field("compilation_failed", custom_shader->compilation_error);
+            // Any stage of a D3D12 pipeline can have the custom shader
+            std::optional<bool> compilation_failed;
+            for (const uint32_t shader_hash : pipeline->shader_hashes)
+            {
+               if (const auto* custom_shader = FindCustomShader(shader_hash); custom_shader && !custom_shader->compilation_errors.empty())
+                  compilation_failed = compilation_failed.value_or(false) || custom_shader->compilation_error;
+            }
+            if (compilation_failed)
+               w->Field("compilation_failed", *compilation_failed);
          }
          else
          {
@@ -674,8 +705,22 @@ namespace Mcp
       if (pipeline)
       {
          w->Field("replace_draw_type", Shader::CachedPipeline::shader_replace_draw_type_names[size_t(pipeline->replace_draw_type)]);
+#if DX12 // A file per stage
+         w->Key("custom_shaders").BeginArray();
+         for (const uint32_t shader_hash : pipeline->shader_hashes)
+         {
+            if (const auto* custom_shader = FindCustomShader(shader_hash))
+            {
+               w->BeginObject().Field("stage", StageName(*pipeline, shader_hash)).Hash("hash", shader_hash);
+               WriteCustomShaderFields(w, *custom_shader, false);
+               w->EndObject();
+            }
+         }
+         w->EndArray();
+#else
          if (const auto* custom_shader = FindCustomShader(pipeline->shader_hashes[0]))
             WriteCustomShader(w, *custom_shader, false);
+#endif
       }
 
       const auto& dd = entry.draw_dispatch_data;
@@ -2569,6 +2614,22 @@ namespace Mcp
             for (const auto* pipeline : it->second)
             {
                w.BeginObject().Field("stage", StageName(*pipeline, *hash)).Field("replaced", ReplacementName(*pipeline)).Field("cloned", pipeline->cloned);
+#if DX12
+               // How the replacement is built: from the stream the game created the pipeline with ("native") or by ReShade's lossy rebuild of it ("fallback"),
+               // the clone bound in place of the pipeline now (null if none), and how many replaced ones are kept for a reload to reuse
+               const uint64_t clone = pipeline->active_clone.load(std::memory_order_acquire);
+#if ENABLE_MINHOOK
+               w.Field("capture", pipeline->capture ? "native" : "fallback");
+#else
+               w.Field("capture", "fallback");
+#endif
+               w.Key("clone");
+               if (clone != 0)
+                  w.Value(std::format("0x{:X}", clone));
+               else
+                  w.Null();
+               w.Field("retired", pipeline->retired_clones.size());
+#endif
                w.Field("replace_draw_type", Shader::CachedPipeline::shader_replace_draw_type_names[size_t(pipeline->replace_draw_type)]).EndObject();
             }
          }
@@ -2583,10 +2644,19 @@ namespace Mcp
       {
          if (!pipeline || !IsReplaced(*pipeline))
             continue;
+#if DX12 // One entry per replaced stage
+         for (const uint32_t shader_hash : pipeline->shader_hashes)
+         {
+            const auto* custom_shader = FindCustomShader(shader_hash);
+            if (custom_shader && !custom_shader->code.empty())
+               w.BeginObject().Hash("hash", shader_hash).Field("stage", StageName(*pipeline, shader_hash)).Field("replaced", ReplacementName(*pipeline)).Path("file", custom_shader->file_path.filename()).EndObject();
+         }
+#else
          w.BeginObject().Hash("hash", pipeline->shader_hashes[0]).Field("stage", pipeline->StageName()).Field("replaced", ReplacementName(*pipeline));
          if (const auto* custom_shader = FindCustomShader(pipeline->shader_hashes[0]))
             w.Path("file", custom_shader->file_path.filename());
          w.EndObject();
+#endif
       }
       w.EndArray();
       return true;
