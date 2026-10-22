@@ -54,7 +54,7 @@ ANALYSIS = {
 }
 READ_TARGET = {
     "view": {"type": "string", "description": "rtv (default), srv, uav, depth, stencil, swapchain, ui, registered:<name>"},
-    "slot": {"type": "integer", "description": "View slot (default 0)"},
+    "slot": {"type": "integer", "description": "View slot (default 0); on D3D12 srv/uav slots are the packed entries luma_trace_get lists (with register/space)"},
     "mip": {"type": "integer", "description": "Mip level (default 0)"},
     "replaced": {"type": "boolean", "description": "Read the bindings of Luma's replaced pass (default true) or the original ones"},
 }
@@ -142,10 +142,13 @@ TOOLS = [
         "luma_read_resource",
         "Read back a view of a pass right after it drew (the frame after the call, not a stale live read). Works for any format, including depth/stencil, "
         "3D LUTs, arrays, MSAA (resolved), BC, r16/rg16, r11g11b10. Writes the raw .bin + .json meta, returns per-channel stats (min/max/mean/percentiles, "
-        "NaN/Inf/negative/above 1/exact zero) and a PNG preview path. PS and CS passes only (use the PS entry of a draw). view=swapchain or ui reads the "
-        "back buffer or Luma's UI texture at present (before display composition), no pass needed. view=registered:<name> reads one of Luma's own "
-        "textures (SMAA input/predication mask/output, GTAO depth mips, motion vectors, core.bloom with mip=, core.smaa_edges...; see luma_dev_values kind "
-        "texture) at present: its last content, usually this frame's.",
+        "NaN/Inf/negative/above 1/exact zero) and a PNG preview path. PS and CS passes only (use the PS entry of a draw; D3D12 entries are whole draws). "
+        "view=swapchain or ui reads the back buffer or Luma's UI texture at present (before display composition), no pass needed. view=registered:<name> "
+        "reads one of Luma's own textures (SMAA input/predication mask/output, GTAO depth mips, motion vectors, core.bloom with mip=, core.smaa_edges...; "
+        "see luma_dev_values kind texture) at present: its last content, usually this frame's. "
+        "D3D12: view=srv needs index and reads the resource right after the entry that last wrote it (draw, dispatch, copy, resolve or clear; "
+        "producer_index). Copy, resolve and clear entries read by index what they wrote (rtv, or depth/stencil); uploads, UAV clears and buffer copies "
+        "are refused, resolves re-run as average (resolve_mode). No ui or registered: views.",
         {**TARGET,
          **READ_TARGET,
          **OUT_DIR,
@@ -211,8 +214,10 @@ TOOLS = [
     tool(
         "luma_read_cbuffer",
         "Read a constant buffer bound to a pass at draw time (VS, PS or CS). Returns float4 rows with float and uint views. "
-        "With 'frames' it reads it on N consecutive frames (jitter sequences, camera latches, half rate updates) and reports which rows change.",
-        {**TARGET, "slot": {"type": "integer", "description": "Constant buffer register b<slot>"},
+        "With 'frames' it reads it on N consecutive frames (jitter sequences, camera latches, half rate updates) and reports which rows change. "
+        "D3D12: root constants come from the bound values; constant buffer views only from UPLOAD heaps (DEFAULT heap ones are refused, their state "
+        "isn't known).",
+        {**TARGET, "slot": {"type": "integer", "description": "Constant buffer register b<slot> (D3D12: the packed entry luma_trace_get lists, with register/space)"},
          "frames": {"type": "integer", "description": "Consecutive frames to read (default 1)"},
          "rows": {"type": "string", "description": "With frames: float4 rows to print per frame, e.g. \"0-3,12\" (default: the rows that change)"}},
         ["slot"],
