@@ -622,6 +622,14 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    // "D3D12RootSignatures::LumaParams"). Plain integers: builds without MinHook have no root signature hook
    int32_t luma_settings_param = -1;
    int32_t luma_data_param = -1;
+   // The pipeline the command list bound, for its draws to follow the formats of the render targets (see "UpdateD3D12PipelineVariant()"). Null if it isn't tracked. Valid while it's bound, like the hashes above
+   const Shader::CachedPipeline* bound_cached_pipeline = nullptr;
+   // What Luma set at the bind: the clone of the pipeline if it has an active one, else the pipeline. A render target format variant is made from it
+   uint64_t bound_base_pipeline = 0;
+   // What the command list really has bound now: "bound_base_pipeline" or one of its variants
+   uint64_t bound_current_pipeline = 0;
+   // Set by the binds of a pipeline and of render targets: the next graphics draw looks at the formats of the render targets again
+   bool render_target_formats_dirty = false;
 #endif
 };
 

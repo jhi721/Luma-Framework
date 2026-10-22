@@ -2,8 +2,11 @@
 
 #include "shader_define.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
+#include <shared_mutex>
+#include <vector>
 #if DX12 && ENABLE_MINHOOK
 #include "d3d12_pso_capture.h"
 #endif
@@ -121,6 +124,21 @@ namespace Shader
          reshade::api::pipeline clone = {};
       };
       std::vector<RetiredClone> retired_clones;
+
+      // The render target formats the pipeline declares (the stream's if it was captured, else the subobject ReShade reports): D3D12 checks them against the render targets bound when it
+      // draws, which the upgrades change. Its clones declare the same
+      std::array<DXGI_FORMAT, 8> render_target_formats = {};
+      uint32_t render_target_count = 0;
+      // The pipelines made from this one, or from one of its clones ("base": its handle stands for the same code as long as it lives), with other render target formats (see
+      // "FindOrCreateD3D12PipelineVariant()"). They live as long as the original, like the retired clones: a command list can still hold one. The lock is never held across a device call
+      struct RenderTargetVariant
+      {
+         uint64_t base = 0;
+         std::array<DXGI_FORMAT, 8> formats = {};
+         uint64_t pipeline = 0; // 0 if making it failed, it's not tried again
+      };
+      mutable std::shared_mutex variants_mutex;
+      mutable std::vector<RenderTargetVariant> variants;
 #endif
 
 #if DEVELOPMENT
