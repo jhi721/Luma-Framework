@@ -7152,7 +7152,10 @@ namespace
 #endif
       // TODO: add "TEST_SDR_HDR_SPLIT_VIEW_MODE" and "TEST_2X_ZOOM" as drawing conditions etc
 
-      if (!force_disable_display_composition && (needs_debug_draw_texture || needs_reencoding || needs_gamma_correction || ui_needs_scaling || ui_needs_composition || needs_gamut_mapping))
+      // The composition shader writes linear (scRGB) or PQ values: a swapchain left in gamma space (not upgraded) already shows the
+      // vanilla image, so only the debug draw goes there
+      const bool output_composable = output_linear || output_pq_bt2020;
+      if (!force_disable_display_composition && (needs_debug_draw_texture || (output_composable && (needs_reencoding || needs_gamma_correction || ui_needs_scaling || ui_needs_composition || needs_gamut_mapping))))
       {
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          if (device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")] && device_data.native_pixel_shaders[CompileTimeStringHash("Display Composition")])
@@ -7175,8 +7178,8 @@ namespace
             D3D11_TEXTURE2D_DESC target_desc;
             back_buffer->GetDesc(&target_desc);
             ASSERT_ONCE((target_desc.BindFlags & D3D11_BIND_RENDER_TARGET) != 0);
-            // For now we only support these formats, nothing else wouldn't really make sense
-            ASSERT_ONCE(target_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || target_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+            // For now we only support these formats, nothing else wouldn't really make sense (other swapchains only get the debug draw)
+            ASSERT_ONCE(!output_composable || target_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || target_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
 
             uint32_t custom_const_buffer_data_1 = 0;
             uint32_t custom_const_buffer_data_2 = 0;
