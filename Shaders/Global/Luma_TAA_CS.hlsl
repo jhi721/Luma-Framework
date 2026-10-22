@@ -39,7 +39,8 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 // Quality levels: 0 Low: 3x3 box, closest depth of the cross, bilinear history. 1 Medium: + 5-tap bicubic history,
-// closest depth of the full 3x3, flickering analysis, reactive mask. 2 High: + 2x2 history. 3 Ultra: + depth clip
+// closest depth of the full 3x3, flickering analysis, reactive mask, depth clip against the previous frame's depth.
+// 2 High: + 2x2 history. 3 Ultra: + depth clip against the reconstructed previous depth
 // ("reconstruct_previous_depth_cs" dispatched first).
 #ifndef TAA_QUALITY
 #define TAA_QUALITY 2
@@ -73,6 +74,19 @@
 // depth, tuned on the lab's layered scenes; AMD FSR 2 derives a resolution-scaled one (~5% of depth at 1080p).
 #ifndef TAA_DEPTH_TOLERANCE
 #define TAA_DEPTH_TOLERANCE 0.3
+#endif
+// Depth clip from Medium quality without a reconstruction pass: a disocclusion is where this frame's closest 3x3 depth is
+// farther than the previous frame's farthest 3x3 depth at the reprojected pixel (kept in the lock texture). The closest
+// against the farthest is blind to a near feature that the jitter hits on some frames only, which never fills a whole
+// 3x3, at the cost of the outermost pixel of a disoccluded band. The two depths are a frame apart, so a surface that
+// recedes (a camera moving back) separates too: the history is kept in proportion to tolerance * depth / separation,
+// with a tolerance above any plausible recession per frame. Ultra keeps the stricter of this and its own depth clip,
+// whose wider tolerance lets this one catch more of the separations it misses.
+#ifndef TAA_PREVIOUS_DEPTH_CLIP
+#define TAA_PREVIOUS_DEPTH_CLIP (TAA_QUALITY >= 1)
+#endif
+#ifndef TAA_PREVIOUS_DEPTH_TOLERANCE
+#define TAA_PREVIOUS_DEPTH_TOLERANCE 0.15
 #endif
 // Thin feature lock: the neighborhood box is built from the current frame only, so a sub-pixel highlight that this frame's
 // jitter missed is clipped out of the history, and the highlight twinkles and loses energy. A pixel whose relative
@@ -311,9 +325,10 @@ Texture2D<float2> MotionVectors : register(t2);
 Texture2D<float4> History : register(t3);
 // Linear depth bits (asuint), written by "reconstruct_previous_depth_cs" and read by the Ultra quality resolve.
 Texture2D<uint> ReconstructedPreviousDepth : register(t4);
-// Alternating like the history, R16_UINT from Medium quality (R8_UINT at Low): the thin feature lock frames left or a moving
+// Alternating like the history, R32_UINT from Medium quality (R8_UINT at Low): the thin feature lock frames left or a moving
 // pixel's speed in the low byte (see "TAA_LOCK_SPEED_STEPS"), the flickering analysis' darkest luminance average in the
-// high byte (see "OutputFlicker" in "main")
+// second byte (see "OutputFlicker" in "main"), and the 3x3's farthest linear depth as the top 16 bits of its float (see
+// "TAA_PREVIOUS_DEPTH_CLIP")
 Texture2D<uint> PreviousLock : register(t5);
 // Flickering analysis state (R11G11B10_FLOAT, alternating like the history), see "OutputFlicker" in "main"
 Texture2D<float3> PreviousFlicker : register(t6);
@@ -427,12 +442,14 @@ float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
    return target + delta * min3(scale);
 }
 
-// The pixel of the 3x3 neighborhood (only its cross with "cross_only") with the closest device depth, and that depth
+// The pixel of the 3x3 neighborhood (only its cross with "cross_only") with the closest device depth, that depth, and the
+// farthest device depth
 void FindClosestDepth(int2 pixel, int2 max_pixel, bool inverted_depth, bool cross_only, out float closest_depth,
-                      out int2 closest_pixel)
+                      out int2 closest_pixel, out float farthest_depth)
 {
    closest_depth = (inverted_depth ? 0.0 : 1.0);
    closest_pixel = pixel;
+   farthest_depth = (inverted_depth ? 1.0 : 0.0);
    // Four 2x2 gathers (the 4x4 texels around the 3x3) instead of 9 loads: one texture instruction per 4 texels. Quad q's top
    // left texel is at offset -1 + 2 * (q & 1, q >> 1); clamp addressing returns the same edge texels as the clamped loads.
    // The cross doesn't reach the bottom right quad.
@@ -461,6 +478,7 @@ void FindClosestDepth(int2 pixel, int2 max_pixel, bool inverted_depth, bool cros
             closest_depth = depth;
             closest_pixel = sample_pixel;
          }
+         farthest_depth = (inverted_depth ? min(farthest_depth, depth) : max(farthest_depth, depth));
       }
    }
 }
@@ -522,7 +540,8 @@ float4 LoadHistory2x(bool from_tile, int2 texel, int2 tile_origin, int2 max_texe
    {
       float closest_depth;
       int2 closest_pixel;
-      FindClosestDepth(pixel, max_pixel, (Flags & TAA_FLAG_INVERTED_DEPTH) != 0, false, closest_depth, closest_pixel);
+      float farthest_depth;
+      FindClosestDepth(pixel, max_pixel, (Flags & TAA_FLAG_INVERTED_DEPTH) != 0, false, closest_depth, closest_pixel, farthest_depth);
 
       const uint linear_depth_bits = asuint(LinearizeDepth(closest_depth));
       const float2 previous_position = pixel + 0.5 + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
@@ -621,8 +640,9 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
 
    float closest_depth;
    int2 closest_pixel;
+   float farthest_depth;
    // At Low quality only the cross is searched
-   FindClosestDepth(pixel, max_pixel, inverted_depth, TAA_QUALITY == 0, closest_depth, closest_pixel);
+   FindClosestDepth(pixel, max_pixel, inverted_depth, TAA_QUALITY == 0, closest_depth, closest_pixel, farthest_depth);
    const float2 motion = MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
    const float speed = length(motion);
    const float2 own_motion = MotionVectors.Load(int3(pixel, 0)) * MotionVectorScale; // "motion" may be a neighbor's
@@ -648,11 +668,13 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    const uint previous_lock_word = (((TAA_LOCK || TAA_FLICKER) && has_previous_state) ? PreviousLock.Load(int3(previous_pixel, 0)) : 0);
    const uint previous_lock_code = (TAA_LOCK ? (previous_lock_word & 0xFFu) : 0);
 
+   // The depth clips run before the history read, so their taps don't keep the 2x history texels live (that made Ultra
+   // 15-30% slower)
+   const float current_linear_depth = LinearizeDepth(closest_depth);
+   float depth_clip = 1.0;
 #if TAA_QUALITY >= 3
    // Depth clip (AMD FSR 2): both depths come from this frame, so a camera moving along its view axis, which changes
-   // every depth, can't make the test fail. It runs before the history read, so its taps don't keep the 2x history
-   // texels live (that made Ultra 15-30% slower).
-   const float current_linear_depth = LinearizeDepth(closest_depth);
+   // every depth, can't make the test fail
    int2 footprint_base;
    float2 footprint_fraction;
    BilinearFootprint(history_position, footprint_base, footprint_fraction);
@@ -672,9 +694,19 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       depth_clip_kept += weight * ((separation > 0.0) ? saturate(TAA_DEPTH_TOLERANCE * current_linear_depth / separation) : 1.0);
       depth_clip_weights += weight;
    }
-   const float depth_clip = ((depth_clip_weights > 0.0) ? (depth_clip_kept / depth_clip_weights) : 1.0);
-#else
-   const float depth_clip = 1.0;
+   if (depth_clip_weights > 0.0)
+   {
+      depth_clip = depth_clip_kept / depth_clip_weights;
+   }
+#endif
+#if TAA_PREVIOUS_DEPTH_CLIP
+   // The previous frame's farthest 3x3 depth at the reprojected pixel, 0 without a state
+   const float previous_farthest_depth = asfloat(previous_lock_word & 0xFFFF0000u);
+   const float depth_separation = current_linear_depth - previous_farthest_depth;
+   if (previous_farthest_depth > 0.0 && depth_separation > 0.0)
+   {
+      depth_clip = min(depth_clip, saturate(TAA_PREVIOUS_DEPTH_TOLERANCE * current_linear_depth / depth_separation));
+   }
 #endif
 
 #if TAA_HISTORY_2X
@@ -841,7 +873,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       // 6, 6 and 5 bit mantissas, ~1.6% and 3% steps, see the store), z in the lock's high byte as a log2 code, 1 to 255
       // over 2^-14 to 2^18 (0, a cleared texture: no state). z only feeds the lighting test, a 10x change, so its 9% steps
       // are fine there; w's test is a 2x change.
-      const uint previous_min_code = previous_lock_word >> 8;
+      const uint previous_min_code = (previous_lock_word >> 8) & 0xFFu;
       const float3 previous_range_mean = (has_previous_state ? PreviousFlicker.Load(int3(previous_pixel, 0)) : 0.0);
       const float previous_min_average = ((previous_min_code > 0) ? exp2((previous_min_code - 1.0) * (32.0 / 254.0) - 14.0) : 0.0);
       const float4 previous_state = float4(previous_range_mean.xy, previous_min_average, previous_range_mean.z);
@@ -1067,6 +1099,12 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
 #else
    const uint lock_code = 0;
 #endif
-   OutputLock[state_pixel] = lock_code | (min_luminance_code << 8);
+#if TAA_PREVIOUS_DEPTH_CLIP
+   // Truncated to the float's top 16 bits: relative steps of 2^-7, far below the tolerance
+   const uint farthest_depth_bits = asuint(LinearizeDepth(farthest_depth)) & 0xFFFF0000u;
+#else
+   const uint farthest_depth_bits = 0;
+#endif
+   OutputLock[state_pixel] = lock_code | (min_luminance_code << 8) | farthest_depth_bits;
 #endif
 }
