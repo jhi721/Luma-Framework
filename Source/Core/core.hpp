@@ -277,6 +277,11 @@ using NativeCommandList = ID3D11DeviceContext;
 #error "A D3D11 header reached a D3D12 build, gate its include with \"DX11\""
 #endif
 
+#if DX12 && LUMA_PATCH_PROVIDERS != 0
+// Their DXBC patching isn't ported to DXIL, and the async clone queue never drains on D3D12
+#error "Shader patch providers are D3D11 only"
+#endif
+
 #define ICON_FK_CANCEL reinterpret_cast<const char*>(u8"\uf00d")
 #define ICON_FK_OK reinterpret_cast<const char*>(u8"\uf00c")
 #define ICON_FK_PLUS reinterpret_cast<const char*>(u8"\uf067")
