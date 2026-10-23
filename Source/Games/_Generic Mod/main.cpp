@@ -9,8 +9,9 @@
 #define AVOID_INPUT_LOSS 1
 
 #if DX12 && DEVELOPMENT
-// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash")
+// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash", "test_smaa_hash")
 #define ENABLE_RCAS 1
+#define ENABLE_SMAA 1
 #endif
 
 #include "..\..\Core\core.hpp"
@@ -24,6 +25,7 @@ namespace
    int test_custom_data_hash = 0; // The draw gets Luma's cbuffers set by the callback, with CustomData1 = 7
    int test_replaced_hash = 0;    // The callback draws it itself and reports it replaced
    int test_rcas_hash = 0;        // The draw becomes RCAS (sharpness 1) of its t0 (the table of root parameter 0) into its render target
+   int test_smaa_hash = 0;        // The draw becomes SMAA of its t0 into its render target (with a "Luma_SMAA_impl.hlsl" in the game's shader folder)
 #endif
 } // namespace
 
@@ -46,7 +48,7 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 #if DX12 && DEVELOPMENT
-      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}});
+      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}});
 #endif
    }
 
@@ -124,7 +126,7 @@ public:
          (*original_draw_dispatch_func)();
          return DrawOrDispatchOverrideType::Replaced;
       }
-      if (is_test_hash(test_rcas_hash))
+      if (const bool rcas = is_test_hash(test_rcas_hash); rcas || is_test_hash(test_smaa_hash))
       {
          // The source is resolved through the development builds' shadow of the descriptor heaps
          const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
@@ -137,7 +139,21 @@ public:
                source = descriptor->view;
             }
          }
-         if (source.resource != 0 && !state.render_target_views.empty() && DrawRCAS(cmd_list_data, device_data, {source.resource}, source.format, {state.render_target_views[0].resource}, state.render_target_descs[0], 1.f))
+         if (source.resource == 0 || state.render_target_views.empty())
+         {
+            return DrawOrDispatchOverrideType::None;
+         }
+         const reshade::api::resource target = {state.render_target_views[0].resource};
+         bool drawn = false;
+         if (rcas)
+         {
+            drawn = DrawRCAS(cmd_list_data, device_data, {source.resource}, source.format, target, state.render_target_descs[0], 1.f);
+         }
+         else
+         {
+            drawn = DrawSMAA(cmd_list_data, device_data, {source.resource}, source.format, {}, {}, target, state.render_target_descs[0], {});
+         }
+         if (drawn)
          {
             return DrawOrDispatchOverrideType::Replaced;
          }
