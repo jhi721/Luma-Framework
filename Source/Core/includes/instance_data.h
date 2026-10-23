@@ -780,7 +780,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    float sr_exposure_texture_value = 1.f;
 #endif // ENABLE_SR
 
-#if DX11 // The D3D12 Luma passes and UI resources are not ported yet (see "docs/DX12-Support-Plan.md"), its cbuffers are in the upload ring below
+#if DX11 // D3D11 objects: the D3D12 Luma passes make their pipelines from the natives' bytecode ("CreateD3D12NativePipeline()"), its UI resources aren't ported, its cbuffers are in the upload ring below
    // Native Shaders (from "native_shaders_definitions")
    bool created_native_shaders = false;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> native_vertex_shaders;

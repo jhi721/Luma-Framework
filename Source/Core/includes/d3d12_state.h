@@ -1,6 +1,6 @@
 #pragma once
 
-// D3D12 state Core tracks from ReShade events, given that D3D12 has no state queries ("docs/DX12-Support-Plan.md" decision D3):
+// D3D12 state Core tracks from ReShade events, given that D3D12 has no state queries:
 // the root signatures, what each command list binds, and a shadow copy of the descriptor heaps to resolve bound tables to descriptors.
 // Release builds only track what game code can query (the pipeline, the root signatures, the render targets and the depth stencil), the rest is
 // for the frame capture (DEVELOPMENT).

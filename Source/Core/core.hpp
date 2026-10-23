@@ -200,7 +200,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #if !DX12
 #define DX11 1
 #elif ENABLE_SR
-// Not ported to D3D12 yet, see "docs/DX12-Support-Plan.md"
+// The D3D12 paths of NGX and FidelityFX aren't written yet
 #error "Super resolution is D3D11 only"
 #endif
 // Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom): release builds track the graphics state they replace too, to
@@ -1997,7 +1997,7 @@ namespace
       }
    }
 
-#if DX11 // Luma's own D3D12 shaders need their own root signature and PSOs ("docs/DX12-Support-Plan.md" phase 4)
+#if DX11 // Luma's own D3D12 shaders need their own root signature and PSOs (see "CreateD3D12NativePipeline()")
    // Expects "s_mutex_loading" and "s_mutex_shader_objects"
    template<typename T = ID3D11DeviceChild>
    void CreateShaderObject(ID3D11Device* native_device, uint32_t native_shader_hash, com_ptr<T>& shader_object, bool force_delete_previous = !(bool)FORCE_KEEP_CUSTOM_SHADERS_LOADED, bool trigger_assert = false)
@@ -4620,7 +4620,7 @@ namespace
 // patch is applied to the shader description so D3D compiles the patched shader
 // directly (no pipeline clone, zero latency). In CLONE mode this function is
 // not compiled and sync providers run in OnInitPipeline instead.
-#if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE && DX11 // D3D12 patching is "docs/DX12-Support-Plan.md" phase 2
+#if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE && DX11 // The sync patch providers aren't ported to D3D12
    bool OnCreatePipeline(
       reshade::api::device* device,
       reshade::api::pipeline_layout layout,
@@ -10634,7 +10634,7 @@ namespace
    }
 #endif
 
-#if DX11 // Draw, copy, clear, sampler and resource hooks aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 3 to 5)
+#if DX11 // D3D11 only: D3D12 upgrades its sampler descriptors as the game writes them ("OnCreateSampler()"), and has its own draw and copy handlers
    // Expects "s_mutex_samplers" to already be locked
    com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
    {
@@ -16121,7 +16121,7 @@ namespace
                changed_selected = true;
                open_settings_tab = true;
 
-#if DX11 // Debug draw and constant buffer tracking are D3D11 only ("docs/DX12-Support-Plan.md" phase A4)
+#if DX11 // Debug draw and constant buffer tracking are D3D11 only
                {
                   debug_draw_pipeline = 0;
                   debug_draw_shader_hash = 0;
@@ -16908,7 +16908,7 @@ namespace
                                     System::OpenExplorerToFile(custom_shader->file_path);
                                  }
 
-#if DX11 // Debug draw and constant buffer tracking ("docs/DX12-Support-Plan.md" phase A4)
+#if DX11 // Debug draw and constant buffer tracking are D3D11 only
                                  bool debug_draw_shader_enabled = false; // Whether this shader/pipeline instance is the one we are draw debugging
 
                                  if (pipeline_pair->second->HasVertexShader() || pipeline_pair->second->HasPixelShader() || pipeline_pair->second->HasComputeShader())

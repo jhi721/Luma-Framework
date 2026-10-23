@@ -1,6 +1,6 @@
 #pragma once
 
-// D3D12 readbacks for the dev MCP ("luma_read_resource", "luma_read_cbuffer"), see "docs/DX12-Support-Plan.md" A4. A readback is a GPU copy
+// D3D12 readbacks for the dev MCP ("luma_read_resource", "luma_read_cbuffer"). A readback is a GPU copy
 // recorded into the game's command list at the target command, into a READBACK buffer that is read once that list ran. The target is a draw
 // or dispatch, or a copy, resolve or clear: the command is re-issued natively right before the copy, and the original call is skipped.
 // D3D12 has no state queries and Core doesn't track resource states (ReShade's "barrier" event drops subresources), so only what is
