@@ -22,7 +22,7 @@ namespace
 {
    std::set<reshade::api::format> toggleable_texture_upgrade_formats;
 #if DX12 && DEVELOPMENT
-   // Driven by the D3D12 smoke test ("_tools/d3d12_smoke/replace_check.py") through the dev MCP, to exercise the game callback paths of Core: pixel shader hashes (written as signed ints), 0 is off
+   // Driven by the D3D12 smoke tests through the dev MCP, to exercise the game callback paths of Core: pixel shader hashes (written as signed ints), 0 is off
    int test_skip_hash = 0;        // The draw is skipped
    int test_custom_data_hash = 0; // The draw gets Luma's cbuffers set by the callback, with CustomData1 = 7
    int test_replaced_hash = 0;    // The callback draws it itself and reports it replaced
@@ -34,7 +34,7 @@ namespace
    int test_viewport_scale_hash = 0; // The draw's viewports and scissors get half their width through "SetGameViewportsD3D12()", and keep it for the draws after it (as a render scale's code does)
 #endif
 #if DX11 && DEVELOPMENT
-   // The D3D11 side of the parity check of the D3D12 passes ("_tools/parity_check.py"), from "[Luma Advanced]": the draw of the pixel shader "TestPassHash" (hex) becomes
+   // The D3D11 side of the parity check of the D3D12 passes (the same input drawn by both, compared per pixel), from "[Luma Advanced]": the draw of the pixel shader "TestPassHash" (hex) becomes
    // "TestPass" of its t0 into its render target 0, with the arguments of the D3D12 knobs above
    enum class TestPass : uint8_t
    {
@@ -52,7 +52,7 @@ namespace
 struct GenericGameDeviceData final : public GameDeviceData
 {
 #if DX11 && DEVELOPMENT
-   com_ptr<ID3D11Buffer> test_smaa_constants; // b1 of the smoke's "Luma_SMAA_impl.hlsl": the metrics of the target, then 4 game floats (0)
+   com_ptr<ID3D11Buffer> test_smaa_constants; // b1 of the parity check's "Luma_SMAA_impl.hlsl": the metrics of the target, then 4 game floats (0)
    com_ptr<ID3D11Texture2D> test_smaa_output; // SMAA's target when RCAS follows it, at the target's size and format
    com_ptr<ID3D11RenderTargetView> test_smaa_output_rtv;
    com_ptr<ID3D11ShaderResourceView> test_smaa_output_srv;

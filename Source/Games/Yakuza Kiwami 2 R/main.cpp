@@ -14,7 +14,6 @@
 // Dragon Engine, D3D12 only (DXIL SM 6.0). The scene ends in 0xD0869ED8 (log10(1 + scene), the only tone curve), the grade
 // 0x167D96E5 (HDR replacement in Shaders/Yakuza Kiwami 2 R) writes an R8G8B8A8 target in gamma, 0x7561D004 copies it into the
 // B8G8R8A8 UI target, the HUD blends over it in gamma, and 0x8578A29E blits that to the swapchain (pow 2.2 decode, sRGB encode).
-// Pipeline record: _tools/yk2r/NOTES.md.
 
 namespace
 {
