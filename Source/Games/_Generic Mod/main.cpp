@@ -44,6 +44,53 @@ public:
 #endif
    }
 
+#if DX12
+   // "TextureUpgradeWriterShaders" (section "<NAME> Advanced" of ReShade.ini): pixel shader hashes in hex, with an optional ":slot" for the render target they write (0 by default),
+   // separated by commas ("0x167D96E5,0x7561D004:1"). On D3D12 the textures a listed shader renders into are the only placed ones upgraded (see "includes/d3d12_clones.h").
+   // "LoadConfigs()" runs on boot, before any device exists, so the list is known when the game creates its textures.
+   void LoadConfigs() override
+   {
+      std::string list(1024, '\0');
+      size_t list_size = list.size();
+      if (!reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TextureUpgradeWriterShaders", list.data(), &list_size))
+      {
+         return;
+      }
+      // ReShade returns a value with commas as a list, one null terminated entry per element
+      list.resize(list_size);
+      std::ranges::replace(list, '\0', ',');
+      std::string parsed;
+      for (size_t start = 0; start < list.size();)
+      {
+         const size_t end = (std::min)(list.find(',', start), list.size());
+         const std::string token = list.substr(start, end - start);
+         start = end + 1;
+         char* hash_end = nullptr;
+         const uint32_t hash = uint32_t(std::strtoul(token.c_str(), &hash_end, 16));
+         if (hash_end == token.c_str())
+         {
+            continue;
+         }
+         const size_t colon = token.find(':');
+         const unsigned long slot = (colon != std::string::npos ? std::strtoul(token.c_str() + colon + 1, nullptr, 10) : 0);
+         if (slot >= D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT)
+         {
+            continue;
+         }
+         std::vector<uint8_t>& rtv_slots = auto_texture_format_upgrade_shader_hashes[hash].rtv_slots;
+         if (std::ranges::find(rtv_slots, uint8_t(slot)) == rtv_slots.end())
+         {
+            rtv_slots.push_back(uint8_t(slot));
+            parsed += std::format("{}0x{:08X}:{}", (parsed.empty() ? "" : ", "), hash, slot);
+         }
+      }
+      if (!parsed.empty())
+      {
+         reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Writer shaders of the textures to upgrade (TextureUpgradeWriterShaders): {}", parsed).c_str());
+      }
+   }
+#endif
+
    void OnCreateDevice(NativeDevice* native_device, DeviceData& device_data) override
    {
       device_data.game = new GenericGameDeviceData;
