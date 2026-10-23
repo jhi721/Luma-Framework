@@ -610,6 +610,8 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 #endif
 
 #if DX12
+   // ReShade's proxy of the list, through whose API Luma records its passes on it (see "DrawRCAS()")
+   reshade::api::command_list* cmd_list = nullptr;
    // What the command list bound, as far as game code can query it on release builds too (see "d3d12_state.h")
    D3D12State::CommandListState d3d12_state;
    // A bundle (secondary command list): the command list that executes it inherits what it bound
@@ -840,6 +842,21 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    } display_composition;
    // The encode of the scRGB proxy into the real back buffer (see "DrawSwapchainEncodeD3D12()")
    NativePassD3D12 swapchain_encode;
+#if ENABLE_D3D12_PASSES
+   // What the D3D12 "DrawRCAS()" makes when it first draws, on the game's command lists. "mutex" serializes its draws and guards the rest
+   struct RCASD3D12
+   {
+      std::shared_mutex mutex;
+      reshade::api::pipeline_layout layout = {};          // Made through ReShade, which its descriptor tables need: "SharpenParams" as 4 root constants (b0), then a table of t0
+      std::vector<reshade::api::descriptor_table> tables; // Of ReShade's GPU heap, by present and by draw in it (see "DrawRCAS()")
+      std::unordered_map<DXGI_FORMAT, com_ptr<ID3D12PipelineState>> pipelines; // By render target format, of the natives of "pipelines_generation"
+      uint32_t pipelines_generation = 0;
+      std::vector<com_ptr<ID3D12PipelineState>> retired; // Of older natives: a game list recorded with them may still run, so they live as long as the device
+      uint64_t frame = UINT64_MAX;                        // The present count of the last draw, and the draws since it
+      uint32_t frame_draws = 0;
+      bool failed = false; // ReShade refused the layout or the tables, which isn't tried again
+   } rcas;
+#endif
 #endif
 
 #if DX11

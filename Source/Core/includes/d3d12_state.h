@@ -72,8 +72,8 @@ namespace D3D12State
       layouts->parameters_by_layout.erase(layout.handle);
    }
 
-#if DEVELOPMENT
-   // What a command list bound to a root parameter
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
+   // What a command list bound to a root parameter (to restore it after a Luma pass, and for the frame capture)
    struct RootBinding
    {
       reshade::api::descriptor_table table = {};                                                      // Descriptor table (a GPU descriptor handle)
@@ -88,7 +88,7 @@ namespace D3D12State
    struct RootState
    {
       reshade::api::pipeline_layout layout = {};
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
       std::vector<RootBinding> bindings; // By root parameter index
 #endif
    };
@@ -131,8 +131,17 @@ namespace D3D12State
       reshade::api::pipeline pipeline = {};
       RootState graphics;
       RootState compute;
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
       reshade::api::primitive_topology primitive_topology = reshade::api::primitive_topology::undefined;
+#endif
+#if ENABLE_D3D12_PASSES
+      // What a Luma pass replaces besides the above (see "RestoreGraphics()")
+      std::vector<reshade::api::viewport> viewports;
+      std::vector<reshade::api::rect> scissor_rects;
+      std::vector<reshade::api::resource_view_desc> render_target_descs; // By slot, next to "render_target_views": what the views are made again of
+      reshade::api::resource_view_desc depth_stencil_desc = {};
+#endif
+#if DEVELOPMENT
       BufferBinding index_buffer;
       std::vector<BufferBinding> vertex_buffers; // By slot
 #endif
@@ -149,13 +158,13 @@ namespace D3D12State
       if (root->layout != layout)
       {
          root->layout = layout;
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
          root->bindings.clear();
 #endif
       }
    }
 
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
    RootBinding* GetRootBinding(RootState* root, reshade::api::pipeline_layout layout, uint32_t param)
    {
       SetRootSignature(root, layout);
@@ -181,13 +190,13 @@ namespace D3D12State
       }
    }
 
-   // "Set*RootSignature()" arrives here with no tables, which is all release builds track
+   // "Set*RootSignature()" arrives here with no tables, which is all release builds without Luma passes track
    void BindDescriptorTables(CommandListState* state, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table* tables)
    {
       ForEachRootState(state, stages, [&](RootState* root)
          {
             SetRootSignature(root, layout);
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
             for (uint32_t i = 0; i < count; i++)
             {
                GetRootBinding(root, layout, first + i)->table = tables[i];
@@ -196,7 +205,7 @@ namespace D3D12State
          });
    }
 
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
    void PushDescriptors(CommandListState* state, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t param, const reshade::api::descriptor_table_update& update)
    {
       if (update.count == 0)
@@ -238,7 +247,9 @@ namespace D3D12State
          }
       }
    }
+#endif
 
+#if DEVELOPMENT
    void BindVertexBuffers(CommandListState* state, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
    {
       if (state->vertex_buffers.size() < size_t(first) + count)
@@ -262,6 +273,14 @@ namespace D3D12State
       }
       state->depth_stencil = dsv;
       state->depth_stencil_view = GetViewInfo(device, dsv);
+#if ENABLE_D3D12_PASSES
+      state->render_target_descs.resize(count);
+      for (uint32_t i = 0; i < count; i++)
+      {
+         state->render_target_descs[i] = (rtvs[i].handle != 0 ? device->get_resource_view_desc(rtvs[i]) : reshade::api::resource_view_desc{});
+      }
+      state->depth_stencil_desc = (dsv.handle != 0 ? device->get_resource_view_desc(dsv) : reshade::api::resource_view_desc{});
+#endif
    }
 
    void BeginRenderPass(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds)
@@ -277,6 +296,110 @@ namespace D3D12State
       state->depth_stencil_view = GetViewInfo(device, state->depth_stencil);
       state->in_render_pass = true;
    }
+
+#if ENABLE_D3D12_PASSES
+   void BindViewports(CommandListState* state, uint32_t first, uint32_t count, const reshade::api::viewport* viewports)
+   {
+      state->viewports.resize((std::max)(state->viewports.size(), size_t(first) + count));
+      std::copy_n(viewports, count, state->viewports.begin() + first);
+   }
+
+   void BindScissorRects(CommandListState* state, uint32_t first, uint32_t count, const reshade::api::rect* rects)
+   {
+      state->scissor_rects.resize((std::max)(state->scissor_rects.size(), size_t(first) + count));
+      std::copy_n(rects, count, state->scissor_rects.begin() + first);
+   }
+
+   // Binds again, after a Luma pass recorded on the game's command list through ReShade's API, the graphics state it replaced: the root
+   // signature with the game's descriptor heaps (ReShade's "bind_descriptor_tables()" sets the heaps back the game had, or the heaps of
+   // the tables), the root arguments, "pipeline" (what Luma really had bound: a replacement or a render target format variant), the
+   // render targets and depth stencil (their views are made again: a game rewrites a CPU descriptor right after binding it), the viewports,
+   // the scissors and the topology. The pass must not touch anything else (index and vertex buffers, blend factor, stencil reference).
+   // Root CBVs and root SRVs/UAVs go natively: ReShade passes the latter as GPU virtual addresses, which its own API can't take back.
+   // ponytail: a game that set its descriptor heaps and bound no table of a heap type yet gets ReShade's heap of that type back (the
+   // heaps ReShade restores are only certain when the game set both or bound tables from them).
+   void RestoreGraphics(reshade::api::command_list* cmd_list, const CommandListState& state, reshade::api::pipeline pipeline)
+   {
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      const RootState& root = state.graphics;
+      if (root.layout.handle != 0)
+      {
+         cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_graphics, root.layout, 0, 0, nullptr);
+         for (uint32_t param = 0; param < root.bindings.size(); param++)
+         {
+            const RootBinding& binding = root.bindings[param];
+            if (binding.table.handle != 0)
+            {
+               cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_graphics, root.layout, param, 1, &binding.table);
+            }
+            else if (binding.descriptor != 0)
+            {
+               switch (binding.descriptor_type)
+               {
+               case reshade::api::descriptor_type::constant_buffer:
+                  native_list->SetGraphicsRootConstantBufferView(param, reinterpret_cast<ID3D12Resource*>(binding.descriptor)->GetGPUVirtualAddress() + binding.descriptor_offset);
+                  break;
+               case reshade::api::descriptor_type::buffer_unordered_access_view:
+                  native_list->SetGraphicsRootUnorderedAccessView(param, binding.descriptor);
+                  break;
+               default:
+                  native_list->SetGraphicsRootShaderResourceView(param, binding.descriptor);
+                  break;
+               }
+            }
+            else if (!binding.constants.empty())
+            {
+               native_list->SetGraphicsRoot32BitConstants(param, UINT(binding.constants.size()), binding.constants.data(), 0);
+            }
+         }
+      }
+      if (pipeline.handle != 0)
+      {
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, pipeline);
+      }
+
+      std::vector<reshade::api::resource_view> render_targets(state.render_target_views.size());
+      for (size_t i = 0; i < render_targets.size(); i++)
+      {
+         // A null resource makes a null view, as the game's was
+         device->create_resource_view({state.render_target_views[i].resource}, reshade::api::resource_usage::render_target, state.render_target_descs[i], &render_targets[i]);
+      }
+      reshade::api::resource_view depth_stencil = {};
+      if (state.depth_stencil_view.resource != 0)
+      {
+         device->create_resource_view({state.depth_stencil_view.resource}, reshade::api::resource_usage::depth_stencil, state.depth_stencil_desc, &depth_stencil);
+      }
+      // D3D12 reads the descriptors when they are bound, so the views can go right after
+      cmd_list->bind_render_targets_and_depth_stencil(uint32_t(render_targets.size()), render_targets.data(), depth_stencil);
+      for (const reshade::api::resource_view view : render_targets)
+      {
+         if (view.handle != 0)
+         {
+            device->destroy_resource_view(view);
+         }
+      }
+      if (depth_stencil.handle != 0)
+      {
+         device->destroy_resource_view(depth_stencil);
+      }
+
+      if (!state.viewports.empty())
+      {
+         cmd_list->bind_viewports(0, uint32_t(state.viewports.size()), state.viewports.data());
+      }
+      if (!state.scissor_rects.empty())
+      {
+         cmd_list->bind_scissor_rects(0, uint32_t(state.scissor_rects.size()), state.scissor_rects.data());
+      }
+      if (state.primitive_topology != reshade::api::primitive_topology::undefined)
+      {
+         const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+         const uint32_t topology = uint32_t(state.primitive_topology);
+         cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      }
+   }
+#endif
 
    // What a game wrote into a descriptor heap slot
    struct Descriptor
