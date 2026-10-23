@@ -843,19 +843,45 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // The encode of the scRGB proxy into the real back buffer (see "DrawSwapchainEncodeD3D12()")
    NativePassD3D12 swapchain_encode;
 #if ENABLE_D3D12_PASSES
-   // What the D3D12 "DrawRCAS()" makes when it first draws, on the game's command lists. "mutex" serializes its draws and guards the rest
-   struct RCASD3D12
+   // What a D3D12 pass drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()") makes when it first draws (see "PrepareD3D12GamePass()").
+   // "mutex" serializes its draws and guards the rest
+   struct GamePassD3D12
    {
       std::shared_mutex mutex;
-      reshade::api::pipeline_layout layout = {};          // Made through ReShade, which its descriptor tables need: "SharpenParams" as 4 root constants (b0), then a table of t0
-      std::vector<reshade::api::descriptor_table> tables; // Of ReShade's GPU heap, by present and by draw in it (see "DrawRCAS()")
-      std::unordered_map<DXGI_FORMAT, com_ptr<ID3D12PipelineState>> pipelines; // By render target format, of the natives of "pipelines_generation"
+      reshade::api::pipeline_layout layout = {};                            // Made through ReShade, which its descriptor tables need
+      std::vector<reshade::api::descriptor_table> tables;                   // Of ReShade's GPU heap, by present, by draw in it and by table of the draw
+      std::unordered_map<uint64_t, com_ptr<ID3D12PipelineState>> pipelines; // By pixel shader hash and render target format, of the natives of "pipelines_generation"
       uint32_t pipelines_generation = 0;
       std::vector<com_ptr<ID3D12PipelineState>> retired; // Of older natives: a game list recorded with them may still run, so they live as long as the device
       uint64_t frame = UINT64_MAX;                        // The present count of the last draw, and the draws since it
       uint32_t frame_draws = 0;
       bool failed = false; // ReShade refused the layout or the tables, which isn't tried again
-   } rcas;
+   };
+#if ENABLE_RCAS
+   GamePassD3D12 rcas; // "SharpenParams" as 4 root constants (b0), then a table of t0
+#endif
+#if ENABLE_SMAA
+   // 8 root constants (b1), a table of t0-t2 and the linear and point samplers (s0, s1)
+   struct SMAAD3D12 : GamePassD3D12
+   {
+      // Uploaded through ReShade's immediate list, so at a present ("CreateSMAATexturesD3D12()"), once a draw asked for them
+      std::atomic<bool> textures_wanted = false;
+      reshade::api::resource area_texture = {};
+      reshade::api::resource search_texture = {};
+      reshade::api::resource_view area_srv = {};
+      reshade::api::resource_view search_srv = {};
+      // At the target's size, made again with it. In a shader resource state between draws
+      reshade::api::resource edges = {};
+      reshade::api::resource weights = {};
+      reshade::api::resource_view edges_rtv = {};
+      reshade::api::resource_view edges_srv = {};
+      reshade::api::resource_view weights_rtv = {};
+      reshade::api::resource_view weights_srv = {};
+      uint32_t width = 0;
+      uint32_t height = 0;
+      std::vector<std::pair<uint64_t, reshade::api::resource>> retired_intermediates; // With the present count they were replaced at
+   } smaa;
+#endif
 #endif
 #endif
 

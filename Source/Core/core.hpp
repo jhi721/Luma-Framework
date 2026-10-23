@@ -199,13 +199,13 @@ using NativeCommandList = ID3D11DeviceContext;
 
 #if !DX12
 #define DX11 1
-#elif ENABLE_SR || ENABLE_SMAA
+#elif ENABLE_SR
 // Not ported to D3D12 yet, see "docs/DX12-Support-Plan.md"
-#error "Super resolution and SMAA are D3D11 only"
+#error "Super resolution is D3D11 only"
 #endif
-// Luma passes recorded in the middle of the game's D3D12 command lists (RCAS): release builds track the graphics state they replace too, to
+// Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA): release builds track the graphics state they replace too, to
 // bind it again after them (see "D3D12State::RestoreGraphics()")
-#if DX12 && ENABLE_RCAS
+#if DX12 && (ENABLE_RCAS || ENABLE_SMAA)
 #define ENABLE_D3D12_PASSES 1
 #else
 #define ENABLE_D3D12_PASSES 0
@@ -274,6 +274,10 @@ using NativeCommandList = ID3D11DeviceContext;
 #if DX11 // Native D3D11 helpers
 #include "utils/resource.hpp"
 #include "utils/draw.hpp"
+#elif ENABLE_SMAA
+#include "texture_data/SMAA_AreaTex.h"
+#include "texture_data/SMAA_SearchTex.h"
+#include "texture_data/SMAA_AreaTex_SharpU.h"
 #endif
 #if DX12 && DEVELOPMENT
 #include "utils/d3d12_trace.hpp"
@@ -749,7 +753,16 @@ namespace
       { CompileTimeStringHash("RCAS PS"), { "Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps" } },
 #endif
 
-#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode and RCAS: the passes of the others aren't ported to D3D12 yet
+#if ENABLE_SMAA // D3D11: CB::LumaGameSettings::OutputRes is required! See BioShock Series implementation. D3D12: see "DrawSMAA()"
+      { CompileTimeStringHash("SMAA Edge Detection VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_edge_detection_vs" } },
+      { CompileTimeStringHash("SMAA Edge Detection PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_edge_detection_ps" } },
+      { CompileTimeStringHash("SMAA Blending Weight Calculation VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_blending_weight_calculation_vs" } },
+      { CompileTimeStringHash("SMAA Blending Weight Calculation PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps" } },
+      { CompileTimeStringHash("SMAA Neighborhood Blending VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_neighborhood_blending_vs" } },
+      { CompileTimeStringHash("SMAA Neighborhood Blending PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps" } },
+#endif
+
+#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS and SMAA: the passes of the others aren't ported to D3D12 yet
       { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
 
       // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
@@ -777,15 +790,6 @@ namespace
       { CompileTimeStringHash("Unclip LUT 3D"), { "Luma_UnclipLUT3D", reshade::api::pipeline_subobject_type::compute_shader } },
       { CompileTimeStringHash("Unclip LUT 2D"), { "Luma_UnclipLUT2D", reshade::api::pipeline_subobject_type::compute_shader } },
       { CompileTimeStringHash("Unclip LUT 1D"), { "Luma_UnclipLUT1D", reshade::api::pipeline_subobject_type::compute_shader } },
-#endif
-
-#if ENABLE_SMAA // CB::LumaGameSettings::OutputRes is required! See BioShock Series implementation.
-      { CompileTimeStringHash("SMAA Edge Detection VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_edge_detection_vs" } },
-      { CompileTimeStringHash("SMAA Edge Detection PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_edge_detection_ps" } },
-      { CompileTimeStringHash("SMAA Blending Weight Calculation VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_blending_weight_calculation_vs" } },
-      { CompileTimeStringHash("SMAA Blending Weight Calculation PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps" } },
-      { CompileTimeStringHash("SMAA Neighborhood Blending VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_neighborhood_blending_vs" } },
-      { CompileTimeStringHash("SMAA Neighborhood Blending PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps" } },
 #endif
 
 #if ENABLE_BLOOM
@@ -3860,19 +3864,47 @@ namespace
       }
       device_data.display_composition.source.reset();
 #if ENABLE_D3D12_PASSES
+      // The caller holds "pass->mutex"
+      const auto destroy_game_pass = [device](DeviceData::GamePassD3D12* pass)
       {
-         auto& rcas = device_data.rcas;
-         const std::unique_lock lock(rcas.mutex);
-         if (rcas.layout.handle != 0)
+         if (pass->layout.handle != 0)
          {
-            device->free_descriptor_tables(uint32_t(rcas.tables.size()), rcas.tables.data());
-            device->destroy_pipeline_layout(rcas.layout);
+            device->free_descriptor_tables(uint32_t(pass->tables.size()), pass->tables.data());
+            device->destroy_pipeline_layout(pass->layout);
          }
-         rcas.tables.clear();
-         rcas.layout = {};
-         rcas.pipelines.clear();
-         rcas.retired.clear();
+         pass->tables.clear();
+         pass->layout = {};
+         pass->pipelines.clear();
+         pass->retired.clear();
+      };
+#if ENABLE_RCAS
+      {
+         const std::unique_lock lock(device_data.rcas.mutex);
+         destroy_game_pass(&device_data.rcas);
       }
+#endif
+#if ENABLE_SMAA
+      {
+         auto& smaa = device_data.smaa;
+         const std::unique_lock lock(smaa.mutex);
+         destroy_game_pass(&smaa);
+         for (reshade::api::resource_view* const view : {&smaa.area_srv, &smaa.search_srv, &smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv})
+         {
+            device->destroy_resource_view(*view);
+            *view = {};
+         }
+         for (reshade::api::resource* const resource : {&smaa.area_texture, &smaa.search_texture, &smaa.edges, &smaa.weights})
+         {
+            device->destroy_resource(*resource);
+            *resource = {};
+         }
+         for (const auto& [present_count, resource] : smaa.retired_intermediates)
+         {
+            device->destroy_resource(resource);
+         }
+         smaa.retired_intermediates.clear();
+      }
+#endif
 #endif
 #if ENABLE_MINHOOK
       D3D12Clones::OnDestroyDevice(native_device);
@@ -8447,14 +8479,14 @@ namespace
 #endif
 
 #if DX12
-   // A fullscreen pipeline of "Copy VS" and the native "pixel_shader_hash" on "root_signature", which renders into "format". Null if the device refused it, or
-   // if the natives aren't compiled (yet), which "natives_found" tells apart.
-   com_ptr<ID3D12PipelineState> CreateD3D12NativePipeline(ID3D12Device* native_device, ID3D12RootSignature* root_signature, uint32_t pixel_shader_hash, DXGI_FORMAT format, bool* natives_found)
+   // A fullscreen pipeline of the natives "vertex_shader_hash" and "pixel_shader_hash" on "root_signature", which renders into "format". Null if the device refused it,
+   // or if the natives aren't compiled (yet), which "natives_found" tells apart.
+   com_ptr<ID3D12PipelineState> CreateD3D12NativePipeline(ID3D12Device* native_device, ID3D12RootSignature* root_signature, uint32_t vertex_shader_hash, uint32_t pixel_shader_hash, DXGI_FORMAT format, bool* natives_found)
    {
       // The DXIL of the natives, from the cache the D3D11 shader objects are made of. Its lock holds for as long as the pipeline needs the code
       const std::shared_lock lock_loading(s_mutex_loading);
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      const auto vertex_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(CompileTimeStringHash("Copy VS")));
+      const auto vertex_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(vertex_shader_hash));
       const auto pixel_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(pixel_shader_hash));
       *natives_found = vertex_shader != custom_shaders_cache.end() && vertex_shader->second && !vertex_shader->second->code.empty() && pixel_shader != custom_shaders_cache.end() && pixel_shader->second && !pixel_shader->second->code.empty();
       if (!*natives_found || !root_signature)
@@ -8519,7 +8551,7 @@ namespace
          const D3D12_STATIC_SAMPLER_DESC linear_clamp_sampler = {.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR, .AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .MaxAnisotropy = 1, .ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER, .MaxLOD = D3D12_FLOAT32_MAX, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL};
          pass->root_signature = D3D12Passes::CreateRootSignature(native_device, {.Version = D3D_ROOT_SIGNATURE_VERSION_1_1, .Desc_1_1 = {.NumParameters = UINT(std::size(parameters)), .pParameters = parameters, .NumStaticSamplers = 1, .pStaticSamplers = &linear_clamp_sampler}});
          bool natives_found = false;
-         pass->pipeline = CreateD3D12NativePipeline(native_device, pass->root_signature.get(), pixel_shader_hash, format, &natives_found);
+         pass->pipeline = CreateD3D12NativePipeline(native_device, pass->root_signature.get(), CompileTimeStringHash("Copy VS"), pixel_shader_hash, format, &natives_found);
          if (!natives_found)
          {
             static std::atomic_flag warned;
@@ -8577,11 +8609,81 @@ namespace
    }
 
 #if ENABLE_D3D12_PASSES
-   // The descriptors of "DrawRCAS()" rotate over this many presents (how far behind a game list may run), with this many draws per present
+   // The descriptors of the passes drawn on the game's command lists rotate over this many presents (how far behind a game list may run), with this many draws
+   // of a pass per present
    // ponytail: a game list executed later than that, or more draws in a present, reads a descriptor that was written again (a valid view, of the wrong texture)
-   constexpr uint32_t RCAS_FRAMES = 16;
-   constexpr uint32_t RCAS_DRAWS_PER_FRAME = 4;
+   constexpr uint32_t D3D12_GAME_PASS_FRAMES = 16;
+   constexpr uint32_t D3D12_GAME_PASS_DRAWS_PER_FRAME = 4;
 
+   // The common start of the passes drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()"), with "pass->mutex" held: makes the layout of "params" (whose
+   // second parameter is the descriptor table) and "tables_per_draw" descriptor tables per draw on the first draw, one attempt, and drops the pipelines of older
+   // natives. Then the tables of this draw, or null if the pass can't draw.
+   const reshade::api::descriptor_table* PrepareD3D12GamePass(DeviceData::GamePassD3D12* pass, DeviceData& device_data, reshade::api::device* device, std::span<const reshade::api::pipeline_layout_param> params, uint32_t tables_per_draw, const char* name)
+   {
+      if (pass->failed)
+      {
+         return nullptr;
+      }
+      if (pass->layout.handle == 0)
+      {
+         pass->tables.resize(D3D12_GAME_PASS_FRAMES * D3D12_GAME_PASS_DRAWS_PER_FRAME * tables_per_draw);
+         if (!device->create_pipeline_layout(uint32_t(params.size()), params.data(), &pass->layout) || !device->allocate_descriptor_tables(uint32_t(pass->tables.size()), pass->layout, 1, pass->tables.data()))
+         {
+            if (pass->layout.handle != 0)
+            {
+               device->destroy_pipeline_layout(pass->layout);
+               pass->layout = {};
+            }
+            pass->tables.clear();
+            pass->failed = true;
+            reshade::log::message(reshade::log::level::error, std::format("[{}] ReShade refused its root signature or its descriptor tables, so it doesn't draw", name).c_str());
+            return nullptr;
+         }
+      }
+
+      const uint32_t natives_generation = device_data.native_shaders_generation.load(std::memory_order_acquire);
+      if (pass->pipelines_generation != natives_generation)
+      {
+         for (auto& [key, pipeline] : pass->pipelines)
+         {
+            pass->retired.push_back(std::move(pipeline));
+         }
+         pass->pipelines.clear();
+         pass->pipelines_generation = natives_generation;
+      }
+
+      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+      if (pass->frame != present_count)
+      {
+         pass->frame = present_count;
+         pass->frame_draws = 0;
+      }
+      return &pass->tables[((present_count % D3D12_GAME_PASS_FRAMES) * D3D12_GAME_PASS_DRAWS_PER_FRAME + (pass->frame_draws++ % D3D12_GAME_PASS_DRAWS_PER_FRAME)) * tables_per_draw];
+   }
+
+   // The pipeline of "pass" of the natives "vertex_shader_hash" and "pixel_shader_hash" (a pass pairs each pixel shader with one vertex shader) into "format", after
+   // "PrepareD3D12GamePass()": one attempt per format and natives generation, except while the natives aren't compiled. Null if there is none.
+   ID3D12PipelineState* GetD3D12GamePassPipeline(DeviceData::GamePassD3D12* pass, ID3D12Device* native_device, uint32_t vertex_shader_hash, uint32_t pixel_shader_hash, DXGI_FORMAT format, const char* name)
+   {
+      const auto [pipeline, inserted] = pass->pipelines.try_emplace((uint64_t(pixel_shader_hash) << 32) | format);
+      if (inserted)
+      {
+         bool natives_found = false;
+         pipeline->second = CreateD3D12NativePipeline(native_device, reinterpret_cast<ID3D12RootSignature*>(pass->layout.handle), vertex_shader_hash, pixel_shader_hash, format, &natives_found);
+         if (!natives_found)
+         {
+            pass->pipelines.erase(pipeline);
+            return nullptr;
+         }
+         if (!pipeline->second)
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[{}] The device refused its pipeline for {} (the debug layer says why), so it doesn't draw into that format", name, GetFormatNameSafe(format)).c_str());
+         }
+      }
+      return pipeline->second.get();
+   }
+
+#if ENABLE_RCAS
    // RCAS sharpening ("Luma_RCAS_PS") of "source" into the whole "target" (through the view "target_desc"), recorded on the game's command list from a game's
    // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawRCAS()". "source" (viewed as 2D "source_format") must be readable by pixel shaders and "target"
    // be a render target, in the states the game left them in at that draw (it records no barrier). It records through ReShade's API, with its descriptor tables
@@ -8598,57 +8700,15 @@ namespace
       auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
       auto& rcas = device_data.rcas;
       const std::unique_lock lock(rcas.mutex);
-      if (rcas.failed)
+      const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.count = 4, .visibility = reshade::api::shader_stage::pixel}, {1, &source_range}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&rcas, device_data, device, params, 1, "RCAS");
+      if (!tables)
       {
          return false;
       }
-      if (rcas.layout.handle == 0)
-      {
-         const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
-         const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.count = 4, .visibility = reshade::api::shader_stage::pixel}, {1, &source_range}};
-         rcas.tables.resize(RCAS_FRAMES * RCAS_DRAWS_PER_FRAME);
-         if (!device->create_pipeline_layout(uint32_t(std::size(params)), params, &rcas.layout) || !device->allocate_descriptor_tables(uint32_t(rcas.tables.size()), rcas.layout, 1, rcas.tables.data()))
-         {
-            if (rcas.layout.handle != 0)
-            {
-               device->destroy_pipeline_layout(rcas.layout);
-               rcas.layout = {};
-            }
-            rcas.tables.clear();
-            rcas.failed = true;
-            reshade::log::message(reshade::log::level::error, "[RCAS] ReShade refused its root signature or its descriptor tables, so it doesn't sharpen");
-            return false;
-         }
-      }
-
-      // One attempt per render target format and natives generation, except while the natives aren't compiled
-      const uint32_t natives_generation = device_data.native_shaders_generation.load(std::memory_order_acquire);
-      if (rcas.pipelines_generation != natives_generation)
-      {
-         for (auto& [format, pipeline] : rcas.pipelines)
-         {
-            rcas.retired.push_back(std::move(pipeline));
-         }
-         rcas.pipelines.clear();
-         rcas.pipelines_generation = natives_generation;
-      }
-      const DXGI_FORMAT target_format = DXGI_FORMAT(target_desc.format);
-      const auto [pipeline, inserted] = rcas.pipelines.try_emplace(target_format);
-      if (inserted)
-      {
-         bool natives_found = false;
-         pipeline->second = CreateD3D12NativePipeline(native_device, reinterpret_cast<ID3D12RootSignature*>(rcas.layout.handle), CompileTimeStringHash("RCAS PS"), target_format, &natives_found);
-         if (!natives_found)
-         {
-            rcas.pipelines.erase(pipeline);
-            return false;
-         }
-         if (!pipeline->second)
-         {
-            reshade::log::message(reshade::log::level::error, std::format("[RCAS] The device refused its pipeline for {} (the debug layer says why), so it doesn't sharpen into that format", GetFormatNameSafe(target_format)).c_str());
-         }
-      }
-      if (!pipeline->second)
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&rcas, native_device, CompileTimeStringHash("Copy VS"), CompileTimeStringHash("RCAS PS"), DXGI_FORMAT(target_desc.format), "RCAS");
+      if (!pipeline)
       {
          return false;
       }
@@ -8664,13 +8724,7 @@ namespace
          }
          return false;
       }
-      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
-      if (rcas.frame != present_count)
-      {
-         rcas.frame = present_count;
-         rcas.frame_draws = 0;
-      }
-      const reshade::api::descriptor_table table = rcas.tables[(present_count % RCAS_FRAMES) * RCAS_DRAWS_PER_FRAME + (rcas.frame_draws++ % RCAS_DRAWS_PER_FRAME)];
+      const reshade::api::descriptor_table table = tables[0];
       const reshade::api::descriptor_table_update source_update = {.table = table, .count = 1, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = &source_view};
       device->update_descriptor_tables(1, &source_update);
       // The table and the render target binding take copies of the descriptors
@@ -8679,9 +8733,9 @@ namespace
       const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
       const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
       const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
-      const float params[4] = {float(width), float(height), sharpness, 0.f};
-      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline->second.get())});
-      cmd_list->push_constants(reshade::api::shader_stage::pixel, rcas.layout, 0, 0, 4, params);
+      const float sharpen_params[4] = {float(width), float(height), sharpness, 0.f};
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+      cmd_list->push_constants(reshade::api::shader_stage::pixel, rcas.layout, 0, 0, 4, sharpen_params);
       cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, rcas.layout, 1, 1, &table);
       cmd_list->bind_render_targets_and_depth_stencil(1, &target_view);
       device->destroy_resource_view(target_view);
@@ -8699,6 +8753,205 @@ namespace
       cmd_list_data.render_target_formats_dirty = true;
       return true;
    }
+#endif // ENABLE_RCAS
+
+#if ENABLE_SMAA
+   // The area and search textures of the D3D12 "DrawSMAA()", once a draw asked for them: ReShade uploads their data on its immediate list, which it flushes
+   // and waits for, which only a present may do. One attempt
+   void CreateSMAATexturesD3D12(reshade::api::device* device, DeviceData& device_data)
+   {
+      auto& smaa = device_data.smaa;
+      if (!smaa.textures_wanted.exchange(false, std::memory_order_relaxed))
+      {
+         return;
+      }
+      const std::unique_lock lock(smaa.mutex);
+      if (smaa.area_texture.handle != 0 || smaa.failed)
+      {
+         return;
+      }
+      std::vector<uint8_t> area_texture_bytes(std::begin(areaTexBytes), std::end(areaTexBytes));
+#if !SMAA_SMOOTH_U_SHAPES
+      for (const auto& [offset, value] : areaTexSharpUPatch)
+      {
+         area_texture_bytes[offset] = value;
+      }
+#endif
+      const reshade::api::subresource_data area_data = {.data = area_texture_bytes.data(), .row_pitch = AREATEX_PITCH, .slice_pitch = AREATEX_SIZE};
+      const reshade::api::subresource_data search_data = {.data = const_cast<unsigned char*>(searchTexBytes), .row_pitch = SEARCHTEX_PITCH, .slice_pitch = SEARCHTEX_SIZE};
+      constexpr reshade::api::resource_usage usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
+      const bool created = device->create_resource({AREATEX_WIDTH, AREATEX_HEIGHT, 1, 1, reshade::api::format::r8g8_unorm, 1, reshade::api::memory_heap::gpu_only, usage}, &area_data, reshade::api::resource_usage::shader_resource, &smaa.area_texture) &&
+                           device->create_resource({SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, 1, 1, reshade::api::format::r8_unorm, 1, reshade::api::memory_heap::gpu_only, usage}, &search_data, reshade::api::resource_usage::shader_resource, &smaa.search_texture) &&
+                           device->create_resource_view(smaa.area_texture, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, reshade::api::format::r8g8_unorm, 0, 1, 0, 1}, &smaa.area_srv) &&
+                           device->create_resource_view(smaa.search_texture, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, reshade::api::format::r8_unorm, 0, 1, 0, 1}, &smaa.search_srv);
+      if (!created)
+      {
+         // What was made is destroyed with the device
+         smaa.failed = true;
+         reshade::log::message(reshade::log::level::error, "[SMAA] ReShade refused its area or search texture, so it doesn't draw");
+      }
+   }
+
+   // SMAA of "color" (viewed as 2D "color_format") into the whole "target" (through the view "target_desc"), recorded on the game's command list from a game's
+   // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawSMAA()", with the contract of "DrawRCAS()" (resource states, restore, false = nothing recorded).
+   // The edge detection reads "color" too: a gamma encoded one is filtered in linear light with "SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR". "predication" (optional, as 2D
+   // "predication_format") is the edge detection's t1. The game's "Luma_SMAA_impl.hlsl" gets "SMAA_RT_METRICS" (the target's) then "game_constants" as cbuffer b1.
+   // It doesn't draw on its first call, which asks the next present for its area and search textures.
+   // ponytail: no stencil mask of the edges (the blending weights run on every pixel, with the same result), no T2x
+   bool DrawSMAA(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource color, reshade::api::format color_format, reshade::api::resource predication, reshade::api::format predication_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, const float (&game_constants)[4])
+   {
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass)
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      auto& smaa = device_data.smaa;
+      const std::unique_lock lock(smaa.mutex);
+      if (smaa.area_texture.handle == 0)
+      {
+         smaa.textures_wanted = true;
+         return false;
+      }
+      const reshade::api::descriptor_range texture_range = {.count = 3, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      const reshade::api::sampler_desc samplers[] = {{.filter = reshade::api::filter_mode::min_mag_mip_linear}, {.filter = reshade::api::filter_mode::min_mag_mip_point}};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = uint32_t(std::size(samplers));
+      sampler_range.visibility = reshade::api::shader_stage::pixel;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = samplers;
+      const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.dx_register_index = 1, .count = 8, .visibility = reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel}, {1, &texture_range}, {1, &sampler_range}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&smaa, device_data, device, params, 3, "SMAA");
+      if (!tables)
+      {
+         return false;
+      }
+      const DXGI_FORMAT target_format = DXGI_FORMAT(target_desc.format);
+      ID3D12PipelineState* const edge_detection_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Edge Detection PS"), DXGI_FORMAT_R8G8_UNORM, "SMAA");
+      ID3D12PipelineState* const blending_weight_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), DXGI_FORMAT_R8G8B8A8_UNORM, "SMAA");
+      ID3D12PipelineState* const neighborhood_blending_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Neighborhood Blending VS"), CompileTimeStringHash("SMAA Neighborhood Blending PS"), target_format, "SMAA");
+      if (!edge_detection_pipeline || !blending_weight_pipeline || !neighborhood_blending_pipeline)
+      {
+         return false;
+      }
+
+      const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
+      const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
+      const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
+      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+      const auto destroy_if_done = [device, present_count](const std::pair<uint64_t, reshade::api::resource>& retired)
+      {
+         if (present_count - retired.first < D3D12_GAME_PASS_FRAMES)
+         {
+            return false;
+         }
+         device->destroy_resource(retired.second);
+         return true;
+      };
+      std::erase_if(smaa.retired_intermediates, destroy_if_done);
+      // The intermediates follow the target's size. The views only hold CPU descriptors (the tables and the bindings copy them), but a game list that still runs may read the old textures
+      if (smaa.width != width || smaa.height != height)
+      {
+         for (reshade::api::resource_view* const view : {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv})
+         {
+            device->destroy_resource_view(*view);
+            *view = {};
+         }
+         for (reshade::api::resource* const resource : {&smaa.edges, &smaa.weights})
+         {
+            if (resource->handle != 0)
+            {
+               smaa.retired_intermediates.emplace_back(present_count, *resource);
+               *resource = {};
+            }
+         }
+         smaa.width = width;
+         smaa.height = height;
+         const auto create_intermediate = [&](reshade::api::format format, reshade::api::resource* resource, reshade::api::resource_view* rtv, reshade::api::resource_view* srv)
+         {
+            const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
+            return device->create_resource({width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource}, nullptr, reshade::api::resource_usage::shader_resource, resource) &&
+                   device->create_resource_view(*resource, reshade::api::resource_usage::render_target, view_desc, rtv) && device->create_resource_view(*resource, reshade::api::resource_usage::shader_resource, view_desc, srv);
+         };
+         if (!create_intermediate(reshade::api::format::r8g8_unorm, &smaa.edges, &smaa.edges_rtv, &smaa.edges_srv) || !create_intermediate(reshade::api::format::r8g8b8a8_unorm, &smaa.weights, &smaa.weights_rtv, &smaa.weights_srv))
+         {
+            // What was made is destroyed with the device, or with the next size
+            smaa.width = 0;
+            smaa.height = 0;
+            static std::atomic_flag logged;
+            if (!logged.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::error, std::format("[SMAA] ReShade refused its {}x{} intermediates, so it doesn't draw", width, height).c_str());
+            }
+            return false;
+         }
+      }
+
+      reshade::api::resource_view color_view = {};
+      reshade::api::resource_view predication_view = {};
+      reshade::api::resource_view target_view = {};
+      const bool created_views = device->create_resource_view(color, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, color_format, 0, 1, 0, 1}, &color_view) &&
+                                 (predication == 0 || device->create_resource_view(predication, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, predication_format, 0, 1, 0, 1}, &predication_view)) &&
+                                 device->create_resource_view(target, reshade::api::resource_usage::render_target, target_desc, &target_view);
+      if (!created_views)
+      {
+         for (const reshade::api::resource_view view : {color_view, predication_view, target_view})
+         {
+            device->destroy_resource_view(view);
+         }
+         return false;
+      }
+      // The descriptors a pass doesn't read are left as they were
+      const reshade::api::resource_view edge_detection_srvs[] = {color_view, predication_view};
+      const reshade::api::resource_view blending_weight_srvs[] = {smaa.edges_srv, smaa.area_srv, smaa.search_srv};
+      const reshade::api::resource_view neighborhood_blending_srvs[] = {color_view, smaa.weights_srv};
+      const reshade::api::descriptor_table_update updates[] = {
+         {.table = tables[0], .count = predication == 0 ? 1u : 2u, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = edge_detection_srvs},
+         {.table = tables[1], .count = uint32_t(std::size(blending_weight_srvs)), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = blending_weight_srvs},
+         {.table = tables[2], .count = uint32_t(std::size(neighborhood_blending_srvs)), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = neighborhood_blending_srvs},
+      };
+      device->update_descriptor_tables(uint32_t(std::size(updates)), updates);
+      device->destroy_resource_view(color_view);
+      device->destroy_resource_view(predication_view);
+
+      const float constants[8] = {1.f / float(width), 1.f / float(height), float(width), float(height), game_constants[0], game_constants[1], game_constants[2], game_constants[3]};
+      cmd_list->push_constants(reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, smaa.layout, 0, 0, uint32_t(std::size(constants)), constants);
+      const reshade::api::viewport viewport = {0.f, 0.f, float(width), float(height), 0.f, 1.f};
+      const reshade::api::rect scissor = {0, 0, int32_t(width), int32_t(height)};
+      cmd_list->bind_viewports(0, 1, &viewport);
+      cmd_list->bind_scissor_rects(0, 1, &scissor);
+      const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+      const uint32_t topology = uint32_t(reshade::api::primitive_topology::triangle_list);
+      cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      const auto draw = [&](ID3D12PipelineState* pipeline, const reshade::api::descriptor_table& table, const reshade::api::resource_view& rtv)
+      {
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+         cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, smaa.layout, 1, 1, &table);
+         cmd_list->bind_render_targets_and_depth_stencil(1, &rtv);
+         cmd_list->draw(3, 1, 0, 0);
+      };
+
+      // The edge detection discards the pixels without edges, which have to read as none
+      cmd_list->barrier(smaa.edges, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+      static constexpr float clear_color[4] = {};
+      cmd_list->clear_render_target_view(smaa.edges_rtv, clear_color);
+      draw(edge_detection_pipeline, tables[0], smaa.edges_rtv);
+      cmd_list->barrier(smaa.edges, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+
+      cmd_list->barrier(smaa.weights, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+      draw(blending_weight_pipeline, tables[1], smaa.weights_rtv);
+      cmd_list->barrier(smaa.weights, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+
+      draw(neighborhood_blending_pipeline, tables[2], target_view);
+      device->destroy_resource_view(target_view);
+
+      D3D12State::RestoreGraphics(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      // The next draw checks its pipeline against the render targets again
+      cmd_list_data.render_target_formats_dirty = true;
+      return true;
+   }
+#endif // ENABLE_SMAA
 #endif // ENABLE_D3D12_PASSES
 
    // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its debug draw and UI composition aren't ported yet): copies the back buffer, then draws
@@ -8923,6 +9176,9 @@ namespace
       NativeDevice* native_device = (NativeDevice*)(queue->get_device()->get_native());
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
+#if DX12 && ENABLE_SMAA
+      CreateSMAATexturesD3D12(queue->get_device(), device_data);
+#endif
 #if DX11 // On D3D12 the queue's immediate command list is ReShade's own, it has no "CommandListData"
       ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(queue->get_immediate_command_list()->get_native());
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
