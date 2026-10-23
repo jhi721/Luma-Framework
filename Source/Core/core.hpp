@@ -774,12 +774,11 @@ namespace
 
 #if DX11 || ENABLE_D3D12_PASSES // D3D12: "ConvertTextureCopyD3D12()"
       { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
-#endif
-#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS, SMAA, bloom and texture copy: the passes of the others aren't ported to D3D12 yet
-
       // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
       { CompileTimeStringHash("Scale VS"), { "Luma_Scale_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
       { CompileTimeStringHash("Scale PS"), { "Luma_Scale_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
+#endif
+#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS, SMAA, bloom and texture copy: the passes of the others aren't ported to D3D12 yet
       
       { CompileTimeStringHash("Copy RGB Max 0 A Sat"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
       { CompileTimeStringHash("Copy RGB Max 0 A Sat MS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "MS", "1" }, { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
@@ -9154,11 +9153,12 @@ namespace
 
    // The copy of a texture Luma upgraded into one of another format family, or back (see "SkipUpgradedFormatCopy()"), which D3D12's copies can't make: "Copy PS" draws it instead, like the D3D11
    // "OnCopyResource_Internal()", and the destination keeps its own precision. Whole 2D textures of the same size with one mip, layer and sample, R16G16B16A16 FLOAT against the R8G8B8A8, B8G8R8A8,
-   // B8G8R8X8, R10G10B10A2 and R11G11B10 families. The textures are in the states of the game's copy (copy source and copy destination) and are left in them; a destination that can't be a render
+   // B8G8R8X8, R10G10B10A2 and R11G11B10 families. With "scaled" (one of them is a clone of another size, see "includes/d3d12_clones.h") the sizes differ and the families can be the same:
+   // "Scale PS" stretches it bilinearly. The textures are in the states of the game's copy (copy source and copy destination) and are left in them; a destination that can't be a render
    // target is drawn through an intermediate of its desc that can, then copied. False, with nothing recorded, if it can't (the caller skips the copy then).
    // ponytail: legacy barriers from the copy states, so a texture still in the common state (promoted by the copy itself) or created in an enhanced barriers layout gets a debug layer error; track
    // their states if a game copies those across formats
-   bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled)
    {
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
       if (cmd_list_data.d3d12_state.in_render_pass)
@@ -9201,8 +9201,9 @@ namespace
       const reshade::api::resource_desc dest_desc = device->get_resource_desc(dest);
       const DXGI_FORMAT source_view_format = view_format(source_desc.texture.format);
       const DXGI_FORMAT dest_view_format = view_format(dest_desc.texture.format);
-      if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-         || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || source_desc.texture.width != dest_desc.texture.width || source_desc.texture.height != dest_desc.texture.height
+      const bool same_size = (source_desc.texture.width == dest_desc.texture.width && source_desc.texture.height == dest_desc.texture.height);
+      if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (!scaled && (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT))
+         || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || (!scaled && !same_size)
          || (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0)
       {
          return false;
@@ -9213,7 +9214,14 @@ namespace
       auto& texture_copy = device_data.texture_copy;
       const std::unique_lock lock(texture_copy.mutex);
       const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
-      const reshade::api::pipeline_layout_param params[] = {{1, &source_range}};
+      // "Scale PS"'s bilinear sampler (s0), which "Copy PS" doesn't read
+      const reshade::api::sampler_desc linear_sampler = {.filter = reshade::api::filter_mode::min_mag_mip_linear};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = 1;
+      sampler_range.visibility = reshade::api::shader_stage::pixel;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = &linear_sampler;
+      const reshade::api::pipeline_layout_param params[] = {{1, &source_range}, {1, &sampler_range}};
       // A game can copy many textures a frame: one descriptor each
       constexpr uint32_t TEXTURE_COPY_DRAWS_PER_FRAME = 64;
       const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&texture_copy, device_data, device, params, 0, 1, "Texture Copy", TEXTURE_COPY_DRAWS_PER_FRAME);
@@ -9221,7 +9229,9 @@ namespace
       {
          return false;
       }
-      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&texture_copy, native_device, CompileTimeStringHash("Copy VS"), CompileTimeStringHash("Copy PS"), dest_view_format, "Texture Copy");
+      const bool stretched = !same_size;
+      ID3D12PipelineState* const pipeline = (stretched ? GetD3D12GamePassPipeline(&texture_copy, native_device, CompileTimeStringHash("Scale VS"), CompileTimeStringHash("Scale PS"), dest_view_format, "Texture Copy")
+                                                       : GetD3D12GamePassPipeline(&texture_copy, native_device, CompileTimeStringHash("Copy VS"), CompileTimeStringHash("Copy PS"), dest_view_format, "Texture Copy"));
       if (!pipeline)
       {
          return false;
@@ -9345,6 +9355,8 @@ namespace
    // ("ConvertTextureCopyD3D12()", with "enable_upgraded_texture_resource_copy_redirection"), the others are skipped, with a log line once for each kind and pair of formats. The resolves between textures
    // of the same family only name the game's format: see "OnResolveTextureRegion()".
    // Returns true to skip the game's copy (it was converted, or can't be made).
+   // A clone of another size (custom dimensions, see "includes/d3d12_clones.h") takes part in the copy: D3D12 can't copy it into (or from) the game's size either, whatever the formats,
+   // so a whole copy is stretched by a draw and the others are skipped.
    bool SkipUpgradedFormatCopy(reshade::api::command_list* cmd_list, const char* copy_kind, reshade::api::resource source, reshade::api::resource dest, CopyExtent extent)
    {
       const bool through_buffer = (extent == CopyExtent::ThroughBuffer);
@@ -9365,7 +9377,12 @@ namespace
       }
       const DXGI_FORMAT source_format = GetTextureFormat(device, source);
       const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
-      if (!through_buffer && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
+#if ENABLE_MINHOOK
+      const bool scaled = (D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(source.handle)).has_value() != D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(dest.handle)).has_value());
+#else
+      constexpr bool scaled = false;
+#endif
+      if (!through_buffer && !scaled && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
       {
          return false;
       }
@@ -9378,7 +9395,7 @@ namespace
       }
 #endif
 #if ENABLE_D3D12_PASSES
-      const bool converted = (extent == CopyExtent::Whole && enable_upgraded_texture_resource_copy_redirection && ConvertTextureCopyD3D12(cmd_list, source, dest));
+      const bool converted = (extent == CopyExtent::Whole && enable_upgraded_texture_resource_copy_redirection && ConvertTextureCopyD3D12(cmd_list, source, dest, scaled));
 #else
       constexpr bool converted = false;
 #endif
@@ -9388,12 +9405,13 @@ namespace
       const std::unique_lock lock_warned(warned_mutex);
       if (converted && warned_copies.emplace(copy_kind, source_format, dest_format, true).second)
       {
-         reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Converted a {} from {} to {} by a draw: D3D12 can't copy between an upgraded texture and another format", copy_kind, GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format)).c_str());
+         const char* const reason = (scaled ? "a clone of another size takes part" : "D3D12 can't copy between an upgraded texture and another format");
+         reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Converted a {} from {} to {} by a draw: {}", copy_kind, GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format), reason).c_str());
       }
       if (!converted && warned_copies.emplace(copy_kind, source_format, dest_format, false).second)
       {
          const std::string what = (through_buffer ? std::format("of an upgraded {} texture: the footprint of the buffer has the format the game created the texture with", GetFormatNameSafe(source_format != DXGI_FORMAT_UNKNOWN ? source_format : dest_format))
-                                                  : std::format("from {} to {}: D3D12 can't copy between an upgraded texture and another format, and this copy can't be converted", GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format)));
+                                                  : std::format("from {} to {}: D3D12 can't copy between an upgraded texture and another format{}, and this copy can't be converted", GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format), (scaled ? " or size" : "")));
          reshade::log::message(reshade::log::level::warning, std::format("[Texture upgrades] Skipped a {} {}", copy_kind, what).c_str());
       }
       return true;
