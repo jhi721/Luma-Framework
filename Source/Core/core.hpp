@@ -965,8 +965,8 @@ namespace
    thread_local reshade::api::resource_desc upgraded_resource_init_desc = {};
    thread_local reshade::api::resource_desc forced_upgraded_resource_init_desc = {};
 #if DX12 && ENABLE_MINHOOK
-   // Set by "OnCreateResource()" for the "OnInitResource()" of the same placed create: the format its clone is made in (unknown: no clone)
-   thread_local DXGI_FORMAT pending_placed_clone_format = DXGI_FORMAT_UNKNOWN;
+   // Set by "OnCreateResource()" for the "OnInitResource()" of the same create: the format its clone is made in (unknown: no clone)
+   thread_local DXGI_FORMAT pending_clone_format = DXGI_FORMAT_UNKNOWN;
 #endif
    thread_local void* upgraded_resource_init_data = {};
    thread_local std::unordered_map<uint64_t, reshade::api::subresource_data*> upgraded_mapped_resources;
@@ -9528,7 +9528,7 @@ namespace
       {
          for (const D3D12Clones::PromotedClone& promoted : promotion.clones)
          {
-            const std::string message = std::format("[Texture upgrades] Promoted the clone of a placed {} texture ({} views, waited {:.1f} ms)", GetFormatNameSafe(promoted.original_format), promoted.view_count, promotion.waited_ms);
+            const std::string message = std::format("[Texture upgrades] Promoted the clone of a {} texture ({} views, waited {:.1f} ms)", GetFormatNameSafe(promoted.original_format), promoted.view_count, promotion.waited_ms);
             reshade::log::message(reshade::log::level::info, message.c_str());
          }
       }
@@ -12507,11 +12507,11 @@ namespace
 #endif
 #endif
 #if DX12 && ENABLE_MINHOOK
-      // The clone of a placed texture (see "includes/d3d12_clones.h"): the original stays as the game made it, the clone is the upgraded one
-      if (const DXGI_FORMAT clone_format = std::exchange(pending_placed_clone_format, DXGI_FORMAT_UNKNOWN); clone_format != DXGI_FORMAT_UNKNOWN)
+      // The clone of a placed texture, or of a committed one with indirect upgrades (see "includes/d3d12_clones.h"): the original stays as the game made it, the clone is the upgraded one
+      if (const DXGI_FORMAT clone_format = std::exchange(pending_clone_format, DXGI_FORMAT_UNKNOWN); clone_format != DXGI_FORMAT_UNKNOWN)
       {
          // Seed mode (writer shaders listed): the clone waits for its promotion, until then the game keeps using the original
-         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), clone_format, D3D12ResourceCreation::current_placed_arguments, auto_texture_format_upgrade_shader_hashes.empty());
+         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), clone_format, D3D12ResourceCreation::current_creation_arguments, auto_texture_format_upgrade_shader_hashes.empty());
          if (clone)
          {
             const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
@@ -12528,12 +12528,14 @@ namespace
 #endif
          }
          static std::mutex logged_mutex;
-         static std::set<std::tuple<bool, reshade::api::format, DXGI_FORMAT>> logged_clones;
+         static std::set<std::tuple<bool, D3D12ResourceCreation::Kind, reshade::api::format, DXGI_FORMAT>> logged_clones;
          const std::unique_lock lock_logged(logged_mutex);
-         if (logged_clones.emplace(clone != nullptr, desc.texture.format, clone_format).second)
+         const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
+         if (logged_clones.emplace(clone != nullptr, creation_kind, desc.texture.format, clone_format).second)
          {
             const char* const original_name = GetFormatNameSafe(DXGI_FORMAT(desc.texture.format));
-            const std::string message = (clone ? std::format("[Texture upgrades] Cloned a placed {} texture as {}", original_name, GetFormatNameSafe(clone_format)) : std::format("[Texture upgrades] The device refused the clone of a placed {} texture as {}, it stays as the game made it", original_name, GetFormatNameSafe(clone_format)));
+            const char* const kind_name = D3D12ResourceCreation::KIND_NAMES[size_t(creation_kind)];
+            const std::string message = (clone ? std::format("[Texture upgrades] Cloned a {} {} texture as {}", kind_name, original_name, GetFormatNameSafe(clone_format)) : std::format("[Texture upgrades] The device refused the clone of a {} {} texture as {}, it stays as the game made it", kind_name, original_name, GetFormatNameSafe(clone_format)));
             reshade::log::message(clone ? reshade::log::level::info : reshade::log::level::warning, message.c_str());
          }
       }
@@ -12649,7 +12651,7 @@ namespace
       // No need to clear "upgraded_resource_init_desc"/"upgraded_resource_init_data" from its last value
       waiting_on_upgraded_resource_init = false; // If the same thread called another "OnCreateResource()" before we got a "OnInitResource()", it implies the resource creation has failed and we didn't get that event (we have to do it by thread as device objects creation is thread safe and can be done by multiple threads concurrently)
 #if DX12 && ENABLE_MINHOOK
-      pending_placed_clone_format = DXGI_FORMAT_UNKNOWN;
+      pending_clone_format = DXGI_FORMAT_UNKNOWN;
 #endif
 
 #if DX12
@@ -12668,11 +12670,9 @@ namespace
       {
          lock.unlock();
 
-#if DX11
          const bool upgrade_directly = !enable_indirect_texture_format_upgrades;
+#if DX11
          const reshade::api::resource_desc original_desc = desc;
-#else
-         constexpr bool upgrade_directly = true; // D3D12 has no mirrors yet, "enable_indirect_texture_format_upgrades" is ignored there
 #endif
 
 #if DEVELOPMENT
@@ -12683,7 +12683,7 @@ namespace
          // The D3D12 rules, on top of the filters: a texture is only upgraded in place if the game creates it committed (it owns its memory, whereas a placed one is in a heap the game sized and shares with other
          // resources, so a bigger one would overflow it or alias them: it keeps its desc and gets a clone in "OnInitResource()". A reserved one has none until the game maps tiles to it), not as a depth
          // texture (the DSV variants aren't made), not shared (another process or API opens it) and without castable formats (ReShade passes them on as the game gave them, and the upgraded format
-         // isn't one of the formats they can be cast to)
+         // isn't one of the formats they can be cast to). With indirect upgrades a committed one gets a clone too, the mirror of D3D11's (views live in descriptor heaps, so they can't be swapped at bind)
          if (std::memcmp(&upgraded_desc.value(), &desc, sizeof(desc)) == 0)
          {
             return false; // The filters chose a texture the upgrade leaves as it is
@@ -12719,9 +12719,9 @@ namespace
 #endif
             return false;
          }
-         if (creation_kind == D3D12ResourceCreation::Kind::Placed)
+         if (creation_kind == D3D12ResourceCreation::Kind::Placed || !upgrade_directly)
          {
-            pending_placed_clone_format = DXGI_FORMAT(upgraded_desc->texture.format);
+            pending_clone_format = DXGI_FORMAT(upgraded_desc->texture.format);
             return false; // The desc stays the game's
          }
 #endif
@@ -21286,10 +21286,6 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
             reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
             reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
 #endif
-            if (enable_indirect_texture_format_upgrades)
-            {
-               reshade::log::message(reshade::log::level::warning, "[Texture upgrades] Indirect upgrades (mirrors) aren't supported on D3D12 yet: its textures are upgraded directly");
-            }
          }
 #endif
 #if !DEVELOPMENT

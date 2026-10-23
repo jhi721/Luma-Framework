@@ -113,7 +113,7 @@ namespace D3D12ResourceCreation
       Committed, // Owns its memory
       Placed,    // In a heap of the game's
       Reserved,  // Tiled, without memory until the game maps tiles to it
-      Clone,     // Luma's committed clone of a placed texture, in the upgraded format (see "d3d12_clones.h")
+      Clone,     // Luma's committed clone of a texture, in the upgraded format (see "d3d12_clones.h")
    };
    constexpr std::array<const char*, 5> KIND_NAMES = {"unknown", "committed", "placed", "reserved", "clone"};
 
@@ -132,25 +132,23 @@ namespace D3D12ResourceCreation
    // The number of castable formats that call passes, 0 for the ones that can't (or outside of a call)
    inline thread_local UINT current_castable_format_count = 0;
 
-   // What a placed create asked for besides the description, so a clone of the resource can be created like it (committed creates don't
-   // record it: they are upgraded in place)
-   struct PlacedCreationArguments
+   // What a create asked for besides the description, so a clone of the resource can be created like it
+   struct CreationArguments
    {
-      bool uses_layouts = false;          // "initial_state" is a "D3D12_BARRIER_LAYOUT" (CreatePlacedResource2)
+      bool uses_layouts = false;          // "initial_state" is a "D3D12_BARRIER_LAYOUT" (CreatePlacedResource2, CreateCommittedResource3)
       UINT initial_state = 0;             // A "D3D12_RESOURCE_STATES", or a "D3D12_BARRIER_LAYOUT"
       bool has_clear_value = false;       // The optimized clear value is optional
       D3D12_CLEAR_VALUE clear_value = {}; // A copy: the game's pointer is gone once the call returns
    };
-   inline thread_local PlacedCreationArguments current_placed_arguments;
+   inline thread_local CreationArguments current_creation_arguments;
 
-   // For the creates that have no castable formats, or no placed arguments
+   // For the creates that have no castable formats
    constexpr size_t NO_CASTABLE_FORMATS = (std::numeric_limits<size_t>::max)();
-   constexpr size_t NO_PLACED_ARGUMENTS = (std::numeric_limits<size_t>::max)();
 
    // A function of the proxy that creates resources of a "kind", hooked once per process. "Method" is its declaration in d3d12.h, so the
    // detour has the interface's own signature. "castable_count_argument" is the index of its "NumCastableFormats" argument, if it has one.
-   // "initial_state_argument" is the index of the initial state (or layout) of a placed create, its optimized clear value follows it.
-   template <typename Method, size_t vtable_slot, Kind kind, size_t castable_count_argument = NO_CASTABLE_FORMATS, size_t initial_state_argument = NO_PLACED_ARGUMENTS>
+   // "initial_state_argument" is the index of the initial state (or layout), its optimized clear value follows it: 3 for all the creates.
+   template <typename Method, size_t vtable_slot, Kind kind, size_t castable_count_argument = NO_CASTABLE_FORMATS, size_t initial_state_argument = 3>
    struct Creation;
 
    template <typename Interface, typename... Arguments, size_t vtable_slot, Kind kind, size_t castable_count_argument, size_t initial_state_argument>
@@ -167,32 +165,21 @@ namespace D3D12ResourceCreation
             static_assert(std::is_same_v<std::tuple_element_t<castable_count_argument, std::tuple<Arguments...>>, UINT32>, "The argument isn't a count");
             castable_format_count = std::get<castable_count_argument>(std::tie(arguments...));
          }
-         PlacedCreationArguments placed_arguments;
-         if constexpr (initial_state_argument != NO_PLACED_ARGUMENTS)
-         {
-            using InitialState = std::tuple_element_t<initial_state_argument, std::tuple<Arguments...>>;
-            using ClearValue = std::tuple_element_t<initial_state_argument + 1, std::tuple<Arguments...>>;
-            static_assert(std::is_same_v<ClearValue, const D3D12_CLEAR_VALUE*>, "The argument isn't a clear value");
-            const D3D12_CLEAR_VALUE* const clear_value = std::get<initial_state_argument + 1>(std::tie(arguments...));
-            placed_arguments = {
-               .uses_layouts = std::is_same_v<InitialState, D3D12_BARRIER_LAYOUT>,
-               .initial_state = static_cast<UINT>(std::get<initial_state_argument>(std::tie(arguments...))),
-               .has_clear_value = clear_value != nullptr,
-               .clear_value = (clear_value ? *clear_value : D3D12_CLEAR_VALUE{}),
-            };
-         }
+         using InitialState = std::tuple_element_t<initial_state_argument, std::tuple<Arguments...>>;
+         using ClearValue = std::tuple_element_t<initial_state_argument + 1, std::tuple<Arguments...>>;
+         static_assert(std::is_same_v<ClearValue, const D3D12_CLEAR_VALUE*>, "The argument isn't a clear value");
+         const D3D12_CLEAR_VALUE* const clear_value = std::get<initial_state_argument + 1>(std::tie(arguments...));
+         const CreationArguments creation_arguments = {
+            .uses_layouts = std::is_same_v<InitialState, D3D12_BARRIER_LAYOUT>,
+            .initial_state = static_cast<UINT>(std::get<initial_state_argument>(std::tie(arguments...))),
+            .has_clear_value = clear_value != nullptr,
+            .clear_value = (clear_value ? *clear_value : D3D12_CLEAR_VALUE{}),
+         };
          const Kind outer_kind = std::exchange(current_kind, kind);
          const UINT outer_castable_format_count = std::exchange(current_castable_format_count, castable_format_count);
-         PlacedCreationArguments outer_placed_arguments;
-         if constexpr (initial_state_argument != NO_PLACED_ARGUMENTS)
-         {
-            outer_placed_arguments = std::exchange(current_placed_arguments, placed_arguments);
-         }
+         const CreationArguments outer_creation_arguments = std::exchange(current_creation_arguments, creation_arguments);
          const HRESULT result = hooked.original(device, arguments...);
-         if constexpr (initial_state_argument != NO_PLACED_ARGUMENTS)
-         {
-            current_placed_arguments = outer_placed_arguments;
-         }
+         current_creation_arguments = outer_creation_arguments;
          current_castable_format_count = outer_castable_format_count;
          current_kind = outer_kind;
          return result;
@@ -215,9 +202,9 @@ namespace D3D12ResourceCreation
    using CommittedResource1 = Creation<decltype(&ID3D12Device4::CreateCommittedResource1), CREATE_COMMITTED_RESOURCE1_SLOT, Kind::Committed>;
    using CommittedResource2 = Creation<decltype(&ID3D12Device8::CreateCommittedResource2), CREATE_COMMITTED_RESOURCE2_SLOT, Kind::Committed>;
    using CommittedResource3 = Creation<decltype(&ID3D12Device10::CreateCommittedResource3), CREATE_COMMITTED_RESOURCE3_SLOT, Kind::Committed, 6>;
-   using PlacedResource = Creation<decltype(&ID3D12Device::CreatePlacedResource), CREATE_PLACED_RESOURCE_SLOT, Kind::Placed, NO_CASTABLE_FORMATS, 3>;
-   using PlacedResource1 = Creation<decltype(&ID3D12Device8::CreatePlacedResource1), CREATE_PLACED_RESOURCE1_SLOT, Kind::Placed, NO_CASTABLE_FORMATS, 3>;
-   using PlacedResource2 = Creation<decltype(&ID3D12Device10::CreatePlacedResource2), CREATE_PLACED_RESOURCE2_SLOT, Kind::Placed, 5, 3>;
+   using PlacedResource = Creation<decltype(&ID3D12Device::CreatePlacedResource), CREATE_PLACED_RESOURCE_SLOT, Kind::Placed>;
+   using PlacedResource1 = Creation<decltype(&ID3D12Device8::CreatePlacedResource1), CREATE_PLACED_RESOURCE1_SLOT, Kind::Placed>;
+   using PlacedResource2 = Creation<decltype(&ID3D12Device10::CreatePlacedResource2), CREATE_PLACED_RESOURCE2_SLOT, Kind::Placed, 5>;
 
    struct Hook
    {

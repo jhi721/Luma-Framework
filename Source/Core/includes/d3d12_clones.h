@@ -2,10 +2,11 @@
 
 #if DX12 && ENABLE_MINHOOK
 
-// The committed clones of the game's placed textures. A placed texture lives in a heap the game sized and shares with other resources, so it
-// is never upgraded in place: when it matches the texture upgrade filters, it gets a clone of its own in the upgraded format, which the
-// hooks that follow redirect the game's views, barriers, clears and copies to. This file owns the registry and the clones' creation and
-// release; the original stays as the game made it.
+// The committed clones of the game's textures. A placed texture lives in a heap the game sized and shares with other resources, so it is
+// never upgraded in place: when it matches the texture upgrade filters, it gets a clone of its own in the upgraded format, which the hooks
+// that follow redirect the game's views, barriers, clears and copies to. With indirect upgrades ("enable_indirect_texture_format_upgrades")
+// the committed textures get one too, instead of their in place upgrade. This file owns the registry and the clones' creation and release;
+// the original stays as the game made it.
 //
 // The registry is process wide, because the hooks that read it are on ReShade's proxy, which has no device. They run on every game thread,
 // so "Find()" is a lock free check of "count" and then a shared lock.
@@ -558,7 +559,7 @@ namespace D3D12Clones
 
    // The clear value of a clone in "format", with the colour the game's value has. The upgraded format of a clone can be typeless, and a
    // clear value needs a typed one: none then (the clear value is only an optimization hint).
-   inline std::optional<D3D12_CLEAR_VALUE> ClearValueFor(DXGI_FORMAT format, const D3D12ResourceCreation::PlacedCreationArguments& arguments)
+   inline std::optional<D3D12_CLEAR_VALUE> ClearValueFor(DXGI_FORMAT format, const D3D12ResourceCreation::CreationArguments& arguments)
    {
       switch (format)
       {
@@ -580,10 +581,10 @@ namespace D3D12Clones
       return clear_value;
    }
 
-   // Creates the clone of the placed texture "original" in "format" on the native device and registers it, with the arguments the game's
-   // create had. A committed resource in the default heap, with the flags and the initial state (or layout) of the original. Null if
-   // the device refuses it (the game keeps its texture as it is). An inactive clone ("active" false) waits for its promotion.
-   inline ID3D12Resource* Create(ID3D12Device* device, ID3D12Resource* original, DXGI_FORMAT format, const D3D12ResourceCreation::PlacedCreationArguments& arguments, bool active)
+   // Creates the clone of the texture "original" in "format" on the native device and registers it, with the arguments the game's create
+   // had. A committed resource in the default heap, with the flags and the initial state (or layout) of the original. Null if the device
+   // refuses it (the game keeps its texture as it is). An inactive clone ("active" false) waits for its promotion.
+   inline ID3D12Resource* Create(ID3D12Device* device, ID3D12Resource* original, DXGI_FORMAT format, const D3D12ResourceCreation::CreationArguments& arguments, bool active)
    {
       const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
       const std::optional<D3D12_CLEAR_VALUE> clear_value = ClearValueFor(format, arguments);
