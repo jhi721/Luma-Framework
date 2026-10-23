@@ -8596,6 +8596,25 @@ namespace
       cmd_list_data.scissors_scaled = false;
    }
 
+   // The D3D12 counterparts of the "RSSetViewports()" and "RSSetScissorRects()" of the D3D11 render scale code in games, which reads the bound ones from the tracker
+   // ("cmd_list_data.d3d12_state.viewports" and "scissor_rects"): set on the game's list and in the tracker, so a Luma pass on the list binds these back ("RestoreGameGraphicsD3D12()"),
+   // not the ones they replaced. A draw into a scaled clone scales them again, as the game's own
+   void SetGameViewportsD3D12(CommandListData& cmd_list_data, uint32_t count, const reshade::api::viewport* viewports)
+   {
+      static_assert(sizeof(reshade::api::viewport) == sizeof(D3D12_VIEWPORT), "ReShade's viewports are D3D12's");
+      reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list_data.cmd_list->get_native())->RSSetViewports(count, reinterpret_cast<const D3D12_VIEWPORT*>(viewports));
+      D3D12State::BindViewports(&cmd_list_data.d3d12_state, 0, count, viewports);
+      cmd_list_data.viewports_scaled = false;
+   }
+
+   void SetGameScissorRectsD3D12(CommandListData& cmd_list_data, uint32_t count, const reshade::api::rect* rects)
+   {
+      static_assert(sizeof(reshade::api::rect) == sizeof(D3D12_RECT), "ReShade's rectangles are D3D12's");
+      reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list_data.cmd_list->get_native())->RSSetScissorRects(count, reinterpret_cast<const D3D12_RECT*>(rects));
+      D3D12State::BindScissorRects(&cmd_list_data.d3d12_state, 0, count, rects);
+      cmd_list_data.scissors_scaled = false;
+   }
+
 #if ENABLE_RCAS
    // RCAS sharpening ("Luma_RCAS_PS") of "source" into the whole "target" (through the view "target_desc"), recorded on the game's command list from a game's
    // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawRCAS()". "source" (viewed as 2D "source_format") must be readable by pixel shaders and "target"
