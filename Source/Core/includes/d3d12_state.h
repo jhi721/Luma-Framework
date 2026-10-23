@@ -140,6 +140,9 @@ namespace D3D12State
       std::vector<reshade::api::rect> scissor_rects;
       std::vector<reshade::api::resource_view_desc> render_target_descs; // By slot, next to "render_target_views": what the views are made again of
       reshade::api::resource_view_desc depth_stencil_desc = {};
+      // "OMSetBlendFactor()", as ReShade passes it: RGBA8 (the float factors truncated to 8 bit)
+      uint32_t blend_constant = 0;
+      bool has_blend_constant = false;
 #endif
 #if DEVELOPMENT
       BufferBinding index_buffer;
@@ -236,7 +239,7 @@ namespace D3D12State
             std::memcpy(binding->constants.data() + first, values, count * sizeof(uint32_t)); });
    }
 
-   // "IASetPrimitiveTopology()" arrives as a dynamic state
+   // "IASetPrimitiveTopology()" and "OMSetBlendFactor()" arrive as dynamic states
    void BindPipelineStates(CommandListState* state, uint32_t count, const reshade::api::dynamic_state* states, const uint32_t* values)
    {
       for (uint32_t i = 0; i < count; i++)
@@ -245,6 +248,13 @@ namespace D3D12State
          {
             state->primitive_topology = static_cast<reshade::api::primitive_topology>(values[i]);
          }
+#if ENABLE_D3D12_PASSES
+         else if (states[i] == reshade::api::dynamic_state::blend_constant)
+         {
+            state->blend_constant = values[i];
+            state->has_blend_constant = true;
+         }
+#endif
       }
    }
 #endif
@@ -310,49 +320,94 @@ namespace D3D12State
       std::copy_n(rects, count, state->scissor_rects.begin() + first);
    }
 
-   // Binds again, after a Luma pass recorded on the game's command list through ReShade's API, the graphics state it replaced: the root
-   // signature with the game's descriptor heaps (ReShade's "bind_descriptor_tables()" sets the heaps back the game had, or the heaps of
-   // the tables), the root arguments, "pipeline" (what Luma really had bound: a replacement or a render target format variant), the
-   // render targets and depth stencil (their views are made again: a game rewrites a CPU descriptor right after binding it), the viewports,
-   // the scissors and the topology. The pass must not touch anything else (index and vertex buffers, blend factor, stencil reference).
-   // Root CBVs and root SRVs/UAVs go natively: ReShade passes the latter as GPU virtual addresses, which its own API can't take back.
+   // Binds "root" again on the graphics or the compute bind point after a Luma pass: the root signature with the game's descriptor heaps (ReShade's
+   // "bind_descriptor_tables()" sets the heaps back the game had, or the heaps of the tables), then the root arguments. Root CBVs and root SRVs/UAVs
+   // go natively: ReShade passes the latter as GPU virtual addresses, which its own API can't take back. Nothing without a root signature.
    // ponytail: a game that set its descriptor heaps and bound no table of a heap type yet gets ReShade's heap of that type back (the
    // heaps ReShade restores are only certain when the game set both or bound tables from them).
-   void RestoreGraphics(reshade::api::command_list* cmd_list, const CommandListState& state, reshade::api::pipeline pipeline)
+   void RestoreRoot(reshade::api::command_list* cmd_list, const RootState& root, bool compute)
    {
-      reshade::api::device* const device = cmd_list->get_device();
-      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
-      const RootState& root = state.graphics;
-      if (root.layout.handle != 0)
+      if (root.layout.handle == 0)
       {
-         cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_graphics, root.layout, 0, 0, nullptr);
-         for (uint32_t param = 0; param < root.bindings.size(); param++)
+         return;
+      }
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      const reshade::api::shader_stage stages = (compute ? reshade::api::shader_stage::all_compute : reshade::api::shader_stage::all_graphics);
+      cmd_list->bind_descriptor_tables(stages, root.layout, 0, 0, nullptr);
+      for (uint32_t param = 0; param < root.bindings.size(); param++)
+      {
+         const RootBinding& binding = root.bindings[param];
+         if (binding.table.handle != 0)
          {
-            const RootBinding& binding = root.bindings[param];
-            if (binding.table.handle != 0)
+            cmd_list->bind_descriptor_tables(stages, root.layout, param, 1, &binding.table);
+         }
+         else if (binding.descriptor != 0)
+         {
+            switch (binding.descriptor_type)
             {
-               cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_graphics, root.layout, param, 1, &binding.table);
-            }
-            else if (binding.descriptor != 0)
+            case reshade::api::descriptor_type::constant_buffer:
             {
-               switch (binding.descriptor_type)
+               const D3D12_GPU_VIRTUAL_ADDRESS address = reinterpret_cast<ID3D12Resource*>(binding.descriptor)->GetGPUVirtualAddress() + binding.descriptor_offset;
+               if (compute)
                {
-               case reshade::api::descriptor_type::constant_buffer:
-                  native_list->SetGraphicsRootConstantBufferView(param, reinterpret_cast<ID3D12Resource*>(binding.descriptor)->GetGPUVirtualAddress() + binding.descriptor_offset);
-                  break;
-               case reshade::api::descriptor_type::buffer_unordered_access_view:
-                  native_list->SetGraphicsRootUnorderedAccessView(param, binding.descriptor);
-                  break;
-               default:
-                  native_list->SetGraphicsRootShaderResourceView(param, binding.descriptor);
-                  break;
+                  native_list->SetComputeRootConstantBufferView(param, address);
                }
+               else
+               {
+                  native_list->SetGraphicsRootConstantBufferView(param, address);
+               }
+               break;
             }
-            else if (!binding.constants.empty())
+            case reshade::api::descriptor_type::buffer_unordered_access_view:
+               if (compute)
+               {
+                  native_list->SetComputeRootUnorderedAccessView(param, binding.descriptor);
+               }
+               else
+               {
+                  native_list->SetGraphicsRootUnorderedAccessView(param, binding.descriptor);
+               }
+               break;
+            default:
+               if (compute)
+               {
+                  native_list->SetComputeRootShaderResourceView(param, binding.descriptor);
+               }
+               else
+               {
+                  native_list->SetGraphicsRootShaderResourceView(param, binding.descriptor);
+               }
+               break;
+            }
+         }
+         else if (!binding.constants.empty())
+         {
+            if (compute)
+            {
+               native_list->SetComputeRoot32BitConstants(param, UINT(binding.constants.size()), binding.constants.data(), 0);
+            }
+            else
             {
                native_list->SetGraphicsRoot32BitConstants(param, UINT(binding.constants.size()), binding.constants.data(), 0);
             }
          }
+      }
+   }
+
+   // Binds again, after a Luma pass recorded on the game's command list through ReShade's API, the graphics state it replaced: the root
+   // signature and its arguments ("RestoreRoot()"), "pipeline" (what Luma really had bound: a replacement or a render target format variant),
+   // the render targets and depth stencil (their views are made again: a game rewrites a CPU descriptor right after binding it), the viewports,
+   // the scissors, the topology and the blend factor. The pass must not touch anything else (index and vertex buffers, stencil reference).
+   // ponytail: the blend factor comes back as ReShade passes it, 8 bit, so a game's factor that isn't a multiple of 1/255 comes back a little lower
+   void RestoreGraphics(reshade::api::command_list* cmd_list, const CommandListState& state, reshade::api::pipeline pipeline)
+   {
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      RestoreRoot(cmd_list, state.graphics, false);
+      if (state.has_blend_constant)
+      {
+         const float blend_factor[4] = {float(state.blend_constant & 0xFF) / 255.f, float((state.blend_constant >> 8) & 0xFF) / 255.f, float((state.blend_constant >> 16) & 0xFF) / 255.f, float((state.blend_constant >> 24) & 0xFF) / 255.f};
+         native_list->OMSetBlendFactor(blend_factor);
       }
       if (pipeline.handle != 0)
       {
@@ -397,6 +452,24 @@ namespace D3D12State
          const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
          const uint32_t topology = uint32_t(state.primitive_topology);
          cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      }
+   }
+
+   // The compute counterpart of "RestoreGraphics()": the compute root signature and its arguments, and "pipeline" (one pipeline is bound
+   // for both). The game's descriptor heaps come back through the graphics root signature if it has no compute one.
+   void RestoreCompute(reshade::api::command_list* cmd_list, const CommandListState& state, reshade::api::pipeline pipeline)
+   {
+      if (state.compute.layout.handle != 0)
+      {
+         RestoreRoot(cmd_list, state.compute, true);
+      }
+      else
+      {
+         RestoreRoot(cmd_list, state.graphics, false);
+      }
+      if (pipeline.handle != 0)
+      {
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, pipeline);
       }
    }
 #endif

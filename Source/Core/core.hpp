@@ -203,9 +203,9 @@ using NativeCommandList = ID3D11DeviceContext;
 // Not ported to D3D12 yet, see "docs/DX12-Support-Plan.md"
 #error "Super resolution is D3D11 only"
 #endif
-// Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA): release builds track the graphics state they replace too, to
+// Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom): release builds track the graphics state they replace too, to
 // bind it again after them (see "D3D12State::RestoreGraphics()")
-#if DX12 && (ENABLE_RCAS || ENABLE_SMAA)
+#if DX12 && (ENABLE_RCAS || ENABLE_SMAA || ENABLE_BLOOM)
 #define ENABLE_D3D12_PASSES 1
 #else
 #define ENABLE_D3D12_PASSES 0
@@ -762,7 +762,17 @@ namespace
       { CompileTimeStringHash("SMAA Neighborhood Blending PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps" } },
 #endif
 
-#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS and SMAA: the passes of the others aren't ported to D3D12 yet
+#if ENABLE_BLOOM
+      { CompileTimeStringHash("Bloom VS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "bloom_main_vs" } },
+      { CompileTimeStringHash("Bloom Prefilter PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_prefilter_ps" } },
+      { CompileTimeStringHash("Bloom Downsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_downsample_ps" } },
+      { CompileTimeStringHash("Bloom Upsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_upsample_ps" } },
+#endif
+#if DX11 || ENABLE_BLOOM // D3D12 only draws it before its bloom
+      { CompileTimeStringHash("Karis Average CS"), { "Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader } },
+#endif
+
+#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS, SMAA and bloom: the passes of the others aren't ported to D3D12 yet
       { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
 
       // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
@@ -791,15 +801,6 @@ namespace
       { CompileTimeStringHash("Unclip LUT 2D"), { "Luma_UnclipLUT2D", reshade::api::pipeline_subobject_type::compute_shader } },
       { CompileTimeStringHash("Unclip LUT 1D"), { "Luma_UnclipLUT1D", reshade::api::pipeline_subobject_type::compute_shader } },
 #endif
-
-#if ENABLE_BLOOM
-      { CompileTimeStringHash("Bloom VS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "bloom_main_vs" } },
-      { CompileTimeStringHash("Bloom Prefilter PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_prefilter_ps" } },
-      { CompileTimeStringHash("Bloom Downsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_downsample_ps" } },
-      { CompileTimeStringHash("Bloom Upsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_upsample_ps" } },
-#endif
-
-      { CompileTimeStringHash("Karis Average CS"), { "Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader } },
 
 #if ENABLE_LUMA_TAA // See "LumaTAA::resolve_shader_hashes"
       { CompileTimeStringHash("Luma TAA Low CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "0" } } } },
@@ -3876,6 +3877,27 @@ namespace
          pass->layout = {};
          pass->pipelines.clear();
          pass->retired.clear();
+         for (const auto& [present_count, resource] : pass->retired_resources)
+         {
+            device->destroy_resource(resource);
+         }
+         pass->retired_resources.clear();
+      };
+      const auto destroy_views = [device](std::initializer_list<reshade::api::resource_view*> views)
+      {
+         for (reshade::api::resource_view* const view : views)
+         {
+            device->destroy_resource_view(*view);
+            *view = {};
+         }
+      };
+      const auto destroy_resources = [device](std::initializer_list<reshade::api::resource*> resources)
+      {
+         for (reshade::api::resource* const resource : resources)
+         {
+            device->destroy_resource(*resource);
+            *resource = {};
+         }
       };
 #if ENABLE_RCAS
       {
@@ -3888,21 +3910,36 @@ namespace
          auto& smaa = device_data.smaa;
          const std::unique_lock lock(smaa.mutex);
          destroy_game_pass(&smaa);
-         for (reshade::api::resource_view* const view : {&smaa.area_srv, &smaa.search_srv, &smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv})
+         destroy_views({&smaa.area_srv, &smaa.search_srv, &smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
+         destroy_resources({&smaa.area_texture, &smaa.search_texture, &smaa.edges, &smaa.weights, &smaa.output});
+      }
+#endif
+#if ENABLE_BLOOM
+      {
+         auto& karis = device_data.karis_average;
+         const std::unique_lock lock(karis.mutex);
+         destroy_game_pass(&karis);
+         destroy_views({&karis.output_srv, &karis.output_uav});
+         destroy_resources({&karis.output});
+      }
+      {
+         auto& bloom = device_data.bloom;
+         const std::unique_lock lock(bloom.mutex);
+         destroy_game_pass(&bloom);
+         for (std::vector<reshade::api::resource_view>* const views : {&bloom.rtvs_y, &bloom.srvs_y, &bloom.rtvs_x, &bloom.srvs_x})
          {
-            device->destroy_resource_view(*view);
-            *view = {};
+            for (const reshade::api::resource_view view : *views)
+            {
+               device->destroy_resource_view(view);
+            }
+            views->clear();
          }
-         for (reshade::api::resource* const resource : {&smaa.area_texture, &smaa.search_texture, &smaa.edges, &smaa.weights, &smaa.output})
-         {
-            device->destroy_resource(*resource);
-            *resource = {};
-         }
-         for (const auto& [present_count, resource] : smaa.retired_intermediates)
+         destroy_resources({&bloom.mips_y});
+         for (const reshade::api::resource resource : bloom.mips_x)
          {
             device->destroy_resource(resource);
          }
-         smaa.retired_intermediates.clear();
+         bloom.mips_x.clear();
       }
 #endif
 #endif
@@ -8479,23 +8516,32 @@ namespace
 #endif
 
 #if DX12
-   // A fullscreen pipeline of the natives "vertex_shader_hash" and "pixel_shader_hash" on "root_signature", which renders into "format". Null if the device refused it,
-   // or if the natives aren't compiled (yet), which "natives_found" tells apart.
-   com_ptr<ID3D12PipelineState> CreateD3D12NativePipeline(ID3D12Device* native_device, ID3D12RootSignature* root_signature, uint32_t vertex_shader_hash, uint32_t pixel_shader_hash, DXGI_FORMAT format, bool* natives_found)
+   // A fullscreen pipeline of the natives "vertex_shader_hash" and "shader_hash" (a pixel shader) on "root_signature", which renders into "format" with "blend", or
+   // without a vertex shader (0) the compute pipeline of "shader_hash". Null if the device refused it, or if the natives aren't compiled (yet), which "natives_found"
+   // tells apart.
+   com_ptr<ID3D12PipelineState> CreateD3D12NativePipeline(ID3D12Device* native_device, ID3D12RootSignature* root_signature, uint32_t vertex_shader_hash, uint32_t shader_hash, DXGI_FORMAT format, bool* natives_found, const D3D12_RENDER_TARGET_BLEND_DESC& blend = D3D12Passes::OPAQUE_BLEND)
    {
       // The DXIL of the natives, from the cache the D3D11 shader objects are made of. Its lock holds for as long as the pipeline needs the code
       const std::shared_lock lock_loading(s_mutex_loading);
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      const auto has_code = [](const auto& shader)
+      {
+         return shader != custom_shaders_cache.end() && shader->second && !shader->second->code.empty();
+      };
+      const auto shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(shader_hash));
       const auto vertex_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(vertex_shader_hash));
-      const auto pixel_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(pixel_shader_hash));
-      *natives_found = vertex_shader != custom_shaders_cache.end() && vertex_shader->second && !vertex_shader->second->code.empty() && pixel_shader != custom_shaders_cache.end() && pixel_shader->second && !pixel_shader->second->code.empty();
+      *natives_found = has_code(shader) && (vertex_shader_hash == 0 || has_code(vertex_shader));
       if (!*natives_found || !root_signature)
       {
          return nullptr;
       }
+      const std::vector<uint8_t>& code = shader->second->code;
+      if (vertex_shader_hash == 0)
+      {
+         return D3D12Passes::CreateComputePipeline(native_device, root_signature, {code.data(), code.size()});
+      }
       const std::vector<uint8_t>& vertex_code = vertex_shader->second->code;
-      const std::vector<uint8_t>& pixel_code = pixel_shader->second->code;
-      return D3D12Passes::CreateFullscreenPipeline(native_device, root_signature, {vertex_code.data(), vertex_code.size()}, {pixel_code.data(), pixel_code.size()}, format);
+      return D3D12Passes::CreateFullscreenPipeline(native_device, root_signature, {vertex_code.data(), vertex_code.size()}, {code.data(), code.size()}, format, blend);
    }
 
    // The common start of Luma's fullscreen passes at present on D3D12 (the display composition and the swapchain encode): they draw "Copy VS" and the
@@ -8615,10 +8661,20 @@ namespace
    constexpr uint32_t D3D12_GAME_PASS_FRAMES = 16;
    constexpr uint32_t D3D12_GAME_PASS_DRAWS_PER_FRAME = 4;
 
-   // The common start of the passes drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()"), with "pass->mutex" held: makes the layout of "params" (whose
-   // second parameter is the descriptor table) and "tables_per_draw" descriptor tables per draw on the first draw, one attempt, and drops the pipelines of older
-   // natives. Then the tables of this draw, or null if the pass can't draw.
-   const reshade::api::descriptor_table* PrepareD3D12GamePass(DeviceData::GamePassD3D12* pass, DeviceData& device_data, reshade::api::device* device, std::span<const reshade::api::pipeline_layout_param> params, uint32_t tables_per_draw, const char* name)
+   // Keeps "resource" (if any) for "D3D12_GAME_PASS_FRAMES" presents (a game list that still runs may read it), after which "PrepareD3D12GamePass()" destroys it. Then clears it
+   void RetireD3D12GamePassResource(DeviceData::GamePassD3D12* pass, uint64_t present_count, reshade::api::resource* resource)
+   {
+      if (resource->handle != 0)
+      {
+         pass->retired_resources.emplace_back(present_count, *resource);
+         *resource = {};
+      }
+   }
+
+   // The common start of the passes drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()", "DrawBloom()"...), with "pass->mutex" held: makes the layout of "params"
+   // (the descriptor table is its parameter "table_param") and "tables_per_draw" descriptor tables per draw on the first draw, one attempt, drops the pipelines of older
+   // natives and destroys the retired resources no list can read anymore. Then the tables of this draw, or null if the pass can't draw.
+   const reshade::api::descriptor_table* PrepareD3D12GamePass(DeviceData::GamePassD3D12* pass, DeviceData& device_data, reshade::api::device* device, std::span<const reshade::api::pipeline_layout_param> params, uint32_t table_param, uint32_t tables_per_draw, const char* name)
    {
       if (pass->failed)
       {
@@ -8627,7 +8683,7 @@ namespace
       if (pass->layout.handle == 0)
       {
          pass->tables.resize(D3D12_GAME_PASS_FRAMES * D3D12_GAME_PASS_DRAWS_PER_FRAME * tables_per_draw);
-         if (!device->create_pipeline_layout(uint32_t(params.size()), params.data(), &pass->layout) || !device->allocate_descriptor_tables(uint32_t(pass->tables.size()), pass->layout, 1, pass->tables.data()))
+         if (!device->create_pipeline_layout(uint32_t(params.size()), params.data(), &pass->layout) || !device->allocate_descriptor_tables(uint32_t(pass->tables.size()), pass->layout, table_param, pass->tables.data()))
          {
             if (pass->layout.handle != 0)
             {
@@ -8653,6 +8709,16 @@ namespace
       }
 
       const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+      const auto destroy_if_done = [device, present_count](const std::pair<uint64_t, reshade::api::resource>& retired)
+      {
+         if (present_count - retired.first < D3D12_GAME_PASS_FRAMES)
+         {
+            return false;
+         }
+         device->destroy_resource(retired.second);
+         return true;
+      };
+      std::erase_if(pass->retired_resources, destroy_if_done);
       if (pass->frame != present_count)
       {
          pass->frame = present_count;
@@ -8663,13 +8729,14 @@ namespace
 
    // The pipeline of "pass" of the natives "vertex_shader_hash" and "pixel_shader_hash" (a pass pairs each pixel shader with one vertex shader) into "format", after
    // "PrepareD3D12GamePass()": one attempt per format and natives generation, except while the natives aren't compiled. Null if there is none.
-   ID3D12PipelineState* GetD3D12GamePassPipeline(DeviceData::GamePassD3D12* pass, ID3D12Device* native_device, uint32_t vertex_shader_hash, uint32_t pixel_shader_hash, DXGI_FORMAT format, const char* name)
+   // A compute pass has no vertex shader (0, see "CreateD3D12NativePipeline()"). "blend" is that of the pixel shader's every pipeline.
+   ID3D12PipelineState* GetD3D12GamePassPipeline(DeviceData::GamePassD3D12* pass, ID3D12Device* native_device, uint32_t vertex_shader_hash, uint32_t pixel_shader_hash, DXGI_FORMAT format, const char* name, const D3D12_RENDER_TARGET_BLEND_DESC& blend = D3D12Passes::OPAQUE_BLEND)
    {
       const auto [pipeline, inserted] = pass->pipelines.try_emplace((uint64_t(pixel_shader_hash) << 32) | format);
       if (inserted)
       {
          bool natives_found = false;
-         pipeline->second = CreateD3D12NativePipeline(native_device, reinterpret_cast<ID3D12RootSignature*>(pass->layout.handle), vertex_shader_hash, pixel_shader_hash, format, &natives_found);
+         pipeline->second = CreateD3D12NativePipeline(native_device, reinterpret_cast<ID3D12RootSignature*>(pass->layout.handle), vertex_shader_hash, pixel_shader_hash, format, &natives_found, blend);
          if (!natives_found)
          {
             pass->pipelines.erase(pipeline);
@@ -8702,7 +8769,7 @@ namespace
       const std::unique_lock lock(rcas.mutex);
       const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
       const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.count = 4, .visibility = reshade::api::shader_stage::pixel}, {1, &source_range}};
-      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&rcas, device_data, device, params, 1, "RCAS");
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&rcas, device_data, device, params, 1, 1, "RCAS");
       if (!tables)
       {
          return false;
@@ -8824,7 +8891,7 @@ namespace
       sampler_range.type = reshade::api::descriptor_type::sampler;
       sampler_range.static_samplers = samplers;
       const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.dx_register_index = 1, .count = 8, .visibility = reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel}, {1, &texture_range}, {1, &sampler_range}};
-      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&smaa, device_data, device, params, 3, "SMAA");
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&smaa, device_data, device, params, 1, 3, "SMAA");
       if (!tables)
       {
          return false;
@@ -8843,16 +8910,6 @@ namespace
       const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
       const bool sharpen = ENABLE_RCAS && rcas_sharpness > 0.f;
       const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
-      const auto destroy_if_done = [device, present_count](const std::pair<uint64_t, reshade::api::resource>& retired)
-      {
-         if (present_count - retired.first < D3D12_GAME_PASS_FRAMES)
-         {
-            return false;
-         }
-         device->destroy_resource(retired.second);
-         return true;
-      };
-      std::erase_if(smaa.retired_intermediates, destroy_if_done);
       // The intermediates follow the target's size (and format, for the blend's). The views only hold CPU descriptors (the tables and the bindings copy them), but a game
       // list that still runs may read the old textures
       const auto retire = [&](std::initializer_list<reshade::api::resource*> resources, std::initializer_list<reshade::api::resource_view*> views)
@@ -8864,11 +8921,7 @@ namespace
          }
          for (reshade::api::resource* const resource : resources)
          {
-            if (resource->handle != 0)
-            {
-               smaa.retired_intermediates.emplace_back(present_count, *resource);
-               *resource = {};
-            }
+            RetireD3D12GamePassResource(&smaa, present_count, resource);
          }
       };
       const auto create_intermediate = [&](reshade::api::format format, reshade::api::resource* resource, reshade::api::resource_view* rtv, reshade::api::resource_view* srv)
@@ -8988,6 +9041,275 @@ namespace
       return true;
    }
 #endif // ENABLE_SMAA
+
+#if ENABLE_BLOOM
+   // The Karis average of "source" (viewed as 2D "source_format", in the state "source_state") into an fp16 texture of its size, which "output" gets, recorded on
+   // the game's command list: the D3D12 counterpart of the D3D11 "DrawKarisAverage()", to feed "DrawBloom()". The source goes into a state compute shaders read
+   // and back; the output is in a shader resource state after it. The game's compute state is bound again after it ("D3D12State::RestoreCompute()"). False, with
+   // nothing recorded, if it can't draw.
+   bool DrawKarisAverage(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource_usage source_state, reshade::api::resource* output)
+   {
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass)
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      auto& karis = device_data.karis_average;
+      const std::unique_lock lock(karis.mutex);
+      const reshade::api::descriptor_range ranges[] = {{.count = 1, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_shader_resource_view}, {.binding = 1, .count = 1, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_unordered_access_view}};
+      const reshade::api::pipeline_layout_param params[] = {{uint32_t(std::size(ranges)), ranges}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&karis, device_data, device, params, 0, 1, "Karis Average");
+      if (!tables)
+      {
+         return false;
+      }
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&karis, native_device, 0, CompileTimeStringHash("Karis Average CS"), DXGI_FORMAT_UNKNOWN, "Karis Average");
+      if (!pipeline)
+      {
+         return false;
+      }
+
+      const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
+      const uint32_t width = source_desc.texture.width;
+      const uint32_t height = source_desc.texture.height;
+      if (karis.width != width || karis.height != height)
+      {
+         device->destroy_resource_view(karis.output_srv);
+         device->destroy_resource_view(karis.output_uav);
+         karis.output_srv = {};
+         karis.output_uav = {};
+         RetireD3D12GamePassResource(&karis, device_data.present_count.load(std::memory_order_relaxed), &karis.output);
+         karis.width = width;
+         karis.height = height;
+         const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1);
+         const bool created = device->create_resource({width, height, 1, 1, reshade::api::format::r16g16b16a16_float, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access}, nullptr, reshade::api::resource_usage::shader_resource, &karis.output) &&
+                              device->create_resource_view(karis.output, reshade::api::resource_usage::shader_resource, view_desc, &karis.output_srv) && device->create_resource_view(karis.output, reshade::api::resource_usage::unordered_access, view_desc, &karis.output_uav);
+         if (!created)
+         {
+            // What was made is destroyed with the device, or with the next size
+            karis.width = 0;
+            karis.height = 0;
+            static std::atomic_flag logged;
+            if (!logged.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::error, std::format("[Karis Average] ReShade refused its {}x{} output, so it doesn't draw", width, height).c_str());
+            }
+            return false;
+         }
+      }
+
+      reshade::api::resource_view source_view = {};
+      if (!device->create_resource_view(source, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, source_format, 0, 1, 0, 1}, &source_view))
+      {
+         return false;
+      }
+      const reshade::api::descriptor_table_update updates[] = {
+         {.table = tables[0], .count = 1, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = &source_view},
+         {.table = tables[0], .binding = 1, .count = 1, .type = reshade::api::descriptor_type::texture_unordered_access_view, .descriptors = &karis.output_uav},
+      };
+      device->update_descriptor_tables(uint32_t(std::size(updates)), updates);
+      device->destroy_resource_view(source_view);
+
+      const reshade::api::resource_usage source_compute_state = source_state | reshade::api::resource_usage::shader_resource_non_pixel;
+      if (source_compute_state != source_state)
+      {
+         cmd_list->barrier(source, source_state, source_compute_state);
+      }
+      cmd_list->barrier(karis.output, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::compute, karis.layout, 0, 1, &tables[0]);
+      cmd_list->dispatch((width + 7) / 8, (height + 7) / 8, 1);
+      cmd_list->barrier(karis.output, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+      if (source_compute_state != source_state)
+      {
+         cmd_list->barrier(source, source_compute_state, source_state);
+      }
+
+      D3D12State::RestoreCompute(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      *output = karis.output;
+      return true;
+   }
+
+   // The most levels "DrawBloom()" takes (each level draws at most 3 times)
+   constexpr uint32_t BLOOM_MAX_MIPS = 16;
+
+   // The bloom of "scene" (viewed as 2D "scene_format", readable by pixel shaders) over "mip_count" levels (at most "BLOOM_MAX_MIPS"), with the gaussian sigma of each
+   // level in "sigmas", recorded on the game's command list: the D3D12 counterpart of the D3D11 "DrawBloom()", with the same passes and sizes. The game's
+   // "Luma_Bloom_impl.hlsl" can only read "LumaBloom" and its texture: the game's cbuffers aren't bound. "bloom" gets the texture whose mip 0 is the bloom (fp16,
+   // half the scene's size), in a shader resource state. The game's graphics state is bound again after it (its blend factor too, see "D3D12State::RestoreGraphics()").
+   // False, with nothing recorded, if it can't draw.
+   bool DrawBloom(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource scene, reshade::api::format scene_format, uint32_t mip_count, const float* sigmas, reshade::api::resource* bloom_output)
+   {
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass || mip_count == 0 || mip_count > BLOOM_MAX_MIPS)
+      {
+         ASSERT_ONCE(mip_count != 0 && mip_count <= BLOOM_MAX_MIPS);
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      auto& bloom = device_data.bloom;
+      const std::unique_lock lock(bloom.mutex);
+      const reshade::api::descriptor_range texture_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      const reshade::api::sampler_desc linear_sampler = {.filter = reshade::api::filter_mode::min_mag_mip_linear};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = 1;
+      sampler_range.visibility = reshade::api::shader_stage::pixel;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = &linear_sampler;
+      const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.dx_register_index = 11, .count = 8, .visibility = reshade::api::shader_stage::pixel}, {1, &texture_range}, {1, &sampler_range}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&bloom, device_data, device, params, 1, 3 * BLOOM_MAX_MIPS, "Bloom");
+      if (!tables)
+      {
+         return false;
+      }
+      // Both blend factors 0.5: an energy preserving average of the upsampled level and the one below
+      const D3D12_RENDER_TARGET_BLEND_DESC average_blend = {.BlendEnable = TRUE, .SrcBlend = D3D12_BLEND_BLEND_FACTOR, .DestBlend = D3D12_BLEND_BLEND_FACTOR, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ZERO, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL};
+      ID3D12PipelineState* const downsample_pipeline = GetD3D12GamePassPipeline(&bloom, native_device, CompileTimeStringHash("Bloom VS"), CompileTimeStringHash("Bloom Downsample PS"), DXGI_FORMAT_R16G16B16A16_FLOAT, "Bloom");
+      ID3D12PipelineState* const prefilter_pipeline = GetD3D12GamePassPipeline(&bloom, native_device, CompileTimeStringHash("Bloom VS"), CompileTimeStringHash("Bloom Prefilter PS"), DXGI_FORMAT_R16G16B16A16_FLOAT, "Bloom");
+      ID3D12PipelineState* const upsample_pipeline = GetD3D12GamePassPipeline(&bloom, native_device, CompileTimeStringHash("Bloom VS"), CompileTimeStringHash("Bloom Upsample PS"), DXGI_FORMAT_R16G16B16A16_FLOAT, "Bloom", average_blend);
+      if (!downsample_pipeline || !prefilter_pipeline || !upsample_pipeline)
+      {
+         return false;
+      }
+
+      const reshade::api::resource_desc scene_desc = device->get_resource_desc(scene);
+      const uint32_t scene_width = scene_desc.texture.width;
+      const uint32_t scene_height = scene_desc.texture.height;
+      const uint32_t x_mip0_width = scene_width / 2;
+      const uint32_t x_mip0_height = scene_height;
+      const uint32_t y_mip0_width = scene_width / 2;
+      const uint32_t y_mip0_height = scene_height / 2;
+      if (bloom.scene_width != scene_width || bloom.scene_height != scene_height || bloom.mip_count != mip_count)
+      {
+         for (std::vector<reshade::api::resource_view>* const views : {&bloom.rtvs_y, &bloom.srvs_y, &bloom.rtvs_x, &bloom.srvs_x})
+         {
+            for (const reshade::api::resource_view view : *views)
+            {
+               device->destroy_resource_view(view);
+            }
+            views->assign(mip_count, {});
+         }
+         const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+         RetireD3D12GamePassResource(&bloom, present_count, &bloom.mips_y);
+         for (reshade::api::resource& resource : bloom.mips_x)
+         {
+            RetireD3D12GamePassResource(&bloom, present_count, &resource);
+         }
+         bloom.mips_x.assign(mip_count, {});
+         bloom.scene_width = scene_width;
+         bloom.scene_height = scene_height;
+         bloom.mip_count = mip_count;
+         constexpr reshade::api::format format = reshade::api::format::r16g16b16a16_float;
+         constexpr reshade::api::resource_usage usage = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
+         bool created = device->create_resource({y_mip0_width, y_mip0_height, 1, uint16_t(mip_count), format, 1, reshade::api::memory_heap::gpu_only, usage}, nullptr, reshade::api::resource_usage::shader_resource, &bloom.mips_y);
+         for (uint32_t i = 0; created && i < mip_count; i++)
+         {
+            const reshade::api::resource_view_desc y_desc(reshade::api::resource_view_type::texture_2d, format, i, 1, 0, 1);
+            const reshade::api::resource_view_desc x_desc(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
+            created = device->create_resource_view(bloom.mips_y, reshade::api::resource_usage::render_target, y_desc, &bloom.rtvs_y[i]) && device->create_resource_view(bloom.mips_y, reshade::api::resource_usage::shader_resource, y_desc, &bloom.srvs_y[i]) &&
+                      device->create_resource({(std::max)(x_mip0_width >> i, 1u), (std::max)(x_mip0_height >> i, 1u), 1, 1, format, 1, reshade::api::memory_heap::gpu_only, usage}, nullptr, reshade::api::resource_usage::shader_resource, &bloom.mips_x[i]) &&
+                      device->create_resource_view(bloom.mips_x[i], reshade::api::resource_usage::render_target, x_desc, &bloom.rtvs_x[i]) && device->create_resource_view(bloom.mips_x[i], reshade::api::resource_usage::shader_resource, x_desc, &bloom.srvs_x[i]);
+         }
+         if (!created)
+         {
+            // What was made is destroyed with the device, or with the next size
+            bloom.mip_count = 0;
+            static std::atomic_flag logged;
+            if (!logged.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::error, std::format("[Bloom] ReShade refused its {} levels for a {}x{} scene, so it doesn't draw", mip_count, scene_width, scene_height).c_str());
+            }
+            return false;
+         }
+      }
+
+      reshade::api::resource_view scene_view = {};
+      if (!device->create_resource_view(scene, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, scene_format, 0, 1, 0, 1}, &scene_view))
+      {
+         return false;
+      }
+
+      const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+      const uint32_t topology = uint32_t(reshade::api::primitive_topology::triangle_list);
+      cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      uint32_t draws = 0;
+      // "source" is read at "source_size", "target" written at "target_size" (both whole)
+      const auto draw = [&](ID3D12PipelineState* pipeline, reshade::api::resource_view source, uint32_t source_width, uint32_t source_height, reshade::api::resource_view target, uint32_t target_width, uint32_t target_height, bool vertical, float sigma)
+      {
+         const reshade::api::descriptor_table table = tables[draws++];
+         const reshade::api::descriptor_table_update update = {.table = table, .count = 1, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = &source};
+         device->update_descriptor_tables(1, &update);
+         // "LumaBloom": src_size, inv_src_size, axis, sigma
+         const float constants[8] = {float(source_width), float(source_height), 1.f / float(source_width), 1.f / float(source_height), vertical ? 0.f : 1.f, vertical ? 1.f : 0.f, sigma, 0.f};
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+         cmd_list->push_constants(reshade::api::shader_stage::pixel, bloom.layout, 0, 0, uint32_t(std::size(constants)), constants);
+         cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, bloom.layout, 1, 1, &table);
+         cmd_list->bind_render_targets_and_depth_stencil(1, &target);
+         const reshade::api::viewport viewport = {0.f, 0.f, float(target_width), float(target_height), 0.f, 1.f};
+         const reshade::api::rect scissor = {0, 0, int32_t(target_width), int32_t(target_height)};
+         cmd_list->bind_viewports(0, 1, &viewport);
+         cmd_list->bind_scissor_rects(0, 1, &scissor);
+         cmd_list->draw(3, 1, 0, 0);
+      };
+      // Between the draws every texture and level is readable, the one drawn into goes to a render target state around its draw
+      auto* const native_mips_y = reinterpret_cast<ID3D12Resource*>(bloom.mips_y.handle);
+      const auto to_target = [&](ID3D12Resource* resource, UINT subresource)
+      {
+         D3D12Passes::Transition(native_list, resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, subresource);
+      };
+      const auto to_shader_resource = [&](ID3D12Resource* resource, UINT subresource)
+      {
+         D3D12Passes::Transition(native_list, resource, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, subresource);
+      };
+      const auto mip_x = [&](uint32_t i)
+      {
+         return reinterpret_cast<ID3D12Resource*>(bloom.mips_x[i].handle);
+      };
+      // The size of level "i" of a chain of "mip0_size"
+      const auto level = [](uint32_t mip0_size, uint32_t i)
+      {
+         return (std::max)(mip0_size >> i, 1u);
+      };
+
+      // Prefilter and downsample: the scene into X0 (horizontally), X0 into Y0 (vertically, with the threshold)
+      to_target(mip_x(0), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+      draw(downsample_pipeline, scene_view, scene_width, scene_height, bloom.rtvs_x[0], level(x_mip0_width, 0), level(x_mip0_height, 0), false, sigmas[0]);
+      to_shader_resource(mip_x(0), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+      to_target(native_mips_y, 0);
+      draw(prefilter_pipeline, bloom.srvs_x[0], level(x_mip0_width, 0), level(x_mip0_height, 0), bloom.rtvs_y[0], level(y_mip0_width, 0), level(y_mip0_height, 0), true, sigmas[0]);
+      to_shader_resource(native_mips_y, 0);
+      // Downsample: Y(i - 1) into Xi, Xi into Yi
+      for (uint32_t i = 1; i < mip_count; i++)
+      {
+         to_target(mip_x(i), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+         draw(downsample_pipeline, bloom.srvs_y[i - 1], level(y_mip0_width, i - 1), level(y_mip0_height, i - 1), bloom.rtvs_x[i], level(x_mip0_width, i), level(x_mip0_height, i), false, sigmas[i]);
+         to_shader_resource(mip_x(i), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+         to_target(native_mips_y, i);
+         draw(downsample_pipeline, bloom.srvs_x[i], level(x_mip0_width, i), level(x_mip0_height, i), bloom.rtvs_y[i], level(y_mip0_width, i), level(y_mip0_height, i), true, sigmas[i]);
+         to_shader_resource(native_mips_y, i);
+      }
+      // Upsample: Yi averaged into Y(i - 1), from the smallest level (its sigma is that of the last downsample, as the D3D11 one)
+      static constexpr float blend_factor[4] = {0.5f, 0.5f, 0.5f, 0.f};
+      native_list->OMSetBlendFactor(blend_factor);
+      for (uint32_t i = mip_count - 1; i > 0; i--)
+      {
+         to_target(native_mips_y, i - 1);
+         draw(upsample_pipeline, bloom.srvs_y[i], level(y_mip0_width, i), level(y_mip0_height, i), bloom.rtvs_y[i - 1], level(y_mip0_width, i - 1), level(y_mip0_height, i - 1), true, sigmas[mip_count - 1]);
+         to_shader_resource(native_mips_y, i - 1);
+      }
+      device->destroy_resource_view(scene_view);
+
+      D3D12State::RestoreGraphics(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      // The next draw checks its pipeline against the render targets again
+      cmd_list_data.render_target_formats_dirty = true;
+      *bloom_output = bloom.mips_y;
+      return true;
+   }
+#endif // ENABLE_BLOOM
 #endif // ENABLE_D3D12_PASSES
 
    // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its debug draw and UI composition aren't ported yet): copies the back buffer, then draws

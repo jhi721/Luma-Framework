@@ -207,16 +207,18 @@ namespace D3D12Passes
       return root_signature;
    }
 
-   // A pipeline for a pass that draws a triangle strip of 4 vertices from SV_VertexID (no input layout) over its one render target: no
-   // culling, depth, stencil or blending, all channels written, no multisampling. The caller sets D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP.
-   // Null if the device refuses it.
-   inline com_ptr<ID3D12PipelineState> CreateFullscreenPipeline(ID3D12Device* device, ID3D12RootSignature* root_signature, D3D12_SHADER_BYTECODE vertex_shader, D3D12_SHADER_BYTECODE pixel_shader, DXGI_FORMAT render_target_format)
+   // The blend of "CreateFullscreenPipeline()": none
+   constexpr D3D12_RENDER_TARGET_BLEND_DESC OPAQUE_BLEND = {.SrcBlend = D3D12_BLEND_ONE, .DestBlend = D3D12_BLEND_ZERO, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ZERO, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL};
+
+   // A pipeline for a pass that draws a triangle strip of 4 vertices (or a triangle list of 3) from SV_VertexID (no input layout) over its one render
+   // target: no culling, depth, stencil or multisampling, "blend" (none by default). The caller sets the topology. Null if the device refuses it.
+   inline com_ptr<ID3D12PipelineState> CreateFullscreenPipeline(ID3D12Device* device, ID3D12RootSignature* root_signature, D3D12_SHADER_BYTECODE vertex_shader, D3D12_SHADER_BYTECODE pixel_shader, DXGI_FORMAT render_target_format, const D3D12_RENDER_TARGET_BLEND_DESC& blend = OPAQUE_BLEND)
    {
       const D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {
          .pRootSignature = root_signature,
          .VS = vertex_shader,
          .PS = pixel_shader,
-         .BlendState = {.RenderTarget = {{.SrcBlend = D3D12_BLEND_ONE, .DestBlend = D3D12_BLEND_ZERO, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ZERO, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL}}},
+         .BlendState = {.RenderTarget = {blend}},
          .SampleMask = D3D12_DEFAULT_SAMPLE_MASK,
          .RasterizerState = {.FillMode = D3D12_FILL_MODE_SOLID, .CullMode = D3D12_CULL_MODE_NONE, .DepthClipEnable = TRUE},
          .PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -229,15 +231,24 @@ namespace D3D12Passes
       return pipeline;
    }
 
-   // All subresources of "resource" from "before" to "after" (legacy barrier). Records nothing for equal states: such a barrier makes the
+   // Null if the device refuses it
+   inline com_ptr<ID3D12PipelineState> CreateComputePipeline(ID3D12Device* device, ID3D12RootSignature* root_signature, D3D12_SHADER_BYTECODE compute_shader)
+   {
+      const D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {.pRootSignature = root_signature, .CS = compute_shader};
+      com_ptr<ID3D12PipelineState> pipeline;
+      device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+      return pipeline;
+   }
+
+   // "subresource" (all by default) of "resource" from "before" to "after" (legacy barrier). Records nothing for equal states: such a barrier makes the
    // list fail to close.
-   inline void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+   inline void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after, UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
    {
       if (before == after)
       {
          return;
       }
-      const D3D12_RESOURCE_BARRIER barrier = {.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, .Transition = {.pResource = resource, .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, .StateBefore = before, .StateAfter = after}};
+      const D3D12_RESOURCE_BARRIER barrier = {.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, .Transition = {.pResource = resource, .Subresource = subresource, .StateBefore = before, .StateAfter = after}};
       list->ResourceBarrier(1, &barrier);
    }
 } // namespace D3D12Passes

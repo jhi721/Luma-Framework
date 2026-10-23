@@ -855,7 +855,8 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       std::vector<com_ptr<ID3D12PipelineState>> retired; // Of older natives: a game list recorded with them may still run, so they live as long as the device
       uint64_t frame = UINT64_MAX;                        // The present count of the last draw, and the draws since it
       uint32_t frame_draws = 0;
-      bool failed = false; // ReShade refused the layout or the tables, which isn't tried again
+      bool failed = false;                                                        // ReShade refused the layout or the tables, which isn't tried again
+      std::vector<std::pair<uint64_t, reshade::api::resource>> retired_resources; // Replaced textures, with the present count they were replaced at (see "RetireD3D12GamePassResource()")
    };
 #if ENABLE_RCAS
    GamePassD3D12 rcas; // "SharpenParams" as 4 root constants (b0), then a table of t0
@@ -884,8 +885,29 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       reshade::api::format output_format = reshade::api::format::unknown;
       uint32_t width = 0;
       uint32_t height = 0;
-      std::vector<std::pair<uint64_t, reshade::api::resource>> retired_intermediates; // With the present count they were replaced at
    } smaa;
+#endif
+#if ENABLE_BLOOM
+   // A table of t0 and u0. Its output (fp16, at the source's size) is in a shader resource state between draws
+   struct KarisAverageD3D12 : GamePassD3D12
+   {
+      reshade::api::resource output = {};
+      reshade::api::resource_view output_srv = {};
+      reshade::api::resource_view output_uav = {};
+      uint32_t width = 0;
+      uint32_t height = 0;
+   } karis_average;
+   // "LumaBloom" as 8 root constants (b11), a table of t0 and the linear sampler (s0). The chains are made again with the scene's size or the mip count,
+   // in a shader resource state between draws: Y is one texture with a mip per level (mip 0 is the bloom), X one texture per level (see "DrawBloom()")
+   struct BloomD3D12 : GamePassD3D12
+   {
+      reshade::api::resource mips_y = {};
+      std::vector<reshade::api::resource> mips_x;
+      std::vector<reshade::api::resource_view> rtvs_y, srvs_y, rtvs_x, srvs_x;
+      uint32_t scene_width = 0;
+      uint32_t scene_height = 0;
+      uint32_t mip_count = 0;
+   } bloom;
 #endif
 #endif
 #endif
