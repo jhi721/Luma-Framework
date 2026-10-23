@@ -30,6 +30,7 @@ namespace
    int test_smaa_rcas = 0;        // 1: the SMAA of "test_smaa_hash" is followed by RCAS (sharpness 1)
    int test_bloom_hash = 0;       // The draw becomes the Karis average and the 3 level bloom of its t0, whose mip 0 is copied into the top left of its render target
    float test_mip_lod_bias = 0.f; // The mip bias of the upgraded samplers, applied at present: it reaches the samplers the game writes after it
+   int test_viewport_scale_hash = 0; // The draw's viewports and scissors get half their width through "SetGameViewportsD3D12()", and keep it for the draws after it (as a render scale's code does)
 #endif
 } // namespace
 
@@ -52,7 +53,7 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 #if DX12 && DEVELOPMENT
-      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}});
+      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
       Mcp::RegisterValues({{"test_mip_lod_bias", &test_mip_lod_bias, -8.f, 8.f}});
 #endif
    }
@@ -61,10 +62,42 @@ public:
    // "TextureUpgradeWriterShaders" (section "<NAME> Advanced" of ReShade.ini): pixel shader hashes in hex, with an optional ":slot" for the render target they write (0 by default),
    // separated by commas ("0x167D96E5,0x7561D004:1"). On D3D12 the textures a listed shader renders into are the only placed ones upgraded (see "includes/d3d12_clones.h").
    // "IndirectTextureUpgrades" (0 or 1) gives the matching committed textures a clone instead of their in place upgrade, "ChainTextureUpgrades" (0 to 2, see
-   // "ChainTextureFormatUpgradesType") promotes the clone of a texture an upgraded one is copied into.
+   // "ChainTextureFormatUpgradesType") promotes the clone of a texture an upgraded one is copied into. "TextureCustomDimensions" gives the textures of a size a clone of another
+   // ("texture_custom_dimensions_upgrades"), as "WxH>WxH" pairs separated by commas ("640x360>1280x720").
    // "LoadConfigs()" runs on boot, before any device exists, so the list is known when the game creates its textures.
    void LoadConfigs() override
    {
+      // ReShade returns a value with commas as a list, one null terminated entry per element
+      const auto read_list = [](const char* key)
+      {
+         std::string list(1024, '\0');
+         size_t list_size = list.size();
+         std::vector<std::string> tokens;
+         if (!reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), key, list.data(), &list_size))
+         {
+            return tokens;
+         }
+         list.resize(list_size);
+         std::ranges::replace(list, '\0', ',');
+         for (size_t start = 0; start < list.size();)
+         {
+            const size_t end = (std::min)(list.find(',', start), list.size());
+            tokens.push_back(list.substr(start, end - start));
+            start = end + 1;
+         }
+         return tokens;
+      };
+
+      for (const std::string& token : read_list("TextureCustomDimensions"))
+      {
+         uint32_t width = 0, height = 0, upgraded_width = 0, upgraded_height = 0;
+         if (sscanf_s(token.c_str(), "%ux%u>%ux%u", &width, &height, &upgraded_width, &upgraded_height) == 4)
+         {
+            texture_custom_dimensions_upgrades.emplace_back(uint4(width, height, 0, 0), reshade::api::format::unknown, uint4(upgraded_width, upgraded_height, 0, 0));
+            reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Custom dimensions (TextureCustomDimensions): {}x{} to {}x{}", width, height, upgraded_width, upgraded_height).c_str());
+         }
+      }
+
       reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "IndirectTextureUpgrades", enable_indirect_texture_format_upgrades);
       int chain_upgrades = int(enable_chain_indirect_texture_format_upgrades);
       if (reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "ChainTextureUpgrades", chain_upgrades))
@@ -76,21 +109,9 @@ public:
          reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Indirect upgrades: {}, chain upgrades: {}", enable_indirect_texture_format_upgrades, int(enable_chain_indirect_texture_format_upgrades)).c_str());
       }
 
-      std::string list(1024, '\0');
-      size_t list_size = list.size();
-      if (!reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TextureUpgradeWriterShaders", list.data(), &list_size))
-      {
-         return;
-      }
-      // ReShade returns a value with commas as a list, one null terminated entry per element
-      list.resize(list_size);
-      std::ranges::replace(list, '\0', ',');
       std::string parsed;
-      for (size_t start = 0; start < list.size();)
+      for (const std::string& token : read_list("TextureUpgradeWriterShaders"))
       {
-         const size_t end = (std::min)(list.find(',', start), list.size());
-         const std::string token = list.substr(start, end - start);
-         start = end + 1;
          char* hash_end = nullptr;
          const uint32_t hash = uint32_t(std::strtoul(token.c_str(), &hash_end, 16));
          if (hash_end == token.c_str())
@@ -132,6 +153,21 @@ public:
       if (is_test_hash(test_skip_hash))
       {
          return DrawOrDispatchOverrideType::Skip;
+      }
+      if (is_test_hash(test_viewport_scale_hash))
+      {
+         std::vector<reshade::api::viewport> viewports = cmd_list_data.d3d12_state.viewports;
+         for (reshade::api::viewport& viewport : viewports)
+         {
+            viewport.width *= 0.5f;
+         }
+         std::vector<reshade::api::rect> scissors = cmd_list_data.d3d12_state.scissor_rects;
+         for (reshade::api::rect& scissor : scissors)
+         {
+            scissor.right = scissor.left + (scissor.right - scissor.left) / 2;
+         }
+         SetGameViewportsD3D12(cmd_list_data, uint32_t(viewports.size()), viewports.data());
+         SetGameScissorRectsD3D12(cmd_list_data, uint32_t(scissors.size()), scissors.data());
       }
       if (is_custom_pass && is_test_hash(test_custom_data_hash))
       {
