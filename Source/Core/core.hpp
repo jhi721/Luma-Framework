@@ -967,8 +967,14 @@ namespace
    thread_local reshade::api::resource_desc upgraded_resource_init_desc = {};
    thread_local reshade::api::resource_desc forced_upgraded_resource_init_desc = {};
 #if DX12 && ENABLE_MINHOOK
-   // Set by "OnCreateResource()" for the "OnInitResource()" of the same create: the format its clone is made in (unknown: no clone)
-   thread_local DXGI_FORMAT pending_clone_format = DXGI_FORMAT_UNKNOWN;
+   // Set by "OnCreateResource()" for the "OnInitResource()" of the same create: the format (unknown: no clone) and the size its clone is made in
+   struct PendingClone
+   {
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      uint32_t width = 0;
+      uint32_t height = 0;
+   };
+   thread_local PendingClone pending_clone;
 #endif
    thread_local void* upgraded_resource_init_data = {};
    thread_local std::unordered_map<uint64_t, reshade::api::subresource_data*> upgraded_mapped_resources;
@@ -6268,16 +6274,21 @@ namespace
 #endif
 
 #if ENABLE_D3D12_PASSES
+   // The game's own: a draw into a scaled clone scales them again ("viewports_scaled")
    void OnBindViewports(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::viewport* viewports)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
-      D3D12State::BindViewports(&cmd_list->get_private_data<CommandListData>()->d3d12_state, first, count, viewports);
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12State::BindViewports(&cmd_list_data.d3d12_state, first, count, viewports);
+      cmd_list_data.viewports_scaled = false;
    }
 
    void OnBindScissorRects(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::rect* rects)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
-      D3D12State::BindScissorRects(&cmd_list->get_private_data<CommandListData>()->d3d12_state, first, count, rects);
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12State::BindScissorRects(&cmd_list_data.d3d12_state, first, count, rects);
+      cmd_list_data.scissors_scaled = false;
    }
 #endif
 
@@ -6881,6 +6892,56 @@ namespace
             {
                D3D12Clones::RequestPromotion(reinterpret_cast<ID3D12Resource*>(render_target_views[slot].resource));
             }
+         }
+      }
+#endif
+#if ENABLE_D3D12_PASSES && ENABLE_MINHOOK
+      // A draw into a clone of another size (custom dimensions: the bound views name the clone) covers it all, like the D3D11 scaled mirrors: the game's viewports and scissors (the
+      // tracked ones) are set scaled by the clone's size over the original's, once until the game or a Luma pass binds them again
+      // ponytail: only render targets (D3D12 has no depth clones yet: an unscaled depth target clips the draw), and no dispatch sizes (neither does D3D11)
+      if (!is_dispatch && D3D12Clones::registry.scaled_count.load(std::memory_order_relaxed) != 0 && (!cmd_list_data.viewports_scaled || !cmd_list_data.scissors_scaled))
+      {
+         const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
+         std::optional<std::pair<float, float>> scale;
+         for (const D3D12State::ViewInfo& view : state.render_target_views)
+         {
+            scale = (view.resource != 0 ? D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(view.resource)) : std::nullopt);
+            if (scale)
+            {
+               break;
+            }
+         }
+         if (scale)
+         {
+            const auto [scale_x, scale_y] = *scale;
+            auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+            if (!cmd_list_data.viewports_scaled && !state.viewports.empty())
+            {
+               // Scaled edges, rounded to whole pixels, and the sizes made again from them: adjacent viewports stay tiled
+               D3D12_VIEWPORT viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+               const UINT viewport_count = UINT((std::min)(state.viewports.size(), std::size(viewports)));
+               for (UINT i = 0; i < viewport_count; i++)
+               {
+                  const reshade::api::viewport& viewport = state.viewports[i];
+                  const float left = std::round(viewport.x * scale_x);
+                  const float top = std::round(viewport.y * scale_y);
+                  viewports[i] = {.TopLeftX = left, .TopLeftY = top, .Width = std::round((viewport.x + viewport.width) * scale_x) - left, .Height = std::round((viewport.y + viewport.height) * scale_y) - top, .MinDepth = viewport.min_depth, .MaxDepth = viewport.max_depth};
+               }
+               native_list->RSSetViewports(viewport_count, viewports);
+            }
+            if (!cmd_list_data.scissors_scaled && !state.scissor_rects.empty())
+            {
+               D3D12_RECT scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+               const UINT scissor_count = UINT((std::min)(state.scissor_rects.size(), std::size(scissors)));
+               for (UINT i = 0; i < scissor_count; i++)
+               {
+                  const reshade::api::rect& rect = state.scissor_rects[i];
+                  scissors[i] = {.left = std::lround(rect.left * scale_x), .top = std::lround(rect.top * scale_y), .right = std::lround(rect.right * scale_x), .bottom = std::lround(rect.bottom * scale_y)};
+               }
+               native_list->RSSetScissorRects(scissor_count, scissors);
+            }
+            cmd_list_data.viewports_scaled = true;
+            cmd_list_data.scissors_scaled = true;
          }
       }
 #endif
@@ -8526,6 +8587,16 @@ namespace
       return pipeline->second.get();
    }
 
+   // After a Luma pass on a game list: the game's graphics state again ("D3D12State::RestoreGraphics()"). Its own viewports and scissors come back, so a draw into a scaled clone scales
+   // them again, and the next draw checks its pipeline against the render targets again
+   void RestoreGameGraphicsD3D12(CommandListData& cmd_list_data)
+   {
+      D3D12State::RestoreGraphics(cmd_list_data.cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      cmd_list_data.render_target_formats_dirty = true;
+      cmd_list_data.viewports_scaled = false;
+      cmd_list_data.scissors_scaled = false;
+   }
+
 #if ENABLE_RCAS
    // RCAS sharpening ("Luma_RCAS_PS") of "source" into the whole "target" (through the view "target_desc"), recorded on the game's command list from a game's
    // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawRCAS()". "source" (viewed as 2D "source_format") must be readable by pixel shaders and "target"
@@ -8591,9 +8662,7 @@ namespace
       cmd_list->bind_pipeline_states(1, &topology_state, &topology);
       cmd_list->draw(4, 1, 0, 0);
 
-      D3D12State::RestoreGraphics(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
-      // The next draw checks its pipeline against the render targets again
-      cmd_list_data.render_target_formats_dirty = true;
+      RestoreGameGraphicsD3D12(cmd_list_data);
       return true;
    }
 #endif // ENABLE_RCAS
@@ -8811,9 +8880,7 @@ namespace
       draw(neighborhood_blending_pipeline, tables[2], target_view);
       device->destroy_resource_view(target_view);
 
-      D3D12State::RestoreGraphics(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
-      // The next draw checks its pipeline against the render targets again
-      cmd_list_data.render_target_formats_dirty = true;
+      RestoreGameGraphicsD3D12(cmd_list_data);
       return true;
    }
 #endif // ENABLE_SMAA
@@ -9079,9 +9146,7 @@ namespace
       }
       device->destroy_resource_view(scene_view);
 
-      D3D12State::RestoreGraphics(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
-      // The next draw checks its pipeline against the render targets again
-      cmd_list_data.render_target_formats_dirty = true;
+      RestoreGameGraphicsD3D12(cmd_list_data);
       *bloom_output = bloom.mips_y;
       return true;
    }
@@ -9231,9 +9296,7 @@ namespace
          cmd_list->barrier(target, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
       }
 
-      D3D12State::RestoreGraphics(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
-      // The next draw checks its pipeline against the render targets again
-      cmd_list_data.render_target_formats_dirty = true;
+      RestoreGameGraphicsD3D12(cmd_list_data);
       return true;
    }
 #endif // ENABLE_D3D12_PASSES
@@ -12697,10 +12760,11 @@ namespace
 #endif
 #if DX12 && ENABLE_MINHOOK
       // The clone of a placed texture, or of a committed one with indirect upgrades (see "includes/d3d12_clones.h"): the original stays as the game made it, the clone is the upgraded one
-      if (const DXGI_FORMAT clone_format = std::exchange(pending_clone_format, DXGI_FORMAT_UNKNOWN); clone_format != DXGI_FORMAT_UNKNOWN)
+      if (const PendingClone pending = std::exchange(pending_clone, {}); pending.format != DXGI_FORMAT_UNKNOWN)
       {
+         const DXGI_FORMAT clone_format = pending.format;
          // Seed mode (writer shaders listed): the clone waits for its promotion, until then the game keeps using the original
-         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), clone_format, D3D12ResourceCreation::current_creation_arguments, auto_texture_format_upgrade_shader_hashes.empty());
+         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), clone_format, pending.width, pending.height, D3D12ResourceCreation::current_creation_arguments, auto_texture_format_upgrade_shader_hashes.empty());
          if (clone)
          {
             const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
@@ -12717,14 +12781,16 @@ namespace
 #endif
          }
          static std::mutex logged_mutex;
-         static std::set<std::tuple<bool, D3D12ResourceCreation::Kind, reshade::api::format, DXGI_FORMAT>> logged_clones;
+         static std::set<std::tuple<bool, D3D12ResourceCreation::Kind, reshade::api::format, DXGI_FORMAT, uint32_t, uint32_t>> logged_clones;
          const std::unique_lock lock_logged(logged_mutex);
          const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
-         if (logged_clones.emplace(clone != nullptr, creation_kind, desc.texture.format, clone_format).second)
+         const bool resized = (pending.width != desc.texture.width || pending.height != desc.texture.height);
+         if (logged_clones.emplace(clone != nullptr, creation_kind, desc.texture.format, clone_format, (resized ? pending.width : 0), (resized ? pending.height : 0)).second)
          {
             const char* const original_name = GetFormatNameSafe(DXGI_FORMAT(desc.texture.format));
             const char* const kind_name = D3D12ResourceCreation::KIND_NAMES[size_t(creation_kind)];
-            const std::string message = (clone ? std::format("[Texture upgrades] Cloned a {} {} texture as {}", kind_name, original_name, GetFormatNameSafe(clone_format)) : std::format("[Texture upgrades] The device refused the clone of a {} {} texture as {}, it stays as the game made it", kind_name, original_name, GetFormatNameSafe(clone_format)));
+            const std::string clone_name = (resized ? std::format("{} at {}x{} (from {}x{})", GetFormatNameSafe(clone_format), pending.width, pending.height, desc.texture.width, desc.texture.height) : std::string(GetFormatNameSafe(clone_format)));
+            const std::string message = (clone ? std::format("[Texture upgrades] Cloned a {} {} texture as {}", kind_name, original_name, clone_name) : std::format("[Texture upgrades] The device refused the clone of a {} {} texture as {}, it stays as the game made it", kind_name, original_name, clone_name));
             reshade::log::message(clone ? reshade::log::level::info : reshade::log::level::warning, message.c_str());
          }
       }
@@ -12840,7 +12906,7 @@ namespace
       // No need to clear "upgraded_resource_init_desc"/"upgraded_resource_init_data" from its last value
       waiting_on_upgraded_resource_init = false; // If the same thread called another "OnCreateResource()" before we got a "OnInitResource()", it implies the resource creation has failed and we didn't get that event (we have to do it by thread as device objects creation is thread safe and can be done by multiple threads concurrently)
 #if DX12 && ENABLE_MINHOOK
-      pending_clone_format = DXGI_FORMAT_UNKNOWN;
+      pending_clone = {};
 #endif
 
 #if DX12
@@ -12895,6 +12961,20 @@ namespace
          {
             refusal = "it takes castable formats, which ReShade passes on as the game gave them and the upgraded format isn't one of";
          }
+         // Custom dimensions ("texture_custom_dimensions_upgrades") always go through a clone: the game's views and copies keep the original's size, and the draws into the clone get scaled
+         // viewports ("OnDrawOrDispatchD3D12()"). Its subresources stay the original's, so its barriers can follow the original's
+         const bool resized = (upgraded_desc->texture.width != desc.texture.width || upgraded_desc->texture.height != desc.texture.height);
+         if (!refusal && (resized || upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples))
+         {
+            if (upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples)
+            {
+               refusal = "its custom dimensions change its layers or samples, which the barriers of its clone couldn't follow";
+            }
+            else if (!ENABLE_D3D12_PASSES)
+            {
+               refusal = "its custom dimensions need the scaled viewports of the D3D12 passes' state tracking (\"ENABLE_D3D12_PASSES\")";
+            }
+         }
          if (refusal)
          {
 #if DEVELOPMENT
@@ -12908,9 +12988,9 @@ namespace
 #endif
             return false;
          }
-         if (creation_kind == D3D12ResourceCreation::Kind::Placed || !upgrade_directly)
+         if (creation_kind == D3D12ResourceCreation::Kind::Placed || !upgrade_directly || resized)
          {
-            pending_clone_format = DXGI_FORMAT(upgraded_desc->texture.format);
+            pending_clone = {.format = DXGI_FORMAT(upgraded_desc->texture.format), .width = upgraded_desc->texture.width, .height = upgraded_desc->texture.height};
             return false; // The desc stays the game's
          }
 #endif

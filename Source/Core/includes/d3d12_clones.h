@@ -67,6 +67,8 @@ namespace D3D12Clones
       ID3D12Device* device = nullptr; // The native device of "resource", which keeps it alive. Its fence and views are the only ones that work on the clone
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
       bool layouts = false;            // Created with enhanced barriers' layouts (the barriers of the original must be mirrored as such)
+      float scale_x = 1.f;             // The clone's width and height over the original's (custom dimensions, "texture_custom_dimensions_upgrades")
+      float scale_y = 1.f;
       bool active = true;              // Written under the exclusive lock only. Inactive: the game's views are on the original, and are recorded in "views"
       MovableFlag promotion_requested; // A listed shader renders into the texture: "PromotePending()" activates the clone at the next present
       // The views of the game on the original while the clone is inactive, by the (ReShade encoded, for CBV/SRV/UAV heaps) CPU descriptor handle they were written to
@@ -98,6 +100,9 @@ namespace D3D12Clones
       std::atomic<uint32_t> record_count = 0;                   // Of "record_owner", for the lock free fast out of the hooks that update the records
       std::atomic<uint32_t> inactive_count = 0;                 // The clones that aren't active, for the lock free fast out of "RequestPromotion()"
       std::atomic<uint32_t> pending_promotions = 0;             // The clones with "promotion_requested"
+      // The active clones of another size than their original, by clone, for the draws into them (see "FindScale()")
+      std::unordered_map<const ID3D12Resource*, std::pair<float, float>> scale_by_clone;
+      std::atomic<uint32_t> scaled_count = 0; // Of "scale_by_clone", for the lock free fast out of every draw
       std::vector<RetiredClone> retired;
       // Of the devices that presented (a game can make several), until "OnDestroyDevice()"
       std::unordered_map<ID3D12Device*, DeviceFence> fences;
@@ -126,12 +131,38 @@ namespace D3D12Clones
       return Find(original, true);
    }
 
+   // The width and height scale of an active clone of another size than its original ("clone" is the clone: the views name it), null for every other resource
+   inline std::optional<std::pair<float, float>> FindScale(const ID3D12Resource* clone)
+   {
+      if (registry.scaled_count.load(std::memory_order_relaxed) == 0)
+      {
+         return std::nullopt;
+      }
+      const std::shared_lock lock(registry.mutex);
+      const auto found = registry.scale_by_clone.find(clone);
+      return (found != registry.scale_by_clone.end() ? std::optional(found->second) : std::nullopt);
+   }
+
+   // The caller holds the exclusive lock
+   inline void AddScaledLocked(const Clone& clone)
+   {
+      if (clone.scale_x != 1.f || clone.scale_y != 1.f)
+      {
+         registry.scale_by_clone[clone.resource.get()] = {clone.scale_x, clone.scale_y};
+         registry.scaled_count.store(uint32_t(registry.scale_by_clone.size()), std::memory_order_relaxed);
+      }
+   }
+
    inline void Add(ID3D12Resource* original, Clone clone)
    {
       const std::unique_lock lock(registry.mutex);
       if (!clone.active)
       {
          registry.inactive_count.fetch_add(1);
+      }
+      else
+      {
+         AddScaledLocked(clone);
       }
       registry.by_original.insert_or_assign(original, std::move(clone));
       registry.count.store(uint32_t(registry.by_original.size()), std::memory_order_relaxed);
@@ -179,6 +210,10 @@ namespace D3D12Clones
       if (found->second.promotion_requested.value.load())
       {
          registry.pending_promotions.fetch_sub(1);
+      }
+      if (registry.scale_by_clone.erase(clone) != 0)
+      {
+         registry.scaled_count.store(uint32_t(registry.scale_by_clone.size()), std::memory_order_relaxed);
       }
       registry.retired.push_back({.resource = std::move(found->second.resource), .device = found->second.device});
       registry.by_original.erase(found);
@@ -523,6 +558,7 @@ namespace D3D12Clones
             clone.active = true;
             registry.inactive_count.fetch_sub(1);
             clone.promotion_requested.value.store(false);
+            AddScaledLocked(clone);
             for (const auto& [handle, record] : clone.views)
             {
                registry.record_owner.erase(handle);
@@ -581,10 +617,10 @@ namespace D3D12Clones
       return clear_value;
    }
 
-   // Creates the clone of the texture "original" in "format" on the native device and registers it, with the arguments the game's create
-   // had. A committed resource in the default heap, with the flags and the initial state (or layout) of the original. Null if the device
+   // Creates the clone of the texture "original" in "format" and "width" x "height" (custom dimensions, else the original's) on the native device and registers it, with the
+   // arguments the game's create had. A committed resource in the default heap, with the flags, subresources and initial state (or layout) of the original. Null if the device
    // refuses it (the game keeps its texture as it is). An inactive clone ("active" false) waits for its promotion.
-   inline ID3D12Resource* Create(ID3D12Device* device, ID3D12Resource* original, DXGI_FORMAT format, const D3D12ResourceCreation::CreationArguments& arguments, bool active)
+   inline ID3D12Resource* Create(ID3D12Device* device, ID3D12Resource* original, DXGI_FORMAT format, uint64_t width, uint32_t height, const D3D12ResourceCreation::CreationArguments& arguments, bool active)
    {
       const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
       const std::optional<D3D12_CLEAR_VALUE> clear_value = ClearValueFor(format, arguments);
@@ -599,6 +635,8 @@ namespace D3D12Clones
          {
             D3D12_RESOURCE_DESC1 desc = original2->GetDesc1();
             desc.Format = format;
+            desc.Width = width;
+            desc.Height = height;
             desc.Alignment = 0; // The placement alignment the game chose (e.g. 4 KB "small" textures) doesn't carry over to a bigger format
             result = device10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_BARRIER_LAYOUT(arguments.initial_state), clear_value_pointer, nullptr, 0, nullptr, IID_PPV_ARGS(&resource));
          }
@@ -607,6 +645,8 @@ namespace D3D12Clones
       {
          D3D12_RESOURCE_DESC desc = original->GetDesc();
          desc.Format = format;
+         desc.Width = width;
+         desc.Height = height;
          desc.Alignment = 0;
          result = device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATES(arguments.initial_state), clear_value_pointer, IID_PPV_ARGS(&resource));
       }
@@ -615,7 +655,8 @@ namespace D3D12Clones
          return nullptr;
       }
       ID3D12Resource* const clone = resource.get();
-      Add(original, {.resource = std::move(resource), .device = device, .format = format, .layouts = arguments.uses_layouts, .active = active});
+      const D3D12_RESOURCE_DESC original_desc = original->GetDesc();
+      Add(original, {.resource = std::move(resource), .device = device, .format = format, .layouts = arguments.uses_layouts, .scale_x = float(width) / float(original_desc.Width), .scale_y = float(height) / float(original_desc.Height), .active = active});
       return clone;
    }
 
