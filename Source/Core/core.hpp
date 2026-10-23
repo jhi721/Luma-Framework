@@ -154,8 +154,8 @@ using NativeCommandList = ID3D11DeviceContext;
 #define ENABLE_REFLEX 1
 #endif // ENABLE_REFLEX
 // scRGB games (the fp16 back buffer the game, ReShade and Luma see) present HDR10 PQ through a proxy back buffer (see "includes/swapchain_proxy.hpp").
-// Needs MinHook; without it the swapchain stays fp16 scRGB. D3D11 only.
-#if !ENABLE_MINHOOK || DX12
+// Needs MinHook; without it the swapchain stays fp16 scRGB.
+#if !ENABLE_MINHOOK
 #undef ENABLE_SWAPCHAIN_PROXY
 #define ENABLE_SWAPCHAIN_PROXY 0
 #elif !defined(ENABLE_SWAPCHAIN_PROXY)
@@ -735,15 +735,15 @@ namespace
       { CompileTimeStringHash("Copy VS"), { "Luma_Copy_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
       { CompileTimeStringHash("Display Composition"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader } },
 
-#if DX11 // The D3D12 builds only have the natives of their display composition, "Copy VS" and "Display Composition": the passes of the others aren't ported to D3D12 yet
+      // Encodes the scRGB proxy back buffer into the real HDR10 PQ (or SDR sRGB) one, see "ENABLE_SWAPCHAIN_PROXY"
+      { CompileTimeStringHash("Swapchain Encode"), { "Luma_SwapchainEncode", reshade::api::pipeline_subobject_type::pixel_shader } },
+
+#if DX11 // The D3D12 builds only have the natives of their display composition and swapchain encode ("Copy VS", "Display Composition", "Swapchain Encode"): the passes of the others aren't ported to D3D12 yet
       { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
 
       // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
       { CompileTimeStringHash("Scale VS"), { "Luma_Scale_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
       { CompileTimeStringHash("Scale PS"), { "Luma_Scale_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
-
-      // Encodes the scRGB proxy back buffer into the real HDR10 PQ (or SDR sRGB) one, see "ENABLE_SWAPCHAIN_PROXY"
-      { CompileTimeStringHash("Swapchain Encode"), { "Luma_SwapchainEncode", reshade::api::pipeline_subobject_type::pixel_shader } },
       
       { CompileTimeStringHash("Copy RGB Max 0 A Sat"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
       { CompileTimeStringHash("Copy RGB Max 0 A Sat MS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "MS", "1" }, { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
@@ -3840,18 +3840,18 @@ namespace
 #endif
 
 #if DX12
+      // Waits for the GPU to be done with the command lists of the passes at present, then lets go of what they used
+      for (DeviceData::NativePassD3D12* pass : {static_cast<DeviceData::NativePassD3D12*>(&device_data.display_composition), &device_data.swapchain_encode})
       {
-         // Waits for the GPU to be done with the composition's command lists, then lets go of what they used
-         auto& composition = device_data.display_composition;
-         const std::unique_lock lock(composition.mutex);
-         D3D12Passes::Destroy(&composition.passes);
-         composition.retired.clear();
-         composition.pipeline.reset();
-         composition.root_signature.reset();
-         composition.source.reset();
-         D3D12UploadRing::Retire(composition.cmd_list_data.upload_ring.get(), &composition.cmd_list_data.upload_pages);
-         composition.cmd_list_data.upload_ring.reset();
+         const std::unique_lock lock(pass->mutex);
+         D3D12Passes::Destroy(&pass->passes);
+         pass->retired.clear();
+         pass->pipeline.reset();
+         pass->root_signature.reset();
+         D3D12UploadRing::Retire(pass->cmd_list_data.upload_ring.get(), &pass->cmd_list_data.upload_pages);
+         pass->cmd_list_data.upload_ring.reset();
       }
+      device_data.display_composition.source.reset();
       device_data.upload_ring.reset(); // The command lists that outlive the device's data keep the pool through their own pointer
 #endif
       device->destroy_private_data<DeviceData>();
@@ -3982,7 +3982,10 @@ namespace
       }
 
 #if DX12
-      last_swapchain_format_upgraded = (GetTypelessFormat(DXGI_FORMAT(game_back_buffer_format)) != GetTypelessFormat(DXGI_FORMAT(desc.back_buffer.texture.format)));
+      // The back buffers the game sees: the fp16 proxies of a proxied swapchain, whatever the real buffers are
+      const bool proxied = ENABLE_SWAPCHAIN_PROXY && swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type == SwapchainUpgradeType::scRGB;
+      const reshade::api::format seen_back_buffer_format = (proxied ? reshade::api::format::r16g16b16a16_float : desc.back_buffer.texture.format);
+      last_swapchain_format_upgraded = (GetTypelessFormat(DXGI_FORMAT(game_back_buffer_format)) != GetTypelessFormat(DXGI_FORMAT(seen_back_buffer_format)));
 #endif
       return changed;
    }
@@ -8314,7 +8317,7 @@ namespace
 #include "includes/mcp_server.inl"
 #endif // DEVELOPMENT
 
-#if ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_SWAPCHAIN_PROXY && DX11
    // Encodes the scRGB proxy into the real HDR10 PQ (or SDR sRGB) back buffer, the last thing drawn in the frame:
    // after the game, the display composition and ReShade's effects and GUI wrote the proxy.
    // Independent of "force_disable_display_composition", nothing else writes the real buffer.
@@ -8400,83 +8403,73 @@ namespace
 #endif
 
 #if DX12
-   // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its debug draw and UI composition aren't ported yet): copies the back buffer, then draws
-   // the "Display Composition" shader over it with "Copy VS", on a command list of Luma's own that runs on the present queue (see "includes/d3d12_passes.h"). What it needs is the device's
-   // ("DeviceData::display_composition"), made when it first draws. Each reason it doesn't draw is logged once.
-   void DrawDisplayCompositionD3D12(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, DeviceData& device_data, uint32_t custom_data_1, float custom_data_4)
+   // The common start of Luma's fullscreen passes at present on D3D12 (the display composition and the swapchain encode): they draw "Copy VS" and the
+   // native "pixel_shader_hash" on a command list of the pass's own that runs on the present queue (see "includes/d3d12_passes.h"). The caller holds
+   // "pass->mutex". Makes that command list on the first draw, and the root signature and pipeline again for a new render target format and when the
+   // natives changed, one attempt each: Luma's settings and data as root CBVs 0 and 1, a table of "srv_count" SRVs from t0, and a linear clamp sampler.
+   // Then resets the pass's LumaData for this present. False if the pass can't draw, each reason logged once.
+   bool PrepareD3D12NativePass(DeviceData::NativePassD3D12* pass, DeviceData& device_data, ID3D12Device* native_device, uint32_t pixel_shader_hash, UINT srv_count, DXGI_FORMAT format, const char* name)
    {
-      auto* const native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
-      auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
-      auto* const back_buffer = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
-      if (!back_buffer)
-      {
-         return;
-      }
-      const auto fail = [](std::atomic_flag* logged, const char* message)
+      const auto fail = [name](std::atomic_flag* logged, const char* reason)
       {
          if (!logged->test_and_set())
          {
-            reshade::log::message(reshade::log::level::error, message);
+            reshade::log::message(reshade::log::level::error, std::format("[{}] {}", name, reason).c_str());
          }
+         return false;
       };
 
-      auto& composition = device_data.display_composition;
-      const std::unique_lock lock(composition.mutex);
-      if (!composition.passes.fence)
+      if (!pass->passes.fence)
       {
          static std::atomic_flag no_passes;
-         if (!D3D12Passes::Create(&composition.passes, native_device))
+         if (!D3D12Passes::Create(&pass->passes, native_device))
          {
-            return fail(&no_passes, "[Display composition] The device refused the fence and the descriptor heaps of its command list, so the image isn't composed");
+            return fail(&no_passes, "The device refused the fence and the descriptor heaps of its command list, so it doesn't draw");
          }
-         composition.cmd_list_data.upload_ring = device_data.upload_ring;
-         composition.cmd_list_data.luma_settings_param = 0;
-         composition.cmd_list_data.luma_data_param = 1;
+         pass->cmd_list_data.upload_ring = device_data.upload_ring;
+         pass->cmd_list_data.luma_settings_param = 0;
+         pass->cmd_list_data.luma_data_param = 1;
       }
-      // The GPU can still run the commands that use what is replaced here: the next frame that is submitted keeps it alive
-      const auto retire = [&](IUnknown* object)
-      {
-         if (object)
-         {
-            composition.retired.emplace_back(object);
-         }
-      };
 
-      // The pipeline is made again for a new back buffer format and when the natives changed, one attempt each: nothing draws if it fails
-      const D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
       const uint32_t natives_generation = device_data.native_shaders_generation.load(std::memory_order_acquire);
-      if (composition.pipeline_format != back_buffer_desc.Format || composition.pipeline_generation != natives_generation)
+      if (pass->pipeline_format != format || pass->pipeline_generation != natives_generation)
       {
-         retire(composition.pipeline.get());
-         retire(composition.root_signature.get());
-         composition.pipeline.reset();
-         composition.root_signature.reset();
-         composition.pipeline_format = back_buffer_desc.Format;
-         composition.pipeline_generation = natives_generation;
+         // The GPU can still run the commands that use them: the next frame that is submitted keeps them alive
+         for (IUnknown* const object : {static_cast<IUnknown*>(pass->pipeline.get()), static_cast<IUnknown*>(pass->root_signature.get())})
+         {
+            if (object)
+            {
+               pass->retired.emplace_back(object);
+            }
+         }
+         pass->pipeline.reset();
+         pass->root_signature.reset();
+         pass->pipeline_format = format;
+         pass->pipeline_generation = natives_generation;
          bool natives_found = false;
          {
             // The DXIL of the natives, from the cache the D3D11 shader objects are made of. Its lock holds for as long as the pipeline needs the code
             const std::shared_lock lock_loading(s_mutex_loading);
             const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
             const auto vertex_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(CompileTimeStringHash("Copy VS")));
-            const auto pixel_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(CompileTimeStringHash("Display Composition")));
+            const auto pixel_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(pixel_shader_hash));
             natives_found = vertex_shader != custom_shaders_cache.end() && vertex_shader->second && !vertex_shader->second->code.empty() && pixel_shader != custom_shaders_cache.end() && pixel_shader->second && !pixel_shader->second->code.empty();
             if (natives_found)
             {
-               // LumaSettings, LumaData and the shader's SRVs t0 to t8 (the source, the UI texture and the debug draw ones, see below), at the registers the natives were compiled with. The sampler is for the debug draw
-               const D3D12_DESCRIPTOR_RANGE1 srv_range = {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV, .NumDescriptors = 9, .OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+               // At the registers the natives were compiled with
+               const D3D12_DESCRIPTOR_RANGE1 srv_range = {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV, .NumDescriptors = srv_count, .OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
                const D3D12_ROOT_PARAMETER1 parameters[] = {
                   {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, .Descriptor = {.ShaderRegister = luma_settings_cbuffer_define_index}, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
                   {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, .Descriptor = {.ShaderRegister = luma_data_cbuffer_define_index}, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
                   {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = {.NumDescriptorRanges = 1, .pDescriptorRanges = &srv_range}, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
                };
                const D3D12_STATIC_SAMPLER_DESC linear_clamp_sampler = {.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR, .AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .MaxAnisotropy = 1, .ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER, .MaxLOD = D3D12_FLOAT32_MAX, .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL};
-               composition.root_signature = D3D12Passes::CreateRootSignature(native_device, {.Version = D3D_ROOT_SIGNATURE_VERSION_1_1, .Desc_1_1 = {.NumParameters = UINT(std::size(parameters)), .pParameters = parameters, .NumStaticSamplers = 1, .pStaticSamplers = &linear_clamp_sampler}});
-               if (composition.root_signature)
+               pass->root_signature = D3D12Passes::CreateRootSignature(native_device, {.Version = D3D_ROOT_SIGNATURE_VERSION_1_1, .Desc_1_1 = {.NumParameters = UINT(std::size(parameters)), .pParameters = parameters, .NumStaticSamplers = 1, .pStaticSamplers = &linear_clamp_sampler}});
+               if (pass->root_signature)
                {
                   const std::vector<uint8_t>& vertex_code = vertex_shader->second->code;
                   const std::vector<uint8_t>& pixel_code = pixel_shader->second->code;
-                  composition.pipeline = D3D12Passes::CreateFullscreenPipeline(native_device, composition.root_signature.get(), {vertex_code.data(), vertex_code.size()}, {pixel_code.data(), pixel_code.size()}, back_buffer_desc.Format);
+                  pass->pipeline = D3D12Passes::CreateFullscreenPipeline(native_device, pass->root_signature.get(), {vertex_code.data(), vertex_code.size()}, {pixel_code.data(), pixel_code.size()}, format);
                }
             }
          }
@@ -8494,20 +8487,84 @@ namespace
 #endif
             }
          }
-         else if (!composition.pipeline)
+         else if (!pass->pipeline)
          {
             static std::atomic_flag no_pipeline;
-            fail(&no_pipeline, "[Display composition] The device refused the root signature or the pipeline of the composition (the debug layer says why), so the image isn't composed");
+            fail(&no_pipeline, "The device refused its root signature or its pipeline (the debug layer says why), so it doesn't draw");
          }
          else
          {
-            reshade::log::message(reshade::log::level::info, std::format("[Display composition] Made its pipeline for {} (natives generation {})", GetFormatNameSafe(back_buffer_desc.Format), natives_generation).c_str());
+            reshade::log::message(reshade::log::level::info, std::format("[{}] Made its pipeline for {} (natives generation {})", name, GetFormatNameSafe(format), natives_generation).c_str());
          }
       }
-      if (!composition.pipeline)
+      if (!pass->pipeline)
+      {
+         return false;
+      }
+      // The pages of the pass's previous LumaData are free once the GPU ran it
+      D3D12UploadRing::Retire(pass->cmd_list_data.upload_ring.get(), &pass->cmd_list_data.upload_pages);
+      pass->cmd_list_data.luma_data_address = 0;
+      return true;
+   }
+
+   // Executes the recording of "pass" (begun after "PrepareD3D12NativePass()") on "native_queue", with what the pass retired kept alive by the frame.
+   // The caller holds "pass->mutex". False, logged once, if its command list failed to close.
+   bool SubmitD3D12NativePass(DeviceData::NativePassD3D12* pass, ID3D12CommandQueue* native_queue, DeviceData& device_data, const char* name)
+   {
+      for (const com_ptr<IUnknown>& object : pass->retired)
+      {
+         D3D12Passes::KeepAlive(&pass->passes, object.get());
+      }
+      pass->retired.clear();
+      if (!D3D12Passes::Submit(&pass->passes, native_queue))
+      {
+         static std::atomic_flag no_submit;
+         if (!no_submit.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[{}] Its command list failed to close (a command it recorded is invalid, the debug layer says which), so it didn't draw", name).c_str());
+         }
+         return false;
+      }
+      D3D12UploadRing::OnExecute(&pass->cmd_list_data.upload_pages, native_queue, device_data.present_count);
+      return true;
+   }
+
+   // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its debug draw and UI composition aren't ported yet): copies the back buffer, then draws
+   // the "Display Composition" shader over it (see "PrepareD3D12NativePass()"). What it needs is the device's ("DeviceData::display_composition"), made when it first draws.
+   // Each reason it doesn't draw is logged once.
+   void DrawDisplayCompositionD3D12(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, DeviceData& device_data, uint32_t custom_data_1, float custom_data_4)
+   {
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
+      auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+      auto* const back_buffer = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
+      if (!back_buffer)
       {
          return;
       }
+      const auto fail = [](std::atomic_flag* logged, const char* message)
+      {
+         if (!logged->test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, message);
+         }
+      };
+
+      const D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
+      auto& composition = device_data.display_composition;
+      const std::unique_lock lock(composition.mutex);
+      // The table's SRVs: t0 the source, t1 the UI texture, t2 to t8 the debug draw ones (see below)
+      if (!PrepareD3D12NativePass(&composition, device_data, native_device, CompileTimeStringHash("Display Composition"), 9, back_buffer_desc.Format, "Display composition"))
+      {
+         return;
+      }
+      // The GPU can still run the commands that use what is replaced here: the next frame that is submitted keeps it alive
+      const auto retire = [&](IUnknown* object)
+      {
+         if (object)
+         {
+            composition.retired.emplace_back(object);
+         }
+      };
 
       // The shader reads a copy of the back buffer while it writes the back buffer
       const D3D12_RESOURCE_DESC source_desc = {.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D, .Width = back_buffer_desc.Width, .Height = back_buffer_desc.Height, .DepthOrArraySize = 1, .MipLevels = 1, .Format = back_buffer_desc.Format, .SampleDesc = {.Count = 1}};
@@ -8561,9 +8618,6 @@ namespace
       D3D12Passes::Transition(list, composition.source.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
       list->SetGraphicsRootSignature(composition.root_signature.get());
       list->SetPipelineState(composition.pipeline.get());
-      // Every present resets the composition's LumaData: the pages of the previous one are free once the GPU ran it
-      D3D12UploadRing::Retire(composition.cmd_list_data.upload_ring.get(), &composition.cmd_list_data.upload_pages);
-      composition.cmd_list_data.luma_data_address = 0;
       SetLumaConstantBuffers(list, composition.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
       SetLumaConstantBuffers(list, composition.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, custom_data_1, 0, 0.f, custom_data_4);
       list->SetGraphicsRootDescriptorTable(2, recording->srv_gpu);
@@ -8576,19 +8630,91 @@ namespace
       list->DrawInstanced(4, 1, 0, 0);
       D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 
-      for (const com_ptr<IUnknown>& object : composition.retired)
+      if (SubmitD3D12NativePass(&composition, native_queue, device_data, "Display composition"))
       {
-         D3D12Passes::KeepAlive(&composition.passes, object.get());
+         composition.drawn_frame = cb_luma_global_settings.FrameIndex;
       }
-      composition.retired.clear();
-      if (!D3D12Passes::Submit(&composition.passes, native_queue))
-      {
-         static std::atomic_flag no_submit;
-         return fail(&no_submit, "[Display composition] Its command list failed to close (a command it recorded is invalid, the debug layer says which), so the image isn't composed");
-      }
-      D3D12UploadRing::OnExecute(&composition.cmd_list_data.upload_pages, native_queue, device_data.present_count);
-      composition.drawn_frame = cb_luma_global_settings.FrameIndex;
    }
+
+#if ENABLE_SWAPCHAIN_PROXY
+   // The D3D12 swapchain encode, the counterpart of "DrawSwapchainEncode()": the native present detours call it ("includes/swapchain_proxy.hpp"), after
+   // ReShade flushed its effects and GUI into the proxy. Encodes the proxy of the current back buffer into the real one, on the queue of the swapchain's
+   // last "present" event. Nothing else writes the real buffer, so a pass that can't draw leaves it black.
+   void DrawSwapchainEncodeD3D12(IDXGISwapChain* native_swapchain)
+   {
+      SwapchainProxy::Entry* const entry = SwapchainProxy::Find(native_swapchain);
+      com_ptr<IDXGISwapChain3> native_swapchain3;
+      if (!entry || !entry->queue || FAILED(native_swapchain->QueryInterface(&native_swapchain3)))
+      {
+         return;
+      }
+      // The window's display changed (HDR toggled, moved to another display...)
+      if (!entry->factory || !entry->factory->IsCurrent())
+      {
+         HWND hwnd = nullptr;
+         native_swapchain3->GetHwnd(&hwnd);
+         bool hdr_supported_window_display = false;
+         bool hdr_enabled_window_display = false;
+         Display::IsHDRSupportedAndEnabled(hwnd, hdr_supported_window_display, hdr_enabled_window_display, native_swapchain3.get());
+         UpdateSwapchainProxyOutput(native_swapchain3.get(), entry, hdr_enabled_window_display);
+      }
+
+      const UINT back_buffer_index = native_swapchain3->GetCurrentBackBufferIndex();
+      com_ptr<ID3D12Resource> proxy;
+      native_swapchain->GetBuffer(back_buffer_index, IID_PPV_ARGS(&proxy)); // The proxies might not have been requested yet (this creates them)
+      const com_ptr<ID3D12Resource> real_buffer = SwapchainProxy::GetRealBackBuffer(native_swapchain, back_buffer_index);
+      if (!proxy || !real_buffer || proxy.get() == real_buffer.get())
+      {
+         return;
+      }
+
+      reshade::api::device* const device = entry->queue->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(entry->queue->get_native());
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      const D3D12_RESOURCE_DESC real_buffer_desc = real_buffer->GetDesc();
+      auto& encode = device_data.swapchain_encode;
+      const std::unique_lock lock(encode.mutex);
+      if (!PrepareD3D12NativePass(&encode, device_data, native_device, CompileTimeStringHash("Swapchain Encode"), 1, real_buffer_desc.Format, "Swapchain encode"))
+      {
+         return;
+      }
+      const std::optional<D3D12Passes::Recording> recording = D3D12Passes::Begin(&encode.passes);
+      if (!recording)
+      {
+         static std::atomic_flag no_frame;
+         if (!no_frame.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, "[Swapchain encode] No frame of its command list is free (the GPU is 16 presents behind), or the device refused it, so the image is black at this present");
+         }
+         return;
+      }
+
+      native_device->CreateRenderTargetView(real_buffer.get(), nullptr, recording->rtv_cpu);
+      const D3D12_SHADER_RESOURCE_VIEW_DESC proxy_srv = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}};
+      native_device->CreateShaderResourceView(proxy.get(), &proxy_srv, recording->srv_cpu);
+
+      // Both are in PRESENT at present, after the game's, the composition's and ReShade's command lists on this queue
+      ID3D12GraphicsCommandList* const list = recording->list;
+      D3D12Passes::Transition(list, proxy.get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      D3D12Passes::Transition(list, real_buffer.get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      list->SetGraphicsRootSignature(encode.root_signature.get());
+      list->SetPipelineState(encode.pipeline.get());
+      SetLumaConstantBuffers(list, encode.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+      SetLumaConstantBuffers(list, encode.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, entry->encode_pq ? 0u : 1u);
+      list->SetGraphicsRootDescriptorTable(2, recording->srv_gpu);
+      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      const D3D12_VIEWPORT viewport = {0.f, 0.f, float(real_buffer_desc.Width), float(real_buffer_desc.Height), 0.f, 1.f};
+      const D3D12_RECT scissor = {0, 0, LONG(real_buffer_desc.Width), LONG(real_buffer_desc.Height)};
+      list->RSSetViewports(1, &viewport);
+      list->RSSetScissorRects(1, &scissor);
+      list->OMSetRenderTargets(1, &recording->rtv_cpu, FALSE, nullptr);
+      list->DrawInstanced(4, 1, 0, 0);
+      D3D12Passes::Transition(list, real_buffer.get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+      D3D12Passes::Transition(list, proxy.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT);
+      SubmitD3D12NativePass(&encode, native_queue, device_data, "Swapchain encode");
+   }
+#endif // ENABLE_SWAPCHAIN_PROXY
 #endif // DX12
 
    void OnPresent(
@@ -8633,6 +8759,13 @@ namespace
 #if ENABLE_SWAPCHAIN_PROXY
       // "finish_present" doesn't run if the previous present failed
       SwapchainProxy::real_buffer_visible = false;
+#if DX12
+      // The native present that follows encodes on this queue
+      if (SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(swapchain->get_native())))
+      {
+         entry->queue = queue;
+      }
+#endif
 #endif
 
 #if ENABLE_REFLEX
@@ -9180,7 +9313,7 @@ namespace
 
       game->OnPresent(native_device, device_data);
 
-#if ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_SWAPCHAIN_PROXY && DX11
       if (const SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(swapchain->get_native())); entry && !entry->has_effect_runtime)
       {
          DrawSwapchainEncode(queue->get_device(), queue->get_immediate_command_list(), (IDXGISwapChain*)(swapchain->get_native()), (HWND)(swapchain->get_hwnd()));
@@ -13720,7 +13853,7 @@ namespace
          if (!block_draw_until_device_custom_shaders_creation) s_mutex_shader_objects.unlock_shared();
       }
 
-#if ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_SWAPCHAIN_PROXY && DX11
       DrawSwapchainEncode(runtime->get_device(), runtime->get_command_queue()->get_immediate_command_list(), (IDXGISwapChain*)(runtime->get_native()), (HWND)(runtime->get_hwnd()));
 #endif
    }
@@ -20403,9 +20536,11 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #endif
 
       reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
-#if ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_SWAPCHAIN_PROXY && DX11
       reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
       reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+#elif ENABLE_SWAPCHAIN_PROXY
+      SwapchainProxy::encode = &DrawSwapchainEncodeD3D12;
 #endif
 
 #if DEVELOPMENT || TEST // Currently Dev only as we don't need the average user to compare the mod on/off
@@ -20603,7 +20738,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #endif
 
       reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
-#if ENABLE_SWAPCHAIN_PROXY
+#if ENABLE_SWAPCHAIN_PROXY && DX11
       reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
       reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
 #endif
