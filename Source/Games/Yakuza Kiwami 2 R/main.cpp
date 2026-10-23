@@ -5,6 +5,9 @@
 // The engine's hardware probe ("pxd::DeviceDetectWindowClass") creates a D3D11 device before the D3D12 ones: skip it
 #define CHECK_GRAPHICS_API_COMPATIBILITY 1
 
+// RCAS sharpening in place of the copy of the grade into the UI target (see "OnDrawOrDispatch()")
+#define ENABLE_RCAS 1
+
 #include "..\..\Core\core.hpp"
 
 // Dragon Engine, D3D12 only (DXIL SM 6.0). The scene ends in 0xD0869ED8 (log10(1 + scene), the only tone curve), the grade
@@ -12,8 +15,29 @@
 // B8G8R8A8 UI target, the HUD blends over it in gamma, and 0x8578A29E blits that to the swapchain (pow 2.2 decode, sRGB encode).
 // Pipeline record: _tools/yk2r/NOTES.md.
 
+namespace
+{
+   constexpr uint32_t PIXEL_SHADER_GRADE = 0x167D96E5;
+   constexpr uint32_t PIXEL_SHADER_COPY = 0x7561D004; // The copy of the grade into the UI target, and the bloom chain's downsample
+
+   float g_rcas_sharpness = 0.f; // RCAS on the graded image (before the HUD), 0 = off (the vanilla copy)
+} // namespace
+
+struct YakuzaKiwami2RDeviceData final : public GameDeviceData
+{
+   // What the grade rendered into (its fp16 clone), for the copy into the UI target to read with RCAS. Written and read by the
+   // threads that record the grade and the UI, cleared when the swapchain (and with it the game's targets) is made again.
+   std::atomic<uint64_t> grade_output = 0;
+   std::atomic<reshade::api::format> grade_output_format = reshade::api::format::unknown;
+};
+
 class YakuzaKiwami2R final : public Game
 {
+   static YakuzaKiwami2RDeviceData& GetGameDeviceData(DeviceData& device_data)
+   {
+      return *static_cast<YakuzaKiwami2RDeviceData*>(device_data.game);
+   }
+
 public:
    void OnInit(bool async) override
    {
@@ -25,6 +49,55 @@ public:
 
       // Manual paper white sliders, not the OS reference level. Core shows the UI one on UI_DRAW_TYPE >= 1.
       use_os_reference_white_level = false;
+   }
+
+   void OnCreateDevice(NativeDevice* native_device, DeviceData& device_data) override
+   {
+      device_data.game = new YakuzaKiwami2RDeviceData;
+   }
+
+   void OnInitSwapchain(reshade::api::swapchain* swapchain) override
+   {
+      GetGameDeviceData(*swapchain->get_device()->get_private_data<DeviceData>()).grade_output = 0;
+   }
+
+   DrawOrDispatchOverrideType OnDrawOrDispatch(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
+      if (state.render_target_views.empty())
+      {
+         return DrawOrDispatchOverrideType::None;
+      }
+      const D3D12State::ViewInfo& render_target = state.render_target_views[0];
+      if (original_shader_hashes.Contains(PIXEL_SHADER_GRADE, reshade::api::shader_stage::pixel))
+      {
+         game_device_data.grade_output_format = render_target.format;
+         game_device_data.grade_output = render_target.resource;
+         return DrawOrDispatchOverrideType::None;
+      }
+      // The copy into the UI target is the one at the swapchain's width (the bloom chain's are smaller). Its source, the grade output, is in a
+      // shader resource state there and the UI target in a render target state, which RCAS needs.
+      const uint64_t grade_output = game_device_data.grade_output;
+      if (g_rcas_sharpness > 0.f && grade_output != 0 && original_shader_hashes.Contains(PIXEL_SHADER_COPY, reshade::api::shader_stage::pixel) && render_target.resource != 0)
+      {
+         reshade::api::device* const device = cmd_list_data.cmd_list->get_device();
+         if (device->get_resource_desc({render_target.resource}).texture.width == device_data.output_resolution.x && DrawRCAS(cmd_list_data, device_data, {grade_output}, game_device_data.grade_output_format, {render_target.resource}, state.render_target_descs[0], g_rcas_sharpness))
+         {
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+      }
+      return DrawOrDispatchOverrideType::None;
+   }
+
+   void LoadConfigs() override
+   {
+      reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
+   }
+
+   void DrawImGuiSettings(DeviceData& device_data) override
+   {
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening of the image under the HUD (0 = off).");
    }
 
    void PrintImGuiAbout() override
