@@ -877,6 +877,11 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       reshade::api::resource_view edges_srv = {};
       reshade::api::resource_view weights_rtv = {};
       reshade::api::resource_view weights_srv = {};
+      // The neighborhood blend's, when RCAS follows it: at the target's size and format
+      reshade::api::resource output = {};
+      reshade::api::resource_view output_rtv = {};
+      reshade::api::resource_view output_srv = {};
+      reshade::api::format output_format = reshade::api::format::unknown;
       uint32_t width = 0;
       uint32_t height = 0;
       std::vector<std::pair<uint64_t, reshade::api::resource>> retired_intermediates; // With the present count they were replaced at

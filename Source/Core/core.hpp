@@ -3888,12 +3888,12 @@ namespace
          auto& smaa = device_data.smaa;
          const std::unique_lock lock(smaa.mutex);
          destroy_game_pass(&smaa);
-         for (reshade::api::resource_view* const view : {&smaa.area_srv, &smaa.search_srv, &smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv})
+         for (reshade::api::resource_view* const view : {&smaa.area_srv, &smaa.search_srv, &smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv})
          {
             device->destroy_resource_view(*view);
             *view = {};
          }
-         for (reshade::api::resource* const resource : {&smaa.area_texture, &smaa.search_texture, &smaa.edges, &smaa.weights})
+         for (reshade::api::resource* const resource : {&smaa.area_texture, &smaa.search_texture, &smaa.edges, &smaa.weights, &smaa.output})
          {
             device->destroy_resource(*resource);
             *resource = {};
@@ -8796,10 +8796,12 @@ namespace
    // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawSMAA()", with the contract of "DrawRCAS()" (resource states, restore, false = nothing recorded).
    // The edge detection reads "color" too: a gamma encoded one is filtered in linear light with "SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR". "predication" (optional, as 2D
    // "predication_format") is the edge detection's t1. The game's "Luma_SMAA_impl.hlsl" gets "SMAA_RT_METRICS" (the target's) then "game_constants" as cbuffer b1.
-   // It doesn't draw on its first call, which asks the next present for its area and search textures.
+   // It doesn't draw on its first call, which asks the next present for its area and search textures. With "rcas_sharpness" > 0 (and "ENABLE_RCAS"), the blend goes
+   // into an intermediate of the target's format that "DrawRCAS()" sharpens into the target (the blend goes into the target if RCAS can't draw).
    // ponytail: no stencil mask of the edges (the blending weights run on every pixel, with the same result), no T2x
-   bool DrawSMAA(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource color, reshade::api::format color_format, reshade::api::resource predication, reshade::api::format predication_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, const float (&game_constants)[4])
+   bool DrawSMAA(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource color, reshade::api::format color_format, reshade::api::resource predication, reshade::api::format predication_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, const float (&game_constants)[4], float rcas_sharpness = 0.f)
    {
+      ASSERT_ONCE(ENABLE_RCAS || rcas_sharpness == 0.f);
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
       if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass)
       {
@@ -8839,6 +8841,7 @@ namespace
       const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
       const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
       const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
+      const bool sharpen = ENABLE_RCAS && rcas_sharpness > 0.f;
       const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
       const auto destroy_if_done = [device, present_count](const std::pair<uint64_t, reshade::api::resource>& retired)
       {
@@ -8850,15 +8853,16 @@ namespace
          return true;
       };
       std::erase_if(smaa.retired_intermediates, destroy_if_done);
-      // The intermediates follow the target's size. The views only hold CPU descriptors (the tables and the bindings copy them), but a game list that still runs may read the old textures
-      if (smaa.width != width || smaa.height != height)
+      // The intermediates follow the target's size (and format, for the blend's). The views only hold CPU descriptors (the tables and the bindings copy them), but a game
+      // list that still runs may read the old textures
+      const auto retire = [&](std::initializer_list<reshade::api::resource*> resources, std::initializer_list<reshade::api::resource_view*> views)
       {
-         for (reshade::api::resource_view* const view : {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv})
+         for (reshade::api::resource_view* const view : views)
          {
             device->destroy_resource_view(*view);
             *view = {};
          }
-         for (reshade::api::resource* const resource : {&smaa.edges, &smaa.weights})
+         for (reshade::api::resource* const resource : resources)
          {
             if (resource->handle != 0)
             {
@@ -8866,25 +8870,42 @@ namespace
                *resource = {};
             }
          }
+      };
+      const auto create_intermediate = [&](reshade::api::format format, reshade::api::resource* resource, reshade::api::resource_view* rtv, reshade::api::resource_view* srv)
+      {
+         const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
+         return device->create_resource({width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource}, nullptr, reshade::api::resource_usage::shader_resource, resource) &&
+                device->create_resource_view(*resource, reshade::api::resource_usage::render_target, view_desc, rtv) && device->create_resource_view(*resource, reshade::api::resource_usage::shader_resource, view_desc, srv);
+      };
+      const auto log_refused = [width, height]()
+      {
+         static std::atomic_flag logged;
+         if (!logged.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[SMAA] ReShade refused its {}x{} intermediates, so it doesn't draw", width, height).c_str());
+         }
+         return false;
+      };
+      if (smaa.width != width || smaa.height != height)
+      {
+         retire({&smaa.edges, &smaa.weights, &smaa.output}, {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
          smaa.width = width;
          smaa.height = height;
-         const auto create_intermediate = [&](reshade::api::format format, reshade::api::resource* resource, reshade::api::resource_view* rtv, reshade::api::resource_view* srv)
-         {
-            const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
-            return device->create_resource({width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource}, nullptr, reshade::api::resource_usage::shader_resource, resource) &&
-                   device->create_resource_view(*resource, reshade::api::resource_usage::render_target, view_desc, rtv) && device->create_resource_view(*resource, reshade::api::resource_usage::shader_resource, view_desc, srv);
-         };
          if (!create_intermediate(reshade::api::format::r8g8_unorm, &smaa.edges, &smaa.edges_rtv, &smaa.edges_srv) || !create_intermediate(reshade::api::format::r8g8b8a8_unorm, &smaa.weights, &smaa.weights_rtv, &smaa.weights_srv))
          {
             // What was made is destroyed with the device, or with the next size
             smaa.width = 0;
             smaa.height = 0;
-            static std::atomic_flag logged;
-            if (!logged.test_and_set())
-            {
-               reshade::log::message(reshade::log::level::error, std::format("[SMAA] ReShade refused its {}x{} intermediates, so it doesn't draw", width, height).c_str());
-            }
-            return false;
+            return log_refused();
+         }
+      }
+      if (sharpen && (smaa.output.handle == 0 || smaa.output_format != target_desc.format))
+      {
+         retire({&smaa.output}, {&smaa.output_rtv, &smaa.output_srv});
+         smaa.output_format = target_desc.format;
+         if (!create_intermediate(target_desc.format, &smaa.output, &smaa.output_rtv, &smaa.output_srv))
+         {
+            return log_refused();
          }
       }
 
@@ -8943,6 +8964,21 @@ namespace
       draw(blending_weight_pipeline, tables[1], smaa.weights_rtv);
       cmd_list->barrier(smaa.weights, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
 
+#if ENABLE_RCAS
+      if (sharpen)
+      {
+         cmd_list->barrier(smaa.output, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+         draw(neighborhood_blending_pipeline, tables[2], smaa.output_rtv);
+         cmd_list->barrier(smaa.output, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+         // It binds the game's state back itself. "rcas.mutex" is only ever taken after "smaa.mutex"
+         if (DrawRCAS(cmd_list_data, device_data, smaa.output, target_desc.format, target, target_desc, rcas_sharpness))
+         {
+            device->destroy_resource_view(target_view);
+            return true;
+         }
+         // It recorded nothing, so the blend's bindings still hold
+      }
+#endif
       draw(neighborhood_blending_pipeline, tables[2], target_view);
       device->destroy_resource_view(target_view);
 
