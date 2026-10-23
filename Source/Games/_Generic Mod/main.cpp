@@ -60,9 +60,22 @@ public:
 #if DX12
    // "TextureUpgradeWriterShaders" (section "<NAME> Advanced" of ReShade.ini): pixel shader hashes in hex, with an optional ":slot" for the render target they write (0 by default),
    // separated by commas ("0x167D96E5,0x7561D004:1"). On D3D12 the textures a listed shader renders into are the only placed ones upgraded (see "includes/d3d12_clones.h").
+   // "IndirectTextureUpgrades" (0 or 1) gives the matching committed textures a clone instead of their in place upgrade, "ChainTextureUpgrades" (0 to 2, see
+   // "ChainTextureFormatUpgradesType") promotes the clone of a texture an upgraded one is copied into.
    // "LoadConfigs()" runs on boot, before any device exists, so the list is known when the game creates its textures.
    void LoadConfigs() override
    {
+      reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "IndirectTextureUpgrades", enable_indirect_texture_format_upgrades);
+      int chain_upgrades = int(enable_chain_indirect_texture_format_upgrades);
+      if (reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "ChainTextureUpgrades", chain_upgrades))
+      {
+         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType(std::clamp(chain_upgrades, 0, int(ChainTextureFormatUpgradesType::DirectAndIndirectDependencies)));
+      }
+      if (enable_indirect_texture_format_upgrades || enable_chain_indirect_texture_format_upgrades != ChainTextureFormatUpgradesType::None)
+      {
+         reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Indirect upgrades: {}, chain upgrades: {}", enable_indirect_texture_format_upgrades, int(enable_chain_indirect_texture_format_upgrades)).c_str());
+      }
+
       std::string list(1024, '\0');
       size_t list_size = list.size();
       if (!reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TextureUpgradeWriterShaders", list.data(), &list_size))
