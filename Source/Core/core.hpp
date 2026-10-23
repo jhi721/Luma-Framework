@@ -3852,6 +3852,9 @@ namespace
          pass->cmd_list_data.upload_ring.reset();
       }
       device_data.display_composition.source.reset();
+#if ENABLE_MINHOOK
+      D3D12Clones::OnDestroyDevice(native_device);
+#endif
       device_data.upload_ring.reset(); // The command lists that outlive the device's data keep the pool through their own pointer
 #endif
       device->destroy_private_data<DeviceData>();

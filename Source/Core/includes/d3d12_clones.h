@@ -16,6 +16,7 @@
 // views are created again on the clone and from then on everything follows it. Only the textures the listed shaders write get upgraded, the
 // ones that hold packed data (IDs, masks) stay in their 8 bit format.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -61,6 +62,7 @@ namespace D3D12Clones
    struct Clone
    {
       com_ptr<ID3D12Resource> resource;
+      ID3D12Device* device = nullptr; // The native device of "resource", which keeps it alive. Its fence and views are the only ones that work on the clone
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
       bool layouts = false;            // Created with enhanced barriers' layouts (the barriers of the original must be mirrored as such)
       bool active = true;              // Written under the exclusive lock only. Inactive: the game's views are on the original, and are recorded in "views"
@@ -73,7 +75,15 @@ namespace D3D12Clones
    struct RetiredClone
    {
       com_ptr<ID3D12Resource> resource;
-      uint64_t fence_value = 0; // 0 until a present signaled the fence behind it
+      ID3D12Device* device = nullptr;
+      uint64_t fence_value = 0; // 0 until a present of its device signaled the device's fence behind it
+   };
+
+   // A fence only works on the queues of its own device
+   struct DeviceFence
+   {
+      com_ptr<ID3D12Fence> fence;
+      uint64_t last_signaled = 0;
    };
 
    struct Registry
@@ -87,8 +97,8 @@ namespace D3D12Clones
       std::atomic<uint32_t> inactive_count = 0;                 // The clones that aren't active, for the lock free fast out of "RequestPromotion()"
       std::atomic<uint32_t> pending_promotions = 0;             // The clones with "promotion_requested"
       std::vector<RetiredClone> retired;
-      com_ptr<ID3D12Fence> fence;
-      uint64_t last_signaled = 0;
+      // Of the devices that presented (a game can make several), until "OnDestroyDevice()"
+      std::unordered_map<ID3D12Device*, DeviceFence> fences;
    };
 
    // Never destroyed: the DLL can be unloaded after d3d12.dll, whose objects the members would release
@@ -168,51 +178,74 @@ namespace D3D12Clones
       {
          registry.pending_promotions.fetch_sub(1);
       }
-      registry.retired.push_back({.resource = std::move(found->second.resource)});
+      registry.retired.push_back({.resource = std::move(found->second.resource), .device = found->second.device});
       registry.by_original.erase(found);
       registry.count.store(uint32_t(registry.by_original.size()), std::memory_order_relaxed);
       registry.retired_count.store(uint32_t(registry.retired.size()), std::memory_order_relaxed);
       return clone;
    }
 
-   // At each present, on the present queue: the clones retired since the last one get the value of a signal behind everything the game
-   // submitted on that queue so far, and the ones whose value passed are released. No wait.
+   // The fence of "device", made on its first use. Null if the device refused it. The caller holds the exclusive lock.
+   inline DeviceFence* FindOrCreateFenceLocked(ID3D12Device* device)
+   {
+      DeviceFence& device_fence = registry.fences[device];
+      if (!device_fence.fence && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&device_fence.fence))))
+      {
+         registry.fences.erase(device);
+         return nullptr;
+      }
+      return &device_fence;
+   }
+
+   // At each present, on the present queue: the clones of the queue's device retired since the last one get the value of a signal behind
+   // everything the game submitted on that queue so far, and the ones whose value passed are released. No wait.
    // ponytail: the fence is on the present queue only; a game that last used a clone on another queue and destroys its original without
-   // synchronizing that queue to the present one breaks D3D12's own destruction rules too.
+   // synchronizing that queue to the present one breaks D3D12's own destruction rules too. The clones of a device that never presents stay
+   // retired until "OnDestroyDevice()".
    inline void OnPresent(ID3D12CommandQueue* queue)
    {
       if (registry.retired_count.load(std::memory_order_relaxed) == 0)
       {
          return;
       }
+      com_ptr<ID3D12Device> device;
+      if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))))
+      {
+         return;
+      }
       const std::unique_lock lock(registry.mutex);
-      if (!registry.fence)
+      DeviceFence* const device_fence = FindOrCreateFenceLocked(device.get());
+      if (!device_fence)
       {
-         com_ptr<ID3D12Device> device;
-         if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&registry.fence))))
-         {
-            return; // The clones stay retired (a leak) rather than released under the GPU
-         }
+         return; // The clones stay retired (a leak) rather than released under the GPU
       }
-      bool needs_signal = false;
-      for (const RetiredClone& retired : registry.retired)
+      const auto of_device = [&](const RetiredClone& retired)
+      { return retired.device == device.get(); };
+      if (std::ranges::any_of(registry.retired, [&](const RetiredClone& retired)
+             { return of_device(retired) && retired.fence_value == 0; }))
       {
-         needs_signal |= (retired.fence_value == 0);
-      }
-      if (needs_signal)
-      {
-         queue->Signal(registry.fence.get(), ++registry.last_signaled);
+         queue->Signal(device_fence->fence.get(), ++device_fence->last_signaled);
          for (RetiredClone& retired : registry.retired)
          {
-            if (retired.fence_value == 0)
+            if (of_device(retired) && retired.fence_value == 0)
             {
-               retired.fence_value = registry.last_signaled;
+               retired.fence_value = device_fence->last_signaled;
             }
          }
       }
-      const uint64_t completed = registry.fence->GetCompletedValue();
-      std::erase_if(registry.retired, [completed](const RetiredClone& retired)
-         { return retired.fence_value <= completed; });
+      const uint64_t completed = device_fence->fence->GetCompletedValue();
+      std::erase_if(registry.retired, [&](const RetiredClone& retired)
+         { return of_device(retired) && retired.fence_value <= completed; });
+      registry.retired_count.store(uint32_t(registry.retired.size()), std::memory_order_relaxed);
+   }
+
+   // The device is gone: D3D12 requires its GPU work to be done by then, so its retired clones go now, and so does its fence (which would keep it alive)
+   inline void OnDestroyDevice(ID3D12Device* device)
+   {
+      const std::unique_lock lock(registry.mutex);
+      registry.fences.erase(device);
+      std::erase_if(registry.retired, [device](const RetiredClone& retired)
+         { return retired.device == device; });
       registry.retired_count.store(uint32_t(registry.retired.size()), std::memory_order_relaxed);
    }
 
@@ -440,12 +473,13 @@ namespace D3D12Clones
       uint64_t wait_value = 0;
       {
          const std::unique_lock lock(registry.mutex);
-         if (!registry.fence && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&registry.fence))))
+         DeviceFence* const device_fence = FindOrCreateFenceLocked(device.get());
+         if (!device_fence)
          {
             return promotion;
          }
-         fence = registry.fence.get();
-         wait_value = ++registry.last_signaled;
+         fence = device_fence->fence.get();
+         wait_value = ++device_fence->last_signaled;
          queue->Signal(fence, wait_value);
       }
       const auto wait_start = std::chrono::steady_clock::now();
@@ -471,10 +505,17 @@ namespace D3D12Clones
       std::vector<Recreation> recreations;
       {
          const std::unique_lock lock(registry.mutex);
+         uint32_t pending_of_other_devices = 0;
          for (auto& [original, clone] : registry.by_original)
          {
             if (clone.active || !clone.promotion_requested.value.load())
             {
+               continue;
+            }
+            // Promoted by a present of its own device, whose queue the wait above didn't cover
+            if (clone.device != device.get())
+            {
+               pending_of_other_devices++;
                continue;
             }
             clone.active = true;
@@ -488,7 +529,7 @@ namespace D3D12Clones
             recreations.push_back({.clone = clone.resource.get(), .views = std::move(clone.views)});
             clone.views.clear();
          }
-         registry.pending_promotions.store(0);
+         registry.pending_promotions.store(pending_of_other_devices);
          registry.record_count.store(uint32_t(registry.record_owner.size()), std::memory_order_relaxed);
       }
       // No lock held: ReShade fires its events from inside these, and the detours of the views take the registry's
@@ -572,7 +613,7 @@ namespace D3D12Clones
          return nullptr;
       }
       ID3D12Resource* const clone = resource.get();
-      Add(original, {.resource = std::move(resource), .format = format, .layouts = arguments.uses_layouts, .active = active});
+      Add(original, {.resource = std::move(resource), .device = device, .format = format, .layouts = arguments.uses_layouts, .active = active});
       return clone;
    }
 
