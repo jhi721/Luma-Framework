@@ -8,8 +8,9 @@
 
 #define AVOID_INPUT_LOSS 1
 
-#if DX12 && DEVELOPMENT
-// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash", "test_smaa_hash", "test_bloom_hash") and of its sampler upgrade ("test_mip_lod_bias")
+#if DEVELOPMENT
+// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash", "test_smaa_hash", "test_bloom_hash") and of its sampler upgrade ("test_mip_lod_bias"),
+// and the D3D11 side of their parity check ("TestPass")
 #define ENABLE_RCAS 1
 #define ENABLE_SMAA 1
 #define ENABLE_BLOOM 1
@@ -32,10 +33,30 @@ namespace
    float test_mip_lod_bias = 0.f; // The mip bias of the upgraded samplers, applied at present: it reaches the samplers the game writes after it
    int test_viewport_scale_hash = 0; // The draw's viewports and scissors get half their width through "SetGameViewportsD3D12()", and keep it for the draws after it (as a render scale's code does)
 #endif
+#if DX11 && DEVELOPMENT
+   // The D3D11 side of the parity check of the D3D12 passes ("_tools/parity_check.py"), from "[Luma Advanced]": the draw of the pixel shader "TestPassHash" (hex) becomes
+   // "TestPass" of its t0 into its render target 0, with the arguments of the D3D12 knobs above
+   enum class TestPass : uint8_t
+   {
+      None,
+      RCAS,
+      SMAA,
+      SMAAThenRCAS,
+      Bloom
+   };
+   TestPass test_pass = TestPass::None;
+   uint32_t test_pass_hash = 0;
+#endif
 } // namespace
 
 struct GenericGameDeviceData final : public GameDeviceData
 {
+#if DX11 && DEVELOPMENT
+   com_ptr<ID3D11Buffer> test_smaa_constants; // b1 of the smoke's "Luma_SMAA_impl.hlsl": the metrics of the target, then 4 game floats (0)
+   com_ptr<ID3D11Texture2D> test_smaa_output; // SMAA's target when RCAS follows it, at the target's size and format
+   com_ptr<ID3D11RenderTargetView> test_smaa_output_rtv;
+   com_ptr<ID3D11ShaderResourceView> test_smaa_output_srv;
+#endif
 };
 
 // Generic mod that should work in many games out of the box, configurable at runtime.
@@ -52,6 +73,21 @@ public:
    {
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
+#if DX11 && DEVELOPMENT
+      char test_pass_name[32] = {};
+      size_t test_pass_name_size = sizeof(test_pass_name);
+      if (reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TestPass", test_pass_name, &test_pass_name_size))
+      {
+         const std::string_view name = test_pass_name;
+         test_pass = (name == "rcas" ? TestPass::RCAS : (name == "smaa" ? TestPass::SMAA : (name == "smaa_rcas" ? TestPass::SMAAThenRCAS : (name == "bloom" ? TestPass::Bloom : TestPass::None))));
+      }
+      char test_pass_hash_text[16] = {};
+      size_t test_pass_hash_size = sizeof(test_pass_hash_text);
+      if (reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TestPassHash", test_pass_hash_text, &test_pass_hash_size))
+      {
+         test_pass_hash = uint32_t(std::strtoul(test_pass_hash_text, nullptr, 16));
+      }
+#endif
 #if DX12 && DEVELOPMENT
       Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
       Mcp::RegisterValues({{"test_mip_lod_bias", &test_mip_lod_bias, -8.f, 8.f}});
@@ -229,6 +265,87 @@ public:
          {
             return DrawOrDispatchOverrideType::Replaced;
          }
+      }
+#endif
+#if DX11 && DEVELOPMENT
+      if (test_pass != TestPass::None && original_shader_hashes.Contains(test_pass_hash, reshade::api::shader_stage::pixel))
+      {
+         com_ptr<ID3D11ShaderResourceView> source;
+         native_device_context->PSGetShaderResources(0, 1, &source);
+         com_ptr<ID3D11RenderTargetView> target;
+         native_device_context->OMGetRenderTargets(1, &target, nullptr);
+         if (!source || !target)
+         {
+            return DrawOrDispatchOverrideType::None;
+         }
+         com_ptr<ID3D11Resource> target_resource;
+         target->GetResource(&target_resource);
+         com_ptr<ID3D11Texture2D> target_texture;
+         target_resource->QueryInterface(&target_texture);
+         D3D11_TEXTURE2D_DESC target_desc;
+         target_texture->GetDesc(&target_desc);
+         if (test_pass == TestPass::Bloom)
+         {
+            static constexpr float sigmas[] = {2.f, 2.f, 2.f};
+            com_ptr<ID3D11ShaderResourceView> karis_average;
+            DrawKarisAverage(native_device, native_device_context, device_data, source.get(), &karis_average);
+            com_ptr<ID3D11ShaderResourceView> bloom;
+            DrawBloom(native_device, native_device_context, device_data, karis_average.get(), int(std::size(sigmas)), sigmas, &bloom);
+            com_ptr<ID3D11Resource> bloom_resource;
+            bloom->GetResource(&bloom_resource);
+            native_device_context->CopySubresourceRegion(target_resource.get(), 0, 0, 0, 0, bloom_resource.get(), 0, nullptr);
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         if (test_pass == TestPass::RCAS)
+         {
+            if (!PrepareRCAS(native_device, device_data))
+            {
+               return DrawOrDispatchOverrideType::None;
+            }
+            DrawRCAS(native_device_context, device_data, source.get(), target.get(), 1.f);
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         if (!game_device_data.test_smaa_constants)
+         {
+            CD3D11_BUFFER_DESC constants_desc(sizeof(float) * 8, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
+            native_device->CreateBuffer(&constants_desc, nullptr, &game_device_data.test_smaa_constants);
+         }
+         if (D3D11_MAPPED_SUBRESOURCE mapped; SUCCEEDED(native_device_context->Map(game_device_data.test_smaa_constants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+         {
+            const float constants[8] = {1.f / float(target_desc.Width), 1.f / float(target_desc.Height), float(target_desc.Width), float(target_desc.Height), 0.f, 0.f, 0.f, 0.f};
+            std::memcpy(mapped.pData, constants, sizeof(constants));
+            native_device_context->Unmap(game_device_data.test_smaa_constants.get(), 0);
+         }
+         ID3D11RenderTargetView* smaa_target = target.get();
+         if (test_pass == TestPass::SMAAThenRCAS)
+         {
+            if (!PrepareRCAS(native_device, device_data))
+            {
+               return DrawOrDispatchOverrideType::None;
+            }
+            D3D11_TEXTURE2D_DESC output_desc = {};
+            if (game_device_data.test_smaa_output)
+            {
+               game_device_data.test_smaa_output->GetDesc(&output_desc);
+            }
+            if (!game_device_data.test_smaa_output || output_desc.Width != target_desc.Width || output_desc.Height != target_desc.Height || output_desc.Format != target_desc.Format)
+            {
+               output_desc = {.Width = target_desc.Width, .Height = target_desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = target_desc.Format, .SampleDesc = {1, 0}, .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE};
+               game_device_data.test_smaa_output = nullptr;
+               game_device_data.test_smaa_output_rtv = nullptr;
+               game_device_data.test_smaa_output_srv = nullptr;
+               native_device->CreateTexture2D(&output_desc, nullptr, &game_device_data.test_smaa_output);
+               native_device->CreateRenderTargetView(game_device_data.test_smaa_output.get(), nullptr, &game_device_data.test_smaa_output_rtv);
+               native_device->CreateShaderResourceView(game_device_data.test_smaa_output.get(), nullptr, &game_device_data.test_smaa_output_srv);
+            }
+            smaa_target = game_device_data.test_smaa_output_rtv.get();
+         }
+         DrawSMAA(native_device, native_device_context, device_data, smaa_target, source.get(), source.get(), nullptr, game_device_data.test_smaa_constants.get());
+         if (test_pass == TestPass::SMAAThenRCAS)
+         {
+            DrawRCAS(native_device_context, device_data, game_device_data.test_smaa_output_srv.get(), target.get(), 1.f);
+         }
+         return DrawOrDispatchOverrideType::Replaced;
       }
 #endif
 
