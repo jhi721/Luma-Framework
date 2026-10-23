@@ -3854,10 +3854,6 @@ namespace
           callback.second();
       }
 
-#if ENABLE_NVAPI
-      Display::NVAPI::DeInit();
-#endif
-
 #if DX12
       // Waits for the GPU to be done with the command lists of the passes at present, then lets go of what they used
       for (DeviceData::NativePassD3D12* pass : {static_cast<DeviceData::NativePassD3D12*>(&device_data.display_composition), &device_data.swapchain_encode})
