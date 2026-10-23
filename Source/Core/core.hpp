@@ -10171,43 +10171,60 @@ namespace
 
    //TODOFT3: merge all the shader permutations that use the same code in Prey (and then move shader binaries to bin folder? Add shader files to VS project?)
 
-#if DX11 // Draw, copy, clear, sampler and resource hooks aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 3 to 5)
-   // Expects "s_mutex_samplers" to already be locked
-   com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
+   // The sampler Luma's upgrade makes of a game's one ("samplers_upgrade_mode", "texture_mip_lod_bias_offset"): "desc" is a "D3D11_SAMPLER_DESC" or a "D3D12_SAMPLER_DESC",
+   // whose members and filter, comparison, anisotropy and bias values are the same. False if it isn't one to upgrade (it can still come out unchanged).
+   // Expects "s_mutex_samplers" to already be locked.
+   template <typename SamplerDesc>
+   bool UpgradeSamplerDesc(const DeviceData& device_data, SamplerDesc* desc_pointer)
    {
-      D3D11_SAMPLER_DESC desc = original_desc;
+      using Filter = decltype(SamplerDesc::Filter);
+      constexpr Filter FILTER_ANISOTROPIC = Filter(reshade::api::filter_mode::anisotropic);
+      constexpr Filter FILTER_COMPARISON_ANISOTROPIC = Filter(reshade::api::filter_mode::compare_anisotropic);
+      constexpr Filter FILTER_MIN_MAG_MIP_LINEAR = Filter(reshade::api::filter_mode::min_mag_mip_linear);
+      constexpr Filter FILTER_COMPARISON_MIN_MAG_MIP_LINEAR = Filter(reshade::api::filter_mode::compare_min_mag_mip_linear);
+      constexpr Filter FILTER_MIN_MAG_LINEAR_MIP_POINT = Filter(reshade::api::filter_mode::min_mag_linear_mip_point);
+      constexpr Filter FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT = Filter(reshade::api::filter_mode::compare_min_mag_linear_mip_point);
+      constexpr Filter FILTER_MIN_MAG_MIP_POINT = Filter(reshade::api::filter_mode::min_mag_mip_point);
+      constexpr Filter FILTER_COMPARISON_MIN_MAG_MIP_POINT = Filter(reshade::api::filter_mode::compare_min_mag_mip_point);
+      constexpr auto COMPARISON_NEVER = decltype(SamplerDesc::ComparisonFunc)(reshade::api::compare_op::never);
+      constexpr UINT REQ_MAXANISOTROPY = 16;
+      constexpr float MIP_LOD_BIAS_MIN = -16.f; // Setting the bias out of range (~ +/- 16) will make DX11 crash
+      constexpr float MIP_LOD_BIAS_MAX = 15.99f;
+
+      SamplerDesc& desc = *desc_pointer;
+      const SamplerDesc original_desc = desc;
 #if !DEVELOPMENT
-      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
+      if (desc.Filter == FILTER_ANISOTROPIC || desc.Filter == FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == FILTER_MIN_MAG_MIP_LINEAR))
       {
-         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
+         if (desc.Filter == FILTER_MIN_MAG_MIP_LINEAR)
          {
-            desc.Filter = D3D11_FILTER_ANISOTROPIC;
+            desc.Filter = FILTER_ANISOTROPIC;
          }
 
-         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+         desc.MaxAnisotropy = REQ_MAXANISOTROPY;
 
          if (samplers_upgrade_mode >= 5) // Bruteforce the offset
          {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
          else if (samplers_upgrade_mode == 4)
          {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
          else if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero
          {
              desc.MipLODBias = (desc.MipLODBias == 0.0f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias;
-             desc.MipLODBias = std::clamp(desc.MipLODBias, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
+             desc.MipLODBias = std::clamp(desc.MipLODBias, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
 
          float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
-         desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
+         desc.MinLOD = (std::max)(desc.MinLOD + (std::min)(bias_difference, 0.f), 0.f);
 
          // TODO: Clean up the code. Other "samplers_upgrade_mode" values aren't supported outside of development (because they aren't even needed, until proven otherwise)
       }
       else
       {
-         return nullptr;
+         return false;
       }
 #else
       // Prey's CryEngine (and most games) only uses:
@@ -10224,58 +10241,59 @@ namespace
       // Note that this might not fix all cases because there's still "ID3D11DeviceContext::SetResourceMinLOD()" and textures that are blurry for other reasons
       // because they use other types of samplers (unfortunately it seems like some decals use "D3D11_FILTER_MIN_MAG_MIP_LINEAR").
       // Note that the AF on different textures in the game seems is possibly linked with other graphics settings than just AF (maybe textures or objects quality).
-      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
+      if (desc.Filter == FILTER_ANISOTROPIC || desc.Filter == FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == FILTER_MIN_MAG_MIP_LINEAR))
       {
-         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
+         if (desc.Filter == FILTER_MIN_MAG_MIP_LINEAR)
          {
-            desc.Filter = D3D11_FILTER_ANISOTROPIC;
+            desc.Filter = FILTER_ANISOTROPIC;
          }
 
-         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+         desc.MaxAnisotropy = REQ_MAXANISOTROPY;
 
          // Note: this is the main ingredient in making textures less blurry
          if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero (as outside of development)
          {
-            desc.MipLODBias = std::clamp((desc.MipLODBias == 0.f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-            desc.MinLOD = max(desc.MinLOD + min(desc.MipLODBias - original_desc.MipLODBias, 0.f), 0.f);
+            desc.MipLODBias = std::clamp((desc.MipLODBias == 0.f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+            desc.MinLOD = (std::max)(desc.MinLOD + (std::min)(desc.MipLODBias - original_desc.MipLODBias, 0.f), 0.f);
          }
          else if (samplers_upgrade_mode == 4)
          {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
          else if (samplers_upgrade_mode >= 5)
          {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
          // Note: this never seems to affect anything in Prey, probably also doesn't in most games
          if (samplers_upgrade_mode >= 6)
          {
-            desc.MinLOD = min(desc.MinLOD, 0.f);
+            desc.MinLOD = (std::min)(desc.MinLOD, 0.f);
          }
       }
-      else if ((desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 1) // This is the most common (main/only) format being used other than AF
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2)
-         || (desc.Filter == D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3)
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4)
-         || (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5)
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
+      else if ((desc.Filter == FILTER_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 1) // This is the most common (main/only) format being used other than AF
+         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2)
+         || (desc.Filter == FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3)
+         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4)
+         || (desc.Filter == FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5)
+         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
       {
          //TODOFT: research. Force this on to see how it behaves. Doesn't work, it doesn't really help any further with (e.g.) blurry decal textures
          // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
          if (samplers_upgrade_mode >= 7)
          {
-            desc.Filter == (desc.ComparisonFunc != D3D11_COMPARISON_NEVER && samplers_upgrade_mode == 7) ? D3D11_FILTER_COMPARISON_ANISOTROPIC : D3D11_FILTER_ANISOTROPIC;
-            desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+            // TODO: this compares instead of assigning, so the filter stays (kept as the D3D11 code always had it)
+            (void)(desc.Filter == ((desc.ComparisonFunc != COMPARISON_NEVER && samplers_upgrade_mode == 7) ? FILTER_COMPARISON_ANISOTROPIC : FILTER_ANISOTROPIC));
+            desc.MaxAnisotropy = REQ_MAXANISOTROPY;
          }
          // Note: changing the lod bias of non anisotropic filters makes reflections (cubemap samples?) a lot more specular (shiny) in Prey (and probably does in other games too), so it's best avoided (it can look better is some screenshots, but it's likely not intended).
          // Even if we only fix up textures that didn't have a positive bias, we run into the same problem.
          if (samplers_upgrade_mode == 4 && desc.MipLODBias <= 0.f)
          {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
          else if (samplers_upgrade_mode >= 5)
          {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
          if (samplers_upgrade_mode >= 6)
          {
@@ -10284,10 +10302,55 @@ namespace
          else
          {
             float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
-            desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
+            desc.MinLOD = (std::max)(desc.MinLOD + (std::min)(bias_difference, 0.f), 0.f);
          }
       }
 #endif // !DEVELOPMENT
+      return true;
+   }
+
+#if DX12
+   // D3D12 samplers are descriptors, which the game writes ("CreateSampler()", "CreateSampler2()"): the heap ones are upgraded as they are written.
+   // ponytail: the static samplers of root signatures stay the game's, and a later "texture_mip_lod_bias_offset" doesn't reach the descriptors written
+   // before it (the D3D11 path swaps samplers at bind); rewrite the tracked descriptors when a D3D12 game needs a live bias (super resolution)
+   bool OnCreateSampler(reshade::api::device* device, reshade::api::sampler_desc& desc)
+   {
+      if (ignore_upgraded_samplers)
+      {
+         return false;
+      }
+      D3D12_SAMPLER_DESC native_desc = {.Filter = D3D12_FILTER(desc.filter), .AddressU = D3D12_TEXTURE_ADDRESS_MODE(desc.address_u), .AddressV = D3D12_TEXTURE_ADDRESS_MODE(desc.address_v), .AddressW = D3D12_TEXTURE_ADDRESS_MODE(desc.address_w), .MipLODBias = desc.mip_lod_bias, .MaxAnisotropy = UINT(desc.max_anisotropy), .ComparisonFunc = D3D12_COMPARISON_FUNC(desc.compare_op), .MinLOD = desc.min_lod, .MaxLOD = desc.max_lod};
+      const DeviceData* const device_data = device->get_private_data<DeviceData>();
+      if (!device_data)
+      {
+         return false;
+      }
+      bool upgraded = false;
+      {
+         const std::shared_lock lock(s_mutex_samplers);
+         upgraded = UpgradeSamplerDesc(*device_data, &native_desc);
+      }
+      if (!upgraded)
+      {
+         return false;
+      }
+      desc.filter = reshade::api::filter_mode(native_desc.Filter);
+      desc.mip_lod_bias = native_desc.MipLODBias;
+      desc.max_anisotropy = float(native_desc.MaxAnisotropy);
+      desc.min_lod = native_desc.MinLOD;
+      return true;
+   }
+#endif
+
+#if DX11 // Draw, copy, clear, sampler and resource hooks aren't ported to D3D12 yet (see "docs/DX12-Support-Plan.md" phases 3 to 5)
+   // Expects "s_mutex_samplers" to already be locked
+   com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
+   {
+      D3D11_SAMPLER_DESC desc = original_desc;
+      if (!UpgradeSamplerDesc(device_data, &desc))
+      {
+         return nullptr;
+      }
 
 #if DEVELOPMENT && !defined(NDEBUG) && 0 // Make sure that the device we are using to create samples is the "native" one (the final one), not the proxy created by ReShade // TODO: delete if ReShade doesn't take my PR for this
       ID3D11Device* parent_device = nullptr;
@@ -21313,6 +21376,12 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          reshade::register_event<reshade::addon_event::destroy_sampler>(OnDestroySampler);
       }
 #endif // DX11
+#if DX12
+      if (enable_samplers_upgrade)
+      {
+         reshade::register_event<reshade::addon_event::create_sampler>(OnCreateSampler);
+      }
+#endif
 
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
@@ -21521,6 +21590,12 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          reshade::unregister_event<reshade::addon_event::destroy_sampler>(OnDestroySampler);
       }
 #endif // DX11
+#if DX12
+      if (enable_samplers_upgrade)
+      {
+         reshade::unregister_event<reshade::addon_event::create_sampler>(OnCreateSampler);
+      }
+#endif
 
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
