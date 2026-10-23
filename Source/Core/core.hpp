@@ -261,6 +261,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #include "utils/pipeline.hpp"
 #include "utils/shader_compiler.hpp"
 #include "includes/d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
+#include "includes/d3d12_clones.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "includes/d3d12_root_signatures.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "utils/display.hpp"
 #if DX11 // Native D3D11 helpers
@@ -951,6 +952,10 @@ namespace
    thread_local bool waiting_on_upgraded_resource_init = false;
    thread_local reshade::api::resource_desc upgraded_resource_init_desc = {};
    thread_local reshade::api::resource_desc forced_upgraded_resource_init_desc = {};
+#if DX12 && ENABLE_MINHOOK
+   // Set by "OnCreateResource()" for the "OnInitResource()" of the same placed create: the format its clone is made in (unknown: no clone)
+   thread_local DXGI_FORMAT pending_placed_clone_format = DXGI_FORMAT_UNKNOWN;
+#endif
    thread_local void* upgraded_resource_init_data = {};
    thread_local std::unordered_map<uint64_t, reshade::api::subresource_data*> upgraded_mapped_resources;
 #if LUMA_PATCH_PROVIDERS != 0
@@ -3640,6 +3645,22 @@ namespace
             reshade::log::message(reshade::log::level::warning, "[Resource creation] The game's creates of resources aren't all hooked, so they can't be told committed from placed (no ReShade device proxy, or MinHook failed): the textures made by the creates that aren't hooked are not upgraded");
          }
       }
+      // The game's views, barriers, clears and discards follow its textures' clones (see "includes/d3d12_clones.h"). With writer shaders listed (the D3D11 seed list), only the textures
+      // they render into get upgraded: on D3D12 their "rtv_slots" are what counts, "uav_slots" and "scale" are ignored
+      if (!D3D12Clones::Install(native_device, !auto_texture_format_upgrade_shader_hashes.empty()))
+      {
+         static std::atomic_flag logged_clone_hooks_failure;
+         if (!logged_clone_hooks_failure.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The hooks of the clones of placed textures aren't all in (no ReShade device proxy, or MinHook failed): those textures can't be upgraded correctly");
+         }
+      }
+      static std::atomic_flag logged_ignored_seed_settings;
+      if (!logged_ignored_seed_settings.test_and_set() && std::ranges::any_of(auto_texture_format_upgrade_shader_hashes, [](const auto& entry)
+                                                             { return !entry.second.uav_slots.empty() || entry.second.scale; }))
+      {
+         reshade::log::message(reshade::log::level::warning, "[Texture upgrades] On D3D12 the writer shaders only promote the textures of their \"rtv_slots\": \"uav_slots\" and \"scale\" are ignored");
+      }
       // The game's root signatures get Luma's cbuffers at the indexes the game picked (see "includes/d3d12_root_signatures.h"), LumaData only if it has one
       if (luma_settings_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
       {
@@ -5975,7 +5996,8 @@ namespace
    // Tracks the pipeline a command list binds (on every build) like the D3D11 binds do: the hashes of its shaders, whether it runs custom ones, and the draw or dispatch callback they match.
    // Then binds the clone in place of the pipeline the game sets. The runtime sets the game's pipeline before this event, and "bind_pipeline()" sets the clone over it.
    // Never with "all_graphics": it would also replay the topology and blend factor ReShade stores for the pipelines it creates.
-   // Not ported: patch clones (no patch providers on D3D12), the known UI shader (UI separation) and the automatic texture format upgrades, nothing on D3D12 uses them yet.
+   // Not ported: patch clones (no patch providers on D3D12) and the known UI shader (UI separation), nothing on D3D12 uses them yet. The automatic texture format upgrades only resolve the writer shader
+   // of a bound pixel shader (see "OnDrawOrDispatchD3D12()").
    void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
@@ -6000,6 +6022,7 @@ namespace
       cmd_list_data.pipeline_state_has_custom_compute_shader = false;
       cmd_list_data.draw_callback = nullptr;
       cmd_list_data.dispatch_callback = nullptr;
+      cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
       cmd_list_data.luma_settings_param = -1;
       cmd_list_data.luma_data_param = -1;
       cmd_list_data.bound_cached_pipeline = nullptr;
@@ -6083,6 +6106,11 @@ namespace
       {
          cmd_list_data.pipeline_state_has_custom_graphics_shader = has_clone;
          cmd_list_data.draw_callback = find_callback(draw_callbacks_by_shader_hashes, cmd_list_data.pipeline_state_original_graphics_shader_hashes);
+         if (cmd_list_data.pipeline_state_original_pixel_shader.handle != 0)
+         {
+            const auto writer = auto_texture_format_upgrade_shader_hashes.find(uint32_t(cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0]));
+            cmd_list_data.auto_graphics_texture_format_upgrades = (writer != auto_texture_format_upgrade_shader_hashes.end() ? &writer->second : nullptr);
+         }
       }
       if (has_clone)
       {
@@ -6721,6 +6749,21 @@ namespace
       const auto& original_shader_hashes = (is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader_hashes : cmd_list_data.pipeline_state_original_graphics_shader_hashes);
       const bool is_custom_pass = (is_dispatch ? cmd_list_data.pipeline_state_has_custom_compute_shader : cmd_list_data.pipeline_state_has_custom_graphics_shader);
 
+#if DX12 && ENABLE_MINHOOK
+      // A listed writer shader draws into the texture of an inactive clone: it is promoted at the next present (see "includes/d3d12_clones.h"), this frame stays as the game made it
+      if (const AutoTextureFormatUpgradeShaderHash* const writer = cmd_list_data.auto_graphics_texture_format_upgrades; writer && !is_dispatch)
+      {
+         const std::vector<D3D12State::ViewInfo>& render_target_views = cmd_list_data.d3d12_state.render_target_views;
+         for (const uint8_t slot : writer->rtv_slots)
+         {
+            if (slot < render_target_views.size() && render_target_views[slot].resource != 0)
+            {
+               D3D12Clones::RequestPromotion(reinterpret_cast<ID3D12Resource*>(render_target_views[slot].resource));
+            }
+         }
+      }
+#endif
+
       // The pipeline for the formats of the render targets comes first, so a re-issue of the draw (or a readback of it) uses it too. A bundle inherits its render targets from the command list that executes
       // it: it keeps the pipeline it bound
       if (!is_dispatch && cmd_list_data.render_target_formats_dirty && ((swapchain_format_upgrade_type > TextureFormatUpgradesType::None && swapchain_upgrade_type > SwapchainUpgradeType::None) || texture_format_upgrades_type > TextureFormatUpgradesType::None))
@@ -6860,6 +6903,24 @@ namespace
       return (desc.type == reshade::api::resource_type::buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(desc.texture.format));
    }
 
+   // The game's placed textures are drawn and sampled through their clones (see "includes/d3d12_clones.h"), so its copies and resolves have to use the clones too: the originals hold nothing. Replaces
+   // each texture that has a clone, true if any was.
+   bool RedirectToClones(reshade::api::resource* source, reshade::api::resource* dest)
+   {
+      bool redirected = false;
+#if ENABLE_MINHOOK
+      for (reshade::api::resource* texture : {source, dest})
+      {
+         if (ID3D12Resource* const clone = D3D12Clones::FindActive(reinterpret_cast<ID3D12Resource*>(texture->handle)))
+         {
+            texture->handle = reinterpret_cast<uint64_t>(clone);
+            redirected = true;
+         }
+      }
+#endif
+      return redirected;
+   }
+
    // D3D12 can't copy between a texture Luma upgraded and a resource of another format family (it tells by the typeless formats: R16G16B16A16 FLOAT against R8G8B8A8 UNORM). The uploads and readbacks through
    // a buffer are never valid for an upgraded texture: ReShade doesn't pass the footprint's format, and the game's is the texture's original one. A later phase converts these copies
    // instead, until then they're skipped, with a warning once for each kind and pair of formats. The resolves between textures of the same family only name the game's format: see "OnResolveTextureRegion()".
@@ -6907,16 +6968,24 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
 #endif
+      const bool redirected = RedirectToClones(&source, &dest);
       if (SkipUpgradedFormatCopy(cmd_list, "copy_resource", source, dest))
       {
          return true;
       }
+      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
+      { native_list->CopyResource(reinterpret_cast<ID3D12Resource*>(dest.handle), reinterpret_cast<ID3D12Resource*>(source.handle)); };
 #if DEVELOPMENT
-      return ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyResource}, {}, [&](ID3D12GraphicsCommandList* native_list)
-         { native_list->CopyResource(reinterpret_cast<ID3D12Resource*>(dest.handle), reinterpret_cast<ID3D12Resource*>(source.handle)); });
-#else
-      return false;
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyResource}, {}, copy))
+      {
+         return true;
+      }
 #endif
+      if (redirected)
+      {
+         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+      }
+      return redirected;
    }
 
 #if DEVELOPMENT
@@ -6937,6 +7006,7 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferToTexture, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = dest_box != nullptr, .box = (dest_box ? D3D12_BOX{.right = dest_box->width(), .bottom = dest_box->height(), .back = dest_box->depth()} : D3D12_BOX{})}); });
 #endif
+      RedirectToClones(&source, &dest); // So a texture with a clone counts as upgraded
       return SkipUpgradedFormatCopy(cmd_list, "copy_buffer_to_texture", source, dest, true);
    }
 
@@ -6948,19 +7018,28 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
 #endif
+      const bool redirected = RedirectToClones(&source, &dest);
       if (SkipUpgradedFormatCopy(cmd_list, "copy_texture_region", source, dest))
       {
          return true;
       }
+      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
+      {
+         const D3D12_TEXTURE_COPY_LOCATION destination = {.pResource = reinterpret_cast<ID3D12Resource*>(dest.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = dest_subresource};
+         const D3D12_TEXTURE_COPY_LOCATION source_location = {.pResource = reinterpret_cast<ID3D12Resource*>(source.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = source_subresource};
+         native_list->CopyTextureRegion(&destination, (dest_box ? dest_box->left : 0), (dest_box ? dest_box->top : 0), (dest_box ? dest_box->front : 0), &source_location, reinterpret_cast<const D3D12_BOX*>(source_box));
+      };
 #if DEVELOPMENT
-      return ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyRegion, .subresource = dest_subresource}, {}, [&](ID3D12GraphicsCommandList* native_list)
-         {
-            const D3D12_TEXTURE_COPY_LOCATION destination = {.pResource = reinterpret_cast<ID3D12Resource*>(dest.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = dest_subresource};
-            const D3D12_TEXTURE_COPY_LOCATION source_location = {.pResource = reinterpret_cast<ID3D12Resource*>(source.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = source_subresource};
-            native_list->CopyTextureRegion(&destination, (dest_box ? dest_box->left : 0), (dest_box ? dest_box->top : 0), (dest_box ? dest_box->front : 0), &source_location, reinterpret_cast<const D3D12_BOX*>(source_box)); });
-#else
-      return false;
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyRegion, .subresource = dest_subresource}, {}, copy))
+      {
+         return true;
+      }
 #endif
+      if (redirected)
+      {
+         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+      }
+      return redirected;
    }
 
    bool OnCopyTextureToBuffer(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint64_t dest_offset, uint32_t row_length, uint32_t slice_height)
@@ -6970,6 +7049,7 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::TextureToBuffer, .source_subresource = source_subresource, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
 #endif
+      RedirectToClones(&source, &dest);
       return SkipUpgradedFormatCopy(cmd_list, "copy_texture_to_buffer", source, dest, true);
    }
 
@@ -6984,6 +7064,7 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
 #endif
+      const bool redirected = RedirectToClones(&source, &dest);
       DXGI_FORMAT resolve_format = DXGI_FORMAT(format);
       bool format_corrected = false;
       if (swapchain_format_upgrade_type > TextureFormatUpgradesType::None || texture_format_upgrades_type > TextureFormatUpgradesType::None) // Optimization
@@ -7037,7 +7118,7 @@ namespace
          return true;
       }
 #endif
-      if (format_corrected)
+      if (format_corrected || redirected)
       {
          resolve(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
          return true;
@@ -8520,6 +8601,26 @@ namespace
    )
    {
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
+
+#if DX12 && ENABLE_MINHOOK
+      D3D12Clones::OnPresent(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+      if (const D3D12Clones::Promotion promotion = D3D12Clones::PromotePending(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())); promotion.timed_out)
+      {
+         static std::atomic_flag logged_promotion_timeout;
+         if (!logged_promotion_timeout.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The GPU didn't finish the present queue within 2 seconds, the promotion of the clones is postponed (it is retried at each present)");
+         }
+      }
+      else
+      {
+         for (const D3D12Clones::PromotedClone& promoted : promotion.clones)
+         {
+            const std::string message = std::format("[Texture upgrades] Promoted the clone of a placed {} texture ({} views, waited {:.1f} ms)", GetFormatNameSafe(promoted.original_format), promoted.view_count, promotion.waited_ms);
+            reshade::log::message(reshade::log::level::info, message.c_str());
+         }
+      }
+#endif
 
       NativeDevice* native_device = (NativeDevice*)(queue->get_device()->get_native());
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
@@ -11420,6 +11521,38 @@ namespace
       }
 #endif
 #endif
+#if DX12 && ENABLE_MINHOOK
+      // The clone of a placed texture (see "includes/d3d12_clones.h"): the original stays as the game made it, the clone is the upgraded one
+      if (const DXGI_FORMAT clone_format = std::exchange(pending_placed_clone_format, DXGI_FORMAT_UNKNOWN); clone_format != DXGI_FORMAT_UNKNOWN)
+      {
+         // Seed mode (writer shaders listed): the clone waits for its promotion, until then the game keeps using the original
+         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), clone_format, D3D12ResourceCreation::current_placed_arguments, auto_texture_format_upgrade_shader_hashes.empty());
+         if (clone)
+         {
+            const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
+            {
+               const std::unique_lock lock_upgrades(device_data.mutex);
+               device_data.resource_upgrades.upgraded_resources.emplace(clone_handle);
+#if DEVELOPMENT
+               device_data.resource_upgrades.original_upgraded_resources_formats[clone_handle] = desc.texture.format;
+#endif
+            }
+#if DEVELOPMENT
+            const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+            device_data.texture_kinds.by_resource[clone_handle] = D3D12ResourceCreation::Kind::Clone;
+#endif
+         }
+         static std::mutex logged_mutex;
+         static std::set<std::tuple<bool, reshade::api::format, DXGI_FORMAT>> logged_clones;
+         const std::unique_lock lock_logged(logged_mutex);
+         if (logged_clones.emplace(clone != nullptr, desc.texture.format, clone_format).second)
+         {
+            const char* const original_name = GetFormatNameSafe(DXGI_FORMAT(desc.texture.format));
+            const std::string message = (clone ? std::format("[Texture upgrades] Cloned a placed {} texture as {}", original_name, GetFormatNameSafe(clone_format)) : std::format("[Texture upgrades] The device refused the clone of a placed {} texture as {}, it stays as the game made it", original_name, GetFormatNameSafe(clone_format)));
+            reshade::log::message(clone ? reshade::log::level::info : reshade::log::level::warning, message.c_str());
+         }
+      }
+#endif
 #if DX12
       // D3D12 fires this right after the "OnCreateResource()" of the same call. The shared resources the game opens come without one (and are never upgraded)
       if (!waiting_on_upgraded_resource_init || (desc.flags & reshade::api::resource_flags::shared) != 0)
@@ -11530,6 +11663,9 @@ namespace
 
       // No need to clear "upgraded_resource_init_desc"/"upgraded_resource_init_data" from its last value
       waiting_on_upgraded_resource_init = false; // If the same thread called another "OnCreateResource()" before we got a "OnInitResource()", it implies the resource creation has failed and we didn't get that event (we have to do it by thread as device objects creation is thread safe and can be done by multiple threads concurrently)
+#if DX12 && ENABLE_MINHOOK
+      pending_placed_clone_format = DXGI_FORMAT_UNKNOWN;
+#endif
 
 #if DX12
       // D3D12 games create thousands of buffers, none of them is a texture. Only the textures of the default heap are candidates (a reserved one has no heap, the custom ones are for the CPU: the filters
@@ -11559,8 +11695,8 @@ namespace
 #endif
 
 #if DX12
-         // The D3D12 rules, on top of the filters: a texture is only upgraded if the game creates it committed (it owns its memory, whereas a placed one is in a heap the game sized and shares with other
-         // resources, so a bigger one would overflow it or alias them, and a reserved one has none until the game maps tiles to it: a later phase clones them), not as a depth
+         // The D3D12 rules, on top of the filters: a texture is only upgraded in place if the game creates it committed (it owns its memory, whereas a placed one is in a heap the game sized and shares with other
+         // resources, so a bigger one would overflow it or alias them: it keeps its desc and gets a clone in "OnInitResource()". A reserved one has none until the game maps tiles to it), not as a depth
          // texture (the DSV variants aren't made), not shared (another process or API opens it) and without castable formats (ReShade passes them on as the game gave them, and the upgraded format
          // isn't one of the formats they can be cast to)
          if (std::memcmp(&upgraded_desc.value(), &desc, sizeof(desc)) == 0)
@@ -11569,9 +11705,9 @@ namespace
          }
          const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
          const char* refusal = nullptr;
-         if (creation_kind != D3D12ResourceCreation::Kind::Committed)
+         if (creation_kind != D3D12ResourceCreation::Kind::Committed && creation_kind != D3D12ResourceCreation::Kind::Placed)
          {
-            refusal = "only the committed ones are upgraded for now (the placed and reserved ones are cloned in a later phase)";
+            refusal = "the reserved ones aren't upgraded yet";
          }
          else if ((desc.usage & reshade::api::resource_usage::depth_stencil) != 0)
          {
@@ -11597,6 +11733,11 @@ namespace
             }
 #endif
             return false;
+         }
+         if (creation_kind == D3D12ResourceCreation::Kind::Placed)
+         {
+            pending_placed_clone_format = DXGI_FORMAT(upgraded_desc->texture.format);
+            return false; // The desc stays the game's
          }
 #endif
 
@@ -11658,6 +11799,24 @@ namespace
          device_data.texture_kinds.by_resource.erase(resource.handle);
       }
 #endif
+#endif
+#if DX12 && ENABLE_MINHOOK
+      // A placed texture's clone is released once the GPU is done with it, and unregistered like an upgraded texture
+      if (const ID3D12Resource* const clone = D3D12Clones::Retire(reinterpret_cast<ID3D12Resource*>(resource.handle)))
+      {
+         const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
+         {
+            const std::unique_lock lock_upgrades(device_data.mutex);
+            device_data.resource_upgrades.upgraded_resources.erase(clone_handle);
+#if DEVELOPMENT
+            device_data.resource_upgrades.original_upgraded_resources_formats.erase(clone_handle);
+#endif
+         }
+#if DEVELOPMENT
+         const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+         device_data.texture_kinds.by_resource.erase(clone_handle);
+#endif
+      }
 #endif
 #if DX12
       // D3D12 engines destroy transient resources (often placed ones) every frame, while the draw threads read these sets under the shared lock (the copy and view hooks): only an upgraded texture needs the
@@ -20468,6 +20627,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          D3D12PsoCapture::Remove();
          D3D12RootSignatures::Remove();
          D3D12ResourceCreation::Remove();
+         D3D12Clones::Remove();
 #endif
 #if ENABLE_SWAPCHAIN_PROXY
          SwapchainProxy::RemoveHooks();

@@ -37,8 +37,8 @@ namespace D3D12ProxyHook
    // ReShade keeps its device proxy in the native device's private data, under the proxy's class UUID ("D3D12Device" in "d3d12_device.hpp")
    constexpr GUID RESHADE_DEVICE_PROXY = {0x2523AFF4, 0x978B, 0x4939, {0xBA, 0x16, 0x8E, 0xE8, 0x76, 0xA4, 0xCB, 0x2A}};
 
-   // The vtable of the device's ReShade proxy (the proxies are objects of one class, so they share it), null if the device has none
-   inline void** FindProxyVtable(ID3D12Device* native_device)
+   // The device's ReShade proxy (not referenced), null if the device has none. The native device and the proxy itself both answer.
+   inline ID3D12Device* FindProxy(ID3D12Device* native_device)
    {
       void* proxy = nullptr;
       UINT proxy_size = sizeof(proxy);
@@ -46,7 +46,14 @@ namespace D3D12ProxyHook
       {
          return nullptr;
       }
-      return *reinterpret_cast<void***>(proxy);
+      return static_cast<ID3D12Device*>(proxy);
+   }
+
+   // The vtable of the device's ReShade proxy (the proxies are objects of one class, so they share it), null if the device has none
+   inline void** FindProxyVtable(ID3D12Device* native_device)
+   {
+      ID3D12Device* const proxy = FindProxy(native_device);
+      return (proxy ? *reinterpret_cast<void***>(proxy) : nullptr);
    }
 
    // A function of the proxy hooked with MinHook. The owner locks around "Attach()" and "Detach()", the detour reads the rest without it as it only runs between them.
@@ -106,8 +113,9 @@ namespace D3D12ResourceCreation
       Committed, // Owns its memory
       Placed,    // In a heap of the game's
       Reserved,  // Tiled, without memory until the game maps tiles to it
+      Clone,     // Luma's committed clone of a placed texture, in the upgraded format (see "d3d12_clones.h")
    };
-   constexpr std::array<const char*, 4> KIND_NAMES = {"unknown", "committed", "placed", "reserved"};
+   constexpr std::array<const char*, 5> KIND_NAMES = {"unknown", "committed", "placed", "reserved", "clone"};
 
    // The slots of the creates in the vtable of "ID3D12Device10", which ReShade's proxy has implemented since 5.2 (the interfaces after it
    // only append methods). Checked against d3d12.h's C vtables by an offline test.
@@ -124,16 +132,29 @@ namespace D3D12ResourceCreation
    // The number of castable formats that call passes, 0 for the ones that can't (or outside of a call)
    inline thread_local UINT current_castable_format_count = 0;
 
-   // For the creates that have no castable formats
+   // What a placed create asked for besides the description, so a clone of the resource can be created like it (committed creates don't
+   // record it: they are upgraded in place)
+   struct PlacedCreationArguments
+   {
+      bool uses_layouts = false;          // "initial_state" is a "D3D12_BARRIER_LAYOUT" (CreatePlacedResource2)
+      UINT initial_state = 0;             // A "D3D12_RESOURCE_STATES", or a "D3D12_BARRIER_LAYOUT"
+      bool has_clear_value = false;       // The optimized clear value is optional
+      D3D12_CLEAR_VALUE clear_value = {}; // A copy: the game's pointer is gone once the call returns
+   };
+   inline thread_local PlacedCreationArguments current_placed_arguments;
+
+   // For the creates that have no castable formats, or no placed arguments
    constexpr size_t NO_CASTABLE_FORMATS = (std::numeric_limits<size_t>::max)();
+   constexpr size_t NO_PLACED_ARGUMENTS = (std::numeric_limits<size_t>::max)();
 
    // A function of the proxy that creates resources of a "kind", hooked once per process. "Method" is its declaration in d3d12.h, so the
    // detour has the interface's own signature. "castable_count_argument" is the index of its "NumCastableFormats" argument, if it has one.
-   template <typename Method, size_t vtable_slot, Kind kind, size_t castable_count_argument = NO_CASTABLE_FORMATS>
+   // "initial_state_argument" is the index of the initial state (or layout) of a placed create, its optimized clear value follows it.
+   template <typename Method, size_t vtable_slot, Kind kind, size_t castable_count_argument = NO_CASTABLE_FORMATS, size_t initial_state_argument = NO_PLACED_ARGUMENTS>
    struct Creation;
 
-   template <typename Interface, typename... Arguments, size_t vtable_slot, Kind kind, size_t castable_count_argument>
-   struct Creation<HRESULT (STDMETHODCALLTYPE Interface::*)(Arguments...), vtable_slot, kind, castable_count_argument>
+   template <typename Interface, typename... Arguments, size_t vtable_slot, Kind kind, size_t castable_count_argument, size_t initial_state_argument>
+   struct Creation<HRESULT (STDMETHODCALLTYPE Interface::*)(Arguments...), vtable_slot, kind, castable_count_argument, initial_state_argument>
    {
       using Function = HRESULT(STDMETHODCALLTYPE*)(Interface*, Arguments...);
       static inline D3D12ProxyHook::HookedFunction<Function> hooked;
@@ -146,9 +167,32 @@ namespace D3D12ResourceCreation
             static_assert(std::is_same_v<std::tuple_element_t<castable_count_argument, std::tuple<Arguments...>>, UINT32>, "The argument isn't a count");
             castable_format_count = std::get<castable_count_argument>(std::tie(arguments...));
          }
+         PlacedCreationArguments placed_arguments;
+         if constexpr (initial_state_argument != NO_PLACED_ARGUMENTS)
+         {
+            using InitialState = std::tuple_element_t<initial_state_argument, std::tuple<Arguments...>>;
+            using ClearValue = std::tuple_element_t<initial_state_argument + 1, std::tuple<Arguments...>>;
+            static_assert(std::is_same_v<ClearValue, const D3D12_CLEAR_VALUE*>, "The argument isn't a clear value");
+            const D3D12_CLEAR_VALUE* const clear_value = std::get<initial_state_argument + 1>(std::tie(arguments...));
+            placed_arguments = {
+               .uses_layouts = std::is_same_v<InitialState, D3D12_BARRIER_LAYOUT>,
+               .initial_state = static_cast<UINT>(std::get<initial_state_argument>(std::tie(arguments...))),
+               .has_clear_value = clear_value != nullptr,
+               .clear_value = (clear_value ? *clear_value : D3D12_CLEAR_VALUE{}),
+            };
+         }
          const Kind outer_kind = std::exchange(current_kind, kind);
          const UINT outer_castable_format_count = std::exchange(current_castable_format_count, castable_format_count);
+         PlacedCreationArguments outer_placed_arguments;
+         if constexpr (initial_state_argument != NO_PLACED_ARGUMENTS)
+         {
+            outer_placed_arguments = std::exchange(current_placed_arguments, placed_arguments);
+         }
          const HRESULT result = hooked.original(device, arguments...);
+         if constexpr (initial_state_argument != NO_PLACED_ARGUMENTS)
+         {
+            current_placed_arguments = outer_placed_arguments;
+         }
          current_castable_format_count = outer_castable_format_count;
          current_kind = outer_kind;
          return result;
@@ -171,9 +215,9 @@ namespace D3D12ResourceCreation
    using CommittedResource1 = Creation<decltype(&ID3D12Device4::CreateCommittedResource1), CREATE_COMMITTED_RESOURCE1_SLOT, Kind::Committed>;
    using CommittedResource2 = Creation<decltype(&ID3D12Device8::CreateCommittedResource2), CREATE_COMMITTED_RESOURCE2_SLOT, Kind::Committed>;
    using CommittedResource3 = Creation<decltype(&ID3D12Device10::CreateCommittedResource3), CREATE_COMMITTED_RESOURCE3_SLOT, Kind::Committed, 6>;
-   using PlacedResource = Creation<decltype(&ID3D12Device::CreatePlacedResource), CREATE_PLACED_RESOURCE_SLOT, Kind::Placed>;
-   using PlacedResource1 = Creation<decltype(&ID3D12Device8::CreatePlacedResource1), CREATE_PLACED_RESOURCE1_SLOT, Kind::Placed>;
-   using PlacedResource2 = Creation<decltype(&ID3D12Device10::CreatePlacedResource2), CREATE_PLACED_RESOURCE2_SLOT, Kind::Placed, 5>;
+   using PlacedResource = Creation<decltype(&ID3D12Device::CreatePlacedResource), CREATE_PLACED_RESOURCE_SLOT, Kind::Placed, NO_CASTABLE_FORMATS, 3>;
+   using PlacedResource1 = Creation<decltype(&ID3D12Device8::CreatePlacedResource1), CREATE_PLACED_RESOURCE1_SLOT, Kind::Placed, NO_CASTABLE_FORMATS, 3>;
+   using PlacedResource2 = Creation<decltype(&ID3D12Device10::CreatePlacedResource2), CREATE_PLACED_RESOURCE2_SLOT, Kind::Placed, 5, 3>;
 
    struct Hook
    {
