@@ -26,6 +26,7 @@ namespace
    int test_replaced_hash = 0;    // The callback draws it itself and reports it replaced
    int test_rcas_hash = 0;        // The draw becomes RCAS (sharpness 1) of its t0 (the table of root parameter 0) into its render target
    int test_smaa_hash = 0;        // The draw becomes SMAA of its t0 into its render target (with a "Luma_SMAA_impl.hlsl" in the game's shader folder)
+   int test_smaa_rcas = 0;        // 1: the SMAA of "test_smaa_hash" is followed by RCAS (sharpness 1)
 #endif
 } // namespace
 
@@ -48,7 +49,7 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 #if DX12 && DEVELOPMENT
-      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}});
+      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}});
 #endif
    }
 
@@ -151,7 +152,7 @@ public:
          }
          else
          {
-            drawn = DrawSMAA(cmd_list_data, device_data, {source.resource}, source.format, {}, {}, target, state.render_target_descs[0], {});
+            drawn = DrawSMAA(cmd_list_data, device_data, {source.resource}, source.format, {}, {}, target, state.render_target_descs[0], {}, float(test_smaa_rcas));
          }
          if (drawn)
          {
