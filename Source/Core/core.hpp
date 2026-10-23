@@ -9290,10 +9290,12 @@ namespace
          return false;
       }
       reshade::api::device* const device = cmd_list->get_device();
+      bool source_upgraded = false;
       {
          DeviceData& device_data = *device->get_private_data<DeviceData>();
          const std::shared_lock lock(device_data.mutex);
-         if (!IsUpgradedTexture(device_data, source) && !IsUpgradedTexture(device_data, dest))
+         source_upgraded = IsUpgradedTexture(device_data, source);
+         if (!source_upgraded && !IsUpgradedTexture(device_data, dest))
          {
             return false;
          }
@@ -9304,6 +9306,14 @@ namespace
       {
          return false;
       }
+#if ENABLE_MINHOOK
+      // Chain upgrades: an upgraded texture copied into one whose clone waits for its promotion (seed mode) promotes it. This copy is still converted (or skipped), from the
+      // next present it is a plain one between the clones
+      if (source_upgraded && !through_buffer && enable_chain_indirect_texture_format_upgrades >= ChainTextureFormatUpgradesType::DirectDependencies)
+      {
+         D3D12Clones::RequestPromotion(reinterpret_cast<ID3D12Resource*>(dest.handle));
+      }
+#endif
 #if ENABLE_D3D12_PASSES
       const bool converted = (extent == CopyExtent::Whole && enable_upgraded_texture_resource_copy_redirection && ConvertTextureCopyD3D12(cmd_list, source, dest));
 #else
