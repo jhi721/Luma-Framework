@@ -3234,8 +3234,7 @@ namespace Mcp
                client->finished = true; });
          clients.push_back(std::move(client));
       }
-      // Not joined: on DLL unload the loader lock keeps a thread from exiting (see "Shutdown"). Cancelled repeatedly, a client could
-      // enter a blocking read right after a cancel.
+      // Cancelled repeatedly, a client could enter a blocking read right after a cancel
       for (int i = 0; i < 150 && unfinished(); i++)
       {
          for (const auto& client : clients)
@@ -3247,9 +3246,18 @@ namespace Mcp
          }
          Sleep(10);
       }
+      // Joined, as each holds a reference to the add-on module until it has exited (see "Shutdown()"). One still blocked is left
+      // behind, and its reference keeps the add-on loaded.
       for (const auto& client : clients)
       {
-         client->thread.detach();
+         if (client->finished)
+         {
+            client->thread.join();
+         }
+         else
+         {
+            client->thread.detach();
+         }
       }
       LocalFree(security_attributes.lpSecurityDescriptor);
       server_running = false;
@@ -3395,7 +3403,8 @@ namespace Mcp
       active_tool.clear();
    }
 
-   // Called on DLL unload
+   // Called from "Uninit()", before ReShade frees the add-on: a thread holds a reference to the add-on module until it has exited, so a
+   // thread still running keeps "FreeLibrary()" from unloading it, and one still exiting unloads it later from its own thread
    void Shutdown()
    {
       if (!server_thread.joinable())
@@ -3406,8 +3415,6 @@ namespace Mcp
       HANDLE self = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
       if (self != INVALID_HANDLE_VALUE)
          CloseHandle(self);
-      server_thread.detach();
-      for (int i = 0; i < 200 && server_running; i++)
-         Sleep(10);
+      server_thread.join();
    }
 } // namespace Mcp

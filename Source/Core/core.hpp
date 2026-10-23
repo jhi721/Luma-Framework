@@ -21413,6 +21413,9 @@ void Uninit()
          }
       }
    }
+#if DEVELOPMENT
+   Mcp::Shutdown();
+#endif
 
 #if 0 // Unload any dll. For now we keep it loaded forever because we might load a custom version of DX shader compiler DLLs, and sometimes ReShade or ReShade addons load and unload multiple times on boot, so we wouldn't want to add any weight to further loads
    Shader::UnInitShaderCompiler();
@@ -21720,7 +21723,6 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
    case DLL_PROCESS_DETACH:
    {
 #if DEVELOPMENT
-      Mcp::Shutdown();
       if (game_window_original_proc && game_window != NULL && IsWindow(game_window))
       {
          SetWindowLongPtr(game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(game_window_original_proc));
