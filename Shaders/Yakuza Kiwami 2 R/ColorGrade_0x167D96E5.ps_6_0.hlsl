@@ -11,8 +11,8 @@
 // peak with PsychoV31. A scalar can't rotate hue, so no hue restore is added on top (the PsychoV hue reference is the shared
 // map's own). Method: Sucker Punch / glowybits 2016 "ColorGradeHdr" (SmoothClamp(max) / max), see "tonemap-lut-bridge" option 3.
 // SDR display modes run the vanilla chain unchanged (scale 1, nothing after it). The noise stays vanilla-sized: added in gamma
-// space after the recovery, never multiplied by 1/scale. The output stays gamma space, 1 = paper white (Core's composition
-// decodes it and applies paper white), values above 1 are allowed.
+// space after the recovery, never multiplied by 1/scale. The output stays gamma space, 1 = UI paper white (pre-scaled for
+// UI_DRAW_TYPE 2; Core's composition decodes it and applies paper white), values above 1 are allowed.
 
 // clang-format off
 // ORDER IS LOAD-BEARING - do not sort. "Common.hlsl" first, it pulls the Luma settings the PsychoV include reads.
@@ -333,6 +333,18 @@ float4 main(
    SV_Target.x = _278;
    SV_Target.y = _279;
    SV_Target.z = _280;
+   // UI_DRAW_TYPE 2: the HUD blends over this output in gamma, the final blit 0x8578A29E writes sRGB(x^2.2), and the composition
+   // decodes that canvas (gamma 2.2 in 0-1, sRGB above: the sRGB/2.2 mismatch fix) before scaling it by UI/Game Paper White. The
+   // fix isn't homogeneous, so a plain gamma factor leaves the scene darker (-10% at 0.05 for 203/400 nits): the pre-scale is applied
+   // to the decoded canvas instead and mapped back to this pass's encoding. Skipped at 1 (matching paper whites), so it stays vanilla.
+   const float ui_pre_scale = GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
+   if (ui_pre_scale != 1.0f)
+   {
+      const float3 canvas = linear_to_sRGB_gamma(gamma_to_linear(SV_Target.rgb, GCT_MIRROR, 2.2f), GCT_MIRROR);
+      const float3 decoded = select(canvas <= 1.0f, pow(canvas, 2.2f), gamma_sRGB_to_linear(canvas, GCT_MIRROR)) * ui_pre_scale;
+      const float3 pre_scaled_canvas = select(decoded <= 1.0f, pow(decoded, 1.0f / 2.2f), linear_to_sRGB_gamma(decoded, GCT_MIRROR));
+      SV_Target.rgb = linear_to_gamma(gamma_sRGB_to_linear(pre_scaled_canvas, GCT_MIRROR), GCT_MIRROR, 2.2f);
+   }
    SV_Target.w = _14.w;
    return SV_Target;
 }
