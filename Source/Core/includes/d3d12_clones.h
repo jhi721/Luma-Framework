@@ -33,6 +33,7 @@
 #include <source/com_ptr.hpp>
 
 #include "d3d12_resource_creation.h"
+#include "d3d12_state.h"
 
 namespace D3D12Clones
 {
@@ -652,6 +653,7 @@ namespace D3D12Clones
    constexpr size_t TRY_CREATE_RENDER_TARGET_VIEW_SLOT = 89;
    constexpr size_t CREATE_COMMAND_LIST1_SLOT = 51; // d3d12.h's C vtable lists 3 earlier methods twice (C and C++ return conventions)
    constexpr size_t RESOURCE_BARRIER_SLOT = 26;
+   constexpr size_t SET_DESCRIPTOR_HEAPS_SLOT = 28;
    constexpr size_t CLEAR_UNORDERED_ACCESS_VIEW_UINT_SLOT = 49;
    constexpr size_t CLEAR_UNORDERED_ACCESS_VIEW_FLOAT_SLOT = 50;
    constexpr size_t DISCARD_RESOURCE_SLOT = 51;
@@ -823,6 +825,7 @@ namespace D3D12Clones
    using ClearUnorderedAccessViewUintHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT[4], UINT, const D3D12_RECT*), CLEAR_UNORDERED_ACCESS_VIEW_UINT_SLOT>;
    using ClearUnorderedAccessViewFloatHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const FLOAT[4], UINT, const D3D12_RECT*), CLEAR_UNORDERED_ACCESS_VIEW_FLOAT_SLOT>;
    using DiscardResourceHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, const D3D12_DISCARD_REGION*), DISCARD_RESOURCE_SLOT>;
+   using SetDescriptorHeapsHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*), SET_DESCRIPTOR_HEAPS_SLOT>;
 
    // Each barrier of the game on a texture that has a clone is followed by the same one on the clone, so the clone goes through the states
    // of the original (it was created in the original's initial state). Aliasing barriers aren't mirrored: the clones are committed.
@@ -924,6 +927,17 @@ namespace D3D12Clones
       }
    }
 
+#if ENABLE_D3D12_PASSES
+   // Not about the clones: the Luma passes drawn on the game's lists give its descriptor heaps back with what this keeps (see "D3D12State::GameDescriptorHeaps")
+   inline void STDMETHODCALLTYPE SetDescriptorHeapsDetour(ID3D12GraphicsCommandList* list, UINT heap_count, ID3D12DescriptorHeap* const* heaps)
+   {
+      SetDescriptorHeapsHook::hooked.original(list, heap_count, heaps);
+      D3D12State::GameDescriptorHeaps game_heaps = {.set_heaps = SetDescriptorHeapsHook::hooked.original, .proxy_list = list, .count = (std::min)(heap_count, 2u)};
+      std::copy_n(heaps, game_heaps.count, game_heaps.heaps);
+      list->SetPrivateData(D3D12State::GAME_DESCRIPTOR_HEAPS_GUID, sizeof(game_heaps), &game_heaps);
+   }
+#endif
+
    inline std::atomic<bool> command_list_hooks_installed = false;
    inline std::mutex command_list_hooks_mutex; // Also for "Remove()"
 
@@ -946,9 +960,12 @@ namespace D3D12Clones
       installed_all &= ClearUnorderedAccessViewUintHook::Install(vtable, &ClearUnorderedAccessViewUintDetour);
       installed_all &= ClearUnorderedAccessViewFloatHook::Install(vtable, &ClearUnorderedAccessViewFloatDetour);
       installed_all &= DiscardResourceHook::Install(vtable, &DiscardResourceDetour);
+#if ENABLE_D3D12_PASSES
+      installed_all &= SetDescriptorHeapsHook::Install(vtable, &SetDescriptorHeapsDetour);
+#endif
       if (!installed_all)
       {
-         reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The command list hooks of the clones aren't all in, so the clones of placed textures can end in a wrong state");
+         reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The command list hooks of the clones aren't all in, so the clones of textures can end in a wrong state, and the Luma passes can leave ReShade's descriptor heaps bound");
       }
       command_list_hooks_installed.store(true, std::memory_order_release);
    }
@@ -1042,6 +1059,7 @@ namespace D3D12Clones
       removed_all &= ClearUnorderedAccessViewUintHook::Remove();
       removed_all &= ClearUnorderedAccessViewFloatHook::Remove();
       removed_all &= DiscardResourceHook::Remove();
+      removed_all &= SetDescriptorHeapsHook::Remove();
       command_list_hooks_installed.store(false, std::memory_order_release);
       return removed_all;
    }

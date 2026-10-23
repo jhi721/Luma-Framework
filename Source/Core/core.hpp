@@ -8081,6 +8081,9 @@ namespace
 
 #if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state
       cmd_list_data.d3d12_state = {};
+#if ENABLE_D3D12_PASSES
+      reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())->SetPrivateData(D3D12State::GAME_DESCRIPTOR_HEAPS_GUID, 0, nullptr);
+#endif
       // The root arguments are gone, and the pages they pointed at are free once the executions of the list finished
       D3D12UploadRing::Retire(cmd_list_data.upload_ring.get(), &cmd_list_data.upload_pages);
       cmd_list_data.luma_data_address = 0;

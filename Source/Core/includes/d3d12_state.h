@@ -320,18 +320,35 @@ namespace D3D12State
       std::copy_n(rects, count, state->scissor_rects.begin() + first);
    }
 
-   // Binds "root" again on the graphics or the compute bind point after a Luma pass: the root signature with the game's descriptor heaps (ReShade's
-   // "bind_descriptor_tables()" sets the heaps back the game had, or the heaps of the tables), then the root arguments. Root CBVs and root SRVs/UAVs
-   // go natively: ReShade passes the latter as GPU virtual addresses, which its own API can't take back. Nothing without a root signature.
-   // ponytail: a game that set its descriptor heaps and bound no table of a heap type yet gets ReShade's heap of that type back (the
-   // heaps ReShade restores are only certain when the game set both or bound tables from them).
+   // The descriptor heaps a game set on a command list, which the hook of its "SetDescriptorHeaps()" (see "d3d12_clones.h") keeps as private data of the native list,
+   // with the proxy list and the hooked function to set them again through: ReShade only gives a game's heaps back after its own when the game set both types or
+   // bound tables from them. Dropped when the list is reset.
+   struct GameDescriptorHeaps
+   {
+      void(STDMETHODCALLTYPE* set_heaps)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*) = nullptr;
+      ID3D12GraphicsCommandList* proxy_list = nullptr;
+      UINT count = 0;
+      ID3D12DescriptorHeap* heaps[2] = {};
+   };
+   constexpr GUID GAME_DESCRIPTOR_HEAPS_GUID = {0x0c6e3f51, 0x8a2d, 0x4b7e, {0xa1, 0x94, 0x3d, 0x52, 0xe8, 0x07, 0x6b, 0xc2}};
+
+   // Binds "root" again on the graphics or the compute bind point after a Luma pass: the game's descriptor heaps ("GameDescriptorHeaps", else what ReShade's
+   // "bind_descriptor_tables()" gives back: the heaps the game had, or the heaps of the tables), the root signature, then the root arguments. Root CBVs and
+   // root SRVs/UAVs go natively: ReShade passes the latter as GPU virtual addresses, which its own API can't take back. Only the heaps without a root signature.
+   // ponytail: without the hook (no MinHook), a game that set its descriptor heaps and bound no table of a heap type yet gets ReShade's heap of that type back
    void RestoreRoot(reshade::api::command_list* cmd_list, const RootState& root, bool compute)
    {
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      GameDescriptorHeaps game_heaps;
+      UINT game_heaps_size = sizeof(game_heaps);
+      if (SUCCEEDED(native_list->GetPrivateData(GAME_DESCRIPTOR_HEAPS_GUID, &game_heaps_size, &game_heaps)) && game_heaps_size == sizeof(game_heaps))
+      {
+         game_heaps.set_heaps(game_heaps.proxy_list, game_heaps.count, game_heaps.heaps);
+      }
       if (root.layout.handle == 0)
       {
          return;
       }
-      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
       const reshade::api::shader_stage stages = (compute ? reshade::api::shader_stage::all_compute : reshade::api::shader_stage::all_graphics);
       cmd_list->bind_descriptor_tables(stages, root.layout, 0, 0, nullptr);
       for (uint32_t param = 0; param < root.bindings.size(); param++)
