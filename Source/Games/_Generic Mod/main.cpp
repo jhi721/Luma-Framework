@@ -9,7 +9,7 @@
 #define AVOID_INPUT_LOSS 1
 
 #if DX12 && DEVELOPMENT
-// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash", "test_smaa_hash", "test_bloom_hash")
+// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash", "test_smaa_hash", "test_bloom_hash") and of its sampler upgrade ("test_mip_lod_bias")
 #define ENABLE_RCAS 1
 #define ENABLE_SMAA 1
 #define ENABLE_BLOOM 1
@@ -29,6 +29,7 @@ namespace
    int test_smaa_hash = 0;        // The draw becomes SMAA of its t0 into its render target (with a "Luma_SMAA_impl.hlsl" in the game's shader folder)
    int test_smaa_rcas = 0;        // 1: the SMAA of "test_smaa_hash" is followed by RCAS (sharpness 1)
    int test_bloom_hash = 0;       // The draw becomes the Karis average and the 3 level bloom of its t0, whose mip 0 is copied into the top left of its render target
+   float test_mip_lod_bias = 0.f; // The mip bias of the upgraded samplers, applied at present: it reaches the samplers the game writes after it
 #endif
 } // namespace
 
@@ -52,6 +53,7 @@ public:
       luma_data_cbuffer_index = 12;
 #if DX12 && DEVELOPMENT
       Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}});
+      Mcp::RegisterValues({{"test_mip_lod_bias", &test_mip_lod_bias, -8.f, 8.f}});
 #endif
    }
 
@@ -185,6 +187,13 @@ public:
    }
    void OnPresent(NativeDevice* native_device, DeviceData& device_data) override
    {
+#if DX12 && DEVELOPMENT
+      if (!custom_texture_mip_lod_bias_offset)
+      {
+         const std::unique_lock lock(s_mutex_samplers);
+         device_data.texture_mip_lod_bias_offset = test_mip_lod_bias;
+      }
+#endif
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -292,6 +301,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 #if DX11
       enable_indirect_texture_format_upgrades = true; // This is generally safer so enable it in the generic mod
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies; // Indirect dependencies are probably not needed as they'd already be upgraded too
+#endif
+#if DX12 && DEVELOPMENT
+      enable_samplers_upgrade = true; // Boot-time only. For the smoke test ("test_mip_lod_bias")
 #endif
       toggleable_texture_upgrade_formats = {
             reshade::api::format::r8g8b8a8_unorm,
