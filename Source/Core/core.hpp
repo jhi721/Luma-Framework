@@ -772,8 +772,10 @@ namespace
       { CompileTimeStringHash("Karis Average CS"), { "Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader } },
 #endif
 
-#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS, SMAA and bloom: the passes of the others aren't ported to D3D12 yet
+#if DX11 || ENABLE_D3D12_PASSES // D3D12: "ConvertTextureCopyD3D12()"
       { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
+#endif
+#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS, SMAA, bloom and texture copy: the passes of the others aren't ported to D3D12 yet
 
       // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
       { CompileTimeStringHash("Scale VS"), { "Luma_Scale_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
@@ -3942,6 +3944,12 @@ namespace
          bloom.mips_x.clear();
       }
 #endif
+      {
+         auto& texture_copy = device_data.texture_copy;
+         const std::unique_lock lock(texture_copy.mutex);
+         destroy_game_pass(&texture_copy);
+         destroy_resources({&texture_copy.target});
+      }
 #endif
 #if ENABLE_MINHOOK
       D3D12Clones::OnDestroyDevice(native_device);
@@ -7003,242 +7011,6 @@ namespace
       return OnDrawOrDispatchD3D12(cmd_list, {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true}, D3D12DrawCommand::Other);
    }
 
-   // Whether Luma changed the format of a texture: one of "resource_upgrades.upgraded_resources", or a back buffer whose format family the swapchain upgrade changed ("device_data.mutex" must be held)
-   bool IsUpgradedTexture(const DeviceData& device_data, reshade::api::resource resource)
-   {
-      return device_data.resource_upgrades.upgraded_resources.contains(resource.handle) || device_data.upgraded_back_buffers.contains(resource.handle);
-   }
-
-   // The format of a texture as the device has it (the upgraded one), unknown for a buffer
-   DXGI_FORMAT GetTextureFormat(reshade::api::device* device, reshade::api::resource resource)
-   {
-      const reshade::api::resource_desc desc = device->get_resource_desc(resource);
-      return (desc.type == reshade::api::resource_type::buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(desc.texture.format));
-   }
-
-   // The game's placed textures are drawn and sampled through their clones (see "includes/d3d12_clones.h"), so its copies and resolves have to use the clones too: the originals hold nothing. Replaces
-   // each texture that has a clone, true if any was.
-   bool RedirectToClones(reshade::api::resource* source, reshade::api::resource* dest)
-   {
-      bool redirected = false;
-#if ENABLE_MINHOOK
-      for (reshade::api::resource* texture : {source, dest})
-      {
-         if (ID3D12Resource* const clone = D3D12Clones::FindActive(reinterpret_cast<ID3D12Resource*>(texture->handle)))
-         {
-            texture->handle = reinterpret_cast<uint64_t>(clone);
-            redirected = true;
-         }
-      }
-#endif
-      return redirected;
-   }
-
-   // D3D12 can't copy between a texture Luma upgraded and a resource of another format family (it tells by the typeless formats: R16G16B16A16 FLOAT against R8G8B8A8 UNORM). The uploads and readbacks through
-   // a buffer are never valid for an upgraded texture: ReShade doesn't pass the footprint's format, and the game's is the texture's original one. A later phase converts these copies
-   // instead, until then they're skipped, with a warning once for each kind and pair of formats. The resolves between textures of the same family only name the game's format: see "OnResolveTextureRegion()".
-   // Returns true to skip the copy.
-   bool SkipUpgradedFormatCopy(reshade::api::command_list* cmd_list, const char* copy_kind, reshade::api::resource source, reshade::api::resource dest, bool through_buffer = false)
-   {
-      if (swapchain_format_upgrade_type == TextureFormatUpgradesType::None && texture_format_upgrades_type == TextureFormatUpgradesType::None) // Optimization
-      {
-         return false;
-      }
-      reshade::api::device* const device = cmd_list->get_device();
-      {
-         DeviceData& device_data = *device->get_private_data<DeviceData>();
-         const std::shared_lock lock(device_data.mutex);
-         if (!IsUpgradedTexture(device_data, source) && !IsUpgradedTexture(device_data, dest))
-         {
-            return false;
-         }
-      }
-      const DXGI_FORMAT source_format = GetTextureFormat(device, source);
-      const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
-      if (!through_buffer && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
-      {
-         return false;
-      }
-
-      static std::mutex warned_mutex;
-      static std::set<std::tuple<std::string_view, DXGI_FORMAT, DXGI_FORMAT>> warned_copies;
-      const std::unique_lock lock_warned(warned_mutex);
-      if (warned_copies.emplace(copy_kind, source_format, dest_format).second)
-      {
-         const std::string what = (through_buffer ? std::format("of an upgraded {} texture: the footprint of the buffer has the format the game created the texture with", GetFormatNameSafe(source_format != DXGI_FORMAT_UNKNOWN ? source_format : dest_format))
-                                                  : std::format("from {} to {}: D3D12 can't copy between an upgraded texture and another format (they are converted in a later phase)", GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format)));
-         reshade::log::message(reshade::log::level::warning, std::format("[Texture upgrades] Skipped a {} {}", copy_kind, what).c_str());
-      }
-      return true;
-   }
-
-   // The copies, uploads and resolves, skipped when they would mix the formats of an upgrade (all builds). Development builds also trace them in the frame capture, and read back what the copies,
-   // resolves and render target and depth stencil clears wrote: their handlers return true when "ReadbackCopyOrClear()" re-issued them
-   bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-#if DEVELOPMENT
-      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
-         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
-#endif
-      const bool redirected = RedirectToClones(&source, &dest);
-      if (SkipUpgradedFormatCopy(cmd_list, "copy_resource", source, dest))
-      {
-         return true;
-      }
-      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
-      { native_list->CopyResource(reinterpret_cast<ID3D12Resource*>(dest.handle), reinterpret_cast<ID3D12Resource*>(source.handle)); };
-#if DEVELOPMENT
-      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyResource}, {}, copy))
-      {
-         return true;
-      }
-#endif
-      if (redirected)
-      {
-         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
-      }
-      return redirected;
-   }
-
-#if DEVELOPMENT
-   bool OnCopyBufferRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
-         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = true, .box = {.left = uint32_t(source_offset), .right = uint32_t(source_offset + size), .bottom = 1, .back = 1}}); });
-      return false;
-   }
-#endif
-
-   // ReShade only passes the footprint's offset and size (no row pitch), so uploads can't be re-issued from this event
-   bool OnCopyBufferToTexture(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, uint32_t row_length, uint32_t slice_height, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-#if DEVELOPMENT
-      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
-         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferToTexture, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = dest_box != nullptr, .box = (dest_box ? D3D12_BOX{.right = dest_box->width(), .bottom = dest_box->height(), .back = dest_box->depth()} : D3D12_BOX{})}); });
-#endif
-      RedirectToClones(&source, &dest); // So a texture with a clone counts as upgraded
-      return SkipUpgradedFormatCopy(cmd_list, "copy_buffer_to_texture", source, dest, true);
-   }
-
-   // "dest_box" is only there when the destination offset isn't zero
-   bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-#if DEVELOPMENT
-      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
-         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
-#endif
-      const bool redirected = RedirectToClones(&source, &dest);
-      if (SkipUpgradedFormatCopy(cmd_list, "copy_texture_region", source, dest))
-      {
-         return true;
-      }
-      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
-      {
-         const D3D12_TEXTURE_COPY_LOCATION destination = {.pResource = reinterpret_cast<ID3D12Resource*>(dest.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = dest_subresource};
-         const D3D12_TEXTURE_COPY_LOCATION source_location = {.pResource = reinterpret_cast<ID3D12Resource*>(source.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = source_subresource};
-         native_list->CopyTextureRegion(&destination, (dest_box ? dest_box->left : 0), (dest_box ? dest_box->top : 0), (dest_box ? dest_box->front : 0), &source_location, reinterpret_cast<const D3D12_BOX*>(source_box));
-      };
-#if DEVELOPMENT
-      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyRegion, .subresource = dest_subresource}, {}, copy))
-      {
-         return true;
-      }
-#endif
-      if (redirected)
-      {
-         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
-      }
-      return redirected;
-   }
-
-   bool OnCopyTextureToBuffer(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint64_t dest_offset, uint32_t row_length, uint32_t slice_height)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-#if DEVELOPMENT
-      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
-         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::TextureToBuffer, .source_subresource = source_subresource, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
-#endif
-      RedirectToClones(&source, &dest);
-      return SkipUpgradedFormatCopy(cmd_list, "copy_texture_to_buffer", source, dest, true);
-   }
-
-   // A resolve names the format to resolve in, which the game took from the textures it created: once Luma upgraded them it is the wrong one, and D3D12 rejects it. When the two textures are of the same format
-   // family (an upgraded multisampled target resolved into an upgraded target or back buffer: both R16G16B16A16 FLOAT now) only the format is wrong, and the resolve is re-issued with the textures' own, like
-   // the D3D11 path does. ReShade's event doesn't carry the mode of a "ResolveSubresourceRegion()": the re-issue averages (the mode of "ResolveSubresource()"), so a MIN or MAX region resolve of a color texture
-   // comes out averaged. Textures of other families can't be resolved into each other, "SkipUpgradedFormatCopy()" skips those (a later phase converts them).
-   bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-#if DEVELOPMENT
-      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
-         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
-#endif
-      const bool redirected = RedirectToClones(&source, &dest);
-      DXGI_FORMAT resolve_format = DXGI_FORMAT(format);
-      bool format_corrected = false;
-      if (swapchain_format_upgrade_type > TextureFormatUpgradesType::None || texture_format_upgrades_type > TextureFormatUpgradesType::None) // Optimization
-      {
-         reshade::api::device* const device = cmd_list->get_device();
-         bool any_upgraded = false;
-         {
-            DeviceData& device_data = *device->get_private_data<DeviceData>();
-            const std::shared_lock lock(device_data.mutex);
-            any_upgraded = IsUpgradedTexture(device_data, source) || IsUpgradedTexture(device_data, dest);
-         }
-         if (any_upgraded)
-         {
-            const DXGI_FORMAT source_format = GetTextureFormat(device, source);
-            const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
-            const DXGI_FORMAT textures_format = (IsTypelessFormat(source_format) ? dest_format : source_format); // The upgraded ones are never typeless
-            format_corrected = (GetTypelessFormat(source_format) == GetTypelessFormat(dest_format) && GetTypelessFormat(resolve_format) != GetTypelessFormat(textures_format) && !IsTypelessFormat(textures_format));
-            if (format_corrected)
-            {
-               resolve_format = textures_format;
-            }
-         }
-      }
-      if (!format_corrected && SkipUpgradedFormatCopy(cmd_list, "resolve_texture_region", source, dest))
-      {
-         return true;
-      }
-      const auto resolve = [&](ID3D12GraphicsCommandList* native_list)
-      {
-         auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
-         auto* native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
-         if (!source_box && dest_x == 0 && dest_y == 0)
-         {
-            native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, resolve_format);
-         }
-         else
-         {
-            com_ptr<ID3D12GraphicsCommandList1> native_list_1;
-            native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
-            if (native_list_1)
-            {
-               D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
-               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, D3D12_RESOLVE_MODE_AVERAGE);
-            }
-         }
-      };
-#if DEVELOPMENT
-      // The readback's target is the command as the game gave it (with its format), what it re-issues is the corrected one
-      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::Resolve, .subresource = dest_subresource, .resolve_format = DXGI_FORMAT(format)}, {}, resolve))
-      {
-         return true;
-      }
-#endif
-      if (format_corrected || redirected)
-      {
-         resolve(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
-         return true;
-      }
-      return false;
-   }
-
 #if DEVELOPMENT
    // The clear values go in the entry's blend factor like on D3D11 (depth and stencil in the first two)
    bool OnClearDepthStencilView(reshade::api::command_list* cmd_list, reshade::api::resource_view dsv, const float* depth, const uint8_t* stencil, uint32_t rect_count, const reshade::api::rect* rects)
@@ -8675,9 +8447,10 @@ namespace
    }
 
    // The common start of the passes drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()", "DrawBloom()"...), with "pass->mutex" held: makes the layout of "params"
-   // (the descriptor table is its parameter "table_param") and "tables_per_draw" descriptor tables per draw on the first draw, one attempt, drops the pipelines of older
-   // natives and destroys the retired resources no list can read anymore. Then the tables of this draw, or null if the pass can't draw.
-   const reshade::api::descriptor_table* PrepareD3D12GamePass(DeviceData::GamePassD3D12* pass, DeviceData& device_data, reshade::api::device* device, std::span<const reshade::api::pipeline_layout_param> params, uint32_t table_param, uint32_t tables_per_draw, const char* name)
+   // (the descriptor table is its parameter "table_param") and "tables_per_draw" descriptor tables per draw, for "draws_per_frame" draws a present (the same for every call),
+   // on the first draw, one attempt, drops the pipelines of older natives and destroys the retired resources no list can read anymore. Then the tables of this draw, or null
+   // if the pass can't draw.
+   const reshade::api::descriptor_table* PrepareD3D12GamePass(DeviceData::GamePassD3D12* pass, DeviceData& device_data, reshade::api::device* device, std::span<const reshade::api::pipeline_layout_param> params, uint32_t table_param, uint32_t tables_per_draw, const char* name, uint32_t draws_per_frame = D3D12_GAME_PASS_DRAWS_PER_FRAME)
    {
       if (pass->failed)
       {
@@ -8685,7 +8458,7 @@ namespace
       }
       if (pass->layout.handle == 0)
       {
-         pass->tables.resize(D3D12_GAME_PASS_FRAMES * D3D12_GAME_PASS_DRAWS_PER_FRAME * tables_per_draw);
+         pass->tables.resize(D3D12_GAME_PASS_FRAMES * draws_per_frame * tables_per_draw);
          if (!device->create_pipeline_layout(uint32_t(params.size()), params.data(), &pass->layout) || !device->allocate_descriptor_tables(uint32_t(pass->tables.size()), pass->layout, table_param, pass->tables.data()))
          {
             if (pass->layout.handle != 0)
@@ -8727,7 +8500,7 @@ namespace
          pass->frame = present_count;
          pass->frame_draws = 0;
       }
-      return &pass->tables[((present_count % D3D12_GAME_PASS_FRAMES) * D3D12_GAME_PASS_DRAWS_PER_FRAME + (pass->frame_draws++ % D3D12_GAME_PASS_DRAWS_PER_FRAME)) * tables_per_draw];
+      return &pass->tables[((present_count % D3D12_GAME_PASS_FRAMES) * draws_per_frame + (pass->frame_draws++ % draws_per_frame)) * tables_per_draw];
    }
 
    // The pipeline of "pass" of the natives "vertex_shader_hash" and "pixel_shader_hash" (a pass pairs each pixel shader with one vertex shader) into "format", after
@@ -9313,7 +9086,413 @@ namespace
       return true;
    }
 #endif // ENABLE_BLOOM
+
+   // The copy of a texture Luma upgraded into one of another format family, or back (see "SkipUpgradedFormatCopy()"), which D3D12's copies can't make: "Copy PS" draws it instead, like the D3D11
+   // "OnCopyResource_Internal()", and the destination keeps its own precision. Whole 2D textures of the same size with one mip, layer and sample, R16G16B16A16 FLOAT against the R8G8B8A8, B8G8R8A8,
+   // B8G8R8X8, R10G10B10A2 and R11G11B10 families. The textures are in the states of the game's copy (copy source and copy destination) and are left in them; a destination that can't be a render
+   // target is drawn through an intermediate of its desc that can, then copied. False, with nothing recorded, if it can't (the caller skips the copy then).
+   // ponytail: legacy barriers from the copy states, so a texture still in the common state (promoted by the copy itself) or created in an enhanced barriers layout gets a debug layer error; track
+   // their states if a game copies those across formats
+   bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   {
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      if (cmd_list_data.d3d12_state.in_render_pass)
+      {
+         return false;
+      }
+      // The format a texture is viewed in (copies move bytes, so the typeless and sRGB ones read as UNORM), unknown for the ones that aren't converted
+      const auto view_format = [](reshade::api::format format)
+      {
+         switch (DXGI_FORMAT(format))
+         {
+         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+         case DXGI_FORMAT_R8G8B8A8_UNORM:
+         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+         case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+         case DXGI_FORMAT_B8G8R8A8_UNORM:
+         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+         case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+         case DXGI_FORMAT_B8G8R8X8_UNORM:
+         case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+            return DXGI_FORMAT_B8G8R8X8_UNORM;
+         case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+         case DXGI_FORMAT_R10G10B10A2_UNORM:
+            return DXGI_FORMAT_R10G10B10A2_UNORM;
+         case DXGI_FORMAT_R11G11B10_FLOAT:
+            return DXGI_FORMAT_R11G11B10_FLOAT;
+         case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+         case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+         default:
+            return DXGI_FORMAT_UNKNOWN;
+         }
+      };
+      const auto is_whole_2d = [](const reshade::api::resource_desc& desc)
+      { return desc.type == reshade::api::resource_type::texture_2d && desc.texture.depth_or_layers == 1 && desc.texture.levels == 1 && desc.texture.samples == 1; };
+      reshade::api::device* const device = cmd_list->get_device();
+      const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
+      const reshade::api::resource_desc dest_desc = device->get_resource_desc(dest);
+      const DXGI_FORMAT source_view_format = view_format(source_desc.texture.format);
+      const DXGI_FORMAT dest_view_format = view_format(dest_desc.texture.format);
+      if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+         || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || source_desc.texture.width != dest_desc.texture.width || source_desc.texture.height != dest_desc.texture.height
+         || (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0)
+      {
+         return false;
+      }
+
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      auto& texture_copy = device_data.texture_copy;
+      const std::unique_lock lock(texture_copy.mutex);
+      const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      const reshade::api::pipeline_layout_param params[] = {{1, &source_range}};
+      // A game can copy many textures a frame: one descriptor each
+      constexpr uint32_t TEXTURE_COPY_DRAWS_PER_FRAME = 64;
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&texture_copy, device_data, device, params, 0, 1, "Texture Copy", TEXTURE_COPY_DRAWS_PER_FRAME);
+      if (!tables)
+      {
+         return false;
+      }
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&texture_copy, native_device, CompileTimeStringHash("Copy VS"), CompileTimeStringHash("Copy PS"), dest_view_format, "Texture Copy");
+      if (!pipeline)
+      {
+         return false;
+      }
+
+      const bool draws_into_dest = (dest_desc.usage & reshade::api::resource_usage::render_target) != 0;
+      if (!draws_into_dest)
+      {
+         reshade::api::resource_desc target_desc = dest_desc;
+         target_desc.usage = reshade::api::resource_usage::render_target | reshade::api::resource_usage::copy_source;
+         target_desc.flags = reshade::api::resource_flags::none;
+         // The rest of the desc is the same for every whole single subresource texture (a "memcmp()" would compare the padding too)
+         const reshade::api::resource_desc& made_desc = texture_copy.target_desc;
+         if (texture_copy.target.handle == 0 || made_desc.texture.width != target_desc.texture.width || made_desc.texture.height != target_desc.texture.height || made_desc.texture.format != target_desc.texture.format)
+         {
+            RetireD3D12GamePassResource(&texture_copy, device_data.present_count.load(std::memory_order_relaxed), &texture_copy.target);
+            if (!device->create_resource(target_desc, nullptr, reshade::api::resource_usage::render_target, &texture_copy.target))
+            {
+               texture_copy.target = {};
+               return false;
+            }
+            texture_copy.target_desc = target_desc;
+         }
+      }
+      const reshade::api::resource target = (draws_into_dest ? dest : texture_copy.target);
+
+      const reshade::api::resource_view_desc source_view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format(source_view_format), 0, 1, 0, 1);
+      const reshade::api::resource_view_desc target_view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format(dest_view_format), 0, 1, 0, 1);
+      reshade::api::resource_view source_view = {};
+      reshade::api::resource_view target_view = {};
+      if (!device->create_resource_view(source, reshade::api::resource_usage::shader_resource, source_view_desc, &source_view) || !device->create_resource_view(target, reshade::api::resource_usage::render_target, target_view_desc, &target_view))
+      {
+         if (source_view.handle != 0)
+         {
+            device->destroy_resource_view(source_view);
+         }
+         return false;
+      }
+      const reshade::api::descriptor_table table = tables[0];
+      const reshade::api::descriptor_table_update source_update = {.table = table, .count = 1, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = &source_view};
+      device->update_descriptor_tables(1, &source_update);
+      // The table and the render target binding take copies of the descriptors
+      device->destroy_resource_view(source_view);
+
+      cmd_list->barrier(source, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource_pixel);
+      if (draws_into_dest)
+      {
+         cmd_list->barrier(dest, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::render_target);
+      }
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, texture_copy.layout, 0, 1, &table);
+      cmd_list->bind_render_targets_and_depth_stencil(1, &target_view);
+      device->destroy_resource_view(target_view);
+      const reshade::api::viewport viewport = {0.f, 0.f, float(dest_desc.texture.width), float(dest_desc.texture.height), 0.f, 1.f};
+      const reshade::api::rect scissor = {0, 0, int32_t(dest_desc.texture.width), int32_t(dest_desc.texture.height)};
+      cmd_list->bind_viewports(0, 1, &viewport);
+      cmd_list->bind_scissor_rects(0, 1, &scissor);
+      const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+      const uint32_t topology = uint32_t(reshade::api::primitive_topology::triangle_strip);
+      cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      cmd_list->draw(4, 1, 0, 0);
+
+      cmd_list->barrier(source, reshade::api::resource_usage::shader_resource_pixel, reshade::api::resource_usage::copy_source);
+      if (draws_into_dest)
+      {
+         cmd_list->barrier(dest, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_dest);
+      }
+      else
+      {
+         cmd_list->barrier(target, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
+         cmd_list->copy_resource(target, dest);
+         cmd_list->barrier(target, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
+      }
+
+      D3D12State::RestoreGraphics(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      // The next draw checks its pipeline against the render targets again
+      cmd_list_data.render_target_formats_dirty = true;
+      return true;
+   }
 #endif // ENABLE_D3D12_PASSES
+
+   // Whether Luma changed the format of a texture: one of "resource_upgrades.upgraded_resources", or a back buffer whose format family the swapchain upgrade changed ("device_data.mutex" must be held)
+   bool IsUpgradedTexture(const DeviceData& device_data, reshade::api::resource resource)
+   {
+      return device_data.resource_upgrades.upgraded_resources.contains(resource.handle) || device_data.upgraded_back_buffers.contains(resource.handle);
+   }
+
+   // The format of a texture as the device has it (the upgraded one), unknown for a buffer
+   DXGI_FORMAT GetTextureFormat(reshade::api::device* device, reshade::api::resource resource)
+   {
+      const reshade::api::resource_desc desc = device->get_resource_desc(resource);
+      return (desc.type == reshade::api::resource_type::buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(desc.texture.format));
+   }
+
+   // The game's placed textures are drawn and sampled through their clones (see "includes/d3d12_clones.h"), so its copies and resolves have to use the clones too: the originals hold nothing. Replaces
+   // each texture that has a clone, true if any was.
+   bool RedirectToClones(reshade::api::resource* source, reshade::api::resource* dest)
+   {
+      bool redirected = false;
+#if ENABLE_MINHOOK
+      for (reshade::api::resource* texture : {source, dest})
+      {
+         if (ID3D12Resource* const clone = D3D12Clones::FindActive(reinterpret_cast<ID3D12Resource*>(texture->handle)))
+         {
+            texture->handle = reinterpret_cast<uint64_t>(clone);
+            redirected = true;
+         }
+      }
+#endif
+      return redirected;
+   }
+
+   // How a copy covers its textures, for "SkipUpgradedFormatCopy()"
+   enum class CopyExtent : uint8_t
+   {
+      Whole,        // All of both textures, which can be converted
+      Part,         // A subresource or a region of one, or a resolve
+      ThroughBuffer // An upload or a readback, through a buffer's footprint
+   };
+
+   // D3D12 can't copy between a texture Luma upgraded and a resource of another format family (it tells by the typeless formats: R16G16B16A16 FLOAT against R8G8B8A8 UNORM). The uploads and readbacks through
+   // a buffer are never valid for an upgraded texture: ReShade doesn't pass the footprint's format, and the game's is the texture's original one. A whole texture copy is converted by a draw where it can
+   // ("ConvertTextureCopyD3D12()", with "enable_upgraded_texture_resource_copy_redirection"), the others are skipped, with a log line once for each kind and pair of formats. The resolves between textures
+   // of the same family only name the game's format: see "OnResolveTextureRegion()".
+   // Returns true to skip the game's copy (it was converted, or can't be made).
+   bool SkipUpgradedFormatCopy(reshade::api::command_list* cmd_list, const char* copy_kind, reshade::api::resource source, reshade::api::resource dest, CopyExtent extent)
+   {
+      const bool through_buffer = (extent == CopyExtent::ThroughBuffer);
+      if (swapchain_format_upgrade_type == TextureFormatUpgradesType::None && texture_format_upgrades_type == TextureFormatUpgradesType::None) // Optimization
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      {
+         DeviceData& device_data = *device->get_private_data<DeviceData>();
+         const std::shared_lock lock(device_data.mutex);
+         if (!IsUpgradedTexture(device_data, source) && !IsUpgradedTexture(device_data, dest))
+         {
+            return false;
+         }
+      }
+      const DXGI_FORMAT source_format = GetTextureFormat(device, source);
+      const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
+      if (!through_buffer && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
+      {
+         return false;
+      }
+#if ENABLE_D3D12_PASSES
+      const bool converted = (extent == CopyExtent::Whole && enable_upgraded_texture_resource_copy_redirection && ConvertTextureCopyD3D12(cmd_list, source, dest));
+#else
+      constexpr bool converted = false;
+#endif
+
+      static std::mutex warned_mutex;
+      static std::set<std::tuple<std::string_view, DXGI_FORMAT, DXGI_FORMAT, bool>> warned_copies;
+      const std::unique_lock lock_warned(warned_mutex);
+      if (converted && warned_copies.emplace(copy_kind, source_format, dest_format, true).second)
+      {
+         reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Converted a {} from {} to {} by a draw: D3D12 can't copy between an upgraded texture and another format", copy_kind, GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format)).c_str());
+      }
+      if (!converted && warned_copies.emplace(copy_kind, source_format, dest_format, false).second)
+      {
+         const std::string what = (through_buffer ? std::format("of an upgraded {} texture: the footprint of the buffer has the format the game created the texture with", GetFormatNameSafe(source_format != DXGI_FORMAT_UNKNOWN ? source_format : dest_format))
+                                                  : std::format("from {} to {}: D3D12 can't copy between an upgraded texture and another format, and this copy can't be converted", GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format)));
+         reshade::log::message(reshade::log::level::warning, std::format("[Texture upgrades] Skipped a {} {}", copy_kind, what).c_str());
+      }
+      return true;
+   }
+
+   // The copies, uploads and resolves, skipped when they would mix the formats of an upgrade (all builds). Development builds also trace them in the frame capture, and read back what the copies,
+   // resolves and render target and depth stencil clears wrote: their handlers return true when "ReadbackCopyOrClear()" re-issued them
+   bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
+#endif
+      const bool redirected = RedirectToClones(&source, &dest);
+      if (SkipUpgradedFormatCopy(cmd_list, "copy_resource", source, dest, CopyExtent::Whole))
+      {
+         return true;
+      }
+      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
+      { native_list->CopyResource(reinterpret_cast<ID3D12Resource*>(dest.handle), reinterpret_cast<ID3D12Resource*>(source.handle)); };
+#if DEVELOPMENT
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyResource}, {}, copy))
+      {
+         return true;
+      }
+#endif
+      if (redirected)
+      {
+         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+      }
+      return redirected;
+   }
+
+#if DEVELOPMENT
+   bool OnCopyBufferRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = true, .box = {.left = uint32_t(source_offset), .right = uint32_t(source_offset + size), .bottom = 1, .back = 1}}); });
+      return false;
+   }
+#endif
+
+   // ReShade only passes the footprint's offset and size (no row pitch), so uploads can't be re-issued from this event
+   bool OnCopyBufferToTexture(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, uint32_t row_length, uint32_t slice_height, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferToTexture, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = dest_box != nullptr, .box = (dest_box ? D3D12_BOX{.right = dest_box->width(), .bottom = dest_box->height(), .back = dest_box->depth()} : D3D12_BOX{})}); });
+#endif
+      RedirectToClones(&source, &dest); // So a texture with a clone counts as upgraded
+      return SkipUpgradedFormatCopy(cmd_list, "copy_buffer_to_texture", source, dest, CopyExtent::ThroughBuffer);
+   }
+
+   // "dest_box" is only there when the destination offset isn't zero
+   bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
+#endif
+      const bool redirected = RedirectToClones(&source, &dest);
+      const bool whole = (source_subresource == 0 && dest_subresource == 0 && !source_box && !dest_box); // The conversion checks that subresource 0 is the whole texture
+      if (SkipUpgradedFormatCopy(cmd_list, "copy_texture_region", source, dest, (whole ? CopyExtent::Whole : CopyExtent::Part)))
+      {
+         return true;
+      }
+      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
+      {
+         const D3D12_TEXTURE_COPY_LOCATION destination = {.pResource = reinterpret_cast<ID3D12Resource*>(dest.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = dest_subresource};
+         const D3D12_TEXTURE_COPY_LOCATION source_location = {.pResource = reinterpret_cast<ID3D12Resource*>(source.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = source_subresource};
+         native_list->CopyTextureRegion(&destination, (dest_box ? dest_box->left : 0), (dest_box ? dest_box->top : 0), (dest_box ? dest_box->front : 0), &source_location, reinterpret_cast<const D3D12_BOX*>(source_box));
+      };
+#if DEVELOPMENT
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyRegion, .subresource = dest_subresource}, {}, copy))
+      {
+         return true;
+      }
+#endif
+      if (redirected)
+      {
+         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+      }
+      return redirected;
+   }
+
+   bool OnCopyTextureToBuffer(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint64_t dest_offset, uint32_t row_length, uint32_t slice_height)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::TextureToBuffer, .source_subresource = source_subresource, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
+#endif
+      RedirectToClones(&source, &dest);
+      return SkipUpgradedFormatCopy(cmd_list, "copy_texture_to_buffer", source, dest, CopyExtent::ThroughBuffer);
+   }
+
+   // A resolve names the format to resolve in, which the game took from the textures it created: once Luma upgraded them it is the wrong one, and D3D12 rejects it. When the two textures are of the same format
+   // family (an upgraded multisampled target resolved into an upgraded target or back buffer: both R16G16B16A16 FLOAT now) only the format is wrong, and the resolve is re-issued with the textures' own, like
+   // the D3D11 path does. ReShade's event doesn't carry the mode of a "ResolveSubresourceRegion()": the re-issue averages (the mode of "ResolveSubresource()"), so a MIN or MAX region resolve of a color texture
+   // comes out averaged. Textures of other families can't be resolved into each other, "SkipUpgradedFormatCopy()" skips those (a later phase converts them).
+   bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
+#endif
+      const bool redirected = RedirectToClones(&source, &dest);
+      DXGI_FORMAT resolve_format = DXGI_FORMAT(format);
+      bool format_corrected = false;
+      if (swapchain_format_upgrade_type > TextureFormatUpgradesType::None || texture_format_upgrades_type > TextureFormatUpgradesType::None) // Optimization
+      {
+         reshade::api::device* const device = cmd_list->get_device();
+         bool any_upgraded = false;
+         {
+            DeviceData& device_data = *device->get_private_data<DeviceData>();
+            const std::shared_lock lock(device_data.mutex);
+            any_upgraded = IsUpgradedTexture(device_data, source) || IsUpgradedTexture(device_data, dest);
+         }
+         if (any_upgraded)
+         {
+            const DXGI_FORMAT source_format = GetTextureFormat(device, source);
+            const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
+            const DXGI_FORMAT textures_format = (IsTypelessFormat(source_format) ? dest_format : source_format); // The upgraded ones are never typeless
+            format_corrected = (GetTypelessFormat(source_format) == GetTypelessFormat(dest_format) && GetTypelessFormat(resolve_format) != GetTypelessFormat(textures_format) && !IsTypelessFormat(textures_format));
+            if (format_corrected)
+            {
+               resolve_format = textures_format;
+            }
+         }
+      }
+      if (!format_corrected && SkipUpgradedFormatCopy(cmd_list, "resolve_texture_region", source, dest, CopyExtent::Part))
+      {
+         return true;
+      }
+      const auto resolve = [&](ID3D12GraphicsCommandList* native_list)
+      {
+         auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
+         auto* native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
+         if (!source_box && dest_x == 0 && dest_y == 0)
+         {
+            native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, resolve_format);
+         }
+         else
+         {
+            com_ptr<ID3D12GraphicsCommandList1> native_list_1;
+            native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
+            if (native_list_1)
+            {
+               D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
+               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, D3D12_RESOLVE_MODE_AVERAGE);
+            }
+         }
+      };
+#if DEVELOPMENT
+      // The readback's target is the command as the game gave it (with its format), what it re-issues is the corrected one
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::Resolve, .subresource = dest_subresource, .resolve_format = DXGI_FORMAT(format)}, {}, resolve))
+      {
+         return true;
+      }
+#endif
+      if (format_corrected || redirected)
+      {
+         resolve(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+         return true;
+      }
+      return false;
+   }
 
    // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its debug draw and UI composition aren't ported yet): copies the back buffer, then draws
    // the "Display Composition" shader over it (see "PrepareD3D12NativePass()"). What it needs is the device's ("DeviceData::display_composition"), made when it first draws.

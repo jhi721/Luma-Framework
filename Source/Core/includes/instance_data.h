@@ -909,6 +909,13 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       uint32_t mip_count = 0;
    } bloom;
 #endif
+   // "ConvertTextureCopyD3D12()": a table of t0. The render target it draws into when the copy's destination can't be one, made again for another desc, in a render
+   // target state between draws
+   struct TextureCopyD3D12 : GamePassD3D12
+   {
+      reshade::api::resource target = {};
+      reshade::api::resource_desc target_desc = {};
+   } texture_copy;
 #endif
 #endif
 
