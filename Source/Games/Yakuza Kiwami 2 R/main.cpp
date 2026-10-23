@@ -21,7 +21,7 @@ namespace
    constexpr uint32_t PIXEL_SHADER_GRADE = 0x167D96E5;
    constexpr uint32_t PIXEL_SHADER_COPY = 0x7561D004; // The copy of the grade into the UI target, and the bloom chain's downsample
 
-   bool g_smaa = false;          // SMAA on the graded image (before the HUD), in place of RCAS when both are on
+   bool g_smaa = false;          // SMAA on the graded image (before the HUD), then RCAS if that is on too
    float g_rcas_sharpness = 0.f; // RCAS on the graded image (before the HUD), 0 = off (the vanilla copy)
 } // namespace
 
@@ -80,7 +80,6 @@ public:
       }
       // The copy into the UI target is the one at the swapchain's width (the bloom chain's are smaller). Its source, the grade output, is in a
       // shader resource state there and the UI target in a render target state, which SMAA and RCAS need.
-      // ponytail: SMAA takes the place of RCAS when both are on: RCAS after SMAA needs a target of its own
       const uint64_t grade_output = game_device_data.grade_output;
       if ((g_smaa || g_rcas_sharpness > 0.f) && grade_output != 0 && original_shader_hashes.Contains(PIXEL_SHADER_COPY, reshade::api::shader_stage::pixel) && render_target.resource != 0)
       {
@@ -92,7 +91,7 @@ public:
          bool drawn = false;
          if (g_smaa)
          {
-            drawn = DrawSMAA(cmd_list_data, device_data, {grade_output}, game_device_data.grade_output_format, {}, {}, {render_target.resource}, state.render_target_descs[0], {});
+            drawn = DrawSMAA(cmd_list_data, device_data, {grade_output}, game_device_data.grade_output_format, {}, {}, {render_target.resource}, state.render_target_descs[0], {}, g_rcas_sharpness);
          }
          else
          {
@@ -114,7 +113,7 @@ public:
 
    void DrawImGuiSettings(DeviceData& device_data) override
    {
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa, false, "Smooths the jagged edges of the image under the HUD (RCAS is off while it's on).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa, false, "Smooths the jagged edges of the image under the HUD.");
       DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening of the image under the HUD (0 = off).");
    }
 
