@@ -9,9 +9,10 @@
 #define AVOID_INPUT_LOSS 1
 
 #if DX12 && DEVELOPMENT
-// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash", "test_smaa_hash")
+// For the D3D12 smoke test of Luma's passes on the game's command lists ("test_rcas_hash", "test_smaa_hash", "test_bloom_hash")
 #define ENABLE_RCAS 1
 #define ENABLE_SMAA 1
+#define ENABLE_BLOOM 1
 #endif
 
 #include "..\..\Core\core.hpp"
@@ -27,6 +28,7 @@ namespace
    int test_rcas_hash = 0;        // The draw becomes RCAS (sharpness 1) of its t0 (the table of root parameter 0) into its render target
    int test_smaa_hash = 0;        // The draw becomes SMAA of its t0 into its render target (with a "Luma_SMAA_impl.hlsl" in the game's shader folder)
    int test_smaa_rcas = 0;        // 1: the SMAA of "test_smaa_hash" is followed by RCAS (sharpness 1)
+   int test_bloom_hash = 0;       // The draw becomes the Karis average and the 3 level bloom of its t0, whose mip 0 is copied into the top left of its render target
 #endif
 } // namespace
 
@@ -49,7 +51,7 @@ public:
       luma_settings_cbuffer_index = 13;
       luma_data_cbuffer_index = 12;
 #if DX12 && DEVELOPMENT
-      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}});
+      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}});
 #endif
    }
 
@@ -127,7 +129,7 @@ public:
          (*original_draw_dispatch_func)();
          return DrawOrDispatchOverrideType::Replaced;
       }
-      if (const bool rcas = is_test_hash(test_rcas_hash); rcas || is_test_hash(test_smaa_hash))
+      if (const bool rcas = is_test_hash(test_rcas_hash), bloom = is_test_hash(test_bloom_hash); rcas || bloom || is_test_hash(test_smaa_hash))
       {
          // The source is resolved through the development builds' shadow of the descriptor heaps
          const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
@@ -146,7 +148,25 @@ public:
          }
          const reshade::api::resource target = {state.render_target_views[0].resource};
          bool drawn = false;
-         if (rcas)
+         if (bloom)
+         {
+            // The smoke's source is in a pixel shader resource state there, its target in a render target state
+            static constexpr float sigmas[] = {2.f, 2.f, 2.f};
+            reshade::api::resource karis_average = {};
+            reshade::api::resource bloom_texture = {};
+            drawn = DrawKarisAverage(cmd_list_data, device_data, {source.resource}, source.format, reshade::api::resource_usage::shader_resource_pixel, &karis_average) &&
+                    DrawBloom(cmd_list_data, device_data, karis_average, reshade::api::format::r16g16b16a16_float, uint32_t(std::size(sigmas)), sigmas, &bloom_texture);
+            if (drawn)
+            {
+               reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+               cmd_list->barrier(bloom_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
+               cmd_list->barrier(target, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_dest);
+               cmd_list->copy_texture_region(bloom_texture, 0, nullptr, target, 0, nullptr);
+               cmd_list->barrier(target, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::render_target);
+               cmd_list->barrier(bloom_texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
+            }
+         }
+         else if (rcas)
          {
             drawn = DrawRCAS(cmd_list_data, device_data, {source.resource}, source.format, target, state.render_target_descs[0], 1.f);
          }
