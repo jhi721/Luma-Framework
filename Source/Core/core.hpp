@@ -9042,31 +9042,29 @@ namespace
       cmd_list_data.scissors_scaled = false;
    }
 
-#if ENABLE_RCAS
-   // RCAS sharpening ("Luma_RCAS_PS") of "source" into the whole "target" (through the view "target_desc"), recorded on the game's command list from a game's
-   // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawRCAS()". "source" (viewed as 2D "source_format") must be readable by pixel shaders and "target"
-   // be a render target, in the states the game left them in at that draw (it records no barrier). It records through ReShade's API, with its descriptor tables
-   // and the game's graphics state bound again after it ("D3D12State::RestoreGraphics()"). False, with nothing recorded, if it can't draw (the natives aren't
-   // compiled yet, the list is in a render pass): the caller then lets the game's draw run.
-   bool DrawRCAS(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, float sharpness)
+   // A fullscreen pass of the native "pixel_shader_hash" (drawn with "Copy VS") of "source" (viewed as 2D "source_format", its t0) into the whole "target" (through the
+   // view "target_desc"), with 4 root constants at b0: the target's width and height, then "param_0" and "param_1". Recorded on the game's command list from a game's
+   // "OnDrawOrDispatch()": "source" must be readable by pixel shaders and "target" be a render target, in the states the game left them in at that draw (it records no
+   // barrier). It records through ReShade's API, with the descriptor tables of "pass" and the game's graphics state bound again after it ("D3D12State::RestoreGraphics()").
+   // False, with nothing recorded, if it can't draw (the natives aren't compiled yet, the list is in a render pass): the caller then lets the game's draw run.
+   bool DrawFullscreenPassD3D12(CommandListData& cmd_list_data, DeviceData& device_data, DeviceData::GamePassD3D12* pass, uint32_t pixel_shader_hash, const char* name, const char* trace_name, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, float param_0, float param_1)
    {
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
-      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "RCAS"))
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, name))
       {
          return false;
       }
       reshade::api::device* const device = cmd_list->get_device();
       auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
-      auto& rcas = device_data.rcas;
-      const std::unique_lock lock(rcas.mutex);
+      const std::unique_lock lock(pass->mutex);
       const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
       const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.count = 4, .visibility = reshade::api::shader_stage::pixel}, {1, &source_range}};
-      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&rcas, device_data, device, params, 1, 1, "RCAS");
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(pass, device_data, device, params, 1, 1, name);
       if (!tables)
       {
          return false;
       }
-      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&rcas, native_device, CompileTimeStringHash("Copy VS"), CompileTimeStringHash("RCAS PS"), DXGI_FORMAT(target_desc.format), "RCAS");
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(pass, native_device, CompileTimeStringHash("Copy VS"), pixel_shader_hash, DXGI_FORMAT(target_desc.format), name);
       if (!pipeline)
       {
          return false;
@@ -9092,10 +9090,10 @@ namespace
       const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
       const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
       const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
-      const float sharpen_params[4] = {float(width), float(height), sharpness, 0.f};
+      const float constants[4] = {float(width), float(height), param_0, param_1};
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
-      cmd_list->push_constants(reshade::api::shader_stage::pixel, rcas.layout, 0, 0, 4, sharpen_params);
-      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, rcas.layout, 1, 1, &table);
+      cmd_list->push_constants(reshade::api::shader_stage::pixel, pass->layout, 0, 0, 4, constants);
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, pass->layout, 1, 1, &table);
       cmd_list->bind_render_targets_and_depth_stencil(1, &target_view);
       device->destroy_resource_view(target_view);
       const reshade::api::viewport viewport = {0.f, 0.f, float(width), float(height), 0.f, 1.f};
@@ -9107,10 +9105,17 @@ namespace
       cmd_list->bind_pipeline_states(1, &topology_state, &topology);
       cmd_list->draw(4, 1, 0, 0);
 
-      TraceLumaPass(&cmd_list_data, device_data, "Luma RCAS", {{.resource = source.handle, .format = source_format}},
+      TraceLumaPass(&cmd_list_data, device_data, trace_name, {{.resource = source.handle, .format = source_format}},
          {{.resource = target.handle, .format = target_desc.format, .first_level = target_desc.texture.first_level, .first_layer = target_desc.texture.first_layer, .layer_count = (std::max)(target_desc.texture.layers, 1u)}});
       RestoreGameGraphicsD3D12(cmd_list_data);
       return true;
+   }
+
+#if ENABLE_RCAS
+   // RCAS sharpening ("Luma_RCAS_PS") of "source" into "target": the D3D12 counterpart of the D3D11 "DrawRCAS()", with the contract of "DrawFullscreenPassD3D12()"
+   bool DrawRCAS(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, float sharpness)
+   {
+      return DrawFullscreenPassD3D12(cmd_list_data, device_data, &device_data.rcas, CompileTimeStringHash("RCAS PS"), "RCAS", "Luma RCAS", source, source_format, target, target_desc, sharpness, 0.f);
    }
 #endif // ENABLE_RCAS
 
