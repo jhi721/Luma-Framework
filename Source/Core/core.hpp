@@ -1119,9 +1119,9 @@ namespace
 #if ENABLE_DRAW_DISPATCH_DATA_CACHE || DEVELOPMENT
    thread_local DrawDispatchData last_draw_dispatch_data = {};
 #endif // ENABLE_DRAW_DISPATCH_DATA_CACHE || DEVELOPMENT
-#if DEVELOPMENT
    // ReShade specific design as we don't get a rejection between the create and init events if creation failed
    thread_local reshade::api::format last_attempted_upgraded_resource_creation_format = reshade::api::format::unknown;
+#if DEVELOPMENT
    thread_local reshade::api::format last_attempted_upgraded_resource_view_creation_view_format = reshade::api::format::unknown;
 
    bool trace_scheduled = false; // For next frame
@@ -11349,8 +11349,7 @@ namespace
          // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
          if (samplers_upgrade_mode >= 7)
          {
-            // TODO: this compares instead of assigning, so the filter stays (kept as the D3D11 code always had it)
-            (void)(desc.Filter == ((desc.ComparisonFunc != COMPARISON_NEVER && samplers_upgrade_mode == 7) ? FILTER_COMPARISON_ANISOTROPIC : FILTER_ANISOTROPIC));
+            desc.Filter = (desc.ComparisonFunc != COMPARISON_NEVER && samplers_upgrade_mode == 7) ? FILTER_COMPARISON_ANISOTROPIC : FILTER_ANISOTROPIC;
             desc.MaxAnisotropy = REQ_MAXANISOTROPY;
          }
          // Note: changing the lod bias of non anisotropic filters makes reflections (cubemap samples?) a lot more specular (shiny) in Prey (and probably does in other games too), so it's best avoided (it can look better is some screenshots, but it's likely not intended).
@@ -13613,9 +13612,7 @@ namespace
             {
                const std::unique_lock lock_upgrades(device_data.mutex);
                device_data.resource_upgrades.upgraded_resources.emplace(clone_handle);
-#if DEVELOPMENT
                device_data.resource_upgrades.original_upgraded_resources_formats[clone_handle] = desc.texture.format;
-#endif
             }
             if (D3D12ResourceCreation::current_creation_arguments.uses_layouts)
             {
@@ -13686,7 +13683,7 @@ namespace
             if (initial_data)
             {
                new_initial_data = *initial_data;
-               assert(upgraded_desc.texture.width == desc.texture.width && upgraded_desc.texture.height == desc.texture.height); // TODO: handle resizing too...
+               assert(upgraded_desc.texture.width == desc.texture.width && upgraded_desc.texture.height == desc.texture.height); // Custom dimensions skip textures with initial data ("GetOptionalResourceUpgradeDesc()")
                if (ConvertResourceData(initial_data, new_initial_data, desc, upgraded_desc.texture.format))
                   new_initial_data_ptr = &new_initial_data;
             }
@@ -13709,9 +13706,7 @@ namespace
 #endif // DX11
          {
             device_data.resource_upgrades.upgraded_resources.emplace(resource.handle);
-#if DEVELOPMENT
             device_data.resource_upgrades.original_upgraded_resources_formats[resource.handle] = last_attempted_upgraded_resource_creation_format;
-#endif
          }
          waiting_on_upgraded_resource_init = false;
       }
@@ -13777,9 +13772,7 @@ namespace
          const reshade::api::resource_desc original_desc = desc;
 #endif
 
-#if DEVELOPMENT
          last_attempted_upgraded_resource_creation_format = desc.texture.format;
-#endif
 
 #if DX12
          // The D3D12 rules, on top of the filters: a texture is only upgraded in place if the game creates it committed (it owns its memory, whereas a placed one is in a heap the game sized and shares with other
@@ -13866,7 +13859,7 @@ namespace
          if (initial_data != nullptr && upgrade_directly)
          {
             reshade::api::subresource_data new_initial_data = *initial_data;
-            assert(original_desc.texture.width == upgraded_desc.value().texture.width && original_desc.texture.height == upgraded_desc.value().texture.height); // TODO: handle resizing too...
+            assert(original_desc.texture.width == upgraded_desc.value().texture.width && original_desc.texture.height == upgraded_desc.value().texture.height); // Custom dimensions skip textures with initial data ("GetOptionalResourceUpgradeDesc()")
             converted_initial_data = ConvertResourceData(initial_data, new_initial_data, original_desc, upgraded_desc.value().texture.format);
             if (converted_initial_data)
             {
@@ -13919,9 +13912,7 @@ namespace
          {
             const std::unique_lock lock_upgrades(device_data.mutex);
             device_data.resource_upgrades.upgraded_resources.erase(clone_handle);
-#if DEVELOPMENT
             device_data.resource_upgrades.original_upgraded_resources_formats.erase(clone_handle);
-#endif
          }
 #if DEVELOPMENT
          const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
@@ -14729,10 +14720,16 @@ namespace
 
       bool needs_downgrade = false;
       bool needs_conversion = false;
+      reshade::api::format original_format = reshade::api::format::unknown;
       {
          const std::shared_lock lock(device_data.mutex);
          needs_downgrade = device_data.resource_upgrades.upgraded_resources.contains(resource.handle); // TODO: also check the swapchain for stuff like this... We should add it to this list!
          needs_conversion = needs_downgrade || device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle);
+         if (needs_downgrade)
+         {
+            original_format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
+            ASSERT_ONCE(original_format != reshade::api::format::unknown); // Every directly upgraded resource has its creation format
+         }
       }
       // If this happened, we need to upgrade the data passed in to match the new format!
       // This happens in Dishonored 2 and Thief on boot, to update videos or splash screens.
@@ -14743,15 +14740,14 @@ namespace
 
          upgraded_mapped_resources[resource.handle] = data;
 
-         if (needs_downgrade)
+         if (needs_downgrade && original_format != reshade::api::format::unknown)
          {
             reshade::api::resource_desc desc = device->get_resource_desc(resource);
             // Update the stride to match the original format, we want the game to write to the resource as if it was the original format (we'll convert the data later).
             // This assumes two things:
             // -The new format is wider and thus there will be enough memory.
             // -The game doesn't dynamically branch on mapping behaviour based on the current (upgraded) resource format, already acknowledging the upgraded format (most games wouldn't, especially not the old ones)
-            constexpr size_t bytes_per_pixel = 4; // 4 for 8bpc, 8 for 16bpc // TODO: we are assuming the original was R8G8B8A8, that is not necessarily true, we need to map what was the original format of all upgraded resources. Same assumption in the unmap function.
-            data->row_pitch = desc.texture.width * bytes_per_pixel;
+            data->row_pitch = reshade::api::format_row_pitch(original_format, desc.texture.width);
          }
       }
    }
@@ -14796,17 +14792,10 @@ namespace
          {
             reshade::api::resource_desc upgraded_desc = device->get_resource_desc(resource);
             reshade::api::resource_desc original_desc = upgraded_desc;
-            original_desc.texture.format = reshade::api::format::r8g8b8a8_unorm; // Guessed
-#if DEVELOPMENT
             {
                const std::shared_lock lock(device_data.mutex);
-               if (device_data.resource_upgrades.original_upgraded_resources_formats.contains(resource.handle))
-               {
-                  original_desc.texture.format = device_data.resource_upgrades.original_upgraded_resources_formats[resource.handle];
-                  ASSERT_ONCE(original_desc.texture.format == reshade::api::format::r8g8b8a8_unorm); // Cache "original_upgraded_resources_formats" outside of development too if this happens! It probably will at some point!
-               }
+               original_desc.texture.format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
             }
-#endif
 
             const size_t buffer_size = original_desc.texture.height * original_desc.texture.depth_or_layers * data->row_pitch; // Automatic reconstruction based on what we told the game
 
@@ -14874,15 +14863,8 @@ namespace
             upgraded_desc = device->get_resource_desc(resource);
             lock_device_read.lock();
             original_desc = upgraded_desc;
-            // TODO: stop randomly guessing the format and actually cache it aside! Note that some games might dynamically pre-convert the data to match the upgraded target format, however, that's unlikely
-            original_desc.texture.format = reshade::api::format::r8g8b8a8_unorm;
-#if DEVELOPMENT
-            if (device_data.resource_upgrades.original_upgraded_resources_formats.contains(resource.handle))
-            {
-               original_desc.texture.format = device_data.resource_upgrades.original_upgraded_resources_formats[resource.handle];
-               ASSERT_ONCE(original_desc.texture.format == reshade::api::format::r8g8b8a8_unorm); // Cache "original_upgraded_resources_formats" outside of development too if this happens! It probably will at some point!
-            }
-#endif
+            // Note that some games might dynamically pre-convert the data to match the upgraded target format, however, that's unlikely
+            original_desc.texture.format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
             convert_data = true;
          }
          auto original_resource_to_mirrored_upgraded_resource = device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.find(resource.handle);
@@ -15225,11 +15207,13 @@ namespace
             // If we detected incompatible formats that were likely caused by Luma upgrading texture formats (of render targets only...),
             // do the copy in shader. It should currently cover all texture formats upgradable with "texture_upgrade_formats".
             // If we ever made a new type of "swapchain_upgrade_type", this should be updated for that.
-            // Note that generally, formats of the same size might be supported as it simply does a byte copy,
-            // like DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UNORM and DXGI_FORMAT_R16G16B16A16_FLOAT are all mutually compatible.
+            // Note that formats of the same typeless group are copied by byte, so DXGI_FORMAT_R16G16B16A16_UNORM <-> DXGI_FORMAT_R16G16B16A16_FLOAT also needs the shader
+            // (a typeless resource keeps the byte copy, its views decide how it's read).
             // TODO: add gamma to linear support (e.g. non sRGB views into sRGB views)? Also just use AreFormatsCopyCompatible(format1, format2)
             if (((isUnorm8(target_desc.Format) || isFloat11(target_desc.Format)) && isFloat16(source_desc.Format))
-               || ((isUnorm8(source_desc.Format) || isFloat11(source_desc.Format)) && isFloat16(target_desc.Format)))
+               || ((isUnorm8(source_desc.Format) || isFloat11(source_desc.Format)) && isFloat16(target_desc.Format))
+               || (!IsTypelessFormat(source_desc.Format) && !IsTypelessFormat(target_desc.Format)
+                  && ((isUnorm16(target_desc.Format) && isFloat16(source_desc.Format)) || (isUnorm16(source_desc.Format) && isFloat16(target_desc.Format)))))
             {
                ASSERT_ONCE_MSG(forced || upgraded_resources, "The game seemingly tried to copy incompatible resource formats for resources that were not upgraded by us");
 

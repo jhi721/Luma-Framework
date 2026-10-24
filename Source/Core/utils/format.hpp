@@ -763,7 +763,7 @@ namespace
       return DXGI_FORMAT_UNKNOWN;
    }
 
-   // TODO: add a strict flag to avoid copying between e.g. UNORM and FLOAT
+   // Whether a byte copy keeps the values
    bool AreFormatsCopyCompatible(DXGI_FORMAT format_a, DXGI_FORMAT format_b)
    {
       auto Is32Bit4ChannelTypeless = [](DXGI_FORMAT format)
@@ -778,6 +778,10 @@ namespace
          return false;
       };
 
+      // Luma upgrades R16G16B16A16_UNORM textures to R16G16B16A16_FLOAT, and D3D11 copies one into the other by byte, reinterpreting the bits
+      // (a typeless format stays compatible, its views decide how it's read)
+      if ((format_a == DXGI_FORMAT_R16G16B16A16_FLOAT && format_b == DXGI_FORMAT_R16G16B16A16_UNORM) || (format_a == DXGI_FORMAT_R16G16B16A16_UNORM && format_b == DXGI_FORMAT_R16G16B16A16_FLOAT))
+         return false;
       format_a = GetTypelessFormat(format_a);
       format_b = GetTypelessFormat(format_b);
       if (format_a == format_b || (Is32Bit4ChannelTypeless(format_a) && Is32Bit4ChannelTypeless(format_b)))

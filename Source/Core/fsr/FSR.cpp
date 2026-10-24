@@ -250,7 +250,7 @@ namespace FidelityFX
       err_code = ffxFsr3ContextCreate(&custom_data->context, &context_desc);
       if (err_code != FFX_OK)
       {
-         // TODO: set FSR as non compatible if this failed with a "non compatible" or "dll missing" error? Or try again?
+         // No retry policy here: without a context "Draw()" fails, and the games then suppress SR until an upscaler is picked again
          printf_s("FSR3: ffxFsr3ContextCreate failed, error = %d\n", static_cast<int>(err_code));
          ASSERT_ONCE_MSG(false, "Couldn't create FSR3 context");
          free(scratch_buffer);

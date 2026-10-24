@@ -712,9 +712,7 @@ void ResourceUpgradeManager::OnResourceDestroyed(uint64_t resource_handle)
 #endif
    }
    upgraded_resources.erase(resource_handle);
-#if DEVELOPMENT
    original_upgraded_resources_formats.erase(resource_handle);
-#endif
 }
 
 // Lock-free: caller/core.hpp holds the single device mutex.

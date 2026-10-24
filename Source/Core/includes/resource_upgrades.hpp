@@ -220,8 +220,8 @@ public:
    // Runtime mirror state
    // ------------------------------------------------------------------
    std::unordered_set<uint64_t> upgraded_resources; // All the directly upgraded resources, excluding the swapchains backbuffers, as they are created internally by DX
+   std::unordered_map<uint64_t, reshade::api::format> original_upgraded_resources_formats; // The format the game created each directly upgraded resource with (its CPU writes are converted from it). DEVELOPMENT also lists the upgraded swapchain buffers
 #if DEVELOPMENT
-   std::unordered_map<uint64_t, reshade::api::format> original_upgraded_resources_formats; // Maps the original resource to its direct upgraded format. These include the swapchain buffers too!
    std::unordered_map<uint64_t, std::pair<uint64_t, reshade::api::format>> original_upgraded_resource_views_formats; // All the views for direct upgraded resources, with the resource and the original resource view format
 #endif
    std::unordered_map<uint64_t, IndirectUpgradedResource> original_resources_to_mirrored_upgraded_resources; // TODO: convert/copy the initial/current data from the source texture when created. Also rename to "indirect_upgraded"
