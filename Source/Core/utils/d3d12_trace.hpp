@@ -271,6 +271,22 @@ namespace D3D12Trace
          entry->ds_size = uint2{ds_size.x, ds_size.y};
    }
 
+   // The render targets and the depth stencil a command list has bound, for the draw entries and the render pass ones
+   void FillBoundTargets(reshade::api::device* device, const DeviceData* device_data, TraceDrawCallData* entry, const D3D12State::CommandListState& state)
+   {
+      for (size_t i = 0; i < state.render_targets.size() && i < TraceDrawCallData::rtvs_size; i++)
+      {
+         if (state.render_targets[i].handle == 0)
+            continue;
+         FillView(device, entry, 'r', uint32_t(i), true, state.render_targets[i].handle, state.render_target_views[i]);
+         entry->rt_is_swapchain[i] = device_data->back_buffers.contains(state.render_target_views[i].resource);
+      }
+      if (state.depth_stencil.handle != 0)
+      {
+         FillView(device, entry, 'd', 0, true, state.depth_stencil.handle, state.depth_stencil_view);
+      }
+   }
+
    // The fixed function state of a graphics pipeline for the capture, in the fields of the D3D11 one so its writers serve both (the D3D11 and D3D12 enums are numbered alike,
    // ReShade's are zero based). ReShade has these subobjects for every graphics pipeline, the D3D12 defaults stand in for the ones a pipeline hasn't ("state_bound" tells for
    // the depth stencil and rasterizer ones). D3D12 has no stencil masks per face on the D3D11 desc, the front face's are kept. Returns the depth stencil state as ReShade has it.
@@ -503,18 +519,9 @@ namespace D3D12Trace
          }
 #endif
 
-         for (size_t i = 0; i < state.render_targets.size() && i < TraceDrawCallData::rtvs_size; i++)
-         {
-            if (state.render_targets[i].handle == 0)
-               continue;
-            FillView(device, &trace_draw_call_data, 'r', uint32_t(i), true, state.render_targets[i].handle, state.render_target_views[i]);
-            trace_draw_call_data.rt_is_swapchain[i] = device_data->back_buffers.contains(state.render_target_views[i].resource);
-         }
-
+         FillBoundTargets(device, device_data, &trace_draw_call_data, state);
          if (state.depth_stencil.handle != 0)
          {
-            FillView(device, &trace_draw_call_data, 'd', 0, true, state.depth_stencil.handle, state.depth_stencil_view);
-
             using DepthStateType = TraceDrawCallData::DepthStateType;
             // Same classification as the D3D11 capture
             if (desc.depth_enable)

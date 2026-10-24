@@ -499,7 +499,7 @@ namespace Mcp
    }
 
    // In "TraceDrawCallData::TraceDrawCallType" and "TraceDrawCallData::CopyKind" order
-   constexpr const char* trace_type_names[] = {"shader", "copy", "clear", "bind_pipeline", "bind_resource", "cpu_read", "cpu_write", "present", "create_command_list", "append_command_list", "reset_command_list", "flush_command_list", "custom"};
+   constexpr const char* trace_type_names[] = {"shader", "copy", "clear", "bind_pipeline", "bind_resource", "cpu_read", "cpu_write", "present", "create_command_list", "append_command_list", "reset_command_list", "flush_command_list", "custom", "begin_render_pass", "end_render_pass"};
    constexpr const char* copy_kind_names[] = {"resource", "region", "resolve", "buffer_region", "buffer_to_texture", "texture_to_buffer"};
    // In "TraceDrawCallData::ClearKind" order (D3D12)
    constexpr const char* clear_kind_names[] = {"render_target", "depth_stencil", "unordered_access"};

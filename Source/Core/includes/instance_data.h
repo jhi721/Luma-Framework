@@ -137,6 +137,9 @@ struct TraceDrawCallData
       ResetCommmandList,
       FlushCommandList,
         Custom, // Custom draw call for custom passes we added/replaced
+      // D3D12 render passes (the game's draws between them are inside the pass)
+      BeginRenderPass,
+      EndRenderPass,
    };
 
    TraceDrawCallType type = TraceDrawCallType::Shader;

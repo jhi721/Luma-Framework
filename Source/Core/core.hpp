@@ -6372,20 +6372,20 @@ namespace
    }
 #endif
 
-   bool OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds, reshade::api::render_pass_flags flags)
+   // Luma's passes and readbacks record draws, copies and barriers that a render pass cannot hold, so they refuse inside one (the game's command runs as it is). Said once for each "kind" (a literal)
+   bool RefusedInRenderPass(const CommandListData& cmd_list_data, const char* kind)
    {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
-      D3D12State::BeginRenderPass(&cmd_list_data.d3d12_state, cmd_list->get_device(), count, rts, ds);
-      cmd_list_data.render_target_formats_dirty = true;
-      return false;
-   }
-
-   bool OnEndRenderPass(reshade::api::command_list* cmd_list)
-   {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
-      cmd_list->get_private_data<CommandListData>()->d3d12_state.in_render_pass = false;
-      return false;
+      if (!cmd_list_data.d3d12_state.in_render_pass)
+      {
+         return false;
+      }
+      static std::shared_mutex mutex;
+      static std::unordered_set<std::string_view> logged_kinds;
+      if (const std::unique_lock lock(mutex); logged_kinds.emplace(kind).second)
+      {
+         reshade::log::message(reshade::log::level::warning, std::format("[{}] Refused inside a render pass: between BeginRenderPass() and EndRenderPass() D3D12 holds no copies or barriers, and the render targets cannot change", kind).c_str());
+      }
+      return true;
    }
 
    // Re-issues the native command of a draw event, nothing for the ones that can't be re-issued. For the "original_draw_dispatch_func" of the callbacks and the readbacks.
@@ -6697,7 +6697,7 @@ namespace
       {
          copy.error = "The draw is recorded in a bundle, which can't hold copies";
       }
-      else if (cmd_list_data.d3d12_state.in_render_pass)
+      else if (RefusedInRenderPass(cmd_list_data, "Draw readback"))
       {
          copy.error = "The draw is inside a render pass, which can't hold copies";
       }
@@ -6918,7 +6918,7 @@ namespace
          copy.data_format = ((view_format != DXGI_FORMAT_UNKNOWN && view_format != DXGI_FORMAT(-1)) ? view_format : desc.Format);
       }
       const uint32_t written_plane = write.subresource / (desc.MipLevels * array_size);
-      if (cmd_list->get_private_data<CommandListData>()->d3d12_state.in_render_pass)
+      if (RefusedInRenderPass(*cmd_list->get_private_data<CommandListData>(), "Write readback"))
       {
          copy.error = "The command is inside a render pass, which can't hold copies";
       }
@@ -6963,6 +6963,33 @@ namespace
          { reissue(native_list); });
    }
 #endif // DEVELOPMENT
+
+   // The render pass entries of the capture hold the targets it binds (see "D3D12Trace::FillBoundTargets()"), the draws inside it have the same ones
+   bool OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds, reshade::api::render_pass_flags flags)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12State::BeginRenderPass(&cmd_list_data.d3d12_state, cmd_list->get_device(), count, rts, ds);
+      cmd_list_data.render_target_formats_dirty = true;
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            entry->type = TraceDrawCallData::TraceDrawCallType::BeginRenderPass;
+            D3D12Trace::FillBoundTargets(cmd_list->get_device(), cmd_list->get_device()->get_private_data<DeviceData>(), entry, cmd_list_data.d3d12_state); });
+#endif
+      return false;
+   }
+
+   bool OnEndRenderPass(reshade::api::command_list* cmd_list)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      cmd_list->get_private_data<CommandListData>()->d3d12_state.in_render_pass = false;
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { entry->type = TraceDrawCallData::TraceDrawCallType::EndRenderPass; });
+#endif
+      return false;
+   }
 
    // A Luma pass of the pass layer (see "D3D12Trace::FillLumaPass()") as a Custom entry of the capture, appended to the entries of "cmd_list_data" (the game's command list it was recorded
    // on, so the capture joins it in submission order after the command that triggered it), or to the device's capture without one (a pass of Luma's own list, at present). Does nothing
@@ -8854,7 +8881,7 @@ namespace
    bool DrawRCAS(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, float sharpness)
    {
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
-      if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass)
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "RCAS"))
       {
          return false;
       }
@@ -8965,7 +8992,7 @@ namespace
    {
       ASSERT_ONCE(ENABLE_RCAS || rcas_sharpness == 0.f);
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
-      if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass)
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "SMAA"))
       {
          return false;
       }
@@ -9146,7 +9173,7 @@ namespace
    bool DrawKarisAverage(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource_usage source_state, reshade::api::resource* output)
    {
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
-      if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass)
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "Karis Average"))
       {
          return false;
       }
@@ -9240,7 +9267,7 @@ namespace
    bool DrawBloom(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource scene, reshade::api::format scene_format, uint32_t mip_count, const float* sigmas, reshade::api::resource* bloom_output)
    {
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
-      if (!cmd_list || cmd_list_data.d3d12_state.in_render_pass || mip_count == 0 || mip_count > BLOOM_MAX_MIPS)
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "Bloom") || mip_count == 0 || mip_count > BLOOM_MAX_MIPS)
       {
          ASSERT_ONCE(mip_count != 0 && mip_count <= BLOOM_MAX_MIPS);
          return false;
@@ -9417,7 +9444,7 @@ namespace
    bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled)
    {
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
-      if (cmd_list_data.d3d12_state.in_render_pass)
+      if (RefusedInRenderPass(cmd_list_data, "Texture Copy"))
       {
          return false;
       }
