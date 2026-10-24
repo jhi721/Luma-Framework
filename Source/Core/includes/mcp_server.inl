@@ -634,6 +634,8 @@ namespace Mcp
          w->Field("upgrade_flags", flags);
       if (entry.IsRTVValid(0))
          w->Field("rt0", std::format("{} {}x{}", GetFormatNameSafe(entry.rtv_format[0]), entry.rtv_size[0].x, entry.rtv_size[0].y));
+      else if (entry.type != TraceDrawCallData::TraceDrawCallType::Shader && !entry.rt_hash[0].empty()) // A whole resource target, see "WriteTraceEntryDetails"
+         w->Field("rt0", std::format("{} {}x{}", GetFormatNameSafe(entry.rt_format[0]), entry.rt_size[0].x, entry.rt_size[0].y));
       if (entry.IsDSVValid() && entry.depth_state != TraceDrawCallData::DepthStateType::Disabled)
          w->Field("depth", EnumName(TraceDrawCallData::depth_state_names, size_t(entry.depth_state)));
       if (entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource && entry.copy_info.kind != TraceDrawCallData::CopyKind::Resource)
@@ -837,6 +839,22 @@ namespace Mcp
          w->Field("register", std::format("{}{}", type, shader_register.index)).Field("space", shader_register.space);
       };
 #endif
+
+      // Entries without a shader (copies, clears, CPU writes, Luma's passes) record whole resources instead of views: the target in
+      // "rt_*[0]" (copy destination) and the source in "sr_*[0]" (copy source, bound buffer)
+      if (entry.type != TraceDrawCallData::TraceDrawCallType::Shader)
+      {
+         const auto write_whole_resource = [&](const char* key, DXGI_FORMAT format, const uint4& size, const std::string& type, const std::string& hash)
+         {
+            if (hash.empty())
+               return;
+            w->Key(key).BeginObject().Format("format", format);
+            w->Key("size").BeginArray().Value(size.x).Value(size.y).Value(size.z).Value(size.w).EndArray();
+            w->Field("type", type).Field("resource", hash).EndObject();
+         };
+         write_whole_resource("source", entry.sr_format[0], entry.sr_size[0], entry.sr_type_name[0], entry.sr_hash[0]);
+         write_whole_resource("target", entry.rt_format[0], entry.rt_size[0], entry.rt_type_name[0], entry.rt_hash[0]);
+      }
 
       WriteViews(w, "rtvs", TraceDrawCallData::rtvs_size, [&](size_t i)
          { return entry.IsRTVValid(i); }, [&](size_t i)
