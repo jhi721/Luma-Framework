@@ -1116,6 +1116,12 @@ namespace
    bool trace_scheduled = false; // For next frame
    std::atomic<bool> trace_running = false; // For this frame. Atomic so hot paths can skip "s_mutex_trace" while no trace runs
    uint32_t trace_count = 0; // Not exactly necessary but... it might help
+#if DX12
+   // The device whose command lists and presents the frame capture records, of a game with several (video or compute ones): only its entries are kept, so the others' don't pile
+   // up. The overlay's device unless another one was picked (in the capture's device list, or by the MCP's "device"), set when a capture starts and cleared with its device.
+   // "s_mutex_trace". ponytail: a reader of another device's capture (the overlay, an MCP job) isn't guarded against that device's destruction on another thread meanwhile
+   DeviceData* trace_device_data = nullptr;
+#endif
 
    // Locks "s_mutex_trace" only while a trace runs, so untraced draws, binds and copies take no lock. Recheck "trace_running" under the returned lock, the trace might have ended in between.
    std::shared_lock<std::shared_mutex> LockTraceIfRunning()
@@ -1125,13 +1131,20 @@ namespace
       return std::shared_lock(s_mutex_trace);
    }
 
-   // The command list data holding the frame capture: the immediate command list's in D3D11 (deferred ones join it), a device one in D3D12
+#if DX12
+   DeviceData& GetTraceDeviceData(reshade::api::effect_runtime* runtime)
+   {
+      return (trace_device_data ? *trace_device_data : *runtime->get_device()->get_private_data<DeviceData>());
+   }
+#endif
+
+   // The command list data holding the frame capture: the immediate command list's in D3D11 (deferred ones join it), the captured device's in D3D12
    CommandListData& GetTraceCommandListData(reshade::api::effect_runtime* runtime)
    {
 #if DX11
       return *runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>();
 #else
-      return runtime->get_device()->get_private_data<DeviceData>()->trace_command_list_data;
+      return GetTraceDeviceData(runtime).trace_command_list_data;
 #endif
    }
 
@@ -3849,6 +3862,15 @@ namespace
          pipeline_cache_generation++;
       }
 
+#if DEVELOPMENT && DX12
+      {
+         const std::unique_lock lock_trace(s_mutex_trace);
+         if (trace_device_data == &device_data)
+         {
+            trace_device_data = nullptr;
+         }
+      }
+#endif
       {
          const std::unique_lock lock(s_mutex_device);
          if (std::vector<NativeDevice*>::iterator position = std::find(global_native_devices.begin(), global_native_devices.end(), native_device); position != global_native_devices.end())
@@ -7010,7 +7032,7 @@ namespace
    {
 #if DEVELOPMENT
       const auto lock_trace = LockTraceIfRunning();
-      if (!lock_trace || !trace_running)
+      if (!lock_trace || !trace_running || (!cmd_list_data && &device_data != trace_device_data))
          return;
       CommandListData& trace_cmd_list_data = (cmd_list_data ? *cmd_list_data : device_data.trace_command_list_data);
       const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
@@ -7420,6 +7442,8 @@ namespace
       if (!cmd_list_data || !lock_trace || !trace_running)
          return;
       DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+      if (&device_data != trace_device_data) // Another device's: the list's entries go with its next reset
+         return;
       CommandListData& trace_cmd_list_data = device_data.trace_command_list_data;
       const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
       const std::unique_lock lock_trace_3(cmd_list_data->mutex_trace);
@@ -10989,7 +11013,7 @@ namespace
       // The jobs that read the composed back buffer run here, the others ran before the composition
       {
          const auto lock_trace = LockTraceIfRunning();
-         if (lock_trace && trace_running)
+         if (lock_trace && trace_running && &device_data == trace_device_data)
          {
             CommandListData& trace_cmd_list_data = device_data.trace_command_list_data;
             const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
@@ -15580,6 +15604,12 @@ namespace
 #endif
             // Split the trace logic over "two" frames, to make sure we capture everything in between two present calls
             trace_scheduled = false;
+#if DX12
+            if (!trace_device_data)
+            {
+               trace_device_data = runtime->get_device()->get_private_data<DeviceData>();
+            }
+#endif
             {
                CommandListData& cmd_list_data = GetTraceCommandListData(runtime);
                const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
@@ -16553,6 +16583,36 @@ namespace
       {
          trace_scheduled = true;
       }
+#if DX12
+      {
+         // A game with several devices: the one the capture records
+         const std::shared_lock lock_device(s_mutex_device);
+         if (global_devices_data.size() > 1)
+         {
+            const std::unique_lock lock_trace(s_mutex_trace);
+            const DeviceData* const captured = (trace_device_data ? trace_device_data : &device_data);
+            const auto device_name = [&](size_t index)
+            { return std::format("Device {}{}", index, (global_devices_data[index] == &device_data ? " (overlay)" : "")); };
+            const size_t captured_index = std::ranges::find(global_devices_data, captured) - global_devices_data.begin();
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.f);
+            ImGui::BeginDisabled(trace_running || trace_scheduled);
+            if (ImGui::BeginCombo("Capture Device", device_name(captured_index).c_str()))
+            {
+               for (size_t i = 0; i < global_devices_data.size(); i++)
+               {
+                  if (ImGui::Selectable(device_name(i).c_str(), global_devices_data[i] == captured) && global_devices_data[i] != captured)
+                  {
+                     trace_device_data = global_devices_data[i];
+                     trace_count = 0; // The list was another device's
+                  }
+               }
+               ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+         }
+      }
+#endif
 #if 0 // Currently not necessary
       ImGui::SameLine();
       ImGui::Checkbox("List Unique Shaders Only", &trace_list_unique_shaders_only);
@@ -16793,6 +16853,10 @@ namespace
          ImGui::PopID();
          if (handle_shader_tab)
          {
+#if DX12
+            // The capture's entries name the pipelines of the device it recorded ("trace_device_data")
+            DeviceData& device_data = GetTraceDeviceData(runtime);
+#endif
             bool list_size_changed = false;
 
             if (ImGui::Button("Clear Capture and Debug Settings"))

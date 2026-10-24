@@ -1544,6 +1544,20 @@ namespace Mcp
          w.Field("has_compilation_errors", shaders_compilation_failed);
       }
       w.Field("trace_count", trace_count);
+#if DX12
+      {
+         // The game's devices: "presenting" is the one this answers from, "captured" the one the frame capture records (see "trace_device_data", "device" of luma_trace_capture)
+         const std::shared_lock lock_device(s_mutex_device);
+         const std::shared_lock lock_trace(s_mutex_trace);
+         w.Key("devices").BeginArray();
+         for (size_t i = 0; i < global_devices_data.size(); i++)
+         {
+            const DeviceData* const candidate = global_devices_data[i];
+            w.BeginObject().Field("index", uint32_t(i)).Field("presenting", candidate == &device_data).Field("captured", candidate == (trace_device_data ? trace_device_data : &device_data)).EndObject();
+         }
+         w.EndArray();
+      }
+#endif
       w.Field("swapchain_upgrade_type", uint32_t(swapchain_upgrade_type));
       w.Field("swapchain_format_upgrade_type", uint32_t(swapchain_format_upgrade_type));
       w.Field("texture_format_upgrades_type", uint32_t(texture_format_upgrades_type));
@@ -3341,6 +3355,40 @@ namespace Mcp
          return RunWaitFrames(job);
       if (tool == "perf")
          return RunPerf(job, device_data, queue);
+#if DX12
+      // The capture is the one of the device it records (see "trace_device_data"), whose pipelines its entries name: "device" (luma_trace_capture) picks it, for the next captures
+      // too. The readbacks at its entries run on the presenting device only.
+      if (tool == "trace_capture" || tool == "trace_list" || tool == "trace_get" || ((tool == "read_resource" || tool == "read_cbuffer") && job->Arg("index")))
+      {
+         const int64_t device_index = ((tool == "trace_capture" && job->phase == 0) ? job->IntArg("device", -1) : -1);
+         DeviceData* traced_device_data = nullptr;
+         {
+            const std::shared_lock lock_device(s_mutex_device);
+            const std::unique_lock lock_trace(s_mutex_trace);
+            if (device_index >= int64_t(global_devices_data.size()))
+            {
+               job->error = std::format("No device {}: the game has {} (luma_status lists them)", device_index, global_devices_data.size());
+               return true;
+            }
+            if (device_index >= 0 && !trace_running && !trace_scheduled)
+            {
+               trace_device_data = global_devices_data[size_t(device_index)];
+            }
+            traced_device_data = (trace_device_data ? trace_device_data : &device_data);
+         }
+         if (traced_device_data != &device_data)
+         {
+            if (tool == "trace_capture")
+               return RunTraceCapture(job, *traced_device_data, traced_device_data->trace_command_list_data);
+            if (tool == "trace_list")
+               return RunTraceList(job, *traced_device_data, traced_device_data->trace_command_list_data);
+            if (tool == "trace_get")
+               return RunTraceGet(job, *traced_device_data, traced_device_data->trace_command_list_data);
+            job->error = "The capture is of another device than the presenting one (luma_trace_capture device), and readbacks only run on the presenting device";
+            return true;
+         }
+      }
+#endif
 #if DX11
       auto* native_device_context = reinterpret_cast<ID3D11DeviceContext*>(queue->get_immediate_command_list()->get_native());
       if (tool == "read_resource")

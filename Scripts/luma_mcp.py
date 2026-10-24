@@ -108,7 +108,9 @@ TOOLS = [
          "frames": {"type": "integer", "description": "Consecutive captures to count draws per hash over (no trigger, max 600)"},
          "top": {"type": "integer", "description": "With frames: most drawn hashes returned (default 64)"},
          "summary": {"type": "boolean", "description": "With frames: frames_seen/min/max per hash instead of the per frame array (long windows)"},
-         "save_as": {"type": "string", "description": "Store the capture's entry list under this name for luma_trace_diff"}},
+         "save_as": {"type": "string", "description": "Store the capture's entry list under this name for luma_trace_diff"},
+         "device": {"type": "integer", "description": "D3D12, a game with several devices: index (luma_status devices) of the one the capture records, kept for the next captures "
+                    "and luma_trace_list/get; the presenting one by default. Readbacks at the entries of another device are refused"}},
     ),
     tool(
         "luma_trace_diff",
