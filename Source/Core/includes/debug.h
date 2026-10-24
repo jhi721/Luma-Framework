@@ -211,6 +211,8 @@ enum class DebugDrawTextureOptionsMask : uint32_t
    SRGB = 1 << 19,
    UVToPixelSpace = 1 << 20,
    Denormalize = 1 << 21,
+   // The texture is an R8_UINT one (the stencil plane), a plain 2D at t9 of the display composition (D3D12 only): loaded as integers and shown as value / 255
+   TextureUint = 1 << 22,
 };
 enum class DebugDrawMode : uint32_t
 {

@@ -2005,6 +2005,69 @@ namespace Mcp
       return pipeline.shader_hashes[(output_shader != pipeline.shader_types.end()) ? (output_shader - pipeline.shader_types.begin()) : 0];
    }
 
+   // The debug draw's shader resource mode ("SyncD3D12DebugDraw()"): the SRV "slot" of the "instance"th (the first if negative) draw of the last capture that runs one of "pipelines" (and has
+   // the "signature", if set) is a texture an earlier draw or dispatch of that capture wrote ("FindProducer()"), which is what the debug draw copies: the target that draw is armed with, its
+   // kind and slot those of the view that wrote it (the SRV's mip is that view's: "FindProducer()" matches it). Nothing, with "error" saying why: no capture, no such draw or SRV, or a texture
+   // written by something else than a draw. "s_mutex_generic" is held.
+   std::optional<D3D12Readback::Target> FindDebugDrawSRVTarget(DeviceData& device_data, const std::unordered_set<Shader::CachedPipeline*>& pipelines, int32_t instance, const std::optional<D3D12Readback::DrawSignature>& signature, uint32_t slot, std::string* error)
+   {
+      CommandListData& cmd_list_data = device_data.trace_command_list_data;
+      const std::shared_lock lock_trace(cmd_list_data.mutex_trace);
+      const std::vector<TraceDrawCallData>& entries = cmd_list_data.trace_draw_calls_data;
+      if (trace_running || entries.empty())
+      {
+         *error = "Capture a frame first (luma_trace_capture): the shader resource mode shows the output of the draw that wrote the SRV, which the capture says";
+         return std::nullopt;
+      }
+      std::optional<size_t> consumer;
+      int32_t draws_found = 0;
+      for (size_t i = 0; i < entries.size() && !consumer; i++)
+      {
+         const TraceDrawCallData& entry = entries[i];
+         bool runs_pipeline = false;
+         for (const Shader::CachedPipeline* pipeline : pipelines)
+         {
+            runs_pipeline |= (entry.type == TraceDrawCallData::TraceDrawCallType::Shader && pipeline->pipeline.handle == entry.pipeline_handle);
+         }
+         if (runs_pipeline && (!signature || D3D12Trace::MakeDrawSignature(device_data, entry.draw_dispatch_data, signature->compute, entry.rt_view[0].resource, entry.ds_view.resource) == *signature) && (instance < 0 || draws_found++ == instance))
+         {
+            consumer = i;
+         }
+      }
+      if (!consumer)
+      {
+         *error = "The last capture has no such draw of the shader (its instance and signature are those of the draw when it was picked)";
+         return std::nullopt;
+      }
+      const TraceDrawCallData& entry = entries[*consumer];
+      if (slot >= entry.srv_count || entry.sr_hash[slot].empty())
+      {
+         *error = std::format("Trace entry {} has no bound SRV at slot {}: pick the slot", *consumer, slot);
+         return std::nullopt;
+      }
+      D3D12Readback::Target target;
+      std::string refusal;
+      const std::optional<size_t> producer = FindProducer(entries, *consumer, entry.sr_hash[slot], entry.srv_mip[slot], entry.srv_format[slot], false, &target, &refusal);
+      if (!refusal.empty())
+      {
+         *error = refusal;
+         return std::nullopt;
+      }
+      if (!producer)
+      {
+         *error = std::format("No entry before {} wrote the resource of its SRV {} as a render target, UAV or depth stencil target, or by a copy, resolve or clear (the capture misses writes from before the captured frame, CopyTiles and DiscardResource)", *consumer, slot);
+         return std::nullopt;
+      }
+      const Shader::CachedPipeline* const pipeline = (entries[*producer].type == TraceDrawCallData::TraceDrawCallType::Shader) ? FindPipeline(device_data, entries[*producer].pipeline_handle) : nullptr;
+      if (!pipeline)
+      {
+         *error = std::format("Trace entry {} wrote the SRV's resource with a copy, resolve or clear, and the debug draw copies the output of draws and dispatches", *producer);
+         return std::nullopt;
+      }
+      FillDrawTarget(device_data, entries, *producer, *pipeline, &target);
+      return target;
+   }
+
    // Shows the draw "index" of the capture "entries" (run by "pipeline") as the D3D12 debug draw, what the overlay's buttons do on D3D11 with the hash
    // and the instance: sets its shader, instance and signature (the settings "SyncD3D12DebugDraw()" arms the copy from), and the view to show: the
    // one of "view" (the kind and slot a "FindProducer()" found), or what its pipeline most likely writes (the first render target, or the unordered
@@ -2024,7 +2087,21 @@ namespace Mcp
       debug_draw_mip = 0;
       if (view)
       {
-         debug_draw_mode = (view->kind == Kind::UnorderedAccess ? DebugDrawMode::UnorderedAccessView : (view->kind == Kind::Depth ? DebugDrawMode::Depth : DebugDrawMode::RenderTarget));
+         switch (view->kind)
+         {
+         case Kind::UnorderedAccess:
+            debug_draw_mode = DebugDrawMode::UnorderedAccessView;
+            break;
+         case Kind::Depth:
+            debug_draw_mode = DebugDrawMode::Depth;
+            break;
+         case Kind::Stencil:
+            debug_draw_mode = DebugDrawMode::Stencil;
+            break;
+         default:
+            debug_draw_mode = DebugDrawMode::RenderTarget;
+            break;
+         }
          debug_draw_view_index = int(view->slot);
       }
       else
@@ -2037,7 +2114,7 @@ namespace Mcp
             debug_draw_mode = DebugDrawMode::Depth;
          }
       }
-      if (debug_draw_mode == DebugDrawMode::Depth)
+      if (debug_draw_mode == DebugDrawMode::Depth || debug_draw_mode == DebugDrawMode::Stencil)
       {
          debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
       }

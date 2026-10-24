@@ -365,12 +365,12 @@ namespace D3D12Readback
    }
 
    // Records the debug draw's copy of "mip" of "layers" layers of "resource" (in "draw_state", the state the target draw needs) into
-   // "state->debug_copy"'s texture of "texture_format", a 2D texture of one mip that rests in PIXEL_SHADER_RESOURCE and is sampled in "srv_format"
+   // "state->debug_copy"'s texture of "texture_format" ("plane" of a depth stencil resource: 1 is its stencil), a 2D texture of one mip that rests in PIXEL_SHADER_RESOURCE and is sampled in "srv_format"
    // (multisampled color is resolved into it). The texture is kept while its description matches, a replaced one is retired with the copy that
    // used it. The copy's buffer only holds its 8 byte token, which "Advance()" needs to retire it. "reissue" re-issues the target draw once
    // nothing can fail anymore. Expects "state->mutex" (exclusive).
    template <typename Reissue>
-   bool RecordDebugCopy(State* state, ID3D12Device* device, ID3D12GraphicsCommandList* native_list, const reshade::api::command_list* cmd_list, ID3D12Resource* resource, D3D12_RESOURCE_STATES draw_state, uint32_t mip, uint32_t first_layer, uint32_t layers, DXGI_FORMAT texture_format, DXGI_FORMAT srv_format, Reissue&& reissue)
+   bool RecordDebugCopy(State* state, ID3D12Device* device, ID3D12GraphicsCommandList* native_list, const reshade::api::command_list* cmd_list, ID3D12Resource* resource, D3D12_RESOURCE_STATES draw_state, uint32_t mip, uint32_t first_layer, uint32_t layers, uint32_t plane, DXGI_FORMAT texture_format, DXGI_FORMAT srv_format, Reissue&& reissue)
    {
       const D3D12_RESOURCE_DESC source_desc = resource->GetDesc();
       const bool resolve = source_desc.SampleDesc.Count > 1;
@@ -418,7 +418,7 @@ namespace D3D12Readback
       const D3D12_RESOURCE_STATES source_state = (resolve ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE);
       const D3D12_RESOURCE_STATES destination_state = (resolve ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST);
       const auto source_subresource = [&](uint32_t layer)
-      { return mip + (first_layer + layer) * source_desc.MipLevels; };
+      { return mip + (first_layer + layer) * source_desc.MipLevels + plane * source_desc.MipLevels * source_desc.DepthOrArraySize; };
       for (uint32_t layer = 0; layer < layers; layer++)
          transition(resource, source_subresource(layer), draw_state, source_state);
       transition(destination, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, destination_state);

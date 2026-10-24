@@ -6521,9 +6521,9 @@ namespace
    }
 
    // The counterpart of "RecordReadback()" for the debug draw ("D3D12Readback::State::debug_target"): copies one mip of the layers "view" covers
-   // into the debug draw's texture, which the display composition draws at present. "error" is what the target draw's checks refused, if
-   // anything. A refusal is logged when it changes and shown by the overlay. Returns true when it re-issued the draw to copy its output after it.
-   bool RecordDebugDraw(reshade::api::command_list* cmd_list, std::string error, const D3D12State::ViewInfo& view, D3D12_RESOURCE_STATES draw_state, bool is_depth, DXGI_FORMAT view_format, auto&& reissue)
+   // (the "plane" of a depth stencil view: 1 is the stencil one, "view_format" then is its R8_UINT) into the debug draw's texture, which the display composition draws at present.
+   // "error" is what the target draw's checks refused, if anything. A refusal is logged when it changes and shown by the overlay. Returns true when it re-issued the draw to copy its output after it.
+   bool RecordDebugDraw(reshade::api::command_list* cmd_list, std::string error, const D3D12State::ViewInfo& view, D3D12_RESOURCE_STATES draw_state, bool is_depth, uint32_t plane, DXGI_FORMAT view_format, auto&& reissue)
    {
       reshade::api::device* device = cmd_list->get_device();
       DeviceData& device_data = *device->get_private_data<DeviceData>();
@@ -6548,9 +6548,9 @@ namespace
          {
             error = "Only 2D textures and their arrays are shown";
          }
-         else if (desc.SampleDesc.Count > 1 && is_depth)
+         else if (desc.SampleDesc.Count > 1 && (is_depth || plane == 1))
          {
-            error = "Multisampled depth can't be resolved";
+            error = "Multisampled depth and stencil can't be resolved";
          }
          else if (view.first_layer >= desc.DepthOrArraySize || view.first_level >= desc.MipLevels)
          {
@@ -6580,7 +6580,7 @@ namespace
       const std::unique_lock lock(readback.mutex);
       if (error.empty())
       {
-         reissued = D3D12Readback::RecordDebugCopy(&readback, reinterpret_cast<ID3D12Device*>(device->get_native()), native_list, cmd_list, resource, draw_state, view.first_level, view.first_layer, layers, texture_format, srv_format, reissue);
+         reissued = D3D12Readback::RecordDebugCopy(&readback, reinterpret_cast<ID3D12Device*>(device->get_native()), native_list, cmd_list, resource, draw_state, view.first_level, view.first_layer, layers, plane, texture_format, srv_format, reissue);
          if (reissued)
          {
             debug_draw_copied_frame = uint32_t(cb_luma_global_settings.FrameIndex);
@@ -6853,7 +6853,7 @@ namespace
       };
       if (is_debug_draw)
       {
-         return RecordDebugDraw(cmd_list, copy.error, view, draw_state, target.kind == Kind::Depth, copy.data_format, reissue);
+         return RecordDebugDraw(cmd_list, copy.error, view, draw_state, target.kind == Kind::Depth, plane, copy.data_format, reissue);
       }
       return RecordReadback(cmd_list, std::move(copy), view, draw_state, plane, buffer, target.kind == Kind::RenderTarget, reissue);
    }
@@ -10076,19 +10076,31 @@ namespace
          case DebugDrawMode::Depth:
             kind = Kind::Depth;
             break;
+         case DebugDrawMode::Stencil:
+            kind = Kind::Stencil;
+            break;
+         case DebugDrawMode::ShaderResource:
+            break; // The draw that wrote the SRV gives the kind, below
          default:
-            error = "D3D12 shows the render target, unordered access view and depth of a draw: pick one of those modes (a shader resource's state isn't known, show the draw that wrote it)";
+            error = "D3D12 shows a draw's render target, unordered access view, depth, stencil, or the output of the draw that wrote its shader resource: pick one of those modes";
             break;
          }
+         const bool shows_shader_resource = (debug_draw_mode == DebugDrawMode::ShaderResource);
+         const std::optional<D3D12Readback::DrawSignature> signature = (debug_draw_signature_hash == debug_draw_shader_hash ? debug_draw_signature : std::nullopt);
          const std::shared_lock lock_generic(s_mutex_generic);
          const auto it = device_data.pipeline_caches_by_shader_hash.find(debug_draw_shader_hash);
-         if (kind && (it == device_data.pipeline_caches_by_shader_hash.end() || it->second.empty()))
+         if ((kind || shows_shader_resource) && (it == device_data.pipeline_caches_by_shader_hash.end() || it->second.empty()))
          {
             error = "The shader has no live pipeline";
          }
+         else if (shows_shader_resource)
+         {
+            // Followed in the last capture at every present: ponytail, cache it per capture if a capture of thousands of entries makes the overlay slow
+            wanted = Mcp::FindDebugDrawSRVTarget(device_data, it->second, debug_draw_pipeline_target_instance, signature, uint32_t(debug_draw_view_index), &error);
+         }
          else if (kind)
          {
-            wanted = {.signature = (debug_draw_signature_hash == debug_draw_shader_hash ? debug_draw_signature : std::nullopt), .instance = debug_draw_pipeline_target_instance, .kind = *kind, .slot = (*kind == Kind::Depth ? 0 : uint32_t(debug_draw_view_index))};
+            wanted = {.signature = signature, .instance = debug_draw_pipeline_target_instance, .kind = *kind, .slot = (*kind == Kind::Depth || *kind == Kind::Stencil ? 0 : uint32_t(debug_draw_view_index))};
             for (const Shader::CachedPipeline* pipeline : it->second)
             {
                wanted->pipelines.push_back(pipeline->pipeline.handle);
@@ -10169,8 +10181,8 @@ namespace
       const D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
       auto& composition = device_data.display_composition;
       const std::unique_lock lock(composition.mutex);
-      // The table's SRVs: t0 the source, t1 the UI texture, t2 to t8 the debug draw ones (see below)
-      if (!PrepareD3D12NativePass(&composition, device_data, native_device, CompileTimeStringHash("Display Composition"), 9, back_buffer_desc.Format, "Display composition"))
+      // The table's SRVs: t0 the source, t1 the UI texture, t2 to t9 the debug draw ones (see below)
+      if (!PrepareD3D12NativePass(&composition, device_data, native_device, CompileTimeStringHash("Display Composition"), 10, back_buffer_desc.Format, "Display composition"))
       {
          return;
       }
@@ -10205,7 +10217,7 @@ namespace
          return fail(&no_frame, "[Display composition] No frame of its command list is free (the GPU is 16 presents behind), or the device refused it, so the image isn't composed at this present");
       }
 
-      // The table's SRVs: the source, then null views of the dimensions the shader declares for the others (t1 the UI texture, t2 to t8 the debug draw ones), the runtime checks the descriptors against them
+      // The table's SRVs: the source, then null views of the dimensions the shader declares for the others (t1 the UI texture, t2 to t9 the debug draw ones), the runtime checks the descriptors against them
       native_device->CreateRenderTargetView(back_buffer, nullptr, recording->rtv_cpu);
       const D3D12_SHADER_RESOURCE_VIEW_DESC source_srv = {.Format = back_buffer_desc.Format, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}};
       const D3D12_SHADER_RESOURCE_VIEW_DESC null_srvs[] = {
@@ -10217,6 +10229,7 @@ namespace
          {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture3D = {.MipLevels = 1}},
          {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture1D = {.MipLevels = 1}},
          {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture1DArray = {.MipLevels = 1, .ArraySize = 1}},
+         {.Format = DXGI_FORMAT_R8_UINT, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}},
       };
       D3D12_CPU_DESCRIPTOR_HANDLE srv = recording->srv_cpu;
       native_device->CreateShaderResourceView(composition.source.get(), &source_srv, srv);
@@ -10226,7 +10239,7 @@ namespace
          native_device->CreateShaderResourceView(nullptr, &null_srv, srv);
       }
 
-      // The debug draw's texture takes the slot of its dimension (t2 or t4, see the shader), with the options and mip the settings ask for
+      // The debug draw's texture takes the slot of its dimension (t2 or t4, see the shader), t9 for the stencil plane (R8_UINT, plain 2D only), with the options and mip the settings ask for
       uint32_t debug_options = 0;
       float debug_mip = 0.f;
       const bool shows_debug_texture = debug_source.texture && debug_source.srv_format != DXGI_FORMAT_UNKNOWN && !IsTypelessFormat(debug_source.srv_format);
@@ -10235,7 +10248,8 @@ namespace
       {
          const D3D12_RESOURCE_DESC debug_desc = debug_source.texture->GetDesc();
          const bool is_array = debug_desc.DepthOrArraySize > 1;
-         if (debug_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && debug_desc.SampleDesc.Count == 1)
+         const bool is_uint = (debug_source.srv_format == DXGI_FORMAT_R8_UINT);
+         if (debug_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && debug_desc.SampleDesc.Count == 1 && !(is_uint && is_array))
          {
             D3D12_SHADER_RESOURCE_VIEW_DESC debug_srv = {.Format = debug_source.srv_format, .ViewDimension = (is_array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D), .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
             if (is_array)
@@ -10247,7 +10261,7 @@ namespace
                debug_srv.Texture2D = {.MostDetailedMip = 0, .MipLevels = debug_desc.MipLevels};
             }
             D3D12_CPU_DESCRIPTOR_HANDLE debug_handle = recording->srv_cpu;
-            debug_handle.ptr += SIZE_T(recording->srv_increment) * (is_array ? 4 : 2);
+            debug_handle.ptr += SIZE_T(recording->srv_increment) * (is_uint ? 9 : (is_array ? 4 : 2));
             native_device->CreateShaderResourceView(debug_source.texture.get(), &debug_srv, debug_handle);
             debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::Texture2D;
             debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::Texture3D;
@@ -10259,6 +10273,14 @@ namespace
             else
             {
                debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::TextureArray;
+            }
+            if (is_uint)
+            {
+               debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::TextureUint;
+            }
+            else
+            {
+               debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::TextureUint;
             }
             debug_options = GetDebugDrawShaderOptions(debug_source.srv_format);
             debug_mip = float(debug_draw_mip);
