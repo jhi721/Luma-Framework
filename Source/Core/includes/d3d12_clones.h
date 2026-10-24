@@ -404,7 +404,70 @@ namespace D3D12Clones
       }
    }
 
-   // Set as private data of the native descriptor heaps (the CBV/SRV/UAV and RTV ones, where the records live): D3D12 releases it when the
+   // A sampler the game wrote into a descriptor heap, as it described it (Luma's upgrade comes after, in ReShade's "create_sampler" event), with the proxy of the device it
+   // wrote it through
+   struct SamplerRecord
+   {
+      ID3D12Device* proxy = nullptr;
+      std::variant<D3D12_SAMPLER_DESC, D3D12_SAMPLER_DESC2> desc;
+   };
+
+   // The samplers the game wrote, by the CPU descriptor (in the game's encoding) they were written or copied to: D3D12 descriptors keep the sampler they were written
+   // with, so "RewriteSamplers()" writes them again when Luma's upgrade of them changes. Only kept with "Install()"'s "track_sampler_descriptors".
+   struct SamplerRecords
+   {
+      std::shared_mutex mutex;
+      std::unordered_map<SIZE_T, SamplerRecord> by_handle;
+      std::atomic<uint32_t> count = 0; // Of "by_handle", for the lock free fast out of the descriptor copies
+   };
+   inline SamplerRecords& sampler_records = *new SamplerRecords; // Never destroyed, like the registry
+
+   inline void RecordSampler(SIZE_T handle, const SamplerRecord& record)
+   {
+      const std::unique_lock lock(sampler_records.mutex);
+      sampler_records.by_handle.insert_or_assign(handle, record);
+      sampler_records.count.store(uint32_t(sampler_records.by_handle.size()), std::memory_order_relaxed);
+   }
+
+   // The game copied sampler descriptors ("sources[i]" to "destinations[i]"): a record follows its descriptor, and an overwritten one is dropped.
+   // ponytail: the exclusive lock per copy while any sampler is recorded; games copy far fewer samplers than views
+   inline void PropagateSamplerRecords(const std::vector<std::pair<SIZE_T, SIZE_T>>& destinations_and_sources)
+   {
+      const std::unique_lock lock(sampler_records.mutex);
+      for (const auto& [destination, source] : destinations_and_sources)
+      {
+         const auto found = sampler_records.by_handle.find(source);
+         if (found != sampler_records.by_handle.end())
+         {
+            const SamplerRecord copied = found->second; // The insert can rehash
+            sampler_records.by_handle.insert_or_assign(destination, copied);
+         }
+         else
+         {
+            sampler_records.by_handle.erase(destination);
+         }
+      }
+      sampler_records.count.store(uint32_t(sampler_records.by_handle.size()), std::memory_order_relaxed);
+   }
+
+   // The sampler records in a descriptor heap that was destroyed, whose slots "RewriteSamplers()" mustn't write
+   inline void DropSamplerRecordsInRange(SIZE_T first_handle, SIZE_T byte_size)
+   {
+      if (sampler_records.count.load(std::memory_order_relaxed) == 0)
+      {
+         return;
+      }
+      const std::unique_lock lock(sampler_records.mutex);
+      std::erase_if(sampler_records.by_handle, [&](const auto& entry)
+         { return entry.first >= first_handle && entry.first - first_handle < byte_size; });
+      sampler_records.count.store(uint32_t(sampler_records.by_handle.size()), std::memory_order_relaxed);
+   }
+
+   // What the descriptor heaps get a "HeapSentinel" for, set by "Install()": the CBV/SRV/UAV and RTV ones in seed mode (the view records), the sampler ones with the sampler records
+   inline bool track_view_heaps = false;
+   inline bool track_sampler_heaps = false;
+
+   // Set as private data of the native descriptor heaps (the CBV/SRV/UAV and RTV ones, where the view records live, and the sampler ones): D3D12 releases it when the
    // heap is destroyed, which nothing else tells reliably. ReShade's proxy heap "Release()" can't say when the last reference went, and
    // its RTV heaps aren't proxied at all.
    // The heaps that have one, so "Remove()" can take the sentinels back before the module unloads: a heap can outlive the add-on, and
@@ -450,6 +513,7 @@ namespace D3D12Clones
          if (remaining == 0)
          {
             DropRecordsInRange(first_handle, byte_size);
+            DropSamplerRecordsInRange(first_handle, byte_size);
             {
                const std::lock_guard lock(tracked_heaps.mutex);
                tracked_heaps.heaps.erase(heap); // Already gone if "Remove()" took it
@@ -497,27 +561,18 @@ namespace D3D12Clones
    // ponytail: waits on the present queue only (work of async compute/copy queues isn't synchronized); command lists recorded for the next
    // frame already consumed their RTV descriptors, so the first promoted frame can show a frame of stale content; a game thread copying a
    // descriptor while it is created again could read a torn one (descriptors have no lock to take).
-   inline Promotion PromotePending(ID3D12CommandQueue* queue)
+   // Signals the fence of "device" on "queue" and waits for it, 2 seconds at most: the GPU is then done with what was submitted to the queue. False if the wait timed out
+   // (or the device refused a fence). "waited_ms" gets how long it took.
+   inline bool WaitForQueue(ID3D12CommandQueue* queue, ID3D12Device* device, double* waited_ms)
    {
-      Promotion promotion;
-      if (registry.pending_promotions.load(std::memory_order_relaxed) == 0)
-      {
-         return promotion;
-      }
-      com_ptr<ID3D12Device> device;
-      ID3D12Device* const proxy = (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) ? D3D12ProxyHook::FindProxy(device.get()) : nullptr);
-      if (!proxy)
-      {
-         return promotion;
-      }
       ID3D12Fence* fence = nullptr;
       uint64_t wait_value = 0;
       {
          const std::unique_lock lock(registry.mutex);
-         DeviceFence* const device_fence = FindOrCreateFenceLocked(device.get());
+         DeviceFence* const device_fence = FindOrCreateFenceLocked(device);
          if (!device_fence)
          {
-            return promotion;
+            return false;
          }
          fence = device_fence->fence.get();
          wait_value = ++device_fence->last_signaled;
@@ -531,8 +586,24 @@ namespace D3D12Clones
       {
          CloseHandle(event);
       }
-      promotion.waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
-      if (!waited)
+      *waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+      return waited;
+   }
+
+   inline Promotion PromotePending(ID3D12CommandQueue* queue)
+   {
+      Promotion promotion;
+      if (registry.pending_promotions.load(std::memory_order_relaxed) == 0)
+      {
+         return promotion;
+      }
+      com_ptr<ID3D12Device> device;
+      ID3D12Device* const proxy = (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) ? D3D12ProxyHook::FindProxy(device.get()) : nullptr);
+      if (!proxy)
+      {
+         return promotion;
+      }
+      if (!WaitForQueue(queue, device.get(), &promotion.waited_ms))
       {
          promotion.timed_out = true; // The requests stay: the next present tries again
          return promotion;
@@ -595,6 +666,67 @@ namespace D3D12Clones
          }
       }
       return promotion;
+   }
+
+   struct SamplerRewrite
+   {
+      size_t count = 0;
+      double waited_ms = 0.0;
+      bool timed_out = false;
+   };
+
+   // Writes the samplers the game wrote on the queue's device again, as it described them, through ReShade's proxy, whose "create_sampler" event upgrades them as Luma's
+   // upgrade is now: for a change of it (the mip bias of super resolution). At present, on the present queue, after the wait for the GPU (one hitch per change), for the
+   // reasons of "PromotePending()", whose limits it shares (only the present queue is waited for; a game thread copying a sampler meanwhile can read a torn one).
+   inline SamplerRewrite RewriteSamplers(ID3D12CommandQueue* queue)
+   {
+      SamplerRewrite rewrite;
+      if (sampler_records.count.load(std::memory_order_relaxed) == 0)
+      {
+         return rewrite;
+      }
+      com_ptr<ID3D12Device> device;
+      ID3D12Device* const proxy = (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) ? D3D12ProxyHook::FindProxy(device.get()) : nullptr);
+      if (!proxy)
+      {
+         return rewrite;
+      }
+      std::vector<std::pair<SIZE_T, std::variant<D3D12_SAMPLER_DESC, D3D12_SAMPLER_DESC2>>> samplers;
+      {
+         const std::shared_lock lock(sampler_records.mutex);
+         for (const auto& [handle, record] : sampler_records.by_handle)
+         {
+            if (record.proxy == proxy)
+            {
+               samplers.emplace_back(handle, record.desc);
+            }
+         }
+      }
+      if (samplers.empty())
+      {
+         return rewrite;
+      }
+      if (!WaitForQueue(queue, device.get(), &rewrite.waited_ms))
+      {
+         rewrite.timed_out = true; // The caller tries again at the next present
+         return rewrite;
+      }
+      // No lock held: ReShade fires its events from inside these, and the sampler detours take the records'
+      com_ptr<ID3D12Device11> proxy11; // For the samplers written with "CreateSampler2()"
+      for (const auto& [handle, desc] : samplers)
+      {
+         const D3D12_CPU_DESCRIPTOR_HANDLE descriptor = {handle};
+         if (const D3D12_SAMPLER_DESC* const desc1 = std::get_if<D3D12_SAMPLER_DESC>(&desc))
+         {
+            proxy->CreateSampler(desc1, descriptor);
+         }
+         else if (proxy11 || SUCCEEDED(proxy->QueryInterface(IID_PPV_ARGS(&proxy11))))
+         {
+            proxy11->CreateSampler2(&std::get<D3D12_SAMPLER_DESC2>(desc), descriptor);
+         }
+      }
+      rewrite.count = samplers.size();
+      return rewrite;
    }
 
    // The clear value of a clone in "format", with the colour the game's value has. The upgraded format of a clone can be typeless, and a
@@ -690,12 +822,15 @@ namespace D3D12Clones
    constexpr size_t CREATE_SHADER_RESOURCE_VIEW_SLOT = 18;
    constexpr size_t CREATE_UNORDERED_ACCESS_VIEW_SLOT = 19;
    constexpr size_t CREATE_RENDER_TARGET_VIEW_SLOT = 20;
+   constexpr size_t CREATE_SAMPLER_SLOT = 22;
+   constexpr size_t CREATE_SAMPLER2_SLOT = 79; // "ID3D12Device11"'s
    constexpr size_t COPY_DESCRIPTORS_SLOT = 23;
    constexpr size_t COPY_DESCRIPTORS_SIMPLE_SLOT = 24;
    // "ID3D12Device15" (not in every SDK's d3d12.h, so its detours take an "ID3D12Device*") appends the "TryCreate" views, which bypass the ones above: counted like the others, each method once
    constexpr size_t TRY_CREATE_SHADER_RESOURCE_VIEW_SLOT = 85;
    constexpr size_t TRY_CREATE_UNORDERED_ACCESS_VIEW_SLOT = 86;
    constexpr size_t TRY_CREATE_CONSTANT_BUFFER_VIEW_SLOT = 87;
+   constexpr size_t TRY_CREATE_SAMPLER2_SLOT = 88;
    constexpr size_t TRY_CREATE_RENDER_TARGET_VIEW_SLOT = 89;
    constexpr size_t CREATE_COMMAND_LIST1_SLOT = 51; // d3d12.h's C vtable lists 3 earlier methods twice (C and C++ return conventions)
    constexpr size_t RESOURCE_BARRIER_SLOT = 26;
@@ -780,6 +915,39 @@ namespace D3D12Clones
       return TryCreateConstantBufferViewHook::hooked.original(device, desc, handle);
    }
 
+   // The samplers the game writes are recorded as it described them ("device" is the proxy), for "RewriteSamplers()"
+   using CreateSamplerHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_SAMPLER_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), CREATE_SAMPLER_SLOT>;
+   using CreateSampler2Hook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_SAMPLER_DESC2*, D3D12_CPU_DESCRIPTOR_HANDLE), CREATE_SAMPLER2_SLOT>;
+   using TryCreateSampler2Hook = ProxyFunction<HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_SAMPLER_DESC2*, D3D12_CPU_DESCRIPTOR_HANDLE), TRY_CREATE_SAMPLER2_SLOT>;
+
+   inline void STDMETHODCALLTYPE CreateSamplerDetour(ID3D12Device* device, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+   {
+      CreateSamplerHook::hooked.original(device, desc, handle);
+      if (desc)
+      {
+         RecordSampler(handle.ptr, {.proxy = device, .desc = *desc});
+      }
+   }
+
+   inline void STDMETHODCALLTYPE CreateSampler2Detour(ID3D12Device* device, const D3D12_SAMPLER_DESC2* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+   {
+      CreateSampler2Hook::hooked.original(device, desc, handle);
+      if (desc)
+      {
+         RecordSampler(handle.ptr, {.proxy = device, .desc = *desc});
+      }
+   }
+
+   inline HRESULT STDMETHODCALLTYPE TryCreateSampler2Detour(ID3D12Device* device, const D3D12_SAMPLER_DESC2* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+   {
+      const HRESULT result = TryCreateSampler2Hook::hooked.original(device, desc, handle);
+      if (SUCCEEDED(result) && desc)
+      {
+         RecordSampler(handle.ptr, {.proxy = device, .desc = *desc});
+      }
+      return result;
+   }
+
    using CopyDescriptorsHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE), COPY_DESCRIPTORS_SLOT>;
    using CopyDescriptorsSimpleHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE), COPY_DESCRIPTORS_SIMPLE_SLOT>;
 
@@ -791,10 +959,28 @@ namespace D3D12Clones
 
    // The range lists of a copy walked in step, as (destination, source) pairs: destination "i" of a range is its start + "i" * the type's
    // increment, in the game's encoding on both sides
+   // Whether a copy of descriptors of "type" can carry records: views, or samplers
+   inline bool CopyCarriesRecords(D3D12_DESCRIPTOR_HEAP_TYPE type)
+   {
+      return (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? sampler_records.count.load(std::memory_order_relaxed) != 0 : (HoldsRecords(type) && registry.record_count.load(std::memory_order_relaxed) != 0));
+   }
+
+   inline void PropagateCopiedRecords(D3D12_DESCRIPTOR_HEAP_TYPE type, const std::vector<std::pair<SIZE_T, SIZE_T>>& destinations_and_sources)
+   {
+      if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+      {
+         PropagateSamplerRecords(destinations_and_sources);
+      }
+      else
+      {
+         PropagateRecords(destinations_and_sources);
+      }
+   }
+
    inline void STDMETHODCALLTYPE CopyDescriptorsDetour(ID3D12Device* device, UINT destination_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE* destination_starts, const UINT* destination_sizes, UINT source_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE* source_starts, const UINT* source_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type)
    {
       CopyDescriptorsHook::hooked.original(device, destination_range_count, destination_starts, destination_sizes, source_range_count, source_starts, source_sizes, type);
-      if (registry.record_count.load(std::memory_order_relaxed) == 0 || !HoldsRecords(type))
+      if (!CopyCarriesRecords(type))
       {
          return;
       }
@@ -826,13 +1012,13 @@ namespace D3D12Clones
             source_offset++;
          }
       }
-      PropagateRecords(destinations_and_sources);
+      PropagateCopiedRecords(type, destinations_and_sources);
    }
 
    inline void STDMETHODCALLTYPE CopyDescriptorsSimpleDetour(ID3D12Device* device, UINT descriptor_count, D3D12_CPU_DESCRIPTOR_HANDLE destination_start, D3D12_CPU_DESCRIPTOR_HANDLE source_start, D3D12_DESCRIPTOR_HEAP_TYPE type)
    {
       CopyDescriptorsSimpleHook::hooked.original(device, descriptor_count, destination_start, source_start, type);
-      if (registry.record_count.load(std::memory_order_relaxed) == 0 || !HoldsRecords(type))
+      if (!CopyCarriesRecords(type))
       {
          return;
       }
@@ -843,16 +1029,17 @@ namespace D3D12Clones
       {
          destinations_and_sources.emplace_back(destination_start.ptr + i * increment, source_start.ptr + i * increment);
       }
-      PropagateRecords(destinations_and_sources);
+      PropagateCopiedRecords(type, destinations_and_sources);
    }
 
-   // Every heap the records can live in gets a "HeapSentinel", so its destruction drops its records. Only hooked in seed mode.
+   // Every heap the records can live in gets a "HeapSentinel", so its destruction drops its records. Only hooked in seed mode or with the sampler records.
    using CreateDescriptorHeapHook = ProxyFunction<HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**), CREATE_DESCRIPTOR_HEAP_SLOT>;
 
    inline HRESULT STDMETHODCALLTYPE CreateDescriptorHeapDetour(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** heap_out)
    {
       const HRESULT result = CreateDescriptorHeapHook::hooked.original(device, desc, riid, heap_out);
-      if (SUCCEEDED(result) && desc && heap_out && *heap_out && riid == __uuidof(ID3D12DescriptorHeap) && HoldsRecords(desc->Type))
+      const bool tracked = (desc && ((track_view_heaps && HoldsRecords(desc->Type)) || (track_sampler_heaps && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)));
+      if (SUCCEEDED(result) && tracked && heap_out && *heap_out && riid == __uuidof(ID3D12DescriptorHeap))
       {
          ID3D12DescriptorHeap* const heap = static_cast<ID3D12DescriptorHeap*>(*heap_out);
          HeapSentinel* const sentinel = new HeapSentinel;
@@ -1206,9 +1393,10 @@ namespace D3D12Clones
    inline std::mutex hooks_mutex; // For "Install()" and "Remove()"
 
    // Hooks the proxy's view creates, descriptor copies and command list creates (the command list functions follow with the first list), once
-   // per process. "seed_mode" (clones start inactive, see the top of this file) also hooks the creation of descriptor heaps. False if there
-   // is no ReShade proxy, or MinHook failed.
-   inline bool Install(ID3D12Device* native_device, bool seed_mode)
+   // per process. "seed_mode" (clones start inactive, see the top of this file) also hooks the creation of descriptor heaps. "track_sampler_descriptors"
+   // (the sampler upgrade) hooks the sampler creates and the creation of descriptor heaps, for "RewriteSamplers()". False if there is no ReShade proxy,
+   // or MinHook failed.
+   inline bool Install(ID3D12Device* native_device, bool seed_mode, bool track_sampler_descriptors)
    {
       void** const proxy_vtable = D3D12ProxyHook::FindProxyVtable(native_device);
       if (!proxy_vtable)
@@ -1226,9 +1414,17 @@ namespace D3D12Clones
       installed_all &= TryCreateConstantBufferViewHook::Install(proxy_vtable, &TryCreateConstantBufferViewDetour);
       installed_all &= CopyDescriptorsHook::Install(proxy_vtable, &CopyDescriptorsDetour);
       installed_all &= CopyDescriptorsSimpleHook::Install(proxy_vtable, &CopyDescriptorsSimpleDetour);
-      if (seed_mode)
+      track_view_heaps = seed_mode;
+      track_sampler_heaps = track_sampler_descriptors;
+      if (seed_mode || track_sampler_descriptors)
       {
          installed_all &= CreateDescriptorHeapHook::Install(proxy_vtable, &CreateDescriptorHeapDetour);
+      }
+      if (track_sampler_descriptors)
+      {
+         installed_all &= CreateSamplerHook::Install(proxy_vtable, &CreateSamplerDetour);
+         installed_all &= CreateSampler2Hook::Install(proxy_vtable, &CreateSampler2Detour);
+         installed_all &= TryCreateSampler2Hook::Install(proxy_vtable, &TryCreateSampler2Detour);
       }
       installed_all &= CreateCommandListHook::Install(proxy_vtable, &CreateCommandListDetour);
       installed_all &= CreateCommandList1Hook::Install(proxy_vtable, &CreateCommandList1Detour);
@@ -1251,6 +1447,9 @@ namespace D3D12Clones
       removed_all &= CopyDescriptorsHook::Remove();
       removed_all &= CopyDescriptorsSimpleHook::Remove();
       removed_all &= CreateDescriptorHeapHook::Remove();
+      removed_all &= CreateSamplerHook::Remove();
+      removed_all &= CreateSampler2Hook::Remove();
+      removed_all &= TryCreateSampler2Hook::Remove();
       {
          // The sentinels go while this code is still loaded. ponytail: a heap being destroyed on another thread at this very moment isn't
          // guarded (the add-on unloads at device or process teardown, when the game is done with its heaps).

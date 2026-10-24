@@ -1059,6 +1059,10 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Live settings (set by the code, not directly by users):
    float default_user_peak_white = default_peak_white;
    float texture_mip_lod_bias_offset = 0.f;
+#if DX12
+   // The sampler upgrade the D3D12 sampler descriptors the game wrote have ("GetSamplersUpgradeState()"): "OnPresent()" writes them again when it changes
+   std::tuple<float, int, int, bool, bool> applied_samplers_upgrade;
+#endif
 #if ENABLE_SR
    float sr_scene_exposure = 1.f;
    float sr_scene_pre_exposure = 1.f;

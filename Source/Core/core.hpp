@@ -715,6 +715,19 @@ namespace
       PUBLISHING_CONSTEXPR bool custom_texture_mip_lod_bias_offset = false; // Live edit
    }
 
+#if DX12
+   // What Luma's upgrade of a sampler depends on: when it changes, the D3D12 sampler descriptors the game wrote are written again (see "OnPresent()")
+   std::tuple<float, int, int, bool, bool> GetSamplersUpgradeState(const DeviceData& device_data)
+   {
+      const std::shared_lock lock(s_mutex_samplers);
+#if DEVELOPMENT
+      return {device_data.texture_mip_lod_bias_offset, samplers_upgrade_mode, samplers_upgrade_mode_2, force_upgrade_linear_samplers, ignore_upgraded_samplers};
+#else
+      return {device_data.texture_mip_lod_bias_offset, samplers_upgrade_mode, 0, force_upgrade_linear_samplers, ignore_upgraded_samplers};
+#endif
+   }
+#endif
+
    // The root path of all the shaders we load and dump
    std::filesystem::path shaders_path;
 
@@ -3729,6 +3742,7 @@ namespace
       game->OnInitDevice(native_device, device_data);
 
 #if DX12
+      device_data.applied_samplers_upgrade = GetSamplersUpgradeState(device_data);
       device_data.upload_ring = std::make_shared<D3D12UploadRing::Pool>(native_device);
 #if ENABLE_MINHOOK
       if (!D3D12PsoCapture::Install(native_device))
@@ -3757,7 +3771,7 @@ namespace
       }
       // The game's views, barriers, clears and discards follow its textures' clones (see "includes/d3d12_clones.h"). With writer shaders listed (the D3D11 seed list), only the textures
       // they render into get upgraded: on D3D12 their "rtv_slots" are what counts, "uav_slots" and "scale" are ignored
-      if (!D3D12Clones::Install(native_device, !auto_texture_format_upgrade_shader_hashes.empty()))
+      if (!D3D12Clones::Install(native_device, !auto_texture_format_upgrade_shader_hashes.empty(), enable_samplers_upgrade))
       {
          static std::atomic_flag logged_clone_hooks_failure;
          if (!logged_clone_hooks_failure.test_and_set())
@@ -11114,6 +11128,34 @@ namespace
       device_data.resource_upgrades.FlushPendingDestructions(queue->get_device(), device_data.mutex);
 
       game->OnPresent(native_device, device_data);
+
+#if DX12 && ENABLE_MINHOOK
+      // A change of the sampler upgrade (the mip bias of super resolution, the dev settings) reaches the sampler descriptors the game wrote before it.
+      // ponytail: one wait for the GPU per change; a game whose bias follows a dynamic resolution every frame would stall every frame (quantize the bias then)
+      if (enable_samplers_upgrade)
+      {
+         if (const auto samplers_upgrade = GetSamplersUpgradeState(device_data); samplers_upgrade != device_data.applied_samplers_upgrade)
+         {
+            const D3D12Clones::SamplerRewrite rewrite = D3D12Clones::RewriteSamplers(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+            if (rewrite.timed_out)
+            {
+               static std::atomic_flag logged_rewrite_timeout;
+               if (!logged_rewrite_timeout.test_and_set())
+               {
+                  reshade::log::message(reshade::log::level::warning, "[Samplers] The GPU didn't finish the present queue within 2 seconds, the game's samplers keep their previous upgrade for now (it is retried at each present)");
+               }
+            }
+            else
+            {
+               device_data.applied_samplers_upgrade = samplers_upgrade;
+#if DEVELOPMENT
+               const std::string message = std::format("[Samplers] Wrote the game's {} sampler descriptors again with the mip bias {} (waited {:.1f} ms)", rewrite.count, std::get<0>(samplers_upgrade), rewrite.waited_ms);
+               reshade::log::message(reshade::log::level::info, message.c_str());
+#endif
+            }
+         }
+      }
+#endif
 
 #if ENABLE_SWAPCHAIN_PROXY && DX11
       if (const SwapchainProxy::Entry* const entry = SwapchainProxy::Find((IDXGISwapChain*)(swapchain->get_native())); entry && !entry->has_effect_runtime)

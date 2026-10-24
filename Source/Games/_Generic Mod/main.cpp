@@ -30,7 +30,7 @@ namespace
    int test_smaa_hash = 0;        // The draw becomes SMAA of its t0 into its render target (with a "Luma_SMAA_impl.hlsl" in the game's shader folder)
    int test_smaa_rcas = 0;        // 1: the SMAA of "test_smaa_hash" is followed by RCAS (sharpness 1)
    int test_bloom_hash = 0;       // The draw becomes the Karis average and the 3 level bloom of its t0, whose mip 0 is copied into the top left of its render target
-   float test_mip_lod_bias = 0.f; // The mip bias of the upgraded samplers, applied at present: it reaches the samplers the game writes after it
+   float test_mip_lod_bias = 0.f; // The mip bias of the upgraded samplers, applied at present (Core writes the game's heap samplers again). "TestMipLodBias" of "[Luma Advanced]" sets it on boot, from the device's creation
    int test_viewport_scale_hash = 0; // The draw's viewports and scissors get half their width through "SetGameViewportsD3D12()", and keep it for the draws after it (as a render scale's code does)
    int test_skip_copy_width = 0;     // The game copies ("OverrideCopyResource()", "OverrideCopyTextureRegion()") into a texture of this width are skipped. "TestSkipCopyWidth" of "[Luma Advanced]" sets it on boot
    int test_smaa_t2x = 0;            // 1: the SMAA of "test_smaa_hash" is T2x (the "Generic SMAA T2x" natives, "SMAA_T2X" in its "Luma_SMAA_impl.hlsl") with its t0 as the velocity texture: the target's alpha is sqrt(5 * length(t0.rg)) where there is no edge
@@ -100,6 +100,7 @@ public:
          shader_hashes_UI.pixel_shaders.emplace(uint32_t(std::strtoul(test_ui_hash_text, nullptr, 16)));
       }
       reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TestSkipCopyWidth", test_skip_copy_width);
+      reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TestMipLodBias", test_mip_lod_bias);
       Mcp::RegisterInts({{"test_skip_copy_width", &test_skip_copy_width, 0, INT_MAX}, {"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_smaa_predication", &test_smaa_predication, 0, 2}, {"test_smaa_t2x", &test_smaa_t2x, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
       Mcp::RegisterValues({{"test_mip_lod_bias", &test_mip_lod_bias, -8.f, 8.f}});
       // SMAA T2x's own blends of the smoke test ("SMAA_T2X" in its "Luma_SMAA_impl.hlsl"): the edge detection and the vertex shaders are 1x's
@@ -377,6 +378,14 @@ public:
    bool OverrideCopyTextureRegion(NativeDevice* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const NativeBox* dst_box, uint64_t& src_resource, uint32_t src_subresource, const NativeBox* src_box) override
    {
       return test_skip_copy_width != 0 && reinterpret_cast<ID3D12Resource*>(dst_resource)->GetDesc().Width == UINT64(test_skip_copy_width);
+   }
+#endif
+#if DX12 && DEVELOPMENT
+   // The boot bias reaches the static samplers of the root signatures the game creates before its first present
+   void OnInitDevice(NativeDevice* native_device, DeviceData& device_data) override
+   {
+      const std::unique_lock lock(s_mutex_samplers);
+      device_data.texture_mip_lod_bias_offset = test_mip_lod_bias;
    }
 #endif
    void OnPresent(NativeDevice* native_device, DeviceData& device_data) override
