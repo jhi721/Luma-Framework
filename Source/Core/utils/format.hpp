@@ -1042,7 +1042,7 @@ namespace
       return name ? name : "Unknown";
    }
 
-   // The frame capture names the values of both APIs with these: the D3D11 and D3D12 enums are numbered alike and named alike apart from the prefix
+   // The frame capture names the values of both APIs with these (and its panels compare them with "LUMA_D3D"): the D3D11 and D3D12 enums are numbered alike and named alike apart from the prefix
 #if DX11
 #define LUMA_D3D(name) D3D11_##name
 #define LUMA_D3D_ADDRESS(name) D3D11_TEXTURE_ADDRESS_##name
@@ -1094,45 +1094,42 @@ namespace
       }
    }
 
-#if DX11
-   const char* GetBlendOpSigns(D3D11_BLEND_OP blend_op)
+   const char* GetBlendOpSigns(LUMA_D3D(BLEND_OP) blend_op)
    {
       switch (blend_op)
       {
-      case D3D11_BLEND_OP_ADD:          return "+";
-      case D3D11_BLEND_OP_SUBTRACT:     return "-";
-      case D3D11_BLEND_OP_REV_SUBTRACT: return "-";
-      case D3D11_BLEND_OP_MIN:          return "min";
-      case D3D11_BLEND_OP_MAX:          return "max";
+      case LUMA_D3D(BLEND_OP_ADD):          return "+";
+      case LUMA_D3D(BLEND_OP_SUBTRACT):     return "-";
+      case LUMA_D3D(BLEND_OP_REV_SUBTRACT): return "-";
+      case LUMA_D3D(BLEND_OP_MIN):          return "min";
+      case LUMA_D3D(BLEND_OP_MAX):          return "max";
       default:                          return "";
       }
    }
 
-   const char* GetLogicOpName(D3D11_LOGIC_OP logicOp)
+   const char* GetLogicOpName(LUMA_D3D(LOGIC_OP) logicOp)
    {
       switch (logicOp)
       {
-      case D3D11_LOGIC_OP_CLEAR:         return "CLEAR";
-      case D3D11_LOGIC_OP_SET:           return "SET";
-      case D3D11_LOGIC_OP_COPY:          return "COPY";
-      case D3D11_LOGIC_OP_COPY_INVERTED: return "COPY_INVERTED";
-      case D3D11_LOGIC_OP_NOOP:          return "NOOP";
-      case D3D11_LOGIC_OP_INVERT:        return "INVERT";
-      case D3D11_LOGIC_OP_AND:           return "AND";
-      case D3D11_LOGIC_OP_NAND:          return "NAND";
-      case D3D11_LOGIC_OP_OR:            return "OR";
-      case D3D11_LOGIC_OP_NOR:           return "NOR";
-      case D3D11_LOGIC_OP_XOR:           return "XOR";
-      case D3D11_LOGIC_OP_EQUIV:         return "EQUIV";
-      case D3D11_LOGIC_OP_AND_REVERSE:   return "AND_REVERSE";
-      case D3D11_LOGIC_OP_AND_INVERTED:  return "AND_INVERTED";
-      case D3D11_LOGIC_OP_OR_REVERSE:    return "OR_REVERSE";
-      case D3D11_LOGIC_OP_OR_INVERTED:   return "OR_INVERTED";
+      case LUMA_D3D(LOGIC_OP_CLEAR):         return "CLEAR";
+      case LUMA_D3D(LOGIC_OP_SET):           return "SET";
+      case LUMA_D3D(LOGIC_OP_COPY):          return "COPY";
+      case LUMA_D3D(LOGIC_OP_COPY_INVERTED): return "COPY_INVERTED";
+      case LUMA_D3D(LOGIC_OP_NOOP):          return "NOOP";
+      case LUMA_D3D(LOGIC_OP_INVERT):        return "INVERT";
+      case LUMA_D3D(LOGIC_OP_AND):           return "AND";
+      case LUMA_D3D(LOGIC_OP_NAND):          return "NAND";
+      case LUMA_D3D(LOGIC_OP_OR):            return "OR";
+      case LUMA_D3D(LOGIC_OP_NOR):           return "NOR";
+      case LUMA_D3D(LOGIC_OP_XOR):           return "XOR";
+      case LUMA_D3D(LOGIC_OP_EQUIV):         return "EQUIV";
+      case LUMA_D3D(LOGIC_OP_AND_REVERSE):   return "AND_REVERSE";
+      case LUMA_D3D(LOGIC_OP_AND_INVERTED):  return "AND_INVERTED";
+      case LUMA_D3D(LOGIC_OP_OR_REVERSE):    return "OR_REVERSE";
+      case LUMA_D3D(LOGIC_OP_OR_INVERTED):   return "OR_INVERTED";
       default:                           return "UNKNOWN";
       }
    }
-
-#endif // DX11
 
    const char* GetFilterName(LUMA_D3D(FILTER) filter)
    {
@@ -1190,6 +1187,5 @@ namespace
       default: return "UNKNOWN";
       }
    }
-#undef LUMA_D3D
 #undef LUMA_D3D_ADDRESS
 }

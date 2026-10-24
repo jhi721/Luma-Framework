@@ -17351,6 +17351,17 @@ namespace
                            }
 #endif // DX11
                         }
+                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::EndRenderPass)
+                        {
+                           if (trace_show_command_list_info)
+                           {
+                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                              name << command_list_info;
+                              name << " - ";
+                           }
+                           name << (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass ? "Begin Render Pass" : "End Render Pass");
+                           text_color = IM_COL32(50, 80, 190, 255); // Some Blue
+                        }
                         else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Custom)
                         {
                            if (trace_show_command_list_info)
@@ -18290,9 +18301,7 @@ namespace
 
                                     if (pipeline_pair->second->HasPixelShader())
                                     {
-#if DX11
                                        auto blend_desc = draw_call_data.blend_desc;
-#endif
 
                                        for (UINT i = 0; i < TraceDrawCallData::rtvs_size; i++)
                                        {
@@ -18402,10 +18411,10 @@ namespace
                                              }
                                           }
 
-#if DX11 // The D3D12 blend state is in the PSO
                                           // Blend mode
                                           {
                                              bool pop_text_style_color = false;
+#if DX11 // "IsBlendInverted()" is with the native D3D11 helpers
                                              // Print out invalid blend modes.
                                              // Note: this is assuming that indirect upgrades always upgrade to a signed float type, which is generally true. Ideally we'd implement something like "GetBestResourceViewUpgradeFormat(draw_call_data.rtv_format[i])" here, but given it's just a warning, it doesn't really matter
                                              if (IsRGBAFormat(draw_call_data.rtv_format[i], true) && (indirect_upgraded || IsSignedFloatFormat(draw_call_data.rtv_format[i])) && IsBlendInverted(draw_call_data.blend_desc, 1, false, i))
@@ -18413,94 +18422,95 @@ namespace
                                                 ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 105, 0, 255)); // Orange
                                                 pop_text_style_color = true;
                                              }
+#endif
 
-                                             const D3D11_RENDER_TARGET_BLEND_DESC1& render_target_blend_desc = blend_desc.IndependentBlendEnable ? blend_desc.RenderTarget[i] : blend_desc.RenderTarget[0];
+                                             const auto& render_target_blend_desc = blend_desc.IndependentBlendEnable ? blend_desc.RenderTarget[i] : blend_desc.RenderTarget[0];
                                              // See "ui_data.blend_mode" for details on usage
                                              if (render_target_blend_desc.BlendEnable)
                                              {
                                                 bool has_drawn_blend_rgb_text = false;
 
-                                                if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR || render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR
-                                                   || render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR || render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR)
+                                                if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_BLEND_FACTOR)
+                                                   || render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
                                                 {
                                                    ImGui::Text("Blend RGB Mode: Blend Factor (Any)");
                                                    has_drawn_blend_rgb_text = true;
                                                 }
-                                                else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ZERO)
+                                                else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ZERO))
                                                 {
                                                    ImGui::Text("Blend RGB Mode: Zero (Override Color with Zero)");
                                                    has_drawn_blend_rgb_text = true;
                                                 }
 
-                                                if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD)
+                                                if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == LUMA_D3D(BLEND_OP_ADD))
                                                 {
-                                                   if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Additive Color");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Additive Alpha");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Additive Alpha (Saturated)");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Premultiplied Alpha"); // The alpha was supposedly (but not necessarily) pre-multiplied in the rgb before the pixel shader output
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Straight Alpha");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Straight Alpha (Saturated)");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
                                                    // Often used for lighting, glow, or compositing effects where the destination alpha controls how much of the source contributes
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_DEST_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_DEST_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Reverse Premultiplied Alpha");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_DEST_COLOR && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ZERO)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_DEST_COLOR) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ZERO))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Multiplicative Color");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
                                                    // It's enabled but it's as if it was disabled
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ZERO)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ZERO))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Disabled");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
                                                 }
                                                 // This subtracts the source from the target
-                                                else if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == D3D11_BLEND_OP::D3D11_BLEND_OP_REV_SUBTRACT)
+                                                else if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == LUMA_D3D(BLEND_OP_REV_SUBTRACT))
                                                 {
-                                                   if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Subtractive Color");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Subtractive Alpha");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Subtractive Alpha (Saturated)");
                                                       has_drawn_blend_rgb_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend RGB Mode: Disabled");
                                                       has_drawn_blend_rgb_text = true;
@@ -18518,7 +18528,7 @@ namespace
                                                    has_drawn_blend_rgb_text = true;
                                                 }
 
-                                                if ((render_target_blend_desc.RenderTargetWriteMask & (D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE)) == 0)
+                                                if ((render_target_blend_desc.RenderTargetWriteMask & (LUMA_D3D(COLOR_WRITE_ENABLE_RED) | LUMA_D3D(COLOR_WRITE_ENABLE_GREEN) | LUMA_D3D(COLOR_WRITE_ENABLE_BLUE))) == 0)
                                                 {
                                                    ImGui::SameLine();
                                                    ImGui::Text(" (Ignored)");
@@ -18530,52 +18540,52 @@ namespace
                                                 bool has_drawn_blend_a_text = false;
 
                                                 // It's enabled but it's as if it was disabled
-                                                if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR || render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR
-                                                   || render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR || render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR)
+                                                if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR)
+                                                   || render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
                                                 {
                                                    ImGui::Text("Blend A Mode: Blend Factor (Any)");
                                                    has_drawn_blend_a_text = true;
                                                 }
-                                                if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO)
+                                                if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ZERO))
                                                 {
                                                    ImGui::Text("Blend A Mode: Zero (Overwrite Alpha with Zero)");
                                                    has_drawn_blend_a_text = true;
                                                 }
 
-                                                if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD)
+                                                if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == LUMA_D3D(BLEND_OP_ADD))
                                                 {
-                                                   if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                                                   if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                                                    {
                                                       ImGui::Text("Blend A Mode: Standard Transparency");
                                                       has_drawn_blend_a_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                                                   else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                                                    {
                                                       ImGui::Text("Blend A Mode: Standard Transparency (Saturated)");
                                                       has_drawn_blend_a_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_DEST_ALPHA && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO)
+                                                   else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_DEST_ALPHA) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ZERO))
                                                    {
                                                       ImGui::Text("Blend A Mode: Multiplicative");
                                                       has_drawn_blend_a_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend A Mode: Additive");
                                                       has_drawn_blend_a_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO)
+                                                   else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ZERO))
                                                    {
                                                       ImGui::Text("Blend A Mode: Source Alpha (Overwrite Alpha, Blending Disabled)");
                                                       has_drawn_blend_a_text = true;
                                                    }
-                                                   else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE)
+                                                   else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ONE))
                                                    {
                                                       ImGui::Text("Blend A Mode: Destination Alpha (Preserve Alpha)");
                                                       has_drawn_blend_a_text = true;
                                                    }
                                                 }
-                                                else if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == D3D11_BLEND_OP::D3D11_BLEND_OP_REV_SUBTRACT)
+                                                else if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == LUMA_D3D(BLEND_OP_REV_SUBTRACT))
                                                 {
                                                    ImGui::Text("Blend A Mode: Subtractive (Any)");
                                                    has_drawn_blend_a_text = true;
@@ -18587,7 +18597,7 @@ namespace
                                                    has_drawn_blend_a_text = true;
                                                 }
 
-                                                if ((render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALPHA) == 0)
+                                                if ((render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALPHA)) == 0)
                                                 {
                                                    ImGui::SameLine();
                                                    ImGui::Text("(Ignored)");
@@ -18610,27 +18620,26 @@ namespace
                                              }
 
                                              // This applies even if blending is disabled!
-                                             if ((render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALL) == D3D11_COLOR_WRITE_ENABLE_ALL)
+                                             if ((render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALL)) == LUMA_D3D(COLOR_WRITE_ENABLE_ALL))
                                              {
                                                 ImGui::Text("Write Mask: All");
                                              }
-                                             else if ((render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALL) == 0)
+                                             else if ((render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALL)) == 0)
                                              {
                                                 ImGui::Text("Write Mask: None");
                                              }
                                              else
                                              {
                                                 ImGui::Text("Write Mask:");
-                                                if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_RED)   ImGui::SameLine(), ImGui::Text(" R");
-                                                if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_GREEN) ImGui::SameLine(), ImGui::Text(" G");
-                                                if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_BLUE)  ImGui::SameLine(), ImGui::Text(" B");
-                                                if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALPHA) ImGui::SameLine(), ImGui::Text(" A");
+                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_RED))   ImGui::SameLine(), ImGui::Text(" R");
+                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_GREEN)) ImGui::SameLine(), ImGui::Text(" G");
+                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_BLUE))  ImGui::SameLine(), ImGui::Text(" B");
+                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALPHA)) ImGui::SameLine(), ImGui::Text(" A");
                                              }
                                           }
 
                                           // Show even if all blend modes are disabled, given that it might still be useful to track its state
                                           ImGui::Text("Blend Factor: %f %f %f %f", draw_call_data.blend_factor[0], draw_call_data.blend_factor[1], draw_call_data.blend_factor[2], draw_call_data.blend_factor[3]);
-#endif // DX11
 
                                           const bool is_highlighted_resource = highlighted_resource == rt_hash;
                                           if (is_highlighted_resource ? ImGui::Button("Unhighlight Resource") : ImGui::Button("Highlight Resource"))
@@ -18689,7 +18698,6 @@ namespace
                                           ImGui::PopID();
                                        }
 
-#if DX11
                                        // Only print this when enabled given it's rare (it's MSAA transparency dithering basically)
                                        if (blend_desc.AlphaToCoverageEnable)
                                        {
@@ -18697,7 +18705,6 @@ namespace
                                           // Don't set "is_first_draw" to true to let depth printing have a space too
                                           ImGui::Text("Alpha to Coverage Enable: %s", blend_desc.AlphaToCoverageEnable ? "True" : "False");
                                        }
-#endif
 
                                        if (!is_first_draw) { ImGui::Text(""); }; // No views drew before, skip space
                                        is_first_draw = false;
@@ -18787,6 +18794,7 @@ namespace
                                           debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
                                           debug_draw_mip = 0;
                                        }
+#endif // DX11
 
                                        ImGui::Text("");
                                        ImGui::Text("Scissors Enabled: %s", draw_call_data.scissor_count >= 1 ? "True" : "False");
@@ -18796,19 +18804,25 @@ namespace
                                           std::to_string(viewport_0.TopLeftY).c_str(),
                                           std::to_string(viewport_0.Width).c_str(),
                                           std::to_string(viewport_0.Height).c_str());
-#endif // DX11
                                     }
 
                                     if (pipeline_pair->second->HasVertexShader() || pipeline_pair->second->HasPixelShader() || pipeline_pair->second->HasComputeShader())
                                     {
-#if DX11 // D3D12 samplers aren't captured yet
+#if DX12 // Packed in binding order
+                                       for (UINT i = 0; i < draw_call_data.sampler_count; i++)
+#else
                                        for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
+#endif
                                        {
                                           if (int(draw_call_data.samplers_filter[i]) >= 0)
                                           {
                                              ImGui::PushID(i + TraceDrawCallData::srvs_size + TraceDrawCallData::uavs_size + TraceDrawCallData::rtvs_size); // Offset by the max amount of previous iterations from above
                                              ImGui::Text("");
+#if DX12
+                                             ImGui::Text("Sampler Register: s%u, space%u", draw_call_data.sa_register[i].index, draw_call_data.sa_register[i].space);
+#else
                                              ImGui::Text("Sampler Index: %u", i);
+#endif
                                              ImGui::Text("Sampler Filter: %s", GetFilterName(draw_call_data.samplers_filter[i]));
                                              ImGui::Text("Sampler Address U: %s", GetTextureAddressModeName(draw_call_data.samplers_address_u[i]));
                                              ImGui::Text("Sampler Address V: %s", GetTextureAddressModeName(draw_call_data.samplers_address_v[i]));
@@ -18817,7 +18831,6 @@ namespace
                                              ImGui::PopID();
                                           }
                                        }
-#endif // DX11
 
                                        for (UINT i = 0; i < TraceDrawCallData::cbs_size; i++)
                                        {

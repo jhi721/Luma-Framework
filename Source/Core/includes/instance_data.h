@@ -110,7 +110,7 @@ enum class D3D12DrawCommand : uint8_t
 };
 #endif
 
-// A frame capture entry. The D3D11 states without a D3D12 equivalent yet (blend, depth stencil, rasterizer, viewports, samplers) are D3D11 only.
+// A frame capture entry. D3D12 fills the D3D11 named render state, viewport and sampler fields with its own, alike numbered, values (see "D3D12Trace").
 struct TraceDrawCallData
 {
    TraceDrawCallData()
