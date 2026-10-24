@@ -104,7 +104,9 @@ namespace PatchedDraws
    {
       static constexpr UINT ring_size = 4 << 20;
       com_ptr<ID3D11Buffer> ring;
-      ID3D11DeviceContext1* ring_context = nullptr; // Not referenced: the immediate context lives as long as the device
+      // The immediate context (not referenced: it lives as long as the device). Only its binds use the ring: a deferred one would get
+      // its constant buffers bound on this one, and must DISCARD its first Map of a buffer in each command list.
+      ID3D11DeviceContext1* ring_context = nullptr;
       UINT ring_offset = 0;
       bool checked = false;
       std::vector<com_ptr<ID3D11Buffer>> buffers; // Without the ring, one per slot
@@ -115,7 +117,7 @@ namespace PatchedDraws
       void Bind(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, std::span<const std::pair<uint32_t, uint32_t>> slots,
          std::span<const std::vector<uint8_t>* const> uploads, std::span<ID3D11Buffer* const> current, const char* log_tag, std::span<const UINT> read_sizes = {})
       {
-         if (!std::exchange(checked, true))
+         if (native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE && !std::exchange(checked, true))
          {
             D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
             com_ptr<ID3D11DeviceContext1> context1;
@@ -148,7 +150,7 @@ namespace PatchedDraws
             // "FirstConstant" and "NumConstants" are multiples of 16 constants (256 bytes)
             total += sizes[i] = (bytes[i] + 255u) & ~255u;
          }
-         if (ring && total != 0 && total <= ring_size)
+         if (ring && native_device_context == ring_context && total != 0 && total <= ring_size)
          {
             const bool restart = ring_offset + total > ring_size;
             D3D11_MAPPED_SUBRESOURCE mapped;
