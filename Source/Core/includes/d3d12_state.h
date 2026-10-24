@@ -10,6 +10,7 @@
 #include <cstring>
 #include <map>
 #include <shared_mutex>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -76,6 +77,36 @@ namespace D3D12State
       const std::unique_lock lock(layouts->mutex);
       layouts->parameters_by_layout[layout.handle] = std::move(parameters);
    }
+
+#if DEVELOPMENT
+   // The static samplers of a root signature 1.2, which ReShade doesn't pass to "init_pipeline_layout": one more parameter of a sampler range each, like the one it makes of the
+   // static samplers of the older versions. Call it from the "init_pipeline_layout" event, after "AddPipelineLayout()"
+   void AddStaticSamplers(PipelineLayouts* layouts, reshade::api::pipeline_layout layout, std::span<const D3D12_STATIC_SAMPLER_DESC1> static_samplers)
+   {
+      if (static_samplers.empty())
+         return;
+      RootParameter parameter = {.type = reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges_and_flags};
+      for (const D3D12_STATIC_SAMPLER_DESC1& sampler : static_samplers)
+      {
+         parameter.ranges.push_back({.dx_register_index = sampler.ShaderRegister, .dx_register_space = sampler.RegisterSpace, .count = 1});
+         reshade::api::sampler_desc& desc = parameter.static_samplers.emplace_back();
+         desc.filter = reshade::api::filter_mode(sampler.Filter);
+         desc.address_u = reshade::api::texture_address_mode(sampler.AddressU);
+         desc.address_v = reshade::api::texture_address_mode(sampler.AddressV);
+         desc.address_w = reshade::api::texture_address_mode(sampler.AddressW);
+         desc.mip_lod_bias = sampler.MipLODBias;
+         desc.max_anisotropy = float(sampler.MaxAnisotropy);
+         desc.compare_op = reshade::api::compare_op(uint32_t(sampler.ComparisonFunc) - 1); // ReShade's are zero based
+         desc.min_lod = sampler.MinLOD;
+         desc.max_lod = sampler.MaxLOD;
+      }
+      const std::unique_lock lock(layouts->mutex);
+      if (const auto found = layouts->parameters_by_layout.find(layout.handle); found != layouts->parameters_by_layout.end())
+      {
+         found->second.push_back(std::move(parameter));
+      }
+   }
+#endif
 
    void RemovePipelineLayout(PipelineLayouts* layouts, reshade::api::pipeline_layout layout)
    {
@@ -144,6 +175,10 @@ namespace D3D12State
       RootState compute;
 #if DEVELOPMENT || ENABLE_D3D12_PASSES
       reshade::api::primitive_topology primitive_topology = reshade::api::primitive_topology::undefined;
+      // "OMSetBlendFactor()", as ReShade passes it: RGBA8 (the float factors truncated to 8 bit)
+      uint32_t blend_constant = 0;
+      bool has_blend_constant = false;
+      uint32_t stencil_ref = 0; // "OMSetStencilRef()", which ReShade passes as the front and back references alike
 #endif
 #if ENABLE_D3D12_PASSES
       // What a Luma pass replaces besides the above (see "RestoreGraphics()")
@@ -151,9 +186,6 @@ namespace D3D12State
       std::vector<reshade::api::rect> scissor_rects;
       std::vector<reshade::api::resource_view_desc> render_target_descs; // By slot, next to "render_target_views": what the views are made again of
       reshade::api::resource_view_desc depth_stencil_desc = {};
-      // "OMSetBlendFactor()", as ReShade passes it: RGBA8 (the float factors truncated to 8 bit)
-      uint32_t blend_constant = 0;
-      bool has_blend_constant = false;
 #endif
 #if DEVELOPMENT
       BufferBinding index_buffer;
@@ -250,7 +282,7 @@ namespace D3D12State
             std::memcpy(binding->constants.data() + first, values, count * sizeof(uint32_t)); });
    }
 
-   // "IASetPrimitiveTopology()" and "OMSetBlendFactor()" arrive as dynamic states
+   // "IASetPrimitiveTopology()", "OMSetBlendFactor()" and "OMSetStencilRef()" arrive as dynamic states
    void BindPipelineStates(CommandListState* state, uint32_t count, const reshade::api::dynamic_state* states, const uint32_t* values)
    {
       for (uint32_t i = 0; i < count; i++)
@@ -259,13 +291,15 @@ namespace D3D12State
          {
             state->primitive_topology = static_cast<reshade::api::primitive_topology>(values[i]);
          }
-#if ENABLE_D3D12_PASSES
          else if (states[i] == reshade::api::dynamic_state::blend_constant)
          {
             state->blend_constant = values[i];
             state->has_blend_constant = true;
          }
-#endif
+         else if (states[i] == reshade::api::dynamic_state::front_stencil_reference_value)
+         {
+            state->stencil_ref = values[i];
+         }
       }
    }
 #endif

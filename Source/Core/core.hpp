@@ -6117,6 +6117,9 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
       D3D12State::AddPipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout, param_count, params);
+#if ENABLE_MINHOOK
+      D3D12State::AddStaticSamplers(&device->get_private_data<DeviceData>()->pipeline_layouts, layout, D3D12RootSignatures::pending_static_samplers);
+#endif
    }
 #endif // DX12 && DEVELOPMENT
 
@@ -6994,7 +6997,7 @@ namespace
    // A Luma pass of the pass layer (see "D3D12Trace::FillLumaPass()") as a Custom entry of the capture, appended to the entries of "cmd_list_data" (the game's command list it was recorded
    // on, so the capture joins it in submission order after the command that triggered it), or to the device's capture without one (a pass of Luma's own list, at present). Does nothing
    // without a trace
-   void TraceLumaPass(CommandListData* cmd_list_data, DeviceData& device_data, const char* name, std::initializer_list<D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute = false)
+   void TraceLumaPass(CommandListData* cmd_list_data, DeviceData& device_data, const char* name, std::initializer_list<D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute = false, bool predicted = false)
    {
 #if DEVELOPMENT
       const auto lock_trace = LockTraceIfRunning();
@@ -7005,6 +7008,7 @@ namespace
       TraceDrawCallData& entry = trace_cmd_list_data.trace_draw_calls_data.emplace_back();
       entry.command_list = trace_cmd_list_data.cmd_list;
       D3D12Trace::FillLumaPass(device_data.reshade_device, &entry, name, inputs, outputs, compute);
+      entry.predicted = predicted;
 #endif
    }
 
@@ -10212,7 +10216,6 @@ namespace
       list->DrawInstanced(4, 1, 0, 0);
       D3D12Passes::Transition(list, real_buffer.get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
       D3D12Passes::Transition(list, proxy.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT);
-      // Not a capture entry: it runs after the present event, where the next frame's capture has already started
       SubmitD3D12NativePass(&encode, native_queue, device_data, "Swapchain encode");
    }
 #endif // ENABLE_SWAPCHAIN_PROXY
@@ -11049,6 +11052,25 @@ namespace
       desc.min_lod = native_desc.MinLOD;
       return true;
    }
+
+#if ENABLE_MINHOOK
+   // The root signature hook's upgrade of root signature 1.2 static samplers, which ReShade doesn't pass to "OnCreateSampler()" (see "D3D12RootSignatures::Hook"). The bias is the first
+   // device's: games have one
+   bool UpgradeStaticSamplerD3D12(D3D12_STATIC_SAMPLER_DESC1* desc)
+   {
+      if (ignore_upgraded_samplers)
+      {
+         return false;
+      }
+      const std::shared_lock lock_device(s_mutex_device);
+      if (global_devices_data.empty())
+      {
+         return false;
+      }
+      const std::shared_lock lock(s_mutex_samplers);
+      return UpgradeSamplerDesc(*global_devices_data.front(), desc);
+   }
+#endif
 #endif
 
 #if DX11 // D3D11 only: D3D12 upgrades its sampler descriptors as the game writes them ("OnCreateSampler()"), and has its own draw and copy handlers
@@ -15298,6 +15320,27 @@ namespace
          }
          was_graphics_capture_key_down = graphics_capture_key_down;
 
+#if DX12 && ENABLE_SWAPCHAIN_PROXY
+         if (trace_running)
+         {
+            // The swapchain encode runs in the native present, after this capture closed: listed ahead of it, as predicted (it draws the proxy of the current back buffer into the real
+            // one, see "DrawSwapchainEncodeD3D12()")
+            auto* const native_swapchain = reinterpret_cast<IDXGISwapChain*>(runtime->get_native());
+            com_ptr<IDXGISwapChain3> native_swapchain3;
+            if (SwapchainProxy::Find(native_swapchain) && SUCCEEDED(native_swapchain->QueryInterface(&native_swapchain3)))
+            {
+               const UINT back_buffer_index = native_swapchain3->GetCurrentBackBufferIndex();
+               com_ptr<ID3D12Resource> proxy;
+               native_swapchain->GetBuffer(back_buffer_index, IID_PPV_ARGS(&proxy));
+               const com_ptr<ID3D12Resource> real_buffer = SwapchainProxy::GetRealBackBuffer(native_swapchain, back_buffer_index);
+               if (proxy && real_buffer && proxy.get() != real_buffer.get())
+               {
+                  TraceLumaPass(nullptr, device_data, "Luma Swapchain Encode", {{.resource = reinterpret_cast<uint64_t>(proxy.get()), .format = reshade::api::format::r16g16b16a16_float}},
+                     {{.resource = reinterpret_cast<uint64_t>(real_buffer.get()), .format = reshade::api::format(real_buffer->GetDesc().Format)}}, false, true);
+               }
+            }
+         }
+#endif
          const std::unique_lock lock_trace(s_mutex_trace);
          if (trace_running)
          {
@@ -22419,6 +22462,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       if (enable_samplers_upgrade)
       {
          reshade::register_event<reshade::addon_event::create_sampler>(OnCreateSampler);
+#if ENABLE_MINHOOK
+         D3D12RootSignatures::hook.upgrade_static_sampler = &UpgradeStaticSamplerD3D12;
+#endif
       }
 #endif
 
@@ -22633,6 +22679,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       if (enable_samplers_upgrade)
       {
          reshade::unregister_event<reshade::addon_event::create_sampler>(OnCreateSampler);
+#if ENABLE_MINHOOK
+         D3D12RootSignatures::hook.upgrade_static_sampler = nullptr;
+#endif
       }
 #endif
 

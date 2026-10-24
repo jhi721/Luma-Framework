@@ -504,6 +504,14 @@ namespace D3D12Trace
 
          // Without a pipeline's state the D3D12 defaults apply (depth test and write, no stencil)
          const reshade::api::depth_stencil_desc desc = FillRenderState(&trace_draw_call_data, pipeline);
+         trace_draw_call_data.stencil_ref = state.stencil_ref;
+         if (state.has_blend_constant)
+         {
+            for (uint32_t i = 0; i < 4; i++)
+            {
+               trace_draw_call_data.blend_factor[i] = float((state.blend_constant >> (8 * i)) & 0xFF) / 255.f;
+            }
+         }
 #if ENABLE_D3D12_PASSES // The viewports and scissors are only tracked with the passes' state
          trace_draw_call_data.viewport_count = UINT((std::min)(state.viewports.size(), std::size(trace_draw_call_data.viewports)));
          for (UINT i = 0; i < trace_draw_call_data.viewport_count; i++)

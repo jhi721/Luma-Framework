@@ -97,13 +97,19 @@ namespace D3D12RootSignatures
       // The runtime's exports, which Luma doesn't link
       PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER create_deserializer = nullptr;
       PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE serialize = nullptr;
+      // Set by the user of the header, optional: changes a root signature 1.2 static sampler and says whether it did. ReShade doesn't pass those to its "create_sampler" event
+      // (the older versions' static samplers go through it), so the upgrade of the samplers has to be made here, on the blob ReShade creates the root signature from.
+      // Called under the detour, any thread
+      bool (*upgrade_static_sampler)(D3D12_STATIC_SAMPLER_DESC1* desc) = nullptr;
    };
    // Shared by the devices: ReShade's proxies all lead to one function, hooked once per process
    inline Hook hook;
 
    // Appends our CBVs to a serialized root signature, or says why it can't. "rewritten" and "params" are only written on success,
    // "parameter_count" is the root signature's own (0 if it couldn't be deserialized). Needs "Install()" to have found the runtime's exports.
-   inline Skip Rewrite(std::span<const std::byte> blob, uint32_t settings_register, int32_t data_register, std::vector<std::byte>* rewritten, LumaParams* params, uint32_t* parameter_count)
+   // "static_samplers", if given, gets the static samplers of a root signature 1.2 (ReShade skips them) as the game made them, or as "Hook::upgrade_static_sampler" changed them in the
+   // rewritten one: it is written whatever the result, nothing for the older versions.
+   inline Skip Rewrite(std::span<const std::byte> blob, uint32_t settings_register, int32_t data_register, std::vector<std::byte>* rewritten, LumaParams* params, uint32_t* parameter_count, std::vector<D3D12_STATIC_SAMPLER_DESC1>* static_samplers = nullptr)
    {
       *parameter_count = 0;
       // A plain serialized root signature is a container too, with only its "RTS0" part
@@ -142,6 +148,14 @@ namespace D3D12RootSignatures
       {
          using Parameter = std::remove_cvref_t<decltype(*desc.pParameters)>;
          *parameter_count = desc.NumParameters;
+         constexpr bool has_static_samplers_1 = std::is_same_v<std::remove_cvref_t<decltype(*desc.pStaticSamplers)>, D3D12_STATIC_SAMPLER_DESC1>;
+         if constexpr (has_static_samplers_1)
+         {
+            if (static_samplers)
+            {
+               static_samplers->assign(desc.pStaticSamplers, desc.pStaticSamplers + desc.NumStaticSamplers);
+            }
+         }
          if ((desc.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE) != 0)
          {
             return Skip::LocalRootSignature;
@@ -206,12 +220,30 @@ namespace D3D12RootSignatures
          const uint32_t original_parameter_count = desc.NumParameters;
          desc.NumParameters = static_cast<uint32_t>(parameters.size());
          desc.pParameters = parameters.data();
-         desc.Flags &= ~DENY_SHADER_ROOT_ACCESS; // The static samplers and everything else stay
+         desc.Flags &= ~DENY_SHADER_ROOT_ACCESS; // The static samplers and everything else stay, but for the ones the hook upgrades
+
+         std::vector<D3D12_STATIC_SAMPLER_DESC1> upgraded_samplers;
+         if constexpr (has_static_samplers_1)
+         {
+            if (hook.upgrade_static_sampler && desc.NumStaticSamplers != 0)
+            {
+               upgraded_samplers.assign(desc.pStaticSamplers, desc.pStaticSamplers + desc.NumStaticSamplers);
+               for (D3D12_STATIC_SAMPLER_DESC1& sampler : upgraded_samplers)
+               {
+                  hook.upgrade_static_sampler(&sampler);
+               }
+               desc.pStaticSamplers = upgraded_samplers.data();
+            }
+         }
 
          com_ptr<ID3DBlob> serialized;
          if (FAILED(hook.serialize(&extended, &serialized, nullptr)))
          {
             return Skip::NotSerializable;
+         }
+         if (static_samplers && !upgraded_samplers.empty())
+         {
+            *static_samplers = upgraded_samplers;
          }
          const auto* const bytes = static_cast<const std::byte*>(serialized->GetBufferPointer());
          rewritten->assign(bytes, bytes + serialized->GetBufferSize());
@@ -258,6 +290,11 @@ namespace D3D12RootSignatures
    // Set while this thread creates a root signature through the hook: ReShade's events run inside the create, and a root signature an
    // add-on creates from one of them is not the game's
    inline thread_local bool rewriting = false;
+#if DEVELOPMENT
+   // The root signature 1.2 static samplers of the root signature this thread creates through the hook, for the "init_pipeline_layout" event that runs inside the create (ReShade's
+   // pipeline layout lacks them): the frame capture lists them (see "D3D12State::AddStaticSamplers()")
+   inline thread_local std::vector<D3D12_STATIC_SAMPLER_DESC1> pending_static_samplers;
+#endif
 
    inline HRESULT STDMETHODCALLTYPE Detour(ID3D12Device* device, UINT node_mask, const void* blob, SIZE_T size, REFIID riid, void** root_signature)
    {
@@ -270,8 +307,12 @@ namespace D3D12RootSignatures
       std::vector<std::byte> rewritten;
       LumaParams params;
       uint32_t parameter_count = 0;
-      const Skip skip = Rewrite({static_cast<const std::byte*>(blob), size}, hook.settings_register, hook.data_register, &rewritten, &params, &parameter_count);
+      std::vector<D3D12_STATIC_SAMPLER_DESC1> static_samplers;
+      const Skip skip = Rewrite({static_cast<const std::byte*>(blob), size}, hook.settings_register, hook.data_register, &rewritten, &params, &parameter_count, &static_samplers);
       const bool injecting = (skip == Skip::None);
+#if DEVELOPMENT
+      pending_static_samplers = std::move(static_samplers);
+#endif
       HRESULT result = hook.original(device, node_mask, (injecting ? rewritten.data() : blob), (injecting ? rewritten.size() : size), riid, root_signature);
       if (!injecting)
       {
@@ -302,6 +343,9 @@ namespace D3D12RootSignatures
          }
       }
       rewriting = was_rewriting;
+#if DEVELOPMENT
+      pending_static_samplers.clear();
+#endif
       return result;
    }
 

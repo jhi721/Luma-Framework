@@ -381,6 +381,7 @@ struct TraceDrawCallData
    bool IsDSVValid() const { return dsv_format != DXGI_FORMAT_UNKNOWN && dsv_format != DXGI_FORMAT(-1); }
 
    const char* custom_name = "Unknown";
+   bool predicted = false; // A custom entry listed before it ran (the swapchain encode, which runs in the native present after the capture closed)
 };
 
 // Applies to command lists and command queue (DirectX 11 command list and deferred or immediate contexts, though usually it's for "ID3D11DeviceContext").

@@ -575,6 +575,8 @@ namespace Mcp
          w->Field("deferred", true);
       if (entry.type == TraceDrawCallData::TraceDrawCallType::Custom)
          w->Field("name", entry.custom_name);
+      if (entry.predicted)
+         w->Field("predicted", true);
       if (entry.type == TraceDrawCallData::TraceDrawCallType::Shader)
       {
          if (const auto* pipeline = FindPipeline(device_data, entry.pipeline_handle))
@@ -667,9 +669,7 @@ namespace Mcp
       w->Field("stencil_enable", bool(depth_stencil.StencilEnable));
       if (depth_stencil.StencilEnable)
       {
-#if DX11 // The D3D12 reference is a command of the list, not tracked
          w->Field("stencil_ref", entry.stencil_ref);
-#endif
          w->Field("read_mask", uint32_t(depth_stencil.StencilReadMask)).Field("write_mask", uint32_t(depth_stencil.StencilWriteMask));
          WriteStencilFace(w, "front", depth_stencil.FrontFace);
          WriteStencilFace(w, "back", depth_stencil.BackFace);
@@ -732,6 +732,12 @@ namespace Mcp
       if (pipeline)
       {
          w->Field("replace_draw_type", Shader::CachedPipeline::shader_replace_draw_type_names[size_t(pipeline->replace_draw_type)]);
+#if DX12 // What the game created the PSO with: a draw into an upgraded target runs a variant with other formats ("rtvs" has the formats of the bound targets)
+         w->Key("pipeline_rt_formats").BeginArray();
+         for (uint32_t i = 0; i < pipeline->render_target_count; i++)
+            w->Value(GetFormatNameSafe(pipeline->render_target_formats[i]));
+         w->EndArray();
+#endif
 #if DX12 // A file per stage
          w->Key("custom_shaders").BeginArray();
          for (const uint32_t shader_hash : pipeline->shader_hashes)
@@ -818,17 +824,12 @@ namespace Mcp
          }
          });
       w->Field("alpha_to_coverage", bool(entry.blend_desc.AlphaToCoverageEnable));
-#if DX11
+#if DX12
+      if (entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
+         w->Field("clear_kind", EnumName(clear_kind_names, size_t(entry.clear_kind)));
+#endif
       // Clear entries store the clear values there (depth and stencil in the first two for depth clears)
       w->Key(entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource ? "clear_values" : "blend_factor").BeginArray().Value(entry.blend_factor[0]).Value(entry.blend_factor[1]).Value(entry.blend_factor[2]).Value(entry.blend_factor[3]).EndArray();
-#else
-      // D3D12 captures no blend factor, only the clear entries have values there
-      if (entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
-      {
-         w->Field("clear_kind", EnumName(clear_kind_names, size_t(entry.clear_kind)));
-         w->Key("clear_values").BeginArray().Value(entry.blend_factor[0]).Value(entry.blend_factor[1]).Value(entry.blend_factor[2]).Value(entry.blend_factor[3]).EndArray();
-      }
-#endif
 
       WriteViews(w, "srvs", TraceDrawCallData::srvs_size, [&](size_t i)
          {
