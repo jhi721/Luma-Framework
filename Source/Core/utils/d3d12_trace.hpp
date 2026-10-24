@@ -271,6 +271,103 @@ namespace D3D12Trace
          entry->ds_size = uint2{ds_size.x, ds_size.y};
    }
 
+   // The fixed function state of a graphics pipeline for the capture, in the fields of the D3D11 one so its writers serve both (the D3D11 and D3D12 enums are numbered alike,
+   // ReShade's are zero based). ReShade has these subobjects for every graphics pipeline, the D3D12 defaults stand in for the ones a pipeline hasn't ("state_bound" tells for
+   // the depth stencil and rasterizer ones). D3D12 has no stencil masks per face on the D3D11 desc, the front face's are kept. Returns the depth stencil state as ReShade has it.
+   // ponytail: the alpha blend factor constants (D3D12 only) read as the shared blend factor, a "front_and_back" cull mode as back
+   reshade::api::depth_stencil_desc FillRenderState(TraceDrawCallData* entry, const Shader::CachedPipeline* pipeline)
+   {
+      reshade::api::blend_desc blend = {};
+      reshade::api::rasterizer_desc rasterizer = {};
+      reshade::api::depth_stencil_desc depth_stencil = {};
+      for (uint32_t i = 0; pipeline && pipeline->subobjects_cache && i < pipeline->subobject_count; i++)
+      {
+         const reshade::api::pipeline_subobject& subobject = pipeline->subobjects_cache[i];
+         if (!subobject.data)
+            continue;
+         switch (subobject.type)
+         {
+         case reshade::api::pipeline_subobject_type::blend_state:
+            blend = *static_cast<const reshade::api::blend_desc*>(subobject.data);
+            break;
+         case reshade::api::pipeline_subobject_type::rasterizer_state:
+            rasterizer = *static_cast<const reshade::api::rasterizer_desc*>(subobject.data);
+            entry->has_rasterizer_state = true;
+            break;
+         case reshade::api::pipeline_subobject_type::depth_stencil_state:
+            depth_stencil = *static_cast<const reshade::api::depth_stencil_desc*>(subobject.data);
+            entry->has_depth_stencil_state = true;
+            break;
+         default:
+            break;
+         }
+      }
+
+      static constexpr D3D12_BLEND blend_factors[] = {D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA,
+         D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_ALPHA_FACTOR, D3D12_BLEND_INV_ALPHA_FACTOR, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR, D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA};
+      const auto to_blend = [](reshade::api::blend_factor factor)
+      { return blend_factors[(std::min)(size_t(factor), std::size(blend_factors) - 1)]; };
+      entry->blend_desc.AlphaToCoverageEnable = blend.alpha_to_coverage_enable;
+      entry->blend_desc.IndependentBlendEnable = TRUE;
+      for (uint32_t i = 0; i < TraceDrawCallData::rtvs_size; i++)
+      {
+         entry->blend_desc.RenderTarget[i] = {
+            .BlendEnable = blend.blend_enable[i],
+            .LogicOpEnable = blend.logic_op_enable[i],
+            .SrcBlend = to_blend(blend.source_color_blend_factor[i]),
+            .DestBlend = to_blend(blend.dest_color_blend_factor[i]),
+            .BlendOp = D3D12_BLEND_OP(uint32_t(blend.color_blend_op[i]) + 1),
+            .SrcBlendAlpha = to_blend(blend.source_alpha_blend_factor[i]),
+            .DestBlendAlpha = to_blend(blend.dest_alpha_blend_factor[i]),
+            .BlendOpAlpha = D3D12_BLEND_OP(uint32_t(blend.alpha_blend_op[i]) + 1),
+            .LogicOp = D3D12_LOGIC_OP(blend.logic_op[i]),
+            .RenderTargetWriteMask = blend.render_target_write_mask[i],
+         };
+      }
+
+      const auto to_stencil_face = [](reshade::api::stencil_op fail_op, reshade::api::stencil_op depth_fail_op, reshade::api::stencil_op pass_op, reshade::api::compare_op func) -> D3D12_DEPTH_STENCILOP_DESC
+      {
+         return {.StencilFailOp = D3D12_STENCIL_OP(uint32_t(fail_op) + 1), .StencilDepthFailOp = D3D12_STENCIL_OP(uint32_t(depth_fail_op) + 1), .StencilPassOp = D3D12_STENCIL_OP(uint32_t(pass_op) + 1), .StencilFunc = D3D12_COMPARISON_FUNC(uint32_t(func) + 1)};
+      };
+      entry->depth_stencil_desc = {
+         .DepthEnable = depth_stencil.depth_enable,
+         .DepthWriteMask = (depth_stencil.depth_write_mask ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO),
+         .DepthFunc = D3D12_COMPARISON_FUNC(uint32_t(depth_stencil.depth_func) + 1),
+         .StencilEnable = depth_stencil.stencil_enable,
+         .StencilReadMask = depth_stencil.front_stencil_read_mask,
+         .StencilWriteMask = depth_stencil.front_stencil_write_mask,
+         .FrontFace = to_stencil_face(depth_stencil.front_stencil_fail_op, depth_stencil.front_stencil_depth_fail_op, depth_stencil.front_stencil_pass_op, depth_stencil.front_stencil_func),
+         .BackFace = to_stencil_face(depth_stencil.back_stencil_fail_op, depth_stencil.back_stencil_depth_fail_op, depth_stencil.back_stencil_pass_op, depth_stencil.back_stencil_func),
+      };
+
+      entry->rasterizer_desc = {
+         .FillMode = (rasterizer.fill_mode == reshade::api::fill_mode::wireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID),
+         .CullMode = D3D12_CULL_MODE((std::min)(uint32_t(rasterizer.cull_mode), 2u) + 1),
+         .FrontCounterClockwise = rasterizer.front_counter_clockwise,
+         .DepthBias = INT(rasterizer.depth_bias),
+         .DepthBiasClamp = rasterizer.depth_bias_clamp,
+         .SlopeScaledDepthBias = rasterizer.slope_scaled_depth_bias,
+         .DepthClipEnable = rasterizer.depth_clip_enable,
+         .MultisampleEnable = rasterizer.multisample_enable,
+         .AntialiasedLineEnable = rasterizer.antialiased_line_enable,
+      };
+      entry->scissor_enable = rasterizer.scissor_enable;
+      return depth_stencil;
+   }
+
+   // A packed sampler entry. A null "desc" (a descriptor that was never written, or whose sampler wasn't seen created) leaves it unbound.
+   void FillSampler(TraceDrawCallData* entry, uint32_t index, const reshade::api::sampler_desc* desc)
+   {
+      if (!desc)
+         return;
+      entry->samplers_filter[index] = D3D12_FILTER(desc->filter);
+      entry->samplers_address_u[index] = D3D12_TEXTURE_ADDRESS_MODE(desc->address_u);
+      entry->samplers_address_v[index] = D3D12_TEXTURE_ADDRESS_MODE(desc->address_v);
+      entry->samplers_address_w[index] = D3D12_TEXTURE_ADDRESS_MODE(desc->address_w);
+      entry->samplers_mip_lod_bias[index] = desc->mip_lod_bias;
+      entry->samplers_comparison_func[index] = D3D12_COMPARISON_FUNC(uint32_t(desc->compare_op) + 1);
+   }
+
    // Reads the table descriptors of a command list's entries ("TraceDrawCallData::table_descriptors"), at its execution
    void ResolveTableDescriptors(std::vector<TraceDrawCallData>* entries, DeviceData* device_data)
    {
@@ -281,7 +378,12 @@ namespace D3D12Trace
          for (const TraceDrawCallData::TableDescriptor& table_descriptor : entry.table_descriptors)
          {
             const D3D12State::Descriptor* descriptor = D3D12State::FindDescriptor(device_data->descriptor_heaps, device, table_descriptor.table, table_descriptor.binding);
-            if (table_descriptor.type != 'b')
+            if (table_descriptor.type == 's')
+            {
+               const auto sampler = device_data->descriptor_heaps.sampler_descs.find(descriptor ? descriptor->handle : 0);
+               FillSampler(&entry, table_descriptor.index, (sampler != device_data->descriptor_heaps.sampler_descs.end()) ? &sampler->second : nullptr);
+            }
+            else if (table_descriptor.type != 'b')
             {
                FillView(device, &entry, table_descriptor.type, table_descriptor.index, true, descriptor ? descriptor->handle : 0, descriptor ? descriptor->view : D3D12State::ViewInfo{});
             }
@@ -295,6 +397,18 @@ namespace D3D12Trace
          }
          entry.table_descriptors.clear();
       }
+   }
+
+   // A draw or dispatch's "D3D12Readback::DrawSignature", from its arguments and the resources of its first render target and depth stencil
+   // (as a frame capture entry or the command list's state holds them), so readbacks find it again on any thread
+   D3D12Readback::DrawSignature MakeDrawSignature(const DeviceData& device_data, const DrawDispatchData& draw_dispatch_data, bool compute, uint64_t rtv_resource, uint64_t dsv_resource)
+   {
+      return {
+         .rtv_resource = (compute || device_data.back_buffers.contains(rtv_resource)) ? 0 : rtv_resource,
+         .dsv_resource = compute ? 0 : dsv_resource,
+         .compute = compute,
+         .arguments = {draw_dispatch_data.vertex_count, draw_dispatch_data.index_count, draw_dispatch_data.instance_count, draw_dispatch_data.first_vertex, draw_dispatch_data.first_index, draw_dispatch_data.dispatch_count.x, draw_dispatch_data.dispatch_count.y, draw_dispatch_data.dispatch_count.z, draw_dispatch_data.indirect},
+      };
    }
 
    // Expects "s_mutex_generic" (shared), "s_mutex_dumping" and the command list's "mutex_trace" to be locked. The table descriptors are
@@ -372,6 +486,23 @@ namespace D3D12Trace
             }
          }
 
+         // Without a pipeline's state the D3D12 defaults apply (depth test and write, no stencil)
+         const reshade::api::depth_stencil_desc desc = FillRenderState(&trace_draw_call_data, pipeline);
+#if ENABLE_D3D12_PASSES // The viewports and scissors are only tracked with the passes' state
+         trace_draw_call_data.viewport_count = UINT((std::min)(state.viewports.size(), std::size(trace_draw_call_data.viewports)));
+         for (UINT i = 0; i < trace_draw_call_data.viewport_count; i++)
+         {
+            const reshade::api::viewport& viewport = state.viewports[i];
+            trace_draw_call_data.viewports[i] = {.TopLeftX = viewport.x, .TopLeftY = viewport.y, .Width = viewport.width, .Height = viewport.height, .MinDepth = viewport.min_depth, .MaxDepth = viewport.max_depth};
+         }
+         trace_draw_call_data.scissor_count = UINT((std::min)(state.scissor_rects.size(), std::size(trace_draw_call_data.scissor_rects)));
+         for (UINT i = 0; i < trace_draw_call_data.scissor_count; i++)
+         {
+            const reshade::api::rect& rect = state.scissor_rects[i];
+            trace_draw_call_data.scissor_rects[i] = {.left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.bottom};
+         }
+#endif
+
          for (size_t i = 0; i < state.render_targets.size() && i < TraceDrawCallData::rtvs_size; i++)
          {
             if (state.render_targets[i].handle == 0)
@@ -384,15 +515,6 @@ namespace D3D12Trace
          {
             FillView(device, &trace_draw_call_data, 'd', 0, true, state.depth_stencil.handle, state.depth_stencil_view);
 
-            // The D3D12 defaults if the PSO had no depth stencil state (depth test and write, no stencil)
-            reshade::api::depth_stencil_desc desc = {};
-            for (uint32_t i = 0; pipeline && i < pipeline->subobject_count; i++)
-            {
-               if (pipeline->subobjects_cache[i].type == reshade::api::pipeline_subobject_type::depth_stencil_state && pipeline->subobjects_cache[i].data)
-               {
-                  desc = *static_cast<const reshade::api::depth_stencil_desc*>(pipeline->subobjects_cache[i].data);
-               }
-            }
             using DepthStateType = TraceDrawCallData::DepthStateType;
             // Same classification as the D3D11 capture
             if (desc.depth_enable)
@@ -415,7 +537,7 @@ namespace D3D12Trace
          }
       }
 
-      // The next packed SRV, UAV or constant buffer entry, UINT32_MAX if they are all taken
+      // The next packed SRV, UAV, constant buffer or sampler entry, UINT32_MAX if they are all taken (the entry is then marked "truncated")
       auto AddEntry = [&](char type, const TraceDrawCallData::ShaderRegister& shader_register) -> uint32_t
       {
          uint32_t* count = &trace_draw_call_data.cb_count;
@@ -425,9 +547,13 @@ namespace D3D12Trace
             count = &trace_draw_call_data.srv_count, registers = trace_draw_call_data.sr_register, max_count = uint32_t(TraceDrawCallData::srvs_size);
          else if (type == 'u')
             count = &trace_draw_call_data.uav_count, registers = trace_draw_call_data.ua_register, max_count = uint32_t(TraceDrawCallData::uavs_size);
-         ASSERT_ONCE(*count < max_count);
+         else if (type == 's')
+            count = &trace_draw_call_data.sampler_count, registers = trace_draw_call_data.sa_register, max_count = uint32_t(TraceDrawCallData::samplers_size);
          if (*count >= max_count)
+         {
+            trace_draw_call_data.truncated = true;
             return UINT32_MAX;
+         }
          registers[*count] = shader_register;
          if (type == 'b')
             trace_draw_call_data.cbs[*count] = true;
@@ -449,6 +575,20 @@ namespace D3D12Trace
       if (layout_it == device_data->pipeline_layouts.parameters_by_layout.end())
          return;
       const std::shared_lock lock_buffers(device_data->buffer_addresses.mutex);
+      // The static samplers belong to the root signature, no command binds them
+      for (const D3D12State::RootParameter& parameter : layout_it->second)
+      {
+         if (parameter.static_samplers.size() != parameter.ranges.size())
+            continue;
+         for (size_t i = 0; i < parameter.ranges.size(); i++)
+         {
+            const TraceDrawCallData::ShaderRegister shader_register = {.index = parameter.ranges[i].dx_register_index, .space = parameter.ranges[i].dx_register_space};
+            if (const uint32_t index = IsDeclared('s', shader_register) ? AddEntry('s', shader_register) : UINT32_MAX; index != UINT32_MAX)
+            {
+               FillSampler(&trace_draw_call_data, index, &parameter.static_samplers[i]);
+            }
+         }
+      }
       for (size_t param_index = 0; param_index < layout_it->second.size() && param_index < root.bindings.size(); param_index++)
       {
          const D3D12State::RootParameter& parameter = layout_it->second[param_index];
@@ -505,11 +645,13 @@ namespace D3D12Trace
             {
                const bool is_srv = IsShaderResourceView(range.type);
                const bool is_uav = IsUnorderedAccessView(range.type);
-               if (!is_srv && !is_uav && range.type != reshade::api::descriptor_type::constant_buffer)
+               const bool is_sampler = (range.type == reshade::api::descriptor_type::sampler);
+               if (!is_srv && !is_uav && !is_sampler && range.type != reshade::api::descriptor_type::constant_buffer)
                   continue;
-               const char type = is_srv ? 't' : (is_uav ? 'u' : 'b');
+               const char type = is_srv ? 't' : (is_uav ? 'u' : (is_sampler ? 's' : 'b'));
                // ponytail: bindless (unbounded) ranges stop at the per type limit, reading "ResourceDescriptorHeap" is out of the capture's scope
                const uint32_t count = (std::min)(range.count, uint32_t(TraceDrawCallData::srvs_size));
+               trace_draw_call_data.truncated |= (range.count > count);
                for (uint32_t i = 0; i < count; i++)
                {
                   const TraceDrawCallData::ShaderRegister shader_register = {.index = range.dx_register_index + i, .space = range.dx_register_space};
@@ -570,5 +712,29 @@ namespace D3D12Trace
       entry->type = TraceDrawCallData::TraceDrawCallType::ClearResource;
       entry->clear_kind = kind;
       FillView(device, entry, 'r', 0, false, 0, D3D12State::GetViewInfo(device, view));
+   }
+
+   // Fills a Luma pass of the pass layer as a Custom entry, the D3D12 counterpart of the D3D11 "MoveInjectedPassTraces()": its inputs as SRVs (the registers are the order the pass binds
+   // them in) and its outputs as render targets, or as unordered access views for a compute pass, each viewed as the format of its "ViewInfo". Readbacks don't re-issue these
+   void FillLumaPass(reshade::api::device* device, TraceDrawCallData* entry, const char* name, std::initializer_list<D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute)
+   {
+      entry->type = TraceDrawCallData::TraceDrawCallType::Custom;
+      entry->custom_name = name;
+      for (const D3D12State::ViewInfo& input : inputs)
+      {
+         const uint32_t index = entry->srv_count++;
+         entry->sr_register[index] = {.index = index};
+         FillView(device, entry, 't', index, true, input.resource, input);
+      }
+      uint32_t output_index = 0;
+      for (const D3D12State::ViewInfo& output : outputs)
+      {
+         if (compute)
+         {
+            entry->ua_register[output_index] = {.index = output_index};
+            entry->uav_count++;
+         }
+         FillView(device, entry, compute ? 'u' : 'r', output_index++, true, output.resource, output);
+      }
    }
 } // namespace D3D12Trace

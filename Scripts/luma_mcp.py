@@ -149,7 +149,7 @@ TOOLS = [
         "see luma_dev_values kind texture) at present: its last content, usually this frame's. "
         "D3D12: view=srv needs index and reads the resource right after the entry that last wrote it (draw, dispatch, copy, resolve or clear; "
         "producer_index). Copy, resolve and clear entries read by index what they wrote (rtv, or depth/stencil); uploads, UAV clears and buffer copies "
-        "are refused, resolves re-run as average (resolve_mode). No ui or registered: views.",
+        "are refused, resolves re-run as average (resolve_mode). No ui view; registered: views are Luma's own textures (core.smaa_edges, core.smaa_weights, core.bloom with mip=, core.sr_output).",
         {**TARGET,
          **READ_TARGET,
          **OUT_DIR,
@@ -219,9 +219,11 @@ TOOLS = [
         "D3D12: root constants come from the bound values; constant buffer views only from UPLOAD heaps (DEFAULT heap ones are refused, their state "
         "isn't known).",
         {**TARGET, "slot": {"type": "integer", "description": "Constant buffer register b<slot> (D3D12: the packed entry luma_trace_get lists, with register/space)"},
+         "register": {"type": "integer", "description": "Instead of slot: the shader register b<register> (D3D12: the draw's entry with that register and space; the error lists the draw's registers. D3D11: same as slot)"},
+         "space": {"type": "integer", "description": "With register, D3D12: the register space (default 0)"},
          "frames": {"type": "integer", "description": "Consecutive frames to read (default 1)"},
          "rows": {"type": "string", "description": "With frames: float4 rows to print per frame, e.g. \"0-3,12\" (default: the rows that change)"}},
-        ["slot"],
+        [],
     ),
     tool("luma_dev_values", "The game's registered knobs: toggles, floats, ints (with their range), per frame counters (e.g. motion vector draws, matches, "
          "refusals by reason) and Luma textures (format/size, read with luma_read_resource view=registered:<name>). Core ones start with \"core.\" "

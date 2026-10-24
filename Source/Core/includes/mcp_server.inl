@@ -350,7 +350,13 @@ namespace Mcp
 #if DX11
    using DevTextureGetter = ID3D11DeviceChild* (*)(DeviceData & device_data);
 #else
-   using DevTextureGetter = ID3D12Resource* (*)(DeviceData & device_data); // Not read back yet ("docs/DX12-Support-Plan.md" A4)
+   // A D3D12 texture of Luma's, borrowed, with the state it rests in between its passes: what a read at present copies it from
+   struct DevTexture
+   {
+      ID3D12Resource* resource = nullptr;
+      D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+   };
+   using DevTextureGetter = DevTexture (*)(DeviceData& device_data);
 #endif
    struct DevValue
    {
@@ -484,7 +490,7 @@ namespace Mcp
       }
    }
 
-   constexpr uint32_t readback_max_frames = 3; // A pass not hit within these frames is reported as missing
+   constexpr uint32_t readback_max_frames = 8; // A pass not hit within these frames is reported as missing
 
    template <size_t N>
    const char* EnumName(const char* const (&names)[N], size_t value)
@@ -634,7 +640,6 @@ namespace Mcp
          w->Field("note", entry.note);
    }
 
-#if DX11 // D3D12 PSO states aren't captured yet
    constexpr const char* comparison_func_names[] = {"", "NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS"};
    constexpr const char* stencil_op_names[] = {"", "KEEP", "ZERO", "REPLACE", "INCR_SAT", "DECR_SAT", "INVERT", "INCR", "DECR"};
    constexpr const char* cull_mode_names[] = {"", "NONE", "FRONT", "BACK"};
@@ -651,26 +656,40 @@ namespace Mcp
    // Pixel shader entries only, the trace doesn't record this state for other stages
    void WriteRenderState(JsonWriter* w, const TraceDrawCallData& entry)
    {
+#if DX11
       const D3D11_DEPTH_STENCIL_DESC depth_stencil = entry.has_depth_stencil_state ? entry.depth_stencil_desc : CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
+#else
+      const D3D11_DEPTH_STENCIL_DESC& depth_stencil = entry.depth_stencil_desc; // The D3D12 capture fills the defaults of a pipeline without one
+#endif
       w->Key("depth_stencil").BeginObject();
       w->Field("state_bound", entry.has_depth_stencil_state).Field("depth_enable", bool(depth_stencil.DepthEnable));
-      w->Field("depth_write", depth_stencil.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL).Field("depth_func", EnumName(comparison_func_names, depth_stencil.DepthFunc));
+      w->Field("depth_write", depth_stencil.DepthWriteMask != 0).Field("depth_func", EnumName(comparison_func_names, depth_stencil.DepthFunc));
       w->Field("stencil_enable", bool(depth_stencil.StencilEnable));
       if (depth_stencil.StencilEnable)
       {
-         w->Field("stencil_ref", entry.stencil_ref).Field("read_mask", uint32_t(depth_stencil.StencilReadMask)).Field("write_mask", uint32_t(depth_stencil.StencilWriteMask));
+#if DX11 // The D3D12 reference is a command of the list, not tracked
+         w->Field("stencil_ref", entry.stencil_ref);
+#endif
+         w->Field("read_mask", uint32_t(depth_stencil.StencilReadMask)).Field("write_mask", uint32_t(depth_stencil.StencilWriteMask));
          WriteStencilFace(w, "front", depth_stencil.FrontFace);
          WriteStencilFace(w, "back", depth_stencil.BackFace);
       }
       w->EndObject();
 
+#if DX11
       const D3D11_RASTERIZER_DESC rasterizer = entry.has_rasterizer_state ? entry.rasterizer_desc : CD3D11_RASTERIZER_DESC(D3D11_DEFAULT);
+      const bool scissor_enable = rasterizer.ScissorEnable;
+#else
+      const D3D11_RASTERIZER_DESC& rasterizer = entry.rasterizer_desc;
+      const bool scissor_enable = entry.scissor_enable;
+#endif
       w->Key("rasterizer").BeginObject();
       w->Field("state_bound", entry.has_rasterizer_state).Field("cull", EnumName(cull_mode_names, rasterizer.CullMode)).Field("fill", EnumName(fill_mode_names, rasterizer.FillMode));
       w->Field("front_ccw", bool(rasterizer.FrontCounterClockwise)).Field("depth_bias", rasterizer.DepthBias).Field("slope_scaled_depth_bias", rasterizer.SlopeScaledDepthBias);
-      w->Field("depth_clip", bool(rasterizer.DepthClipEnable)).Field("scissor_enable", bool(rasterizer.ScissorEnable)).Field("multisample", bool(rasterizer.MultisampleEnable));
+      w->Field("depth_clip", bool(rasterizer.DepthClipEnable)).Field("scissor_enable", scissor_enable).Field("multisample", bool(rasterizer.MultisampleEnable));
       w->EndObject();
 
+#if DX11 || ENABLE_D3D12_PASSES // D3D12 tracks the viewports and scissors with the passes' state only
       w->Field("viewport_count", entry.viewport_count).Key("viewports").BeginArray();
       for (UINT i = 0; i < entry.viewport_count; i++)
       {
@@ -685,8 +704,8 @@ namespace Mcp
          w->BeginArray().Value(rect.left).Value(rect.top).Value(rect.right).Value(rect.bottom).EndArray();
       }
       w->EndArray();
+#endif
    }
-#endif // DX11
 
    void WriteViews(JsonWriter* w, const char* key, size_t count, auto is_valid, auto write)
    {
@@ -740,19 +759,20 @@ namespace Mcp
       w->Field("topology", uint32_t(entry.primitive_topology));
       w->EndObject();
 
-#if DX11
+#if DX11 || ENABLE_D3D12_PASSES
       const D3D11_VIEWPORT& viewport_0 = entry.viewports[0]; // Zeroed if none
       w->Key("viewport0").BeginArray().Value(viewport_0.TopLeftX).Value(viewport_0.TopLeftY).Value(viewport_0.Width).Value(viewport_0.Height).EndArray();
       w->Field("scissors", entry.scissor_count >= 1);
 #endif
       w->Field("depth_state", EnumName(TraceDrawCallData::depth_state_names, size_t(entry.depth_state)));
       w->Field("stencil_state", EnumName(TraceDrawCallData::depth_state_names, size_t(entry.stencil_state)));
-#if DX11
       if (pipeline && pipeline->HasPixelShader())
          WriteRenderState(w, entry);
-#else
+#if DX12
       if (entry.uses_descriptor_heap)
          w->Field("uses_descriptor_heap", true).Field("descriptor_heap_note", "Indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices are usually in the root constants");
+      if (entry.truncated)
+         w->Field("truncated", true).Field("truncated_note", "Bindless ranges and bindings past the per type limits of an entry (SRV 128, UAV 64, CBV 32) aren't listed");
 #endif
       if (entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource)
       {
@@ -790,17 +810,15 @@ namespace Mcp
          {
          write_resource(entry.rt_format[i], entry.rtv_format[i], entry.rt_size[i], entry.rtv_size[i], entry.rtv_mip[i], entry.rt_type_name[i], entry.rt_hash[i], entry.rt_debug_name[i]);
          if (entry.rt_is_swapchain[i]) w->Field("swapchain", true);
-#if DX11
          const auto& blend = entry.blend_desc.RenderTarget[entry.blend_desc.IndependentBlendEnable ? i : 0];
          w->Field("write_mask", uint32_t(blend.RenderTargetWriteMask));
          if (blend.BlendEnable)
          {
             w->Field("blend", std::format("{} {} {} / alpha {} {} {}", GetBlendName(blend.SrcBlend), GetBlendOpName(blend.BlendOp), GetBlendName(blend.DestBlend), GetBlendName(blend.SrcBlendAlpha), GetBlendOpName(blend.BlendOpAlpha), GetBlendName(blend.DestBlendAlpha)));
          }
-#endif
          });
-#if DX11
       w->Field("alpha_to_coverage", bool(entry.blend_desc.AlphaToCoverageEnable));
+#if DX11
       // Clear entries store the clear values there (depth and stencil in the first two for depth clears)
       w->Key(entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource ? "clear_values" : "blend_factor").BeginArray().Value(entry.blend_factor[0]).Value(entry.blend_factor[1]).Value(entry.blend_factor[2]).Value(entry.blend_factor[3]).EndArray();
 #else
@@ -860,7 +878,7 @@ namespace Mcp
             w->Field("debug_name", entry.ds_debug_name);
          w->EndObject();
       }
-      WriteViews(w, "cbs", D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, [&](size_t i)
+      WriteViews(w, "cbs", TraceDrawCallData::cbs_size, [&](size_t i)
          { return entry.cbs[i]; }, [&](size_t i)
          {
 #if DX12 // Root constants have no buffer, a CBV is a range of any buffer (root CBVs have no size)
@@ -888,15 +906,31 @@ namespace Mcp
          if (entry.cb_num_constants[i] != 0) w->Field("first_constant", entry.cb_first_constant[i]).Field("num_constants", entry.cb_num_constants[i]);
 #endif
          });
-#if DX11 // D3D12 samplers aren't captured yet
-      WriteViews(w, "samplers", D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, [&](size_t i)
-         { return entry.samplers_filter[i] != static_cast<D3D11_FILTER>(-1); }, [&](size_t i)
+      WriteViews(w, "samplers", TraceDrawCallData::samplers_size, [&](size_t i)
          {
+#if DX12
+         return i < entry.sampler_count;
+#else
+         return entry.samplers_filter[i] != static_cast<D3D11_FILTER>(-1);
+#endif
+         }, [&](size_t i)
+         {
+#if DX12 // A sampler descriptor the shader references, never written or created before the capture
+         write_register('s', entry.sa_register[i]);
+         if (entry.samplers_filter[i] == static_cast<D3D11_FILTER>(-1))
+         {
+            w->Field("bound", false);
+            return;
+         }
+#endif
          w->Field("filter", GetFilterName(entry.samplers_filter[i])).Field("filter_id", uint32_t(entry.samplers_filter[i]));
          w->Field("address", std::format("{} {} {}", GetTextureAddressModeName(entry.samplers_address_u[i]), GetTextureAddressModeName(entry.samplers_address_v[i]), GetTextureAddressModeName(entry.samplers_address_w[i])));
          w->Key("address_ids").BeginArray().Value(uint32_t(entry.samplers_address_u[i])).Value(uint32_t(entry.samplers_address_v[i])).Value(uint32_t(entry.samplers_address_w[i])).EndArray();
-         w->Field("mip_lod_bias", entry.samplers_mip_lod_bias[i]); });
+#if DX12
+         if (((entry.samplers_filter[i] >> D3D12_FILTER_REDUCTION_TYPE_SHIFT) & D3D12_FILTER_REDUCTION_TYPE_MASK) == D3D12_FILTER_REDUCTION_TYPE_COMPARISON)
+            w->Field("comparison", EnumName(comparison_func_names, entry.samplers_comparison_func[i]));
 #endif
+         w->Field("mip_lod_bias", entry.samplers_mip_lod_bias[i]); });
 
       if (!entry.input_layout_hash.empty())
       {
@@ -1202,14 +1236,17 @@ namespace Mcp
    }
 #endif // DX11
 
-#if DX11
    // Super resolution tap: wraps every "sr_implementations" entry (see "Init()") to record what games feed the upscalers
    constexpr const char* sr_resource_names[] = {"source_color", "motion_vectors", "depth_buffer", "exposure", "bias_mask", "transparency_alpha", "output_color"};
    constexpr size_t sr_history_size = 256;
 
    struct SrCapture
    {
+#if DX11
       std::vector<std::pair<const char*, com_ptr<ID3D11Resource>>> textures; // GPU copies, read back at present
+#else
+      DeviceData* device_data = nullptr; // Its "readback.captures" are the GPU copies, read back at present
+#endif
       bool draw_succeeded;
    };
    std::atomic<bool> sr_capture_armed = false;
@@ -1231,12 +1268,12 @@ namespace Mcp
       {
          return inner->IsSupported(data);
       }
-      bool Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter* adapter) override
+      bool Init(SR::InstanceData*& data, SR::Device* device, IDXGIAdapter* adapter) override
       {
          init_count++;
          return inner->Init(data, device, adapter);
       }
-      void Deinit(SR::InstanceData*& data, ID3D11Device* optional_device) override
+      void Deinit(SR::InstanceData*& data, SR::Device* optional_device) override
       {
          deinit_count++;
          inner->Deinit(data, optional_device);
@@ -1245,7 +1282,7 @@ namespace Mcp
       {
          inner->ReleaseResources(data);
       }
-      bool UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* command_list, const SR::SettingsData& settings_data) override
+      bool UpdateSettings(SR::InstanceData* data, SR::CommandList* command_list, const SR::SettingsData& settings_data) override
       {
          const bool succeeded = inner->UpdateSettings(data, command_list, settings_data);
          const std::lock_guard lock(mutex);
@@ -1254,23 +1291,57 @@ namespace Mcp
          last_update_succeeded = succeeded;
          return succeeded;
       }
-      bool Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data) override
+      bool Draw(const SR::InstanceData* data, SR::CommandList* command_list, const DrawData& draw_data) override
       {
-         ID3D11Resource* const resources[] = {draw_data.source_color, draw_data.motion_vectors, draw_data.depth_buffer, draw_data.exposure, draw_data.bias_mask, draw_data.transparency_alpha, draw_data.output_color};
+         SR::Resource* const resources[] = {draw_data.source_color, draw_data.motion_vectors, draw_data.depth_buffer, draw_data.exposure, draw_data.bias_mask, draw_data.transparency_alpha, draw_data.output_color};
          const bool capture = sr_capture_armed.load() && sr_capture_armed.exchange(false);
-         com_ptr<ID3D11Device> native_device;
+         com_ptr<SR::Device> native_device;
          SrCapture captured;
+         // D3D12: recorded in the draw's list, in the state "DrawData" has the texture in (the output is the last one), and read at present once the game executed the list
+         const auto copy_texture = [&](size_t i)
+         {
+#if DX11
+            captured.textures.emplace_back(sr_resource_names[i], CloneResource(native_device.get(), command_list, resources[i]));
+#else
+            if (!captured.device_data)
+               return;
+            D3D12Readback::State& readback = captured.device_data->readback;
+            const std::unique_lock lock(readback.mutex);
+            const D3D12_RESOURCE_STATES state = ((i + 1 == std::size(resources)) ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const DXGI_FORMAT format = D3D12Readback::PlaneFormat(resources[i]->GetDesc().Format, false);
+            D3D12Readback::Copy& copy = readback.captures.emplace_back(D3D12Readback::Capture{.name = sr_resource_names[i], .copy = {.native_list = reinterpret_cast<uint64_t>(command_list), .data_format = format}}).copy;
+            const uint32_t subresource = 0;
+            if (D3D12Readback::RecordTextureCopy(&readback, native_device.get(), command_list, resources[i], state, std::span(&subresource, 1), format, &copy, [] {}))
+            {
+               D3D12Readback::recorded_copies++;
+            }
+            else
+            {
+               copy.status = D3D12Readback::Copy::Status::Failed;
+               copy.error = "Failed to create the readback resources";
+            }
+#endif
+         };
          if (capture)
          {
+#if DX11
             command_list->GetDevice(&native_device);
+#else
+            command_list->GetDevice(IID_PPV_ARGS(&native_device));
+            const auto found = std::ranges::find_if(global_devices_data, [&](const DeviceData* candidate)
+               { return candidate->native_device == native_device.get(); });
+            captured.device_data = (found != global_devices_data.end()) ? *found : nullptr;
+#endif
             for (size_t i = 0; i < std::size(resources) - 1; i++) // Inputs before the upscaler runs
                if (resources[i])
-                  captured.textures.emplace_back(sr_resource_names[i], CloneResource(native_device.get(), command_list, resources[i]));
+                  copy_texture(i);
          }
          captured.draw_succeeded = inner->Draw(data, command_list, draw_data);
+#if DX11 // D3D12: the SR pass isn't a trace entry yet
          QueueInjectedPassTrace(command_list, "Luma Super Resolution", draw_data.output_color);
+#endif
          if (capture && draw_data.output_color)
-            captured.textures.emplace_back(sr_resource_names[std::size(resources) - 1], CloneResource(native_device.get(), command_list, draw_data.output_color));
+            copy_texture(std::size(resources) - 1);
          {
             const std::lock_guard lock(mutex);
             last_draw = draw_data;
@@ -1280,8 +1351,15 @@ namespace Mcp
                for (size_t i = 0; i < std::size(resources); i++)
                {
                   last_resources[i] = {};
-                  if (resources[i])
-                     GetResourceInfo(resources[i], last_resources[i].size, last_resources[i].format, nullptr, &last_resources[i].resource);
+                  if (!resources[i])
+                     continue;
+#if DX11
+                  GetResourceInfo(resources[i], last_resources[i].size, last_resources[i].format, nullptr, &last_resources[i].resource);
+#else
+                  // What the D3D12 "GetResourceInfo()" gives, which wants a ReShade device the tap doesn't have
+                  const D3D12_RESOURCE_DESC desc = resources[i]->GetDesc();
+                  last_resources[i] = {.size = {uint32_t(desc.Width), desc.Height, desc.DepthOrArraySize, (desc.SampleDesc.Count > 1 ? desc.SampleDesc.Count : desc.MipLevels)}, .format = desc.Format, .resource = std::to_string(std::hash<void*>{}(resources[i]))};
+#endif
                }
             }
             history[draw_count % sr_history_size] = {cb_luma_global_settings.FrameIndex, draw_data.frame_index, draw_data.jitter_x, draw_data.jitter_y, draw_data.pre_exposure, draw_data.vert_fov, draw_data.render_width, draw_data.render_height, draw_data.reset, captured.draw_succeeded};
@@ -1402,7 +1480,6 @@ namespace Mcp
       uint32_t failures = 0;
       uint32_t resets = 0;
    };
-#endif // DX11
 
    // Where readbacks go ("out_dir" can only pick a subfolder): an elevated game must not write where a non elevated client asks.
    // Not under the game's "Luma" folder, a non empty one there would shadow the repository shaders.
@@ -1762,7 +1839,7 @@ namespace Mcp
             job->error = std::format("Constant buffer tracking doesn't support {} passes", job->stage);
             return true;
          }
-         const int64_t slot = job->IntArg("slot", 0);
+         const int64_t slot = job->IntArg(job->Arg("register") ? "register" : "slot", 0); // D3D11 slots are the registers
          if (slot < 0 || slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
          {
             job->error = "\"slot\" is out of range";
@@ -1828,12 +1905,153 @@ namespace Mcp
       return nullptr;
    }
 
+   // The last entry of "entries" before "end" whose output holds what a read of "resource" wants (a read of mip "srv_mip", any if it has none,
+   // in "srv_format", which picks a depth stencil plane): a draw's render target, unordered access view or depth stencil target, or, unless
+   // "draws_only", a copy, resolve or clear. Sets the view of "target" to read it, and returns its index, or nothing. "refusal" gets why the one
+   // found can't be read (the reasons of "UnreadableWrite()").
+   std::optional<size_t> FindProducer(const std::vector<TraceDrawCallData>& entries, size_t end, const std::string& resource, std::optional<uint32_t> srv_mip, DXGI_FORMAT srv_format, bool draws_only, D3D12Readback::Target* target, std::string* refusal)
+   {
+      using Kind = D3D12Readback::Kind;
+      const bool reads_stencil = srv_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || srv_format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+      const auto reads_mip = [&](const D3D12State::ViewInfo& view)
+      { return !srv_mip || view.first_level == *srv_mip; };
+      std::optional<size_t> producer;
+      for (size_t i = end; i-- > 0 && !producer;)
+      {
+         const TraceDrawCallData& entry = entries[i];
+         if (entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource || entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
+         {
+            if (draws_only)
+               continue;
+            // The planes it wrote (bit 0 depth, bit 1 stencil): a resource copy both and a depth stencil clear the ones it cleared, the
+            // others the plane of their destination subresource (the index is mip + layer * mips + plane * mips * layers)
+            const bool is_clear = entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource;
+            const bool is_resource_copy = !is_clear && entry.copy_info.kind == TraceDrawCallData::CopyKind::Resource;
+            uint32_t planes = 1;
+            if (is_resource_copy)
+            {
+               planes = 3;
+            }
+            else if (is_clear && entry.clear_kind == TraceDrawCallData::ClearKind::DepthStencil)
+            {
+               planes = ((entry.depth_state == TraceDrawCallData::DepthStateType::WriteOnly ? 1 : 0) | (entry.stencil_state == TraceDrawCallData::DepthStateType::WriteOnly ? 2 : 0));
+            }
+            else if (!is_clear)
+            {
+               const uint32_t mips = (entry.rt_type_name[0].find("MS") != std::string::npos ? 1 : (std::max)(entry.rt_size[0].w, 1u));
+               const uint32_t layers = (entry.rt_type_name[0] == "Texture 3D" ? 1 : (std::max)(entry.rt_size[0].z, 1u));
+               planes = 1u << (entry.copy_info.dest_subresource / (mips * layers));
+            }
+            if (entry.rt_hash[0] == resource && (is_resource_copy || reads_mip(entry.rt_view[0])) && (planes & (reads_stencil ? 2u : 1u)) != 0)
+            {
+               if (const char* unreadable = UnreadableWrite(entry))
+               {
+                  *refusal = std::format("Trace entry {} {}", i, unreadable);
+                  return std::nullopt;
+               }
+               producer = i;
+               target->kind = (reads_stencil ? Kind::Stencil : Kind::RenderTarget); // Depth for the depth stencil resources
+               target->slot = 0;
+               target->mip = srv_mip.value_or(0);
+               target->format = srv_format;
+            }
+            continue;
+         }
+         for (uint32_t slot = 0; slot < TraceDrawCallData::rtvs_size && !producer; slot++)
+         {
+            if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource && reads_mip(entry.rt_view[slot]))
+            {
+               producer = i;
+               target->kind = Kind::RenderTarget;
+               target->slot = slot;
+            }
+         }
+         for (uint32_t slot = 0; slot < entry.uav_count && !producer; slot++)
+         {
+            if (entry.ua_hash[slot] == resource && reads_mip(entry.ua_view[slot]))
+            {
+               producer = i;
+               target->kind = Kind::UnorderedAccess;
+               target->slot = slot;
+            }
+         }
+         using DepthStateType = TraceDrawCallData::DepthStateType;
+         const DepthStateType plane_state = (reads_stencil ? entry.stencil_state : entry.depth_state);
+         if (!producer && entry.IsDSVValid() && entry.ds_hash == resource && reads_mip(entry.ds_view) && (plane_state == DepthStateType::TestAndWrite || plane_state == DepthStateType::WriteOnly))
+         {
+            producer = i;
+            target->kind = (reads_stencil ? Kind::Stencil : Kind::Depth);
+            target->slot = 0;
+         }
+      }
+      return producer;
+   }
+
+   // The target of the draw "index" of "entries" (run by "pipeline"): its pipeline, its outputs and arguments, and its place among the draws equal to it.
+   // Returns the hash of the shader that writes the outputs, which names it.
+   uint32_t FillDrawTarget(DeviceData& device_data, const std::vector<TraceDrawCallData>& entries, size_t index, const Shader::CachedPipeline& pipeline, D3D12Readback::Target* target)
+   {
+      const TraceDrawCallData& entry = entries[index];
+      const bool compute = pipeline.HasComputeShader();
+      target->pipelines = {entry.pipeline_handle};
+      const auto signature_of = [&](const TraceDrawCallData& other)
+      { return D3D12Trace::MakeDrawSignature(device_data, other.draw_dispatch_data, compute, other.rt_view[0].resource, other.ds_view.resource); };
+      target->signature = signature_of(entry);
+      target->instance = int32_t(std::count_if(entries.begin(), entries.begin() + index, [&](const TraceDrawCallData& other)
+         { return other.pipeline_handle == entry.pipeline_handle && signature_of(other) == *target->signature; }));
+      const auto output_shader = std::ranges::find_if(pipeline.shader_types, [](reshade::api::pipeline_subobject_type type)
+         { return type == reshade::api::pipeline_subobject_type::pixel_shader || type == reshade::api::pipeline_subobject_type::compute_shader; });
+      return pipeline.shader_hashes[(output_shader != pipeline.shader_types.end()) ? (output_shader - pipeline.shader_types.begin()) : 0];
+   }
+
+   // Shows the draw "index" of the capture "entries" (run by "pipeline") as the D3D12 debug draw, what the overlay's buttons do on D3D11 with the hash
+   // and the instance: sets its shader, instance and signature (the settings "SyncD3D12DebugDraw()" arms the copy from), and the view to show: the
+   // one of "view" (the kind and slot a "FindProducer()" found), or what its pipeline most likely writes (the first render target, or the unordered
+   // access views of a compute shader, or depth for a draw with no render target)
+   void SetD3D12DebugDrawFromTrace(DeviceData& device_data, const std::vector<TraceDrawCallData>& entries, size_t index, const Shader::CachedPipeline& pipeline, const D3D12Readback::Target* view = nullptr)
+   {
+      using Kind = D3D12Readback::Kind;
+      D3D12Readback::Target target;
+      debug_draw_shader_hash = FillDrawTarget(device_data, entries, index, pipeline, &target);
+      const std::string hash_string = Shader::Hash_NumToStr(debug_draw_shader_hash);
+      strcpy_s(debug_draw_shader_hash_string, hash_string.c_str());
+      debug_draw_pipeline_target_instance = target.instance;
+      debug_draw_signature = target.signature;
+      debug_draw_signature_hash = debug_draw_shader_hash;
+      debug_draw_registered_texture.clear();
+      const bool was_depth = debug_draw_mode == DebugDrawMode::Depth || debug_draw_mode == DebugDrawMode::Stencil;
+      debug_draw_mip = 0;
+      if (view)
+      {
+         debug_draw_mode = (view->kind == Kind::UnorderedAccess ? DebugDrawMode::UnorderedAccessView : (view->kind == Kind::Depth ? DebugDrawMode::Depth : DebugDrawMode::RenderTarget));
+         debug_draw_view_index = int(view->slot);
+      }
+      else
+      {
+         debug_draw_mode = pipeline.HasComputeShader() ? DebugDrawMode::UnorderedAccessView : DebugDrawMode::RenderTarget;
+         debug_draw_view_index = 0;
+         // Fall back on depth if the main render target isn't valid
+         if (debug_draw_mode == DebugDrawMode::RenderTarget && !entries[index].IsRTVValid(0) && entries[index].depth_state != TraceDrawCallData::DepthStateType::Disabled)
+         {
+            debug_draw_mode = DebugDrawMode::Depth;
+         }
+      }
+      if (debug_draw_mode == DebugDrawMode::Depth)
+      {
+         debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
+      }
+      else if (was_depth)
+      {
+         debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::RedOnly;
+      }
+   }
+
    // In "D3D12Readback::WriteKind" order, what a copy, resolve or clear target is named in the result ("written_by")
    constexpr const char* written_by_names[] = {"copy", "region copy", "resolve", "render target clear", "depth stencil clear"};
 
    // The D3D12 counterpart of the D3D11 "ResolveTarget()": the command a readback copies the output of, the entry "index" of the last capture or
-   // the "instance"th draw with "hash". A capture entry gives its pipeline (or, for a copy, resolve or clear, what it did), its recording thread
-   // and its instance among that thread's commands equal to it: every D3D12 command list is like a D3D11 deferred context.
+   // the "instance"th draw with "hash". A capture entry gives its pipeline and signature (outputs and arguments, or, for a copy, resolve or
+   // clear, what it did) and its instance among the commands equal to it, on any thread: a job system records a pass on another thread each frame.
    bool ResolveTarget(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, std::optional<size_t> index, D3D12Readback::Target* target)
    {
       const std::shared_lock lock_generic(s_mutex_generic);
@@ -1897,9 +2115,8 @@ namespace Mcp
                return false;
             }
             target->write = write;
-            target->thread = entry.thread_id;
             target->instance = int32_t(std::count_if(entries.begin(), entries.begin() + *index, [&](const TraceDrawCallData& other)
-               { return other.thread_id == entry.thread_id && write_of(other) == write; }));
+               { return write_of(other) == write; }));
             job->shader_hash = 0;
             job->stage = written_by_names[size_t(write.kind)];
             job->written_resource = entry.rt_hash[0];
@@ -1909,17 +2126,12 @@ namespace Mcp
          pipeline = (entry.type == TraceDrawCallData::TraceDrawCallType::Shader) ? FindPipeline(device_data, entry.pipeline_handle) : nullptr;
          if (!pipeline)
          {
-            job->error = std::format("Trace index {} is not a shader pass with a live pipeline", *index);
+            job->error = (entry.type == TraceDrawCallData::TraceDrawCallType::Custom) ? std::format("Trace index {} is a Luma pass (\"{}\"): readbacks only re-issue the game's draws, read its input from the game pass that wrote it", *index, entry.custom_name)
+                                                                                      : std::format("Trace index {} is not a shader pass with a live pipeline", *index);
             return false;
          }
-         target->pipelines = {entry.pipeline_handle};
-         target->thread = entry.thread_id;
-         target->instance = int32_t(std::count_if(entries.begin(), entries.begin() + *index, [&](const TraceDrawCallData& other)
-            { return other.pipeline_handle == entry.pipeline_handle && other.thread_id == entry.thread_id; }));
          // Named after the shader that writes the outputs
-         const auto output_shader = std::ranges::find_if(pipeline->shader_types, [](reshade::api::pipeline_subobject_type type)
-            { return type == reshade::api::pipeline_subobject_type::pixel_shader || type == reshade::api::pipeline_subobject_type::compute_shader; });
-         job->shader_hash = pipeline->shader_hashes[(output_shader != pipeline->shader_types.end()) ? (output_shader - pipeline->shader_types.begin()) : 0];
+         job->shader_hash = FillDrawTarget(device_data, entries, *index, *pipeline, target);
       }
       else if (const auto hash = job->HashArg("hash"))
       {
@@ -1980,7 +2192,7 @@ namespace Mcp
       {
          if (++job->frames < readback_max_frames)
             return ReadbackPoll::Wait;
-         job->error = std::format("The pass was not drawn in {} frames (check \"instance\": a capture entry counts it among its recording thread's commands)", readback_max_frames);
+         job->error = std::format("The pass was not drawn in {} frames (check \"instance\": a capture entry counts it among the draws of its pipeline with the same outputs and arguments, on any thread)", readback_max_frames);
          return ReadbackPoll::Failed;
       }
       if (job->phase == 1)
@@ -2030,20 +2242,55 @@ namespace Mcp
       return ReadbackPoll::Failed;
    }
 
+   // Describes a D3D12 texture readback in "job.result", and queues its file ("stem" names it)
+   void AddD3D12TextureFile(Job* job, std::string_view stem, const D3D12Readback::Copy& copy, std::vector<char> bytes)
+   {
+      const D3D12_RESOURCE_DESC& desc = copy.desc;
+      const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+      const char* dimension = (is_3d ? "3d" : ((desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ? "1d" : "2d"));
+      const uint32_t depth = (is_3d ? (std::max)(uint32_t(desc.DepthOrArraySize) >> copy.mip, 1u) : 1u);
+      const uint32_t slices = (is_3d ? 1u : uint32_t(copy.footprints.size()));
+      AddTextureFile(job, ReadbackPath(*job, stem), {.dimension = dimension, .width = (std::max)(uint32_t(desc.Width >> copy.mip), 1u), .height = (std::max)(desc.Height >> copy.mip, 1u), .depth = depth, .slices = slices, .mip = copy.mip, .mips = desc.MipLevels, .samples = desc.SampleDesc.Count, .format = desc.Format, .view_format = copy.data_format, .row_pitch = copy.footprints[0].Footprint.RowPitch, .rows = copy.rows}, std::move(bytes));
+      if (copy.first_layer != 0)
+      {
+         job->result.Field("first_slice", copy.first_layer);
+      }
+   }
+
    bool RunReadResource(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
    {
-      const auto add_texture_file = [job](std::string_view stem, const D3D12Readback::Copy& copy, std::vector<char> bytes)
+      // Copies mip "mip" of the first layer of "resource" (in "state") at present, on a command list of Luma's own: ReShade only flushes its queue's immediate
+      // command list when its own API recorded into it, native commands there could run any time later. Waits for the queue, then writes the file
+      const auto read_now = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES state, uint32_t mip, std::string_view stem)
       {
-         const D3D12_RESOURCE_DESC& desc = copy.desc;
-         const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-         const char* dimension = (is_3d ? "3d" : ((desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ? "1d" : "2d"));
-         const uint32_t depth = (is_3d ? (std::max)(uint32_t(desc.DepthOrArraySize) >> copy.mip, 1u) : 1u);
-         const uint32_t slices = (is_3d ? 1u : uint32_t(copy.footprints.size()));
-         AddTextureFile(job, ReadbackPath(*job, stem), {.dimension = dimension, .width = (std::max)(uint32_t(desc.Width >> copy.mip), 1u), .height = (std::max)(desc.Height >> copy.mip, 1u), .depth = depth, .slices = slices, .mip = copy.mip, .mips = desc.MipLevels, .samples = desc.SampleDesc.Count, .format = desc.Format, .view_format = copy.data_format, .row_pitch = copy.footprints[0].Footprint.RowPitch, .rows = copy.rows}, std::move(bytes));
-         if (copy.first_layer != 0)
+         auto* native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
+         com_ptr<ID3D12CommandAllocator> allocator;
+         com_ptr<ID3D12GraphicsCommandList> native_list;
+         if (!resource || FAILED(native_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) || FAILED(native_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr, IID_PPV_ARGS(&native_list))))
          {
-            job->result.Field("first_slice", copy.first_layer);
+            job->error = "The texture is missing (the swapchain has no current back buffer), or the command list for the copy couldn't be created";
+            return false;
          }
+         D3D12Readback::Copy copy = {.mip = mip, .data_format = resource->GetDesc().Format};
+         const std::unique_lock lock(device_data.readback.mutex);
+         const bool recorded = D3D12Readback::RecordTextureCopy(&device_data.readback, native_device, native_list.get(), resource, state, std::span(&mip, 1), copy.data_format, &copy, [] {});
+         native_list->Close();
+         if (!recorded)
+         {
+            job->error = "Failed to create the readback resources";
+            return false;
+         }
+         ID3D12CommandList* const lists[] = {native_list.get()};
+         reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())->ExecuteCommandLists(1, lists);
+         queue->wait_idle();
+         std::optional<std::vector<char>> bytes = D3D12Readback::TryRead(copy);
+         if (!bytes)
+         {
+            job->error = "The texture copy didn't run";
+            return false;
+         }
+         AddD3D12TextureFile(job, stem, copy, std::move(*bytes));
+         return true;
       };
 
       const std::string* view = job->Arg("view");
@@ -2058,42 +2305,45 @@ namespace Mcp
                job->error = "Luma's display composition didn't draw at this present: it is off, the output needs none with the current settings and defines, or its shaders are missing (see luma_log)";
                return true;
             }
-            // On a command list of Luma's own: ReShade only flushes its queue's immediate command list when its own API recorded into it,
-            // native commands there could run any time later
-            auto* back_buffer = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
-            auto* native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
-            com_ptr<ID3D12CommandAllocator> allocator;
-            com_ptr<ID3D12GraphicsCommandList> native_list;
-            if (!back_buffer || FAILED(native_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) || FAILED(native_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.get(), nullptr, IID_PPV_ARGS(&native_list))))
-            {
-               job->error = "The swapchain has no current back buffer, or the command list for the copy couldn't be created";
-               return true;
-            }
             // At present the back buffer is in PRESENT (COMMON), after the game's command lists on this queue
-            D3D12Readback::Copy copy = {.data_format = back_buffer->GetDesc().Format};
-            const uint32_t subresource = 0;
-            const std::unique_lock lock(device_data.readback.mutex);
-            const bool recorded = D3D12Readback::RecordTextureCopy(&device_data.readback, native_device, native_list.get(), back_buffer, D3D12_RESOURCE_STATE_PRESENT, std::span(&subresource, 1), copy.data_format, &copy, [] {});
-            native_list->Close();
-            if (!recorded)
-            {
-               job->error = "Failed to create the readback resources";
+            if (!read_now(reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle), D3D12_RESOURCE_STATE_PRESENT, 0, "swapchain"))
                return true;
-            }
-            ID3D12CommandList* const lists[] = {native_list.get()};
-            reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())->ExecuteCommandLists(1, lists);
-            queue->wait_idle();
-            std::optional<std::vector<char>> bytes = D3D12Readback::TryRead(copy);
-            if (!bytes)
-            {
-               job->error = "The back buffer copy didn't run";
-               return true;
-            }
-            add_texture_file("swapchain", copy, std::move(*bytes));
 #if ENABLE_MINHOOK
             job->result.Field("creation", "swapchain");
 #endif
             job->result.Field("view", "swapchain").Field("note", composed ? "Read at present, after Luma's display composition and before ReShade's effects" : "Read at present, before Luma's display composition and ReShade's effects");
+            return true;
+         }
+
+         if (view && view->starts_with("registered:"))
+         {
+            const std::string name = view->substr(11);
+            DevTexture texture;
+            {
+               const std::lock_guard lock(s_mutex_dev_values);
+               const DevValue* dev_value = FindDevValue(name);
+               if (!dev_value || dev_value->kind != DevValueKind::Texture)
+               {
+                  job->error = "Unknown registered texture " + name + " (see luma_dev_values, kind texture)";
+                  return true;
+               }
+               texture = dev_value->texture(device_data);
+            }
+            if (!texture.resource)
+            {
+               job->error = name + " is not allocated (its feature is off, or hasn't run yet)";
+               return true;
+            }
+            const uint32_t mip = uint32_t(job->IntArg("mip", 0));
+            if (mip >= texture.resource->GetDesc().MipLevels)
+            {
+               job->error = std::format("Mip {} is out of range ({} mips)", mip, texture.resource->GetDesc().MipLevels);
+               return true;
+            }
+            if (read_now(texture.resource, texture.state, mip, name))
+            {
+               job->result.Field("view", *view).Field("note", "Read at present: the texture's last content, usually this frame's");
+            }
             return true;
          }
 
@@ -2102,7 +2352,7 @@ namespace Mcp
          const auto kind = kinds.find(view ? *view : "rtv");
          if (kind == kinds.end())
          {
-            job->error = "\"view\" must be one of rtv, srv, uav, depth, stencil, swapchain (D3D12 has no UI texture or registered textures yet)";
+            job->error = "\"view\" must be one of rtv, srv, uav, depth, stencil, swapchain, registered:<name> (D3D12 has no UI texture yet)";
             return true;
          }
          D3D12Readback::Target target = {.kind = kind->second, .slot = uint32_t(job->IntArg("slot", 0, 0, INT32_MAX))};
@@ -2137,72 +2387,12 @@ namespace Mcp
             const uint32_t srv_mip = entries[*index].srv_mip[srv_slot];
             const DXGI_FORMAT srv_format = entries[*index].srv_format[srv_slot];
             const bool reads_stencil = srv_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || srv_format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
-            std::optional<size_t> producer;
-            for (size_t i = *index; i-- > 0 && !producer;)
+            std::string refusal;
+            const std::optional<size_t> producer = FindProducer(entries, *index, resource, srv_mip, srv_format, false, &target, &refusal);
+            if (!refusal.empty())
             {
-               const TraceDrawCallData& entry = entries[i];
-               if (entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource || entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
-               {
-                  // The planes it wrote (bit 0 depth, bit 1 stencil): a resource copy both and a depth stencil clear the ones it cleared, the
-                  // others the plane of their destination subresource (the index is mip + layer * mips + plane * mips * layers)
-                  const bool is_clear = entry.type == TraceDrawCallData::TraceDrawCallType::ClearResource;
-                  const bool is_resource_copy = !is_clear && entry.copy_info.kind == TraceDrawCallData::CopyKind::Resource;
-                  uint32_t planes = 1;
-                  if (is_resource_copy)
-                  {
-                     planes = 3;
-                  }
-                  else if (is_clear && entry.clear_kind == TraceDrawCallData::ClearKind::DepthStencil)
-                  {
-                     planes = ((entry.depth_state == TraceDrawCallData::DepthStateType::WriteOnly ? 1 : 0) | (entry.stencil_state == TraceDrawCallData::DepthStateType::WriteOnly ? 2 : 0));
-                  }
-                  else if (!is_clear)
-                  {
-                     const uint32_t mips = (entry.rt_type_name[0].find("MS") != std::string::npos ? 1 : (std::max)(entry.rt_size[0].w, 1u));
-                     const uint32_t layers = (entry.rt_type_name[0] == "Texture 3D" ? 1 : (std::max)(entry.rt_size[0].z, 1u));
-                     planes = 1u << (entry.copy_info.dest_subresource / (mips * layers));
-                  }
-                  if (entry.rt_hash[0] == resource && (is_resource_copy || entry.rt_view[0].first_level == srv_mip) && (planes & (reads_stencil ? 2u : 1u)) != 0)
-                  {
-                     if (const char* refusal = UnreadableWrite(entry))
-                     {
-                        job->error = std::format("Trace entry {} {}", i, refusal);
-                        return true;
-                     }
-                     producer = i;
-                     target.kind = (reads_stencil ? Kind::Stencil : Kind::RenderTarget); // Depth for the depth stencil resources
-                     target.slot = 0;
-                     target.mip = srv_mip;
-                     target.format = srv_format;
-                  }
-                  continue;
-               }
-               for (uint32_t slot = 0; slot < TraceDrawCallData::rtvs_size && !producer; slot++)
-               {
-                  if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource && entry.rt_view[slot].first_level == srv_mip)
-                  {
-                     producer = i;
-                     target.kind = Kind::RenderTarget;
-                     target.slot = slot;
-                  }
-               }
-               for (uint32_t slot = 0; slot < entry.uav_count && !producer; slot++)
-               {
-                  if (entry.ua_hash[slot] == resource && entry.ua_view[slot].first_level == srv_mip)
-                  {
-                     producer = i;
-                     target.kind = Kind::UnorderedAccess;
-                     target.slot = slot;
-                  }
-               }
-               using DepthStateType = TraceDrawCallData::DepthStateType;
-               const DepthStateType plane_state = (reads_stencil ? entry.stencil_state : entry.depth_state);
-               if (!producer && entry.IsDSVValid() && entry.ds_hash == resource && entry.ds_view.first_level == srv_mip && (plane_state == DepthStateType::TestAndWrite || plane_state == DepthStateType::WriteOnly))
-               {
-                  producer = i;
-                  target.kind = (reads_stencil ? Kind::Stencil : Kind::Depth);
-                  target.slot = 0;
-               }
+               job->error = refusal;
+               return true;
             }
             if (!producer)
             {
@@ -2243,7 +2433,7 @@ namespace Mcp
          // Named after the shader of a draw, or the command and the resource of a copy, resolve or clear
          std::string stem = (job->readback_target->write.resource != 0) ? std::format("{}_{}", job->stage, job->written_resource) : std::format("{:08X}", job->shader_hash);
          std::ranges::replace(stem, ' ', '_');
-         add_texture_file(std::format("{}_{}_{}{}", stem, job->instance, view ? *view : "rtv", job->readback_target->slot), copy, std::move(bytes));
+         AddD3D12TextureFile(job, std::format("{}_{}_{}{}", stem, job->instance, view ? *view : "rtv", job->readback_target->slot), copy, std::move(bytes));
 #if ENABLE_MINHOOK
          // How the game created the texture: a back buffer is the swapchain's (ReShade fires no "init_resource" for those, so the map has none),
          // the hooks of "includes/d3d12_resource_creation.h" tag the rest, unknown for a resource they didn't see
@@ -2267,13 +2457,20 @@ namespace Mcp
    {
       if (job->phase == 0)
       {
-         const int64_t slot = job->IntArg("slot", 0);
-         if (slot < 0 || slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+         // "register" (+ "space") picks the entry by its shader register, "slot" by its packed index in the capture
+         const bool by_register = job->Arg("register") != nullptr;
+         const int64_t slot = job->IntArg(by_register ? "register" : "slot", 0);
+         if (slot < 0 || slot >= (by_register ? INT32_MAX : int64_t(TraceDrawCallData::cbs_size)))
          {
-            job->error = "\"slot\" is out of range";
+            job->error = by_register ? "\"register\" is out of range" : "\"slot\" is out of range";
             return true;
          }
          D3D12Readback::Target target = {.kind = D3D12Readback::Kind::ConstantBuffer, .slot = uint32_t(slot)};
+         if (by_register)
+         {
+            target.cb_register = uint32_t(slot);
+            target.cb_space = uint32_t(job->IntArg("space", 0, 0, INT32_MAX));
+         }
          std::optional<size_t> index;
          if (job->Arg("index"))
          {
@@ -2283,7 +2480,11 @@ namespace Mcp
             return true;
          job->readback_target = std::move(target);
          ArmReadback(job, device_data);
-         job->result.Hash("hash", job->shader_hash).Field("stage", job->stage).Field("instance", job->instance).Field("slot", slot);
+         job->result.Hash("hash", job->shader_hash).Field("stage", job->stage).Field("instance", job->instance);
+         if (!by_register)
+         {
+            job->result.Field("slot", slot);
+         }
          job->phase = 1;
          return false;
       }
@@ -2370,15 +2571,23 @@ namespace Mcp
             w.Field("kind", "texture");
 #if DX11
             const com_ptr<ID3D11Resource> resource = GetTexture(dev_value, device_data);
-            w.Field("allocated", bool(resource));
-            if (resource)
+            const bool allocated = bool(resource);
+#else
+            const DevTexture texture = dev_value.texture(device_data);
+            const bool allocated = texture.resource != nullptr;
+#endif
+            w.Field("allocated", allocated);
+            if (allocated)
             {
                uint4 size = {};
                DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+#if DX11
                GetResourceInfo(resource.get(), size, format);
+#else
+               GetResourceInfo(device_data.reshade_device, {reinterpret_cast<uint64_t>(texture.resource)}, size, format);
+#endif
                w.Format("format", format).Key("size").BeginArray().Value(size.x).Value(size.y).Value(size.z).Value(size.w).EndArray();
             }
-#endif
             break;
          }
          }
@@ -2475,6 +2684,9 @@ namespace Mcp
 
 #if DX11
    bool RunSrCapture(Job* job, ID3D11DeviceContext* native_device_context)
+#else
+   bool RunSrCapture(Job* job, DeviceData& device_data)
+#endif
    {
       if (job->phase == 0)
       {
@@ -2482,6 +2694,12 @@ namespace Mcp
             const std::lock_guard lock(s_mutex_sr_capture);
             sr_capture.reset();
          }
+#if DX12
+         {
+            const std::unique_lock lock(device_data.readback.mutex);
+            D3D12Readback::Retire(&device_data.readback); // The copies of an earlier job
+         }
+#endif
          sr_capture_armed = true;
          job->phase = 1;
          return false;
@@ -2489,7 +2707,11 @@ namespace Mcp
       std::optional<SrCapture> captured;
       {
          const std::lock_guard lock(s_mutex_sr_capture);
+#if DX11
          captured.swap(sr_capture);
+#else
+         captured = sr_capture; // Kept until the copies are read, which takes presents
+#endif
       }
       const uint32_t max_frames = uint32_t(job->IntArg("max_frames", 30, 1, 3600)); // Read even when the first frame has the capture
       if (!captured)
@@ -2501,6 +2723,7 @@ namespace Mcp
          return true;
       }
       auto& w = job->result;
+#if DX11
       w.Field("draw_succeeded", captured->draw_succeeded).Key("textures").BeginArray();
       for (const auto& [name, texture] : captured->textures)
       {
@@ -2513,9 +2736,73 @@ namespace Mcp
          w.EndObject();
       }
       w.EndArray();
+#else
+      if (!captured->device_data)
+      {
+         job->error = "The super resolution draw's device isn't one of Luma's";
+         const std::lock_guard lock(s_mutex_sr_capture);
+         sr_capture.reset();
+         return true;
+      }
+      // The copies run when the game executes the draw's list, which can be some presents later ("D3D12Readback::Advance()" never waits for the queue)
+      using Status = D3D12Readback::Copy::Status;
+      D3D12Readback::State& readback = captured->device_data->readback;
+      const std::unique_lock lock_readback(readback.mutex);
+      if (job->phase == 1)
+      {
+         job->phase = 2;
+         job->frames = 0;
+      }
+      bool pending = false;
+      for (D3D12Readback::Capture& capture : readback.captures)
+      {
+         D3D12Readback::Copy& copy = capture.copy;
+         if (copy.status == Status::Executed && !capture.bytes && copy.error.empty())
+         {
+            std::vector<char> bytes;
+            const D3D12Readback::Completion completion = D3D12Readback::Advance(&copy, &bytes);
+            if (completion == D3D12Readback::Completion::Ran)
+            {
+               capture.bytes = std::move(bytes);
+            }
+            else if (completion == D3D12Readback::Completion::NotRun)
+            {
+               // Stays executed: its buffer is retired below, the GPU may still write it
+               copy.error = "The copy didn't run: the game's predication skipped it, or its command list wasn't submitted";
+            }
+         }
+         else if (copy.status == Status::Discarded)
+         {
+            copy.status = Status::Failed;
+            copy.error = "Its command list was reset without being executed";
+         }
+         pending |= !capture.bytes && copy.error.empty() && (copy.status == Status::Recorded || copy.status == Status::Executed);
+      }
+      if (pending && ++job->frames < readback_max_gpu_frames)
+         return false;
+      w.Field("draw_succeeded", captured->draw_succeeded).Key("textures").BeginArray();
+      for (D3D12Readback::Capture& capture : readback.captures)
+      {
+         w.BeginObject().Field("name", capture.name);
+         if (capture.bytes)
+         {
+            AddD3D12TextureFile(job, std::string("sr_") + capture.name, capture.copy, std::move(*capture.bytes));
+         }
+         else
+         {
+            w.Field("error", capture.copy.error.empty() ? std::format("The GPU didn't get to the copy in {} frames: its queue waits for something the game signals later", readback_max_gpu_frames) : capture.copy.error);
+         }
+         w.EndObject();
+      }
+      w.EndArray();
+      std::erase_if(readback.captures, [](const D3D12Readback::Capture& capture)
+         { return capture.bytes.has_value(); });
+      D3D12Readback::Retire(&readback); // What the GPU may still write
+      const std::lock_guard lock(s_mutex_sr_capture);
+      sr_capture.reset();
+#endif
       return true;
    }
-#endif // DX11
 
    bool RunShaderList(Job* job, DeviceData& device_data)
    {
@@ -2990,10 +3277,7 @@ namespace Mcp
       if (tool == "read_cbuffer")
          return RunReadConstantBuffer(job, device_data, cmd_list_data);
       if (tool == "sr_capture")
-      {
-         job->error = "sr_capture is D3D11 only (no super resolution on D3D12 yet)";
-         return true;
-      }
+         return RunSrCapture(job, device_data);
 #endif
       if (tool == "trace_capture")
          return RunTraceCapture(job, device_data, cmd_list_data);
@@ -3308,6 +3592,92 @@ namespace Mcp
             { return device_data.managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].get(); }},
          {"core.bloom", [](DeviceData&) -> ID3D11DeviceChild*
             { return draw_bloom_mips.srv_mips_y.empty() ? nullptr : draw_bloom_mips.srv_mips_y[0]; }}});
+#else
+      // The same ones, as the pass layer leaves them between its passes (shader resource states, see "DrawSMAA()" and "DrawBloom()"), with "core.bloom"'s mips through "mip"
+      RegisterTextures({
+#if ENABLE_D3D12_PASSES && ENABLE_SMAA
+         {"core.smaa_edges", [](DeviceData& device_data) -> DevTexture
+            {
+               const std::shared_lock lock(device_data.smaa.mutex);
+               return {reinterpret_cast<ID3D12Resource*>(device_data.smaa.edges.handle), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE};
+            }},
+         {"core.smaa_weights", [](DeviceData& device_data) -> DevTexture
+            {
+               const std::shared_lock lock(device_data.smaa.mutex);
+               return {reinterpret_cast<ID3D12Resource*>(device_data.smaa.weights.handle), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE};
+            }},
+#endif
+#if ENABLE_D3D12_PASSES && ENABLE_BLOOM
+         {"core.bloom", [](DeviceData& device_data) -> DevTexture
+            {
+               const std::shared_lock lock(device_data.bloom.mutex);
+               return {reinterpret_cast<ID3D12Resource*>(device_data.bloom.mips_y.handle), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE};
+            }},
+#endif
+#if ENABLE_SR
+         // Where "SR::SuperResolutionImpl::DrawData" has the output while NGX writes it. Nothing transitions it afterwards yet: a D3D12 caller of "Draw()" that does must say so here
+         {"core.sr_output", [](DeviceData& device_data) -> DevTexture
+            { return {device_data.sr_output_color.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS}; }},
+#endif
+         // The copy of the view the overlay's debug draw shows ("D3D12Readback::State::debug_copy"), read like the others at present
+         {"core.debug_draw", [](DeviceData& device_data) -> DevTexture
+            {
+               const std::shared_lock lock(device_data.readback.mutex);
+               const std::optional<D3D12Readback::Copy>& copy = device_data.readback.debug_copy;
+               if (!copy || copy->status != D3D12Readback::Copy::Status::Executed)
+                  return {};
+               return {copy->debug_texture.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+            }},
+      });
+
+      // The overlay's debug draw ("SyncD3D12DebugDraw()"), for the agents that have no overlay: the settings its widgets edit, the entry of the last
+      // capture to show (-1: off, it sets the shader, instance and signature like the overlay's buttons) and the registered texture to show in place of
+      // a draw's view (the 1st, 2nd... of "luma_dev_values"' textures, 0: none)
+      static int debug_draw_capture_index = -1;
+      static int debug_draw_registered_index = 0;
+      RegisterInts({
+         {"core.debug_draw_mode", reinterpret_cast<int*>(&debug_draw_mode), 0, int(DebugDrawMode::Stencil)},
+         {"core.debug_draw_slot", &debug_draw_view_index, 0, 7},
+         {"core.debug_draw_instance", &debug_draw_pipeline_target_instance, -1, 1000},
+         {"core.debug_draw_options", reinterpret_cast<int*>(&debug_draw_options), 0, INT_MAX},
+         {"core.debug_draw_index", &debug_draw_capture_index, -1, INT_MAX, [](DeviceData& device_data, double value) -> std::string
+            {
+               debug_draw_capture_index = int(value);
+               if (value < 0)
+               {
+                  debug_draw_shader_hash = 0;
+                  debug_draw_shader_hash_string[0] = 0;
+                  return {};
+               }
+               CommandListData& cmd_list_data = device_data.trace_command_list_data;
+               const std::shared_lock lock_generic(s_mutex_generic);
+               const std::shared_lock lock_trace(cmd_list_data.mutex_trace);
+               const std::vector<TraceDrawCallData>& entries = cmd_list_data.trace_draw_calls_data;
+               const size_t index = size_t(value);
+               if (trace_running || index >= entries.size())
+                  return std::format("Trace index {} is out of range (captured {}), run luma_trace_capture first", index, entries.size());
+               const Shader::CachedPipeline* pipeline = (entries[index].type == TraceDrawCallData::TraceDrawCallType::Shader) ? FindPipeline(device_data, entries[index].pipeline_handle) : nullptr;
+               if (!pipeline)
+                  return std::format("Trace index {} is not a shader pass with a live pipeline", index);
+               SetD3D12DebugDrawFromTrace(device_data, entries, index, *pipeline);
+               return {};
+            }},
+         {"core.debug_draw_registered", &debug_draw_registered_index, 0, INT_MAX, [](DeviceData&, double value) -> std::string
+            {
+               debug_draw_registered_index = int(value);
+               debug_draw_registered_texture.clear();
+               int remaining = int(value);
+               for (const DevValue& dev_value : dev_values) // The caller holds "s_mutex_dev_values"
+               {
+                  if (dev_value.kind == DevValueKind::Texture && --remaining == 0)
+                  {
+                     debug_draw_registered_texture = dev_value.name;
+                  }
+               }
+               return (value > 0 && debug_draw_registered_texture.empty()) ? std::string("There are not that many registered textures") : std::string();
+            }},
+      });
+      RegisterCounter("core.debug_draw_copied_frame", &debug_draw_copied_frame);
 #endif
 
       // "Init()" runs again when ReShade re-inits the addon without unloading it (The Witcher creates a probe D3D9 device first):
@@ -3375,7 +3745,7 @@ namespace Mcp
          // Disarmed if its draw never came, and its copy kept until the GPU is done with it
          const std::unique_lock lock(device_data.readback.mutex);
          device_data.readback.target.reset();
-         D3D12Readback::armed = false;
+         D3D12Readback::UpdateArmed(device_data.readback);
          D3D12Readback::Retire(&device_data.readback);
       }
 #endif

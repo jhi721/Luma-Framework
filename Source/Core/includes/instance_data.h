@@ -117,9 +117,7 @@ struct TraceDrawCallData
    {
       thread_id = std::this_thread::get_id();
 
-#if DX11
-      std::fill_n(samplers_filter, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, static_cast<D3D11_FILTER>(-1)); // Default to no sampler
-#endif
+      std::fill_n(samplers_filter, samplers_size, static_cast<D3D11_FILTER>(-1)); // Default to no sampler
    }
 
    enum class TraceDrawCallType
@@ -190,26 +188,34 @@ struct TraceDrawCallData
 
    DepthStateType depth_state = DepthStateType::Disabled;
    DepthStateType stencil_state = DepthStateType::Disabled;
-#if DX11
-   // Already includes all the render targets
+   // Already includes all the render targets. The D3D12 capture converts its PSO's blend state to it (the D3D11 and D3D12 enums are numbered alike)
    D3D11_BLEND_DESC1 blend_desc = {};
-#endif
    // The blend factor (D3D11 draws), or the clear values of clear entries (depth and stencil in the first two for depth clears)
    FLOAT blend_factor[4] = {1.f, 1.f, 1.f, 1.f};
 
-   bool cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-   std::string cb_hash[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {}; // Ptr hash (not content hash)
-   // D3D11.1 partial buffer binding offsets (0/0 means data not available or full-buffer bind via legacy API)
-   UINT cb_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-   UINT cb_num_constants[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-
-#if DX11
-   D3D11_FILTER samplers_filter[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_u[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_v[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_w[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   float samplers_mip_lod_bias[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+   // D3D12 packs the constant buffers in binding order (see "cb_register"): a draw can have more of them than D3D11's slots
+#if DX12
+   static constexpr size_t cbs_size = 32;
+#else
+   static constexpr size_t cbs_size = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
 #endif
+   bool cbs[cbs_size] = {};
+   std::string cb_hash[cbs_size] = {}; // Ptr hash (not content hash)
+   // D3D11.1 partial buffer binding offsets (0/0 means data not available or full-buffer bind via legacy API)
+   UINT cb_first_constant[cbs_size] = {};
+   UINT cb_num_constants[cbs_size] = {};
+
+   // D3D12 packs the samplers in binding order (see "sa_register"), with the D3D12 values in the D3D11 enums (they are numbered alike)
+#if DX12
+   static constexpr size_t samplers_size = 32;
+#else
+   static constexpr size_t samplers_size = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+#endif
+   D3D11_FILTER samplers_filter[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_u[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_v[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_w[samplers_size] = {};
+   float samplers_mip_lod_bias[samplers_size] = {};
 
    // Render Target (Resource+Views)
    static constexpr size_t rtvs_size = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; // Max size (we can lower it if needed) // TODO: allocate these as a vector of structs
@@ -274,18 +280,24 @@ struct TraceDrawCallData
    uint32_t srv_count = 0;
    uint32_t uav_count = 0;
    uint32_t cb_count = 0;
+   uint32_t sampler_count = 0;
    ShaderRegister sr_register[srvs_size] = {};
    ShaderRegister ua_register[uavs_size] = {};
-   ShaderRegister cb_register[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-   std::vector<uint32_t> cb_root_constants[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]; // The values of root constants (they have no "cb_hash")
+   ShaderRegister cb_register[cbs_size] = {};
+   ShaderRegister sa_register[samplers_size] = {};
+   // Only the comparison filters use it
+   D3D11_COMPARISON_FUNC samplers_comparison_func[samplers_size] = {};
+   std::vector<uint32_t> cb_root_constants[cbs_size]; // The values of root constants (they have no "cb_hash")
    bool uses_descriptor_heap = false; // A shader indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices usually are in the constants
+   // A bindless range or a type's packed entries went past their limit: the entries above are incomplete
+   bool truncated = false;
    // The table descriptors of the entries above, read when the command list executes: until it's submitted, games can still write
    // them (root signature 1.0 and "DESCRIPTORS_VOLATILE" ranges)
    struct TableDescriptor
    {
       reshade::api::descriptor_table table = {};
       uint32_t binding = 0; // Offset from the table start
-      char type = 0;        // 't', 'u' or 'b'
+      char type = 0;        // 't', 'u', 'b' or 's'
       uint32_t index = 0;   // In the packed SRV, UAV or constant buffer entries
    };
    std::vector<TableDescriptor> table_descriptors;
@@ -296,7 +308,7 @@ struct TraceDrawCallData
    D3D12State::ViewInfo rt_view[rtvs_size] = {};
    D3D12State::ViewInfo ua_view[uavs_size] = {};
    D3D12State::ViewInfo ds_view = {};
-   uint64_t cb_resource[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+   uint64_t cb_resource[cbs_size] = {};
    uint64_t copy_source = 0;
    // The view a clear entry cleared: readbacks re-issue render target and depth stencil clears, not unordered access ones
    enum class ClearKind : uint8_t
@@ -308,18 +320,20 @@ struct TraceDrawCallData
    ClearKind clear_kind = ClearKind::RenderTarget;
 #endif
 
-#if DX11
-   // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults.
+   // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults. The D3D12 capture
+   // converts its PSO's, and tracks the viewports and scissors only with "ENABLE_D3D12_PASSES".
    bool has_depth_stencil_state = false;
    D3D11_DEPTH_STENCIL_DESC depth_stencil_desc = {};
    UINT stencil_ref = 0;
    bool has_rasterizer_state = false;
    D3D11_RASTERIZER_DESC rasterizer_desc = {};
+#if DX12
+   bool scissor_enable = false; // D3D12's rasterizer desc has no scissor flag
+#endif
    UINT viewport_count = 0;
    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
    UINT scissor_count = 0;
    D3D11_RECT scissor_rects[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
-#endif // DX11
 
    // Copy entries (source in "sr_*[0]", destination in "rt_*[0]")
    enum class CopyKind : uint8_t
@@ -948,11 +962,13 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 #endif
    void* cb_per_view_global_buffer_map_data = nullptr;
 #endif // DX11
+#if DEVELOPMENT
+   DXGI_FORMAT debug_draw_texture_format = DXGI_FORMAT_UNKNOWN; // The view format, not the texture format
+   uint4 debug_draw_texture_size = {}; // 3rd and 4th channels are Array/MS/Mips
+#endif
 #if DEVELOPMENT && DX11
    std::shared_ptr<void> debug_draw_frozen_draw_state_stack;
    com_ptr<ID3D11Resource> debug_draw_texture;
-   DXGI_FORMAT debug_draw_texture_format = DXGI_FORMAT_UNKNOWN; // The view format, not the texture format
-   uint4 debug_draw_texture_size = {}; // 3rd and 4th channels are Array/MS/Mips
 
    struct TrackBufferData
    {

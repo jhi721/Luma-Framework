@@ -24,6 +24,10 @@ namespace D3D12State
       reshade::api::pipeline_layout_param_type type = reshade::api::pipeline_layout_param_type::push_descriptors;
       reshade::api::constant_range constants = {};        // Root constants
       std::vector<reshade::api::descriptor_range> ranges; // Descriptor table ranges, or the root descriptor
+#if DEVELOPMENT
+      // The static samplers of a root signature are one parameter of a sampler range each (ReShade's D3D12 hook makes it so), these are their descs by range
+      std::vector<reshade::api::sampler_desc> static_samplers;
+#endif
    };
 
    struct PipelineLayouts
@@ -54,10 +58,17 @@ namespace D3D12State
             break;
          case reshade::api::pipeline_layout_param_type::descriptor_table_with_flags:
          case reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges_and_flags:
-            // The derived range type has another stride (static samplers aren't kept, they take no descriptors)
+            // The derived range type has another stride
             for (uint32_t j = 0; j < param.descriptor_table_with_flags.count; j++)
             {
-               parameter.ranges.push_back(param.descriptor_table_with_flags.ranges[j]);
+               const reshade::api::descriptor_range_with_flags& range = param.descriptor_table_with_flags.ranges[j];
+               parameter.ranges.push_back(range);
+#if DEVELOPMENT
+               if (range.static_samplers)
+               {
+                  parameter.static_samplers.push_back(*range.static_samplers);
+               }
+#endif
             }
             break;
          }
@@ -506,6 +517,9 @@ namespace D3D12State
    {
       std::shared_mutex mutex;
       std::unordered_map<uint64_t, std::vector<Descriptor>> descriptors_by_heap;
+      // The descs of the samplers a game created, by the CPU descriptor it created them in ("init_sampler"): the handle its descriptors and their copies keep.
+      // ponytail: a game that creates another sampler in the same slot changes what its older copies read
+      std::unordered_map<uint64_t, reshade::api::sampler_desc> sampler_descs;
    };
 
    // "get_descriptor_heap_offset()" maps both CPU and GPU descriptor handles. Expects "heaps->mutex" to be locked.

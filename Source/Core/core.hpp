@@ -45,6 +45,16 @@
 #define D3D11_PS_CS_UAV_REGISTER_COUNT D3D12_PS_CS_UAV_REGISTER_COUNT
 #define D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT
 #define D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
+// The render state and sampler types of the frame capture (see "TraceDrawCallData"): D3D12's are laid out and numbered like D3D11's (apart from its rasterizer's missing scissor flag)
+#define D3D11_BLEND_DESC1 D3D12_BLEND_DESC
+#define D3D11_DEPTH_STENCIL_DESC D3D12_DEPTH_STENCIL_DESC
+#define D3D11_DEPTH_STENCILOP_DESC D3D12_DEPTH_STENCILOP_DESC
+#define D3D11_RASTERIZER_DESC D3D12_RASTERIZER_DESC
+#define D3D11_VIEWPORT D3D12_VIEWPORT
+#define D3D11_RECT D3D12_RECT
+#define D3D11_FILTER D3D12_FILTER
+#define D3D11_TEXTURE_ADDRESS_MODE D3D12_TEXTURE_ADDRESS_MODE
+#define D3D11_COMPARISON_FUNC D3D12_COMPARISON_FUNC
 // The native objects the "Game" interface receives
 using NativeDevice = ID3D12Device;
 using NativeCommandList = ID3D12GraphicsCommandList;
@@ -1126,30 +1136,45 @@ namespace
 
    thread_local reshade::api::command_list* thread_local_cmd_list = nullptr; // Hacky global variable (possibly not cleared, stale), only use to quickly tell the command list of the thread
 
-#if DX11
-   // Textures debug drawing
+   // Textures debug drawing. D3D12 copies the texture where its draw hook finds the target ("D3D12Readback::State::debug_target", made from these by "SyncD3D12DebugDraw()")
    namespace
    {
       uint32_t debug_draw_shader_hash = 0;
       char debug_draw_shader_hash_string[HASH_CHARACTERS_LENGTH + 1] = {};
       uint64_t debug_draw_pipeline = 0; // In DX11 shaders and pipelines are the same thing so this is kinda useless (excluding the rare case where multiple pipelines (compiled shader objects) were based on the same shader, and hence had the same hash)
       int32_t debug_draw_pipeline_target_instance = -1;
+#if DX11
       std::thread::id debug_draw_pipeline_target_thread = std::thread::id(); // Filter target instances by thread, which would hopefully reliably match the command lists, over multiple frames
 
       std::atomic<int32_t> debug_draw_pipeline_instance = 0; // Theoretically should be within "CommandListData" but this should work for most cases
+#endif
 
       DebugDrawMode debug_draw_mode = DebugDrawMode::Custom;
+#if DX11
       bool debug_draw_freeze_inputs = false; // Allows freezing the inputs/state of this pass, allowing you to edit the shader and seeing the results live. This is bundled with the textures debug draw feature because generally you don't need to freeze the inputs of any prior pass if not the very same one you are analyzing (or iterating upon). If the game stopped drawing the shader, debugging would also stop.
+#endif
       int32_t debug_draw_view_index = 0;
+#if DX11
       bool debug_draw_disable_blends = false; // Allows disabling HW blends so we can debug the raw pixel shader output
+#endif
       uint32_t debug_draw_options = (uint32_t)DebugDrawTextureOptionsMask::Fullscreen | (uint32_t)DebugDrawTextureOptionsMask::BackgroundPassthrough | (uint32_t)DebugDrawTextureOptionsMask::Tonemap;
       int32_t debug_draw_mip = 0;
+#if DX11
       bool debug_draw_pipeline_instance_filter_by_thread = false; // Not true by default as it seems like quite a few games set up multiple render threads, so this conflicts between frames
+#endif
       bool debug_draw_auto_clear_texture = false;
+#if DX11
       bool debug_draw_replaced_pass = false; // Whether we print the debugging of the original or replaced pass (the resources bindings etc might be different, though this won't forcefully run the original pass if it was skipped by the game's mod custom code, so this isn't fully reliable)
+#endif
       bool debug_draw_auto_gamma = true;
+#if DX12
+      // The outputs and arguments of the draw to show (see "D3D12Readback::DrawSignature"), what tells it apart from the other draws of its pipeline on engines that record passes on any thread. Only valid for the hash it was made with.
+      std::optional<D3D12Readback::DrawSignature> debug_draw_signature;
+      uint32_t debug_draw_signature_hash = 0;
+      std::string debug_draw_registered_texture; // "DevValueKind::Texture" name shown straight from the state it rests in (DebugDrawMode::Custom), instead of a copy of a draw's view
+      uint32_t debug_draw_copied_frame = 0;      // "FrameIndex" of the last copy of a draw's view
+#endif
    }
-#endif // DX11
 
    // Constant Buffers tracking
    namespace
@@ -1221,6 +1246,41 @@ namespace
    {
       return GetShaderDefineData(hash).GetCompiledNumericalValue();
    }
+
+#if DEVELOPMENT
+   // The options the display composition shader gets to draw a texture of "view_format" as the debug draw: the user's ones, with the gamma conversion
+   // guessed from the format if "debug_draw_auto_gamma" (kept in them), and no tonemap for what isn't HDR
+   uint32_t GetDebugDrawShaderOptions(DXGI_FORMAT view_format)
+   {
+      if (debug_draw_auto_gamma)
+      {
+         // TODO: if this is depth and depth is inverted (or not), should we flip the gamma direction? Gamma to linear looks good on direct/linear depth
+         if (!IsLinearFormat(view_format)) // We don't use the texture format as we create a new view with the native format
+         {
+            debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::GammaToLinear;
+         }
+         else
+         {
+            debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::LinearToGamma;
+            debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::GammaToLinear;
+            // If the game rendering or post processing was in gamma space, automatically linearize color textures (just a guess, it's usually right)
+            if (IsRGBAFormat(view_format, false) && GetShaderDefineCompiledNumericalValue(POST_PROCESS_SPACE_TYPE_HASH) == 0)
+            {
+               debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::GammaToLinear;
+            }
+         }
+      }
+
+      uint32_t shader_options = debug_draw_options;
+      const bool debug_draw_saturate = (debug_draw_options & (uint32_t)DebugDrawTextureOptionsMask::Saturate) != 0;
+      // TODO: save two versions of "debug_draw_options", one that matches the user settings and one that is the current automated version of it
+      if (debug_draw_saturate || !IsFloatFormat(view_format))
+      {
+         shader_options &= ~(uint32_t)DebugDrawTextureOptionsMask::Tonemap;
+      }
+      return shader_options;
+   }
+#endif
 
    // TODO: add a setting to compile all the shaders in all game folders at once to quickly test them
    // Ideally only to be called once on boot and cached
@@ -6089,6 +6149,15 @@ namespace
       return false;
    }
 
+   // The desc of a sampler a game created, by the CPU descriptor it created it in (the frame capture reads it back from the descriptors' copies)
+   void OnInitSamplerDescriptor(reshade::api::device* device, const reshade::api::sampler_desc& desc, reshade::api::sampler sampler)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+      D3D12State::DescriptorHeaps& heaps = device->get_private_data<DeviceData>()->descriptor_heaps;
+      const std::unique_lock lock(heaps.mutex);
+      heaps.sampler_descs[sampler.handle] = desc;
+   }
+
 #endif // DX12 && DEVELOPMENT
 
    enum class LumaConstantBufferType
@@ -6439,7 +6508,100 @@ namespace
       return reissued;
    }
 
-   // The dev MCP's readbacks ("includes/d3d12_readback.hpp"): copies the view a job asked for at its target draw. Returns true when it
+   // The counterpart of "RecordReadback()" for the debug draw ("D3D12Readback::State::debug_target"): copies one mip of the layers "view" covers
+   // into the debug draw's texture, which the display composition draws at present. "error" is what the target draw's checks refused, if
+   // anything. A refusal is logged when it changes and shown by the overlay. Returns true when it re-issued the draw to copy its output after it.
+   bool RecordDebugDraw(reshade::api::command_list* cmd_list, std::string error, const D3D12State::ViewInfo& view, D3D12_RESOURCE_STATES draw_state, bool is_depth, DXGI_FORMAT view_format, auto&& reissue)
+   {
+      reshade::api::device* device = cmd_list->get_device();
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      D3D12Readback::State& readback = device_data.readback;
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      auto* resource = reinterpret_cast<ID3D12Resource*>(view.resource);
+      DXGI_FORMAT texture_format = view_format;
+      DXGI_FORMAT srv_format = view_format;
+      uint32_t layers = 1;
+      if (error.empty())
+      {
+         const D3D12_RESOURCE_DESC desc = (resource ? resource->GetDesc() : D3D12_RESOURCE_DESC{});
+         if (!resource)
+         {
+            error = "The view has no resource";
+         }
+         else if (native_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+         {
+            error = "The draw isn't on a direct command list: the display composition draws on the present queue";
+         }
+         else if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+         {
+            error = "Only 2D textures and their arrays are shown";
+         }
+         else if (desc.SampleDesc.Count > 1 && is_depth)
+         {
+            error = "Multisampled depth can't be resolved";
+         }
+         else if (view.first_layer >= desc.DepthOrArraySize || view.first_level >= desc.MipLevels)
+         {
+            error = "The view is out of its resource's range";
+         }
+         else
+         {
+            layers = (std::min)(view.layer_count, uint32_t(desc.DepthOrArraySize) - view.first_layer);
+            if (is_depth)
+            {
+               const D3D12Readback::DepthSampleFormats formats = D3D12Readback::DepthSampleFormatsOf(desc.Format);
+               texture_format = formats.texture;
+               srv_format = formats.srv;
+            }
+            else if (view_format == DXGI_FORMAT_UNKNOWN)
+            {
+               texture_format = srv_format = desc.Format;
+            }
+            if (texture_format == DXGI_FORMAT_UNKNOWN || (!is_depth && IsTypelessFormat(texture_format)))
+            {
+               error = "The view has no typed format to show it in";
+            }
+         }
+      }
+
+      bool reissued = false;
+      const std::unique_lock lock(readback.mutex);
+      if (error.empty())
+      {
+         reissued = D3D12Readback::RecordDebugCopy(&readback, reinterpret_cast<ID3D12Device*>(device->get_native()), native_list, cmd_list, resource, draw_state, view.first_level, view.first_layer, layers, texture_format, srv_format, reissue);
+         if (reissued)
+         {
+            debug_draw_copied_frame = uint32_t(cb_luma_global_settings.FrameIndex);
+            device_data.debug_draw_texture_format = srv_format;
+            device_data.debug_draw_texture_size = {uint32_t((std::max)(resource->GetDesc().Width >> view.first_level, 1ull)), (std::max)(resource->GetDesc().Height >> view.first_level, 1u), layers, 1};
+         }
+         else
+         {
+            error = "Failed to create the debug draw's texture";
+         }
+      }
+      if (!error.empty() && readback.debug_copy)
+      {
+         // What the target draw showed last isn't kept on screen
+         if (readback.debug_copy->status == D3D12Readback::Copy::Status::Recorded)
+         {
+            D3D12Readback::recorded_copies--;
+         }
+         readback.debug_copy->status = D3D12Readback::Copy::Status::Failed;
+      }
+      if (error != readback.debug_error)
+      {
+         if (!error.empty())
+         {
+            reshade::log::message(reshade::log::level::warning, ("[Debug draw] " + error).c_str());
+         }
+         readback.debug_error = error;
+      }
+      return reissued;
+   }
+
+   // The dev MCP's readbacks ("includes/d3d12_readback.hpp"): copies the view a job asked for at its target draw, and the overlay's debug
+   // draw ("D3D12Readback::State::debug_target") the one it shows. Returns true when it
    // re-issued the draw to copy its output after it, then the original call must be skipped. The game's draw callback can have replaced the draw
    // (it is not re-issued, the copy follows what the game drew) or skipped it (the readback is refused).
    bool ReadbackDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command, DrawOrDispatchOverrideType override_type)
@@ -6451,15 +6613,43 @@ namespace
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
       D3D12Readback::State& readback = device_data.readback;
       D3D12Readback::Target target;
+      bool is_debug_draw = false;
       {
          const std::unique_lock lock(readback.mutex);
-         if (!readback.target || std::ranges::find(readback.target->pipelines, cmd_list_data.d3d12_state.pipeline.handle) == readback.target->pipelines.end() || (readback.target->thread != std::thread::id() && readback.target->thread != std::this_thread::get_id()))
+         // Whether this draw is the one "candidate" asks for: its pipeline, thread, outputs and arguments, then its place among the ones that match (negative: all of them)
+         const auto matches = [&](const std::optional<D3D12Readback::Target>& candidate, int32_t* instances)
+         {
+            if (!candidate || std::ranges::find(candidate->pipelines, cmd_list_data.d3d12_state.pipeline.handle) == candidate->pipelines.end() || (candidate->thread != std::thread::id() && candidate->thread != std::this_thread::get_id()))
+            {
+               return false;
+            }
+            // A capture's index target matches by signature, whatever thread the game records the pass on
+            if (candidate->signature)
+            {
+               const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
+               if (D3D12Trace::MakeDrawSignature(device_data, draw_dispatch_data, candidate->signature->compute, state.render_target_views.empty() ? 0 : state.render_target_views[0].resource, state.depth_stencil_view.resource) != *candidate->signature)
+               {
+                  return false;
+               }
+            }
+            return (*instances)++ == candidate->instance || candidate->instance < 0;
+         };
+         // The MCP's readback goes first: a draw it takes isn't copied for the debug draw this frame
+         if (matches(readback.target, &readback.instances))
+         {
+            target = std::move(*readback.target);
+            readback.target.reset();
+            D3D12Readback::UpdateArmed(readback);
+         }
+         else if (matches(readback.debug_target, &readback.debug_instances))
+         {
+            target = *readback.debug_target;
+            is_debug_draw = true;
+         }
+         else
+         {
             return false;
-         if (readback.instances++ != readback.target->instance)
-            return false;
-         target = std::move(*readback.target);
-         readback.target.reset();
-         D3D12Readback::armed = false;
+         }
       }
 
       // The bindings in the frame capture's order, so slots mean what "luma_trace_get" lists
@@ -6582,6 +6772,27 @@ namespace
          }
          case Kind::ConstantBuffer:
          {
+            if (target.cb_register)
+            {
+               const std::span<const TraceDrawCallData::ShaderRegister> registers(entry.cb_register, entry.cb_count);
+               const auto register_it = std::ranges::find_if(registers, [&](const TraceDrawCallData::ShaderRegister& shader_register)
+                  { return shader_register.index == *target.cb_register && shader_register.space == target.cb_space; });
+               if (register_it == registers.end())
+               {
+                  std::string available;
+                  for (const auto& [index, space] : registers)
+                  {
+                     std::format_to(std::back_inserter(available), "{}b{}", available.empty() ? "" : ", ", index);
+                     if (space != 0)
+                     {
+                        std::format_to(std::back_inserter(available), " space{}", space);
+                     }
+                  }
+                  copy.error = std::format("The draw has no constant buffer at register b{} space{}, it has: {}{}", *target.cb_register, target.cb_space, available.empty() ? "none" : available, entry.truncated ? " (more were cut: the trace entry is truncated)" : "");
+                  break;
+               }
+               target.slot = uint32_t(register_it - registers.begin());
+            }
             if (target.slot >= entry.cb_count)
             {
                copy.error = std::format("The draw has no constant buffer at slot {}", target.slot);
@@ -6628,6 +6839,10 @@ namespace
             ReissueDrawOrDispatch(native_list, draw_dispatch_data, command);
          }
       };
+      if (is_debug_draw)
+      {
+         return RecordDebugDraw(cmd_list, copy.error, view, draw_state, target.kind == Kind::Depth, copy.data_format, reissue);
+      }
       return RecordReadback(cmd_list, std::move(copy), view, draw_state, plane, buffer, target.kind == Kind::RenderTarget, reissue);
    }
 
@@ -6657,7 +6872,7 @@ namespace
             return false;
          target = std::move(*readback.target);
          readback.target.reset();
-         D3D12Readback::armed = false;
+         D3D12Readback::UpdateArmed(readback);
       }
 
       using Kind = D3D12Readback::Kind;
@@ -6748,6 +6963,23 @@ namespace
          { reissue(native_list); });
    }
 #endif // DEVELOPMENT
+
+   // A Luma pass of the pass layer (see "D3D12Trace::FillLumaPass()") as a Custom entry of the capture, appended to the entries of "cmd_list_data" (the game's command list it was recorded
+   // on, so the capture joins it in submission order after the command that triggered it), or to the device's capture without one (a pass of Luma's own list, at present). Does nothing
+   // without a trace
+   void TraceLumaPass(CommandListData* cmd_list_data, DeviceData& device_data, const char* name, std::initializer_list<D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute = false)
+   {
+#if DEVELOPMENT
+      const auto lock_trace = LockTraceIfRunning();
+      if (!lock_trace || !trace_running)
+         return;
+      CommandListData& trace_cmd_list_data = (cmd_list_data ? *cmd_list_data : device_data.trace_command_list_data);
+      const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
+      TraceDrawCallData& entry = trace_cmd_list_data.trace_draw_calls_data.emplace_back();
+      entry.command_list = trace_cmd_list_data.cmd_list;
+      D3D12Trace::FillLumaPass(device_data.reshade_device, &entry, name, inputs, outputs, compute);
+#endif
+   }
 
    // The counterpart of the D3D11 function further down. The Luma cbuffers are root CBVs that Luma's hook added to the game's root signatures (see "includes/d3d12_root_signatures.h"),
    // set here at the root parameters of the pipeline the command list bound with a replacement. Their memory comes from the upload ring (see "includes/d3d12_upload_ring.h"): one copy of the
@@ -8678,6 +8910,8 @@ namespace
       cmd_list->bind_pipeline_states(1, &topology_state, &topology);
       cmd_list->draw(4, 1, 0, 0);
 
+      TraceLumaPass(&cmd_list_data, device_data, "Luma RCAS", {{.resource = source.handle, .format = source_format}},
+         {{.resource = target.handle, .format = target_desc.format, .first_level = target_desc.texture.first_level, .first_layer = target_desc.texture.first_layer, .layer_count = (std::max)(target_desc.texture.layers, 1u)}});
       RestoreGameGraphicsD3D12(cmd_list_data);
       return true;
    }
@@ -8878,6 +9112,9 @@ namespace
       draw(blending_weight_pipeline, tables[1], smaa.weights_rtv);
       cmd_list->barrier(smaa.weights, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
 
+      // Before its sharpening ("DrawRCAS()" traces itself)
+      TraceLumaPass(&cmd_list_data, device_data, "Luma SMAA", {{.resource = color.handle, .format = color_format}, {.resource = predication.handle, .format = predication_format}},
+         {{.resource = target.handle, .format = target_desc.format, .first_level = target_desc.texture.first_level, .first_layer = target_desc.texture.first_layer, .layer_count = (std::max)(target_desc.texture.layers, 1u)}});
 #if ENABLE_RCAS
       if (sharpen)
       {
@@ -8986,6 +9223,7 @@ namespace
          cmd_list->barrier(source, source_compute_state, source_state);
       }
 
+      TraceLumaPass(&cmd_list_data, device_data, "Luma Karis Average", {{.resource = source.handle, .format = source_format}}, {{.resource = karis.output.handle, .format = reshade::api::format::r16g16b16a16_float}}, true);
       D3D12State::RestoreCompute(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
       *output = karis.output;
       return true;
@@ -9162,6 +9400,7 @@ namespace
       }
       device->destroy_resource_view(scene_view);
 
+      TraceLumaPass(&cmd_list_data, device_data, "Luma Bloom", {{.resource = scene.handle, .format = scene_format}}, {{.resource = bloom.mips_y.handle, .format = reshade::api::format::r16g16b16a16_float}});
       RestoreGameGraphicsD3D12(cmd_list_data);
       *bloom_output = bloom.mips_y;
       return true;
@@ -9323,6 +9562,7 @@ namespace
          cmd_list->barrier(target, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
       }
 
+      TraceLumaPass(&cmd_list_data, device_data, "Luma Texture Copy", {{.resource = source.handle, .format = reshade::api::format(source_view_format)}}, {{.resource = dest.handle, .format = reshade::api::format(dest_view_format)}});
       RestoreGameGraphicsD3D12(cmd_list_data);
       return true;
    }
@@ -9602,10 +9842,112 @@ namespace
       return false;
    }
 
-   // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its debug draw and UI composition aren't ported yet): copies the back buffer, then draws
+   // What the D3D12 display composition draws as the debug draw (see "FindD3D12DebugDrawSource()"): a texture of one 2D view, sampled in "srv_format"
+   struct D3D12DebugDrawSource
+   {
+      com_ptr<ID3D12Resource> texture;
+      D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; // Where it rests between its writers and readers
+      DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
+   };
+
+#if DEVELOPMENT
+   // Arms the debug draw's target from the overlay's settings (the globals the D3D11 draw hook reads on each draw), at each present: the draws
+   // of the hash's pipelines are copied from now on, the one that is the "debug_draw_pipeline_target_instance"th (all if negative), of the signature
+   // the overlay stored for this hash if any. Also starts the count of the instances over, as on D3D11 ("debug_draw_pipeline_instance").
+   void SyncD3D12DebugDraw(DeviceData& device_data)
+   {
+      using Kind = D3D12Readback::Kind;
+      D3D12Readback::State& readback = device_data.readback;
+      std::optional<D3D12Readback::Target> wanted;
+      std::string error;
+      if (debug_draw_shader_hash != 0 && debug_draw_registered_texture.empty())
+      {
+         std::optional<Kind> kind;
+         switch (debug_draw_mode)
+         {
+         case DebugDrawMode::RenderTarget:
+            kind = Kind::RenderTarget;
+            break;
+         case DebugDrawMode::UnorderedAccessView:
+            kind = Kind::UnorderedAccess;
+            break;
+         case DebugDrawMode::Depth:
+            kind = Kind::Depth;
+            break;
+         default:
+            error = "D3D12 shows the render target, unordered access view and depth of a draw: pick one of those modes (a shader resource's state isn't known, show the draw that wrote it)";
+            break;
+         }
+         const std::shared_lock lock_generic(s_mutex_generic);
+         const auto it = device_data.pipeline_caches_by_shader_hash.find(debug_draw_shader_hash);
+         if (kind && (it == device_data.pipeline_caches_by_shader_hash.end() || it->second.empty()))
+         {
+            error = "The shader has no live pipeline";
+         }
+         else if (kind)
+         {
+            wanted = {.signature = (debug_draw_signature_hash == debug_draw_shader_hash ? debug_draw_signature : std::nullopt), .instance = debug_draw_pipeline_target_instance, .kind = *kind, .slot = (*kind == Kind::Depth ? 0 : uint32_t(debug_draw_view_index))};
+            for (const Shader::CachedPipeline* pipeline : it->second)
+            {
+               wanted->pipelines.push_back(pipeline->pipeline.handle);
+            }
+         }
+      }
+      const std::unique_lock lock(readback.mutex);
+      readback.debug_instances = 0;
+      const auto& current = readback.debug_target;
+      const bool same = (current.has_value() == wanted.has_value()) && (!wanted || (current->pipelines == wanted->pipelines && current->instance == wanted->instance && current->kind == wanted->kind && current->slot == wanted->slot && current->signature == wanted->signature));
+      if (!same)
+      {
+         readback.debug_target = std::move(wanted);
+         D3D12Readback::UpdateArmed(readback);
+      }
+      // The draw hook's refusals are in "debug_error" too (cleared by its next copy), this one is the settings'
+      if (!error.empty())
+      {
+         if (error != readback.debug_error)
+         {
+            reshade::log::message(reshade::log::level::warning, ("[Debug draw] " + error).c_str());
+            readback.debug_error = error;
+         }
+      }
+      else if (!readback.debug_target)
+      {
+         readback.debug_error.clear();
+      }
+   }
+
+   // The texture the display composition draws as the debug draw: a registered Luma texture ("debug_draw_registered_texture") in the state it rests in, or the
+   // copy of the target draw's view once its command list went to the queue. Null if there is none.
+   D3D12DebugDrawSource FindD3D12DebugDrawSource(DeviceData& device_data)
+   {
+      if (!debug_draw_registered_texture.empty())
+      {
+         Mcp::DevTexture registered;
+         {
+            const std::lock_guard lock(Mcp::s_mutex_dev_values);
+            const Mcp::DevValue* dev_value = Mcp::FindDevValue(debug_draw_registered_texture);
+            if (dev_value && dev_value->kind == Mcp::DevValueKind::Texture)
+            {
+               registered = dev_value->texture(device_data);
+            }
+         }
+         return {.texture = registered.resource, .state = registered.state, .srv_format = (registered.resource ? registered.resource->GetDesc().Format : DXGI_FORMAT_UNKNOWN)};
+      }
+      const std::shared_lock lock(device_data.readback.mutex);
+      const std::optional<D3D12Readback::Copy>& copy = device_data.readback.debug_copy;
+      if (device_data.readback.debug_target && copy && copy->status == D3D12Readback::Copy::Status::Executed)
+      {
+         return {.texture = copy->debug_texture, .srv_format = copy->data_format};
+      }
+      return {};
+   }
+#endif // DEVELOPMENT
+
+   // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its UI composition isn't ported yet): copies the back buffer, then draws
    // the "Display Composition" shader over it (see "PrepareD3D12NativePass()"). What it needs is the device's ("DeviceData::display_composition"), made when it first draws.
    // Each reason it doesn't draw is logged once.
-   void DrawDisplayCompositionD3D12(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, DeviceData& device_data, uint32_t custom_data_1, float custom_data_4)
+   void DrawDisplayCompositionD3D12(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, DeviceData& device_data, uint32_t custom_data_1, float custom_data_4, const D3D12DebugDrawSource& debug_source)
    {
       auto* const native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
       auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
@@ -9682,6 +10024,54 @@ namespace
          native_device->CreateShaderResourceView(nullptr, &null_srv, srv);
       }
 
+      // The debug draw's texture takes the slot of its dimension (t2 or t4, see the shader), with the options and mip the settings ask for
+      uint32_t debug_options = 0;
+      float debug_mip = 0.f;
+      const bool shows_debug_texture = debug_source.texture && debug_source.srv_format != DXGI_FORMAT_UNKNOWN && !IsTypelessFormat(debug_source.srv_format);
+#if DEVELOPMENT
+      if (shows_debug_texture)
+      {
+         const D3D12_RESOURCE_DESC debug_desc = debug_source.texture->GetDesc();
+         const bool is_array = debug_desc.DepthOrArraySize > 1;
+         if (debug_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && debug_desc.SampleDesc.Count == 1)
+         {
+            D3D12_SHADER_RESOURCE_VIEW_DESC debug_srv = {.Format = debug_source.srv_format, .ViewDimension = (is_array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D), .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            if (is_array)
+            {
+               debug_srv.Texture2DArray = {.MostDetailedMip = 0, .MipLevels = debug_desc.MipLevels, .FirstArraySlice = 0, .ArraySize = debug_desc.DepthOrArraySize};
+            }
+            else
+            {
+               debug_srv.Texture2D = {.MostDetailedMip = 0, .MipLevels = debug_desc.MipLevels};
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE debug_handle = recording->srv_cpu;
+            debug_handle.ptr += SIZE_T(recording->srv_increment) * (is_array ? 4 : 2);
+            native_device->CreateShaderResourceView(debug_source.texture.get(), &debug_srv, debug_handle);
+            debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::Texture2D;
+            debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::Texture3D;
+            debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::TextureMultiSample;
+            if (is_array)
+            {
+               debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::TextureArray;
+            }
+            else
+            {
+               debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::TextureArray;
+            }
+            debug_options = GetDebugDrawShaderOptions(debug_source.srv_format);
+            debug_mip = float(debug_draw_mip);
+            device_data.debug_draw_texture_format = debug_source.srv_format;
+            device_data.debug_draw_texture_size = {uint32_t(debug_desc.Width), debug_desc.Height, debug_desc.DepthOrArraySize, debug_desc.MipLevels};
+         }
+      }
+#endif
+      // A registered texture that doesn't rest where a pixel shader can read it
+      ID3D12Resource* const debug_transition_resource = ((shows_debug_texture && (debug_source.state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) == 0) ? debug_source.texture.get() : nullptr);
+      if (shows_debug_texture)
+      {
+         retire(debug_source.texture.get());
+      }
+
       // The back buffer is in PRESENT at present, after the game's command lists on this queue
       ID3D12GraphicsCommandList* const list = recording->list;
       D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -9689,10 +10079,14 @@ namespace
       list->CopyResource(composition.source.get(), back_buffer);
       D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
       D3D12Passes::Transition(list, composition.source.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      if (debug_transition_resource)
+      {
+         D3D12Passes::Transition(list, debug_transition_resource, debug_source.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      }
       list->SetGraphicsRootSignature(composition.root_signature.get());
       list->SetPipelineState(composition.pipeline.get());
       SetLumaConstantBuffers(list, composition.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-      SetLumaConstantBuffers(list, composition.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, custom_data_1, 0, 0.f, custom_data_4);
+      SetLumaConstantBuffers(list, composition.cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, custom_data_1, debug_options, debug_mip, custom_data_4);
       list->SetGraphicsRootDescriptorTable(2, recording->srv_gpu);
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
       const D3D12_VIEWPORT viewport = {0.f, 0.f, float(back_buffer_desc.Width), float(back_buffer_desc.Height), 0.f, 1.f};
@@ -9701,11 +10095,17 @@ namespace
       list->RSSetScissorRects(1, &scissor);
       list->OMSetRenderTargets(1, &recording->rtv_cpu, FALSE, nullptr);
       list->DrawInstanced(4, 1, 0, 0);
+      if (debug_transition_resource)
+      {
+         D3D12Passes::Transition(list, debug_transition_resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, debug_source.state);
+      }
       D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 
       if (SubmitD3D12NativePass(&composition, native_queue, device_data, "Display composition"))
       {
          composition.drawn_frame = cb_luma_global_settings.FrameIndex;
+         TraceLumaPass(nullptr, device_data, "Luma Display Composition", {{.resource = reinterpret_cast<uint64_t>(composition.source.get()), .format = reshade::api::format(back_buffer_desc.Format)}},
+            {{.resource = reinterpret_cast<uint64_t>(back_buffer), .format = reshade::api::format(back_buffer_desc.Format)}});
       }
    }
 
@@ -9785,6 +10185,7 @@ namespace
       list->DrawInstanced(4, 1, 0, 0);
       D3D12Passes::Transition(list, real_buffer.get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
       D3D12Passes::Transition(list, proxy.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT);
+      // Not a capture entry: it runs after the present event, where the next frame's capture has already started
       SubmitD3D12NativePass(&encode, native_queue, device_data, "Swapchain encode");
    }
 #endif // ENABLE_SWAPCHAIN_PROXY
@@ -9928,9 +10329,12 @@ namespace
 #endif
       bool needs_gamut_mapping = mod_active && GetShaderDefineCompiledNumericalValue(GAMUT_MAPPING_TYPE_HASH) != 0;
 
-      // The debug draw isn't ported to D3D12 yet
 #if DEVELOPMENT && DX11
       bool needs_debug_draw_texture = device_data.debug_draw_texture.get() != nullptr; // Note that this might look wrong if "output_linear" is false
+#elif DEVELOPMENT
+      SyncD3D12DebugDraw(device_data);
+      const D3D12DebugDrawSource debug_draw_source = FindD3D12DebugDrawSource(device_data);
+      const bool needs_debug_draw_texture = debug_draw_source.texture != nullptr;
 #else
       constexpr bool needs_debug_draw_texture = false;
 #endif
@@ -10103,25 +10507,6 @@ namespace
                   debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::Texture2D;
                }
 
-               if (debug_draw_auto_gamma)
-               {
-                  // TODO: if this is depth and depth is inverted (or not), should we flip the gamma direction? Gamma to linear looks good on direct/linear depth
-                  if (!IsLinearFormat(device_data.debug_draw_texture_format)) // We don't use the view format as we create a new view with the native format
-                  {
-                     debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::GammaToLinear;
-                  }
-                  else
-                  {
-                     debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::LinearToGamma;
-                     debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::GammaToLinear;
-                     // If the game rendering or post processing was in gamma space, automatically linearize color textures (just a guess, it's usually right)
-                     if (IsRGBAFormat(device_data.debug_draw_texture_format, false) && GetShaderDefineCompiledNumericalValue(POST_PROCESS_SPACE_TYPE_HASH) == 0)
-                     {
-                        debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::GammaToLinear;
-                     }
-                  }
-               }
-
                com_ptr<ID3D11ShaderResourceView> debug_srv;
                // We recreate this every frame, it doesn't really matter (and this is allowed to fail in case of quirky formats)
                HRESULT hr = native_device->CreateShaderResourceView(device_data.debug_draw_texture.get(), &debug_srv_desc, &debug_srv);
@@ -10137,15 +10522,7 @@ namespace
                ID3D11ShaderResourceView* const debug_srv_const = debug_srv.get();
                native_device_context->PSSetShaderResources(debug_draw_srv_slot, 1, &debug_srv_const); // Use index 1 (0 is already used)
 
-               auto temp_debug_draw_options = debug_draw_options;
-               bool debug_draw_saturate = (debug_draw_options & (uint32_t)DebugDrawTextureOptionsMask::Saturate) != 0;
-               // TODO: save two versions of "debug_draw_options", one that matches the user settings and one that is the current automated version of it
-               if (debug_draw_saturate || !IsFloatFormat(device_data.debug_draw_texture_format))
-               {
-                  temp_debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::Tonemap;
-               }
-               custom_const_buffer_data_2 = temp_debug_draw_options;
-
+               custom_const_buffer_data_2 = GetDebugDrawShaderOptions(device_data.debug_draw_texture_format);
                custom_const_buffer_data_3 = float(debug_draw_mip);
             }
             // Empty the shader resources so the shader can tell there isn't one
@@ -10329,7 +10706,11 @@ namespace
 #endif // DEVELOPMENT
          }
 #else
-         DrawDisplayCompositionD3D12(queue, swapchain, device_data, custom_const_buffer_data_1, custom_const_buffer_data_4);
+#if DEVELOPMENT
+         DrawDisplayCompositionD3D12(queue, swapchain, device_data, custom_const_buffer_data_1, custom_const_buffer_data_4, debug_draw_source);
+#else
+         DrawDisplayCompositionD3D12(queue, swapchain, device_data, custom_const_buffer_data_1, custom_const_buffer_data_4, {});
+#endif
 #endif // DX11
       }
 #if DX11
@@ -10367,6 +10748,17 @@ namespace
 
 #if DEVELOPMENT && DX12
       // The jobs that read the composed back buffer run here, the others ran before the composition
+      {
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && trace_running)
+         {
+            CommandListData& trace_cmd_list_data = device_data.trace_command_list_data;
+            const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
+            TraceDrawCallData& entry = trace_cmd_list_data.trace_draw_calls_data.emplace_back();
+            entry.command_list = trace_cmd_list_data.cmd_list;
+            entry.type = TraceDrawCallData::TraceDrawCallType::Present;
+         }
+      }
       Mcp::OnPresent(device_data, device_data.trace_command_list_data, queue, swapchain, true);
 #endif
 
@@ -16297,7 +16689,7 @@ namespace
                               if (found_highlighted_resource_write) break;
                               found_highlighted_resource_write |= draw_call_data.rt_hash[i] == highlighted_resource;
                            }
-                           for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+                           for (UINT i = 0; i < TraceDrawCallData::cbs_size; i++)
                            {
                               if (found_highlighted_resource_read) break;
                               found_highlighted_resource_read |= draw_call_data.cb_hash[i] == highlighted_resource;
@@ -16639,7 +17031,7 @@ namespace
                            name << "Present";
                            text_color = IM_COL32(50, 80, 190, 255); // Some Blue
 
-#if DX11 // D3D12 captures have no present entries yet
+#if DX11
                            // Highlight the resource on the swapchain too, given that "Present" traces aren't tracked the same way
                            if (!highlighted_resource.empty() && !device_data.swapchains.empty())
                            {
@@ -16652,6 +17044,16 @@ namespace
 
                               std::string backbuffer_hash = std::to_string(std::hash<void*>{}(back_buffer.get()));
                               if (highlighted_resource == backbuffer_hash)
+                              {
+                                 found_highlighted_resource_read = true;
+                              }
+                           }
+#else
+                           if (!highlighted_resource.empty() && !device_data.swapchains.empty())
+                           {
+                              // Not fully safe, but it should do for almost all cases
+                              const reshade::api::resource back_buffer = (*device_data.swapchains.begin())->get_current_back_buffer();
+                              if (highlighted_resource == std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(back_buffer.handle))))
                               {
                                  found_highlighted_resource_read = true;
                               }
@@ -16748,6 +17150,16 @@ namespace
                                  debug_draw_mip = 0;
                               }
                               debug_draw_freeze_inputs = false; // Optional, but also unfreeze inputs automatically every time we swap the target pass here
+                           }
+                        }
+#else
+                        if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
+                        {
+                           ImGui::SameLine();
+                           ImGui::SetNextItemAllowOverlap(); // Allow the button to be clickable if rects overlap
+                           if (ImGui::SmallButton(ICON_FK_SEARCH))
+                           {
+                              Mcp::SetD3D12DebugDrawFromTrace(device_data, cmd_list_data.trace_draw_calls_data, size_t(index), *pipeline_pair->second);
                            }
                         }
 #endif // DX11
@@ -17163,6 +17575,26 @@ namespace
                                     else
                                     {
                                        device_data.track_buffer_data.Clear();
+                                    }
+                                 }
+#else
+                                 if (pipeline_pair->second->HasPixelShader() || pipeline_pair->second->HasComputeShader())
+                                 {
+                                    // Whether this instance is the draw being shown: its shader, signature and place among its equals
+                                    D3D12Readback::Target selected_target;
+                                    const uint32_t selected_hash = Mcp::FillDrawTarget(device_data, cmd_list_data.trace_draw_calls_data, size_t(selected_index), *pipeline_pair->second, &selected_target);
+                                    const bool debug_draw_shader_enabled = debug_draw_registered_texture.empty() && debug_draw_shader_hash == selected_hash && debug_draw_signature_hash == selected_hash && debug_draw_signature == selected_target.signature && debug_draw_pipeline_target_instance == selected_target.instance;
+                                    if (debug_draw_shader_enabled ? ImGui::Button("Disable Debug Draw Shader Instance") : ImGui::Button("Debug Draw Shader Instance"))
+                                    {
+                                       if (debug_draw_shader_enabled)
+                                       {
+                                          debug_draw_shader_hash = 0;
+                                          debug_draw_shader_hash_string[0] = 0;
+                                       }
+                                       else
+                                       {
+                                          Mcp::SetD3D12DebugDrawFromTrace(device_data, cmd_list_data.trace_draw_calls_data, size_t(selected_index), *pipeline_pair->second);
+                                       }
                                     }
                                  }
 #endif // DX11
@@ -18096,7 +18528,7 @@ namespace
                                        }
 #endif // DX11
 
-                                       for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+                                       for (UINT i = 0; i < TraceDrawCallData::cbs_size; i++)
                                        {
                                           if (draw_call_data.cbs[i])
                                           {
@@ -19066,6 +19498,241 @@ namespace
 
             ImGui::EndTabItem(); // Upgraded Textures
          }
+#else
+         // D3D12: the textures Luma upgraded (clones, in place upgrades, back buffers) and its own, with how they were made. A game texture's state isn't known
+         // outside of its writers, so it is shown through the last draw of the last frame capture that wrote it ("D3D12Readback::State::debug_target"); the textures
+         // of Luma's own are shown from the state they rest in.
+         if (ImGui::BeginTabItem("Upgraded Textures"))
+         {
+            struct GameTexture
+            {
+               uint64_t handle = 0;
+               bool swapchain = false;
+               uint4 size = {};
+               DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+               std::string type_name;
+               std::string hash;
+               std::string debug_name;
+            };
+            static uint64_t selected_texture = 0;
+            static std::string selected_luma_texture;
+            static std::string debug_draw_texture_status; // Why the last "Debug Draw Texture" showed nothing
+
+            // Read under the lock that keeps them from being destroyed meanwhile
+            std::vector<GameTexture> game_textures;
+            {
+               const std::shared_lock lock(device_data.mutex);
+               const auto add = [&](uint64_t handle, bool swapchain)
+               {
+                  GameTexture& texture = game_textures.emplace_back();
+                  texture.handle = handle;
+                  texture.swapchain = swapchain;
+                  GetResourceInfo(device_data.reshade_device, reshade::api::resource{handle}, texture.size, texture.format, &texture.type_name, &texture.hash, &texture.debug_name);
+               };
+               for (const uint64_t handle : device_data.resource_upgrades.upgraded_resources)
+               {
+                  add(handle, false);
+               }
+               for (const uint64_t handle : device_data.back_buffers)
+               {
+                  add(handle, true);
+               }
+            }
+            const auto selected_game_texture = std::ranges::find(game_textures, selected_texture, &GameTexture::handle);
+
+            if (ImGui::BeginChild("TexturesList", ImVec2(500, -FLT_MIN), ImGuiChildFlags_ResizeX))
+            {
+               if (ImGui::BeginListBox("##TexturesListBox", ImVec2(-FLT_MIN, -FLT_MIN)))
+               {
+                  for (const GameTexture& texture : game_textures)
+                  {
+                     ImU32 text_color = (texture.swapchain ? IM_COL32(0, 0, 255, 255) : IM_COL32(0, 255, 0, 255)); // Blue, Green
+                     if (highlighted_resource == texture.hash)
+                     {
+                        text_color = IM_COL32(255, 0, 0, 255); // Red
+                     }
+                     ImGui::PushStyleColor(ImGuiCol_Text, text_color);
+                     ImGui::PushID(int(texture.handle));
+                     if (ImGui::Selectable(texture.debug_name.empty() ? texture.hash.c_str() : texture.debug_name.c_str(), selected_luma_texture.empty() && selected_texture == texture.handle))
+                     {
+                        selected_texture = texture.handle;
+                        selected_luma_texture.clear();
+                     }
+                     ImGui::PopID();
+                     ImGui::PopStyleColor();
+                  }
+                  ImGui::SeparatorText("Luma textures");
+                  {
+                     const std::lock_guard lock(Mcp::s_mutex_dev_values);
+                     for (const Mcp::DevValue& dev_value : Mcp::dev_values)
+                     {
+                        if (dev_value.kind == Mcp::DevValueKind::Texture && ImGui::Selectable(dev_value.name.c_str(), selected_luma_texture == dev_value.name))
+                        {
+                           selected_luma_texture = dev_value.name;
+                        }
+                     }
+                  }
+                  ImGui::EndListBox();
+               }
+            }
+            ImGui::EndChild(); // TexturesList
+
+            ImGui::SameLine();
+            if (ImGui::BeginChild("##TexturesDetails", ImVec2(0, 0)))
+            {
+               if (!selected_luma_texture.empty())
+               {
+                  Mcp::DevTexture luma_texture;
+                  {
+                     const std::lock_guard lock(Mcp::s_mutex_dev_values);
+                     const Mcp::DevValue* dev_value = Mcp::FindDevValue(selected_luma_texture);
+                     if (dev_value && dev_value->kind == Mcp::DevValueKind::Texture)
+                     {
+                        luma_texture = dev_value->texture(device_data);
+                     }
+                  }
+                  ImGui::Text("Name: %s", selected_luma_texture.c_str());
+                  if (luma_texture.resource)
+                  {
+                     const D3D12_RESOURCE_DESC desc = luma_texture.resource->GetDesc();
+                     ImGui::Text("Format: %s", GetFormatNameSafe(desc.Format));
+                     ImGui::Text("Size: %ux%ux%ux%u", uint32_t(desc.Width), desc.Height, desc.DepthOrArraySize, desc.MipLevels);
+                  }
+                  else
+                  {
+                     ImGui::Text("Not allocated (its feature is off, or hasn't run yet)");
+                  }
+                  const bool shown = debug_draw_registered_texture == selected_luma_texture;
+                  if (shown ? ImGui::Button("Disable Debug Draw Texture") : ImGui::Button("Debug Draw Texture"))
+                  {
+                     debug_draw_registered_texture = (shown ? "" : selected_luma_texture);
+                     if (!shown)
+                     {
+                        // Reset all the settings we don't need anymore, as they were for a different debug draw mode
+                        debug_draw_shader_hash = 0;
+                        debug_draw_shader_hash_string[0] = 0;
+                        debug_draw_pipeline = 0;
+                        if (debug_draw_mode == DebugDrawMode::Depth || debug_draw_mode == DebugDrawMode::Stencil)
+                        {
+                           debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::RedOnly;
+                        }
+                        debug_draw_mode = DebugDrawMode::Custom;
+                        debug_draw_view_index = 0;
+                        debug_draw_mip = 0;
+                        device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
+                        device_data.debug_draw_texture_size = {};
+                     }
+                  }
+               }
+               else if (selected_game_texture != game_textures.end())
+               {
+                  const GameTexture& texture = *selected_game_texture;
+                  ImGui::Text("Hash: %s", texture.hash.c_str());
+                  if (!texture.debug_name.empty())
+                  {
+                     ImGui::Text("Debug Name: %s", texture.debug_name.c_str());
+                  }
+                  ImGui::Text("Type: %s", texture.type_name.c_str());
+                  ImGui::Text("Format: %s", GetFormatNameSafe(texture.format));
+                  ImGui::Text("Size: %ux%ux%ux%u", texture.size.x, texture.size.y, texture.size.z, texture.size.w);
+                  if (texture.swapchain)
+                  {
+                     ImGui::Text("Swapchain back buffer: it is what the final image is drawn to");
+                  }
+#if ENABLE_MINHOOK
+                  else
+                  {
+                     bool is_clone = false;
+                     {
+                        const std::shared_lock lock_clones(D3D12Clones::registry.mutex);
+                        for (const auto& [original, clone] : D3D12Clones::registry.by_original)
+                        {
+                           if (reinterpret_cast<uint64_t>(clone.resource.get()) != texture.handle)
+                              continue;
+                           is_clone = true;
+                           ImGui::Text("Original Hash: %s", std::to_string(std::hash<void*>{}(original)).c_str());
+                           ImGui::Text("Upgrade Type: Clone%s%s", clone.active ? "" : " (inactive: waits for a listed writer shader)", (clone.scale_x != 1.f || clone.scale_y != 1.f) ? " (Scaled)" : "");
+                           if (clone.scale_x != 1.f || clone.scale_y != 1.f)
+                           {
+                              ImGui::Text("Clone Scale: %.3fx%.3f", clone.scale_x, clone.scale_y);
+                           }
+                           break;
+                        }
+                     }
+                     {
+                        const std::shared_lock lock(device_data.mutex);
+                        if (!is_clone)
+                        {
+                           ImGui::Text("Upgrade Type: In place");
+                        }
+                        if (const auto original_format = device_data.resource_upgrades.original_upgraded_resources_formats.find(texture.handle); original_format != device_data.resource_upgrades.original_upgraded_resources_formats.end())
+                        {
+                           ImGui::Text("Original Format: %s", GetFormatNameSafe(DXGI_FORMAT(original_format->second)));
+                        }
+                     }
+                     const std::shared_lock lock_kinds(device_data.texture_kinds.mutex);
+                     if (const auto kind = device_data.texture_kinds.by_resource.find(texture.handle); kind != device_data.texture_kinds.by_resource.end())
+                     {
+                        ImGui::Text("Created As: %s", D3D12ResourceCreation::KIND_NAMES[size_t(kind->second)]);
+                     }
+                  }
+#endif // ENABLE_MINHOOK
+
+                  // Works on direct and indirect upgrades!
+                  const bool is_highlighted_resource = highlighted_resource == texture.hash;
+                  if (is_highlighted_resource ? ImGui::Button("Unhighlight Resource") : ImGui::Button("Highlight Resource"))
+                  {
+                     highlighted_resource = is_highlighted_resource ? "" : texture.hash;
+                  }
+
+                  // The back buffer is what the final image is drawn to
+                  if (!texture.swapchain)
+                  {
+                     const bool shown = debug_draw_registered_texture.empty() && debug_draw_shader_hash != 0 && debug_draw_texture_status.empty();
+                     if (ImGui::Button("Debug Draw Texture"))
+                     {
+                        debug_draw_texture_status.clear();
+                        const std::shared_lock lock_generic(s_mutex_generic);
+                        CommandListData& capture_data = device_data.trace_command_list_data;
+                        const std::shared_lock lock_trace(capture_data.mutex_trace);
+                        const std::vector<TraceDrawCallData>& entries = capture_data.trace_draw_calls_data;
+                        D3D12Readback::Target view;
+                        std::string refusal;
+                        const std::optional<size_t> producer = (trace_running ? std::nullopt : Mcp::FindProducer(entries, entries.size(), texture.hash, std::nullopt, DXGI_FORMAT_UNKNOWN, true, &view, &refusal));
+                        const Shader::CachedPipeline* pipeline = (producer ? Mcp::FindPipeline(device_data, entries[*producer].pipeline_handle) : nullptr);
+                        if (pipeline)
+                        {
+                           Mcp::SetD3D12DebugDrawFromTrace(device_data, entries, *producer, *pipeline, &view);
+                        }
+                        else
+                        {
+                           debug_draw_texture_status = "No draw of the last frame capture wrote it (capture a frame first): its state isn't known anywhere else";
+                        }
+                     }
+                     if (ImGui::IsItemHovered())
+                     {
+                        ImGui::SetTooltip("Shows the render target, unordered access view or depth of the last draw of the last frame capture that wrote this texture.");
+                     }
+                     if (shown)
+                     {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Disable Debug Draw"))
+                        {
+                           debug_draw_shader_hash = 0;
+                           debug_draw_shader_hash_string[0] = 0;
+                        }
+                     }
+                     if (!debug_draw_texture_status.empty())
+                     {
+                        ImGui::TextColored(ImVec4(1.f, 0.3f, 0.3f, 1.f), "%s", debug_draw_texture_status.c_str());
+                     }
+                  }
+               }
+            }
+            ImGui::EndChild(); // TexturesDetails
+
+            ImGui::EndTabItem(); // Upgraded Textures
+         }
 #endif // DX11
 #endif // !GRAPHICS_ANALYZER
 #endif // DEVELOPMENT
@@ -19914,7 +20581,6 @@ namespace
                   defines_need_recompilation = true;
                }
 
-#if DX11 // Debug draw
                ImGui::NewLine();
                ImGuiInputTextFlags text_flags = ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_AlwaysOverwrite | ImGuiInputTextFlags_NoUndoRedo;
                if (ImGui::InputTextWithHint("Debug Draw Shader Hash", "12345678", debug_draw_shader_hash_string, HASH_CHARACTERS_LENGTH + 1, text_flags))
@@ -19937,14 +20603,20 @@ namespace
                      debug_draw_pipeline = 0;
                   }
 
+#if DX11
                   device_data.debug_draw_frozen_draw_state_stack.reset();
                   device_data.debug_draw_texture = nullptr;
+#endif
                   device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
                   device_data.debug_draw_texture_size = {};
                }
                ImGui::SameLine();
                // Allow it to go through if we have a custom debug draw texture set
+#if DX11
                bool debug_draw_enabled = debug_draw_shader_hash != 0 || debug_draw_pipeline != 0 || (debug_draw_mode == DebugDrawMode::Custom && device_data.debug_draw_texture.get()); // It wants to be shown (if it manages!)
+#else
+               bool debug_draw_enabled = debug_draw_shader_hash != 0 || debug_draw_pipeline != 0 || !debug_draw_registered_texture.empty();
+#endif
                // Show the reset button for both conditions or they could get stuck
                if (debug_draw_enabled)
                {
@@ -19955,8 +20627,12 @@ namespace
                      debug_draw_shader_hash = 0;
                      debug_draw_pipeline = 0;
 
+#if DX11
                      device_data.debug_draw_frozen_draw_state_stack.reset();
                      device_data.debug_draw_texture = nullptr;
+#else
+                     debug_draw_registered_texture.clear();
+#endif
                      device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
                      device_data.debug_draw_texture_size = {};
                   }
@@ -19990,11 +20666,13 @@ namespace
                            debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::RedOnly;
                         }
                      }
+#if DX11
                      if (ImGui::Checkbox("Debug Draw: Freeze Inputs", &debug_draw_freeze_inputs))
                      {
                         device_data.debug_draw_frozen_draw_state_stack.reset();
                      }
                      ImGui::Checkbox("Debug Draw: Disable Blends", &debug_draw_disable_blends);
+#endif
                   }
                   if (debug_draw_mode == DebugDrawMode::RenderTarget)
                   {
@@ -20002,20 +20680,34 @@ namespace
                   }
                   else if (debug_draw_mode == DebugDrawMode::UnorderedAccessView)
                   {
+#if DX11
                      ImGui::SliderInt("Debug Draw: Unordered Access View", &debug_draw_view_index, 0, device_data.uav_max_count - 1);
+#else
+                     ImGui::SliderInt("Debug Draw: Unordered Access View", &debug_draw_view_index, 0, 7);
+#endif
                   }
+#if DX11 // D3D12 shows the draw that wrote a shader resource instead, its state isn't known
                   else if (debug_draw_mode == DebugDrawMode::ShaderResource)
                   {
                      ImGui::SliderInt("Debug Draw: Pixel Shader Resource Index", &debug_draw_view_index, 0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - 1);
                   }
+#endif
+#if DX11
                   const int max_mip = GetTextureMaxMipLevels(D3D11_REQ_TEXTURE1D_U_DIMENSION) - 1;
+#else
+                  const int max_mip = 14; // The mips of the largest 2D texture (16384)
+#endif
                   ImGui::SliderInt("Debug Draw: Texture Mip", &debug_draw_mip, 0, max_mip);
+#if DX11
                   ImGui::Checkbox("Debug Draw: Allow Drawing Replaced Pass", &debug_draw_replaced_pass);
+#endif
                   ImGui::SliderInt("Debug Draw: Target Pipeline Instance", &debug_draw_pipeline_target_instance, -1, 100); // In case the same pipeline was run more than once by the game, we can pick one to print
+#if DX11
                   if (ImGui::Checkbox("Debug Draw: Filter Target Pipeline Instance By Thread", &debug_draw_pipeline_instance_filter_by_thread) && !debug_draw_pipeline_instance_filter_by_thread)
                   {
                      debug_draw_pipeline_target_thread = std::thread::id();
                   }
+#endif
                   bool debug_draw_fullscreen = (debug_draw_options & (uint32_t)DebugDrawTextureOptionsMask::Fullscreen) != 0;
                   bool debug_draw_rend_res_scale = (debug_draw_options & (uint32_t)DebugDrawTextureOptionsMask::RenderResolutionScale) != 0;
                   bool debug_draw_red_only = (debug_draw_options & (uint32_t)DebugDrawTextureOptionsMask::RedOnly) != 0;
@@ -20277,7 +20969,11 @@ namespace
                   {
                      ImGui::SetTooltip("Bilinear instead of Nearest Neighbor");
                   }
+#if DX11
                   if (device_data.debug_draw_texture || debug_draw_auto_clear_texture)
+#else
+                  if (device_data.debug_draw_texture_size.x != 0)
+#endif
                   {
                      if (GetFormatName(device_data.debug_draw_texture_format) != nullptr)
                      {
@@ -20289,14 +20985,23 @@ namespace
                      }
                      ImGui::Text("Debug Draw Info: Texture Size: %ux%ux%ux%u", device_data.debug_draw_texture_size.x, device_data.debug_draw_texture_size.y, device_data.debug_draw_texture_size.z, device_data.debug_draw_texture_size.w);
                   }
+#if DX11
                   if (ImGui::Checkbox("Debug Draw: Auto Clear Texture", &debug_draw_auto_clear_texture)) // Is it persistent or not (in case the target texture stopped being found on newer frames). We could also "freeze" it and stop updating it, but we don't need that for now.
                   {
                      device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
                      device_data.debug_draw_texture_size = {};
                   }
+#else
+                  {
+                     const std::shared_lock lock(device_data.readback.mutex);
+                     if (!device_data.readback.debug_error.empty())
+                     {
+                        ImGui::TextColored(ImVec4(1.f, 0.3f, 0.3f, 1.f), "Debug Draw Error: %s", device_data.readback.debug_error.c_str());
+                     }
+                  }
+                  ImGui::Text("Debug Draw Info: Last Copy Frame: %u", debug_draw_copied_frame);
+#endif
                }
-
-#endif // DX11
 
 #if !GRAPHICS_ANALYZER // Graphics Analyzer doesn't want upgrades
                ImGui::NewLine();
@@ -21087,7 +21792,7 @@ void Init(bool async)
 #endif
 #if DEVELOPMENT
    Mcp::Start();
-#if ENABLE_SR && DX11
+#if ENABLE_SR
    // Games call through these pointers, so the MCP tap sees every settings update and draw
    for (auto& [type, implementation] : sr_implementations)
    {
@@ -21564,6 +22269,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+      reshade::register_event<reshade::addon_event::init_sampler>(OnInitSamplerDescriptor);
       reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
@@ -21791,6 +22497,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::init_sampler>(OnInitSamplerDescriptor);
       reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
       reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);

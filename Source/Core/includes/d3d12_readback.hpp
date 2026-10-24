@@ -12,6 +12,7 @@
 // fence, signaled on its queue at a present, and its buffer is read at a later present once that fence passed ("Advance()").
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -64,16 +65,31 @@ namespace D3D12Readback
       bool operator==(const Write&) const = default;
    };
 
+   // What tells the draws of a pipeline apart across frames and threads (a job system records the same pass on another thread each frame):
+   // its outputs and arguments ("D3D12Trace::MakeDrawSignature()"). Swapchain back buffers rotate, so they count as none.
+   struct DrawSignature
+   {
+      uint64_t rtv_resource = 0; // The resources of render target 0 and of the depth stencil, none for compute
+      uint64_t dsv_resource = 0;
+      bool compute = false;
+      std::array<uint32_t, 9> arguments = {};
+      bool operator==(const DrawSignature&) const = default;
+   };
+
    // The command a readback copies the output of, recorded on "thread" (any if none): the "instance"th draw since the last present with one of
-   // "pipelines", or, with a "write.resource", the "instance"th copy, resolve or clear equal to "write". Those have no view: "kind" only picks
-   // the plane of a depth resource (stencil, else depth).
+   // "pipelines" (and the "signature", if set), or, with a "write.resource", the "instance"th copy, resolve or clear equal to "write". Those
+   // have no view: "kind" only picks the plane of a depth resource (stencil, else depth).
    struct Target
    {
       std::vector<uint64_t> pipelines;
       std::thread::id thread;
+      std::optional<DrawSignature> signature;
       int32_t instance = 0;
       Kind kind = Kind::RenderTarget;
       uint32_t slot = 0; // The render target slot, or the packed UAV or constant buffer entry (as the frame capture lists them)
+      // Constant buffers: the "b" register (in "cb_space") whose packed entry is read, in place of "slot"
+      std::optional<uint32_t> cb_register;
+      uint32_t cb_space = 0;
       Write write;
       uint32_t mip = 0;                         // Resource copies: the mip to read, they wrote all of them
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; // Copies and resolves: how to read the data of a color texture (an SRV's view format), its own if unknown
@@ -92,6 +108,9 @@ namespace D3D12Readback
       Status status = Status::Recorded;
       std::string error;
       const reshade::api::command_list* cmd_list = nullptr;
+      // The copies recorded on a native list that its recorder has no "reshade::api::command_list" of (the super resolution tap, called with the
+      // native list of the game's): its events carry the list, "get_native()" is that list
+      uint64_t native_list = 0;
       com_ptr<ID3D12CommandQueue> queue; // Where its list went (kept alive for the fence, games can release their queues)
 
       com_ptr<ID3D12Resource> buffer;   // READBACK, in COPY_DEST for its whole life
@@ -113,6 +132,10 @@ namespace D3D12Readback
       std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
       uint32_t rows = 0; // Of each subresource (block rows for block compressed formats)
 
+      // The debug draw's copy: the texture one mip of the view's layers is copied into (the buffer above only holds its token), "data_format" is how
+      // the display composition samples it
+      com_ptr<ID3D12Resource> debug_texture;
+
       // Constant buffers: "size" bytes at "buffer_offset" of the bound buffer, or the root constants
       std::string resource; // The frame capture's hash of the buffer
       uint64_t buffer_offset = 0;
@@ -122,6 +145,14 @@ namespace D3D12Readback
       uint32_t register_space = 0;
    };
 
+   // One texture of the dev MCP's "sr_capture": the super resolution tap copies each one the draw has, in the draw's command list
+   struct Capture
+   {
+      const char* name = nullptr;
+      Copy copy;
+      std::optional<std::vector<char>> bytes; // Once it ran
+   };
+
    // One per device
    struct State
    {
@@ -129,16 +160,31 @@ namespace D3D12Readback
       std::optional<Target> target;   // Armed by an MCP job, taken by the target command
       int32_t instances = 0;          // Commands matching "target" since the last present
       std::optional<Copy> copy;       // The MCP job's
+      std::vector<Capture> captures;  // The "sr_capture" job's
       std::vector<Copy> retired;      // Copies a job gave up on, whose buffer the GPU may still write
       com_ptr<ID3D12Resource> tokens; // UPLOAD, mapped for its whole life
       uint64_t* mapped_tokens = nullptr;
       uint64_t next_token = 1;
+
+      // The overlay's debug draw: its target stays armed (matched like "target", counted by its own "debug_instances"), and its copy is
+      // made again at each match into one texture of Luma's, which the display composition draws at present once its list ran
+      std::optional<Target> debug_target;
+      int32_t debug_instances = 0;
+      std::optional<Copy> debug_copy;
+      // Why the last match wasn't copied, empty if it was
+      std::string debug_error;
    };
 
    // Checked without a lock by every draw, copy, resolve and clear: a "State::target" is armed (rechecked under its lock)
    std::atomic<bool> armed = false;
    // Checked without a lock by every command list execution, reset and destruction: copies in "Status::Recorded"
    std::atomic<uint32_t> recorded_copies = 0;
+
+   // After a target was taken or dropped: the debug draw's stays armed. Expects "state.mutex".
+   void UpdateArmed(const State& state)
+   {
+      armed = state.target.has_value() || state.debug_target.has_value();
+   }
 
    constexpr uint32_t token_slots = 64; // Each copy takes its token from its own slot, the GPU reads it when the list runs
 
@@ -290,6 +336,134 @@ namespace D3D12Readback
       return true;
    }
 
+   // The format a depth stencil format is copied in (its typeless family, so the copy can be sampled) and the one its depth plane is sampled in
+   struct DepthSampleFormats
+   {
+      DXGI_FORMAT texture = DXGI_FORMAT_UNKNOWN;
+      DXGI_FORMAT srv = DXGI_FORMAT_UNKNOWN;
+   };
+
+   DepthSampleFormats DepthSampleFormatsOf(DXGI_FORMAT format)
+   {
+      switch (format)
+      {
+      case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      case DXGI_FORMAT_R24G8_TYPELESS:
+         return {DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS};
+      case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      case DXGI_FORMAT_R32G8X24_TYPELESS:
+         return {DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS};
+      case DXGI_FORMAT_D32_FLOAT:
+      case DXGI_FORMAT_R32_TYPELESS:
+         return {DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT};
+      case DXGI_FORMAT_D16_UNORM:
+      case DXGI_FORMAT_R16_TYPELESS:
+         return {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM};
+      default:
+         return {};
+      }
+   }
+
+   // Records the debug draw's copy of "mip" of "layers" layers of "resource" (in "draw_state", the state the target draw needs) into
+   // "state->debug_copy"'s texture of "texture_format", a 2D texture of one mip that rests in PIXEL_SHADER_RESOURCE and is sampled in "srv_format"
+   // (multisampled color is resolved into it). The texture is kept while its description matches, a replaced one is retired with the copy that
+   // used it. The copy's buffer only holds its 8 byte token, which "Advance()" needs to retire it. "reissue" re-issues the target draw once
+   // nothing can fail anymore. Expects "state->mutex" (exclusive).
+   template <typename Reissue>
+   bool RecordDebugCopy(State* state, ID3D12Device* device, ID3D12GraphicsCommandList* native_list, const reshade::api::command_list* cmd_list, ID3D12Resource* resource, D3D12_RESOURCE_STATES draw_state, uint32_t mip, uint32_t first_layer, uint32_t layers, DXGI_FORMAT texture_format, DXGI_FORMAT srv_format, Reissue&& reissue)
+   {
+      const D3D12_RESOURCE_DESC source_desc = resource->GetDesc();
+      const bool resolve = source_desc.SampleDesc.Count > 1;
+      const D3D12_RESOURCE_DESC desc = {.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D, .Width = (std::max)(source_desc.Width >> mip, 1ull), .Height = (std::max)(source_desc.Height >> mip, 1u), .DepthOrArraySize = UINT16(layers), .MipLevels = 1, .Format = texture_format, .SampleDesc = {.Count = 1}, .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN};
+      if (!state->debug_copy)
+      {
+         state->debug_copy.emplace().status = Copy::Status::Failed; // Nothing recorded yet
+      }
+      Copy* copy = &*state->debug_copy;
+      if (copy->debug_texture)
+      {
+         const D3D12_RESOURCE_DESC current = copy->debug_texture->GetDesc();
+         if (current.Width != desc.Width || current.Height != desc.Height || current.DepthOrArraySize != desc.DepthOrArraySize || current.Format != desc.Format)
+         {
+            if (copy->status == Copy::Status::Recorded || copy->status == Copy::Status::Executed)
+            {
+               state->retired.push_back(std::move(*copy)); // The GPU can still sample it
+               *copy = {};
+               copy->status = Copy::Status::Failed;
+            }
+            copy->debug_texture.reset();
+         }
+      }
+      if (!copy->debug_texture)
+      {
+         const D3D12_HEAP_PROPERTIES heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+         if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&copy->debug_texture))))
+            return false;
+      }
+      if (!copy->buffer)
+      {
+         copy->buffer = CreateBuffer(device, D3D12_HEAP_TYPE_READBACK, sizeof(uint64_t));
+      }
+      if (!copy->buffer || !CreateTokens(state, device))
+         return false;
+
+      reissue();
+
+      std::vector<D3D12_RESOURCE_BARRIER> barriers;
+      const auto transition = [&barriers](ID3D12Resource* barrier_resource, uint32_t subresource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+      {
+         barriers.push_back({.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, .Transition = {.pResource = barrier_resource, .Subresource = subresource, .StateBefore = before, .StateAfter = after}});
+      };
+      ID3D12Resource* const destination = copy->debug_texture.get();
+      const D3D12_RESOURCE_STATES source_state = (resolve ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE);
+      const D3D12_RESOURCE_STATES destination_state = (resolve ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST);
+      const auto source_subresource = [&](uint32_t layer)
+      { return mip + (first_layer + layer) * source_desc.MipLevels; };
+      for (uint32_t layer = 0; layer < layers; layer++)
+         transition(resource, source_subresource(layer), draw_state, source_state);
+      transition(destination, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, destination_state);
+      native_list->ResourceBarrier(UINT(barriers.size()), barriers.data());
+      for (uint32_t layer = 0; layer < layers; layer++)
+      {
+         if (resolve)
+         {
+            native_list->ResolveSubresource(destination, layer, resource, source_subresource(layer), texture_format);
+         }
+         else
+         {
+            const D3D12_TEXTURE_COPY_LOCATION copy_destination = {.pResource = destination, .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = layer};
+            const D3D12_TEXTURE_COPY_LOCATION copy_source = {.pResource = resource, .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = source_subresource(layer)};
+            native_list->CopyTextureRegion(&copy_destination, 0, 0, 0, &copy_source, nullptr); // Depth stencil sources need whole subresources
+         }
+      }
+      barriers.clear();
+      for (uint32_t layer = 0; layer < layers; layer++)
+         transition(resource, source_subresource(layer), source_state, draw_state);
+      transition(destination, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, destination_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      native_list->ResourceBarrier(UINT(barriers.size()), barriers.data());
+      RecordToken(state, native_list, copy);
+
+      if (copy->status != Copy::Status::Recorded)
+      {
+         recorded_copies++;
+      }
+      // A copy still in a list that wasn't executed is replaced: the list of this one is the one whose execution counts
+      copy->status = Copy::Status::Recorded;
+      copy->error.clear();
+      copy->cmd_list = cmd_list;
+      copy->native_list = 0;
+      copy->queue.reset();
+      copy->fence.reset();
+      copy->fence_value = 0;
+      copy->signals = 0;
+      copy->desc = source_desc;
+      copy->texture = reinterpret_cast<uint64_t>(resource);
+      copy->mip = mip;
+      copy->first_layer = first_layer;
+      copy->data_format = srv_format;
+      return true;
+   }
+
    // Records a copy of "size" bytes at "offset" of a buffer in an UPLOAD heap (always GENERIC_READ, which includes COPY_SOURCE, so no barrier).
    // Expects "state->mutex" (exclusive).
    bool RecordBufferCopy(State* state, ID3D12Device* device, ID3D12GraphicsCommandList* native_list, ID3D12Resource* resource, uint64_t offset, uint64_t size, Copy* copy)
@@ -382,6 +556,14 @@ namespace D3D12Readback
       {
          function(&*state->copy);
       }
+      if (state->debug_copy)
+      {
+         function(&*state->debug_copy);
+      }
+      for (Capture& capture : state->captures)
+      {
+         function(&capture.copy);
+      }
       for (Copy& copy : state->retired)
       {
          function(&copy);
@@ -394,7 +576,7 @@ namespace D3D12Readback
       const std::unique_lock lock(state->mutex);
       ForEachCopy(state, [&](Copy* copy)
          {
-            if (copy->status == Copy::Status::Recorded && copy->cmd_list == cmd_list)
+            if (copy->status == Copy::Status::Recorded && (copy->cmd_list == cmd_list || (copy->native_list != 0 && copy->native_list == cmd_list->get_native())))
             {
                copy->status = Copy::Status::Executed;
                copy->queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
@@ -408,7 +590,7 @@ namespace D3D12Readback
       const std::unique_lock lock(state->mutex);
       ForEachCopy(state, [&](Copy* copy)
          {
-            if (copy->status == Copy::Status::Recorded && copy->cmd_list == cmd_list)
+            if (copy->status == Copy::Status::Recorded && (copy->cmd_list == cmd_list || (copy->native_list != 0 && copy->native_list == cmd_list->get_native())))
             {
                copy->status = Copy::Status::Discarded;
                recorded_copies--;
@@ -417,14 +599,26 @@ namespace D3D12Readback
          { return copy.status == Copy::Status::Discarded; });
    }
 
-   // Moves the job's copy to "retired" if the GPU may still write its buffer. Expects "state->mutex" (exclusive).
+   // Moves the job's copy and captures to "retired" if the GPU may still write their buffer. Expects "state->mutex" (exclusive).
    void Retire(State* state)
    {
-      if (state->copy && (state->copy->status == Copy::Status::Recorded || state->copy->status == Copy::Status::Executed))
+      const auto retire = [state](Copy* copy)
       {
-         state->retired.push_back(std::move(*state->copy));
+         if (copy->status == Copy::Status::Recorded || copy->status == Copy::Status::Executed)
+         {
+            state->retired.push_back(std::move(*copy));
+         }
+      };
+      if (state->copy)
+      {
+         retire(&*state->copy);
       }
       state->copy.reset();
+      for (Capture& capture : state->captures)
+      {
+         retire(&capture.copy);
+      }
+      state->captures.clear();
    }
 
    // Frees the retired copies the GPU is done with (rare: a job gave up on them): executed ones once "Advance()" has no more to wait for,
