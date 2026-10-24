@@ -43,10 +43,10 @@
 namespace D3D12Clones
 {
    // A view the game created on a texture whose clone is inactive, to be created again on the clone when it gets promoted. The alternative of
-   // "desc" is the kind of the view (SRV, UAV or RTV).
+   // "desc" is the kind of the view (SRV, UAV, RTV or DSV: no depth clone is inactive, but "RouteView()" routes the views it gets a record of).
    struct ViewRecord
    {
-      std::variant<D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_RENDER_TARGET_VIEW_DESC> desc;
+      std::variant<D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_RENDER_TARGET_VIEW_DESC, D3D12_DEPTH_STENCIL_VIEW_DESC> desc;
       bool has_desc = false; // False if the game passed no description (the view takes the format of the resource)
    };
 
@@ -659,8 +659,11 @@ namespace D3D12Clones
             case 1:
                proxy->CreateUnorderedAccessView(recreation.clone, nullptr, (record.has_desc ? &std::get<1>(record.desc) : nullptr), descriptor);
                break;
-            default:
+            case 2:
                proxy->CreateRenderTargetView(recreation.clone, (record.has_desc ? &std::get<2>(record.desc) : nullptr), descriptor);
+               break;
+            default:
+               proxy->CreateDepthStencilView(recreation.clone, (record.has_desc ? &std::get<3>(record.desc) : nullptr), descriptor);
                break;
             }
          }
@@ -730,9 +733,14 @@ namespace D3D12Clones
    }
 
    // The clear value of a clone in "format", with the colour the game's value has. The upgraded format of a clone can be typeless, and a
-   // clear value needs a typed one: none then (the clear value is only an optimization hint).
-   inline std::optional<D3D12_CLEAR_VALUE> ClearValueFor(DXGI_FORMAT format, const D3D12ResourceCreation::CreationArguments& arguments)
+   // clear value needs a typed one: none then (the clear value is only an optimization hint). A clone in the original's format ("original_format":
+   // custom dimensions only) takes the game's value as it is, a typeless depth texture's typed one included.
+   inline std::optional<D3D12_CLEAR_VALUE> ClearValueFor(DXGI_FORMAT format, DXGI_FORMAT original_format, const D3D12ResourceCreation::CreationArguments& arguments)
    {
+      if (format == original_format)
+      {
+         return (arguments.has_clear_value ? std::optional(arguments.clear_value) : std::nullopt);
+      }
       switch (format)
       {
       case DXGI_FORMAT_R32G32B32A32_TYPELESS:
@@ -759,7 +767,7 @@ namespace D3D12Clones
    inline ID3D12Resource* Create(ID3D12Device* device, ID3D12Resource* original, DXGI_FORMAT format, uint64_t width, uint32_t height, const D3D12ResourceCreation::CreationArguments& arguments, bool active)
    {
       const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
-      const std::optional<D3D12_CLEAR_VALUE> clear_value = ClearValueFor(format, arguments);
+      const std::optional<D3D12_CLEAR_VALUE> clear_value = ClearValueFor(format, original->GetDesc().Format, arguments);
       const D3D12_CLEAR_VALUE* const clear_value_pointer = (clear_value ? &*clear_value : nullptr);
       com_ptr<ID3D12Resource> resource;
       HRESULT result = E_FAIL;
@@ -822,6 +830,7 @@ namespace D3D12Clones
    constexpr size_t CREATE_SHADER_RESOURCE_VIEW_SLOT = 18;
    constexpr size_t CREATE_UNORDERED_ACCESS_VIEW_SLOT = 19;
    constexpr size_t CREATE_RENDER_TARGET_VIEW_SLOT = 20;
+   constexpr size_t CREATE_DEPTH_STENCIL_VIEW_SLOT = 21;
    constexpr size_t CREATE_SAMPLER_SLOT = 22;
    constexpr size_t CREATE_SAMPLER2_SLOT = 79; // "ID3D12Device11"'s
    constexpr size_t COPY_DESCRIPTORS_SLOT = 23;
@@ -832,6 +841,7 @@ namespace D3D12Clones
    constexpr size_t TRY_CREATE_CONSTANT_BUFFER_VIEW_SLOT = 87;
    constexpr size_t TRY_CREATE_SAMPLER2_SLOT = 88;
    constexpr size_t TRY_CREATE_RENDER_TARGET_VIEW_SLOT = 89;
+   constexpr size_t TRY_CREATE_DEPTH_STENCIL_VIEW_SLOT = 90;
    constexpr size_t CREATE_COMMAND_LIST1_SLOT = 51; // d3d12.h's C vtable lists 3 earlier methods twice (C and C++ return conventions)
    constexpr size_t RESOURCE_BARRIER_SLOT = 26;
    constexpr size_t SET_DESCRIPTOR_HEAPS_SLOT = 28;
@@ -849,10 +859,12 @@ namespace D3D12Clones
    using CreateShaderResourceViewHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), CREATE_SHADER_RESOURCE_VIEW_SLOT>;
    using CreateUnorderedAccessViewHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), CREATE_UNORDERED_ACCESS_VIEW_SLOT>;
    using CreateRenderTargetViewHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), CREATE_RENDER_TARGET_VIEW_SLOT>;
+   using CreateDepthStencilViewHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), CREATE_DEPTH_STENCIL_VIEW_SLOT>;
    using CreateConstantBufferViewHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), CREATE_CONSTANT_BUFFER_VIEW_SLOT>;
    using TryCreateShaderResourceViewHook = ProxyFunction<HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), TRY_CREATE_SHADER_RESOURCE_VIEW_SLOT>;
    using TryCreateUnorderedAccessViewHook = ProxyFunction<HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), TRY_CREATE_UNORDERED_ACCESS_VIEW_SLOT>;
    using TryCreateRenderTargetViewHook = ProxyFunction<HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), TRY_CREATE_RENDER_TARGET_VIEW_SLOT>;
+   using TryCreateDepthStencilViewHook = ProxyFunction<HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), TRY_CREATE_DEPTH_STENCIL_VIEW_SLOT>;
    using TryCreateConstantBufferViewHook = ProxyFunction<HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE), TRY_CREATE_CONSTANT_BUFFER_VIEW_SLOT>;
 
    // A description the game passed, copied into a record
@@ -884,6 +896,13 @@ namespace D3D12Clones
       CreateRenderTargetViewHook::hooked.original(device, RouteView(resource, handle.ptr, &record), desc, handle);
    }
 
+   // The depth textures of custom dimensions have clones (see "OnCreateResource()" in core.hpp)
+   inline void STDMETHODCALLTYPE CreateDepthStencilViewDetour(ID3D12Device* device, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+   {
+      const ViewRecord record = MakeViewRecord(desc);
+      CreateDepthStencilViewHook::hooked.original(device, RouteView(resource, handle.ptr, &record), desc, handle);
+   }
+
    // A constant buffer view overwrites the descriptor of a recorded view in the same heap
    inline void STDMETHODCALLTYPE CreateConstantBufferViewDetour(ID3D12Device* device, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
    {
@@ -907,6 +926,12 @@ namespace D3D12Clones
    {
       const ViewRecord record = MakeViewRecord(desc);
       return TryCreateRenderTargetViewHook::hooked.original(device, RouteView(resource, handle.ptr, &record), desc, handle);
+   }
+
+   inline HRESULT STDMETHODCALLTYPE TryCreateDepthStencilViewDetour(ID3D12Device* device, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+   {
+      const ViewRecord record = MakeViewRecord(desc);
+      return TryCreateDepthStencilViewHook::hooked.original(device, RouteView(resource, handle.ptr, &record), desc, handle);
    }
 
    inline HRESULT STDMETHODCALLTYPE TryCreateConstantBufferViewDetour(ID3D12Device* device, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
@@ -1407,10 +1432,12 @@ namespace D3D12Clones
       bool installed_all = CreateShaderResourceViewHook::Install(proxy_vtable, &CreateShaderResourceViewDetour);
       installed_all &= CreateUnorderedAccessViewHook::Install(proxy_vtable, &CreateUnorderedAccessViewDetour);
       installed_all &= CreateRenderTargetViewHook::Install(proxy_vtable, &CreateRenderTargetViewDetour);
+      installed_all &= CreateDepthStencilViewHook::Install(proxy_vtable, &CreateDepthStencilViewDetour);
       installed_all &= CreateConstantBufferViewHook::Install(proxy_vtable, &CreateConstantBufferViewDetour);
       installed_all &= TryCreateShaderResourceViewHook::Install(proxy_vtable, &TryCreateShaderResourceViewDetour);
       installed_all &= TryCreateUnorderedAccessViewHook::Install(proxy_vtable, &TryCreateUnorderedAccessViewDetour);
       installed_all &= TryCreateRenderTargetViewHook::Install(proxy_vtable, &TryCreateRenderTargetViewDetour);
+      installed_all &= TryCreateDepthStencilViewHook::Install(proxy_vtable, &TryCreateDepthStencilViewDetour);
       installed_all &= TryCreateConstantBufferViewHook::Install(proxy_vtable, &TryCreateConstantBufferViewDetour);
       installed_all &= CopyDescriptorsHook::Install(proxy_vtable, &CopyDescriptorsDetour);
       installed_all &= CopyDescriptorsSimpleHook::Install(proxy_vtable, &CopyDescriptorsSimpleDetour);
@@ -1439,10 +1466,12 @@ namespace D3D12Clones
       bool removed_all = CreateShaderResourceViewHook::Remove();
       removed_all &= CreateUnorderedAccessViewHook::Remove();
       removed_all &= CreateRenderTargetViewHook::Remove();
+      removed_all &= CreateDepthStencilViewHook::Remove();
       removed_all &= CreateConstantBufferViewHook::Remove();
       removed_all &= TryCreateShaderResourceViewHook::Remove();
       removed_all &= TryCreateUnorderedAccessViewHook::Remove();
       removed_all &= TryCreateRenderTargetViewHook::Remove();
+      removed_all &= TryCreateDepthStencilViewHook::Remove();
       removed_all &= TryCreateConstantBufferViewHook::Remove();
       removed_all &= CopyDescriptorsHook::Remove();
       removed_all &= CopyDescriptorsSimpleHook::Remove();

@@ -7251,20 +7251,26 @@ namespace
       }
 #endif
 #if ENABLE_D3D12_PASSES && ENABLE_MINHOOK
-      // A draw into a clone of another size (custom dimensions: the bound views name the clone) covers it all, like the D3D11 scaled mirrors: the game's viewports and scissors (the
-      // tracked ones) are set scaled by the clone's size over the original's, once until the game or a Luma pass binds them again
-      // ponytail: only render targets (D3D12 has no depth clones yet: an unscaled depth target clips the draw), and no dispatch sizes (neither does D3D11)
+      // A draw into a clone of another size (custom dimensions: the bound views name the clone; the depth's counts for a draw without render targets) covers it all, like the D3D11 scaled
+      // mirrors: the game's viewports and scissors (the tracked ones) are set scaled by the clone's size over the original's, once until the game or a Luma pass binds them again
+      // ponytail: no dispatch sizes (neither does D3D11) and no clear rects; a depth copy between a scaled and an unscaled texture is skipped ("SkipUpgradedFormatCopy()")
       if (!is_dispatch && D3D12Clones::registry.scaled_count.load(std::memory_order_relaxed) != 0 && (!cmd_list_data.viewports_scaled || !cmd_list_data.scissors_scaled))
       {
          const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
          std::optional<std::pair<float, float>> scale;
+         bool any_render_target = false;
          for (const D3D12State::ViewInfo& view : state.render_target_views)
          {
+            any_render_target |= (view.resource != 0);
             scale = (view.resource != 0 ? D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(view.resource)) : std::nullopt);
             if (scale)
             {
                break;
             }
+         }
+         if (!any_render_target && state.depth_stencil_view.resource != 0)
+         {
+            scale = D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(state.depth_stencil_view.resource));
          }
          if (scale)
          {
@@ -13773,22 +13779,32 @@ namespace
 
 #if DX12
          // The D3D12 rules, on top of the filters: a texture is only upgraded in place if the game creates it committed (it owns its memory, whereas a placed one is in a heap the game sized and shares with other
-         // resources, so a bigger one would overflow it or alias them: it keeps its desc and gets a clone in "OnInitResource()". A reserved one has none until the game maps tiles to it), not as a depth
-         // texture (the DSV variants aren't made), not shared (another process or API opens it) and without castable formats (ReShade passes them on as the game gave them, and the upgraded format
-         // isn't one of the formats they can be cast to). With indirect upgrades a committed one gets a clone too, the mirror of D3D11's (views live in descriptor heaps, so they can't be swapped at bind)
+         // resources, so a bigger one would overflow it or alias them: it keeps its desc and gets a clone in "OnInitResource()". A reserved one has none until the game maps tiles to it), a depth
+         // texture only through a clone of custom dimensions (its format isn't upgraded: the DSV variants aren't made), not shared (another process or API opens it) and without castable formats
+         // (ReShade passes them on as the game gave them, and the upgraded format isn't one of the formats they can be cast to). With indirect upgrades a committed one gets a clone too, the mirror
+         // of D3D11's (views live in descriptor heaps, so they can't be swapped at bind)
          if (std::memcmp(&upgraded_desc.value(), &desc, sizeof(desc)) == 0)
          {
             return false; // The filters chose a texture the upgrade leaves as it is
          }
          const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
+         // Custom dimensions ("texture_custom_dimensions_upgrades") always go through a clone: the game's views and copies keep the original's size, and the draws into the clone get scaled
+         // viewports ("OnDrawOrDispatchD3D12()"). Its subresources stay the original's, so its barriers can follow the original's
+         const bool resized = (upgraded_desc->texture.width != desc.texture.width || upgraded_desc->texture.height != desc.texture.height);
+         const bool is_depth = (desc.usage & reshade::api::resource_usage::depth_stencil) != 0;
          const char* refusal = nullptr;
          if (creation_kind != D3D12ResourceCreation::Kind::Committed && creation_kind != D3D12ResourceCreation::Kind::Placed)
          {
             refusal = "the reserved ones aren't upgraded yet";
          }
-         else if ((desc.usage & reshade::api::resource_usage::depth_stencil) != 0)
+         else if (is_depth && !resized)
          {
-            refusal = "depth textures aren't upgraded on D3D12 yet";
+            refusal = "depth textures are only cloned for custom dimensions on D3D12 (their formats aren't upgraded yet)";
+         }
+         else if (is_depth && !auto_texture_format_upgrade_shader_hashes.empty())
+         {
+            // A scaled depth next to the original size of a render target whose clone waits would clip or misplace more than an unscaled one
+            refusal = "with writer shaders listed the clones of its render targets wait for their promotion, which a depth clone can't follow";
          }
          else if ((desc.flags & reshade::api::resource_flags::shared) != 0)
          {
@@ -13798,9 +13814,6 @@ namespace
          {
             refusal = "it takes castable formats, which ReShade passes on as the game gave them and the upgraded format isn't one of";
          }
-         // Custom dimensions ("texture_custom_dimensions_upgrades") always go through a clone: the game's views and copies keep the original's size, and the draws into the clone get scaled
-         // viewports ("OnDrawOrDispatchD3D12()"). Its subresources stay the original's, so its barriers can follow the original's
-         const bool resized = (upgraded_desc->texture.width != desc.texture.width || upgraded_desc->texture.height != desc.texture.height);
          if (!refusal && (resized || upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples))
          {
             if (upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples)
@@ -13827,7 +13840,8 @@ namespace
          }
          if (creation_kind == D3D12ResourceCreation::Kind::Placed || !upgrade_directly || resized)
          {
-            pending_clone = {.format = DXGI_FORMAT(upgraded_desc->texture.format), .width = upgraded_desc->texture.width, .height = upgraded_desc->texture.height};
+            // A depth clone keeps the game's format, whatever the depth format filters chose: only its size follows the custom dimensions
+            pending_clone = {.format = DXGI_FORMAT(is_depth ? desc.texture.format : upgraded_desc->texture.format), .width = upgraded_desc->texture.width, .height = upgraded_desc->texture.height};
             return false; // The desc stays the game's
          }
 #endif
