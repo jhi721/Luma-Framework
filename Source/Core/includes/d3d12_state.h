@@ -306,15 +306,12 @@ namespace D3D12State
 
    void BeginRenderPass(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds)
    {
-      state->render_targets.resize(count);
-      state->render_target_views.resize(count);
+      std::vector<reshade::api::resource_view> rtvs(count);
       for (uint32_t i = 0; i < count; i++)
       {
-         state->render_targets[i] = rts[i].view;
-         state->render_target_views[i] = GetViewInfo(device, rts[i].view);
+         rtvs[i] = rts[i].view;
       }
-      state->depth_stencil = ds ? ds->view : reshade::api::resource_view{};
-      state->depth_stencil_view = GetViewInfo(device, state->depth_stencil);
+      BindRenderTargets(state, device, count, rtvs.data(), ds ? ds->view : reshade::api::resource_view{});
       state->in_render_pass = true;
    }
 
