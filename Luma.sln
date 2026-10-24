@@ -183,6 +183,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Sunset Overdrive", "Source\
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Yakuza Kiwami 2 R", "Source\Games\Yakuza Kiwami 2 R\Yakuza Kiwami 2 R.vcxproj", "{8EF6725D-F0CE-4766-A4C2-E098D8DA004F}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Yakuza Kiwami R", "Source\Games\Yakuza Kiwami R\Yakuza Kiwami R.vcxproj", "{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Development-Debug|Win32 = Development-Debug|Win32
@@ -1223,6 +1225,18 @@ Global
 		{8EF6725D-F0CE-4766-A4C2-E098D8DA004F}.Test-Release|Win32.ActiveCfg = Test-Release|x64
 		{8EF6725D-F0CE-4766-A4C2-E098D8DA004F}.Test-Release|x64.ActiveCfg = Test-Release|x64
 		{8EF6725D-F0CE-4766-A4C2-E098D8DA004F}.Test-Release|x64.Build.0 = Test-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Development-Debug|Win32.ActiveCfg = Development-Debug|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Development-Debug|x64.ActiveCfg = Development-Debug|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Development-Debug|x64.Build.0 = Development-Debug|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Development-Release|Win32.ActiveCfg = Development-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Development-Release|x64.ActiveCfg = Development-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Development-Release|x64.Build.0 = Development-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Publishing-Release|Win32.ActiveCfg = Publishing-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Publishing-Release|x64.ActiveCfg = Publishing-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Publishing-Release|x64.Build.0 = Publishing-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Test-Release|Win32.ActiveCfg = Test-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Test-Release|x64.ActiveCfg = Test-Release|x64
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}.Test-Release|x64.Build.0 = Test-Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -1307,6 +1321,7 @@ Global
 		{3A6C5692-A5DE-46AE-8E7A-1838642DDC30} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{EA17BA10-38EA-4D6C-845B-B72286F8AC2E} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{8EF6725D-F0CE-4766-A4C2-E098D8DA004F} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {8B799422-BA66-3174-B21F-B9FA07C4B2E3}
