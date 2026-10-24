@@ -2784,6 +2784,12 @@ namespace
                   {
                      file_name_cso += L"_0x" + std::wstring(hash_string.begin(), hash_string.end());
                   }
+                  // The repository's shaders are shared by every project: a D3D12 build's DXIL can't take the name of a D3D11 build's DXBC, which would
+                  // load it as the cache of the same native (the config's preprocessor hash matches) and fail to create its shader
+                  if (std::string_view(local_shader_target).substr(3) >= "6_0")
+                  {
+                     file_name_cso += L"." + std::wstring(local_shader_target.begin(), local_shader_target.end());
+                  }
                }
 
                size_t first_hash_pos = file_name_cso.find(L"0x");
