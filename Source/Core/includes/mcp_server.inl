@@ -1536,10 +1536,10 @@ namespace Mcp
       return !ec && std::mismatch(root.begin(), root.end(), canonical_dir.begin(), canonical_dir.end()).first == root.end();
    }
 
-   // "<out_dir>/<stem>_f<frame>.bin"
+   // "<out_dir>/<stem>_p<pid>_f<frame>.bin": every Luma process shares the root, and two of them with the same shaders reach the same frame
    std::filesystem::path ReadbackPath(const Job& job, std::string_view stem)
    {
-      const std::string file = std::format("{}_f{}.bin", stem, cb_luma_global_settings.FrameIndex);
+      const std::string file = std::format("{}_p{}_f{}.bin", stem, GetCurrentProcessId(), cb_luma_global_settings.FrameIndex);
       if (const std::string* out_dir = job.Arg("out_dir"))
          return Utf8Path(*out_dir) / file;
       return ReadbackRoot() / file;
