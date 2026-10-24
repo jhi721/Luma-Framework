@@ -137,7 +137,7 @@ static constexpr uint32_t kBloomBrightPassHash = 0xF8942FF1;
 // User-facing AA settings persisted through ReShade.
 static bool g_smaa_enable = true;
 static float g_rcas_sharpness = 0.f; // RCAS on the SMAA or DLSS / FSR output (0 = off)
-// SMAA's and RCAS's resources go after this many presents without them (menus still run SMAA under an upscaler)
+// SMAA's, RCAS's and XeGTAO's resources go after this many presents without them (menus still run SMAA under an upscaler)
 static constexpr uint32_t smaa_idle_release_frames = 600;
 
 // SMAA predication, uploaded as SmaaPredication.xyz. Not exposed: tuned to this engine's non-reverse hyperbolic
@@ -719,6 +719,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11UnorderedAccessView> uav_gtao_working[2];
    ComPtr<ID3D11ShaderResourceView> srv_gtao_working[2];
    uint32_t gtao_w = 0, gtao_h = 0;
+   // Luma frame index of the last XeGTAO dispatch (see "smaa_idle_release_frames")
+   uint32_t gtao_frame = 0;
 
    // b11 = (FinalValuePower, DepthScale, RadiusOverride, DebugView, NoiseIndex), written every frame.
    com_ptr<ID3D11Buffer> cb_gtao;
@@ -2803,6 +2805,7 @@ public:
             gd->gtao_w = w;
             gd->gtao_h = h;
          }
+         gd->gtao_frame = cb_luma_global_settings.FrameIndex;
 
 #if DEVELOPMENT || TEST
          const float dbg = (float)g_gtao_debug_view;
@@ -3438,6 +3441,11 @@ public:
       {
          gd.smaa_input = {};
          gd.rcas_out = {};
+      }
+      // XeGTAO's scratch goes once it stopped running (XeGTAO or the game's AO off, or no AO in the scene)
+      if (gd.tex_gtao_depth_mips && cb_luma_global_settings.FrameIndex - gd.gtao_frame > smaa_idle_release_frames)
+      {
+         ReleaseGTAOScratch(&gd);
       }
       // Luma bloom off: DrawBloom's mip chains go (rebuilt at its next draw)
       if (!g_bloom_enable)
