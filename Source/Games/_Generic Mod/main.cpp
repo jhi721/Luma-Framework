@@ -33,6 +33,7 @@ namespace
    float test_mip_lod_bias = 0.f; // The mip bias of the upgraded samplers, applied at present: it reaches the samplers the game writes after it
    int test_viewport_scale_hash = 0; // The draw's viewports and scissors get half their width through "SetGameViewportsD3D12()", and keep it for the draws after it (as a render scale's code does)
    int test_skip_copy_width = 0;     // The game copies ("OverrideCopyResource()", "OverrideCopyTextureRegion()") into a texture of this width are skipped. "TestSkipCopyWidth" of "[Luma Advanced]" sets it on boot
+   int test_smaa_t2x = 0;            // 1: the SMAA of "test_smaa_hash" is T2x (the "Generic SMAA T2x" natives, "SMAA_T2X" in its "Luma_SMAA_impl.hlsl") with its t0 as the velocity texture: the target's alpha is sqrt(5 * length(t0.rg)) where there is no edge
    int test_smaa_predication = 0;    // The SMAA of "test_smaa_hash" gets the edge threshold 0.3 as game constant x (the smoke's "Luma_SMAA_impl.hlsl" has predication on: 0 keeps its 0.05): 1 without a predication texture, 2 with its t0 as the predication texture
 #endif
 #if DX11 && DEVELOPMENT
@@ -99,8 +100,11 @@ public:
          shader_hashes_UI.pixel_shaders.emplace(uint32_t(std::strtoul(test_ui_hash_text, nullptr, 16)));
       }
       reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TestSkipCopyWidth", test_skip_copy_width);
-      Mcp::RegisterInts({{"test_skip_copy_width", &test_skip_copy_width, 0, INT_MAX}, {"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_smaa_predication", &test_smaa_predication, 0, 2}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
+      Mcp::RegisterInts({{"test_skip_copy_width", &test_skip_copy_width, 0, INT_MAX}, {"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_smaa_predication", &test_smaa_predication, 0, 2}, {"test_smaa_t2x", &test_smaa_t2x, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
       Mcp::RegisterValues({{"test_mip_lod_bias", &test_mip_lod_bias, -8.f, 8.f}});
+      // SMAA T2x's own blends of the smoke test ("SMAA_T2X" in its "Luma_SMAA_impl.hlsl"): the edge detection and the vertex shaders are 1x's
+      native_shaders_definitions.emplace(CompileTimeStringHash("Generic SMAA T2x Blending Weight Calculation PS"), ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("Generic SMAA T2x Neighborhood Blending PS"), ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});
 #endif
    }
 
@@ -271,7 +275,8 @@ public:
          {
             const float smaa_constants[4] = {(test_smaa_predication != 0 ? 0.3f : 0.f), 0.f, 0.f, 0.f};
             const reshade::api::resource predication = {(test_smaa_predication == 2 ? source.resource : 0)};
-            drawn = DrawSMAA(cmd_list_data, device_data, {source.resource}, source.format, predication, source.format, target, state.render_target_descs[0], smaa_constants, float(test_smaa_rcas));
+            const SMAAT2xD3D12 t2x = {.blending_weight_calculation_ps = CompileTimeStringHash("Generic SMAA T2x Blending Weight Calculation PS"), .neighborhood_blending_ps = CompileTimeStringHash("Generic SMAA T2x Neighborhood Blending PS"), .velocity = {source.resource}, .velocity_format = source.format};
+            drawn = DrawSMAA(cmd_list_data, device_data, {source.resource}, source.format, predication, source.format, target, state.render_target_descs[0], smaa_constants, float(test_smaa_rcas), (test_smaa_t2x != 0 ? &t2x : nullptr));
          }
          if (drawn)
          {
