@@ -9723,7 +9723,17 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
 #endif
-      const bool redirected = RedirectToClones(&source, &dest);
+      bool redirected = RedirectToClones(&source, &dest);
+      {
+         // Like D3D11, the game can make the copy itself or change what it copies (then the copy is re-issued with them)
+         const reshade::api::resource redirected_source = source;
+         const reshade::api::resource redirected_dest = dest;
+         if (game->OverrideCopyResource(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle))
+         {
+            return true;
+         }
+         redirected |= (source.handle != redirected_source.handle || dest.handle != redirected_dest.handle);
+      }
       if (SkipUpgradedFormatCopy(cmd_list, "copy_resource", source, dest, CopyExtent::Whole))
       {
          return true;
@@ -9773,7 +9783,17 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
 #endif
-      const bool redirected = RedirectToClones(&source, &dest);
+      bool redirected = RedirectToClones(&source, &dest);
+      {
+         const reshade::api::resource redirected_source = source;
+         const reshade::api::resource redirected_dest = dest;
+         if (game->OverrideCopyTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, dest_subresource, reinterpret_cast<const D3D12_BOX*>(dest_box), source.handle,
+                source_subresource, reinterpret_cast<const D3D12_BOX*>(source_box)))
+         {
+            return true;
+         }
+         redirected |= (source.handle != redirected_source.handle || dest.handle != redirected_dest.handle);
+      }
       const bool whole = (source_subresource == 0 && dest_subresource == 0 && !source_box && !dest_box); // The conversion checks that subresource 0 is the whole texture
       if (SkipUpgradedFormatCopy(cmd_list, "copy_texture_region", source, dest, (whole ? CopyExtent::Whole : CopyExtent::Part)))
       {
@@ -9821,6 +9841,13 @@ namespace
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
 #endif
       const bool redirected = RedirectToClones(&source, &dest);
+      // Like D3D11 (where it is only for the indirect upgrades' mirrors): a whole resolve between substituted resources can be made by the game
+      if (redirected && source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0 &&
+          game->OverrideResolveTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle,
+             GetTextureFormat(cmd_list->get_device(), source)))
+      {
+         return true;
+      }
       DXGI_FORMAT resolve_format = DXGI_FORMAT(format);
       bool format_corrected = false;
       if (swapchain_format_upgrade_type > TextureFormatUpgradesType::None || texture_format_upgrades_type > TextureFormatUpgradesType::None) // Optimization

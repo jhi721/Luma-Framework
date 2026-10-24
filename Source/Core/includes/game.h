@@ -52,13 +52,19 @@ public:
       device_data.game = nullptr;
    }
 
-#if DX11
-   virtual bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) { return false; }
+   // The resources are the ones the copy will use, after the substitution of the clones (D3D11: the indirect upgrades' mirrors) a game can change them ("dst_resource" and "src_resource" are
+   // "ID3D11Resource" or "ID3D12Resource" pointers). True if the game made the copy itself. The boxes are the copy's, null for a whole one. Released D3D12 builds only run these with texture or
+   // swapchain upgrades (the copy events aren't registered otherwise)
+#if DX12
+   using NativeBox = D3D12_BOX;
+#else
+   using NativeBox = D3D11_BOX;
+#endif
+   virtual bool OverrideCopyResource(NativeDevice* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) { return false; }
    // A whole-resource MSAA resolve after the indirect upgrade substitution ("dst_resource"/"src_resource" are the mirrors, "format" the
    // mirrors' format). True if the game resolved it itself.
-   virtual bool OverrideResolveTextureRegion(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, uint64_t dst_resource, uint64_t src_resource, DXGI_FORMAT format) { return false; }
-   virtual bool OverrideCopyTextureRegion(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const D3D11_BOX* dst_box, uint64_t& src_resource, uint32_t src_subresource, const D3D11_BOX* src_box) { return false; }
-#endif // DX11
+   virtual bool OverrideResolveTextureRegion(NativeDevice* native_device, NativeCommandList* native_device_context, DeviceData& device_data, uint64_t dst_resource, uint64_t src_resource, DXGI_FORMAT format) { return false; }
+   virtual bool OverrideCopyTextureRegion(NativeDevice* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const NativeBox* dst_box, uint64_t& src_resource, uint32_t src_subresource, const NativeBox* src_box) { return false; }
 
    // ============================================================================
    // Shader patching providers. Select which ones a game uses with the

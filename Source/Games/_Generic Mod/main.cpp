@@ -32,6 +32,7 @@ namespace
    int test_bloom_hash = 0;       // The draw becomes the Karis average and the 3 level bloom of its t0, whose mip 0 is copied into the top left of its render target
    float test_mip_lod_bias = 0.f; // The mip bias of the upgraded samplers, applied at present: it reaches the samplers the game writes after it
    int test_viewport_scale_hash = 0; // The draw's viewports and scissors get half their width through "SetGameViewportsD3D12()", and keep it for the draws after it (as a render scale's code does)
+   int test_skip_copy_width = 0;     // The game copies ("OverrideCopyResource()", "OverrideCopyTextureRegion()") into a texture of this width are skipped. "TestSkipCopyWidth" of "[Luma Advanced]" sets it on boot
 #endif
 #if DX11 && DEVELOPMENT
    // The D3D11 side of the parity check of the D3D12 passes (the same input drawn by both, compared per pixel), from "[Luma Advanced]": the draw of the pixel shader "TestPassHash" (hex) becomes
@@ -96,7 +97,8 @@ public:
       {
          shader_hashes_UI.pixel_shaders.emplace(uint32_t(std::strtoul(test_ui_hash_text, nullptr, 16)));
       }
-      Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
+      reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TestSkipCopyWidth", test_skip_copy_width);
+      Mcp::RegisterInts({{"test_skip_copy_width", &test_skip_copy_width, 0, INT_MAX}, {"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
       Mcp::RegisterValues({{"test_mip_lod_bias", &test_mip_lod_bias, -8.f, 8.f}});
 #endif
    }
@@ -358,6 +360,17 @@ public:
 
       return DrawOrDispatchOverrideType::None; // Don't cancel the original draw call
    }
+#if DX12 && DEVELOPMENT
+   // The D3D12 smoke test of the game copy overrides: a copy into a texture of "test_skip_copy_width" is skipped, the destination keeps what it had
+   bool OverrideCopyResource(NativeDevice* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) override
+   {
+      return test_skip_copy_width != 0 && reinterpret_cast<ID3D12Resource*>(dst_resource)->GetDesc().Width == UINT64(test_skip_copy_width);
+   }
+   bool OverrideCopyTextureRegion(NativeDevice* native_device, DeviceData& device_data, uint64_t& dst_resource, uint32_t dst_subresource, const NativeBox* dst_box, uint64_t& src_resource, uint32_t src_subresource, const NativeBox* src_box) override
+   {
+      return test_skip_copy_width != 0 && reinterpret_cast<ID3D12Resource*>(dst_resource)->GetDesc().Width == UINT64(test_skip_copy_width);
+   }
+#endif
    void OnPresent(NativeDevice* native_device, DeviceData& device_data) override
    {
 #if DX12 && DEVELOPMENT
