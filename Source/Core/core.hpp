@@ -281,6 +281,8 @@ using NativeCommandList = ID3D11DeviceContext;
 #include "utils/pipeline.hpp"
 #include "utils/shader_compiler.hpp"
 #include "includes/d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
+// See "DX12", "ENABLE_MINHOOK" and "DEVELOPMENT"
+#include "includes/d3d12_command_signatures.h"
 #include "includes/d3d12_clones.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "includes/d3d12_root_signatures.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "utils/display.hpp"
@@ -3733,6 +3735,17 @@ namespace
       {
          reshade::log::message(reshade::log::level::warning, "[PSO capture] ID3D12Device2::CreatePipelineState isn't hooked for this device, so shader replacements will rebuild its pipelines through ReShade");
       }
+#if DEVELOPMENT
+      // What the game's ExecuteIndirect() commands set, for the frame capture and the MCP's readbacks (see "includes/d3d12_command_signatures.h")
+      if (!D3D12CommandSignatures::Install(native_device))
+      {
+         static std::atomic_flag logged_signatures_failure;
+         if (!logged_signatures_failure.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Frame capture] ID3D12Device::CreateCommandSignature isn't hooked, so the capture can't say what the game's ExecuteIndirect() commands set");
+         }
+      }
+#endif
       // Which of the game's resources are committed, placed or reserved (see "includes/d3d12_resource_creation.h")
       if (!D3D12ResourceCreation::Install(native_device))
       {
@@ -6478,8 +6491,8 @@ namespace
    }
 
    // Finishes a readback at its target command: "reissue" re-issues the command on the native list, then the "plane" of one mip of the layers
-   // "view" covers is copied, where "draw_state" is the state the command left it in (a constant buffer's "buffer" range is copied before its
-   // draw instead). "is_color" is false for depth planes, which multisampled textures can't resolve. Returns true when it re-issued the command
+   // "view" covers is copied, where "draw_state" is the state the command left it in (a constant buffer's or an ExecuteIndirect()'s "buffer"
+   // range is copied before its draw instead, from "draw_state"). "is_color" is false for depth planes, which multisampled textures can't resolve. Returns true when it re-issued the command
    // to copy its output after it, then the original call must be skipped.
    bool RecordReadback(reshade::api::command_list* cmd_list, D3D12Readback::Copy copy, const D3D12State::ViewInfo& view, D3D12_RESOURCE_STATES draw_state, uint32_t plane, ID3D12Resource* buffer, bool is_color, auto&& reissue)
    {
@@ -6525,7 +6538,7 @@ namespace
       {
          auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
          // Before the draw for constant buffers, it doesn't write them
-         const bool recorded = buffer ? D3D12Readback::RecordBufferCopy(&readback, native_device, native_list, buffer, copy.buffer_offset, copy.size, &copy) : D3D12Readback::RecordTextureCopy(&readback, native_device, native_list, resource, draw_state, subresources, copy.data_format, &copy, reissue);
+         const bool recorded = buffer ? D3D12Readback::RecordBufferCopy(&readback, native_device, native_list, buffer, copy.buffer_offset, copy.size, &copy, draw_state) : D3D12Readback::RecordTextureCopy(&readback, native_device, native_list, resource, draw_state, subresources, copy.data_format, &copy, reissue);
          reissued = recorded && !buffer;
          if (!recorded)
          {
@@ -6742,7 +6755,7 @@ namespace
       {
          copy.error = "The game's draw callback skipped this draw";
       }
-      else if (target.kind != Kind::ConstantBuffer && command == D3D12DrawCommand::Other && override_type == DrawOrDispatchOverrideType::None)
+      else if (target.kind != Kind::ConstantBuffer && target.kind != Kind::IndirectArguments && command == D3D12DrawCommand::Other && override_type == DrawOrDispatchOverrideType::None)
       {
          copy.error = "Indirect and mesh draws can't be re-issued to copy their output";
       }
@@ -6857,6 +6870,7 @@ namespace
             }
             else
             {
+               draw_state = D3D12_RESOURCE_STATE_COPY_SOURCE; // No barrier: GENERIC_READ includes it
                const uint64_t buffer_size = buffer->GetDesc().Width;
                copy.buffer_offset = (std::min)(uint64_t(entry.cb_first_constant[target.slot]) * 16, buffer_size);
                // Root constant buffer views have no size: up to what a view can address
@@ -6865,6 +6879,40 @@ namespace
             }
             break;
          }
+#if ENABLE_MINHOOK
+         case Kind::IndirectArguments:
+         {
+            // ExecuteIndirect() requires its arguments in INDIRECT_ARGUMENT (which GENERIC_READ of UPLOAD heaps includes), the copy happens before it.
+            // ponytail: the first 32 commands, and not the count buffer (the GPU may run fewer than "max_count")
+            const std::optional<D3D12CommandSignatures::Call>& call = D3D12CommandSignatures::current_call;
+            D3D12_HEAP_PROPERTIES heap = {};
+            if (!call || !call->signature || call->signature->stride == 0)
+            {
+               copy.error = "The draw isn't an ExecuteIndirect() of a command signature created after Luma's hook";
+            }
+            else if (!call->argument_buffer || FAILED(call->argument_buffer->GetHeapProperties(&heap, nullptr)) || (heap.Type != D3D12_HEAP_TYPE_UPLOAD && heap.Type != D3D12_HEAP_TYPE_DEFAULT))
+            {
+               copy.error = "The argument buffer isn't in an UPLOAD or DEFAULT heap (a reserved or custom heap buffer), its state isn't known";
+            }
+            else
+            {
+               buffer = call->argument_buffer;
+               draw_state = (heap.Type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+               const uint64_t buffer_size = buffer->GetDesc().Width;
+               copy.buffer_offset = (std::min)(call->argument_offset, buffer_size);
+               copy.indirect_stride = call->signature->stride;
+               copy.indirect_commands = uint32_t((std::min)({uint64_t(call->max_count), uint64_t(32), (buffer_size - copy.buffer_offset) / copy.indirect_stride}));
+               copy.indirect_arguments = call->signature->arguments;
+               copy.size = uint64_t(copy.indirect_commands) * copy.indirect_stride;
+               if (copy.size == 0)
+               {
+                  copy.error = "The ExecuteIndirect() runs no command";
+                  buffer = nullptr;
+               }
+            }
+            break;
+         }
+#endif
          }
       }
 
@@ -18004,15 +18052,47 @@ namespace
                                     }
 #endif
 
+#if DX12 && ENABLE_MINHOOK
+                                    // ExecuteIndirect(): what its command signature sets per command (the bindings of those root arguments are each command's, not the ones listed)
+                                    const auto show_indirect_command = [&]
+                                    {
+                                       if (!draw_call_data.draw_dispatch_data.indirect || draw_call_data.indirect_buffer == 0)
+                                          return;
+                                       ImGui::Text("Indirect Commands: up to %u%s", draw_call_data.indirect_max_count, draw_call_data.indirect_count_buffer ? " (and a count buffer)" : "");
+                                       if (!draw_call_data.indirect_signature_known)
+                                       {
+                                          ImGui::Text("Command Signature: unknown (created before Luma's hook)");
+                                          return;
+                                       }
+                                       ImGui::Text("Command Stride: %u", draw_call_data.indirect_stride);
+                                       for (const TraceDrawCallData::IndirectArgument& argument : draw_call_data.indirect_arguments)
+                                       {
+                                          if (argument.register_type != 0)
+                                          {
+                                             ImGui::Text("Per Command: %s %c%u space%u", D3D12CommandSignatures::ArgumentName(argument.type), argument.register_type, argument.shader_register.index, argument.shader_register.space);
+                                          }
+                                          else
+                                          {
+                                             ImGui::Text("Per Command: %s", D3D12CommandSignatures::ArgumentName(argument.type));
+                                          }
+                                       }
+                                    };
+#endif
                                     if (pipeline_pair->second->HasComputeShader())
                                     {
                                        ImGui::Text("Indirect: %s", draw_call_data.draw_dispatch_data.indirect ? "True" : "False");
+#if DX12 && ENABLE_MINHOOK
+                                       show_indirect_command();
+#endif
                                        ImGui::Text("Dispatch Count: %ux%ux%u", draw_call_data.draw_dispatch_data.dispatch_count.x, draw_call_data.draw_dispatch_data.dispatch_count.y, draw_call_data.draw_dispatch_data.dispatch_count.z);
                                        is_first_draw = false;
                                     }
                                     else if (pipeline_pair->second->HasVertexShader())
                                     {
                                        ImGui::Text("Indirect: %s", draw_call_data.draw_dispatch_data.indirect ? "True" : "False");
+#if DX12 && ENABLE_MINHOOK
+                                       show_indirect_command();
+#endif
                                        ImGui::NewLine();
                                        ImGui::Text("Vertex Count: %u", draw_call_data.draw_dispatch_data.vertex_count);
                                        ImGui::Text("Instance Count: %u", draw_call_data.draw_dispatch_data.instance_count);
@@ -23045,6 +23125,9 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          D3D12RootSignatures::Remove();
          D3D12ResourceCreation::Remove();
          D3D12Clones::Remove();
+#if DEVELOPMENT
+         D3D12CommandSignatures::Remove();
+#endif
 #endif
 #if ENABLE_SWAPCHAIN_PROXY
          SwapchainProxy::RemoveHooks();

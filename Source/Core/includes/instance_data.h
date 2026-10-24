@@ -292,6 +292,25 @@ struct TraceDrawCallData
    D3D11_COMPARISON_FUNC samplers_comparison_func[samplers_size] = {};
    std::vector<uint32_t> cb_root_constants[cbs_size]; // The values of root constants (they have no "cb_hash")
    bool uses_descriptor_heap = false; // A shader indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices usually are in the constants
+   // ExecuteIndirect() (with the command signature hooks, see "D3D12CommandSignatures"): the argument buffer range, the most commands and what each command sets,
+   // in the signature's order. The root arguments name their root parameter's register: those bindings are each command's, not the ones the list shows.
+   struct IndirectArgument
+   {
+      D3D12_INDIRECT_ARGUMENT_TYPE type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+      uint32_t root_parameter = UINT32_MAX; // Root constants and views
+      char register_type = 0;               // 'b', 't' or 'u', 0 if the root parameter isn't known
+      ShaderRegister shader_register;
+      uint32_t constant_offset = 0; // Root constants: the first 32 bit value and how many
+      uint32_t constant_count = 0;
+      uint32_t slot = 0; // Vertex buffers
+   };
+   bool indirect_signature_known = false;
+   uint64_t indirect_buffer = 0;
+   uint64_t indirect_offset = 0;
+   uint32_t indirect_max_count = 0;
+   uint32_t indirect_stride = 0;
+   bool indirect_count_buffer = false;
+   std::vector<IndirectArgument> indirect_arguments;
    // A bindless range or a type's packed entries went past their limit: the entries above are incomplete
    bool truncated = false;
    // The table descriptors of the entries above, read when the command list executes: until it's submitted, games can still write

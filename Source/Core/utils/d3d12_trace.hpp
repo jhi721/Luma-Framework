@@ -594,6 +594,68 @@ namespace D3D12Trace
       const D3D12State::RootState& root = is_dispatch ? state.compute : state.graphics;
       const std::shared_lock lock_layouts(device_data->pipeline_layouts.mutex);
       const auto layout_it = device_data->pipeline_layouts.parameters_by_layout.find(root.layout.handle);
+#if ENABLE_MINHOOK
+      // ExecuteIndirect(): what its signature sets per command, the root arguments by the register of their root parameter
+      if (draw_dispatch_data.indirect && D3D12CommandSignatures::current_call)
+      {
+         const D3D12CommandSignatures::Call& call = *D3D12CommandSignatures::current_call;
+         trace_draw_call_data.indirect_buffer = reinterpret_cast<uint64_t>(call.argument_buffer);
+         trace_draw_call_data.indirect_offset = call.argument_offset;
+         trace_draw_call_data.indirect_max_count = call.max_count;
+         trace_draw_call_data.indirect_count_buffer = call.count_buffer != nullptr;
+         if (call.signature)
+         {
+            trace_draw_call_data.indirect_signature_known = true;
+            trace_draw_call_data.indirect_stride = call.signature->stride;
+            const std::vector<D3D12State::RootParameter>* parameters = (layout_it != device_data->pipeline_layouts.parameters_by_layout.end() ? &layout_it->second : nullptr);
+            for (const D3D12_INDIRECT_ARGUMENT_DESC& desc : call.signature->arguments)
+            {
+               TraceDrawCallData::IndirectArgument& argument = trace_draw_call_data.indirect_arguments.emplace_back();
+               argument.type = desc.Type;
+               char register_type = 0;
+               switch (desc.Type)
+               {
+               case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+                  argument.slot = desc.VertexBuffer.Slot;
+                  break;
+               case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+                  argument.root_parameter = desc.Constant.RootParameterIndex;
+                  argument.constant_offset = desc.Constant.DestOffsetIn32BitValues;
+                  argument.constant_count = desc.Constant.Num32BitValuesToSet;
+                  register_type = 'b';
+                  break;
+               case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+                  argument.root_parameter = desc.ConstantBufferView.RootParameterIndex;
+                  register_type = 'b';
+                  break;
+               case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+                  argument.root_parameter = desc.ShaderResourceView.RootParameterIndex;
+                  register_type = 't';
+                  break;
+               case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+                  argument.root_parameter = desc.UnorderedAccessView.RootParameterIndex;
+                  register_type = 'u';
+                  break;
+               default:
+                  break;
+               }
+               if (!parameters || argument.root_parameter >= parameters->size())
+                  continue;
+               const D3D12State::RootParameter& parameter = (*parameters)[argument.root_parameter];
+               if (parameter.type == reshade::api::pipeline_layout_param_type::push_constants)
+               {
+                  argument.shader_register = {.index = parameter.constants.dx_register_index, .space = parameter.constants.dx_register_space};
+                  argument.register_type = register_type;
+               }
+               else if (!parameter.ranges.empty())
+               {
+                  argument.shader_register = {.index = parameter.ranges[0].dx_register_index, .space = parameter.ranges[0].dx_register_space};
+                  argument.register_type = register_type;
+               }
+            }
+         }
+      }
+#endif
       if (layout_it == device_data->pipeline_layouts.parameters_by_layout.end())
          return;
       const std::shared_lock lock_buffers(device_data->buffer_addresses.mutex);

@@ -6,7 +6,8 @@
 // D3D12 has no state queries and Core doesn't track resource states (ReShade's "barrier" event drops subresources), so only what is
 // certain is copied: render targets and unordered access views right after the draw, a depth or stencil plane after a draw whose
 // pipeline writes it, what a copy left in COPY_DEST, a resolve in RESOLVE_DEST, a render target clear in RENDER_TARGET and a depth stencil
-// clear in DEPTH_WRITE, constant buffers in UPLOAD heaps (always GENERIC_READ). The barriers are legacy ones: textures a game manages
+// clear in DEPTH_WRITE, constant buffers in UPLOAD heaps (always GENERIC_READ), an ExecuteIndirect()'s arguments right before it (INDIRECT_ARGUMENT
+// outside UPLOAD heaps). The barriers are legacy ones: textures a game manages
 // with enhanced barrier layouts are outside their interop rules.
 // Completion never waits for a queue inside present (the game can have it wait on a fence it signals after present): a copy gets its own
 // fence, signaled on its queue at a present, and its buffer is read at a later present once that fence passed ("Advance()").
@@ -28,6 +29,8 @@
 
 #include <source/com_ptr.hpp>
 
+#include "d3d12_passes.h"
+
 namespace D3D12Readback
 {
    enum class Kind : uint8_t
@@ -37,6 +40,7 @@ namespace D3D12Readback
       Depth,
       Stencil,
       ConstantBuffer,
+      IndirectArguments, // The commands an ExecuteIndirect() reads from its argument buffer (see "D3D12CommandSignatures")
    };
 
    // What re-issuable copies, resolves and clears do to a resource. Unordered access view clears and uploads aren't here: ReShade passes no
@@ -143,6 +147,10 @@ namespace D3D12Readback
       std::vector<uint32_t> root_constants;
       uint32_t register_index = 0;
       uint32_t register_space = 0;
+      // Indirect arguments: "indirect_commands" commands of "indirect_stride" bytes from "buffer_offset", laid out as "indirect_arguments" says
+      uint32_t indirect_stride = 0;
+      uint32_t indirect_commands = 0;
+      std::vector<D3D12_INDIRECT_ARGUMENT_DESC> indirect_arguments;
    };
 
    // One texture of the dev MCP's "sr_capture": the super resolution tap copies each one the draw has, in the draw's command list
@@ -464,9 +472,9 @@ namespace D3D12Readback
       return true;
    }
 
-   // Records a copy of "size" bytes at "offset" of a buffer in an UPLOAD heap (always GENERIC_READ, which includes COPY_SOURCE, so no barrier).
-   // Expects "state->mutex" (exclusive).
-   bool RecordBufferCopy(State* state, ID3D12Device* device, ID3D12GraphicsCommandList* native_list, ID3D12Resource* resource, uint64_t offset, uint64_t size, Copy* copy)
+   // Records a copy of "size" bytes at "offset" of a buffer: in an UPLOAD heap by default (always GENERIC_READ, which includes COPY_SOURCE, so no
+   // barrier), else in "buffer_state", which it leaves it in. Expects "state->mutex" (exclusive).
+   bool RecordBufferCopy(State* state, ID3D12Device* device, ID3D12GraphicsCommandList* native_list, ID3D12Resource* resource, uint64_t offset, uint64_t size, Copy* copy, D3D12_RESOURCE_STATES buffer_state = D3D12_RESOURCE_STATE_COPY_SOURCE)
    {
       copy->buffer_offset = offset;
       copy->size = size;
@@ -474,7 +482,9 @@ namespace D3D12Readback
       copy->buffer = CreateBuffer(device, D3D12_HEAP_TYPE_READBACK, copy->token_offset + sizeof(uint64_t));
       if (!copy->buffer || !CreateTokens(state, device))
          return false;
+      D3D12Passes::Transition(native_list, resource, buffer_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
       native_list->CopyBufferRegion(copy->buffer.get(), 0, resource, offset, size);
+      D3D12Passes::Transition(native_list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE, buffer_state);
       RecordToken(state, native_list, copy);
       return true;
    }

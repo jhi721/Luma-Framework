@@ -764,6 +764,33 @@ namespace Mcp
       w->Field("indirect", dd.indirect);
       w->Field("topology", uint32_t(entry.primitive_topology));
       w->EndObject();
+#if DX12
+      // ExecuteIndirect(): the signature's arguments, the root ones by register (their bindings are each command's); the values with luma_read_cbuffer indirect
+      if (dd.indirect && entry.indirect_buffer != 0)
+      {
+         w->Key("indirect_command").BeginObject().Field("argument_offset", entry.indirect_offset).Field("max_count", entry.indirect_max_count).Field("count_buffer", entry.indirect_count_buffer);
+         w->Field("signature_known", entry.indirect_signature_known);
+         if (entry.indirect_signature_known)
+         {
+            w->Field("stride", entry.indirect_stride).Key("arguments").BeginArray();
+            for (const TraceDrawCallData::IndirectArgument& argument : entry.indirect_arguments)
+            {
+               w->BeginObject().Field("type", D3D12CommandSignatures::ArgumentName(argument.type));
+               if (argument.root_parameter != UINT32_MAX)
+                  w->Field("root_parameter", argument.root_parameter);
+               if (argument.register_type != 0)
+                  w->Field("register", std::format("{}{}", argument.register_type, argument.shader_register.index)).Field("space", argument.shader_register.space);
+               if (argument.type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT)
+                  w->Field("constant_offset", argument.constant_offset).Field("constant_count", argument.constant_count);
+               if (argument.type == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW)
+                  w->Field("slot", argument.slot);
+               w->EndObject();
+            }
+            w->EndArray();
+         }
+         w->EndObject();
+      }
+#endif
 
 #if DX11 || ENABLE_D3D12_PASSES
       const D3D11_VIEWPORT& viewport_0 = entry.viewports[0]; // Zeroed if none
@@ -2549,15 +2576,16 @@ namespace Mcp
    {
       if (job->phase == 0)
       {
-         // "register" (+ "space") picks the entry by its shader register, "slot" by its packed index in the capture
-         const bool by_register = job->Arg("register") != nullptr;
-         const int64_t slot = job->IntArg(by_register ? "register" : "slot", 0);
+         // "register" (+ "space") picks the entry by its shader register, "slot" by its packed index in the capture, "indirect" reads the commands of an ExecuteIndirect()
+         const bool indirect = job->BoolArg("indirect", false);
+         const bool by_register = !indirect && job->Arg("register") != nullptr;
+         const int64_t slot = (indirect ? 0 : job->IntArg(by_register ? "register" : "slot", 0));
          if (slot < 0 || slot >= (by_register ? INT32_MAX : int64_t(TraceDrawCallData::cbs_size)))
          {
             job->error = by_register ? "\"register\" is out of range" : "\"slot\" is out of range";
             return true;
          }
-         D3D12Readback::Target target = {.kind = D3D12Readback::Kind::ConstantBuffer, .slot = uint32_t(slot)};
+         D3D12Readback::Target target = {.kind = (indirect ? D3D12Readback::Kind::IndirectArguments : D3D12Readback::Kind::ConstantBuffer), .slot = uint32_t(slot)};
          if (by_register)
          {
             target.cb_register = uint32_t(slot);
@@ -2573,7 +2601,7 @@ namespace Mcp
          job->readback_target = std::move(target);
          ArmReadback(job, device_data);
          job->result.Hash("hash", job->shader_hash).Field("stage", job->stage).Field("instance", job->instance);
-         if (!by_register)
+         if (!by_register && !indirect)
          {
             job->result.Field("slot", slot);
          }
@@ -2588,6 +2616,41 @@ namespace Mcp
          return false;
       if (poll == ReadbackPoll::Failed)
          return true;
+#if ENABLE_MINHOOK
+      // An ExecuteIndirect()'s commands: per command, the 32 bit values of each argument in the signature's order (GPU virtual addresses as two)
+      if (copy.indirect_stride != 0)
+      {
+         auto& w = job->result;
+         w.Field("stride", copy.indirect_stride).Field("offset_bytes", copy.buffer_offset).Field("commands_read", copy.indirect_commands).Key("commands").BeginArray();
+         for (uint32_t i = 0; i < copy.indirect_commands; i++)
+         {
+            size_t offset = size_t(i) * copy.indirect_stride;
+            w.BeginArray();
+            for (const D3D12_INDIRECT_ARGUMENT_DESC& argument : copy.indirect_arguments)
+            {
+               const size_t size = D3D12CommandSignatures::ArgumentSize(argument);
+               w.BeginObject().Field("type", D3D12CommandSignatures::ArgumentName(argument.Type));
+               if (size == 0 || offset + size > bytes.size())
+               {
+                  w.Field("error", "unknown size, the rest of the command isn't read").EndObject();
+                  break;
+               }
+               w.Key("values").BeginArray();
+               for (size_t value_offset = offset; value_offset + sizeof(uint32_t) <= offset + size; value_offset += sizeof(uint32_t))
+               {
+                  uint32_t value = 0;
+                  std::memcpy(&value, bytes.data() + value_offset, sizeof(value));
+                  w.Value(value);
+               }
+               w.EndArray().EndObject();
+               offset += size;
+            }
+            w.EndArray();
+         }
+         w.EndArray();
+         return true;
+      }
+#endif
       const bool is_root_constants = !copy.root_constants.empty();
       if (is_root_constants)
       {

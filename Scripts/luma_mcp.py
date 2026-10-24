@@ -223,6 +223,8 @@ TOOLS = [
         {**TARGET, "slot": {"type": "integer", "description": "Constant buffer register b<slot> (D3D12: the packed entry luma_trace_get lists, with register/space)"},
          "register": {"type": "integer", "description": "Instead of slot: the shader register b<register> (D3D12: the draw's entry with that register and space; the error lists the draw's registers. D3D11: same as slot)"},
          "space": {"type": "integer", "description": "With register, D3D12: the register space (default 0)"},
+         "indirect": {"type": "boolean", "description": "D3D12, an ExecuteIndirect() entry: read its commands from the argument buffer instead (up to 32, each argument's "
+                      "32 bit values in the signature's order; luma_trace_get lists the arguments)"},
          "frames": {"type": "integer", "description": "Consecutive frames to read (default 1)"},
          "rows": {"type": "string", "description": "With frames: float4 rows to print per frame, e.g. \"0-3,12\" (default: the rows that change)"}},
         [],
@@ -756,6 +758,8 @@ def format_row(floats, uints, row):
 
 
 def postprocess_cbuffer(result, rows_spec):
+    if "commands" in result:  # An ExecuteIndirect()'s commands, already decoded
+        return
     if "series" in result:
         frames = []
         for entry in result.pop("series"):

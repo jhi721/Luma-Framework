@@ -35,6 +35,7 @@
 #include <include/reshade.hpp>
 #include <source/com_ptr.hpp>
 
+#include "d3d12_command_signatures.h"
 #include "d3d12_passes.h"
 #include "d3d12_resource_creation.h"
 #include "d3d12_state.h"
@@ -1168,6 +1169,9 @@ namespace D3D12Clones
       installed_all &= SetDescriptorHeapsHook::Install(vtable, &SetDescriptorHeapsDetour);
       installed_all &= BeginRenderPassHook::Install(vtable, &BeginRenderPassDetour);
       installed_all &= EndRenderPassHook::Install(vtable, &EndRenderPassDetour);
+#endif
+#if DEVELOPMENT
+      installed_all &= D3D12CommandSignatures::InstallListHook(vtable);
 #endif
       if (!installed_all)
       {
