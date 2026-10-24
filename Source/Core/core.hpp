@@ -979,6 +979,9 @@ namespace
    WNDPROC game_window_custom_proc = nullptr;
 #endif
    thread_local bool last_swapchain_linear_space = false;
+   // Set by "OnCreateSwapchain()": the format the game asked for the swapchain, and the one it sees on it (equal unless upgraded)
+   reshade::api::format last_swapchain_vanilla_format = reshade::api::format::unknown;
+   reshade::api::format last_swapchain_seen_format = reshade::api::format::unknown;
 #if DX12
    // Set by "OnCreateSwapchain()" for "OnInitSwapchain()": the swapchain upgrade changed the format family of the swapchain (the game made it with another one)
    thread_local bool last_swapchain_format_upgraded = false;
@@ -4128,6 +4131,14 @@ namespace
 
       // There's only one swapchain so it's fine if this is global ("OnInitSwapchain()" will always be called later anyway)
       bool changed = false;
+      // Some games (Yakuza Kiwami) resize the swapchain with the format its description reports, which is the one we upgraded it to
+      // (or the proxies' fp16): they still render for their vanilla one
+      if (desc.back_buffer.texture.format == last_swapchain_seen_format && last_swapchain_seen_format != last_swapchain_vanilla_format)
+      {
+         desc.back_buffer.texture.format = last_swapchain_vanilla_format;
+         changed = true;
+      }
+      last_swapchain_vanilla_format = desc.back_buffer.texture.format;
 #if DX12
       // ReShade tells the format the game asked for, also when it resized with DXGI_FORMAT_UNKNOWN (it keeps the game's description, the add-ons' changes are not in it)
       const reshade::api::format game_back_buffer_format = desc.back_buffer.texture.format;
@@ -4190,7 +4201,6 @@ namespace
          changed = true;
       }
 
-      // Note that occasionally this breaks after resizing the swapchain, because some games resize the swapchain maintaining whatever format it had before
       last_swapchain_linear_space = desc.back_buffer.texture.format == reshade::api::format::r8g8b8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::b8g8r8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::r16g16b16a16_float;
 #if GAME_FF7_REMAKE
       last_swapchain_format = desc.back_buffer.texture.format;
@@ -4204,12 +4214,13 @@ namespace
          changed = true;
       }
 
-#if DX12
       // The back buffers the game sees: the fp16 proxies of a proxied swapchain, whatever the real buffers are
       const bool proxied = ENABLE_SWAPCHAIN_PROXY && swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type == SwapchainUpgradeType::scRGB;
       const reshade::api::format seen_back_buffer_format = (proxied ? reshade::api::format::r16g16b16a16_float : desc.back_buffer.texture.format);
+#if DX12
       last_swapchain_format_upgraded = (GetTypelessFormat(DXGI_FORMAT(game_back_buffer_format)) != GetTypelessFormat(DXGI_FORMAT(seen_back_buffer_format)));
 #endif
+      last_swapchain_seen_format = seen_back_buffer_format;
       return changed;
    }
 
