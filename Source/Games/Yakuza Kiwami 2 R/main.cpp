@@ -77,13 +77,17 @@ public:
          game_device_data.grade_output = render_target.resource;
          return DrawOrDispatchOverrideType::None;
       }
-      // The copy into the UI target is the one at the swapchain's width (the bloom chain's are smaller). Its source, the grade output, is in a
-      // shader resource state there and the UI target in a render target state, which SMAA and RCAS need.
+      // The copy into the UI target is the one at the swapchain's width into a target the game made B8G8R8A8: the bloom chain's are smaller,
+      // and its two other copies at that width write R11G11B10 / fp16 targets. Its source, the grade output, is in a shader resource state
+      // there and the UI target in a render target state, which SMAA and RCAS need.
       const uint64_t grade_output = game_device_data.grade_output;
       if ((g_smaa || g_rcas_sharpness > 0.f) && grade_output != 0 && original_shader_hashes.Contains(PIXEL_SHADER_COPY, reshade::api::shader_stage::pixel) && render_target.resource != 0)
       {
          reshade::api::device* const device = cmd_list_data.cmd_list->get_device();
-         if (device->get_resource_desc({render_target.resource}).texture.width != device_data.output_resolution.x)
+         // The format the game created the pipeline with, which Luma's upgrades (the target's clone, the pipeline's variant) leave as it was
+         const DXGI_FORMAT game_format = (cmd_list_data.bound_cached_pipeline ? cmd_list_data.bound_cached_pipeline->render_target_formats[0] : DXGI_FORMAT_UNKNOWN);
+         const bool is_ui_target_format = game_format == DXGI_FORMAT_B8G8R8A8_UNORM || game_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || game_format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+         if (!is_ui_target_format || device->get_resource_desc({render_target.resource}).texture.width != device_data.output_resolution.x)
          {
             return DrawOrDispatchOverrideType::None;
          }
