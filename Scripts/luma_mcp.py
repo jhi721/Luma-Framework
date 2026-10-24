@@ -149,7 +149,7 @@ TOOLS = [
         "see luma_dev_values kind texture) at present: its last content, usually this frame's. "
         "D3D12: view=srv needs index and reads the resource right after the entry that last wrote it (draw, dispatch, copy, resolve or clear; "
         "producer_index). Copy, resolve and clear entries read by index what they wrote (rtv, or depth/stencil); uploads, UAV clears and buffer copies "
-        "are refused, resolves re-run as average (resolve_mode). No ui view; registered: views are Luma's own textures (core.smaa_edges, core.smaa_weights, core.bloom with mip=, core.sr_output).",
+        "are refused, resolves re-run in the game's mode (resolve_mode). No ui view; registered: views are Luma's own textures (core.smaa_edges, core.smaa_weights, core.bloom with mip=, core.sr_output).",
         {**TARGET,
          **READ_TARGET,
          **OUT_DIR,

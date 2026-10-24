@@ -2412,7 +2412,7 @@ namespace Mcp
             job->result.Field("written_by", job->stage).Field("resource", job->written_resource);
             if (job->readback_target->write.kind == D3D12Readback::WriteKind::Resolve)
             {
-               job->result.Field("resolve_mode", "average: re-issued so, ReShade drops a ResolveSubresourceRegion's MIN or MAX mode");
+               job->result.Field("resolve_mode", "the game's: re-issued in it (Luma hooks ResolveSubresourceRegion, ReShade's event drops the mode)");
             }
          }
          else

@@ -699,6 +699,7 @@ namespace D3D12Clones
    constexpr size_t CLEAR_UNORDERED_ACCESS_VIEW_UINT_SLOT = 49;
    constexpr size_t CLEAR_UNORDERED_ACCESS_VIEW_FLOAT_SLOT = 50;
    constexpr size_t DISCARD_RESOURCE_SLOT = 51;
+   constexpr size_t RESOLVE_SUBRESOURCE_REGION_SLOT = 64; // "ID3D12GraphicsCommandList1"'s, after "OMSetDepthBounds" and "SetSamplePositions"
    constexpr size_t BARRIER_SLOT = 80;
 
    // The views of a game's texture are created on its clone (once it is active, see "RouteView()"), so the descriptors (which ReShade copies and
@@ -867,6 +868,7 @@ namespace D3D12Clones
    using ClearUnorderedAccessViewUintHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT[4], UINT, const D3D12_RECT*), CLEAR_UNORDERED_ACCESS_VIEW_UINT_SLOT>;
    using ClearUnorderedAccessViewFloatHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const FLOAT[4], UINT, const D3D12_RECT*), CLEAR_UNORDERED_ACCESS_VIEW_FLOAT_SLOT>;
    using DiscardResourceHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, const D3D12_DISCARD_REGION*), DISCARD_RESOURCE_SLOT>;
+   using ResolveSubresourceRegionHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList1*, ID3D12Resource*, UINT, UINT, UINT, ID3D12Resource*, UINT, D3D12_RECT*, DXGI_FORMAT, D3D12_RESOLVE_MODE), RESOLVE_SUBRESOURCE_REGION_SLOT>;
    using SetDescriptorHeapsHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*), SET_DESCRIPTOR_HEAPS_SLOT>;
 
    // Each barrier of the game on a texture that has a clone is followed by the same one on the clone, so the clone goes through the states
@@ -969,6 +971,17 @@ namespace D3D12Clones
       }
    }
 
+   // Not about the clones: ReShade's "resolve_texture_region" event doesn't carry the mode of a "ResolveSubresourceRegion()" and fires inside the call, on this thread, so the event's handler
+   // reads it here. Any other resolve is AVERAGE.
+   inline thread_local D3D12_RESOLVE_MODE current_resolve_mode = D3D12_RESOLVE_MODE_AVERAGE;
+
+   inline void STDMETHODCALLTYPE ResolveSubresourceRegionDetour(ID3D12GraphicsCommandList1* list, ID3D12Resource* dest, UINT dest_subresource, UINT dest_x, UINT dest_y, ID3D12Resource* source, UINT source_subresource, D3D12_RECT* source_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode)
+   {
+      current_resolve_mode = mode;
+      ResolveSubresourceRegionHook::hooked.original(list, dest, dest_subresource, dest_x, dest_y, source, source_subresource, source_rect, format, mode);
+      current_resolve_mode = D3D12_RESOLVE_MODE_AVERAGE;
+   }
+
 #if ENABLE_D3D12_PASSES
    // Not about the clones: the Luma passes drawn on the game's lists give its descriptor heaps back with what this keeps (see "D3D12State::GameDescriptorHeaps")
    inline void STDMETHODCALLTYPE SetDescriptorHeapsDetour(ID3D12GraphicsCommandList* list, UINT heap_count, ID3D12DescriptorHeap* const* heaps)
@@ -1002,6 +1015,7 @@ namespace D3D12Clones
       installed_all &= ClearUnorderedAccessViewUintHook::Install(vtable, &ClearUnorderedAccessViewUintDetour);
       installed_all &= ClearUnorderedAccessViewFloatHook::Install(vtable, &ClearUnorderedAccessViewFloatDetour);
       installed_all &= DiscardResourceHook::Install(vtable, &DiscardResourceDetour);
+      installed_all &= ResolveSubresourceRegionHook::Install(vtable, &ResolveSubresourceRegionDetour);
 #if ENABLE_D3D12_PASSES
       installed_all &= SetDescriptorHeapsHook::Install(vtable, &SetDescriptorHeapsDetour);
 #endif
@@ -1101,6 +1115,7 @@ namespace D3D12Clones
       removed_all &= ClearUnorderedAccessViewUintHook::Remove();
       removed_all &= ClearUnorderedAccessViewFloatHook::Remove();
       removed_all &= DiscardResourceHook::Remove();
+      removed_all &= ResolveSubresourceRegionHook::Remove();
       removed_all &= SetDescriptorHeapsHook::Remove();
       command_list_hooks_installed.store(false, std::memory_order_release);
       return removed_all;

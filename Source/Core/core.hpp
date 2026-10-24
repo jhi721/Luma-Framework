@@ -6958,9 +6958,8 @@ namespace
       }
       else if (is_resolve && (write.source == write.resource || is_depth || write.resolve_format == DXGI_FORMAT_UNKNOWN || IsTypelessFormat(write.resolve_format) || IsIntFormat(write.resolve_format) || write.resolve_format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE || write.resolve_format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE))
       {
-         // ReShade drops the mode of "ResolveSubresourceRegion()", so resolves are re-issued with AVERAGE, the only mode of
-         // "ResolveSubresource()": depth, integer and sampler feedback formats can't use it. A MIN or MAX region resolve of a color format
-         // (both work with any render target format) reads, and draws that frame, averaged.
+         // Resolves are re-issued in the game's mode ("D3D12Clones::current_resolve_mode", see "OnResolveTextureRegion()"); depth, integer and
+         // sampler feedback formats stay refused (their modes aren't validated here).
          copy.error = "Only resolves of color float, unorm and snorm formats are re-issued, not depth, integer, typeless or sampler feedback ones, nor a resource resolved into itself";
       }
       else if (desc.SampleDesc.Count > 1 && !is_depth && native_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -8763,6 +8762,12 @@ namespace
       return true;
    }
 
+   // Whether Luma changed the format of a texture: one of "resource_upgrades.upgraded_resources", or a back buffer whose format family the swapchain upgrade changed ("device_data.mutex" must be held)
+   bool IsUpgradedTexture(const DeviceData& device_data, reshade::api::resource resource)
+   {
+      return device_data.resource_upgrades.upgraded_resources.contains(resource.handle) || device_data.upgraded_back_buffers.contains(resource.handle);
+   }
+
 #if ENABLE_D3D12_PASSES
    // The descriptors of the passes drawn on the game's command lists rotate over this many presents (how far behind a game list may run), with this many draws
    // of a pass per present
@@ -9487,12 +9492,13 @@ namespace
    // source or destination of, and a barrier on a resource in the common state may name any promotable state as its before state (COPY_SOURCE, COPY_DEST and the shader resource states are, for
    // textures), so the copy states below hold for the textures a game copies through promotion too. A source promoted to a read state decays to the common state when the list executes, a
    // destination promoted to a write state stays in COPY_DEST: the destination ends in COPY_DEST, as the copy it replaces leaves it, and the source in the common state, from which the game's
-   // later barriers (before state COPY_SOURCE or COMMON) and promotions are valid whether it transitioned the source explicitly or relied on promotion.
+   // later barriers (before state COPY_SOURCE or COMMON) and promotions are valid whether it transitioned the source explicitly or relied on promotion. "dest_state" is the state the destination is
+   // in and stays in: the copy destination one, or the resolve destination one of a resolve's ("ConvertResolveD3D12()"), which the copy into a destination that can't be drawn into goes through.
    // A texture created with an enhanced barriers layout ("D3D12ResourceCreation::MayBeInLayout()") can't take legacy barriers, and the layout the game's copy found it in isn't known: a source
    // like that is copied (the copy the game's own is, valid in whatever layout) into an intermediate, which the draw samples, and a destination like that is drawn into through an intermediate
    // that is then copied into it, so the game's textures are only ever copied.
    // ponytail: that is a copy more than known layouts would need; track them (barrier events) to transition the textures instead
-   bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled)
+   bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled, reshade::api::resource_usage dest_state = reshade::api::resource_usage::copy_dest)
    {
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
       if (RefusedInRenderPass(cmd_list_data, "Texture Copy"))
@@ -9546,6 +9552,10 @@ namespace
       if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (!scaled && (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT))
          || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || (!scaled && !same_size)
          || (!source_in_layout && (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0))
+      {
+         return false;
+      }
+      if (dest_in_layout && dest_state != reshade::api::resource_usage::copy_dest) // No layout to put a resolve's destination in to copy into it
       {
          return false;
       }
@@ -9633,7 +9643,7 @@ namespace
       }
       if (draws_into_dest)
       {
-         cmd_list->barrier(dest, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::render_target);
+         cmd_list->barrier(dest, dest_state, reshade::api::resource_usage::render_target);
       }
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
       cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, texture_copy.layout, 0, 1, &table);
@@ -9651,12 +9661,21 @@ namespace
       cmd_list->barrier(sampled_source, reshade::api::resource_usage::shader_resource_pixel, (source_in_layout ? reshade::api::resource_usage::copy_dest : reshade::api::resource_usage::general));
       if (draws_into_dest)
       {
-         cmd_list->barrier(dest, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_dest);
+         cmd_list->barrier(dest, reshade::api::resource_usage::render_target, dest_state);
       }
       else
       {
+         const bool dest_needs_copy_state = (dest_state != reshade::api::resource_usage::copy_dest);
          cmd_list->barrier(target, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
+         if (dest_needs_copy_state)
+         {
+            cmd_list->barrier(dest, dest_state, reshade::api::resource_usage::copy_dest);
+         }
          cmd_list->copy_resource(target, dest);
+         if (dest_needs_copy_state)
+         {
+            cmd_list->barrier(dest, reshade::api::resource_usage::copy_dest, dest_state);
+         }
          cmd_list->barrier(target, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
       }
 
@@ -9664,13 +9683,64 @@ namespace
       RestoreGameGraphicsD3D12(cmd_list_data);
       return true;
    }
-#endif // ENABLE_D3D12_PASSES
 
-   // Whether Luma changed the format of a texture: one of "resource_upgrades.upgraded_resources", or a back buffer whose format family the swapchain upgrade changed ("device_data.mutex" must be held)
-   bool IsUpgradedTexture(const DeviceData& device_data, reshade::api::resource resource)
+   // The whole resolve of a multisampled texture into a single sample one of another format family (an upgraded one and a plain one) or of another size (a clone, see "includes/d3d12_clones.h"),
+   // which D3D12's resolve can't make: the source is resolved into an intermediate of its own format and size ("GetD3D12CopyIntermediate()", a resolve destination), in "mode" (a resolve is a
+   // resolve of the game's: MIN and MAX included), and "ConvertTextureCopyD3D12()" draws that into the destination, in the resolve destination state the game's resolve found it in and leaves it in.
+   // The source stays as it is: the resolve of the intermediate is valid wherever the game's is. "format" is the one the game resolves in, which is the source's own unless Luma upgraded it (then the
+   // upgraded format: the game named the original one). False if it can't be converted (the caller skips the resolve then): the intermediate may have been resolved into, which nothing reads.
+   bool ConvertResolveD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode)
    {
-      return device_data.resource_upgrades.upgraded_resources.contains(resource.handle) || device_data.upgraded_back_buffers.contains(resource.handle);
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      if (RefusedInRenderPass(cmd_list_data, "Texture Copy"))
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
+      const reshade::api::resource_desc dest_desc = device->get_resource_desc(dest);
+      if (source_desc.type != reshade::api::resource_type::texture_2d || source_desc.texture.samples <= 1 || source_desc.texture.depth_or_layers != 1 || source_desc.texture.levels != 1 || dest_desc.type != reshade::api::resource_type::texture_2d || dest_desc.texture.samples != 1)
+      {
+         return false;
+      }
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      bool source_upgraded = false;
+      {
+         const std::shared_lock lock(device_data.mutex);
+         source_upgraded = IsUpgradedTexture(device_data, source);
+      }
+      reshade::api::resource_desc resolved_desc = source_desc;
+      resolved_desc.texture.samples = 1;
+      resolved_desc.usage = reshade::api::resource_usage::copy_source | reshade::api::resource_usage::resolve_dest | reshade::api::resource_usage::shader_resource;
+      resolved_desc.flags = reshade::api::resource_flags::none;
+      reshade::api::resource resolved = {};
+      {
+         const std::unique_lock lock(device_data.texture_copy.mutex); // "ConvertTextureCopyD3D12()" takes it again
+         resolved = GetD3D12CopyIntermediate(device_data, device, resolved_desc, reshade::api::resource_usage::copy_source);
+      }
+      if (resolved.handle == 0)
+      {
+         return false;
+      }
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      auto* const native_resolved = reinterpret_cast<ID3D12Resource*>(resolved.handle);
+      auto* const native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
+      const DXGI_FORMAT resolve_format = (source_upgraded ? DXGI_FORMAT(source_desc.texture.format) : format);
+      cmd_list->barrier(resolved, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::resolve_dest);
+      com_ptr<ID3D12GraphicsCommandList1> native_list_1;
+      native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
+      if (native_list_1)
+      {
+         native_list_1->ResolveSubresourceRegion(native_resolved, 0, 0, 0, native_source, 0, nullptr, resolve_format, mode);
+      }
+      else
+      {
+         native_list->ResolveSubresource(native_resolved, 0, native_source, 0, resolve_format);
+      }
+      cmd_list->barrier(resolved, reshade::api::resource_usage::resolve_dest, reshade::api::resource_usage::copy_source);
+      return ConvertTextureCopyD3D12(cmd_list, resolved, dest, scaled, reshade::api::resource_usage::resolve_dest);
    }
+#endif // ENABLE_D3D12_PASSES
 
    // The format of a texture as the device has it (the upgraded one), unknown for a buffer
    DXGI_FORMAT GetTextureFormat(reshade::api::device* device, reshade::api::resource resource)
@@ -9701,7 +9771,8 @@ namespace
    enum class CopyExtent : uint8_t
    {
       Whole,        // All of both textures, which can be converted
-      Part,         // A subresource or a region of one, or a resolve
+      WholeResolve, // A resolve of all of both textures, which can be converted too
+      Part,         // A subresource or a region of one, or a resolve of those
       ThroughBuffer // An upload or a readback, through a buffer's footprint
    };
 
@@ -9711,8 +9782,8 @@ namespace
    // of the same family only name the game's format: see "OnResolveTextureRegion()".
    // Returns true to skip the game's copy (it was converted, or can't be made).
    // A clone of another size (custom dimensions, see "includes/d3d12_clones.h") takes part in the copy: D3D12 can't copy it into (or from) the game's size either, whatever the formats,
-   // so a whole copy is stretched by a draw and the others are skipped.
-   bool SkipUpgradedFormatCopy(reshade::api::command_list* cmd_list, const char* copy_kind, reshade::api::resource source, reshade::api::resource dest, CopyExtent extent)
+   // so a whole copy is stretched by a draw and the others are skipped. "resolve_format" and "resolve_mode" are the game's for a resolve ("ConvertResolveD3D12()").
+   bool SkipUpgradedFormatCopy(reshade::api::command_list* cmd_list, const char* copy_kind, reshade::api::resource source, reshade::api::resource dest, CopyExtent extent, DXGI_FORMAT resolve_format = DXGI_FORMAT_UNKNOWN, D3D12_RESOLVE_MODE resolve_mode = D3D12_RESOLVE_MODE_AVERAGE)
    {
       const bool through_buffer = (extent == CopyExtent::ThroughBuffer);
       if (swapchain_format_upgrade_type == TextureFormatUpgradesType::None && texture_format_upgrades_type == TextureFormatUpgradesType::None) // Optimization
@@ -9750,7 +9821,7 @@ namespace
       }
 #endif
 #if ENABLE_D3D12_PASSES
-      const bool converted = (extent == CopyExtent::Whole && enable_upgraded_texture_resource_copy_redirection && ConvertTextureCopyD3D12(cmd_list, source, dest, scaled));
+      const bool converted = (enable_upgraded_texture_resource_copy_redirection && ((extent == CopyExtent::Whole && ConvertTextureCopyD3D12(cmd_list, source, dest, scaled)) || (extent == CopyExtent::WholeResolve && ConvertResolveD3D12(cmd_list, source, dest, scaled, resolve_format, resolve_mode))));
 #else
       constexpr bool converted = false;
 #endif
@@ -9889,8 +9960,8 @@ namespace
 
    // A resolve names the format to resolve in, which the game took from the textures it created: once Luma upgraded them it is the wrong one, and D3D12 rejects it. When the two textures are of the same format
    // family (an upgraded multisampled target resolved into an upgraded target or back buffer: both R16G16B16A16 FLOAT now) only the format is wrong, and the resolve is re-issued with the textures' own, like
-   // the D3D11 path does. ReShade's event doesn't carry the mode of a "ResolveSubresourceRegion()": the re-issue averages (the mode of "ResolveSubresource()"), so a MIN or MAX region resolve of a color texture
-   // comes out averaged. Textures of other families can't be resolved into each other, "SkipUpgradedFormatCopy()" skips those (a later phase converts them).
+   // the D3D11 path does, in the mode of the game's ("D3D12Clones::current_resolve_mode": ReShade's event doesn't carry it). Textures of other families, or of another size (a clone), can't be resolved into
+   // each other: "SkipUpgradedFormatCopy()" has the whole resolve between them made by a draw ("ConvertResolveD3D12()"), and skips the others.
    bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
@@ -9899,8 +9970,14 @@ namespace
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
 #endif
       const bool redirected = RedirectToClones(&source, &dest);
+#if ENABLE_MINHOOK
+      const D3D12_RESOLVE_MODE resolve_mode = D3D12Clones::current_resolve_mode;
+#else
+      constexpr D3D12_RESOLVE_MODE resolve_mode = D3D12_RESOLVE_MODE_AVERAGE;
+#endif
+      const bool whole = (source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0);
       // Like D3D11 (where it is only for the indirect upgrades' mirrors): a whole resolve between substituted resources can be made by the game
-      if (redirected && source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0 &&
+      if (redirected && whole &&
           game->OverrideResolveTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle,
              GetTextureFormat(cmd_list->get_device(), source)))
       {
@@ -9929,7 +10006,7 @@ namespace
             }
          }
       }
-      if (!format_corrected && SkipUpgradedFormatCopy(cmd_list, "resolve_texture_region", source, dest, CopyExtent::Part))
+      if (SkipUpgradedFormatCopy(cmd_list, "resolve_texture_region", source, dest, (whole ? CopyExtent::WholeResolve : CopyExtent::Part), DXGI_FORMAT(format), resolve_mode))
       {
          return true;
       }
@@ -9937,7 +10014,7 @@ namespace
       {
          auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
          auto* native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
-         if (!source_box && dest_x == 0 && dest_y == 0)
+         if (!source_box && dest_x == 0 && dest_y == 0 && resolve_mode == D3D12_RESOLVE_MODE_AVERAGE)
          {
             native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, resolve_format);
          }
@@ -9948,7 +10025,7 @@ namespace
             if (native_list_1)
             {
                D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
-               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, D3D12_RESOLVE_MODE_AVERAGE);
+               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, resolve_mode);
             }
          }
       };
