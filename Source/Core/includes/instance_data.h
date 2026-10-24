@@ -775,8 +775,13 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Resources:
 
 #if ENABLE_SR
+#if DX12
+   com_ptr<ID3D12Resource> sr_output_color;
+   com_ptr<ID3D12Resource> sr_exposure;
+#else
    com_ptr<ID3D11Texture2D> sr_output_color;
    com_ptr<ID3D11Texture2D> sr_exposure;
+#endif
    float sr_exposure_texture_value = 1.f;
 #endif // ENABLE_SR
 

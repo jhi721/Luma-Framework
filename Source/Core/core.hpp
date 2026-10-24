@@ -199,9 +199,9 @@ using NativeCommandList = ID3D11DeviceContext;
 
 #if !DX12
 #define DX11 1
-#elif ENABLE_SR
-// The D3D12 paths of NGX and FidelityFX aren't written yet
-#error "Super resolution is D3D11 only"
+#elif ENABLE_FIDELITY_SK || ENABLE_LUMA_TAA
+// Only DLSS (NGX) has a D3D12 path so far
+#error "FSR and Luma TAA are D3D11 only"
 #endif
 // Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom): release builds track the graphics state they replace too, to
 // bind it again after them (see "D3D12State::RestoreGraphics()")
@@ -3593,12 +3593,14 @@ namespace
 #endif // DX11
 
 #if ENABLE_SR
-      com_ptr<IDXGIAdapter> native_adapter;
+      com_ptr<IDXGIAdapter> native_adapter; // Unused by DLSS, which is all D3D12 has
+#if DX11
       if (SUCCEEDED(hr))
       {
          hr = native_dxgi_device->GetAdapter(&native_adapter);
          assert(SUCCEEDED(hr));
       }
+#endif
 
       bool selected_sr_implementation = false;
       for (auto& sr_implementation : sr_implementations)
@@ -21085,7 +21087,7 @@ void Init(bool async)
 #endif
 #if DEVELOPMENT
    Mcp::Start();
-#if ENABLE_SR
+#if ENABLE_SR && DX11
    // Games call through these pointers, so the MCP tap sees every settings update and draw
    for (auto& [type, implementation] : sr_implementations)
    {

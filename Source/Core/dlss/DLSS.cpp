@@ -11,8 +11,20 @@
 #include <cstring>
 #include <cassert>
 #include <unordered_set>
+#include <vector>
 #include <wrl/client.h>
+#if DX12
+#include <d3d12.h>
+// NGX names its entry points per API, with the same arguments
+#define NGX_D3D(name) NVSDK_NGX_D3D12_##name
+#define NGX_D3D_CREATE_DLSS_EXT(command_list, ...) NGX_D3D12_CREATE_DLSS_EXT(command_list, 1, 1, __VA_ARGS__) // Single GPU node
+#define NGX_D3D_EVALUATE_DLSS_EXT NGX_D3D12_EVALUATE_DLSS_EXT
+#else
 #include <d3d11.h>
+#define NGX_D3D(name) NVSDK_NGX_D3D11_##name
+#define NGX_D3D_CREATE_DLSS_EXT NGX_D3D11_CREATE_DLSS_EXT
+#define NGX_D3D_EVALUATE_DLSS_EXT NGX_D3D11_EVALUATE_DLSS_EXT
+#endif
 
 // Should be <= the max (last) of NVSDK_NGX_PerfQuality_Value
 #define NUM_PERF_QUALITY_MODES 6
@@ -28,7 +40,9 @@ namespace NGX
 	{
 		NVSDK_NGX_Handle* super_sampling_feature = nullptr;
 		NVSDK_NGX_Parameter* runtime_params = nullptr;
+#if !DX12 // A D3D11 feature is used on the context it was created on, a D3D12 one on any command list
 		Microsoft::WRL::ComPtr<ID3D11DeviceContext>	command_list;
+#endif
 	};
 
 	struct DLSSInstanceData : public SR::InstanceData
@@ -42,59 +56,97 @@ namespace NGX
 		std::unordered_set<NVSDK_NGX_Parameter*>	unique_parameters;
 		// Current global capabilities params (independent from the current settings/res).
 		NVSDK_NGX_Parameter*								capabilities_params = nullptr;
-		Microsoft::WRL::ComPtr<ID3D11Device>		device;
+		Microsoft::WRL::ComPtr<SR::Device>			device;
 		// Set by a successful draw into a new output ("DrawData::output_recreated")
 		mutable bool										recreate_feature = false;
+#if DX12
+		// D3D12 command lists that evaluated a replaced feature can still be running, so it's released a few "UpdateSettings()" (frames) later.
+		// ponytail: a feature replaced right before DLSS is turned off waits for the next "UpdateSettings()" or the shutdown.
+		struct RetiredFeature
+		{
+			DLSSInternalInstance instance;
+			uint64_t settings_update = 0;
+		};
+		std::vector<RetiredFeature> retired_features;
+		uint64_t settings_updates = 0;
+#endif
 
 		virtual ~DLSSInstanceData()
 		{
 			// Just to be explicit
 			device.Reset();
+#if !DX12
 			instance.command_list.Reset();
+#endif
 
 			// We need to release these at the end, otherwise DLSS crashes as it holds references to them (there's probably a way to release them as they come but it doesn't really matter)
 			for (NVSDK_NGX_Handle* handle : unique_handles)
 			{
 				if (handle != nullptr)
 				{
-					assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_ReleaseFeature(handle)));
+					assert(NVSDK_NGX_SUCCEED(NGX_D3D(ReleaseFeature)(handle)));
 				}
 			}
 			for (NVSDK_NGX_Parameter* parameter : unique_parameters)
 			{
 				if (parameter != nullptr)
 				{
-					assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_DestroyParameters(parameter)));
+					assert(NVSDK_NGX_SUCCEED(NGX_D3D(DestroyParameters)(parameter)));
 				}
 			}
 
 			if (capabilities_params != nullptr)
 			{
-				assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_DestroyParameters(capabilities_params)));
+				assert(NVSDK_NGX_SUCCEED(NGX_D3D(DestroyParameters)(capabilities_params)));
+			}
+		}
+
+		void ReleaseFeature(const DLSSInternalInstance& released)
+		{
+			if (released.super_sampling_feature != nullptr)
+			{
+				NGX_D3D(ReleaseFeature)(released.super_sampling_feature);
+				unique_handles.erase(released.super_sampling_feature);
+			}
+			if (released.runtime_params != nullptr)
+			{
+				NGX_D3D(DestroyParameters)(released.runtime_params);
+				unique_parameters.erase(released.runtime_params);
 			}
 		}
 
 		void ReleaseSuperSamplingFeature()
 		{
-			if (instance.super_sampling_feature != nullptr)
-			{
-				NVSDK_NGX_D3D11_ReleaseFeature(instance.super_sampling_feature);
-				unique_handles.erase(instance.super_sampling_feature);
-			}
-			if (instance.runtime_params != nullptr)
-			{
-				NVSDK_NGX_D3D11_DestroyParameters(instance.runtime_params);
-				unique_parameters.erase(instance.runtime_params);
-			}
+#if DX12
+			retired_features.push_back({.instance = instance, .settings_update = settings_updates});
+#else
+			ReleaseFeature(instance);
+#endif
 			instance = {};
 		}
 
+#if DX12
+		void ReleaseRetiredFeatures()
+		{
+			// A swapchain has up to 3 frames in flight
+			std::erase_if(retired_features, [this](const RetiredFeature& retired)
+			{
+				if (settings_updates - retired.settings_update <= 3)
+				{
+					return false;
+				}
+				ReleaseFeature(retired.instance);
+				return true;
+			});
+		}
+#endif
+
 		// Based on "settings_data" 
-		DLSSInternalInstance CreateSuperSamplingFeature(ID3D11DeviceContext* command_list, int quality_value)
+		DLSSInternalInstance CreateSuperSamplingFeature(SR::CommandList* command_list, int quality_value)
 		{
 			NVSDK_NGX_Parameter* runtime_params = nullptr;
 			// Note: this could fail on outdated drivers
-			NVSDK_NGX_Result param_result = NVSDK_NGX_D3D11_AllocateParameters(&runtime_params);
+			NVSDK_NGX_Result param_result = NGX_D3D(AllocateParameters)(&runtime_params);
 			assert(NVSDK_NGX_SUCCEED(param_result));
 			if (NVSDK_NGX_FAILED(param_result))
 			{
@@ -156,7 +208,7 @@ namespace NGX
 			create_params.Feature.InPerfQualityValue = perf_quality_value;
 			create_params.InFeatureCreateFlags = create_flags;
 
-			NVSDK_NGX_Result create_result = NGX_D3D11_CREATE_DLSS_EXT(
+			NVSDK_NGX_Result create_result = NGX_D3D_CREATE_DLSS_EXT(
 				command_list,
 				&feature,
 				runtime_params,
@@ -170,7 +222,7 @@ namespace NGX
 
 				create_params.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced;
 
-				create_result = NGX_D3D11_CREATE_DLSS_EXT(
+				create_result = NGX_D3D_CREATE_DLSS_EXT(
 					command_list,
 					&feature,
 					runtime_params,
@@ -181,12 +233,16 @@ namespace NGX
 			// If this mode creation failed, it's likely it will always fail anyway.
 			assert(NVSDK_NGX_SUCCEED(create_result));
 
+#if DX12
+			return DLSSInternalInstance{ feature, runtime_params };
+#else
 			return DLSSInternalInstance{ feature, runtime_params, command_list };
+#endif
 		}
 	};
 }
 
-bool NGX::DLSS::Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter* adapter)
+bool NGX::DLSS::Init(SR::InstanceData*& data, SR::Device* device, IDXGIAdapter* adapter)
 {
 	if (data)
 	{
@@ -208,7 +264,7 @@ bool NGX::DLSS::Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter
 		};
 		feature_info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
 #endif
-		NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, data_path, device, &feature_info);
+		NVSDK_NGX_Result result = NGX_D3D(Init_with_ProjectID)(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, data_path, device, &feature_info);
 
 		if (NVSDK_NGX_SUCCEED(result))
 		{
@@ -217,7 +273,7 @@ bool NGX::DLSS::Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter
 
 			custom_data->min_resolution = 32; // DLSS doesn't support output below 32x32
 
-			result = NVSDK_NGX_D3D11_GetCapabilityParameters(&custom_data->capabilities_params);
+			result = NGX_D3D(GetCapabilityParameters)(&custom_data->capabilities_params);
 			assert(NVSDK_NGX_SUCCEED(result));
 		}
 
@@ -254,7 +310,7 @@ bool NGX::DLSS::Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter
 	return custom_data != nullptr && custom_data->is_supported;
 }
 
-void NGX::DLSS::Deinit(SR::InstanceData*& data, ID3D11Device* optional_device)
+void NGX::DLSS::Deinit(SR::InstanceData*& data, SR::Device* optional_device)
 {
 	auto& custom_data = reinterpret_cast<DLSSInstanceData*&>(data);
 
@@ -273,7 +329,7 @@ void NGX::DLSS::Deinit(SR::InstanceData*& data, ID3D11Device* optional_device)
 		delete custom_data;
 		custom_data = nullptr;
 
-		assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_Shutdown1(optional_device)));
+		assert(NVSDK_NGX_SUCCEED(NGX_D3D(Shutdown1)(optional_device)));
 	}
 }
 
@@ -301,7 +357,7 @@ int NGX::DLSS::GetJitterPhases(const SR::InstanceData* data) const
    return SR::GetDlssJitterPhases(data->settings_data.render_height, data->settings_data.output_height);
 }
 
-bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* command_list, const SR::SettingsData& settings_data)
+bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, SR::CommandList* command_list, const SR::SettingsData& settings_data)
 {
 	auto& custom_data = reinterpret_cast<DLSSInstanceData*&>(data);
 
@@ -309,7 +365,12 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 	if (!command_list || !custom_data || !custom_data->is_supported)
 		return false;
 
-#ifndef NDEBUG 
+#if DX12
+	custom_data->settings_updates++;
+	custom_data->ReleaseRetiredFeatures();
+	constexpr bool same_command_list = true;
+#else
+#ifndef NDEBUG
 	Microsoft::WRL::ComPtr<ID3D11Device> device;
 	command_list->GetDevice(device.GetAddressOf());
 	assert(custom_data->device.Get() == device.Get());
@@ -318,12 +379,14 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 	device->GetImmediateContext(&immediate_context);
 	assert(immediate_context.Get() == command_list); // DLSS only supports the immediate context apparently (both here and in the actual draw function)!
 #endif
+	const bool same_command_list = custom_data->instance.command_list.Get() == command_list;
+#endif
 
 	bool feature_instance_created = custom_data->instance.super_sampling_feature != nullptr && custom_data->instance.runtime_params != nullptr;
 
 	// No need to re-instantiate DLSS "features" if all the params are the same
 	if (settings_data == custom_data->settings_data
-		&& custom_data->instance.command_list.Get() == command_list && feature_instance_created && !custom_data->recreate_feature)
+		&& same_command_list && feature_instance_created && !custom_data->recreate_feature)
 	{
 		return true;
 	}
@@ -401,7 +464,7 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 	return custom_data->instance.super_sampling_feature != nullptr && custom_data->instance.runtime_params != nullptr;
 }
 
-bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data)
+bool NGX::DLSS::Draw(const SR::InstanceData* data, SR::CommandList* command_list, const DrawData& draw_data)
 {
 	const auto& custom_data = reinterpret_cast<const DLSSInstanceData*&>(data);
 
@@ -411,9 +474,11 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
 	{
 		return false;
 	}
+#if !DX12
 	assert(custom_data->instance.command_list.Get() == command_list);
+#endif
 
-	NVSDK_NGX_D3D11_DLSS_Eval_Params eval_params;
+	NGX_D3D(DLSS_Eval_Params) eval_params;
 	memset(&eval_params, 0, sizeof(eval_params));
 
 	auto render_width = draw_data.render_width;
@@ -446,7 +511,7 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
 	eval_params.InJitterOffsetX = draw_data.jitter_x;
 	eval_params.InJitterOffsetY = draw_data.jitter_y;
 
-	NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(
+	NVSDK_NGX_Result result = NGX_D3D_EVALUATE_DLSS_EXT(
 		command_list,
 		custom_data->instance.super_sampling_feature,
 		custom_data->instance.runtime_params,
