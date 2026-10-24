@@ -9003,14 +9003,26 @@ namespace
       }
    }
 
+   // SMAA T2x on D3D12, the counterpart of the D3D11 "SMAAT2xPasses": the natives (the hashes of their names) of the game's blending weight and neighborhood blending pixel shaders built
+   // with "SMAA_SUBSAMPLE_INDICES" and "SMAA_REPROJECTION" (see "SMAA_Passes.hlsl"), and "velocity" (viewed as 2D "velocity_format", in a pixel shader readable state as "color" is), which the
+   // neighborhood blend reads at t2. Its target then holds the velocity length in alpha, for the game's temporal resolve.
+   struct SMAAT2xD3D12
+   {
+      uint32_t blending_weight_calculation_ps = 0;
+      uint32_t neighborhood_blending_ps = 0;
+      reshade::api::resource velocity = {};
+      reshade::api::format velocity_format = reshade::api::format::unknown;
+   };
+
    // SMAA of "color" (viewed as 2D "color_format") into the whole "target" (through the view "target_desc"), recorded on the game's command list from a game's
    // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawSMAA()", with the contract of "DrawRCAS()" (resource states, restore, false = nothing recorded).
    // The edge detection reads "color" too: a gamma encoded one is filtered in linear light with "SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR". "predication" (optional, as 2D
    // "predication_format") is the edge detection's t1. The game's "Luma_SMAA_impl.hlsl" gets "SMAA_RT_METRICS" (the target's) then "game_constants" as cbuffer b1.
    // It doesn't draw on its first call, which asks the next present for its area and search textures. With "rcas_sharpness" > 0 (and "ENABLE_RCAS"), the blend goes
    // into an intermediate of the target's format that "DrawRCAS()" sharpens into the target (the blend goes into the target if RCAS can't draw).
-   // ponytail: no stencil mask of the edges (the blending weights run on every pixel, with the same result), no T2x
-   bool DrawSMAA(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource color, reshade::api::format color_format, reshade::api::resource predication, reshade::api::format predication_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, const float (&game_constants)[4], float rcas_sharpness = 0.f)
+   // With "t2x" the blends are the variants of that, and RCAS isn't applied (the target's alpha is the velocity length, which the game's resolve reads).
+   // ponytail: no stencil mask of the edges (the blending weights run on every pixel, with the same result)
+   bool DrawSMAA(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource color, reshade::api::format color_format, reshade::api::resource predication, reshade::api::format predication_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, const float (&game_constants)[4], float rcas_sharpness = 0.f, const SMAAT2xD3D12* t2x = nullptr)
    {
       ASSERT_ONCE(ENABLE_RCAS || rcas_sharpness == 0.f);
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
@@ -9042,8 +9054,8 @@ namespace
       }
       const DXGI_FORMAT target_format = DXGI_FORMAT(target_desc.format);
       ID3D12PipelineState* const edge_detection_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Edge Detection PS"), DXGI_FORMAT_R8G8_UNORM, "SMAA");
-      ID3D12PipelineState* const blending_weight_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Blending Weight Calculation VS"), CompileTimeStringHash("SMAA Blending Weight Calculation PS"), DXGI_FORMAT_R8G8B8A8_UNORM, "SMAA");
-      ID3D12PipelineState* const neighborhood_blending_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Neighborhood Blending VS"), CompileTimeStringHash("SMAA Neighborhood Blending PS"), target_format, "SMAA");
+      ID3D12PipelineState* const blending_weight_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Blending Weight Calculation VS"), (t2x ? t2x->blending_weight_calculation_ps : CompileTimeStringHash("SMAA Blending Weight Calculation PS")), DXGI_FORMAT_R8G8B8A8_UNORM, "SMAA");
+      ID3D12PipelineState* const neighborhood_blending_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Neighborhood Blending VS"), (t2x ? t2x->neighborhood_blending_ps : CompileTimeStringHash("SMAA Neighborhood Blending PS")), target_format, "SMAA");
       if (!edge_detection_pipeline || !blending_weight_pipeline || !neighborhood_blending_pipeline)
       {
          return false;
@@ -9052,7 +9064,7 @@ namespace
       const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
       const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
       const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
-      const bool sharpen = ENABLE_RCAS && rcas_sharpness > 0.f;
+      const bool sharpen = ENABLE_RCAS && rcas_sharpness > 0.f && !t2x;
       const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
       // The intermediates follow the target's size (and format, for the blend's). The views only hold CPU descriptors (the tables and the bindings copy them), but a game
       // list that still runs may read the old textures
@@ -9109,12 +9121,14 @@ namespace
       reshade::api::resource_view color_view = {};
       reshade::api::resource_view predication_view = {};
       reshade::api::resource_view target_view = {};
+      reshade::api::resource_view velocity_view = {};
       const bool created_views = device->create_resource_view(color, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, color_format, 0, 1, 0, 1}, &color_view) &&
                                  (predication == 0 || device->create_resource_view(predication, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, predication_format, 0, 1, 0, 1}, &predication_view)) &&
+                                 (!t2x || device->create_resource_view(t2x->velocity, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, t2x->velocity_format, 0, 1, 0, 1}, &velocity_view)) &&
                                  device->create_resource_view(target, reshade::api::resource_usage::render_target, target_desc, &target_view);
       if (!created_views)
       {
-         for (const reshade::api::resource_view view : {color_view, predication_view, target_view})
+         for (const reshade::api::resource_view view : {color_view, predication_view, velocity_view, target_view})
          {
             device->destroy_resource_view(view);
          }
@@ -9123,15 +9137,16 @@ namespace
       // The descriptors a pass doesn't read are left as they were
       const reshade::api::resource_view edge_detection_srvs[] = {color_view, predication_view};
       const reshade::api::resource_view blending_weight_srvs[] = {smaa.edges_srv, smaa.area_srv, smaa.search_srv};
-      const reshade::api::resource_view neighborhood_blending_srvs[] = {color_view, smaa.weights_srv};
+      const reshade::api::resource_view neighborhood_blending_srvs[] = {color_view, smaa.weights_srv, velocity_view};
       const reshade::api::descriptor_table_update updates[] = {
          {.table = tables[0], .count = predication == 0 ? 1u : 2u, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = edge_detection_srvs},
          {.table = tables[1], .count = uint32_t(std::size(blending_weight_srvs)), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = blending_weight_srvs},
-         {.table = tables[2], .count = uint32_t(std::size(neighborhood_blending_srvs)), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = neighborhood_blending_srvs},
+         {.table = tables[2], .count = (t2x ? uint32_t(std::size(neighborhood_blending_srvs)) : 2u), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = neighborhood_blending_srvs},
       };
       device->update_descriptor_tables(uint32_t(std::size(updates)), updates);
       device->destroy_resource_view(color_view);
       device->destroy_resource_view(predication_view);
+      device->destroy_resource_view(velocity_view);
 
       const float constants[8] = {1.f / float(width), 1.f / float(height), float(width), float(height), game_constants[0], game_constants[1], game_constants[2], game_constants[3]};
       cmd_list->push_constants(reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, smaa.layout, 0, 0, uint32_t(std::size(constants)), constants);
@@ -9162,7 +9177,7 @@ namespace
       cmd_list->barrier(smaa.weights, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
 
       // Before its sharpening ("DrawRCAS()" traces itself)
-      TraceLumaPass(&cmd_list_data, device_data, "Luma SMAA", {{.resource = color.handle, .format = color_format}, {.resource = predication.handle, .format = predication_format}},
+      TraceLumaPass(&cmd_list_data, device_data, "Luma SMAA", {{.resource = color.handle, .format = color_format}, {.resource = predication.handle, .format = predication_format}, {.resource = (t2x ? t2x->velocity.handle : 0), .format = (t2x ? t2x->velocity_format : reshade::api::format::unknown)}},
          {{.resource = target.handle, .format = target_desc.format, .first_level = target_desc.texture.first_level, .first_layer = target_desc.texture.first_layer, .layer_count = (std::max)(target_desc.texture.layers, 1u)}});
 #if ENABLE_RCAS
       if (sharpen)
