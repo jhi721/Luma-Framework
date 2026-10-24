@@ -4014,7 +4014,11 @@ namespace
          auto& texture_copy = device_data.texture_copy;
          const std::unique_lock lock(texture_copy.mutex);
          destroy_game_pass(&texture_copy);
-         destroy_resources({&texture_copy.target});
+         for (const auto& intermediate : texture_copy.intermediates)
+         {
+            device->destroy_resource(intermediate.resource);
+         }
+         texture_copy.intermediates.clear();
       }
 #endif
 #if ENABLE_MINHOOK
@@ -9447,13 +9451,47 @@ namespace
    }
 #endif // ENABLE_BLOOM
 
+   // The texture "desc" asks for (its usage, size and format are the key) that the copy conversions go through, made on first use in "initial_usage" and kept: a game converts textures of different
+   // sizes and formats in one frame. The oldest goes (retired, see "RetireD3D12GamePassResource()") when there are too many. "device_data.texture_copy.mutex" is held. Null if the device refuses it.
+   reshade::api::resource GetD3D12CopyIntermediate(DeviceData& device_data, reshade::api::device* device, const reshade::api::resource_desc& desc, reshade::api::resource_usage initial_usage)
+   {
+      auto& texture_copy = device_data.texture_copy;
+      // The rest of the desc is the same for every whole single subresource texture (a "memcmp()" would compare the padding too)
+      const auto found = std::ranges::find_if(texture_copy.intermediates, [&](const DeviceData::TextureCopyD3D12::Intermediate& intermediate)
+         { return intermediate.usage == desc.usage && intermediate.width == desc.texture.width && intermediate.height == desc.texture.height && intermediate.format == desc.texture.format; });
+      if (found != texture_copy.intermediates.end())
+      {
+         return found->resource;
+      }
+      constexpr size_t MAX_INTERMEDIATES = 16;
+      if (texture_copy.intermediates.size() >= MAX_INTERMEDIATES)
+      {
+         RetireD3D12GamePassResource(&texture_copy, device_data.present_count.load(std::memory_order_relaxed), &texture_copy.intermediates.front().resource);
+         texture_copy.intermediates.erase(texture_copy.intermediates.begin());
+      }
+      reshade::api::resource made = {};
+      if (!device->create_resource(desc, nullptr, initial_usage, &made))
+      {
+         return {};
+      }
+      texture_copy.intermediates.push_back({.resource = made, .usage = desc.usage, .width = desc.texture.width, .height = desc.texture.height, .format = desc.texture.format});
+      return made;
+   }
+
    // The copy of a texture Luma upgraded into one of another format family, or back (see "SkipUpgradedFormatCopy()"), which D3D12's copies can't make: "Copy PS" draws it instead, like the D3D11
    // "OnCopyResource_Internal()", and the destination keeps its own precision. Whole 2D textures of the same size with one mip, layer and sample, R16G16B16A16 FLOAT against the R8G8B8A8, B8G8R8A8,
    // B8G8R8X8, R10G10B10A2 and R11G11B10 families. With "scaled" (one of them is a clone of another size, see "includes/d3d12_clones.h") the sizes differ and the families can be the same:
-   // "Scale PS" stretches it bilinearly. The textures are in the states of the game's copy (copy source and copy destination) and are left in them; a destination that can't be a render
-   // target is drawn through an intermediate of its desc that can, then copied. False, with nothing recorded, if it can't (the caller skips the copy then).
-   // ponytail: legacy barriers from the copy states, so a texture still in the common state (promoted by the copy itself) or created in an enhanced barriers layout gets a debug layer error; track
-   // their states if a game copies those across formats
+   // "Scale PS" stretches it bilinearly. The textures are in the states of the game's copy (copy source and copy destination): a destination that can't be a render target is drawn through an
+   // intermediate of its desc that can, then copied. False, with nothing recorded, if it can't (the caller skips the copy then).
+   // States ("Using Resource Barriers to Synchronize Resource States in Direct3D 12", "Implicit State Transitions"): a texture in the common state is promoted to a copy state by the copy it is the
+   // source or destination of, and a barrier on a resource in the common state may name any promotable state as its before state (COPY_SOURCE, COPY_DEST and the shader resource states are, for
+   // textures), so the copy states below hold for the textures a game copies through promotion too. A source promoted to a read state decays to the common state when the list executes, a
+   // destination promoted to a write state stays in COPY_DEST: the destination ends in COPY_DEST, as the copy it replaces leaves it, and the source in the common state, from which the game's
+   // later barriers (before state COPY_SOURCE or COMMON) and promotions are valid whether it transitioned the source explicitly or relied on promotion.
+   // A texture created with an enhanced barriers layout ("D3D12ResourceCreation::MayBeInLayout()") can't take legacy barriers, and the layout the game's copy found it in isn't known: a source
+   // like that is copied (the copy the game's own is, valid in whatever layout) into an intermediate, which the draw samples, and a destination like that is drawn into through an intermediate
+   // that is then copied into it, so the game's textures are only ever copied.
+   // ponytail: that is a copy more than known layouts would need; track them (barrier events) to transition the textures instead
    bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled)
    {
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
@@ -9498,9 +9536,16 @@ namespace
       const DXGI_FORMAT source_view_format = view_format(source_desc.texture.format);
       const DXGI_FORMAT dest_view_format = view_format(dest_desc.texture.format);
       const bool same_size = (source_desc.texture.width == dest_desc.texture.width && source_desc.texture.height == dest_desc.texture.height);
+#if ENABLE_MINHOOK
+      const bool source_in_layout = D3D12ResourceCreation::MayBeInLayout(source.handle);
+      const bool dest_in_layout = D3D12ResourceCreation::MayBeInLayout(dest.handle);
+#else
+      constexpr bool source_in_layout = false;
+      constexpr bool dest_in_layout = false;
+#endif
       if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (!scaled && (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT))
          || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || (!scaled && !same_size)
-         || (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0)
+         || (!source_in_layout && (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0))
       {
          return false;
       }
@@ -9533,32 +9578,37 @@ namespace
          return false;
       }
 
-      const bool draws_into_dest = (dest_desc.usage & reshade::api::resource_usage::render_target) != 0;
+      reshade::api::resource sampled_source = source;
+      if (source_in_layout)
+      {
+         reshade::api::resource_desc copied_desc = source_desc;
+         copied_desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
+         copied_desc.flags = reshade::api::resource_flags::none;
+         sampled_source = GetD3D12CopyIntermediate(device_data, device, copied_desc, reshade::api::resource_usage::copy_dest);
+         if (sampled_source.handle == 0)
+         {
+            return false;
+         }
+      }
+      const bool draws_into_dest = (!dest_in_layout && (dest_desc.usage & reshade::api::resource_usage::render_target) != 0);
+      reshade::api::resource target = dest;
       if (!draws_into_dest)
       {
          reshade::api::resource_desc target_desc = dest_desc;
          target_desc.usage = reshade::api::resource_usage::render_target | reshade::api::resource_usage::copy_source;
          target_desc.flags = reshade::api::resource_flags::none;
-         // The rest of the desc is the same for every whole single subresource texture (a "memcmp()" would compare the padding too)
-         const reshade::api::resource_desc& made_desc = texture_copy.target_desc;
-         if (texture_copy.target.handle == 0 || made_desc.texture.width != target_desc.texture.width || made_desc.texture.height != target_desc.texture.height || made_desc.texture.format != target_desc.texture.format)
+         target = GetD3D12CopyIntermediate(device_data, device, target_desc, reshade::api::resource_usage::render_target);
+         if (target.handle == 0)
          {
-            RetireD3D12GamePassResource(&texture_copy, device_data.present_count.load(std::memory_order_relaxed), &texture_copy.target);
-            if (!device->create_resource(target_desc, nullptr, reshade::api::resource_usage::render_target, &texture_copy.target))
-            {
-               texture_copy.target = {};
-               return false;
-            }
-            texture_copy.target_desc = target_desc;
+            return false;
          }
       }
-      const reshade::api::resource target = (draws_into_dest ? dest : texture_copy.target);
 
       const reshade::api::resource_view_desc source_view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format(source_view_format), 0, 1, 0, 1);
       const reshade::api::resource_view_desc target_view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format(dest_view_format), 0, 1, 0, 1);
       reshade::api::resource_view source_view = {};
       reshade::api::resource_view target_view = {};
-      if (!device->create_resource_view(source, reshade::api::resource_usage::shader_resource, source_view_desc, &source_view) || !device->create_resource_view(target, reshade::api::resource_usage::render_target, target_view_desc, &target_view))
+      if (!device->create_resource_view(sampled_source, reshade::api::resource_usage::shader_resource, source_view_desc, &source_view) || !device->create_resource_view(target, reshade::api::resource_usage::render_target, target_view_desc, &target_view))
       {
          if (source_view.handle != 0)
          {
@@ -9572,7 +9622,15 @@ namespace
       // The table and the render target binding take copies of the descriptors
       device->destroy_resource_view(source_view);
 
-      cmd_list->barrier(source, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource_pixel);
+      if (source_in_layout)
+      {
+         cmd_list->copy_resource(source, sampled_source);
+         cmd_list->barrier(sampled_source, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource_pixel);
+      }
+      else
+      {
+         cmd_list->barrier(source, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource_pixel);
+      }
       if (draws_into_dest)
       {
          cmd_list->barrier(dest, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::render_target);
@@ -9590,7 +9648,7 @@ namespace
       cmd_list->bind_pipeline_states(1, &topology_state, &topology);
       cmd_list->draw(4, 1, 0, 0);
 
-      cmd_list->barrier(source, reshade::api::resource_usage::shader_resource_pixel, reshade::api::resource_usage::copy_source);
+      cmd_list->barrier(sampled_source, reshade::api::resource_usage::shader_resource_pixel, (source_in_layout ? reshade::api::resource_usage::copy_dest : reshade::api::resource_usage::general));
       if (draws_into_dest)
       {
          cmd_list->barrier(dest, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_dest);
@@ -13271,6 +13329,11 @@ namespace
 #endif
 #endif
 #if DX12 && ENABLE_MINHOOK
+      if (D3D12ResourceCreation::current_creation_arguments.uses_layouts && desc.type != reshade::api::resource_type::buffer)
+      {
+         const std::unique_lock lock_layouts(D3D12ResourceCreation::layout_textures_mutex);
+         D3D12ResourceCreation::layout_textures.emplace(resource.handle);
+      }
       // The clone of a placed texture, or of a committed one with indirect upgrades (see "includes/d3d12_clones.h"): the original stays as the game made it, the clone is the upgraded one
       if (const PendingClone pending = std::exchange(pending_clone, {}); pending.format != DXGI_FORMAT_UNKNOWN)
       {
@@ -13286,6 +13349,11 @@ namespace
 #if DEVELOPMENT
                device_data.resource_upgrades.original_upgraded_resources_formats[clone_handle] = desc.texture.format;
 #endif
+            }
+            if (D3D12ResourceCreation::current_creation_arguments.uses_layouts)
+            {
+               const std::unique_lock lock_layouts(D3D12ResourceCreation::layout_textures_mutex);
+               D3D12ResourceCreation::layout_textures.emplace(clone_handle);
             }
 #if DEVELOPMENT
             const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
@@ -13567,10 +13635,12 @@ namespace
 #endif
 #endif
 #if DX12 && ENABLE_MINHOOK
+      D3D12ResourceCreation::ForgetLayoutTexture(resource.handle);
       // A placed texture's clone is released once the GPU is done with it, and unregistered like an upgraded texture
       if (const ID3D12Resource* const clone = D3D12Clones::Retire(reinterpret_cast<ID3D12Resource*>(resource.handle)))
       {
          const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
+         D3D12ResourceCreation::ForgetLayoutTexture(clone_handle);
          {
             const std::unique_lock lock_upgrades(device_data.mutex);
             device_data.resource_upgrades.upgraded_resources.erase(clone_handle);

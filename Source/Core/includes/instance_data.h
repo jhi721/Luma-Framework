@@ -932,12 +932,20 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       uint32_t mip_count = 0;
    } bloom;
 #endif
-   // "ConvertTextureCopyD3D12()": a table of t0. The render target it draws into when the copy's destination can't be one, made again for another desc, in a render
-   // target state between draws
+   // "ConvertTextureCopyD3D12()": a table of t0, and the textures it goes through, one for each usage, size and format the game's copies had (see "GetD3D12CopyIntermediate()"): the render
+   // target it draws into when the copy's destination can't be one (or may be in a layout), in a render target state between draws, and the texture it samples when the copy's source may be in a
+   // layout (a copy of the source), in a copy destination state between draws
    struct TextureCopyD3D12 : GamePassD3D12
    {
-      reshade::api::resource target = {};
-      reshade::api::resource_desc target_desc = {};
+      struct Intermediate
+      {
+         reshade::api::resource resource = {};
+         reshade::api::resource_usage usage = reshade::api::resource_usage::undefined;
+         uint32_t width = 0;
+         uint32_t height = 0;
+         reshade::api::format format = reshade::api::format::unknown;
+      };
+      std::vector<Intermediate> intermediates;
    } texture_copy;
 #endif
 #endif

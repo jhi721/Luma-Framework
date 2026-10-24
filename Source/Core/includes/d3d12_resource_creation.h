@@ -24,6 +24,7 @@
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <Windows.h>
@@ -262,6 +263,32 @@ namespace D3D12ResourceCreation
       std::shared_mutex mutex;
       std::unordered_map<uint64_t, Kind> by_resource;
    };
+
+   // The textures created with a layout (CreatePlacedResource2, CreateCommittedResource3, and their clones), which sit in whatever layout the game's enhanced barriers put them in: the
+   // legacy resource barriers of a Luma pass are invalid on them.
+   // ponytail: a texture created with a state and moved by "Barrier()" isn't known to be in a layout; track "Barrier()" per texture if a game does that
+   inline std::shared_mutex layout_textures_mutex;
+   inline std::unordered_set<uint64_t> layout_textures;
+
+   // True if the texture (an "ID3D12Resource" pointer) was created with a layout
+   inline bool MayBeInLayout(uint64_t texture)
+   {
+      const std::shared_lock lock(layout_textures_mutex);
+      return layout_textures.contains(texture);
+   }
+
+   inline void ForgetLayoutTexture(uint64_t texture)
+   {
+      {
+         const std::shared_lock lock(layout_textures_mutex); // Most destroyed resources aren't in it, and a game can destroy many a frame
+         if (!layout_textures.contains(texture))
+         {
+            return;
+         }
+      }
+      const std::unique_lock lock(layout_textures_mutex);
+      layout_textures.erase(texture);
+   }
 } // namespace D3D12ResourceCreation
 
 #endif // DX12 && ENABLE_MINHOOK
