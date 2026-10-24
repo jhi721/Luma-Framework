@@ -136,7 +136,7 @@ TOOLS = [
         "luma_trace_get",
         "Full state of one captured entry: RTV/SRV/UAV/DSV resource and view formats and sizes, blend per RT, depth/stencil (func, write, stencil ref/ops), "
         "rasterizer (cull, scissor enable, depth clip/bias), all viewports and scissor rects, samplers (filter, address, mip bias), bound cbuffers (with D3D11.1 ranges), "
-        "input layout, draw/dispatch arguments, copy kind/regions (copy, region, resolve, buffer), clear values, custom shader file and compilation errors. "
+        "input layout, draw/dispatch arguments, copy kind/regions (copy, region, resolve, buffer), the source/target resources of copies, clears, CPU writes and Luma passes, clear values, custom shader file and compilation errors. "
         "The state is recorded before the game mod's draw hook runs: a viewport it scales, a blend or shader it swaps in are not shown "
         "(read the result with luma_read_resource instead).",
         {"index": {"type": "integer", "description": "Entry index from luma_trace_list"}}, ["index"],
