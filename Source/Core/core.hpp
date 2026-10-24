@@ -11326,15 +11326,21 @@ namespace
    }
 
 #if DX12
-   // D3D12 samplers are descriptors, which the game writes ("CreateSampler()", "CreateSampler2()"): the heap ones are upgraded as they are written.
-   // ponytail: the static samplers of root signatures stay the game's, and a later "texture_mip_lod_bias_offset" doesn't reach the descriptors written
-   // before it (the D3D11 path swaps samplers at bind); rewrite the tracked descriptors when a D3D12 game needs a live bias (super resolution)
+   // D3D12 samplers are descriptors, which the game writes ("CreateSampler()", "CreateSampler2()"): the heap ones are upgraded as they are written, and written
+   // again when the upgrade changes ("D3D12Clones::RewriteSamplers()"). ReShade also passes the static samplers of root signatures 1.0 and 1.1 here, which the
+   // root signature hook upgraded already ("UpgradeStaticSamplerD3D12()"). Static samplers are immutable: they keep the upgrade of when their root signature was created.
    bool OnCreateSampler(reshade::api::device* device, reshade::api::sampler_desc& desc)
    {
       if (ignore_upgraded_samplers)
       {
          return false;
       }
+#if ENABLE_MINHOOK
+      if (D3D12RootSignatures::static_samplers_upgraded)
+      {
+         return false;
+      }
+#endif
       D3D12_SAMPLER_DESC native_desc = {.Filter = D3D12_FILTER(desc.filter), .AddressU = D3D12_TEXTURE_ADDRESS_MODE(desc.address_u), .AddressV = D3D12_TEXTURE_ADDRESS_MODE(desc.address_v), .AddressW = D3D12_TEXTURE_ADDRESS_MODE(desc.address_w), .MipLODBias = desc.mip_lod_bias, .MaxAnisotropy = UINT(desc.max_anisotropy), .ComparisonFunc = D3D12_COMPARISON_FUNC(desc.compare_op), .MinLOD = desc.min_lod, .MaxLOD = desc.max_lod};
       const DeviceData* const device_data = device->get_private_data<DeviceData>();
       if (!device_data)
@@ -11358,8 +11364,7 @@ namespace
    }
 
 #if ENABLE_MINHOOK
-   // The root signature hook's upgrade of root signature 1.2 static samplers, which ReShade doesn't pass to "OnCreateSampler()" (see "D3D12RootSignatures::Hook"). The bias is the first
-   // device's: games have one
+   // The root signature hook's upgrade of static samplers, made in the blob ReShade gets (see "D3D12RootSignatures::Hook"). The bias is the first device's: games have one
    bool UpgradeStaticSamplerD3D12(D3D12_STATIC_SAMPLER_DESC1* desc)
    {
       if (ignore_upgraded_samplers)

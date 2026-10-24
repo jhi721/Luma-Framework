@@ -8,7 +8,7 @@
 // mask) and fails the game's create if the rebuild fails. So the blob is rewritten before ReShade sees it: a detour on the
 // "CreateRootSignature" of ReShade's device proxy (one function for every proxy) appends the CBVs with the D3D12 runtime's own
 // (de)serializer, at the blob's own version, and ReShade creates the result as it would the game's. The root signatures that can't take
-// the CBVs (see "Skip") go through as they came.
+// the CBVs (see "Skip") go through without them. The static samplers are upgraded in the same rewrite, CBVs or not.
 // Include it where "utils/shader_compiler.hpp" can be included: that header relies on "Globals", "Hash" and <fstream> coming before it.
 
 #include <algorithm>
@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <mutex>
 #include <shared_mutex>
@@ -97,16 +98,17 @@ namespace D3D12RootSignatures
       // The runtime's exports, which Luma doesn't link
       PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER create_deserializer = nullptr;
       PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE serialize = nullptr;
-      // Set by the user of the header, optional: changes a root signature 1.2 static sampler and says whether it did. ReShade doesn't pass those to its "create_sampler" event
-      // (the older versions' static samplers go through it), so the upgrade of the samplers has to be made here, on the blob ReShade creates the root signature from.
-      // Called under the detour, any thread
+      // Set by the user of the header, optional: changes a static sampler (of any version: the older ones come as a 1.2 one with no flags) and says whether it did.
+      // ReShade doesn't pass root signature 1.2 static samplers to its "create_sampler" event, and the older versions' make it rebuild the root signature from its own
+      // model when an add-on changes one, so the samplers are upgraded here, on the blob ReShade creates the root signature from. Called under the detour, any thread
       bool (*upgrade_static_sampler)(D3D12_STATIC_SAMPLER_DESC1* desc) = nullptr;
    };
    // Shared by the devices: ReShade's proxies all lead to one function, hooked once per process
    inline Hook hook;
 
-   // Appends our CBVs to a serialized root signature, or says why it can't. "rewritten" and "params" are only written on success,
-   // "parameter_count" is the root signature's own (0 if it couldn't be deserialized). Needs "Install()" to have found the runtime's exports.
+   // Appends our CBVs to a serialized root signature and upgrades its static samplers ("Hook::upgrade_static_sampler"). The result is about the CBVs: why they couldn't go in,
+   // "Skip::None" if they did. "rewritten" is written when the blob changed (the CBVs, the samplers or both), "params" when the CBVs went in, "parameter_count" is the
+   // root signature's own (0 if it couldn't be deserialized). Needs "Install()" to have found the runtime's exports.
    // "static_samplers", if given, gets the static samplers of a root signature 1.2 (ReShade skips them) as the game made them, or as "Hook::upgrade_static_sampler" changed them in the
    // rewritten one: it is written whatever the result, nothing for the older versions.
    inline Skip Rewrite(std::span<const std::byte> blob, uint32_t settings_register, int32_t data_register, std::vector<std::byte>* rewritten, LumaParams* params, uint32_t* parameter_count, std::vector<D3D12_STATIC_SAMPLER_DESC1>* static_samplers = nullptr)
@@ -143,19 +145,10 @@ namespace D3D12RootSignatures
       };
 
       // The three versions have their own types ("desc" is a "D3D12_ROOT_SIGNATURE_DESC", "...DESC1" or "...DESC2", with "D3D12_ROOT_PARAMETER"s
-      // or "...PARAMETER1"s) but the same member names, so one lambda takes them all. It changes "desc", the member of "extended" it is.
-      const auto append = [&](auto& desc) -> Skip
+      // or "...PARAMETER1"s) but the same member names, so these lambdas take them all. "append" changes "desc", the member of "extended" it is.
+      const auto check_cbvs = [&](const auto& desc) -> Skip
       {
          using Parameter = std::remove_cvref_t<decltype(*desc.pParameters)>;
-         *parameter_count = desc.NumParameters;
-         constexpr bool has_static_samplers_1 = std::is_same_v<std::remove_cvref_t<decltype(*desc.pStaticSamplers)>, D3D12_STATIC_SAMPLER_DESC1>;
-         if constexpr (has_static_samplers_1)
-         {
-            if (static_samplers)
-            {
-               static_samplers->assign(desc.pStaticSamplers, desc.pStaticSamplers + desc.NumStaticSamplers);
-            }
-         }
          if ((desc.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE) != 0)
          {
             return Skip::LocalRootSignature;
@@ -203,52 +196,99 @@ namespace D3D12RootSignatures
          {
             return Skip::OverBudget;
          }
+         return Skip::None;
+      };
 
-         std::vector<Parameter> parameters(desc.pParameters, desc.pParameters + desc.NumParameters);
-         for (const uint32_t luma_register : luma_registers)
-         {
-            Parameter& cbv = parameters.emplace_back();
-            cbv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-            cbv.Descriptor.ShaderRegister = luma_register;
-            cbv.Descriptor.RegisterSpace = LUMA_CB_REGISTER_SPACE;
-            cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-            if constexpr (requires { cbv.Descriptor.Flags; })
-            {
-               cbv.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE; // Root signature 1.1 and later
-            }
-         }
-         const uint32_t original_parameter_count = desc.NumParameters;
-         desc.NumParameters = static_cast<uint32_t>(parameters.size());
-         desc.pParameters = parameters.data();
-         desc.Flags &= ~DENY_SHADER_ROOT_ACCESS; // The static samplers and everything else stay, but for the ones the hook upgrades
-
-         std::vector<D3D12_STATIC_SAMPLER_DESC1> upgraded_samplers;
+      const auto append = [&](auto& desc) -> Skip
+      {
+         using Parameter = std::remove_cvref_t<decltype(*desc.pParameters)>;
+         using StaticSampler = std::remove_cvref_t<decltype(*desc.pStaticSamplers)>;
+         constexpr bool has_static_samplers_1 = std::is_same_v<StaticSampler, D3D12_STATIC_SAMPLER_DESC1>;
+         *parameter_count = desc.NumParameters;
          if constexpr (has_static_samplers_1)
          {
-            if (hook.upgrade_static_sampler && desc.NumStaticSamplers != 0)
+            if (static_samplers)
             {
-               upgraded_samplers.assign(desc.pStaticSamplers, desc.pStaticSamplers + desc.NumStaticSamplers);
-               for (D3D12_STATIC_SAMPLER_DESC1& sampler : upgraded_samplers)
+               static_samplers->assign(desc.pStaticSamplers, desc.pStaticSamplers + desc.NumStaticSamplers);
+            }
+         }
+
+         const Skip skip = check_cbvs(desc);
+         const uint32_t original_parameter_count = desc.NumParameters;
+         std::vector<Parameter> parameters;
+         if (skip == Skip::None)
+         {
+            parameters.assign(desc.pParameters, desc.pParameters + desc.NumParameters);
+            for (const uint32_t luma_register : luma_registers)
+            {
+               Parameter& cbv = parameters.emplace_back();
+               cbv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+               cbv.Descriptor.ShaderRegister = luma_register;
+               cbv.Descriptor.RegisterSpace = LUMA_CB_REGISTER_SPACE;
+               cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+               if constexpr (requires { cbv.Descriptor.Flags; })
                {
-                  hook.upgrade_static_sampler(&sampler);
+                  cbv.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE; // Root signature 1.1 and later
                }
+            }
+            desc.NumParameters = static_cast<uint32_t>(parameters.size());
+            desc.pParameters = parameters.data();
+            desc.Flags &= ~DENY_SHADER_ROOT_ACCESS; // The static samplers and everything else stay, but for the ones the hook upgrades
+         }
+
+         // Upgraded whether or not the CBVs went in. The older versions' samplers lack 1.2's "Flags", their last member, and go through the callback as a 1.2 one.
+         static_assert(offsetof(D3D12_STATIC_SAMPLER_DESC1, Flags) == sizeof(D3D12_STATIC_SAMPLER_DESC));
+         std::vector<StaticSampler> upgraded_samplers;
+         bool samplers_upgraded = false;
+         if (hook.upgrade_static_sampler && desc.NumStaticSamplers != 0)
+         {
+            upgraded_samplers.assign(desc.pStaticSamplers, desc.pStaticSamplers + desc.NumStaticSamplers);
+            for (StaticSampler& sampler : upgraded_samplers)
+            {
+               if constexpr (has_static_samplers_1)
+               {
+                  samplers_upgraded |= hook.upgrade_static_sampler(&sampler);
+               }
+               else
+               {
+                  D3D12_STATIC_SAMPLER_DESC1 widened = {};
+                  std::memcpy(&widened, &sampler, sizeof(sampler));
+                  if (hook.upgrade_static_sampler(&widened))
+                  {
+                     std::memcpy(&sampler, &widened, sizeof(sampler));
+                     samplers_upgraded = true;
+                  }
+               }
+            }
+            if (samplers_upgraded)
+            {
                desc.pStaticSamplers = upgraded_samplers.data();
             }
+         }
+         if (skip != Skip::None && !samplers_upgraded)
+         {
+            return skip;
          }
 
          com_ptr<ID3DBlob> serialized;
          if (FAILED(hook.serialize(&extended, &serialized, nullptr)))
          {
-            return Skip::NotSerializable;
+            return (skip == Skip::None ? Skip::NotSerializable : skip);
          }
-         if (static_samplers && !upgraded_samplers.empty())
+         if constexpr (has_static_samplers_1)
          {
-            *static_samplers = upgraded_samplers;
+            if (static_samplers && samplers_upgraded)
+            {
+               *static_samplers = upgraded_samplers;
+            }
          }
          const auto* const bytes = static_cast<const std::byte*>(serialized->GetBufferPointer());
          rewritten->assign(bytes, bytes + serialized->GetBufferSize());
-         *params = {.settings_index = static_cast<int32_t>(original_parameter_count), .data_index = (data_register >= 0 ? static_cast<int32_t>(original_parameter_count) + 1 : -1)};
-         return Skip::None;
+         if (skip == Skip::None)
+         {
+            *params = {.settings_index = static_cast<int32_t>(original_parameter_count), .data_index = (data_register >= 0 ? static_cast<int32_t>(original_parameter_count) + 1 : -1)};
+         }
+         return skip;
       };
 
       switch (extended.Version)
@@ -290,6 +330,9 @@ namespace D3D12RootSignatures
    // Set while this thread creates a root signature through the hook: ReShade's events run inside the create, and a root signature an
    // add-on creates from one of them is not the game's
    inline thread_local bool rewriting = false;
+   // Set while this thread's ReShade proxy creates a rewritten blob: its static samplers went through "Hook::upgrade_static_sampler" already, so the "create_sampler" event
+   // ReShade fires for the older versions' must leave them (a second upgrade would add the bias again, and a change makes ReShade rebuild the root signature)
+   inline thread_local bool static_samplers_upgraded = false;
 #if DEVELOPMENT
    // The root signature 1.2 static samplers of the root signature this thread creates through the hook, for the "init_pipeline_layout" event that runs inside the create (ReShade's
    // pipeline layout lacks them): the frame capture lists them (see "D3D12State::AddStaticSamplers()")
@@ -309,37 +352,34 @@ namespace D3D12RootSignatures
       uint32_t parameter_count = 0;
       std::vector<D3D12_STATIC_SAMPLER_DESC1> static_samplers;
       const Skip skip = Rewrite({static_cast<const std::byte*>(blob), size}, hook.settings_register, hook.data_register, &rewritten, &params, &parameter_count, &static_samplers);
-      const bool injecting = (skip == Skip::None);
+      const bool injecting = !rewritten.empty(); // The CBVs, the upgraded static samplers or both
 #if DEVELOPMENT
       pending_static_samplers = std::move(static_samplers);
 #endif
-      HRESULT result = hook.original(device, node_mask, (injecting ? rewritten.data() : blob), (injecting ? rewritten.size() : size), riid, root_signature);
-      if (!injecting)
+      if (skip != Skip::None && skip_logs[static_cast<size_t>(skip)].fetch_add(1) < MAX_LOGS)
       {
-         if (skip_logs[static_cast<size_t>(skip)].fetch_add(1) < MAX_LOGS)
-         {
-            hook.log(std::format("A root signature{} is left without Luma's constant buffers: {}", (parameter_count != 0 ? std::format(" (root parameters: {})", parameter_count) : std::string()), SKIP_NAMES[static_cast<size_t>(skip)]).c_str());
-         }
-         if (SUCCEEDED(result))
-         {
-            const std::unique_lock lock(injected.mutex);
-            injected.by_root_signature[reinterpret_cast<uint64_t>(*root_signature)] = {.skip = skip};
-         }
+         hook.log(std::format("A root signature{} is left without Luma's constant buffers: {}", (parameter_count != 0 ? std::format(" (root parameters: {})", parameter_count) : std::string()), SKIP_NAMES[static_cast<size_t>(skip)]).c_str());
       }
-      else if (SUCCEEDED(result))
+      const bool were_static_samplers_upgraded = std::exchange(static_samplers_upgraded, injecting);
+      HRESULT result = hook.original(device, node_mask, (injecting ? rewritten.data() : blob), (injecting ? rewritten.size() : size), riid, root_signature);
+      static_samplers_upgraded = were_static_samplers_upgraded;
+      if (SUCCEEDED(result))
       {
          const std::unique_lock lock(injected.mutex);
-         injected.by_root_signature[reinterpret_cast<uint64_t>(*root_signature)] = params;
-         injected.original_parts.emplace(RootSignaturePart(blob, size));
+         injected.by_root_signature[reinterpret_cast<uint64_t>(*root_signature)] = (skip == Skip::None ? params : LumaParams{.skip = skip});
+         if (injecting)
+         {
+            injected.original_parts.emplace(RootSignaturePart(blob, size));
+         }
       }
-      else
+      else if (injecting)
       {
          // The game gets its root signature as it made it
          const HRESULT rewritten_result = result;
          result = hook.original(device, node_mask, blob, size, riid, root_signature);
          if (create_failure_logs.fetch_add(1) < MAX_LOGS)
          {
-            hook.log(std::format("Creating a root signature (root parameters: {}) with Luma's constant buffers failed with {:#010x}, retried as the game made it, which returned {:#010x}", parameter_count, static_cast<uint32_t>(rewritten_result), static_cast<uint32_t>(result)).c_str());
+            hook.log(std::format("Creating a root signature (root parameters: {}) as Luma rewrote it failed with {:#010x}, retried as the game made it, which returned {:#010x}", parameter_count, static_cast<uint32_t>(rewritten_result), static_cast<uint32_t>(result)).c_str());
          }
       }
       rewriting = was_rewriting;
