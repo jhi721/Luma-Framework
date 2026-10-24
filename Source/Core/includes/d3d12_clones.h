@@ -21,9 +21,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -33,6 +35,7 @@
 #include <include/reshade.hpp>
 #include <source/com_ptr.hpp>
 
+#include "d3d12_passes.h"
 #include "d3d12_resource_creation.h"
 #include "d3d12_state.h"
 
@@ -700,6 +703,8 @@ namespace D3D12Clones
    constexpr size_t CLEAR_UNORDERED_ACCESS_VIEW_FLOAT_SLOT = 50;
    constexpr size_t DISCARD_RESOURCE_SLOT = 51;
    constexpr size_t RESOLVE_SUBRESOURCE_REGION_SLOT = 64; // "ID3D12GraphicsCommandList1"'s, after "OMSetDepthBounds" and "SetSamplePositions"
+   constexpr size_t BEGIN_RENDER_PASS_SLOT = 68;          // "ID3D12GraphicsCommandList4"'s, after "SetViewInstanceMask", "WriteBufferImmediate" and "SetProtectedResourceSession"
+   constexpr size_t END_RENDER_PASS_SLOT = 69;
    constexpr size_t BARRIER_SLOT = 80;
 
    // The views of a game's texture are created on its clone (once it is active, see "RouteView()"), so the descriptors (which ReShade copies and
@@ -870,6 +875,8 @@ namespace D3D12Clones
    using DiscardResourceHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, const D3D12_DISCARD_REGION*), DISCARD_RESOURCE_SLOT>;
    using ResolveSubresourceRegionHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList1*, ID3D12Resource*, UINT, UINT, UINT, ID3D12Resource*, UINT, D3D12_RECT*, DXGI_FORMAT, D3D12_RESOLVE_MODE), RESOLVE_SUBRESOURCE_REGION_SLOT>;
    using SetDescriptorHeapsHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*), SET_DESCRIPTOR_HEAPS_SLOT>;
+   using BeginRenderPassHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*, UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS), BEGIN_RENDER_PASS_SLOT>;
+   using EndRenderPassHook = ProxyFunction<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*), END_RENDER_PASS_SLOT>;
 
    // Each barrier of the game on a texture that has a clone is followed by the same one on the clone, so the clone goes through the states
    // of the original (it was created in the original's initial state). Aliasing barriers aren't mirrored: the clones are committed.
@@ -991,6 +998,147 @@ namespace D3D12Clones
       std::copy_n(heaps, game_heaps.count, game_heaps.heaps);
       list->SetPrivateData(D3D12State::GAME_DESCRIPTOR_HEAPS_GUID, sizeof(game_heaps), &game_heaps);
    }
+
+   // A render pass the game began, kept as private data of the native list until its end
+   struct RenderPass
+   {
+      bool emulated = false;
+      D3D12_RENDER_PASS_FLAGS flags = D3D12_RENDER_PASS_FLAG_NONE;
+      UINT render_target_count = 0;
+      D3D12_RENDER_PASS_RENDER_TARGET_DESC render_targets[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+   };
+   constexpr GUID RENDER_PASS_GUID = {0x7d2e94b3, 0x1c5f, 0x4a68, {0x8b, 0x07, 0xe3, 0x5a, 0x91, 0xd4, 0x26, 0xcf}};
+
+   // Not about the clones: the game's render passes are emulated the way the D3D12 runtime maps them for drivers without render passes, so Luma's passes, copy conversion and readbacks
+   // (binds, clears, copies, resolves and render target barriers, which D3D12 forbids between "BeginRenderPass()" and "EndRenderPass()") can run inside them: the CLEAR beginnings
+   // become clears, the targets are bound with "OMSetRenderTargets()", and the RESOLVE endings become resolves at the end. All goes through the proxy, so ReShade's events, Luma's
+   // state and the clone hooks see ordinary commands. A suspending and resuming pair has the same accesses: the resuming one doesn't clear again, the suspending one doesn't resolve
+   // yet. A DISCARD keeps the content, which is one valid outcome of it. A resolve leaves its source in the state it began in, and its destination is in RESOLVE_DEST by contract.
+   // ponytail: the passes it can't emulate stay native, and Luma's passes refuse inside them ("RefusedInRenderPass()"): PRESERVE_LOCAL accesses, render targets with NO_ACCESS,
+   // depth/stencil resolves, resolves of textures in an enhanced barrier layout. Emulate those when a game logs one.
+   inline void STDMETHODCALLTYPE BeginRenderPassDetour(ID3D12GraphicsCommandList4* list, UINT render_target_count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* render_targets, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth_stencil, D3D12_RENDER_PASS_FLAGS flags)
+   {
+      const auto native_reason = [&]() -> const char*
+      {
+         for (UINT i = 0; i < render_target_count; i++)
+         {
+            const D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE beginning = render_targets[i].BeginningAccess.Type;
+            if (beginning != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD && beginning != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE && beginning != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+            {
+               return "a render target begins with neither DISCARD, PRESERVE nor CLEAR";
+            }
+            const D3D12_RENDER_PASS_ENDING_ACCESS& ending = render_targets[i].EndingAccess;
+            if (ending.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
+            {
+               if (D3D12ResourceCreation::MayBeInLayout(reinterpret_cast<uint64_t>(ending.Resolve.pSrcResource)) || D3D12ResourceCreation::MayBeInLayout(reinterpret_cast<uint64_t>(ending.Resolve.pDstResource)))
+               {
+                  return "a resolve's texture was created with an enhanced barrier layout";
+               }
+            }
+            else if (ending.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD && ending.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE)
+            {
+               return "a render target ends with neither DISCARD, PRESERVE nor RESOLVE";
+            }
+         }
+         if (!depth_stencil)
+         {
+            return nullptr;
+         }
+         for (const D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE beginning : {depth_stencil->DepthBeginningAccess.Type, depth_stencil->StencilBeginningAccess.Type})
+         {
+            if (beginning != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD && beginning != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE && beginning != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR && beginning != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS)
+            {
+               return "a depth or stencil plane begins with neither DISCARD, PRESERVE, CLEAR nor NO_ACCESS";
+            }
+         }
+         for (const D3D12_RENDER_PASS_ENDING_ACCESS_TYPE ending : {depth_stencil->DepthEndingAccess.Type, depth_stencil->StencilEndingAccess.Type})
+         {
+            if (ending != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD && ending != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE && ending != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS)
+            {
+               return "a depth or stencil plane ends with neither DISCARD, PRESERVE nor NO_ACCESS (a resolve)";
+            }
+         }
+         return nullptr;
+      };
+      const char* const reason = native_reason();
+      RenderPass pass = {.emulated = (reason == nullptr), .flags = flags, .render_target_count = (std::min)(render_target_count, UINT(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT))};
+      std::copy_n(render_targets, pass.render_target_count, pass.render_targets);
+      list->SetPrivateData(RENDER_PASS_GUID, sizeof(pass), &pass);
+      if (reason)
+      {
+         static std::shared_mutex mutex;
+         static std::unordered_set<std::string_view> logged_reasons;
+         if (const std::unique_lock lock(mutex); logged_reasons.emplace(reason).second)
+         {
+            reshade::log::message(reshade::log::level::warning, std::format("[Render passes] A render pass of the game stays native, so Luma's passes refuse inside it: {}", reason).c_str());
+         }
+         BeginRenderPassHook::hooked.original(list, render_target_count, render_targets, depth_stencil, flags);
+         return;
+      }
+
+      const bool binds_depth_stencil = depth_stencil && (depth_stencil->DepthBeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS || depth_stencil->StencilBeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS);
+      if ((flags & D3D12_RENDER_PASS_FLAG_RESUMING_PASS) == 0)
+      {
+         for (UINT i = 0; i < pass.render_target_count; i++)
+         {
+            if (render_targets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+            {
+               list->ClearRenderTargetView(render_targets[i].cpuDescriptor, render_targets[i].BeginningAccess.Clear.ClearValue.Color, 0, nullptr);
+            }
+         }
+         D3D12_CLEAR_FLAGS clear_flags = D3D12_CLEAR_FLAGS(0);
+         if (binds_depth_stencil && depth_stencil->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+         {
+            clear_flags |= D3D12_CLEAR_FLAG_DEPTH;
+         }
+         if (binds_depth_stencil && depth_stencil->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+         {
+            clear_flags |= D3D12_CLEAR_FLAG_STENCIL;
+         }
+         if (clear_flags != 0)
+         {
+            list->ClearDepthStencilView(depth_stencil->cpuDescriptor, clear_flags, depth_stencil->DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth, depth_stencil->StencilBeginningAccess.Clear.ClearValue.DepthStencil.Stencil, 0, nullptr);
+         }
+      }
+      D3D12_CPU_DESCRIPTOR_HANDLE render_target_views[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      for (UINT i = 0; i < pass.render_target_count; i++)
+      {
+         render_target_views[i] = render_targets[i].cpuDescriptor;
+      }
+      list->OMSetRenderTargets(pass.render_target_count, render_target_views, FALSE, (binds_depth_stencil ? &depth_stencil->cpuDescriptor : nullptr));
+   }
+
+   inline void STDMETHODCALLTYPE EndRenderPassDetour(ID3D12GraphicsCommandList4* list)
+   {
+      RenderPass pass;
+      UINT size = sizeof(pass);
+      if (FAILED(list->GetPrivateData(RENDER_PASS_GUID, &size, &pass)) || size != sizeof(pass) || !pass.emulated)
+      {
+         EndRenderPassHook::hooked.original(list);
+         return;
+      }
+      if ((pass.flags & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS) != 0)
+      {
+         return;
+      }
+      // The game keeps the subresource parameters alive until its "EndRenderPass()"
+      for (UINT i = 0; i < pass.render_target_count; i++)
+      {
+         if (pass.render_targets[i].EndingAccess.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
+         {
+            continue;
+         }
+         const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS& resolve = pass.render_targets[i].EndingAccess.Resolve;
+         for (UINT j = 0; j < resolve.SubresourceCount; j++)
+         {
+            const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS& subresource = resolve.pSubresourceParameters[j];
+            D3D12_RECT source_rect = subresource.SrcRect;
+            D3D12Passes::Transition(list, resolve.pSrcResource, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, subresource.SrcSubresource);
+            list->ResolveSubresourceRegion(resolve.pDstResource, subresource.DstSubresource, subresource.DstX, subresource.DstY, resolve.pSrcResource, subresource.SrcSubresource, &source_rect, resolve.Format, resolve.ResolveMode);
+            D3D12Passes::Transition(list, resolve.pSrcResource, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, subresource.SrcSubresource);
+         }
+      }
+   }
 #endif
 
    inline std::atomic<bool> command_list_hooks_installed = false;
@@ -1018,10 +1166,12 @@ namespace D3D12Clones
       installed_all &= ResolveSubresourceRegionHook::Install(vtable, &ResolveSubresourceRegionDetour);
 #if ENABLE_D3D12_PASSES
       installed_all &= SetDescriptorHeapsHook::Install(vtable, &SetDescriptorHeapsDetour);
+      installed_all &= BeginRenderPassHook::Install(vtable, &BeginRenderPassDetour);
+      installed_all &= EndRenderPassHook::Install(vtable, &EndRenderPassDetour);
 #endif
       if (!installed_all)
       {
-         reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The command list hooks of the clones aren't all in, so the clones of textures can end in a wrong state, and the Luma passes can leave ReShade's descriptor heaps bound");
+         reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The command list hooks of the clones aren't all in, so the clones of textures can end in a wrong state, and the Luma passes can leave ReShade's descriptor heaps bound or refuse inside the game's render passes");
       }
       command_list_hooks_installed.store(true, std::memory_order_release);
    }
@@ -1117,6 +1267,8 @@ namespace D3D12Clones
       removed_all &= DiscardResourceHook::Remove();
       removed_all &= ResolveSubresourceRegionHook::Remove();
       removed_all &= SetDescriptorHeapsHook::Remove();
+      removed_all &= BeginRenderPassHook::Remove();
+      removed_all &= EndRenderPassHook::Remove();
       command_list_hooks_installed.store(false, std::memory_order_release);
       return removed_all;
    }

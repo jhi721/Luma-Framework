@@ -6384,7 +6384,8 @@ namespace
    }
 #endif
 
-   // Luma's passes and readbacks record draws, copies and barriers that a render pass cannot hold, so they refuse inside one (the game's command runs as it is). Said once for each "kind" (a literal)
+   // Luma's passes and readbacks record draws, copies and barriers that a render pass cannot hold, so they refuse inside one (the game's command runs as it is). Only the native ones
+   // count: the hooks emulate the others with ordinary binds and clears (see "D3D12Clones::BeginRenderPassDetour()"). Said once for each "kind" (a literal)
    bool RefusedInRenderPass(const CommandListData& cmd_list_data, const char* kind)
    {
       if (!cmd_list_data.d3d12_state.in_render_pass)
@@ -6395,7 +6396,7 @@ namespace
       static std::unordered_set<std::string_view> logged_kinds;
       if (const std::unique_lock lock(mutex); logged_kinds.emplace(kind).second)
       {
-         reshade::log::message(reshade::log::level::warning, std::format("[{}] Refused inside a render pass: between BeginRenderPass() and EndRenderPass() D3D12 holds no copies or barriers, and the render targets cannot change", kind).c_str());
+         reshade::log::message(reshade::log::level::warning, std::format("[{}] Refused inside a render pass that stays native (see the \"[Render passes]\" warning): between BeginRenderPass() and EndRenderPass() D3D12 holds no copies or barriers, and the render targets cannot change", kind).c_str());
       }
       return true;
    }

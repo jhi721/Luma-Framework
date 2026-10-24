@@ -195,7 +195,7 @@ namespace D3D12State
       std::vector<ViewInfo> render_target_views;
       reshade::api::resource_view depth_stencil = {};
       ViewInfo depth_stencil_view;
-      bool in_render_pass = false; // Copies and barriers are invalid between "BeginRenderPass()" and "EndRenderPass()"
+      bool in_render_pass = false; // Copies and barriers are invalid between "BeginRenderPass()" and "EndRenderPass()" (of a native render pass: see "D3D12Clones::BeginRenderPassDetour()")
    };
 
    // Setting a different root signature invalidates all root arguments, setting the same one keeps them
