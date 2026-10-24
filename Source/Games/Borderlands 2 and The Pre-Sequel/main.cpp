@@ -1829,9 +1829,7 @@ class Borderlands2 final : public Game
          // The scene is not exposed yet: the tonemap multiplies it by its exposure (ImageAdjustments2.w, 1.0 to 1.8) after the
          // upscaler. DLSS's auto exposure covers that; FSR's clips highlights (FSR-Best-Practices FIN-3), so it runs at exposure 1.
          .auto_exposure = device_data.sr_type != SR::Type::FSR,
-         // DLAA on scene-referred HDR input takes preset J or K, never L or M (DLSS-Best-Practices PRE-4): "Default" picks K (11), so
-         // NVIDIA can't change it over the air; an explicit choice is kept
-         .render_preset = (dlss_render_preset != 0 ? dlss_render_preset : 11u),
+         .render_preset = dlss_render_preset,
       };
       sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
