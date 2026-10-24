@@ -6444,12 +6444,14 @@ namespace
 
 #if DEVELOPMENT
    // Command lists record their own capture entries, "OnExecuteCommandList()" joins them in submission order
+   // A bundle records its draws whether a capture runs or not: it is often recorded once and executed every frame, and its entries join the capture of the list that executes it
+   // ("OnExecuteSecondaryCommandList()"). They go with its next reset.
    void TraceDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data)
    {
-      const auto lock_trace = LockTraceIfRunning();
-      if (!lock_trace || !trace_running)
-         return;
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      const auto lock_trace = LockTraceIfRunning();
+      if (!cmd_list_data.is_bundle && (!lock_trace || !trace_running))
+         return;
       const std::shared_lock lock_generic(s_mutex_generic);
       const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
       const std::lock_guard<std::recursive_mutex> lock_dumping(s_mutex_dumping);
@@ -8395,12 +8397,33 @@ namespace
    void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
-      const CommandListData& bundle_data = *secondary_cmd_list->get_private_data<CommandListData>();
+      CommandListData& bundle_data = *secondary_cmd_list->get_private_data<CommandListData>();
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+#if DEVELOPMENT
+      // The bundle's draws join the capture after an "Append Command List" entry, as copies (a bundle runs many times), with what a bundle inherits from the list that executes
+      // it: targets, viewports, scissors, stencil reference and blend constants
+      if (const auto lock_trace = LockTraceIfRunning(); lock_trace && trace_running)
+      {
+         DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+         const std::shared_lock lock_generic(s_mutex_generic);
+         const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
+         const std::shared_lock lock_trace_3(bundle_data.mutex_trace);
+         TraceDrawCallData& marker = cmd_list_data.trace_draw_calls_data.emplace_back();
+         marker.type = TraceDrawCallData::TraceDrawCallType::AppendCommandList;
+         marker.command_list = secondary_cmd_list;
+         for (const TraceDrawCallData& bundle_entry : bundle_data.trace_draw_calls_data)
+         {
+            TraceDrawCallData& entry = cmd_list_data.trace_draw_calls_data.emplace_back(bundle_entry);
+            const auto pipeline_it = device_data.pipeline_cache_by_pipeline_handle.find(entry.pipeline_handle);
+            const Shader::CachedPipeline* const pipeline = (pipeline_it != device_data.pipeline_cache_by_pipeline_handle.end() ? pipeline_it->second : nullptr);
+            D3D12Trace::FillOutputState(cmd_list->get_device(), &device_data, &entry, cmd_list_data.d3d12_state, D3D12Trace::FillRenderState(&entry, pipeline));
+         }
+      }
+#endif
       if (bundle_data.d3d12_state.pipeline.handle == 0) // It bound no pipeline, the executing command list keeps its own
       {
          return;
       }
-      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
       cmd_list_data.d3d12_state.pipeline = bundle_data.d3d12_state.pipeline;
       // A bundle that set no root signature uses the one of the command list executing it
       if (bundle_data.d3d12_state.graphics.layout.handle != 0)

@@ -427,6 +427,58 @@ namespace D3D12Trace
       };
    }
 
+   // What a draw takes from the command list besides its pipeline and root arguments: the stencil reference, blend constants, viewports, scissors and targets, and what the
+   // pipeline's depth stencil state "desc" does with the bound depth stencil. A bundle's draws take them from the list that executes the bundle.
+   void FillOutputState(reshade::api::device* device, const DeviceData* device_data, TraceDrawCallData* entry, const D3D12State::CommandListState& state, const reshade::api::depth_stencil_desc& desc)
+   {
+      entry->stencil_ref = state.stencil_ref;
+      if (state.has_blend_constant)
+      {
+         for (uint32_t i = 0; i < 4; i++)
+         {
+            entry->blend_factor[i] = float((state.blend_constant >> (8 * i)) & 0xFF) / 255.f;
+         }
+      }
+#if ENABLE_D3D12_PASSES // The viewports and scissors are only tracked with the passes' state
+      entry->viewport_count = UINT((std::min)(state.viewports.size(), std::size(entry->viewports)));
+      for (UINT i = 0; i < entry->viewport_count; i++)
+      {
+         const reshade::api::viewport& viewport = state.viewports[i];
+         entry->viewports[i] = {.TopLeftX = viewport.x, .TopLeftY = viewport.y, .Width = viewport.width, .Height = viewport.height, .MinDepth = viewport.min_depth, .MaxDepth = viewport.max_depth};
+      }
+      entry->scissor_count = UINT((std::min)(state.scissor_rects.size(), std::size(entry->scissor_rects)));
+      for (UINT i = 0; i < entry->scissor_count; i++)
+      {
+         const reshade::api::rect& rect = state.scissor_rects[i];
+         entry->scissor_rects[i] = {.left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.bottom};
+      }
+#endif
+
+      FillBoundTargets(device, device_data, entry, state);
+      if (state.depth_stencil.handle != 0)
+      {
+         using DepthStateType = TraceDrawCallData::DepthStateType;
+         // Same classification as the D3D11 capture
+         if (desc.depth_enable)
+         {
+            const bool test = desc.depth_func != reshade::api::compare_op::always;
+            if (desc.depth_write_mask)
+               entry->depth_state = test ? DepthStateType::TestAndWrite : DepthStateType::WriteOnly;
+            else
+               entry->depth_state = test ? DepthStateType::TestOnly : DepthStateType::Disabled;
+         }
+         const bool has_stencil = entry->dsv_format == DXGI_FORMAT_D24_UNORM_S8_UINT || entry->dsv_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+         const bool stencil_writes = desc.front_stencil_pass_op != reshade::api::stencil_op::keep || desc.front_stencil_fail_op != reshade::api::stencil_op::keep || desc.front_stencil_depth_fail_op != reshade::api::stencil_op::keep || desc.back_stencil_pass_op != reshade::api::stencil_op::keep || desc.back_stencil_fail_op != reshade::api::stencil_op::keep || desc.back_stencil_depth_fail_op != reshade::api::stencil_op::keep;
+         const bool stencil_tests = desc.front_stencil_func != reshade::api::compare_op::always || desc.back_stencil_func != reshade::api::compare_op::always;
+         const bool stencil_write = desc.stencil_enable && has_stencil && (desc.front_stencil_write_mask != 0 || desc.back_stencil_write_mask != 0) && stencil_writes;
+         const bool stencil_read = desc.stencil_enable && has_stencil && (desc.front_stencil_read_mask != 0 || desc.back_stencil_read_mask != 0) && stencil_tests;
+         if (stencil_read || stencil_write)
+         {
+            entry->stencil_state = stencil_read ? (stencil_write ? DepthStateType::TestAndWrite : DepthStateType::TestOnly) : DepthStateType::WriteOnly;
+         }
+      }
+   }
+
    // Expects "s_mutex_generic" (shared), "s_mutex_dumping" and the command list's "mutex_trace" to be locked. The table descriptors are
    // read later, by "ResolveTableDescriptors()".
    void AddTraceDrawCallData(std::vector<TraceDrawCallData>* trace_draw_calls_data, DeviceData* device_data, const reshade::api::command_list* cmd_list, const D3D12State::CommandListState& state,
@@ -504,52 +556,7 @@ namespace D3D12Trace
 
          // Without a pipeline's state the D3D12 defaults apply (depth test and write, no stencil)
          const reshade::api::depth_stencil_desc desc = FillRenderState(&trace_draw_call_data, pipeline);
-         trace_draw_call_data.stencil_ref = state.stencil_ref;
-         if (state.has_blend_constant)
-         {
-            for (uint32_t i = 0; i < 4; i++)
-            {
-               trace_draw_call_data.blend_factor[i] = float((state.blend_constant >> (8 * i)) & 0xFF) / 255.f;
-            }
-         }
-#if ENABLE_D3D12_PASSES // The viewports and scissors are only tracked with the passes' state
-         trace_draw_call_data.viewport_count = UINT((std::min)(state.viewports.size(), std::size(trace_draw_call_data.viewports)));
-         for (UINT i = 0; i < trace_draw_call_data.viewport_count; i++)
-         {
-            const reshade::api::viewport& viewport = state.viewports[i];
-            trace_draw_call_data.viewports[i] = {.TopLeftX = viewport.x, .TopLeftY = viewport.y, .Width = viewport.width, .Height = viewport.height, .MinDepth = viewport.min_depth, .MaxDepth = viewport.max_depth};
-         }
-         trace_draw_call_data.scissor_count = UINT((std::min)(state.scissor_rects.size(), std::size(trace_draw_call_data.scissor_rects)));
-         for (UINT i = 0; i < trace_draw_call_data.scissor_count; i++)
-         {
-            const reshade::api::rect& rect = state.scissor_rects[i];
-            trace_draw_call_data.scissor_rects[i] = {.left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.bottom};
-         }
-#endif
-
-         FillBoundTargets(device, device_data, &trace_draw_call_data, state);
-         if (state.depth_stencil.handle != 0)
-         {
-            using DepthStateType = TraceDrawCallData::DepthStateType;
-            // Same classification as the D3D11 capture
-            if (desc.depth_enable)
-            {
-               const bool test = desc.depth_func != reshade::api::compare_op::always;
-               if (desc.depth_write_mask)
-                  trace_draw_call_data.depth_state = test ? DepthStateType::TestAndWrite : DepthStateType::WriteOnly;
-               else
-                  trace_draw_call_data.depth_state = test ? DepthStateType::TestOnly : DepthStateType::Disabled;
-            }
-            const bool has_stencil = trace_draw_call_data.dsv_format == DXGI_FORMAT_D24_UNORM_S8_UINT || trace_draw_call_data.dsv_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-            const bool stencil_writes = desc.front_stencil_pass_op != reshade::api::stencil_op::keep || desc.front_stencil_fail_op != reshade::api::stencil_op::keep || desc.front_stencil_depth_fail_op != reshade::api::stencil_op::keep || desc.back_stencil_pass_op != reshade::api::stencil_op::keep || desc.back_stencil_fail_op != reshade::api::stencil_op::keep || desc.back_stencil_depth_fail_op != reshade::api::stencil_op::keep;
-            const bool stencil_tests = desc.front_stencil_func != reshade::api::compare_op::always || desc.back_stencil_func != reshade::api::compare_op::always;
-            const bool stencil_write = desc.stencil_enable && has_stencil && (desc.front_stencil_write_mask != 0 || desc.back_stencil_write_mask != 0) && stencil_writes;
-            const bool stencil_read = desc.stencil_enable && has_stencil && (desc.front_stencil_read_mask != 0 || desc.back_stencil_read_mask != 0) && stencil_tests;
-            if (stencil_read || stencil_write)
-            {
-               trace_draw_call_data.stencil_state = stencil_read ? (stencil_write ? DepthStateType::TestAndWrite : DepthStateType::TestOnly) : DepthStateType::WriteOnly;
-            }
-         }
+         FillOutputState(device, device_data, &trace_draw_call_data, state, desc);
       }
 
       // The next packed SRV, UAV, constant buffer or sampler entry, UINT32_MAX if they are all taken (the entry is then marked "truncated")
