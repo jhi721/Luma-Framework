@@ -32,7 +32,7 @@ SamplerState PointSampler : register(s1);
 float4 SampleGammaInLinear(Texture2D tex, float2 coord)
 {
    const float2 nearest = round(coord * SMAA_RT_METRICS.zw - 0.5);
-   const float2 texel = abs(coord * SMAA_RT_METRICS.zw - 0.5 - nearest) < 1.0 / 512.0 ? nearest : coord * SMAA_RT_METRICS.zw - 0.5;
+   const float2 texel = select(abs(coord * SMAA_RT_METRICS.zw - 0.5 - nearest) < 1.0 / 512.0, nearest, coord * SMAA_RT_METRICS.zw - 0.5);
    const int2 last = int2(SMAA_RT_METRICS.zw) - 1;
    float4 color;
    [branch] if (all(texel == nearest))

@@ -12,6 +12,7 @@ Texture2DMSArray<float4> debugTexture2DMSArray : register(t5);
 Texture3D<float4> debugTexture3D : register(t6);
 Texture1D<float4> debugTexture1D : register(t7);
 Texture1DArray<float4> debugTexture1DArray : register(t8);
+Texture2D<uint4> debugTexture2DUint : register(t9); // The stencil plane (D3D12): plain 2D, "TextureUint"
 // TODO: add TextureCube(s) support... Update "debug_draw_srv_slot_numbers" in c++ if you change this. And also for uint/sint textures.
 #endif
 
@@ -27,8 +28,13 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 	bool _textureCube = _texture2D && _texture3D;
 	bool _textureMS = (LumaData.CustomData2 & (1 << 11)) != 0;
 	bool _textureArray = (LumaData.CustomData2 & (1 << 12)) != 0;
+	bool _textureUint = (LumaData.CustomData2 & (1 << 22)) != 0; // The texture is the integer one at t9
 	float debugWidth = 0.0, debugHeightOrArraySize = 1.0, debugDepthOrArraySize = 1.0, sampleCount = 1.0; // Default to 0 to make sure they stay zero if the texture wasn't bound
-	if (_texture1D && _textureArray)
+	if (_textureUint)
+	{
+		debugTexture2DUint.GetDimensions(debugWidth, debugHeightOrArraySize);
+	}
+	else if (_texture1D && _textureArray)
 	{
 		debugTexture1DArray.GetDimensions(debugWidth, debugHeightOrArraySize);
 	}
@@ -58,6 +64,7 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 	}
 	// TODO: add better support for depth stencil formats? uint?
 	// Skip if there's no texture. It might be undefined behaviour, but it seems to work on Nvidia
+	bool drawn = false; // Returned once at the end: returning from inside the branch makes fxc warn X4000 (potentially uninitialized "DrawDebugTexture")
 	if (debugWidth != 0.0)
 	{
 		float2 resolutionScale = 1.0;
@@ -168,7 +175,9 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 		}
 		else
 		{
-			if (bilinear) // TODO: implement for other texture types
+			if (_textureUint) // The stencil plane: the integer in 0-1 (8 bits), alpha 1
+				color = float4(float3(debugTexture2DUint.Load(int3(debugPosInt.x, debugPosInt.y, mipLevel)).rgb) / 255.0, 1.0);
+			else if (bilinear) // TODO: implement for other texture types
 				color = debugTexture2D.SampleLevel(linearSampler, debugPos.xy / debugSize.xy, mipLevel);
 			else
 				color = debugTexture2D.Load(int3(debugPosInt.x, debugPosInt.y, mipLevel)); // Approximate to the closest texel (sharp!)
@@ -235,10 +244,10 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 		if (validTexel || !backgroundPassthrough)
 		{
 			outColor = color * gamePaperWhite; // Scale by user paper white brightness just to make it more visible
-			return true;
+			drawn = true;
 		}
     }
-	return false;
+	return drawn;
 }
 #endif
 

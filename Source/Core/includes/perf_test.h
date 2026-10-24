@@ -205,13 +205,8 @@ namespace Perf
             if (!set.pending || native_device_context->GetData(set.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
                continue;
             set.pending = false;
-            if (!measuring)
-               continue;
-            if (disjoint.Disjoint || disjoint.Frequency == 0)
-            {
-               disjoint_count++;
-               continue;
-            }
+            // Read even the dropped stamps: an "End" on a query whose results were never read warns
+            // (QUERY_END_ABANDONING_PREVIOUS_RESULTS)
             TimestampReadback<Stamps> readback = {.frequency = disjoint.Frequency};
             for (size_t stamp = 0; stamp < Stamps; stamp++)
             {
@@ -219,6 +214,13 @@ namespace Perf
                {
                   readback.valid |= 1u << stamp;
                }
+            }
+            if (!measuring)
+               continue;
+            if (disjoint.Disjoint || disjoint.Frequency == 0)
+            {
+               disjoint_count++;
+               continue;
             }
             if (readback.Has(FRAME_START) && readback.Has(FRAME_END))
             {

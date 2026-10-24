@@ -18,7 +18,17 @@
 #include <utility>
 #include <vector>
 
+#if DX11
 #include "managed_resources.h"
+#else
+#include "d3d12_passes.h"
+#include "d3d12_state.h"
+#include "d3d12_upload_ring.h"
+#include "d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
+#if DEVELOPMENT
+#include "d3d12_readback.hpp"
+#endif
+#endif
 #include "patch.hpp"
 #include "debug.h"
 #include "resource_upgrades.hpp"
@@ -47,7 +57,7 @@ enum class DrawOrDispatchOverrideType
 };
 
 // Same signature as "Game::OnDrawOrDispatch()". See "draw_callbacks_by_shader_hashes" and "dispatch_callbacks_by_shader_hashes".
-using DrawOrDispatchCallback = DrawOrDispatchOverrideType(*)(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const Shader::ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func);
+using DrawOrDispatchCallback = DrawOrDispatchOverrideType(*)(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const Shader::ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func);
 
 enum class ShaderReplaceDrawType
 {
@@ -88,13 +98,26 @@ struct DrawDispatchData
    bool indirect = false;
 };
 
+#if DX12
+// The command a D3D12 draw event stands for, to re-issue it natively. "ExecuteIndirect()" comes without its command signature, and ReShade passes
+// "DispatchMesh()" with X as Y: those ("Other") can't be re-issued.
+enum class D3D12DrawCommand : uint8_t
+{
+   Draw,
+   DrawIndexed,
+   Dispatch,
+   Other,
+};
+#endif
+
+// A frame capture entry. D3D12 fills the D3D11 named render state, viewport and sampler fields with its own, alike numbered, values (see "D3D12Trace").
 struct TraceDrawCallData
 {
    TraceDrawCallData()
    {
       thread_id = std::this_thread::get_id();
 
-      std::fill_n(samplers_filter, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, static_cast<D3D11_FILTER>(-1)); // Default to no sampler
+      std::fill_n(samplers_filter, samplers_size, static_cast<D3D11_FILTER>(-1)); // Default to no sampler
    }
 
    enum class TraceDrawCallType
@@ -114,6 +137,9 @@ struct TraceDrawCallData
       ResetCommmandList,
       FlushCommandList,
         Custom, // Custom draw call for custom passes we added/replaced
+      // D3D12 render passes (the game's draws between them are inside the pass)
+      BeginRenderPass,
+      EndRenderPass,
    };
 
    TraceDrawCallType type = TraceDrawCallType::Shader;
@@ -130,8 +156,13 @@ struct TraceDrawCallData
    Shader::ShaderVariant clone_variant = Shader::ShaderVariant::Original;
    bool patch_enabled = false;
 
+#if DX11
    // The original command list (can be useful to have later)
    com_ptr<ID3D11DeviceContext> command_list = nullptr;
+#else
+   // The command list that recorded this call. It only identifies it, it might be destroyed by now.
+   const reshade::api::command_list* command_list = nullptr;
+#endif
    // The thread this call was made on (usually 1:1 with deferred (async) command lists)
    std::thread::id thread_id = {};
 
@@ -150,7 +181,7 @@ struct TraceDrawCallData
    DrawDispatchData draw_dispatch_data = {};
 
    // Vertex shader
-   D3D11_PRIMITIVE_TOPOLOGY primitive_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+   D3D_PRIMITIVE_TOPOLOGY primitive_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
    std::vector<std::string> vertex_buffer_hashes;
    std::string input_layout_hash;
    std::string index_buffer_hash;
@@ -160,25 +191,38 @@ struct TraceDrawCallData
 
    DepthStateType depth_state = DepthStateType::Disabled;
    DepthStateType stencil_state = DepthStateType::Disabled;
-   // Already includes all the render targets
+   // Already includes all the render targets. The D3D12 capture converts its PSO's blend state to it (the D3D11 and D3D12 enums are numbered alike)
    D3D11_BLEND_DESC1 blend_desc = {};
-   FLOAT blend_factor[4] = { 1.f, 1.f, 1.f, 1.f };
+   // The blend factor (D3D11 draws), or the clear values of clear entries (depth and stencil in the first two for depth clears)
+   FLOAT blend_factor[4] = {1.f, 1.f, 1.f, 1.f};
 
-   bool cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-   std::string cb_hash[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {}; // Ptr hash (not content hash)
+   // D3D12 packs the constant buffers in binding order (see "cb_register"): a draw can have more of them than D3D11's slots
+#if DX12
+   static constexpr size_t cbs_size = 32;
+#else
+   static constexpr size_t cbs_size = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+#endif
+   bool cbs[cbs_size] = {};
+   std::string cb_hash[cbs_size] = {}; // Ptr hash (not content hash)
    // D3D11.1 partial buffer binding offsets (0/0 means data not available or full-buffer bind via legacy API)
-   UINT cb_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-   UINT cb_num_constants[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+   UINT cb_first_constant[cbs_size] = {};
+   UINT cb_num_constants[cbs_size] = {};
 
-   D3D11_FILTER samplers_filter[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_u[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_v[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_w[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   float samplers_mip_lod_bias[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+   // D3D12 packs the samplers in binding order (see "sa_register"), with the D3D12 values in the D3D11 enums (they are numbered alike)
+#if DX12
+   static constexpr size_t samplers_size = 32;
+#else
+   static constexpr size_t samplers_size = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+#endif
+   D3D11_FILTER samplers_filter[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_u[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_v[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_w[samplers_size] = {};
+   float samplers_mip_lod_bias[samplers_size] = {};
 
    // Render Target (Resource+Views)
    static constexpr size_t rtvs_size = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; // Max size (we can lower it if needed) // TODO: allocate these as a vector of structs
-   const ID3D11RenderTargetView* rtvs[rtvs_size] = {};                  // TODO.. find a better way, this is very hacky (though safe, as long as we read/compare it)
+   uint64_t rtvs[rtvs_size] = {};                                       // View handles, only compared and looked up
    DXGI_FORMAT rt_format[rtvs_size] = {};                               // The format of the resource
    DXGI_FORMAT rtv_format[rtvs_size] = {};                              // The format of the view
    uint4 rt_size[rtvs_size] = {};                                       // 3th and 4th channels are Array, MS and Mips
@@ -194,7 +238,7 @@ struct TraceDrawCallData
 #else
    static constexpr size_t srvs_size = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 #endif
-   const ID3D11ShaderResourceView* srvs[srvs_size] = {};
+   uint64_t srvs[srvs_size] = {};
    DXGI_FORMAT srv_format[srvs_size] = {};                                   // The format of the view
    DXGI_FORMAT sr_format[srvs_size] = {};                            // The format of the resource
    uint4 sr_size[srvs_size] = {};                                            // 3th and 4th channels are Array, MS and Mips
@@ -211,7 +255,7 @@ struct TraceDrawCallData
 #else
    static constexpr size_t uavs_size = D3D11_1_UAV_SLOT_COUNT;
 #endif
-   const ID3D11UnorderedAccessView* uavs[uavs_size] = {};
+   uint64_t uavs[uavs_size] = {};
    DXGI_FORMAT ua_format[uavs_size] = {};               // The format of the resource
    DXGI_FORMAT uav_format[uavs_size] = {};     // The format of the view
    uint4 ua_size[uavs_size] = {};                       // 3th and 4th channels are Array, MS and Mips
@@ -228,12 +272,86 @@ struct TraceDrawCallData
    std::string ds_hash = {}; // Ptr hash (not content hash)
    std::string ds_debug_name = {}; // Debug name of the texture or the view
 
-   // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults.
+#if DX12
+   // D3D12 binds by root signature, not by slot: the SRV, UAV and constant buffer entries above are packed in binding order, the
+   // first "*_count" are valid, and these are their registers
+   struct ShaderRegister
+   {
+      uint32_t index = 0;
+      uint32_t space = 0;
+   };
+   uint32_t srv_count = 0;
+   uint32_t uav_count = 0;
+   uint32_t cb_count = 0;
+   uint32_t sampler_count = 0;
+   ShaderRegister sr_register[srvs_size] = {};
+   ShaderRegister ua_register[uavs_size] = {};
+   ShaderRegister cb_register[cbs_size] = {};
+   ShaderRegister sa_register[samplers_size] = {};
+   // Only the comparison filters use it
+   D3D11_COMPARISON_FUNC samplers_comparison_func[samplers_size] = {};
+   std::vector<uint32_t> cb_root_constants[cbs_size]; // The values of root constants (they have no "cb_hash")
+   bool uses_descriptor_heap = false; // A shader indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices usually are in the constants
+   // ExecuteIndirect() (with the command signature hooks, see "D3D12CommandSignatures"): the argument buffer range, the most commands and what each command sets,
+   // in the signature's order. The root arguments name their root parameter's register: those bindings are each command's, not the ones the list shows.
+   struct IndirectArgument
+   {
+      D3D12_INDIRECT_ARGUMENT_TYPE type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+      uint32_t root_parameter = UINT32_MAX; // Root constants and views
+      char register_type = 0;               // 'b', 't' or 'u', 0 if the root parameter isn't known
+      ShaderRegister shader_register;
+      uint32_t constant_offset = 0; // Root constants: the first 32 bit value and how many
+      uint32_t constant_count = 0;
+      uint32_t slot = 0; // Vertex buffers
+   };
+   bool indirect_signature_known = false;
+   uint64_t indirect_buffer = 0;
+   uint64_t indirect_offset = 0;
+   uint32_t indirect_max_count = 0;
+   uint32_t indirect_stride = 0;
+   bool indirect_count_buffer = false;
+   std::vector<IndirectArgument> indirect_arguments;
+   // A bindless range or a type's packed entries went past their limit: the entries above are incomplete
+   bool truncated = false;
+   // The table descriptors of the entries above, read when the command list executes: until it's submitted, games can still write
+   // them (root signature 1.0 and "DESCRIPTORS_VOLATILE" ranges)
+   struct TableDescriptor
+   {
+      reshade::api::descriptor_table table = {};
+      uint32_t binding = 0; // Offset from the table start
+      char type = 0;        // 't', 'u', 'b' or 's'
+      uint32_t index = 0;   // In the packed SRV, UAV or constant buffer entries
+   };
+   std::vector<TableDescriptor> table_descriptors;
+   // What readbacks copy, which the hashes above can't give back: the render target, unordered access and depth stencil views, and the
+   // buffers of constant buffer views (root constants have none). Copy, resolve and clear entries have no views: their "rt_view[0]" is
+   // what they wrote (the cleared view, else the whole resource or the destination subresource's mip and layer) and "copy_source" is
+   // the resource a copy read
+   D3D12State::ViewInfo rt_view[rtvs_size] = {};
+   D3D12State::ViewInfo ua_view[uavs_size] = {};
+   D3D12State::ViewInfo ds_view = {};
+   uint64_t cb_resource[cbs_size] = {};
+   uint64_t copy_source = 0;
+   // The view a clear entry cleared: readbacks re-issue render target and depth stencil clears, not unordered access ones
+   enum class ClearKind : uint8_t
+   {
+      RenderTarget,
+      DepthStencil,
+      UnorderedAccess,
+   };
+   ClearKind clear_kind = ClearKind::RenderTarget;
+#endif
+
+   // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults. The D3D12 capture
+   // converts its PSO's, and tracks the viewports and scissors only with "ENABLE_D3D12_PASSES".
    bool has_depth_stencil_state = false;
    D3D11_DEPTH_STENCIL_DESC depth_stencil_desc = {};
    UINT stencil_ref = 0;
    bool has_rasterizer_state = false;
    D3D11_RASTERIZER_DESC rasterizer_desc = {};
+#if DX12
+   bool scissor_enable = false; // D3D12's rasterizer desc has no scissor flag
+#endif
    UINT viewport_count = 0;
    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
    UINT scissor_count = 0;
@@ -246,6 +364,9 @@ struct TraceDrawCallData
       Region,
       Resolve,
       BufferRegion,
+      // D3D12 only
+      BufferToTexture, // An upload: "box" is the written size in texels, from the origin
+      TextureToBuffer,
    };
    struct CopyInfo
    {
@@ -254,7 +375,12 @@ struct TraceDrawCallData
       UINT dest_subresource = 0;
       uint3 dest_offset = {}; // Bytes in "x" for buffer copies
       bool has_box = false;
-      D3D11_BOX box = {}; // Source region (bytes in "left"/"right" for buffer copies)
+      // Source region (bytes in "left"/"right" for buffer copies, but the written size in texels for D3D12 uploads)
+#if DX11
+      D3D11_BOX box = {};
+#else
+      D3D12_BOX box = {};
+#endif
       DXGI_FORMAT resolve_format = DXGI_FORMAT_UNKNOWN;
    };
    CopyInfo copy_info;
@@ -274,6 +400,7 @@ struct TraceDrawCallData
    bool IsDSVValid() const { return dsv_format != DXGI_FORMAT_UNKNOWN && dsv_format != DXGI_FORMAT(-1); }
 
    const char* custom_name = "Unknown";
+   bool predicted = false; // A custom entry listed before it ran (the swapchain encode, which runs in the native present after the capture closed)
 };
 
 // Applies to command lists and command queue (DirectX 11 command list and deferred or immediate contexts, though usually it's for "ID3D11DeviceContext").
@@ -331,6 +458,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    // Patch variant API (game-facing). Per-context/per-bind state.
    // ============================================================================
 
+#if DX11
    // Switch between original and patched shader for a given hash.
    // "stages" selects which original handle to use (vertex/pixel/compute).
    void UseShaderVariant(ID3D11DeviceContext* native_device_context, uint32_t shader_hash,
@@ -361,6 +489,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       else if ((stages & reshade::api::shader_stage::compute) != 0)
          native_device_context->CSSetShader(reinterpret_cast<ID3D11ComputeShader*>(handle), nullptr, 0);
    }
+#endif // DX11
 
    enum ViewState
    {
@@ -430,6 +559,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       any_upgraded_cs_uavs = std::any_of(cs_uavs_state.begin(), cs_uavs_state.end(), [](auto v) { return v == ViewState::SetAndUpgraded; });
    }
 
+#if DX11
    static void SetConstantBuffers(ID3D11DeviceContext* device_context, reshade::api::shader_stage stages, uint32_t slot, ID3D11Buffer* const buffers, uint32_t num = 1)
    {
       if ((stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
@@ -441,6 +571,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
          device_context->CSSetConstantBuffers(slot, num, &buffers);
    }
+#endif // DX11
 
 #if ENABLE_AUTO_CBUFFER_RESTORATION
    com_ptr<ID3D11Buffer> original_constant_buffers[(uint8_t)Shader::Stage::Count][D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
@@ -503,7 +634,9 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    std::shared_mutex mutex_trace;
    std::vector<TraceDrawCallData> trace_draw_calls_data;
 
+#if DX11
    void AddGraphicsCaptureCustomDrawCall(const char* name, class ID3D11DeviceContext* native_device_context, class ID3D11Resource* resource = nullptr, class ID3D11View* view = nullptr);
+#endif // DX11
 
    bool requires_join = false;
 
@@ -511,6 +644,31 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    bool any_dispatch_done = false;
 
    ShaderCustomDepthStencilType temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
+#endif
+
+#if DX12
+   // ReShade's proxy of the list, through whose API Luma records its passes on it (see "DrawRCAS()")
+   reshade::api::command_list* cmd_list = nullptr;
+   // What the command list bound, as far as game code can query it on release builds too (see "d3d12_state.h")
+   D3D12State::CommandListState d3d12_state;
+   // A bundle (secondary command list): the command list that executes it inherits what it bound
+   bool is_bundle = false;
+   // The memory of the root CBVs Luma sets on this command list (see "d3d12_upload_ring.h"). The pool is the device's, held here too: this data can outlive the device's
+   std::shared_ptr<D3D12UploadRing::Pool> upload_ring;
+   D3D12UploadRing::Pages upload_pages;
+   D3D12_GPU_VIRTUAL_ADDRESS luma_data_address = 0; // Of the last upload of "cb_luma_instance_data", 0 since the last reset
+   // The root parameters of Luma's CBVs in the root signature of the bound pipeline, when the bind swapped in a replacement (-1 for the CBVs it doesn't have, see
+   // "D3D12RootSignatures::LumaParams"). Plain integers: builds without MinHook have no root signature hook
+   int32_t luma_settings_param = -1;
+   int32_t luma_data_param = -1;
+   // The pipeline the command list bound, for its draws to follow the formats of the render targets (see "UpdateD3D12PipelineVariant()"). Null if it isn't tracked. Valid while it's bound, like the hashes above
+   const Shader::CachedPipeline* bound_cached_pipeline = nullptr;
+   // What Luma set at the bind: the clone of the pipeline if it has an active one, else the pipeline. A render target format variant is made from it
+   uint64_t bound_base_pipeline = 0;
+   // What the command list really has bound now: "bound_base_pipeline" or one of its variants
+   uint64_t bound_current_pipeline = 0;
+   // Set by the binds of a pipeline and of render targets: the next graphics draw looks at the formats of the render targets again
+   bool render_target_formats_dirty = false;
 #endif
 };
 
@@ -579,10 +737,16 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    Reflex::DeviceData reflex; // For the first swapchain (the only one expected)
 #endif
    std::unordered_set<uint64_t> back_buffers; // From all the swapchains (whether they are upgraded or not)
-   ID3D11Device* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
+#if DX12
+   // The ones of "back_buffers" whose format family the swapchain upgrade changed (see "OnCreateSwapchain()"): only these can't take the game's copies through a buffer
+   std::unordered_set<uint64_t> upgraded_back_buffers;
+#endif
+   NativeDevice* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
    reshade::api::device* reshade_device = nullptr; // Always valid as it's our parent. Not owned by this.
+#if DX11
    com_ptr<ID3D11DeviceContext> primary_command_list; // The immediate/primary command list is always valid
    CommandListData* primary_command_list_data = nullptr; // The immediate/primary command list is always valid
+#endif
 
    UINT uav_max_count = D3D11_1_UAV_SLOT_COUNT; // DX11.1. Use "D3D11_PS_CS_UAV_REGISTER_COUNT" for DX11.
 
@@ -614,8 +778,22 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::unordered_set<uint64_t> pipelines_to_reload;
    static_assert(sizeof(reshade::api::pipeline::handle) == sizeof(uint64_t));
 
+#if DX12 && DEVELOPMENT // For the frame capture, for now
+   D3D12State::PipelineLayouts pipeline_layouts;
+   D3D12State::DescriptorHeaps descriptor_heaps;
+   D3D12State::BufferAddresses buffer_addresses;
+   // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)
+   CommandListData trace_command_list_data;
+   D3D12Readback::State readback; // The dev MCP's GPU copies
+#if ENABLE_MINHOOK
+   D3D12ResourceCreation::TextureKinds texture_kinds; // How the game created each live texture, for the dev MCP's "creation" (see "includes/d3d12_resource_creation.h")
+#endif
+#endif
+
+#if DX11
    // Custom samplers mapped to original ones by texture LOD bias
    std::unordered_map<uint64_t, std::unordered_map<float, com_ptr<ID3D11SamplerState>>> custom_sampler_by_original_sampler;
+#endif
 
 #if ENABLE_SR
    SR::Type sr_type = SR::Type::None; // If active, the SR tech enabled by the user and supported+initialized correctly on this device
@@ -634,11 +812,17 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Resources:
 
 #if ENABLE_SR
+#if DX12
+   com_ptr<ID3D12Resource> sr_output_color;
+   com_ptr<ID3D12Resource> sr_exposure;
+#else
    com_ptr<ID3D11Texture2D> sr_output_color;
    com_ptr<ID3D11Texture2D> sr_exposure;
+#endif
    float sr_exposure_texture_value = 1.f;
 #endif // ENABLE_SR
 
+#if DX11 // D3D11 objects: the D3D12 Luma passes make their pipelines from the natives' bytecode ("CreateD3D12NativePipeline()"), its UI resources aren't ported, its cbuffers are in the upload ring below
    // Native Shaders (from "native_shaders_definitions")
    bool created_native_shaders = false;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> native_vertex_shaders;
@@ -662,9 +846,130 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    com_ptr<ID3D11Buffer> luma_global_settings;
    com_ptr<ID3D11Buffer> luma_instance_data;
    com_ptr<ID3D11Buffer> luma_ui_data;
+#endif // DX11
    CB::LumaUIDataPadded cb_luma_ui_data = {};
    std::atomic<bool> cb_luma_global_settings_dirty = true;
 
+#if DX12
+   // The memory of the root CBVs Luma adds to the game's root signatures (see "d3d12_upload_ring.h"). Command lists hold the pool too, their data can outlive this
+   std::shared_ptr<D3D12UploadRing::Pool> upload_ring;
+   // The copies of the Luma settings, one per change: a command list keeps pointing at the one it recorded. Every command list may use the newest, so "settings_mutex"
+   // serializes the uploads into these pages
+   D3D12UploadRing::Pages settings_pages = {.shared = true};
+   std::shared_mutex settings_mutex;
+   std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> settings_address = 0; // The newest copy, 0 before the first
+   // The ring frees its pages by the fences it signals with this count at each present
+   std::atomic<uint64_t> present_count = 0;
+
+   // Bumped when any of Luma's native shaders changes (see "CompileCustomShaders()"): the pipelines made of them are made again
+   std::atomic<uint32_t> native_shaders_generation = 0;
+
+   // What a fullscreen pass of Luma's natives at present makes when it first draws (see "PrepareD3D12NativePass()"). "mutex" serializes the pass's draws and guards the rest
+   struct NativePassD3D12
+   {
+      std::shared_mutex mutex;
+      D3D12Passes::Context passes;                 // Its command list, run on the present queue
+      com_ptr<ID3D12RootSignature> root_signature; // Its CBVs are at the registers the natives were compiled with
+      com_ptr<ID3D12PipelineState> pipeline;       // Null if the last attempt to make it for the format and generation below failed
+      DXGI_FORMAT pipeline_format = DXGI_FORMAT_UNKNOWN;
+      uint32_t pipeline_generation = 0;
+      std::vector<com_ptr<IUnknown>> retired; // What it replaced, which the GPU can still use: the next frame it submits keeps it alive
+      CommandListData cmd_list_data;          // Owns the memory of its root CBVs (root parameters 0 and 1), for "SetLumaConstantBuffers()"
+   };
+   // The display composition (see "DrawDisplayCompositionD3D12()")
+   struct DisplayCompositionD3D12 : NativePassD3D12
+   {
+      com_ptr<ID3D12Resource> source;    // A copy of the back buffer, which the shader reads while it writes the back buffer
+      uint32_t drawn_frame = UINT32_MAX; // The "FrameIndex" of the last present it drew in, for the dev MCP
+   } display_composition;
+   // The encode of the scRGB proxy into the real back buffer (see "DrawSwapchainEncodeD3D12()")
+   NativePassD3D12 swapchain_encode;
+#if ENABLE_D3D12_PASSES
+   // What a D3D12 pass drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()") makes when it first draws (see "PrepareD3D12GamePass()").
+   // "mutex" serializes its draws and guards the rest
+   struct GamePassD3D12
+   {
+      std::shared_mutex mutex;
+      reshade::api::pipeline_layout layout = {};                            // Made through ReShade, which its descriptor tables need
+      std::vector<reshade::api::descriptor_table> tables;                   // Of ReShade's GPU heap, by present, by draw in it and by table of the draw
+      std::unordered_map<uint64_t, com_ptr<ID3D12PipelineState>> pipelines; // By pixel shader hash and render target format, of the natives of "pipelines_generation"
+      uint32_t pipelines_generation = 0;
+      std::vector<com_ptr<ID3D12PipelineState>> retired; // Of older natives: a game list recorded with them may still run, so they live as long as the device
+      uint64_t frame = UINT64_MAX;                        // The present count of the last draw, and the draws since it
+      uint32_t frame_draws = 0;
+      bool failed = false;                                                        // ReShade refused the layout or the tables, which isn't tried again
+      std::vector<std::pair<uint64_t, reshade::api::resource>> retired_resources; // Replaced textures, with the present count they were replaced at (see "RetireD3D12GamePassResource()")
+   };
+#if ENABLE_RCAS
+   GamePassD3D12 rcas; // "SharpenParams" as 4 root constants (b0), then a table of t0
+#endif
+#if ENABLE_SMAA
+   // 8 root constants (b1), a table of t0-t2 and the linear and point samplers (s0, s1)
+   struct SMAAD3D12 : GamePassD3D12
+   {
+      // Uploaded through ReShade's immediate list, so at a present ("CreateSMAATexturesD3D12()"), once a draw asked for them
+      std::atomic<bool> textures_wanted = false;
+      reshade::api::resource area_texture = {};
+      reshade::api::resource search_texture = {};
+      reshade::api::resource_view area_srv = {};
+      reshade::api::resource_view search_srv = {};
+      // At the target's size, made again with it. In a shader resource state between draws
+      reshade::api::resource edges = {};
+      reshade::api::resource weights = {};
+      reshade::api::resource_view edges_rtv = {};
+      reshade::api::resource_view edges_srv = {};
+      reshade::api::resource_view weights_rtv = {};
+      reshade::api::resource_view weights_srv = {};
+      // The neighborhood blend's, when RCAS follows it: at the target's size and format
+      reshade::api::resource output = {};
+      reshade::api::resource_view output_rtv = {};
+      reshade::api::resource_view output_srv = {};
+      reshade::api::format output_format = reshade::api::format::unknown;
+      uint32_t width = 0;
+      uint32_t height = 0;
+   } smaa;
+#endif
+#if ENABLE_BLOOM
+   // A table of t0 and u0. Its output (fp16, at the source's size) is in a shader resource state between draws
+   struct KarisAverageD3D12 : GamePassD3D12
+   {
+      reshade::api::resource output = {};
+      reshade::api::resource_view output_srv = {};
+      reshade::api::resource_view output_uav = {};
+      uint32_t width = 0;
+      uint32_t height = 0;
+   } karis_average;
+   // "LumaBloom" as 8 root constants (b11), a table of t0 and the linear sampler (s0). The chains are made again with the scene's size or the mip count,
+   // in a shader resource state between draws: Y is one texture with a mip per level (mip 0 is the bloom), X one texture per level (see "DrawBloom()")
+   struct BloomD3D12 : GamePassD3D12
+   {
+      reshade::api::resource mips_y = {};
+      std::vector<reshade::api::resource> mips_x;
+      std::vector<reshade::api::resource_view> rtvs_y, srvs_y, rtvs_x, srvs_x;
+      uint32_t scene_width = 0;
+      uint32_t scene_height = 0;
+      uint32_t mip_count = 0;
+   } bloom;
+#endif
+   // "ConvertTextureCopyD3D12()": a table of t0, and the textures it goes through, one for each usage, size and format the game's copies had (see "GetD3D12CopyIntermediate()"): the render
+   // target it draws into when the copy's destination can't be one (or may be in a layout), in a render target state between draws, and the texture it samples when the copy's source may be in a
+   // layout (a copy of the source), in a copy destination state between draws
+   struct TextureCopyD3D12 : GamePassD3D12
+   {
+      struct Intermediate
+      {
+         reshade::api::resource resource = {};
+         reshade::api::resource_usage usage = reshade::api::resource_usage::undefined;
+         uint32_t width = 0;
+         uint32_t height = 0;
+         reshade::api::format format = reshade::api::format::unknown;
+      };
+      std::vector<Intermediate> intermediates;
+   } texture_copy;
+#endif
+#endif
+
+#if DX11
    // UI
    com_ptr<ID3D11Texture2D> ui_texture;
    com_ptr<ID3D11RenderTargetView> ui_texture_rtv;
@@ -687,11 +992,14 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::unordered_set<ID3D11Buffer*> cb_per_view_global_buffers;
 #endif
    void* cb_per_view_global_buffer_map_data = nullptr;
+#endif // DX11
 #if DEVELOPMENT
-   std::shared_ptr<void> debug_draw_frozen_draw_state_stack;
-   com_ptr<ID3D11Resource> debug_draw_texture;
    DXGI_FORMAT debug_draw_texture_format = DXGI_FORMAT_UNKNOWN; // The view format, not the texture format
    uint4 debug_draw_texture_size = {}; // 3rd and 4th channels are Array/MS/Mips
+#endif
+#if DEVELOPMENT && DX11
+   std::shared_ptr<void> debug_draw_frozen_draw_state_stack;
+   com_ptr<ID3D11Resource> debug_draw_texture;
 
    struct TrackBufferData
    {
@@ -751,6 +1059,10 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Live settings (set by the code, not directly by users):
    float default_user_peak_white = default_peak_white;
    float texture_mip_lod_bias_offset = 0.f;
+#if DX12
+   // The sampler upgrade the D3D12 sampler descriptors the game wrote have ("GetSamplersUpgradeState()"): "OnPresent()" writes them again when it changes
+   std::tuple<float, int, int, bool, bool> applied_samplers_upgrade;
+#endif
 #if ENABLE_SR
    float sr_scene_exposure = 1.f;
    float sr_scene_pre_exposure = 1.f;
@@ -766,6 +1078,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Per game custom data
    GameDeviceData* game = nullptr;
 
+#if DX11
    std::vector<ID3D11Buffer*> GetLumaCBuffers() const
    {
       std::vector<ID3D11Buffer*> buffers;
@@ -779,6 +1092,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    }
 
    ManagedResources managed_resources;
+#endif // DX11
 };
 
 // A Luma native shader ("native_*_shaders") by name, null until compiled. Looked up with "find": "operator[]" would insert on a miss,
@@ -804,7 +1118,9 @@ struct __declspec(uuid("c5805458-2c02-4ebf-b139-38b85118d971")) SwapchainData
 
    std::unordered_set<uint64_t> back_buffers;
 
+#if DX11
    std::vector<com_ptr<ID3D11RenderTargetView>> display_composition_rtvs;
+#endif
 
    // Whether the original SDR (vanilla) swapchain was linear space (e.g. sRGB formats)
     bool vanilla_was_linear_space = false;

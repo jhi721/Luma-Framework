@@ -446,6 +446,12 @@ namespace Patch
          case reshade::api::pipeline_subobject_type::vertex_shader:
          case reshade::api::pipeline_subobject_type::compute_shader:
          case reshade::api::pipeline_subobject_type::pixel_shader:
+#if DX12
+         case reshade::api::pipeline_subobject_type::hull_shader:
+         case reshade::api::pipeline_subobject_type::domain_shader:
+         case reshade::api::pipeline_subobject_type::amplification_shader:
+         case reshade::api::pipeline_subobject_type::mesh_shader:
+#endif
             break;
          default:
             continue;

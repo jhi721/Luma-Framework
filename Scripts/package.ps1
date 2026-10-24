@@ -8,7 +8,7 @@
     root plus a "Luma/" folder (the shaders mount, filtered to this project),
     with the project-level (Core/Textures) folders only included when the
     project opts in via UseLumaFastNoise, plus the runtime DLLs the project
-    needs (dxcompiler.dll for DXP, d3dcompiler_47.dll, ReShade as dxgi.dll,
+    needs (dxcompiler.dll for D3D12 projects, d3dcompiler_47.dll, ReShade as dxgi.dll,
     NGX DLSS when opted in). dgVoodoo games (UseDgVoodoo) also get dgVoodoo2,
     plus a "-Linux" zip with its Wine/Proton build (UseDgVoodooLinux),
     optionally behind the D3D9 VA Fix proxy (UseD3D9VAFix), with its CSMT layer on in
@@ -97,7 +97,8 @@ $useDgVoodoo = Test-PropEnabled $vcxproj "UseDgVoodoo"
 $useDgVoodooLinux = Test-PropEnabled $vcxproj "UseDgVoodooLinux"
 $useD3D9VAFix = Test-PropEnabled $vcxproj "UseD3D9VAFix"
 $useD3D9CSMT = Test-PropEnabled $vcxproj "UseD3D9CSMT"
-Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT"
+$isD3D12 = (Get-Content $vcxproj -Raw) -match "<LumaGraphicsAPI>\s*D3D12\s*</LumaGraphicsAPI>"
+Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT D3D12=$isD3D12"
 if (($useDgVoodooLinux -or $useD3D9VAFix) -and -not $useDgVoodoo) {
     Write-Error "UseDgVoodooLinux and UseD3D9VAFix need UseDgVoodoo"
     exit 1
@@ -154,11 +155,20 @@ try {
         }
     }
 
-    # Runtime DLLs (dxcompiler.dll is intentionally not shipped: Luma only uses the
-    #    SM5 recipe path, which is native — DXC/DXIL is only needed once SM6 is used)
+    # Runtime DLLs
     $d3dCompilerSrc = if ($Platform -eq "Win32") { Join-Path $repoRoot "Shaders\Decompiler\d3dcompiler_47_x32.dll" }
                       else { Join-Path $repoRoot "Shaders\Decompiler\d3dcompiler_47.dll" }
     if (Test-Path $d3dCompilerSrc) { Copy-Item $d3dCompilerSrc -Destination "$tempDir\Luma" -Force }
+    # D3D12 builds compile Luma's own passes (e.g. the display composition) as SM 6.0 with DXC. DXC 1.8.2502 and later
+    # sign the DXIL themselves, so dxil.dll isn't needed. D3D11 projects only use FXC.
+    if ($isD3D12) {
+        $dxcSrc = Join-Path $repoRoot "Shaders\Decompiler\dxcompiler.dll"
+        if (-not (Test-Path $dxcSrc)) {
+            Write-Error "dxcompiler.dll not found: $dxcSrc"
+            exit 1
+        }
+        Copy-Item $dxcSrc -Destination "$tempDir\Luma" -Force
+    }
     $reshadeSrc = if ($Platform -eq "Win32") { Join-Path $repoRoot "Source\External\reshade\bin\Win32\Release\ReShade32.dll" }
                   else { Join-Path $repoRoot "Source\External\reshade\bin\x64\Release\ReShade64.dll" }
     if (Test-Path $reshadeSrc) { Copy-Item $reshadeSrc -Destination (Join-Path $tempDir "dxgi.dll") -Force }

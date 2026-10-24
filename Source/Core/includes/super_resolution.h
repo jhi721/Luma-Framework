@@ -7,10 +7,24 @@
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Resource;
+struct ID3D12Device;
+struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
 struct IDXGIAdapter;
 
 namespace SR
 {
+	// The objects of the API the mod is built for (only DLSS has a D3D12 path so far)
+#if DX12
+	using Device = ID3D12Device;
+	using CommandList = ID3D12GraphicsCommandList;
+	using Resource = ID3D12Resource;
+#else
+	using Device = ID3D11Device;
+	using CommandList = ID3D11DeviceContext;
+	using Resource = ID3D11Resource;
+#endif
+
 	// Note that these don't necessarily match 1:1 with classes, some might be different configurations of the same implementation.
 	enum class UserType
 	{
@@ -221,16 +235,16 @@ namespace SR
 		// Must be called once before usage. Still expects Deinit() to be called even if it failed.
 		// Returns whether this SR implementation is supported by hardware and driver.
 		// Fill in a data "handle", there can be more than one at a time.
-		virtual bool Init(InstanceData*& data, ID3D11Device* device, IDXGIAdapter* adapter = nullptr) { return false; }
+		virtual bool Init(InstanceData*& data, Device* device, IDXGIAdapter* adapter = nullptr) { return false; }
 		// Should be called before shutdown or on device destruction.
-		virtual void Deinit(InstanceData*& data, ID3D11Device* optional_device = nullptr) {}
+		virtual void Deinit(InstanceData*& data, Device* optional_device = nullptr) {}
 		// Frees what "UpdateSettings()" and "Draw()" created (the upscaler's own resources, the SR bridge's helper) but keeps the implementation loaded,
 		// for when it's not selected anymore. The next "UpdateSettings()" (for the SR bridge, "Draw()") creates them again.
 		virtual void ReleaseResources(InstanceData* data) {}
 
 		// Note that this might expect the same command list all the times.
 		// Returns true if the settings changed or were up to date.
-		virtual bool UpdateSettings(InstanceData* data, ID3D11DeviceContext* command_list, const SettingsData& settings_data) { return false; }
+		virtual bool UpdateSettings(InstanceData* data, CommandList* command_list, const SettingsData& settings_data) { return false; }
 
 		struct DrawData
 		{
@@ -239,15 +253,17 @@ namespace SR
 			// created again after a draw (DLSS-Best-Practices OUT-4): a successful draw with this set recreates it at the next "UpdateSettings()".
 			bool output_recreated = false;
 
-			ID3D11Resource* output_color = nullptr;
-			ID3D11Resource* source_color = nullptr;
-			ID3D11Resource* motion_vectors = nullptr;
-			ID3D11Resource* depth_buffer = nullptr; // SR expects the depth to be the device/HW one (1 being near, not 1 being the camera (linear depth)), though it might actually not matter
+			// On D3D12 the caller puts the inputs in "D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE" and the output in
+			// "D3D12_RESOURCE_STATE_UNORDERED_ACCESS" (NGX's expectation), and binds its own state back after "Draw()" (see "NeedsStateRestoration()").
+			Resource* output_color = nullptr;
+			Resource* source_color = nullptr;
+			Resource* motion_vectors = nullptr;
+			Resource* depth_buffer = nullptr; // SR expects the depth to be the device/HW one (1 being near, not 1 being the camera (linear depth)), though it might actually not matter
 
 			// Optional data:
-			ID3D11Resource* exposure = nullptr; // Can be left nullptr to default to 1 or to auto exposure
-			ID3D11Resource* bias_mask = nullptr; // Reactivity/Bias mask (might not be used by all SR implementations)
-			ID3D11Resource* transparency_alpha = nullptr; // Amount of intensity in this pixel (only used by some FSR implementations)
+			Resource* exposure = nullptr; // Can be left nullptr to default to 1 or to auto exposure
+			Resource* bias_mask = nullptr; // Reactivity/Bias mask (might not be used by all SR implementations)
+			Resource* transparency_alpha = nullptr; // Amount of intensity in this pixel (only used by some FSR implementations)
 
 			unsigned int render_width = 0;
 			unsigned int render_height = 0;
@@ -265,7 +281,7 @@ namespace SR
 
 		// Returns true if drawing didn't fail.
 		// Note that this might expect the same command list all the times.
-		virtual bool Draw(const InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data) { return false; }
+		virtual bool Draw(const InstanceData* data, CommandList* command_list, const DrawData& draw_data) { return false; }
 
 		// Returns the suggested or requested period, depending on the implementation.
 		// All implementations work well with Halton for now, so always use that.

@@ -125,6 +125,12 @@
 #ifndef LUMA_UI_DATA_CB_INDEX
 #define LUMA_UI_DATA_CB_INDEX b11
 #endif
+// D3D12: Luma's cbuffers are root CBVs it appends to the game's root signatures, in a register space of their own ("LUMA_CB_SPACE")
+#ifdef LUMA_CB_SPACE
+#define LUMA_CB_REGISTER(index) register(index, LUMA_CB_SPACE)
+#else
+#define LUMA_CB_REGISTER(index) register(index)
+#endif
 
 /////////////////////////////////////////
 // Rendering features toggles (development)
@@ -179,7 +185,7 @@ namespace CB
 // Luma global settings (usually, but not necessarily, changed a maximum of once per frame)
 // Regarding "LUMA_SETTINGS_CB_INDEX", most engines (e.g. CryEngine, Unreal, Unity) push the registers that are used by each shader again for every draw, so it's generally safe to overridden them anyway (they are all reset between frames).
 // Game and Dev settings should only be accessed outside of global shaders and includes, given the struct isn't guaranteed to be fully defined there.
-cbuffer LumaSettings : register(LUMA_SETTINGS_CB_INDEX)
+cbuffer LumaSettings : LUMA_CB_REGISTER(LUMA_SETTINGS_CB_INDEX)
 {
   struct
   {

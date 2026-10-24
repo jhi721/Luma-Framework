@@ -586,7 +586,7 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
             if ((rtvs[i] != nullptr || (show_used_unbound_resources && cached_shader->rtvs[i])) && (show_unused_bound_resources || cached_shader->rtvs[i]))
             {
                rtvs[i] = RedirectMirroredRVS(rtvs[i].get());
-               trace_draw_call_data.rtvs[i] = rtvs[i].get();
+               trace_draw_call_data.rtvs[i] = reinterpret_cast<uint64_t>(rtvs[i].get());
 
                D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
                rtv_desc.Format = DXGI_FORMAT(-1);
@@ -626,7 +626,7 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
             if ((uavs[i] != nullptr || (show_used_unbound_resources && cached_shader->uavs[i])) && (show_unused_bound_resources || cached_shader->uavs[i]))
             {
                uavs[i] = RedirectMirroredRVS(uavs[i].get());
-               trace_draw_call_data.uavs[i] = uavs[i].get();
+               trace_draw_call_data.uavs[i] = reinterpret_cast<uint64_t>(uavs[i].get());
 
                D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
                uav_desc.Format = DXGI_FORMAT(-1);
@@ -649,7 +649,7 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
             if ((srvs[i] != nullptr || (show_used_unbound_resources && cached_shader->srvs[i])) && (show_unused_bound_resources || cached_shader->srvs[i]))
             {
                srvs[i] = RedirectMirroredRVS(srvs[i].get());
-               trace_draw_call_data.srvs[i] = srvs[i].get();
+               trace_draw_call_data.srvs[i] = reinterpret_cast<uint64_t>(srvs[i].get());
 
                D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
                srv_desc.Format = DXGI_FORMAT(-1);
@@ -709,7 +709,7 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
             if ((srvs[i] != nullptr || (show_used_unbound_resources && cached_shader->srvs[i])) && (show_unused_bound_resources || cached_shader->srvs[i]))
             {
                srvs[i] = RedirectMirroredRVS(srvs[i].get());
-               trace_draw_call_data.srvs[i] = srvs[i].get();
+               trace_draw_call_data.srvs[i] = reinterpret_cast<uint64_t>(srvs[i].get());
 
                D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
                srv_desc.Format = DXGI_FORMAT(-1);
@@ -789,7 +789,7 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
             if ((srvs[i] != nullptr || (show_used_unbound_resources && cached_shader->srvs[i])) && (show_unused_bound_resources || cached_shader->srvs[i]))
             {
                srvs[i] = RedirectMirroredRVS(srvs[i].get());
-               trace_draw_call_data.srvs[i] = srvs[i].get();
+               trace_draw_call_data.srvs[i] = reinterpret_cast<uint64_t>(srvs[i].get());
 
                D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
                srv_desc.Format = DXGI_FORMAT(-1);
@@ -812,7 +812,7 @@ void AddTraceDrawCallData(std::vector<TraceDrawCallData>& trace_draw_calls_data,
             if ((uavs[i] != nullptr || (show_used_unbound_resources && cached_shader->uavs[i])) && (show_unused_bound_resources || cached_shader->uavs[i]))
             {
                uavs[i] = RedirectMirroredRVS(uavs[i].get());
-               trace_draw_call_data.uavs[i] = uavs[i].get();
+               trace_draw_call_data.uavs[i] = reinterpret_cast<uint64_t>(uavs[i].get());
 
                D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
                uav_desc.Format = DXGI_FORMAT(-1);

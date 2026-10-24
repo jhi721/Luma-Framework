@@ -54,9 +54,10 @@ ANALYSIS = {
 }
 READ_TARGET = {
     "view": {"type": "string", "description": "rtv (default), srv, uav, depth, stencil, swapchain, ui, registered:<name>"},
-    "slot": {"type": "integer", "description": "View slot (default 0)"},
+    "slot": {"type": "integer", "description": "View slot (default 0); on D3D12 srv/uav slots are the packed entries luma_trace_get lists (with register/space)"},
     "mip": {"type": "integer", "description": "Mip level (default 0)"},
     "replaced": {"type": "boolean", "description": "Read the bindings of Luma's replaced pass (default true) or the original ones"},
+    "composed": {"type": "boolean", "description": "D3D12, with view=swapchain: read the back buffer after Luma's display composition instead of before it (an error if the composition doesn't draw)"},
 }
 COMPARE_OPTIONS = {
     "region": ANALYSIS["region"],
@@ -107,7 +108,9 @@ TOOLS = [
          "frames": {"type": "integer", "description": "Consecutive captures to count draws per hash over (no trigger, max 600)"},
          "top": {"type": "integer", "description": "With frames: most drawn hashes returned (default 64)"},
          "summary": {"type": "boolean", "description": "With frames: frames_seen/min/max per hash instead of the per frame array (long windows)"},
-         "save_as": {"type": "string", "description": "Store the capture's entry list under this name for luma_trace_diff"}},
+         "save_as": {"type": "string", "description": "Store the capture's entry list under this name for luma_trace_diff"},
+         "device": {"type": "integer", "description": "D3D12, a game with several devices: index (luma_status devices) of the one the capture records, kept for the next captures "
+                    "and luma_trace_list/get; the presenting one by default. Readbacks at the entries of another device are refused"}},
     ),
     tool(
         "luma_trace_diff",
@@ -142,10 +145,13 @@ TOOLS = [
         "luma_read_resource",
         "Read back a view of a pass right after it drew (the frame after the call, not a stale live read). Works for any format, including depth/stencil, "
         "3D LUTs, arrays, MSAA (resolved), BC, r16/rg16, r11g11b10. Writes the raw .bin + .json meta, returns per-channel stats (min/max/mean/percentiles, "
-        "NaN/Inf/negative/above 1/exact zero) and a PNG preview path. PS and CS passes only (use the PS entry of a draw). view=swapchain or ui reads the "
-        "back buffer or Luma's UI texture at present (before display composition), no pass needed. view=registered:<name> reads one of Luma's own "
-        "textures (SMAA input/predication mask/output, GTAO depth mips, motion vectors, core.bloom with mip=, core.smaa_edges...; see luma_dev_values kind "
-        "texture) at present: its last content, usually this frame's.",
+        "NaN/Inf/negative/above 1/exact zero) and a PNG preview path. PS and CS passes only (use the PS entry of a draw; D3D12 entries are whole draws). "
+        "view=swapchain or ui reads the back buffer or Luma's UI texture at present (before display composition; D3D12: composed=true reads the swapchain after it), no pass needed. view=registered:<name> "
+        "reads one of Luma's own textures (SMAA input/predication mask/output, GTAO depth mips, motion vectors, core.bloom with mip=, core.smaa_edges...; "
+        "see luma_dev_values kind texture) at present: its last content, usually this frame's. "
+        "D3D12: view=srv needs index and reads the resource right after the entry that last wrote it (draw, dispatch, copy, resolve or clear; "
+        "producer_index). Copy, resolve and clear entries read by index what they wrote (rtv, or depth/stencil); uploads, UAV clears and buffer copies "
+        "are refused, resolves re-run in the game's mode (resolve_mode). No ui view; registered: views are Luma's own textures (core.smaa_edges, core.smaa_weights, core.bloom with mip=, core.sr_output).",
         {**TARGET,
          **READ_TARGET,
          **OUT_DIR,
@@ -211,11 +217,17 @@ TOOLS = [
     tool(
         "luma_read_cbuffer",
         "Read a constant buffer bound to a pass at draw time (VS, PS or CS). Returns float4 rows with float and uint views. "
-        "With 'frames' it reads it on N consecutive frames (jitter sequences, camera latches, half rate updates) and reports which rows change.",
-        {**TARGET, "slot": {"type": "integer", "description": "Constant buffer register b<slot>"},
+        "With 'frames' it reads it on N consecutive frames (jitter sequences, camera latches, half rate updates) and reports which rows change. "
+        "D3D12: root constants come from the bound values; constant buffer views only from UPLOAD heaps (DEFAULT heap ones are refused, their state "
+        "isn't known).",
+        {**TARGET, "slot": {"type": "integer", "description": "Constant buffer register b<slot> (D3D12: the packed entry luma_trace_get lists, with register/space)"},
+         "register": {"type": "integer", "description": "Instead of slot: the shader register b<register> (D3D12: the draw's entry with that register and space; the error lists the draw's registers. D3D11: same as slot)"},
+         "space": {"type": "integer", "description": "With register, D3D12: the register space (default 0)"},
+         "indirect": {"type": "boolean", "description": "D3D12, an ExecuteIndirect() entry: read its commands from the argument buffer instead (up to 32, each argument's "
+                      "32 bit values in the signature's order; luma_trace_get lists the arguments)"},
          "frames": {"type": "integer", "description": "Consecutive frames to read (default 1)"},
          "rows": {"type": "string", "description": "With frames: float4 rows to print per frame, e.g. \"0-3,12\" (default: the rows that change)"}},
-        ["slot"],
+        [],
     ),
     tool("luma_dev_values", "The game's registered knobs: toggles, floats, ints (with their range), per frame counters (e.g. motion vector draws, matches, "
          "refusals by reason) and Luma textures (format/size, read with luma_read_resource view=registered:<name>). Core ones start with \"core.\" "
@@ -746,12 +758,14 @@ def format_row(floats, uints, row):
 
 
 def postprocess_cbuffer(result, rows_spec):
+    if "commands" in result:  # An ExecuteIndirect()'s commands, already decoded
+        return
     if "series" in result:
         frames = []
         for entry in result.pop("series"):
             frame, hex_string = entry.split(":", 1)
             frames.append((int(frame),) + dword_views(hex_string))
-        row_count = min(len(f[2]) for f in frames) // 4
+        row_count = (min(len(f[2]) for f in frames) + 3) // 4  # D3D12 root constants can end mid row
         changing = [r for r in range(row_count) if len({f[2][r * 4:r * 4 + 4] for f in frames}) > 1]
         shown = sorted(parse_rows(rows_spec)) if rows_spec else changing[:32]
         result["frames"] = len(frames)
@@ -761,8 +775,9 @@ def postprocess_cbuffer(result, rows_spec):
         return
     floats, uints = dword_views(result.pop("hex_dwords"))
     first = result.get("first_constant", 0)
-    last = first + result["num_constants"] if result.get("num_constants") else len(floats) // 4
-    result["rows"] = [f"c{r}: {format_row(floats, uints, r)}" + ("" if first <= r < last else " (outside bound range)") for r in range(len(floats) // 4)]
+    row_count = (len(floats) + 3) // 4
+    last = first + result["num_constants"] if result.get("num_constants") else row_count
+    result["rows"] = [f"c{r}: {format_row(floats, uints, r)}" + ("" if first <= r < last else " (outside bound range)") for r in range(row_count)]
 
 
 TRACE_DIR = os.path.join(tempfile.gettempdir(), "luma-mcp", "traces")

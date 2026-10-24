@@ -790,52 +790,6 @@ void ConvertR8G8B8A8toR16G16B16A16(
 }
 
 #if DEVELOPMENT
-// Needs to match in shader
-enum class DebugDrawTextureOptionsMask : uint32_t
-{
-   None = 0,
-   Fullscreen = 1 << 0,
-   RenderResolutionScale = 1 << 1,
-   ShowAlpha = 1 << 2,
-   PreMultiplyAlpha = 1 << 3,
-   InvertColors = 1 << 4,
-   LinearToGamma = 1 << 5,
-   GammaToLinear = 1 << 6,
-   FlipY = 1 << 7,
-   Saturate = 1 << 8,
-   RedOnly = 1 << 9,
-   BackgroundPassthrough = 1 << 10,
-   TextureMultiSample = 1 << 11,
-   TextureArray = 1 << 12,
-   // If this is true and Texture3D is also true, the texture is a cube. If both are false it's 1D.
-   Texture2D = 1 << 13,
-   Texture3D = 1 << 14,
-   Abs = 1 << 15,
-   Zoom4x = 1 << 16,
-   Bilinear = 1 << 17,
-   Tonemap = 1 << 18,
-   SRGB = 1 << 19,
-   UVToPixelSpace = 1 << 20,
-   Denormalize = 1 << 21,
-};
-enum class DebugDrawMode : uint32_t
-{
-   Custom,
-   // TODO: rename all of these to "View", or not
-   RenderTarget,
-   UnorderedAccessView,
-   ShaderResource,
-   Depth,
-   Stencil,
-};
-static constexpr const char* debug_draw_mode_strings[] = {
-    "Custom",
-    "Render Target",
-    "Unordered Access View",
-    "Shader Resource",
-    "Depth",
-    "Stencil",
-};
 
 bool CopyDebugDrawTexture(DebugDrawMode debug_draw_mode, int32_t debug_draw_view_index, reshade::api::command_list* cmd_list, bool is_dispatch /*= false*/)
 {

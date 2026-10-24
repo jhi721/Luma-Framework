@@ -2,6 +2,15 @@
 
 #include "shader_define.h"
 
+#include <array>
+#include <atomic>
+#include <memory>
+#include <shared_mutex>
+#include <vector>
+#if DX12 && ENABLE_MINHOOK
+#include "d3d12_pso_capture.h"
+#endif
+
 // Forward declarations
 enum class ShaderReplaceDrawType;
 enum class ShaderCustomDepthStencilType;
@@ -86,8 +95,50 @@ namespace Shader
       // Any value is valid and possible, including 0
 #if DX12
       std::vector<uint32_t> shader_hashes;
+      std::vector<reshade::api::pipeline_subobject_type> shader_types; // The stage of each of "shader_hashes"
 #else
       std::array<uint32_t, 1> shader_hashes;
+#endif
+
+#if DX12
+      // The root signature of "layout", referenced by us so a clone can use it after the game released it. Null if the shaders embed it
+      com_ptr<ID3D12RootSignature> root_signature;
+      // The root parameters of Luma's CBVs in it, -1 for the CBVs it doesn't have (see "D3D12RootSignatures::LumaParams"). Plain integers: builds without MinHook have no root signature hook
+      int32_t luma_settings_param = -1;
+      int32_t luma_data_param = -1;
+#if ENABLE_MINHOOK
+      // The stream the game created the pipeline with (see "includes/d3d12_pso_capture.h"), its shader bytecode pointing at the copies in
+      // "subobjects_cache". Null if the create wasn't captured: clones are then rebuilt by ReShade
+      std::unique_ptr<D3D12PsoCapture::Stream> capture;
+#endif
+      // The clone bound in place of the original, 0 if none. Read without a lock by the bind callback. Owned like "pipeline_clone", which it
+      // can mirror: destroyed once, with the original
+      std::atomic<uint64_t> active_clone = 0;
+      // The hash of the code the clone in "pipeline_clone" was built from, kept with it when it's retired. Under "s_mutex_generic", like "pipeline_clone"
+      uint64_t active_clone_code_hash = 0;
+      // The clones that were replaced, built from the code of "code_hash". A command list can still hold one, so they live as long as the
+      // original, and a reload reuses the one with the same hash
+      struct RetiredClone
+      {
+         uint64_t code_hash = 0;
+         reshade::api::pipeline clone = {};
+      };
+      std::vector<RetiredClone> retired_clones;
+
+      // The render target formats the pipeline declares (the stream's if it was captured, else the subobject ReShade reports): D3D12 checks them against the render targets bound when it
+      // draws, which the upgrades change. Its clones declare the same
+      std::array<DXGI_FORMAT, 8> render_target_formats = {};
+      uint32_t render_target_count = 0;
+      // The pipelines made from this one, or from one of its clones ("base": its handle stands for the same code as long as it lives), with other render target formats (see
+      // "FindOrCreateD3D12PipelineVariant()"). They live as long as the original, like the retired clones: a command list can still hold one. The lock is never held across a device call
+      struct RenderTargetVariant
+      {
+         uint64_t base = 0;
+         std::array<DXGI_FORMAT, 8> formats = {};
+         uint64_t pipeline = 0; // 0 if making it failed, it's not tried again
+      };
+      mutable std::shared_mutex variants_mutex;
+      mutable std::vector<RenderTargetVariant> variants;
 #endif
 
 #if DEVELOPMENT
@@ -153,6 +204,22 @@ namespace Shader
          }
          return false;
       }
+      // The stage of a shader in the frame capture, "XS" if unknown
+      static const char* StageName(reshade::api::pipeline_subobject_type type)
+      {
+         switch (type)
+         {
+         case reshade::api::pipeline_subobject_type::vertex_shader: return "VS";
+         case reshade::api::pipeline_subobject_type::hull_shader: return "HS";
+         case reshade::api::pipeline_subobject_type::domain_shader: return "DS";
+         case reshade::api::pipeline_subobject_type::geometry_shader: return "GS";
+         case reshade::api::pipeline_subobject_type::amplification_shader: return "AS";
+         case reshade::api::pipeline_subobject_type::mesh_shader: return "MS";
+         case reshade::api::pipeline_subobject_type::pixel_shader: return "PS";
+         case reshade::api::pipeline_subobject_type::compute_shader: return "CS";
+         default: return "XS";
+         }
+      }
       // The stage the frame capture shows, "XS" if none
       const char* StageName() const
       {
@@ -217,6 +284,22 @@ namespace Shader
       std::vector<uint8_t> live_patched_owned_data;
       const void* live_patched_data = nullptr; // Usually nullptr. Valid if we edited the byte code of the shader live when it was created (including shader debug data stripped)
       size_t live_patched_size = 0;
+
+#if DX12
+      // The registers the shader declares, read lazily by the frame capture ("D3D12Trace::ParseResourceBindings()"). The per slot
+      // reflections above have no register spaces.
+      struct ResourceBinding
+      {
+         char type = 0; // 'b', 't', 'u' or 's'
+         uint32_t index = 0;
+         uint32_t space = 0;
+         uint32_t count = 1;
+      };
+      std::vector<ResourceBinding> bindings;
+      bool parsed_bindings = false;
+      bool found_bindings = false; // If not, the capture doesn't filter by "bindings"
+      bool uses_descriptor_heap = false; // SM 6.6 "ResourceDescriptorHeap[]" or "SamplerDescriptorHeap[]", which "bindings" can't list
+#endif
 #endif
 
 #if ALLOW_SHADERS_DUMPING || DEVELOPMENT

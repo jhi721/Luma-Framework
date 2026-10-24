@@ -3,18 +3,25 @@
 // Proxy back buffer for scRGB games, which present HDR10 PQ: the game and Luma (up to its display composition) keep seeing an
 // fp16 scRGB back buffer (a plain texture), while the real DXGI buffer is R10G10B10A2_UNORM, written once per frame by the
 // swapchain encode pass at the end of Luma's "present" (see "DrawSwapchainEncode()"), before ReShade's effects and overlay.
+// D3D12 has one proxy per back buffer.
 //
 // Only the game sees the proxy: the "GetBuffer()", "GetDesc()" and "GetDesc1()" slots of the vtable of ReShade's wrapper (the
 // swapchain the game holds) are replaced. ReShade (it calls the native swapchain), Luma's calls on the native swapchain and
 // overlays hooking the native "Present()" get the real buffer, with its real format and color space (HDR10 PQ, or sRGB on SDR).
 #if ENABLE_SWAPCHAIN_PROXY
+#if DX11
 #include <d3d11.h>
+#else
+#include <d3d12.h>
+#include <include/reshade.hpp>
+#endif
 #include <dxgi1_6.h>
 
 #include <algorithm>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -33,6 +40,7 @@ namespace SwapchainProxy
       // ReShade's wrapper of the native swapchain, what the game calls
       IDXGISwapChain* wrapper = nullptr;
 
+#if DX11
       // Created by "Register()" (null if that failed), lives until "Unregister()"
       com_ptr<ID3D11Texture2D> proxy;
       com_ptr<ID3D11ShaderResourceView> proxy_srv;
@@ -40,6 +48,11 @@ namespace SwapchainProxy
       // Only used by the present thread, which ReShade serializes with the swapchain and effect runtime init/destroy events
       com_ptr<ID3D11Texture2D> real_buffer;
       com_ptr<ID3D11RenderTargetView> real_rtv;
+#else
+      // One per back buffer (committed, in the PRESENT state), created by "Register()" (empty if that failed), lives until "Unregister()".
+      // The real buffers aren't kept: "ResizeBuffers()" fails while anything references them.
+      std::vector<com_ptr<ID3D12Resource>> proxies;
+#endif
       // The display state is stale once it stops being current
       com_ptr<IDXGIFactory1> factory;
       // Whether the window's display is in HDR (PQ output), otherwise it's SDR (sRGB output)
@@ -95,6 +108,7 @@ namespace SwapchainProxy
    inline void CreateProxy(Entry* entry)
    {
       DXGI_SWAP_CHAIN_DESC swapchain_desc;
+#if DX11
       com_ptr<ID3D11Device> device;
       if (FAILED(entry->native->GetDesc(&swapchain_desc)) || FAILED(entry->native->GetDevice(IID_PPV_ARGS(&device))))
          return;
@@ -114,25 +128,64 @@ namespace SwapchainProxy
          entry->proxy = nullptr;
          entry->proxy_srv = nullptr;
       }
+#else
+      // The proxies are made on the native device, so ReShade's proxy and Luma's creation hooks never see them (as for the real back buffers,
+      // which fire no "init_resource" either). A D3D12 swapchain is made on a queue, which its "GetDevice()" may hand out instead of the device.
+      const auto fail = [](const char* reason)
+      {
+         reshade::log::message(reshade::log::level::error, (std::string("[Swapchain proxy] ") + reason + ", so the game draws into the 10 bit buffer and HDR looks wrong").c_str());
+      };
+      com_ptr<ID3D12Device> device;
+      if (FAILED(entry->native->GetDesc(&swapchain_desc)))
+         return fail("The swapchain refused its desc");
+      if (com_ptr<ID3D12CommandQueue> queue; FAILED(entry->native->GetDevice(IID_PPV_ARGS(&device))) && (FAILED(entry->native->GetDevice(IID_PPV_ARGS(&queue))) || FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))))
+         return fail("The swapchain gave out neither its device nor its queue");
+
+      const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+      const D3D12_RESOURCE_DESC proxy_desc = {
+         .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+         .Width = swapchain_desc.BufferDesc.Width,
+         .Height = swapchain_desc.BufferDesc.Height,
+         .DepthOrArraySize = 1,
+         .MipLevels = 1,
+         .Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+         .SampleDesc = {.Count = 1},
+         .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | ((swapchain_desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) != 0 ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE),
+      };
+      entry->proxies.resize(swapchain_desc.BufferCount);
+      for (com_ptr<ID3D12Resource>& proxy : entry->proxies)
+      {
+         if (FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &proxy_desc, D3D12_RESOURCE_STATE_PRESENT, nullptr, IID_PPV_ARGS(&proxy))))
+         {
+            entry->proxies.clear();
+            return fail("The device refused the proxy back buffers");
+         }
+         proxy->SetName(L"Luma swapchain proxy");
+      }
+#endif
    }
 
-   // Empty if the swapchain isn't proxied (or the proxy couldn't be created), the caller then returns the real buffer
-   inline std::optional<HRESULT> QueryProxy(IDXGISwapChain* swapchain, REFIID riid, void** surface)
+   // Empty if the swapchain isn't proxied (or the proxy couldn't be created), the caller then returns the real buffer.
+   // D3D11 swapchains only give out buffer 0.
+   inline std::optional<HRESULT> QueryProxy(IDXGISwapChain* swapchain, UINT buffer, REFIID riid, void** surface)
    {
       const std::shared_lock lock(mutex);
       const Entry* const entry = FindLocked(swapchain);
-      if (!entry || !entry->proxy)
+#if DX11
+      if (!entry || !entry->proxy || buffer != 0)
          return std::nullopt;
       return entry->proxy->QueryInterface(riid, surface);
+#else
+      if (!entry || buffer >= entry->proxies.size())
+         return std::nullopt;
+      return entry->proxies[buffer]->QueryInterface(riid, surface);
+#endif
    }
 
    inline HRESULT STDMETHODCALLTYPE GetBufferDetour(IDXGISwapChain* swapchain, UINT buffer, REFIID riid, void** surface)
    {
-      if (buffer == 0)
-      {
-         if (const std::optional<HRESULT> hr = QueryProxy(swapchain, riid, surface))
-            return *hr;
-      }
+      if (const std::optional<HRESULT> hr = QueryProxy(swapchain, buffer, riid, surface))
+         return *hr;
       return original_get_buffer(swapchain, buffer, riid, surface);
    }
 
