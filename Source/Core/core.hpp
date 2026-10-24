@@ -213,12 +213,15 @@ using NativeCommandList = ID3D11DeviceContext;
 // Only DLSS (NGX) has a D3D12 path so far
 #error "FSR and Luma TAA are D3D11 only"
 #endif
-// Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom): release builds track the graphics state they replace too, to
-// bind it again after them (see "D3D12State::RestoreGraphics()")
-#if DX12 && (ENABLE_RCAS || ENABLE_SMAA || ENABLE_BLOOM)
+// Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom, the texture copy conversion) and the viewports they scale for clones of other sizes:
+// release builds track the graphics state they replace too, to bind it again after them (see "D3D12State::RestoreGraphics()"). On for every D3D12 build, as the copy conversion and
+// the custom dimensions of the texture upgrades need it too; a game can define it as 0 (the copies that cross format families are skipped then, and custom dimensions refused)
+#ifndef ENABLE_D3D12_PASSES
+#if DX12
 #define ENABLE_D3D12_PASSES 1
 #else
 #define ENABLE_D3D12_PASSES 0
+#endif
 #endif
 
 // This might not disable all shaders dumping related code, but it disables enough to remove any performance cost
