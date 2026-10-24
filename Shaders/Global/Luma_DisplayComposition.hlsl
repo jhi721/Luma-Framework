@@ -127,8 +127,8 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 		// Zoom around the center		
 		float zoom = zoom4x ? 4.0 : 1.0;
 		float3 debugSize = float3(debugWidth, debugHeightOrArraySize, debugDepthOrArraySize); // I don't think we need -1 on this
-		float3 center = fullscreen ? 0 : (-debugSize * 0.5); // Zoom around the center if non fullscreen mode // TODO: polish... not right
-		debugPos.xyz = ((debugPos.xyz - center) / zoom) + center;
+		float2 center = (fullscreen ? float2(targetWidth, targetHeight) : debugSize.xy) * 0.5; // The center of the drawn texture (the slice index isn't zoomed)
+		debugPos.xy = ((debugPos.xy - center) / zoom) + center;
 		// TODO: add a brightness scale to convert from UV space to pixel space (e.g. motion vectors)
 
 		// TODO: should we also apply the "resolutionScale" around the center?
