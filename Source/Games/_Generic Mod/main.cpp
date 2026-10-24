@@ -89,6 +89,13 @@ public:
       }
 #endif
 #if DX12 && DEVELOPMENT
+      // "TestUIHash" (hex, section "<NAME> Advanced"): a pixel shader whose draws count as UI, so "core.hide_ui" skips them (the D3D12 smoke test of Hide UI)
+      char test_ui_hash_text[16] = {};
+      size_t test_ui_hash_size = sizeof(test_ui_hash_text);
+      if (reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "TestUIHash", test_ui_hash_text, &test_ui_hash_size))
+      {
+         shader_hashes_UI.pixel_shaders.emplace(uint32_t(std::strtoul(test_ui_hash_text, nullptr, 16)));
+      }
       Mcp::RegisterInts({{"test_skip_hash", &test_skip_hash, INT_MIN, INT_MAX}, {"test_custom_data_hash", &test_custom_data_hash, INT_MIN, INT_MAX}, {"test_replaced_hash", &test_replaced_hash, INT_MIN, INT_MAX}, {"test_rcas_hash", &test_rcas_hash, INT_MIN, INT_MAX}, {"test_smaa_hash", &test_smaa_hash, INT_MIN, INT_MAX}, {"test_smaa_rcas", &test_smaa_rcas, 0, 1}, {"test_bloom_hash", &test_bloom_hash, INT_MIN, INT_MAX}, {"test_viewport_scale_hash", &test_viewport_scale_hash, INT_MIN, INT_MAX}});
       Mcp::RegisterValues({{"test_mip_lod_bias", &test_mip_lod_bias, -8.f, 8.f}});
 #endif

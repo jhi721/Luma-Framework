@@ -6179,7 +6179,7 @@ namespace
    // Tracks the pipeline a command list binds (on every build) like the D3D11 binds do: the hashes of its shaders, whether it runs custom ones, and the draw or dispatch callback they match.
    // Then binds the clone in place of the pipeline the game sets. The runtime sets the game's pipeline before this event, and "bind_pipeline()" sets the clone over it.
    // Never with "all_graphics": it would also replay the topology and blend factor ReShade stores for the pipelines it creates.
-   // Not ported: patch clones (no patch providers on D3D12) and the known UI shader (UI separation), nothing on D3D12 uses them yet. The automatic texture format upgrades only resolve the writer shader
+   // Not ported: patch clones (no patch providers on D3D12) and UI separation. The known UI shader is only tracked for Hide UI. The automatic texture format upgrades only resolve the writer shader
    // of a bound pixel shader (see "OnDrawOrDispatchD3D12()").
    void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
    {
@@ -6206,6 +6206,7 @@ namespace
       cmd_list_data.draw_callback = nullptr;
       cmd_list_data.dispatch_callback = nullptr;
       cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
+      cmd_list_data.is_known_ui_shader_bound = false;
       cmd_list_data.luma_settings_param = -1;
       cmd_list_data.luma_data_param = -1;
       cmd_list_data.bound_cached_pipeline = nullptr;
@@ -6289,6 +6290,7 @@ namespace
       {
          cmd_list_data.pipeline_state_has_custom_graphics_shader = has_clone;
          cmd_list_data.draw_callback = find_callback(draw_callbacks_by_shader_hashes, cmd_list_data.pipeline_state_original_graphics_shader_hashes);
+         cmd_list_data.is_known_ui_shader_bound = ((enable_ui_separation || hide_ui) && cmd_list_data.pipeline_state_original_graphics_shader_hashes.Contains(shader_hashes_UI));
          if (cmd_list_data.pipeline_state_original_pixel_shader.handle != 0)
          {
             const auto writer = auto_texture_format_upgrade_shader_hashes.find(uint32_t(cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0]));
@@ -7247,7 +7249,11 @@ namespace
 #endif
 
       DrawOrDispatchOverrideType override_type = DrawOrDispatchOverrideType::None;
-      if (!original_shader_hashes.Empty()) // Like on D3D11, nothing is called for the pipelines we don't track
+      if (!is_dispatch && hide_ui && cmd_list_data.is_known_ui_shader_bound)
+      {
+         override_type = DrawOrDispatchOverrideType::Skip; // As on D3D11, before the game's callbacks
+      }
+      else if (!original_shader_hashes.Empty()) // Like on D3D11, nothing is called for the pipelines we don't track
       {
          reshade::api::device* device = cmd_list->get_device();
          auto* native_device = reinterpret_cast<NativeDevice*>(device->get_native());
