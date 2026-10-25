@@ -9063,11 +9063,12 @@ namespace
    }
 
    // A fullscreen pass of the native "pixel_shader_hash" (drawn with "Copy VS") of "source" (viewed as 2D "source_format", its t0) into the whole "target" (through the
-   // view "target_desc"), with 4 root constants at b0: the target's width and height, then "param_0" and "param_1". Recorded on the game's command list from a game's
+   // view "target_desc"), with root constants at b0: the target's width and height, then "params" (as many each draw of "pass" as on its first). Recorded on the game's command list from a game's
    // "OnDrawOrDispatch()": "source" must be readable by pixel shaders and "target" be a render target, in the states the game left them in at that draw (it records no
    // barrier). It records through ReShade's API, with the descriptor tables of "pass" and the game's graphics state bound again after it ("D3D12State::RestoreGraphics()").
    // False, with nothing recorded, if it can't draw (the natives aren't compiled yet, the list is in a render pass): the caller then lets the game's draw run.
-   bool DrawFullscreenPassD3D12(CommandListData& cmd_list_data, DeviceData& device_data, DeviceData::GamePassD3D12* pass, uint32_t pixel_shader_hash, const char* name, const char* trace_name, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, float param_0, float param_1)
+   // "blend": that of every draw of "pixel_shader_hash" (see "GetD3D12GamePassPipeline()").
+   bool DrawFullscreenPassD3D12(CommandListData& cmd_list_data, DeviceData& device_data, DeviceData::GamePassD3D12* pass, uint32_t pixel_shader_hash, const char* name, const char* trace_name, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, std::span<const float> params, const D3D12_RENDER_TARGET_BLEND_DESC& blend = D3D12Passes::OPAQUE_BLEND)
    {
       reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
       if (!cmd_list || RefusedInRenderPass(cmd_list_data, name))
@@ -9078,13 +9079,17 @@ namespace
       auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
       const std::unique_lock lock(pass->mutex);
       const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
-      const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.count = 4, .visibility = reshade::api::shader_stage::pixel}, {1, &source_range}};
-      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(pass, device_data, device, params, 1, 1, name);
+      // D3D12 root signatures hold 64 DWORDs, the table takes one
+      std::array<float, 62> constants;
+      ASSERT_ONCE(2 + params.size() <= constants.size());
+      const uint32_t constant_count = uint32_t((std::min)(2 + params.size(), constants.size()));
+      const reshade::api::pipeline_layout_param layout_params[] = {reshade::api::constant_range{.count = constant_count, .visibility = reshade::api::shader_stage::pixel}, {1, &source_range}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(pass, device_data, device, layout_params, 1, 1, name);
       if (!tables)
       {
          return false;
       }
-      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(pass, native_device, CompileTimeStringHash("Copy VS"), pixel_shader_hash, DXGI_FORMAT(target_desc.format), name);
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(pass, native_device, CompileTimeStringHash("Copy VS"), pixel_shader_hash, DXGI_FORMAT(target_desc.format), name, blend);
       if (!pipeline)
       {
          return false;
@@ -9110,9 +9115,11 @@ namespace
       const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
       const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
       const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
-      const float constants[4] = {float(width), float(height), param_0, param_1};
+      constants[0] = float(width);
+      constants[1] = float(height);
+      std::copy_n(params.begin(), constant_count - 2, constants.begin() + 2);
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
-      cmd_list->push_constants(reshade::api::shader_stage::pixel, pass->layout, 0, 0, 4, constants);
+      cmd_list->push_constants(reshade::api::shader_stage::pixel, pass->layout, 0, 0, constant_count, constants.data());
       cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, pass->layout, 1, 1, &table);
       cmd_list->bind_render_targets_and_depth_stencil(1, &target_view);
       device->destroy_resource_view(target_view);
@@ -9135,7 +9142,8 @@ namespace
    // RCAS sharpening ("Luma_RCAS_PS") of "source" into "target": the D3D12 counterpart of the D3D11 "DrawRCAS()", with the contract of "DrawFullscreenPassD3D12()"
    bool DrawRCAS(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, float sharpness)
    {
-      return DrawFullscreenPassD3D12(cmd_list_data, device_data, &device_data.rcas, CompileTimeStringHash("RCAS PS"), "RCAS", "Luma RCAS", source, source_format, target, target_desc, sharpness, 0.f);
+      const float params[] = {sharpness, 0.f};
+      return DrawFullscreenPassD3D12(cmd_list_data, device_data, &device_data.rcas, CompileTimeStringHash("RCAS PS"), "RCAS", "Luma RCAS", source, source_format, target, target_desc, params);
    }
 #endif // ENABLE_RCAS
 
