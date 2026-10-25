@@ -181,7 +181,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Mirror's Edge", "Source\Gam
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Sunset Overdrive", "Source\Games\Sunset Overdrive\Sunset Overdrive.vcxproj", "{3A6C5692-A5DE-46AE-8E7A-1838642DDC30}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Yakuza Kiwami R", "Source\Games\Yakuza Kiwami R\Yakuza Kiwami R.vcxproj", "{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Yakuza Kiwami", "Source\Games\Yakuza Kiwami\Yakuza Kiwami.vcxproj", "{6F2DA762-9ED2-4F8E-B2E7-FB34A005B430}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NieR Replicant", "Source\Games\NieR Replicant\NieR Replicant.vcxproj", "{D7DCEC3D-3209-4370-8CED-8CF6A4D34D78}"
 EndProject
