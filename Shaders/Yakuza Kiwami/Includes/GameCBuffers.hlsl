@@ -16,6 +16,9 @@ struct LumaGameSettings
    float VideoAutoHDRBoost;  // 0..1 highlight-expansion strength. 0 = peak at sRGB white (off).
    float Dithering;          // 0/1. One output code value of noise on the final image (8-bit SDR, 10-bit PQ HDR).
    float Exposure;           // 1 = vanilla. Linear multiplier on the graded HDR color, before the display map.
+   float Contrast;           // 1 = vanilla. PsychoV31's contrast (its cone response power).
+   float Saturation;         // 1 = vanilla. PsychoV31's purity.
+   float HighlightDechroma;  // 0 = off (default). PsychoV31 highlights desaturation (its "dechroma").
 };
 
 // Define the game specific cbuffer (instance/pass) data here

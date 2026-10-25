@@ -118,4 +118,15 @@ float3 YKR_EncodeOutput(float3 color)
    return linear_to_gamma(color);
 }
 
+// The screen effects' color on the draws main.cpp flags (LumaData.CustomData1): they draw over the canvas "YKR_EncodeOutput" pre-scaled
+// to the UI paper white, so their color gets the same pre-scale in gamma space, and a fade to white lands on the scene's paper white
+float3 YKR_ScreenEffectColor(float3 color)
+{
+   if (LumaData.CustomData1 != 0u)
+   {
+      color *= pow(GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false), 1.0 / 2.2);
+   }
+   return color;
+}
+
 #endif // SRC_YKR_COMMON_HLSL

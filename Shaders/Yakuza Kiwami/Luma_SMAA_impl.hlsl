@@ -11,8 +11,21 @@
 cbuffer SMAAConstants : register(b1)
 {
    float4 smaa_rt_metrics;
-   float4 smaa_predication; // Scale, strength: (2, 0.5) with the depth's edges, (1, 0) = plain ULTRA without them
+   float4 smaa_predication; // Scale, strength: (2, 0.5) with the depth's edges, (1, 0) = plain ULTRA without them; z = T2x subsample index (0 = none, 1/2 = the jitter phases)
 }
+
+// "SMAA_T2X" 1 is SMAA T2x (main.cpp, without DLSS): the scene jitters by a quarter pixel diagonally in two phases, the blending weights take the
+// phase's area texture subsamples, the neighborhood blend keeps the velocity length in alpha and Luma_YKR_SMAAT2xResolve blends it with the previous frame.
+#ifndef SMAA_T2X
+#define SMAA_T2X 0
+#endif
+
+#if SMAA_T2X
+#define SMAA_SUBSAMPLE_INDICES float4(smaa_predication.zzz, 0)
+#define SMAA_REPROJECTION      1
+// The motion vector target holds the UV delta from the current to the previous position (unjittered). SMAA's velocity is the opposite.
+#define SMAA_DECODE_VELOCITY(sample) (-(sample).rg)
+#endif
 
 #define SMAA_RT_METRICS smaa_rt_metrics
 #define SMAA_PRESET_ULTRA

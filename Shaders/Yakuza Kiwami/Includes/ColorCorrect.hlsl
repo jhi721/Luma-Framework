@@ -9,14 +9,14 @@
 //
 // SDR: the vanilla grade on the scene as vanilla stored it ("YKR_VanillaScene"), exact.
 // HDR (RenoDX's "Vanilla+"): the grade runs a second time on the extended scene compressed into its [0,1] range (Neutwo on the
-// display-linear max channel, peak 1), then the result is expanded by the same scale; hue and most of the chrominance are taken
-// from the vanilla grade (OKLab), then Exposure and a Neutwo max channel display map in BT.2020. Output: gamma space, 1.0 = UI
+// display-linear max channel, peak 1), then the result is expanded by the same scale, then Exposure and PsychoV31 to the peak
+// with MacLeod-Boynton hue emulation from the vanilla grade (as the Remastered Collection's Y5R). Output: gamma space, 1.0 = UI
 // paper white, values above 1 allowed (POST_PROCESS_SPACE_TYPE 0, UI_DRAW_TYPE 2).
 
 // clang-format off
 // ORDER IS LOAD-BEARING - do not sort. "Common.hlsl" first, it pulls the Luma settings.
 #include "Common.hlsl"
-#include "../../Includes/ColorGradingLUT.hlsl" // RestoreHueAndChrominance
+#include "../../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueEmulation
 // clang-format on
 
 #ifndef TONEMAP_TYPE
@@ -27,12 +27,6 @@
 static bool ykr_color_correct_compressed = false;
 // The smallest compression scale among this pixel's scene samples (the "_ca" permutations take three)
 static float ykr_color_correct_scale = 1.0;
-
-// Neutwo, from RenoDX's "tonemap/neutwo.hlsl" (Carlos Lopez, MIT): x / sqrt(x^2 / peak^2 + 1), slope 1 at 0, asymptote "peak"
-float YKR_Neutwo(float x, float peak)
-{
-   return peak * x * rsqrt(mad(x, x, peak * peak));
-}
 
 bool YKR_ColorCorrectHDR()
 {
@@ -52,7 +46,7 @@ float4 YKR_ColorCorrectScene(float4 scene)
    // The vanilla display decoded the encoded scene with its 2.2 gamma
    const float3 encoded = max(scene.rgb, 0.0);
    const float display_max = pow(max3(encoded), 2.2);
-   const float scale = display_max > 0.0 ? YKR_Neutwo(display_max, 1.0) / display_max : 1.0;
+   const float scale = display_max > 0.0 ? renodx::tonemap::Neutwo(display_max, 1.0) / display_max : 1.0;
    // ponytail: "_ca" expands its three taps by the most compressed one's scale; exact for every other permutation (one tap)
    ykr_color_correct_scale = min(ykr_color_correct_scale, scale);
    return float4(encoded * pow(scale, 1.0 / 2.2), saturate(scene.a));
@@ -61,26 +55,21 @@ float4 YKR_ColorCorrectScene(float4 scene)
 // Both grades are gamma 2.2 encoded and end in a saturate
 float4 YKR_ColorCorrectOutput(float4 vanilla_graded, float4 hdr_graded)
 {
-   const float3 vanilla_linear = gamma_to_linear(saturate(vanilla_graded.rgb));
-   float3 color = vanilla_linear;
+   const float3 vanilla_encoded = saturate(vanilla_graded.rgb);
+   float3 color = gamma_to_linear(vanilla_encoded);
    [branch] if (ykr_color_correct_compressed)
    {
-      color = gamma_to_linear(saturate(hdr_graded.rgb)) / ykr_color_correct_scale;
-      // The vanilla grade is the clipped reference: hue below 0.9 (an achromatic reference has no hue to lock to), and 0.7 of its
-      // chrominance, Splatoon's dose: most of vanilla's whitening of the brightest colors, which the display map no longer does.
-      // Oklab chrominance grows with brightness, so the reference is first scaled to the color's luminance: what transfers is
-      // vanilla's chrominance relative to its lightness, not its absolute value (a red that vanilla clipped at 1 would whiten).
-      // Only the whitening transfers: the HDR grade already ran the vanilla saturation, and raising chrominance toward the scaled
-      // reference pushes saturated colors out of BT.709.
-      const float vanilla_luminance = GetLuminance(vanilla_linear);
-      const float3 vanilla_reference = vanilla_luminance > 0.0 ? vanilla_linear * (GetLuminance(color) / vanilla_luminance) : vanilla_linear;
-      color = RestoreHueAndChrominance(color, vanilla_reference, 0.8, 0.7, 0.0, 1.0);
-      color *= LumaSettings.GameSettings.Exposure;
-      // A scalar in BT.709 is the same scalar in BT.2020, whose max channel the PQ output holds at the peak
-      const float display_max = max3(BT709_To_BT2020(color));
-      const float paper_white = max(LumaSettings.GamePaperWhiteNits, 1.0);
-      const float peak = max(LumaSettings.PeakWhiteNits, paper_white) / paper_white;
-      color *= display_max > 0.0 ? YKR_Neutwo(display_max, peak) / display_max : 1.0;
+      const float3 extended_linear = gamma_to_linear(saturate(hdr_graded.rgb)) / ykr_color_correct_scale * LumaSettings.GameSettings.Exposure;
+      // The materials bend each channel through the soft vanilla curve, so the vanilla grade is the hue reference. Where it whitens
+      // (the curve's clip) its hue is unstable, so it fades to this color's own hue by its HSV saturation coordinate,
+      // (max - min) / max of the gamma-encoded grade (0.05..0.3, Y5R's gate); both are max-normalized so the lerp blends hues.
+      const float vanilla_max = max3(vanilla_encoded);
+      const float hue_gate = smoothstep(0.05, 0.3, vanilla_max > 0.0 ? (vanilla_max - min3(vanilla_encoded)) / vanilla_max : 0.0);
+      const float3 extended_bt2020 = BT709_To_BT2020(extended_linear);
+      const float3 vanilla_bt2020 = BT709_To_BT2020(color);
+      const float3 hue_reference_bt2020 = lerp(extended_bt2020 / max(max3(extended_bt2020), 1e-6), vanilla_bt2020 / max(max3(vanilla_bt2020), 1e-6), hue_gate);
+      color = PsychoVDisplayMapWithHueEmulation(extended_linear, hue_reference_bt2020, LumaSettings.GameSettings.Contrast,
+                                                LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightDechroma);
    }
    // max also turns NaN into 0
    return float4(YKR_EncodeOutput(max(0.0, color)), vanilla_graded.a);
