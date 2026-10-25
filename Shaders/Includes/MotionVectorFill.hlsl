@@ -11,11 +11,16 @@
 // The camera motion of a pixel: its device depth reprojected from the current to the previous frame's camera ("reprojection":
 // current clip space to the previous frame's, column vectors). "jitter_ndc": this frame's projection jitter, in the depth, not in
 // the motion vectors. Previous minus current, UV space, like the patched draws.
-void WriteCameraMotion(RWTexture2D<float2> motion_vectors, uint2 pixel, uint2 size, float4x4 reprojection, float2 jitter_ndc, float depth)
+float2 CameraMotion(uint2 pixel, uint2 size, float4x4 reprojection, float2 jitter_ndc, float depth)
 {
    const float4 current = float4((pixel + 0.5) / size * float2(2.0, -2.0) + float2(-1.0, 1.0) - jitter_ndc, depth, 1.0);
    const float4 previous = mul(reprojection, current);
-   motion_vectors[pixel] = (previous.xy / previous.w - current.xy) * float2(0.5, -0.5);
+   return (previous.xy / previous.w - current.xy) * float2(0.5, -0.5);
+}
+
+void WriteCameraMotion(RWTexture2D<float2> motion_vectors, uint2 pixel, uint2 size, float4x4 reprojection, float2 jitter_ndc, float depth)
+{
+   motion_vectors[pixel] = CameraMotion(pixel, size, reprojection, jitter_ndc, depth);
 }
 
 // FSR's masks from what the alpha blended draws wrote themselves ("MotionVectorPatch::PatchPixelShaderReactive", max blended;
