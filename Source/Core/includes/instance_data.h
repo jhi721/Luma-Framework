@@ -873,6 +873,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       com_ptr<ID3D12PipelineState> pipeline;       // Null if the last attempt to make it for the format and generation below failed
       DXGI_FORMAT pipeline_format = DXGI_FORMAT_UNKNOWN;
       uint32_t pipeline_generation = 0;
+      bool pipeline_compute = false; // Made for a compute shader (see "PrepareD3D12NativePass()")
       std::vector<com_ptr<IUnknown>> retired; // What it replaced, which the GPU can still use: the next frame it submits keeps it alive
       CommandListData cmd_list_data;          // Owns the memory of its root CBVs (root parameters 0 and 1), for "SetLumaConstantBuffers()"
    };
@@ -898,6 +899,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       uint64_t frame = UINT64_MAX;                        // The present count of the last draw, and the draws since it
       uint32_t frame_draws = 0;
       bool failed = false;                                                        // ReShade refused the layout or the tables, which isn't tried again
+      uint32_t fullscreen_source_count = 0;                                       // "DrawFullscreenPassD3D12()": the SRVs of the table of t0, fixed by the pass's first draw
       std::vector<std::pair<uint64_t, reshade::api::resource>> retired_resources; // Replaced textures, with the present count they were replaced at (see "RetireD3D12GamePassResource()")
    };
 #if ENABLE_RCAS

@@ -2132,7 +2132,6 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new BayonettaGameDeviceData;
-      device_data.taa_detected = true; // No TAA to replace, but Core's upscaler status checks for it
 #if DEVELOPMENT
       const auto& stats = GetGameDeviceData(device_data).aa_last_stats;
       Mcp::RegisterCounters(

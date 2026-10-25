@@ -141,6 +141,10 @@ namespace SwapchainProxy
       if (com_ptr<ID3D12CommandQueue> queue; FAILED(entry->native->GetDevice(IID_PPV_ARGS(&device))) && (FAILED(entry->native->GetDevice(IID_PPV_ARGS(&queue))) || FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))))
          return fail("The swapchain gave out neither its device nor its queue");
 
+      // Unordered access where the device loads fp16 from typed UAVs: the display composition then writes the proxy in place, without a copy of it
+      // (see "DrawDisplayCompositionD3D12()")
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT};
+      const bool typed_uav_load = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support))) && (format_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
       const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
       const D3D12_RESOURCE_DESC proxy_desc = {
          .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -150,7 +154,7 @@ namespace SwapchainProxy
          .MipLevels = 1,
          .Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
          .SampleDesc = {.Count = 1},
-         .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | ((swapchain_desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) != 0 ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE),
+         .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | (((swapchain_desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) != 0 || typed_uav_load) ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE),
       };
       entry->proxies.resize(swapchain_desc.BufferCount);
       for (com_ptr<ID3D12Resource>& proxy : entry->proxies)

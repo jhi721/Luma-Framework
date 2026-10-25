@@ -19,6 +19,25 @@ Texture2D<uint4> debugTexture2DUint : register(t9); // The stencil plane (D3D12)
 // Note: this might not always be set, only use in known cases
 SamplerState linearSampler : register(s0);
 
+// D3D12 composes in place when the back buffer allows unordered access ("main_cs"): it reads the pixel it writes, so the back buffer needs no copy.
+// The pixel shader reads the copy (t0), where these are constant
+RWTexture2D<float4> backBuffer : register(u0);
+static bool sourceInPlace = false;
+static float4 sourceInPlaceColor = 0.0;
+static float2 sourceInPlaceSize = 0.0;
+
+float2 GetSourceSize()
+{
+	if (sourceInPlace)
+	{
+		return sourceInPlaceSize;
+	}
+	float width;
+	float height;
+	sourceTexture.GetDimensions(width, height);
+	return float2(width, height);
+}
+
 #if DEVELOPMENT
 bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, float UIPaperWhite)
 {
@@ -92,9 +111,9 @@ bool DrawDebugTexture(float3 pos, inout float4 outColor, float gamePaperWhite, f
 		int sliceWidth = debugWidth + 0.5;
 		debugPos.z = (uint(debugPos.x) / sliceWidth) + 0.5; // Basically: "depthOrArrayIndex"
 
-		float targetWidth;
-		float targetHeight;
-		sourceTexture.GetDimensions(targetWidth, targetHeight);
+		const float2 targetSize = GetSourceSize();
+		const float targetWidth = targetSize.x;
+		const float targetHeight = targetSize.y;
 
 		bool size2DMatches = debugWidth == targetWidth && debugHeightOrArraySize == targetHeight;
 		fullscreen = fullscreen || size2DMatches;
@@ -312,9 +331,9 @@ float4 main(float4 pos : SV_Position) : SV_Target0
 	}
 #endif
 
-	float sourceWidth;
-	float sourceHeight;
-	sourceTexture.GetDimensions(sourceWidth, sourceHeight);
+	const float2 sourceSize = GetSourceSize();
+	float sourceWidth = sourceSize.x;
+	float sourceHeight = sourceSize.y;
 
 #if TEST_2X_ZOOM // TEST: zoom into the image to analyze it
 	const float scale = 2.0;
@@ -331,7 +350,7 @@ float4 main(float4 pos : SV_Position) : SV_Target0
 	float targetHeight2 = targetHeight1 * DVS5 * 0.5;
 	float mipLevel1 = log2(sourceHeight / targetHeight1);
 	float mipLevel2 = log2(sourceHeight / targetHeight2);
-	float4 color = sourceTexture.Load((int3)pos.xyz);
+	float4 color = sourceInPlace ? sourceInPlaceColor : sourceTexture.Load((int3)pos.xyz);
 	float4 mipColor1 = 0.0;
 	float4 mipColor2 = 0.0;
 #if 0
@@ -640,4 +659,21 @@ float4 main(float4 pos : SV_Position) : SV_Target0
 // #endif
 
 	return float4(color.rgb, color.a);
+}
+
+// The in place composition (see "backBuffer"), at 8x8 pixels per group
+[numthreads(8, 8, 1)]
+void main_cs(uint3 id : SV_DispatchThreadID)
+{
+	uint width;
+	uint height;
+	backBuffer.GetDimensions(width, height);
+	if (id.x >= width || id.y >= height)
+	{
+		return;
+	}
+	sourceInPlace = true;
+	sourceInPlaceColor = backBuffer[id.xy];
+	sourceInPlaceSize = float2(width, height);
+	backBuffer[id.xy] = main(float4(id.xy + 0.5, 0.0, 1.0));
 }

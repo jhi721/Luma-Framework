@@ -3757,6 +3757,72 @@ namespace Mcp
       LocalFree(security_attributes.lpSecurityDescriptor);
       server_running = false;
    }
+#if !DX11
+   // "core.log_vram" (one shot): logs the video memory Luma allocates next to the game, as the device sizes each allocation (the system's
+   // per process counters miss what the driver keeps pooled), and the process' usage as DXGI reports it. Needs "s_mutex_dev_values"
+   void LogVram(DeviceData& device_data)
+   {
+      auto* const device = reinterpret_cast<ID3D12Device*>(device_data.native_device);
+      const auto allocation_size = [device](ID3D12Resource* resource) -> uint64_t
+      {
+         if (!resource)
+            return 0;
+         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+         return device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+      };
+      constexpr double mb = 1024.0 * 1024.0;
+      std::string text = "[VRAM]";
+      com_ptr<IDXGIFactory4> factory;
+      com_ptr<IDXGIAdapter3> adapter;
+      DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+      if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) &&
+          SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)))
+      {
+         text += std::format(" Process {:.0f} MB of a {:.0f} MB budget.", local.CurrentUsage / mb, local.Budget / mb);
+      }
+      uint64_t textures_total = 0;
+      text += " Luma textures (MB):";
+      for (const DevValue& dev_value : dev_values)
+      {
+         const uint64_t size = (dev_value.kind == DevValueKind::Texture ? allocation_size(dev_value.texture(device_data).resource) : 0);
+         if (size != 0)
+         {
+            textures_total += size;
+            text += std::format(" {} {:.1f},", dev_value.name, size / mb);
+         }
+      }
+      {
+         const std::unique_lock lock(device_data.display_composition.mutex);
+         const uint64_t size = allocation_size(device_data.display_composition.source.get());
+         textures_total += size;
+         text += std::format(" composition copy {:.1f}; total {:.0f}.", size / mb, textures_total / mb);
+      }
+#if ENABLE_MINHOOK
+      // The clones of the upgraded textures, next to their originals (the game's memory, which stays allocated)
+      std::map<DXGI_FORMAT, std::array<uint64_t, 3>> clones_by_format; // Count, clones' size, originals' size
+      {
+         const std::shared_lock lock(D3D12Clones::registry.mutex);
+         for (const auto& [original, clone] : D3D12Clones::registry.by_original)
+         {
+            std::array<uint64_t, 3>& totals = clones_by_format[clone.format];
+            totals[0]++;
+            totals[1] += allocation_size(clone.resource.get());
+            totals[2] += allocation_size(original);
+         }
+      }
+      uint64_t clones_total = 0;
+      text += " Texture upgrade clones (format: count, clones MB / originals MB):";
+      for (const auto& [format, totals] : clones_by_format)
+      {
+         clones_total += totals[1];
+         text += std::format(" {}: {}, {:.1f} / {:.1f};", uint32_t(format), totals[0], totals[1] / mb, totals[2] / mb);
+      }
+      text += std::format(" clones total {:.0f} MB.", clones_total / mb);
+#endif
+      reshade::log::message(reshade::log::level::info, text.c_str());
+   }
+#endif // !DX11
+
    // Called from "Init()": starts the pipe server and registers Core's knobs
    void Start()
    {
@@ -3840,6 +3906,15 @@ namespace Mcp
                return {copy->debug_texture.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
             }},
       });
+
+      static bool log_vram = false;
+      RegisterDevValue({"core.log_vram", DevValueKind::Toggle, &log_vram, nullptr, -DBL_MAX, DBL_MAX, nullptr, [](DeviceData& device_data, double value)
+         {
+            if (value != 0.0)
+            {
+               LogVram(device_data);
+            }
+            return std::string(); }});
 
       // The overlay's debug draw ("SyncD3D12DebugDraw()"), for the agents that have no overlay: the settings its widgets edit, the entry of the last
       // capture to show (-1: off, it sets the shader, instance and signature like the overlay's buttons) and the registered texture to show in place of

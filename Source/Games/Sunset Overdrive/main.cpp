@@ -388,7 +388,6 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new SunsetOverdriveGameDeviceData;
-      device_data.taa_detected = true; // No TAA to replace, but Core's upscaler status checks for it
    }
 
    // Draws a velocity pass with the motion vectors added as the shaders' extra output (RT2 of the camera pass, RT1 of the object

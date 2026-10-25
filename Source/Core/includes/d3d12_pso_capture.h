@@ -134,6 +134,25 @@ namespace D3D12PsoCapture
       }
    };
 
+   // Whether the pipeline writes depth: depth test enabled with a write mask, in the stream's depth stencil subobject (any of its three versions). False without one
+   // (the runtime's default for an omitted subobject isn't documented)
+   inline bool WritesDepth(Stream& stream)
+   {
+      if (const auto* const depth_stencil = stream.Find<D3D12_DEPTH_STENCIL_DESC>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL))
+      {
+         return depth_stencil->DepthEnable && depth_stencil->DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+      }
+      if (const auto* const depth_stencil = stream.Find<D3D12_DEPTH_STENCIL_DESC1>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1))
+      {
+         return depth_stencil->DepthEnable && depth_stencil->DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+      }
+      if (const auto* const depth_stencil = stream.Find<D3D12_DEPTH_STENCIL_DESC2>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2))
+      {
+         return depth_stencil->DepthEnable && depth_stencil->DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+      }
+      return false;
+   }
+
    // Null if the stream can't be copied: it holds a subobject we don't know the layout of, a repeated one or a truncated one
    inline std::unique_ptr<Stream> Copy(const D3D12_PIPELINE_STATE_STREAM_DESC& desc)
    {

@@ -130,12 +130,14 @@ namespace Shader
       std::array<DXGI_FORMAT, 8> render_target_formats = {};
       uint32_t render_target_count = 0;
       // The pipelines made from this one, or from one of its clones ("base": its handle stands for the same code as long as it lives), with other render target formats (see
-      // "FindOrCreateD3D12PipelineVariant()"). They live as long as the original, like the retired clones: a command list can still hold one. The lock is never held across a device call
+      // "FindOrCreateD3D12PipelineVariant()"), or a game's own variant of the original (see "FindOrCreateD3D12GameVariant()"). They live as long as the original, like the retired clones:
+      // a command list can still hold one. The lock is never held across a device call
       struct RenderTargetVariant
       {
          uint64_t base = 0;
          std::array<DXGI_FORMAT, 8> formats = {};
-         uint64_t pipeline = 0; // 0 if making it failed, it's not tried again
+         uint32_t game_variant_id = 0; // 0 for the format variants of Core, else the game's id (then "base" is the original)
+         uint64_t pipeline = 0;        // 0 if making it failed or a game refused the pipeline, it's not tried again
       };
       mutable std::shared_mutex variants_mutex;
       mutable std::vector<RenderTargetVariant> variants;
@@ -446,41 +448,41 @@ namespace Shader
       bool Contains(const ShaderHashesList<OtherShaderHashesCount, OtherStages>& other) const
       {
          using OtherList = ShaderHashesList<OtherShaderHashesCount, OtherStages>;
+         // Whether a stage's hashes share one. A single hash (a draw's "original_shader_hashes") against a set is one lookup, not a walk of the set
+         const auto shares_hash = [](const ShaderHashesContainer<Count>& ours, const ShaderHashesContainer<OtherShaderHashesCount>& theirs)
+         {
+            if constexpr (Count == ShaderHashesCount::Single && OtherShaderHashesCount == ShaderHashesCount::Multiple)
+            {
+               return ours[0] != SHADER_HASH_NONE && ShaderHashesContains(theirs, ShaderHashesType<OtherShaderHashesCount>(ours[0]));
+            }
+            else
+            {
+               for (const ShaderHashesType<OtherShaderHashesCount> shader_hash : theirs)
+               {
+                  if (ShaderHashesContains(ours, shader_hash))
+                  {
+                     return true;
+                  }
+               }
+               return false;
+            }
+         };
          if constexpr (!IgnoreGraphics && !OtherList::IgnoreGraphics)
          {
-            for (const ShaderHashesType<OtherShaderHashesCount> shader_hash : other.pixel_shaders)
+            if (shares_hash(pixel_shaders, other.pixel_shaders) || shares_hash(vertex_shaders, other.vertex_shaders))
             {
-               if (ShaderHashesContains(pixel_shaders, shader_hash))
-               {
-                  return true;
-               }
-            }
-            for (const ShaderHashesType<OtherShaderHashesCount> shader_hash : other.vertex_shaders)
-            {
-               if (ShaderHashesContains(vertex_shaders, shader_hash))
-               {
-                  return true;
-               }
+               return true;
             }
 #if GEOMETRY_SHADER_SUPPORT
-            for (const ShaderHashesType<OtherShaderHashesCount> shader_hash : other.geometry_shaders)
+            if (shares_hash(geometry_shaders, other.geometry_shaders))
             {
-               if (ShaderHashesContains(geometry_shaders, shader_hash))
-               {
-                  return true;
-               }
+               return true;
             }
 #endif
          }
          if constexpr (!IgnoreCompute && !OtherList::IgnoreCompute)
          {
-            for (const ShaderHashesType<OtherShaderHashesCount> shader_hash : other.compute_shaders)
-            {
-               if (ShaderHashesContains(compute_shaders, shader_hash))
-               {
-                  return true;
-               }
-            }
+            return shares_hash(compute_shaders, other.compute_shaders);
          }
          return false;
       }

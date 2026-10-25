@@ -1738,7 +1738,6 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new SaintsRowIVGameDeviceData;
-      device_data.taa_detected = true; // No TAA to replace, but Core's upscaler UI checks for it
    }
 
    // Sharpened alpha (Golus) for alpha to coverage: "o0.a" becomes saturate((a - Alpha_Threshold) / fwidth(a) + 0.5), so

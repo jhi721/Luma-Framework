@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <concurrent_unordered_map.h>
+#include <concurrent_vector.h>
 #include <d3d12.h>
 #include <include/reshade.hpp>
 
@@ -158,7 +160,7 @@ namespace D3D12State
       return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (is_texture ? desc.texture.first_level : 0), .first_layer = (is_texture ? desc.texture.first_layer : 0), .layer_count = (is_texture ? (std::max)(desc.texture.layers, 1u) : UINT32_MAX)};
    }
 
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE
    // A bound index or vertex buffer: ReShade resolves their GPU virtual address to the buffer
    struct BufferBinding
    {
@@ -189,6 +191,8 @@ namespace D3D12State
 #endif
 #if DEVELOPMENT
       BufferBinding index_buffer;
+#endif
+#if DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE
       std::vector<BufferBinding> vertex_buffers; // By slot
 #endif
       std::vector<reshade::api::resource_view> render_targets;
@@ -304,7 +308,7 @@ namespace D3D12State
    }
 #endif
 
-#if DEVELOPMENT
+#if DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE
    void BindVertexBuffers(CommandListState* state, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
    {
       if (state->vertex_buffers.size() < size_t(first) + count)
@@ -543,32 +547,31 @@ namespace D3D12State
       ViewInfo view; // Views only, resolved when written as the copies of a descriptor outlive what its address holds next
    };
 
-   // By heap (CPU only and shader visible ones), indexed by descriptor
+   // By heap (CPU only and shader visible ones), indexed by descriptor. Lock free like ReShade's "examples/utils/descriptor_tracking": games write
+   // descriptors on all their recording threads (a "CopyDescriptorsSimple()" per draw), and one mutex made them wait on each other. The maps are
+   // insert only and growing a "concurrent_vector" never moves its elements, so a found descriptor stays valid.
+   // ponytail: a slot read while another thread writes it can be torn (D3D12 only forbids conflicting writes); the readers are diagnostics
    struct DescriptorHeaps
    {
-      std::shared_mutex mutex;
-      std::unordered_map<uint64_t, std::vector<Descriptor>> descriptors_by_heap;
+      concurrency::concurrent_unordered_map<uint64_t, concurrency::concurrent_vector<Descriptor>> descriptors_by_heap;
       // The descs of the samplers a game created, by the CPU descriptor it created them in ("init_sampler"): the handle its descriptors and their copies keep.
       // ponytail: a game that creates another sampler in the same slot changes what its older copies read
-      std::unordered_map<uint64_t, reshade::api::sampler_desc> sampler_descs;
+      concurrency::concurrent_unordered_map<uint64_t, reshade::api::sampler_desc> sampler_descs;
    };
 
-   // "get_descriptor_heap_offset()" maps both CPU and GPU descriptor handles. Expects "heaps->mutex" to be locked.
-   std::vector<Descriptor>* GetHeapDescriptors(DescriptorHeaps* heaps, reshade::api::device* device, reshade::api::descriptor_table table, uint32_t binding, uint32_t count, uint32_t* offset)
+   // "get_descriptor_heap_offset()" maps both CPU and GPU descriptor handles
+   concurrency::concurrent_vector<Descriptor>* GetHeapDescriptors(DescriptorHeaps* heaps, reshade::api::device* device, reshade::api::descriptor_table table, uint32_t binding, uint32_t count, uint32_t* offset)
    {
       reshade::api::descriptor_heap heap = {};
       device->get_descriptor_heap_offset(table, binding, 0, &heap, offset);
       if (heap.handle == 0)
          return nullptr;
-      std::vector<Descriptor>& descriptors = heaps->descriptors_by_heap[heap.handle];
-      if (descriptors.size() < size_t(*offset) + count)
-      {
-         descriptors.resize(size_t(*offset) + count);
-      }
+      concurrency::concurrent_vector<Descriptor>& descriptors = heaps->descriptors_by_heap[heap.handle];
+      descriptors.grow_to_at_least(size_t(*offset) + count);
       return &descriptors;
    }
 
-   // What a table slot holds, nullptr if the game never wrote it. Expects "heaps.mutex" to be locked (shared is enough).
+   // What a table slot holds, nullptr if the game never wrote it
    const Descriptor* FindDescriptor(const DescriptorHeaps& heaps, reshade::api::device* device, reshade::api::descriptor_table table, uint32_t binding)
    {
       reshade::api::descriptor_heap heap = {};
@@ -582,12 +585,11 @@ namespace D3D12State
 
    void UpdateDescriptors(DescriptorHeaps* heaps, reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_update* updates)
    {
-      const std::unique_lock lock(heaps->mutex);
       for (uint32_t i = 0; i < count; i++)
       {
          const reshade::api::descriptor_table_update& update = updates[i];
          uint32_t offset = 0;
-         std::vector<Descriptor>* descriptors = GetHeapDescriptors(heaps, device, update.table, update.binding + update.array_offset, update.count, &offset);
+         concurrency::concurrent_vector<Descriptor>* descriptors = GetHeapDescriptors(heaps, device, update.table, update.binding + update.array_offset, update.count, &offset);
          if (!descriptors)
             continue;
          for (uint32_t j = 0; j < update.count; j++)
@@ -623,19 +625,22 @@ namespace D3D12State
 
    void CopyDescriptors(DescriptorHeaps* heaps, reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_copy* copies)
    {
-      const std::unique_lock lock(heaps->mutex);
       for (uint32_t i = 0; i < count; i++)
       {
          const reshade::api::descriptor_table_copy& copy = copies[i];
          uint32_t source_offset = 0;
          uint32_t dest_offset = 0;
-         std::vector<Descriptor>* source = GetHeapDescriptors(heaps, device, copy.source_table, copy.source_binding + copy.source_array_offset, copy.count, &source_offset);
-         std::vector<Descriptor>* dest = GetHeapDescriptors(heaps, device, copy.dest_table, copy.dest_binding + copy.dest_array_offset, copy.count, &dest_offset);
+         concurrency::concurrent_vector<Descriptor>* source = GetHeapDescriptors(heaps, device, copy.source_table, copy.source_binding + copy.source_array_offset, copy.count, &source_offset);
+         concurrency::concurrent_vector<Descriptor>* dest = GetHeapDescriptors(heaps, device, copy.dest_table, copy.dest_binding + copy.dest_array_offset, copy.count, &dest_offset);
          if (!source || !dest)
             continue;
-         // Through a temporary: the ranges can overlap within a heap, and resizing the destination can move the source ("GetHeapDescriptors()")
-         std::vector<Descriptor> copied(source->begin() + source_offset, source->begin() + source_offset + copy.count);
-         std::copy(copied.begin(), copied.end(), dest->begin() + dest_offset);
+         // Ranges within a heap can overlap: then a destination after the source is copied from its end
+         const bool backward = (source == dest && dest_offset > source_offset);
+         for (uint32_t j = 0; j < copy.count; j++)
+         {
+            const uint32_t k = backward ? (copy.count - 1 - j) : j;
+            (*dest)[dest_offset + k] = (*source)[source_offset + k];
+         }
       }
    }
 

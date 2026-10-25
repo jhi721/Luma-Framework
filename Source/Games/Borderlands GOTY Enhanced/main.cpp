@@ -1686,7 +1686,6 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new BorderlandsGotyGameDeviceData;
-      device_data.taa_detected = true; // No TAA to replace, but Core's upscaler UI checks for it
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool: the last complete frame's counts
       const auto& stats = GetGameDeviceData(device_data).mv_last_stats;

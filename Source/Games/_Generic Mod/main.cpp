@@ -238,7 +238,6 @@ public:
          D3D12State::ViewInfo source;
          if (!state.graphics.bindings.empty() && state.graphics.bindings[0].table.handle != 0)
          {
-            const std::shared_lock lock(device_data.descriptor_heaps.mutex);
             if (const D3D12State::Descriptor* descriptor = D3D12State::FindDescriptor(device_data.descriptor_heaps, cmd_list_data.cmd_list->get_device(), state.graphics.bindings[0].table, 0))
             {
                source = descriptor->view;

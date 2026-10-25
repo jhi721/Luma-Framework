@@ -388,7 +388,6 @@ namespace D3D12Trace
    void ResolveTableDescriptors(std::vector<TraceDrawCallData>* entries, DeviceData* device_data)
    {
       reshade::api::device* device = device_data->reshade_device;
-      const std::shared_lock lock_heaps(device_data->descriptor_heaps.mutex);
       for (TraceDrawCallData& entry : *entries)
       {
          for (const TraceDrawCallData::TableDescriptor& table_descriptor : entry.table_descriptors)
@@ -800,7 +799,7 @@ namespace D3D12Trace
 
    // Fills a Luma pass of the pass layer as a Custom entry, the D3D12 counterpart of the D3D11 "MoveInjectedPassTraces()": its inputs as SRVs (the registers are the order the pass binds
    // them in) and its outputs as render targets, or as unordered access views for a compute pass, each viewed as the format of its "ViewInfo". Readbacks don't re-issue these
-   void FillLumaPass(reshade::api::device* device, TraceDrawCallData* entry, const char* name, std::initializer_list<D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute)
+   void FillLumaPass(reshade::api::device* device, TraceDrawCallData* entry, const char* name, std::span<const D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute)
    {
       entry->type = TraceDrawCallData::TraceDrawCallType::Custom;
       entry->custom_name = name;
