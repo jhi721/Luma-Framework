@@ -753,6 +753,10 @@ namespace
    uint32_t luma_settings_cbuffer_index = 13;
    uint32_t luma_data_cbuffer_index = -1; // Needed, unless "POST_PROCESS_SPACE_TYPE" is 0 and we don't need the final display composition pass
 	uint32_t luma_ui_cbuffer_index = -1; // Optional, for "UI_DRAW_TYPE" 1
+#if DX12 && ENABLE_MINHOOK
+   // Root parameters the game wants in every root signature, after Luma's CBVs (see "D3D12RootSignatures::GameParameter"). Set by the game in "OnInit()", read once at device init
+   std::vector<D3D12RootSignatures::GameParameter> d3d12_game_root_parameters;
+#endif
 
    // The registers Luma's native shaders are compiled with ("LUMA_*_CB_INDEX"): the game's indices above, else the first free ones (see "CompileCustomShaders()", which writes them
    // with the same values every time). The D3D12 passes bind their cbuffers there.
@@ -3795,7 +3799,7 @@ namespace
       {
          const int32_t data_register = (luma_data_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT ? static_cast<int32_t>(luma_data_cbuffer_index) : -1);
          if (!D3D12RootSignatures::Install(native_device, luma_settings_cbuffer_index, data_register, [](const char* message)
-                { reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] {}", message).c_str()); }))
+                { reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] {}", message).c_str()); }, d3d12_game_root_parameters))
          {
             static std::atomic_flag logged_install_failure;
             if (!logged_install_failure.test_and_set())

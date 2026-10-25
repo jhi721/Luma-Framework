@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -74,13 +76,40 @@ namespace D3D12RootSignatures
       "it can't be serialized with the CBVs",
    };
 
-   // The root parameters of the CBVs appended to a root signature (the game's own keep their indices), -1 for a CBV it has none of, and why
-   // a root signature created through the hook has none ("Skip::None" for one the hook never saw)
+   // Why a root signature got Luma's CBVs but not the game's own root parameters ("GameParameter")
+   enum class GameSkip : uint8_t
+   {
+      None,           // They went in, or the game declared none
+      RegistersInUse, // A parameter already uses their registers in our space
+      OverBudget,     // They would take it over "D3D12_MAX_ROOT_COST" DWORDs
+   };
+   constexpr std::array<const char*, 3> GAME_SKIP_NAMES = {
+      "added",
+      "a parameter already uses their registers",
+      "they would take it over the 64 DWORDs a root signature holds",
+   };
+
+   // A root parameter a game asks for in every root signature, after Luma's CBVs: a root descriptor (CBV, SRV or UAV) or 32-bit constants, in
+   // "LUMA_CB_REGISTER_SPACE", visible to all stages. "constant_count" is the DWORDs of the constants (ignored for a descriptor).
+   struct GameParameter
+   {
+      D3D12_ROOT_PARAMETER_TYPE type = D3D12_ROOT_PARAMETER_TYPE_CBV;
+      uint32_t shader_register = 0;
+      uint32_t constant_count = 0;
+   };
+   // How many a game can ask for (a root signature holds 64 DWORDs, so the ones it asks for rarely all fit next to the game's own)
+   constexpr size_t MAX_GAME_PARAMETERS = 4;
+
+   // The root parameters appended to a root signature (the game's own keep their indices), -1 for a parameter it has none of, and why
+   // a root signature created through the hook has no CBVs ("Skip::None" for one the hook never saw). "game_index" is the first of the game's
+   // parameters (the others follow in the order it declared them), "game_skip" why a root signature that has the CBVs lacks them.
    struct LumaParams
    {
       int32_t settings_index = -1;
       int32_t data_index = -1;
+      int32_t game_index = -1;
       Skip skip = Skip::None;
+      GameSkip game_skip = GameSkip::None;
    };
 
    using CreateRootSignatureFunction = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
@@ -95,6 +124,9 @@ namespace D3D12RootSignatures
       uint32_t settings_register = 0;
       int32_t data_register = -1;
       LogFunction log = nullptr;
+      // The game's root parameters, appended after the CBVs (see "GameParameter")
+      std::array<GameParameter, MAX_GAME_PARAMETERS> game_parameters;
+      uint32_t game_parameter_count = 0;
       // The runtime's exports, which Luma doesn't link
       PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER create_deserializer = nullptr;
       PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE serialize = nullptr;
@@ -111,7 +143,9 @@ namespace D3D12RootSignatures
    // root signature's own (0 if it couldn't be deserialized). Needs "Install()" to have found the runtime's exports.
    // "static_samplers", if given, gets the static samplers of a root signature 1.2 (ReShade skips them) as the game made them, or as "Hook::upgrade_static_sampler" changed them in the
    // rewritten one: it is written whatever the result, nothing for the older versions.
-   inline Skip Rewrite(std::span<const std::byte> blob, uint32_t settings_register, int32_t data_register, std::vector<std::byte>* rewritten, LumaParams* params, uint32_t* parameter_count, std::vector<D3D12_STATIC_SAMPLER_DESC1>* static_samplers = nullptr)
+   // "game_parameters" go after the CBVs, all or none: if one's register is in use or they don't fit, the root signature gets the CBVs alone ("params->game_skip" says why).
+   inline Skip Rewrite(std::span<const std::byte> blob, uint32_t settings_register, int32_t data_register, std::vector<std::byte>* rewritten, LumaParams* params, uint32_t* parameter_count, std::vector<D3D12_STATIC_SAMPLER_DESC1>* static_samplers = nullptr,
+      std::span<const GameParameter> game_parameters = {})
    {
       *parameter_count = 0;
       // A plain serialized root signature is a container too, with only its "RTS0" part
@@ -134,19 +168,40 @@ namespace D3D12RootSignatures
 
       const std::array<uint32_t, 2> registers = {settings_register, static_cast<uint32_t>(data_register)};
       const std::span<const uint32_t> luma_registers = std::span(registers).first(data_register >= 0 ? 2 : 1);
-      // Whether "count" registers from "first" in a space (UINT_MAX: unbounded) hold one of ours
-      const auto uses_luma_register = [&luma_registers](uint32_t space, uint32_t first, uint32_t count)
+      // The registers of the game's parameters: constants share the CBVs' (b), the root SRVs and UAVs have their own (t, u)
+      struct Claim
       {
-         const auto in_range = [first, count](uint32_t luma_register)
+         D3D12_DESCRIPTOR_RANGE_TYPE kind;
+         uint32_t shader_register;
+      };
+      const auto kind_of = [](D3D12_ROOT_PARAMETER_TYPE type)
+      {
+         return (type == D3D12_ROOT_PARAMETER_TYPE_SRV ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : (type == D3D12_ROOT_PARAMETER_TYPE_UAV ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_CBV));
+      };
+      std::vector<Claim> luma_claims, game_claims;
+      for (const uint32_t luma_register : luma_registers)
+      {
+         luma_claims.push_back({.kind = D3D12_DESCRIPTOR_RANGE_TYPE_CBV, .shader_register = luma_register});
+      }
+      uint32_t game_cost = 0;
+      for (const GameParameter& game_parameter : game_parameters)
+      {
+         game_claims.push_back({.kind = kind_of(game_parameter.type), .shader_register = game_parameter.shader_register});
+         game_cost += (game_parameter.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? game_parameter.constant_count : ROOT_DESCRIPTOR_COST);
+      }
+      // Whether "count" registers of a kind from "first" in a space (UINT_MAX: unbounded) hold one of the claims
+      const auto uses_register = [](const std::vector<Claim>& claims, D3D12_DESCRIPTOR_RANGE_TYPE kind, uint32_t space, uint32_t first, uint32_t count)
+      {
+         const auto in_range = [&](const Claim& claim)
          {
-            return luma_register >= first && (count == UINT_MAX || luma_register - first < count);
+            return claim.kind == kind && claim.shader_register >= first && (count == UINT_MAX || claim.shader_register - first < count);
          };
-         return space == LUMA_CB_REGISTER_SPACE && std::ranges::any_of(luma_registers, in_range);
+         return space == LUMA_CB_REGISTER_SPACE && std::ranges::any_of(claims, in_range);
       };
 
       // The three versions have their own types ("desc" is a "D3D12_ROOT_SIGNATURE_DESC", "...DESC1" or "...DESC2", with "D3D12_ROOT_PARAMETER"s
       // or "...PARAMETER1"s) but the same member names, so these lambdas take them all. "append" changes "desc", the member of "extended" it is.
-      const auto check_cbvs = [&](const auto& desc) -> Skip
+      const auto check_cbvs = [&](const auto& desc, GameSkip* game_skip) -> Skip
       {
          using Parameter = std::remove_cvref_t<decltype(*desc.pParameters)>;
          if ((desc.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE) != 0)
@@ -154,47 +209,57 @@ namespace D3D12RootSignatures
             return Skip::LocalRootSignature;
          }
 
-         bool registers_in_use = false;
+         bool luma_registers_in_use = false;
+         bool game_registers_in_use = false;
          uint64_t cost = 0;
+         const auto take = [&](D3D12_DESCRIPTOR_RANGE_TYPE kind, uint32_t space, uint32_t first, uint32_t count)
+         {
+            luma_registers_in_use = luma_registers_in_use || uses_register(luma_claims, kind, space, first, count);
+            game_registers_in_use = game_registers_in_use || uses_register(game_claims, kind, space, first, count);
+         };
          for (const Parameter& parameter : std::span(desc.pParameters, desc.NumParameters))
          {
             switch (parameter.ParameterType)
             {
             case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
             {
-               const auto ranges = std::span(parameter.DescriptorTable.pDescriptorRanges, parameter.DescriptorTable.NumDescriptorRanges);
-               registers_in_use = registers_in_use || std::ranges::any_of(ranges, [&](const auto& range)
-                                                         { return range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV && uses_luma_register(range.RegisterSpace, range.BaseShaderRegister, range.NumDescriptors); });
+               for (const auto& range : std::span(parameter.DescriptorTable.pDescriptorRanges, parameter.DescriptorTable.NumDescriptorRanges))
+               {
+                  take(range.RangeType, range.RegisterSpace, range.BaseShaderRegister, range.NumDescriptors);
+               }
                cost += 1;
                break;
             }
             case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
             {
-               registers_in_use = registers_in_use || uses_luma_register(parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister, 1);
+               take(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister, 1);
                cost += parameter.Constants.Num32BitValues;
                break;
             }
-            case D3D12_ROOT_PARAMETER_TYPE_CBV:
+            default: // The root descriptors
             {
-               registers_in_use = registers_in_use || uses_luma_register(parameter.Descriptor.RegisterSpace, parameter.Descriptor.ShaderRegister, 1);
-               cost += ROOT_DESCRIPTOR_COST;
-               break;
-            }
-            case D3D12_ROOT_PARAMETER_TYPE_SRV:
-            case D3D12_ROOT_PARAMETER_TYPE_UAV:
-            {
+               take(kind_of(parameter.ParameterType), parameter.Descriptor.RegisterSpace, parameter.Descriptor.ShaderRegister, 1);
                cost += ROOT_DESCRIPTOR_COST;
                break;
             }
             }
          }
-         if (registers_in_use)
+         if (luma_registers_in_use)
          {
             return Skip::RegistersInUse;
          }
-         if (cost + ROOT_DESCRIPTOR_COST * luma_registers.size() > D3D12_MAX_ROOT_COST)
+         const uint64_t luma_cost = ROOT_DESCRIPTOR_COST * luma_registers.size();
+         if (cost + luma_cost > D3D12_MAX_ROOT_COST)
          {
             return Skip::OverBudget;
+         }
+         if (game_registers_in_use)
+         {
+            *game_skip = GameSkip::RegistersInUse;
+         }
+         else if (cost + luma_cost + game_cost > D3D12_MAX_ROOT_COST)
+         {
+            *game_skip = GameSkip::OverBudget;
          }
          return Skip::None;
       };
@@ -213,7 +278,8 @@ namespace D3D12RootSignatures
             }
          }
 
-         const Skip skip = check_cbvs(desc);
+         GameSkip game_skip = GameSkip::None;
+         const Skip skip = check_cbvs(desc, &game_skip);
          const uint32_t original_parameter_count = desc.NumParameters;
          std::vector<Parameter> parameters;
          if (skip == Skip::None)
@@ -229,6 +295,27 @@ namespace D3D12RootSignatures
                if constexpr (requires { cbv.Descriptor.Flags; })
                {
                   cbv.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE; // Root signature 1.1 and later
+               }
+            }
+            if (game_skip == GameSkip::None)
+            {
+               for (const GameParameter& game_parameter : game_parameters)
+               {
+                  Parameter& added = parameters.emplace_back();
+                  added.ParameterType = game_parameter.type;
+                  added.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                  if (game_parameter.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                  {
+                     added.Constants = {.ShaderRegister = game_parameter.shader_register, .RegisterSpace = LUMA_CB_REGISTER_SPACE, .Num32BitValues = game_parameter.constant_count};
+                     continue;
+                  }
+                  added.Descriptor.ShaderRegister = game_parameter.shader_register;
+                  added.Descriptor.RegisterSpace = LUMA_CB_REGISTER_SPACE;
+                  if constexpr (requires { added.Descriptor.Flags; })
+                  {
+                     // Root signature 1.1 and later. Like the CBVs, the data of a root SRV is set before the command list executes; a UAV's is written by the GPU
+                     added.Descriptor.Flags = (game_parameter.type == D3D12_ROOT_PARAMETER_TYPE_UAV ? D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE : D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE);
+                  }
                }
             }
             desc.NumParameters = static_cast<uint32_t>(parameters.size());
@@ -286,7 +373,12 @@ namespace D3D12RootSignatures
          rewritten->assign(bytes, bytes + serialized->GetBufferSize());
          if (skip == Skip::None)
          {
-            *params = {.settings_index = static_cast<int32_t>(original_parameter_count), .data_index = (data_register >= 0 ? static_cast<int32_t>(original_parameter_count) + 1 : -1)};
+            *params = {
+               .settings_index = static_cast<int32_t>(original_parameter_count),
+               .data_index = (data_register >= 0 ? static_cast<int32_t>(original_parameter_count) + 1 : -1),
+               .game_index = (!game_parameters.empty() && game_skip == GameSkip::None ? static_cast<int32_t>(original_parameter_count + luma_registers.size()) : -1),
+               .game_skip = game_skip,
+            };
          }
          return skip;
       };
@@ -326,6 +418,7 @@ namespace D3D12RootSignatures
    // The logs are for the first few of each, as a game can create thousands of root signatures
    constexpr uint32_t MAX_LOGS = 3;
    inline std::array<std::atomic<uint32_t>, SKIP_NAMES.size()> skip_logs;
+   inline std::array<std::atomic<uint32_t>, GAME_SKIP_NAMES.size()> game_skip_logs;
    inline std::atomic<uint32_t> create_failure_logs;
    // Set while this thread creates a root signature through the hook: ReShade's events run inside the create, and a root signature an
    // add-on creates from one of them is not the game's
@@ -351,7 +444,7 @@ namespace D3D12RootSignatures
       LumaParams params;
       uint32_t parameter_count = 0;
       std::vector<D3D12_STATIC_SAMPLER_DESC1> static_samplers;
-      const Skip skip = Rewrite({static_cast<const std::byte*>(blob), size}, hook.settings_register, hook.data_register, &rewritten, &params, &parameter_count, &static_samplers);
+      const Skip skip = Rewrite({static_cast<const std::byte*>(blob), size}, hook.settings_register, hook.data_register, &rewritten, &params, &parameter_count, &static_samplers, std::span(hook.game_parameters).first(hook.game_parameter_count));
       const bool injecting = !rewritten.empty(); // The CBVs, the upgraded static samplers or both
 #if DEVELOPMENT
       pending_static_samplers = std::move(static_samplers);
@@ -359,6 +452,10 @@ namespace D3D12RootSignatures
       if (skip != Skip::None && skip_logs[static_cast<size_t>(skip)].fetch_add(1) < MAX_LOGS)
       {
          hook.log(std::format("A root signature{} is left without Luma's constant buffers: {}", (parameter_count != 0 ? std::format(" (root parameters: {})", parameter_count) : std::string()), SKIP_NAMES[static_cast<size_t>(skip)]).c_str());
+      }
+      if (params.game_skip != GameSkip::None && game_skip_logs[static_cast<size_t>(params.game_skip)].fetch_add(1) < MAX_LOGS)
+      {
+         hook.log(std::format("A root signature (root parameters: {}) gets Luma's constant buffers but not the game's root parameters: {}", parameter_count, GAME_SKIP_NAMES[static_cast<size_t>(params.game_skip)]).c_str());
       }
       const bool were_static_samplers_upgraded = std::exchange(static_samplers_upgraded, injecting);
       HRESULT result = hook.original(device, node_mask, (injecting ? rewritten.data() : blob), (injecting ? rewritten.size() : size), riid, root_signature);
@@ -393,9 +490,11 @@ namespace D3D12RootSignatures
    // first install stay). False if there is no ReShade device proxy, the runtime lacks the (de)serializer or MinHook failed. A later
    // device's proxy can lead elsewhere when another module patched the proxies' vtable after the first install, to a function that calls
    // ReShade's: the hook on that covers it.
-   // "settings_register" and "data_register" (-1: no LumaData) are the CBVs' registers in "LUMA_CB_REGISTER_SPACE".
-   inline bool Install(ID3D12Device* native_device, uint32_t settings_register, int32_t data_register, LogFunction log)
+   // "settings_register" and "data_register" (-1: no LumaData) are the CBVs' registers in "LUMA_CB_REGISTER_SPACE". "game_parameters" (at most
+   // "MAX_GAME_PARAMETERS") are appended after them, as the first install has them.
+   inline bool Install(ID3D12Device* native_device, uint32_t settings_register, int32_t data_register, LogFunction log, std::span<const GameParameter> game_parameters = {})
    {
+      assert(game_parameters.size() <= MAX_GAME_PARAMETERS);
       void** const proxy_vtable = D3D12ProxyHook::FindProxyVtable(native_device);
       if (!proxy_vtable)
       {
@@ -416,6 +515,8 @@ namespace D3D12RootSignatures
       hook.settings_register = settings_register;
       hook.data_register = data_register;
       hook.log = log;
+      hook.game_parameter_count = static_cast<uint32_t>((std::min)(game_parameters.size(), MAX_GAME_PARAMETERS));
+      std::copy_n(game_parameters.begin(), hook.game_parameter_count, hook.game_parameters.begin());
       return hook.create_deserializer && hook.serialize && D3D12ProxyHook::Attach(&hook, proxy_vtable[CREATE_ROOT_SIGNATURE_SLOT], &Detour);
    }
 
