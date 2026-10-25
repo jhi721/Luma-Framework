@@ -9018,10 +9018,26 @@ namespace
    }
 
    // After a Luma pass on a game list: the game's graphics state again ("D3D12State::RestoreGraphics()"). Its own viewports and scissors come back, so a draw into a scaled clone scales
-   // them again, and the next draw checks its pipeline against the render targets again
+   // them again, and the next draw checks its pipeline against the render targets again. A replaced graphics pipeline gets its Luma constant buffers back too: "SetLumaConstantBuffers()"
+   // sets them natively before the game's draw callback, so the tracker doesn't know them, and the game's root signature bound again resets every root argument (the replaced
+   // shader would read unset root CBVs)
    void RestoreGameGraphicsD3D12(CommandListData& cmd_list_data)
    {
       D3D12State::RestoreGraphics(cmd_list_data.cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      if (cmd_list_data.luma_settings_param >= 0 && cmd_list_data.pipeline_state_original_compute_shader.handle == 0)
+      {
+         auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list_data.cmd_list->get_native());
+         const DeviceData& device_data = *cmd_list_data.cmd_list->get_device()->get_private_data<DeviceData>();
+         const D3D12_GPU_VIRTUAL_ADDRESS settings_address = device_data.settings_address.load(std::memory_order_acquire);
+         if (settings_address != 0)
+         {
+            native_list->SetGraphicsRootConstantBufferView(cmd_list_data.luma_settings_param, settings_address);
+         }
+         if (cmd_list_data.luma_data_param >= 0 && cmd_list_data.luma_data_address != 0)
+         {
+            native_list->SetGraphicsRootConstantBufferView(cmd_list_data.luma_data_param, cmd_list_data.luma_data_address);
+         }
+      }
       cmd_list_data.render_target_formats_dirty = true;
       cmd_list_data.viewports_scaled = false;
       cmd_list_data.scissors_scaled = false;
