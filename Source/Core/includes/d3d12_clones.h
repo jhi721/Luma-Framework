@@ -35,6 +35,7 @@
 #include <include/reshade.hpp>
 #include <source/com_ptr.hpp>
 
+#include "../utils/format.hpp"
 #include "d3d12_command_signatures.h"
 #include "d3d12_passes.h"
 #include "d3d12_resource_creation.h"
@@ -70,8 +71,7 @@ namespace D3D12Clones
       com_ptr<ID3D12Resource> resource;
       ID3D12Device* device = nullptr; // The native device of "resource", which keeps it alive. Its fence and views are the only ones that work on the clone
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-      bool layouts = false;            // Created with enhanced barriers' layouts (the barriers of the original must be mirrored as such)
-      float scale_x = 1.f;             // The clone's width and height over the original's (custom dimensions, "texture_custom_dimensions_upgrades")
+      float scale_x = 1.f; // The clone's width and height over the original's (custom dimensions, "texture_custom_dimensions_upgrades")
       float scale_y = 1.f;
       bool active = true;              // Written under the exclusive lock only. Inactive: the game's views are on the original, and are recorded in "views"
       MovableFlag promotion_requested; // A listed shader renders into the texture: "PromotePending()" activates the clone at the next present
@@ -84,13 +84,15 @@ namespace D3D12Clones
    {
       com_ptr<ID3D12Resource> resource;
       ID3D12Device* device = nullptr;
-      uint64_t fence_value = 0; // 0 until a present of its device signaled the device's fence behind it
+      ID3D12CommandQueue* queue = nullptr; // The present queue whose fence "fence_value" is of
+      uint64_t fence_value = 0;            // 0 until a present of its device signaled that queue's fence behind it
    };
 
-   // A fence only works on the queues of its own device
-   struct DeviceFence
+   // A fence per queue: a fence holds the last value signaled on it, so a signal of one queue would pass the pending ones of another
+   struct QueueFence
    {
       com_ptr<ID3D12Fence> fence;
+      ID3D12Device* device = nullptr; // A fence only works on the queues of its own device
       uint64_t last_signaled = 0;
    };
 
@@ -108,12 +110,19 @@ namespace D3D12Clones
       std::unordered_map<const ID3D12Resource*, std::pair<float, float>> scale_by_clone;
       std::atomic<uint32_t> scaled_count = 0; // Of "scale_by_clone", for the lock free fast out of every draw
       std::vector<RetiredClone> retired;
-      // Of the devices that presented (a game can make several), until "OnDestroyDevice()"
-      std::unordered_map<ID3D12Device*, DeviceFence> fences;
+      // Of the queues that presented or were waited for (a game can make several devices), until "OnDestroyDevice()" of their device
+      std::unordered_map<ID3D12CommandQueue*, QueueFence> fences;
    };
 
    // Never destroyed: the DLL can be unloaded after d3d12.dll, whose objects the members would release
    inline Registry& registry = *new Registry;
+
+   // "Find()" for a caller that holds the lock
+   inline ID3D12Resource* FindLocked(const ID3D12Resource* original, bool active_only = false)
+   {
+      const auto found = registry.by_original.find(const_cast<ID3D12Resource*>(original));
+      return (found != registry.by_original.end() && (found->second.active || !active_only) ? found->second.resource.get() : nullptr);
+   }
 
    // The clone of "original", null if it has none. The clone lives at least as long as its original (the retirement is the original's
    // destruction), so the pointer is good for as long as the caller has the original.
@@ -126,8 +135,7 @@ namespace D3D12Clones
          return nullptr;
       }
       const std::shared_lock lock(registry.mutex);
-      const auto found = registry.by_original.find(const_cast<ID3D12Resource*>(original));
-      return (found != registry.by_original.end() && (found->second.active || !active_only) ? found->second.resource.get() : nullptr);
+      return FindLocked(original, active_only);
    }
 
    inline ID3D12Resource* FindActive(const ID3D12Resource* original)
@@ -226,16 +234,17 @@ namespace D3D12Clones
       return clone;
    }
 
-   // The fence of "device", made on its first use. Null if the device refused it. The caller holds the exclusive lock.
-   inline DeviceFence* FindOrCreateFenceLocked(ID3D12Device* device)
+   // The fence of "queue" (of "device"), made on its first use. Null if the device refused it. The caller holds the exclusive lock.
+   inline QueueFence* FindOrCreateFenceLocked(ID3D12CommandQueue* queue, ID3D12Device* device)
    {
-      DeviceFence& device_fence = registry.fences[device];
-      if (!device_fence.fence && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&device_fence.fence))))
+      QueueFence& queue_fence = registry.fences[queue];
+      if (!queue_fence.fence && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue_fence.fence))))
       {
-         registry.fences.erase(device);
+         registry.fences.erase(queue);
          return nullptr;
       }
-      return &device_fence;
+      queue_fence.device = device;
+      return &queue_fence;
    }
 
    // At each present, on the present queue: the clones of the queue's device retired since the last one get the value of a signal behind
@@ -255,28 +264,30 @@ namespace D3D12Clones
          return;
       }
       const std::unique_lock lock(registry.mutex);
-      DeviceFence* const device_fence = FindOrCreateFenceLocked(device.get());
-      if (!device_fence)
+      QueueFence* const queue_fence = FindOrCreateFenceLocked(queue, device.get());
+      if (!queue_fence)
       {
          return; // The clones stay retired (a leak) rather than released under the GPU
       }
-      const auto of_device = [&](const RetiredClone& retired)
-      { return retired.device == device.get(); };
-      if (std::ranges::any_of(registry.retired, [&](const RetiredClone& retired)
-             { return of_device(retired) && retired.fence_value == 0; }))
+      bool stamped = false;
+      for (RetiredClone& retired : registry.retired)
       {
-         queue->Signal(device_fence->fence.get(), ++device_fence->last_signaled);
-         for (RetiredClone& retired : registry.retired)
+         if (retired.device == device.get() && retired.fence_value == 0)
          {
-            if (of_device(retired) && retired.fence_value == 0)
-            {
-               retired.fence_value = device_fence->last_signaled;
-            }
+            retired.queue = queue;
+            retired.fence_value = queue_fence->last_signaled + 1;
+            stamped = true;
          }
       }
-      const uint64_t completed = device_fence->fence->GetCompletedValue();
-      std::erase_if(registry.retired, [&](const RetiredClone& retired)
-         { return of_device(retired) && retired.fence_value <= completed; });
+      if (stamped)
+      {
+         queue->Signal(queue_fence->fence.get(), ++queue_fence->last_signaled);
+      }
+      // Each against the fence of the queue that stamped it, so the clones of a queue that stopped presenting go too
+      std::erase_if(registry.retired, [](const RetiredClone& retired)
+         {
+            const auto stamp_fence = (retired.fence_value != 0 ? registry.fences.find(retired.queue) : registry.fences.end());
+            return stamp_fence != registry.fences.end() && retired.fence_value <= stamp_fence->second.fence->GetCompletedValue(); });
       registry.retired_count.store(uint32_t(registry.retired.size()), std::memory_order_relaxed);
    }
 
@@ -284,7 +295,8 @@ namespace D3D12Clones
    inline void OnDestroyDevice(ID3D12Device* device)
    {
       const std::unique_lock lock(registry.mutex);
-      registry.fences.erase(device);
+      std::erase_if(registry.fences, [device](const auto& queue_and_fence)
+         { return queue_and_fence.second.device == device; });
       std::erase_if(registry.retired, [device](const RetiredClone& retired)
          { return retired.device == device; });
       registry.retired_count.store(uint32_t(registry.retired.size()), std::memory_order_relaxed);
@@ -295,7 +307,7 @@ namespace D3D12Clones
    // A view written into a recorded handle replaces the recorded one, so the record goes either way.
    inline ID3D12Resource* RouteView(ID3D12Resource* resource, SIZE_T handle, const ViewRecord* record)
    {
-      if ((registry.count.load(std::memory_order_relaxed) == 0 && registry.record_count.load(std::memory_order_relaxed) == 0) || (!record && registry.record_count.load(std::memory_order_relaxed) == 0))
+      if (registry.record_count.load(std::memory_order_relaxed) == 0 && (!record || registry.count.load(std::memory_order_relaxed) == 0))
       {
          return resource;
       }
@@ -359,6 +371,7 @@ namespace D3D12Clones
             continue;
          }
          ID3D12Resource* original = nullptr;
+         Clone* source_clone = nullptr; // "EraseRecordLocked()" only erases views, so the pointer stays good
          std::optional<ViewRecord> copied;
          if (const auto owner = registry.record_owner.find(source); owner != registry.record_owner.end())
          {
@@ -367,6 +380,7 @@ namespace D3D12Clones
             {
                if (const auto record = clone->second.views.find(source); record != clone->second.views.end())
                {
+                  source_clone = &clone->second;
                   copied = record->second;
                }
             }
@@ -374,7 +388,7 @@ namespace D3D12Clones
          EraseRecordLocked(destination);
          if (copied)
          {
-            registry.by_original.find(original)->second.views[destination] = *copied;
+            source_clone->views[destination] = std::move(*copied);
             registry.record_owner[destination] = original;
          }
       }
@@ -554,14 +568,7 @@ namespace D3D12Clones
       bool timed_out = false;
    };
 
-   // At present, on the present queue, never mid frame: shader visible descriptors can be read by lists the GPU still runs. Waits for the GPU
-   // to be done with the queue (one hitch per batch, at load or resize), then creates the recorded views again on the clones of the
-   // requested promotions, through ReShade's proxy (so it updates its view registry and upgrades the formats like it does for any view), and
-   // sets the clones active.
-   // ponytail: waits on the present queue only (work of async compute/copy queues isn't synchronized); command lists recorded for the next
-   // frame already consumed their RTV descriptors, so the first promoted frame can show a frame of stale content; a game thread copying a
-   // descriptor while it is created again could read a torn one (descriptors have no lock to take).
-   // Signals the fence of "device" on "queue" and waits for it, 2 seconds at most: the GPU is then done with what was submitted to the queue. False if the wait timed out
+   // Signals the fence of "queue" (of "device") and waits for it, 2 seconds at most: the GPU is then done with what was submitted to the queue. False if the wait timed out
    // (or the device refused a fence). "waited_ms" gets how long it took.
    inline bool WaitForQueue(ID3D12CommandQueue* queue, ID3D12Device* device, double* waited_ms)
    {
@@ -569,13 +576,13 @@ namespace D3D12Clones
       uint64_t wait_value = 0;
       {
          const std::unique_lock lock(registry.mutex);
-         DeviceFence* const device_fence = FindOrCreateFenceLocked(device);
-         if (!device_fence)
+         QueueFence* const queue_fence = FindOrCreateFenceLocked(queue, device);
+         if (!queue_fence)
          {
             return false;
          }
-         fence = device_fence->fence.get();
-         wait_value = ++device_fence->last_signaled;
+         fence = queue_fence->fence.get();
+         wait_value = ++queue_fence->last_signaled;
          queue->Signal(fence, wait_value);
       }
       const auto wait_start = std::chrono::steady_clock::now();
@@ -590,6 +597,14 @@ namespace D3D12Clones
       return waited;
    }
 
+   // At present, on the present queue, never mid frame: shader visible descriptors can be read by lists the GPU still runs. Waits for the GPU
+   // to be done with the queue (one hitch per batch, at load or resize), then creates the recorded views again on the clones of the
+   // requested promotions, through ReShade's proxy (so it updates its view registry and upgrades the formats like it does for any view), and
+   // sets the clones active.
+   // ponytail: waits on the present queue only (work of async compute/copy queues isn't synchronized); command lists recorded for the next
+   // frame already consumed their RTV descriptors, so the first promoted frame can show a frame of stale content; a game thread copying a
+   // descriptor while it is created again could read a torn one, and one writing it between the check of its record and its creation
+   // gets it overwritten (descriptors have no lock to take).
    inline Promotion PromotePending(ID3D12CommandQueue* queue)
    {
       Promotion promotion;
@@ -611,6 +626,7 @@ namespace D3D12Clones
 
       struct Recreation
       {
+         ID3D12Resource* original = nullptr;
          ID3D12Resource* clone = nullptr;
          std::unordered_map<SIZE_T, ViewRecord> views;
       };
@@ -634,22 +650,29 @@ namespace D3D12Clones
             registry.inactive_count.fetch_sub(1);
             clone.promotion_requested.value.store(false);
             AddScaledLocked(clone);
-            for (const auto& [handle, record] : clone.views)
-            {
-               registry.record_owner.erase(handle);
-            }
+            // The handles stay in "record_owner" until their view is created again below: a descriptor the game writes (or copies over, or
+            // whose heap it destroys) meanwhile drops its record, and keeps what the game wrote
             promotion.clones.push_back({.original_format = original->GetDesc().Format, .clone_format = clone.format, .view_count = clone.views.size()});
-            recreations.push_back({.clone = clone.resource.get(), .views = std::move(clone.views)});
+            recreations.push_back({.original = original, .clone = clone.resource.get(), .views = std::move(clone.views)});
             clone.views.clear();
          }
          registry.pending_promotions.store(pending_of_other_devices);
-         registry.record_count.store(uint32_t(registry.record_owner.size()), std::memory_order_relaxed);
       }
-      // No lock held: ReShade fires its events from inside these, and the detours of the views take the registry's
+      // No lock held across the creates: ReShade fires its events from inside them, and the detours of the views take the registry's
       for (const Recreation& recreation : recreations)
       {
          for (const auto& [handle, record] : recreation.views)
          {
+            {
+               const std::unique_lock lock(registry.mutex);
+               const auto owner = registry.record_owner.find(handle);
+               if (owner == registry.record_owner.end() || owner->second != recreation.original)
+               {
+                  continue;
+               }
+               registry.record_owner.erase(owner);
+               registry.record_count.store(uint32_t(registry.record_owner.size()), std::memory_order_relaxed);
+            }
             const D3D12_CPU_DESCRIPTOR_HANDLE descriptor = {handle};
             switch (record.desc.index())
             {
@@ -733,31 +756,46 @@ namespace D3D12Clones
    }
 
    // The clear value of a clone in "format", with the colour the game's value has. The upgraded format of a clone can be typeless, and a
-   // clear value needs a typed one: none then (the clear value is only an optimization hint). A clone in the original's format ("original_format":
-   // custom dimensions only) takes the game's value as it is, a typeless depth texture's typed one included.
+   // clear value needs a typed format of its group: the one the upgraded views of the group get (sRGB if the game's value is), none for
+   // another typeless group (the clear value is only an optimization hint). A clone in the original's format ("original_format": custom
+   // dimensions only) takes the game's value as it is, a typeless depth texture's typed one included.
    inline std::optional<D3D12_CLEAR_VALUE> ClearValueFor(DXGI_FORMAT format, DXGI_FORMAT original_format, const D3D12ResourceCreation::CreationArguments& arguments)
    {
       if (format == original_format)
       {
          return (arguments.has_clear_value ? std::optional(arguments.clear_value) : std::nullopt);
       }
-      switch (format)
-      {
-      case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-      case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-      case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-      case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-      case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-         return std::nullopt;
-      default:
-         break;
-      }
       if (!arguments.has_clear_value)
       {
          return std::nullopt;
       }
       D3D12_CLEAR_VALUE clear_value = arguments.clear_value;
-      clear_value.Format = format;
+      const bool srgb = (clear_value.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || clear_value.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+      switch (format)
+      {
+      case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+         clear_value.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+         break;
+      case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+         clear_value.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+         break;
+      case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+         clear_value.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+         break;
+      case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+         clear_value.Format = (srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM);
+         break;
+      case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+         clear_value.Format = (srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM);
+         break;
+      default:
+         if (IsTypelessFormat(format))
+         {
+            return std::nullopt;
+         }
+         clear_value.Format = format;
+         break;
+      }
       return clear_value;
    }
 
@@ -767,7 +805,8 @@ namespace D3D12Clones
    inline ID3D12Resource* Create(ID3D12Device* device, ID3D12Resource* original, DXGI_FORMAT format, uint64_t width, uint32_t height, const D3D12ResourceCreation::CreationArguments& arguments, bool active)
    {
       const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
-      const std::optional<D3D12_CLEAR_VALUE> clear_value = ClearValueFor(format, original->GetDesc().Format, arguments);
+      const D3D12_RESOURCE_DESC original_desc = original->GetDesc();
+      const std::optional<D3D12_CLEAR_VALUE> clear_value = ClearValueFor(format, original_desc.Format, arguments);
       const D3D12_CLEAR_VALUE* const clear_value_pointer = (clear_value ? &*clear_value : nullptr);
       com_ptr<ID3D12Resource> resource;
       HRESULT result = E_FAIL;
@@ -787,7 +826,7 @@ namespace D3D12Clones
       }
       else
       {
-         D3D12_RESOURCE_DESC desc = original->GetDesc();
+         D3D12_RESOURCE_DESC desc = original_desc;
          desc.Format = format;
          desc.Width = width;
          desc.Height = height;
@@ -799,8 +838,7 @@ namespace D3D12Clones
          return nullptr;
       }
       ID3D12Resource* const clone = resource.get();
-      const D3D12_RESOURCE_DESC original_desc = original->GetDesc();
-      Add(original, {.resource = std::move(resource), .device = device, .format = format, .layouts = arguments.uses_layouts, .scale_x = float(width) / float(original_desc.Width), .scale_y = float(height) / float(original_desc.Height), .active = active});
+      Add(original, {.resource = std::move(resource), .device = device, .format = format, .scale_x = float(width) / float(original_desc.Width), .scale_y = float(height) / float(original_desc.Height), .active = active});
       return clone;
    }
 
@@ -871,10 +909,7 @@ namespace D3D12Clones
    template <typename Description>
    ViewRecord MakeViewRecord(const Description* desc)
    {
-      ViewRecord record;
-      record.desc = (desc ? *desc : Description{});
-      record.has_desc = (desc != nullptr);
-      return record;
+      return {.desc = (desc ? *desc : Description{}), .has_desc = (desc != nullptr)};
    }
 
    inline void STDMETHODCALLTYPE CreateShaderResourceViewDetour(ID3D12Device* device, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
@@ -982,8 +1017,6 @@ namespace D3D12Clones
       return type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
    }
 
-   // The range lists of a copy walked in step, as (destination, source) pairs: destination "i" of a range is its start + "i" * the type's
-   // increment, in the game's encoding on both sides
    // Whether a copy of descriptors of "type" can carry records: views, or samplers
    inline bool CopyCarriesRecords(D3D12_DESCRIPTOR_HEAP_TYPE type)
    {
@@ -1009,6 +1042,8 @@ namespace D3D12Clones
       {
          return;
       }
+      // The range lists walked in step, as (destination, source) pairs: destination "i" of a range is its start + "i" * the type's
+      // increment, in the game's encoding on both sides
       const SIZE_T increment = device->GetDescriptorHandleIncrementSize(type);
       thread_local std::vector<std::pair<SIZE_T, SIZE_T>> destinations_and_sources;
       destinations_and_sources.clear();
@@ -1102,24 +1137,27 @@ namespace D3D12Clones
       }
       thread_local std::vector<D3D12_RESOURCE_BARRIER> combined; // Reused by the thread: allocates only while it grows
       combined.clear();
-      for (UINT i = 0; i < barrier_count; i++)
       {
-         combined.push_back(barriers[i]);
-         D3D12_RESOURCE_BARRIER mirrored = barriers[i];
-         if (mirrored.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+         const std::shared_lock lock(registry.mutex);
+         for (UINT i = 0; i < barrier_count; i++)
          {
-            mirrored.Transition.pResource = Find(mirrored.Transition.pResource);
-            if (mirrored.Transition.pResource)
+            combined.push_back(barriers[i]);
+            D3D12_RESOURCE_BARRIER mirrored = barriers[i];
+            if (mirrored.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
             {
-               combined.push_back(mirrored);
+               mirrored.Transition.pResource = FindLocked(mirrored.Transition.pResource);
+               if (mirrored.Transition.pResource)
+               {
+                  combined.push_back(mirrored);
+               }
             }
-         }
-         else if (mirrored.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV)
-         {
-            mirrored.UAV.pResource = Find(mirrored.UAV.pResource);
-            if (mirrored.UAV.pResource)
+            else if (mirrored.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV)
             {
-               combined.push_back(mirrored);
+               mirrored.UAV.pResource = FindLocked(mirrored.UAV.pResource);
+               if (mirrored.UAV.pResource)
+               {
+                  combined.push_back(mirrored);
+               }
             }
          }
       }
@@ -1140,24 +1178,27 @@ namespace D3D12Clones
       textures.clear();
       texture_starts.clear();
       combined_groups.assign(groups, groups + group_count);
-      for (UINT32 i = 0; i < group_count; i++)
       {
-         texture_starts.push_back(textures.size());
-         if (groups[i].Type != D3D12_BARRIER_TYPE_TEXTURE)
+         const std::shared_lock lock(registry.mutex);
+         for (UINT32 i = 0; i < group_count; i++)
          {
-            continue;
-         }
-         for (UINT32 j = 0; j < groups[i].NumBarriers; j++)
-         {
-            textures.push_back(groups[i].pTextureBarriers[j]);
-            D3D12_TEXTURE_BARRIER mirrored = groups[i].pTextureBarriers[j];
-            mirrored.pResource = Find(mirrored.pResource);
-            if (mirrored.pResource)
+            texture_starts.push_back(textures.size());
+            if (groups[i].Type != D3D12_BARRIER_TYPE_TEXTURE)
             {
-               textures.push_back(mirrored);
+               continue;
             }
+            for (UINT32 j = 0; j < groups[i].NumBarriers; j++)
+            {
+               textures.push_back(groups[i].pTextureBarriers[j]);
+               D3D12_TEXTURE_BARRIER mirrored = groups[i].pTextureBarriers[j];
+               mirrored.pResource = FindLocked(mirrored.pResource);
+               if (mirrored.pResource)
+               {
+                  textures.push_back(mirrored);
+               }
+            }
+            combined_groups[i].NumBarriers = UINT32(textures.size() - texture_starts[i]);
          }
-         combined_groups[i].NumBarriers = UINT32(textures.size() - texture_starts[i]);
       }
       for (UINT32 i = 0; i < group_count; i++)
       {
@@ -1281,7 +1322,17 @@ namespace D3D12Clones
       {
          static std::shared_mutex mutex;
          static std::unordered_set<std::string_view> logged_reasons;
-         if (const std::unique_lock lock(mutex); logged_reasons.emplace(reason).second)
+         bool first_time = false;
+         {
+            const std::shared_lock lock(mutex);
+            first_time = !logged_reasons.contains(reason);
+         }
+         if (first_time)
+         {
+            const std::unique_lock lock(mutex);
+            first_time = logged_reasons.emplace(reason).second;
+         }
+         if (first_time)
          {
             reshade::log::message(reshade::log::level::warning, std::format("[Render passes] A render pass of the game stays native, so Luma's passes refuse inside it: {}", reason).c_str());
          }

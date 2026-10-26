@@ -8185,21 +8185,6 @@ namespace
       cmd_list_data.scissors_scaled = false;
    }
 
-   // True when the hash-upgrade scale chain is active this frame: a scale-enabled seed exists and SR
-   // upscaled early. Everything scale-specific (the shader flag probe and scaled copies) is gated on this.
-   bool IsScaleChainActive(const DeviceData& device_data)
-   {
-      if (!device_data.has_drawn_sr)
-         return false;
-      // TODO: cache this
-      for (const auto& entry : auto_texture_format_upgrade_shader_hashes)
-      {
-         if (entry.second.scale)
-            return true;
-      }
-      return false;
-   }
-
    void SetLumaConstantBuffers(ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, LumaConstantBufferType type, uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0, float custom_data_3 = 0.f, float custom_data_4 = 0.f, bool do_safety_checks = true)
    {
       constexpr bool force_update = false;
@@ -8310,7 +8295,7 @@ namespace
          // The shader applies the render scale only in the scaling zone: the hash-upgrade scale chain is
          // active (SR upscaled early) AND this pass still renders below output resolution (same aspect).
          // The RTV probe below only runs when a scale chain actually exists, to keep the common path cheap.
-         bool render_scale_active = IsScaleChainActive(device_data);
+         bool render_scale_active = device_data.resource_upgrades.IsScaleChainActive({.has_drawn_sr = device_data.has_drawn_sr});
          if (render_scale_active)
          {
             com_ptr<ID3D11RenderTargetView> rtv;
@@ -15489,7 +15474,7 @@ namespace
                // BEFORE the game's OnDrawOrDispatch executes SR and flips has_drawn_sr. So also treat a copy
                // as scaleable when either resource is a scaled mirror, so we don't mistake the scaled seed
                // (or a chain resource derived from it) for the game's own different-size copy.
-               if (!IsScaleChainActive(device_data) && texture_custom_dimensions_upgrades.empty() && !device_data.resource_upgrades.IsScaledMirrorResource(source.handle) && !device_data.resource_upgrades.IsScaledMirrorResource(dest.handle))
+               if (!device_data.resource_upgrades.IsScaleChainActive({.has_drawn_sr = device_data.has_drawn_sr}) && texture_custom_dimensions_upgrades.empty() && !device_data.resource_upgrades.IsScaledMirrorResource(source.handle) && !device_data.resource_upgrades.IsScaledMirrorResource(dest.handle))
                   return false;
                use_scale = true;
             }
