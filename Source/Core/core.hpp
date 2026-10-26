@@ -1579,9 +1579,9 @@ namespace
    // the blend of target 0 they shared. A stream without one gets the runtime's default blend (documented only as "a default value"), so one is added only for a blend other than
    // the opaque write-all one that every default target is assumed to have.
    // Calls the device: no Luma lock may be held, but the one keeping the code alive. The clone is destroyed with the original, retired or not.
-   reshade::api::pipeline CreateD3D12Clone(CachedPipeline* cached_pipeline, std::span<const D3D12StageReplacement> replacements, const std::array<DXGI_FORMAT, 8>* render_target_formats = nullptr, const D3D12AppendedRenderTarget* appended_render_target = nullptr)
+   reshade::api::pipeline CreateD3D12Clone(const CachedPipeline& cached_pipeline, std::span<const D3D12StageReplacement> replacements, const std::array<DXGI_FORMAT, 8>* render_target_formats = nullptr, const D3D12AppendedRenderTarget* appended_render_target = nullptr)
    {
-      ID3D12Device* const native_device = reinterpret_cast<ID3D12Device*>(cached_pipeline->device->get_native());
+      ID3D12Device* const native_device = reinterpret_cast<ID3D12Device*>(cached_pipeline.device->get_native());
       const char* const kind = (render_target_formats ? "variant" : "clone");
       // The runtime only answers E_INVALIDARG when a replacement reads Luma's constant buffers that the pipeline's root signature doesn't hold: names the likely causes
       const auto luma_cbuffers_hint = [&]
@@ -1592,9 +1592,9 @@ namespace
             return hint;
          }
 #if ENABLE_MINHOOK
-         if (cached_pipeline->luma_settings_param < 0)
+         if (cached_pipeline.luma_settings_param < 0)
          {
-            const D3D12RootSignatures::Skip skip = (cached_pipeline->layout.handle == 0 ? D3D12RootSignatures::Skip::ShaderContainer : D3D12RootSignatures::Find(cached_pipeline->layout.handle).skip);
+            const D3D12RootSignatures::Skip skip = (cached_pipeline.layout.handle == 0 ? D3D12RootSignatures::Skip::ShaderContainer : D3D12RootSignatures::Find(cached_pipeline.layout.handle).skip);
             hint = std::format(" (if the replacement reads Luma's constant buffers: its root signature has none because {})", (skip != D3D12RootSignatures::Skip::None ? D3D12RootSignatures::SKIP_NAMES[static_cast<size_t>(skip)] : "it wasn't created through Luma's hook"));
          }
 #endif
@@ -1611,48 +1611,26 @@ namespace
          return hint;
       };
 #if ENABLE_MINHOOK
-      D3D12PsoCapture::Stream* const capture = cached_pipeline->capture.get();
-      const bool has_serialized_root_signature = capture && capture->Find<D3D12PsoCapture::SerializedRootSignatureDesc>(D3D12PsoCapture::SERIALIZED_ROOT_SIGNATURE);
-#else
-      constexpr bool has_serialized_root_signature = false;
-#endif
-#if ENABLE_MINHOOK
+      D3D12PsoCapture::Stream* const capture = cached_pipeline.capture.get();
       const bool can_append_render_target = (capture && render_target_formats);
 #else
       constexpr bool can_append_render_target = false;
 #endif
       if (appended_render_target && !can_append_render_target)
       {
-         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused to append a render target to pipeline {:x}: it has no captured stream", cached_pipeline->pipeline.handle).c_str());
+         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused to append a render target to pipeline {:x}: it has no captured stream", cached_pipeline.pipeline.handle).c_str());
          return {};
-      }
-
-      // A pipeline whose shaders embed their root signature has no object for it, and the replacements (compiled from HLSL) don't carry it:
-      // its clone needs one, made from the game's shaders and kept for the next clones. A serialized root signature in the stream is its own.
-      // The variant of the original keeps the shaders that embed it, and mustn't write the pipeline from a draw thread.
-      if (!replacements.empty() && cached_pipeline->layout.handle == 0 && !has_serialized_root_signature && !cached_pipeline->root_signature)
-      {
-         for (uint32_t i = 0; i < cached_pipeline->subobject_count && !cached_pipeline->root_signature; ++i)
-         {
-            const reshade::api::pipeline_subobject& subobject = cached_pipeline->subobjects_cache[i];
-            const auto* original = static_cast<const reshade::api::shader_desc*>(subobject.data);
-            // The device logs an error if asked to make a root signature from a shader that doesn't embed one (a "RTS0" chunk)
-            if (!ToStreamShaderType(subobject.type) || Shader::FindChunk(original->code, original->code_size, "RTS0") == nullptr)
-            {
-               continue;
-            }
-            com_ptr<ID3D12RootSignature> root_signature;
-            if (SUCCEEDED(native_device->CreateRootSignature(0, original->code, original->code_size, IID_PPV_ARGS(&root_signature))))
-            {
-               cached_pipeline->root_signature = std::move(root_signature);
-            }
-         }
       }
 
 #if ENABLE_MINHOOK
       if (capture)
       {
          std::vector<std::byte> stream = capture->bytes;
+         const auto append_subobject = [&stream](const auto& subobject)
+         {
+            const auto* const bytes = reinterpret_cast<const std::byte*>(&subobject);
+            stream.insert(stream.end(), bytes, bytes + sizeof(subobject));
+         };
          for (const D3D12StageReplacement& replacement : replacements)
          {
             D3D12_SHADER_BYTECODE* const bytecode = capture->Find<D3D12_SHADER_BYTECODE>(replacement.stream_type, stream.data());
@@ -1666,10 +1644,10 @@ namespace
          {
             D3D12_RT_FORMAT_ARRAY* const stream_formats = capture->Find<D3D12_RT_FORMAT_ARRAY>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, stream.data());
             // The pipeline's own targets, so the slot of the appended one
-            const uint32_t appended_slot = (std::min)((stream_formats ? stream_formats->NumRenderTargets : cached_pipeline->render_target_count), 8u);
+            const uint32_t appended_slot = (std::min)((stream_formats ? stream_formats->NumRenderTargets : cached_pipeline.render_target_count), 8u);
             if (appended_render_target && appended_slot == 8)
             {
-               reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused to append a render target to pipeline {:x}: it already has 8", cached_pipeline->pipeline.handle).c_str());
+               reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused to append a render target to pipeline {:x}: it already has 8", cached_pipeline.pipeline.handle).c_str());
                return {};
             }
             if (stream_formats)
@@ -1681,16 +1659,15 @@ namespace
                   stream_formats->NumRenderTargets = appended_slot + 1;
                }
             }
-            else if (cached_pipeline->render_target_count != 0 || appended_render_target)
+            else if (cached_pipeline.render_target_count != 0 || appended_render_target)
             {
-               D3D12PsoCapture::Subobject<D3D12_RT_FORMAT_ARRAY> formats_subobject = {.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, .data = {.NumRenderTargets = cached_pipeline->render_target_count + (appended_render_target ? 1u : 0u)}};
+               D3D12PsoCapture::Subobject<D3D12_RT_FORMAT_ARRAY> formats_subobject = {.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, .data = {.NumRenderTargets = cached_pipeline.render_target_count + (appended_render_target ? 1u : 0u)}};
                std::copy_n(render_target_formats->begin(), 8, formats_subobject.data.RTFormats);
                if (appended_render_target)
                {
                   formats_subobject.data.RTFormats[appended_slot] = appended_render_target->format;
                }
-               const auto* formats_bytes = reinterpret_cast<const std::byte*>(&formats_subobject);
-               stream.insert(stream.end(), formats_bytes, formats_bytes + sizeof(formats_subobject));
+               append_subobject(formats_subobject);
             }
 
             if (appended_render_target)
@@ -1717,22 +1694,19 @@ namespace
                   D3D12PsoCapture::Subobject<D3D12_BLEND_DESC> blend_subobject = {.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND};
                   std::fill_n(blend_subobject.data.RenderTarget, 8, D3D12Passes::OPAQUE_BLEND);
                   set_appended_blend(&blend_subobject.data);
-                  const auto* blend_bytes = reinterpret_cast<const std::byte*>(&blend_subobject);
-                  stream.insert(stream.end(), blend_bytes, blend_bytes + sizeof(blend_subobject));
+                  append_subobject(blend_subobject);
                }
             }
          }
-         if (!replacements.empty() && cached_pipeline->layout.handle == 0 && cached_pipeline->root_signature)
+         if (!replacements.empty() && cached_pipeline.layout.handle == 0 && cached_pipeline.root_signature)
          {
             if (ID3D12RootSignature** const stream_root_signature = capture->Find<ID3D12RootSignature*>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, stream.data()))
             {
-               *stream_root_signature = cached_pipeline->root_signature.get();
+               *stream_root_signature = cached_pipeline.root_signature.get();
             }
             else
             {
-               const D3D12PsoCapture::Subobject<ID3D12RootSignature*> root_signature_subobject = {.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, .data = cached_pipeline->root_signature.get()};
-               const auto* root_signature_bytes = reinterpret_cast<const std::byte*>(&root_signature_subobject);
-               stream.insert(stream.end(), root_signature_bytes, root_signature_bytes + sizeof(root_signature_subobject));
+               append_subobject(D3D12PsoCapture::Subobject<ID3D12RootSignature*>{.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, .data = cached_pipeline.root_signature.get()});
             }
          }
 
@@ -1745,7 +1719,7 @@ namespace
          }
          if (FAILED(result))
          {
-            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the {} of pipeline {:x} failed with HRESULT {:#010x}{}", kind, cached_pipeline->pipeline.handle, static_cast<uint32_t>(result), luma_cbuffers_hint()).c_str());
+            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the {} of pipeline {:x} failed with HRESULT {:#010x}{}", kind, cached_pipeline.pipeline.handle, static_cast<uint32_t>(result), luma_cbuffers_hint()).c_str());
             return {};
          }
          return {reinterpret_cast<uint64_t>(pipeline)};
@@ -1758,7 +1732,7 @@ namespace
          reshade::log::message(reshade::log::level::warning, "[Shader replacement] A pipeline without a captured stream is rebuilt through ReShade, which doesn't model all of its state (like the strip cut value and view instancing)");
       }
       // ReShade's rebuild from the subobjects it reported: a copy of the array that points at the replacements' code and at the override formats
-      std::vector<reshade::api::pipeline_subobject> subobjects(cached_pipeline->subobjects_cache, cached_pipeline->subobjects_cache + cached_pipeline->subobject_count);
+      std::vector<reshade::api::pipeline_subobject> subobjects(cached_pipeline.subobjects_cache, cached_pipeline.subobjects_cache + cached_pipeline.subobject_count);
       std::vector<reshade::api::shader_desc> replaced_shaders;
       replaced_shaders.reserve(replacements.size()); // The subobjects point at them
       std::array<reshade::api::format, 8> override_formats = {};
@@ -1779,10 +1753,10 @@ namespace
          }
       }
       reshade::api::pipeline clone = {};
-      if (!cached_pipeline->device->create_pipeline({reinterpret_cast<uint64_t>(cached_pipeline->root_signature.get())}, cached_pipeline->subobject_count, subobjects.data(), &clone))
+      if (!cached_pipeline.device->create_pipeline({reinterpret_cast<uint64_t>(cached_pipeline.root_signature.get())}, cached_pipeline.subobject_count, subobjects.data(), &clone))
       {
          clone = {};
-         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the {} of pipeline {:x} through ReShade failed{}", kind, cached_pipeline->pipeline.handle, luma_cbuffers_hint()).c_str());
+         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the {} of pipeline {:x} through ReShade failed{}", kind, cached_pipeline.pipeline.handle, luma_cbuffers_hint()).c_str());
       }
       return clone;
    }
@@ -1845,13 +1819,13 @@ namespace
       if (is_clone)
       {
          const std::shared_lock lock_generic(s_mutex_generic);
-         const auto retired_clone = std::ranges::find(cached_pipeline.retired_clones, base, [](const CachedPipeline::RetiredClone& retired)
-            { return retired.clone.handle; });
          if (cached_pipeline.pipeline_clone.handle == base)
          {
             clone_code_hash = cached_pipeline.active_clone_code_hash;
          }
-         else if (retired_clone != cached_pipeline.retired_clones.end())
+         else if (const auto retired_clone = std::ranges::find(cached_pipeline.retired_clones, base, [](const CachedPipeline::RetiredClone& retired)
+                     { return retired.clone.handle; });
+            retired_clone != cached_pipeline.retired_clones.end())
          {
             clone_code_hash = retired_clone->code_hash;
          }
@@ -1872,9 +1846,8 @@ namespace
          }
          if (!clone_code_changed && accepted)
          {
-            // The pipeline is never const, the embedded root signature a clone's creation may write was made with the clone
             const std::span<const D3D12StageReplacement> variant_replacements = (game_variant ? game_variant->replacements : std::span<const D3D12StageReplacement>(replacements));
-            variant = CreateD3D12Clone(const_cast<CachedPipeline*>(&cached_pipeline), variant_replacements, &formats, (game_variant ? &game_variant->appended_render_target : nullptr));
+            variant = CreateD3D12Clone(cached_pipeline, variant_replacements, &formats, (game_variant ? &game_variant->appended_render_target : nullptr));
          }
       }
       if (clone_code_changed)
@@ -3219,6 +3192,61 @@ namespace
 #endif
    }
 
+   // What freeing cached pipelines leaves for the caller to release once it dropped the locks: calls into the device could deadlock if the game rendering is multithreaded
+   struct PipelineObjectsToRelease
+   {
+      std::vector<uint64_t> pipelines; // TODO: define a pointer size for ReShade handles, given they are just a pointer 64bit in x64 and 32bit in x32
+#if DX12
+      std::vector<com_ptr<ID3D12RootSignature>> root_signatures;
+#endif
+   };
+
+   // Frees a destroyed pipeline, which no thread can find anymore but through its clones: they and its variants go to "to_release". Needs "s_mutex_generic" locked
+   void FreeCachedPipeline(DeviceData& device_data, CachedPipeline* cached_pipeline, PipelineObjectsToRelease* to_release)
+   {
+      // Destroy our cloned subojects
+      DestroyPipelineSubojects(cached_pipeline->subobjects_cache, cached_pipeline->subobject_count);
+      cached_pipeline->subobjects_cache = nullptr;
+
+      // Destroy our cloned version of the pipeline (and leave the original intact, because the life time is not handled by us)
+      // Preserved patch clones (kept across unloads) can have "cloned == false"
+      // while still owning the object — destroy by handle presence.
+      if (cached_pipeline->cloned || cached_pipeline->pipeline_clone.handle != 0)
+      {
+         if (cached_pipeline->cloned)
+         {
+            cached_pipeline->cloned = false;
+            device_data.cloned_pipeline_count--;
+         }
+         to_release->pipelines.push_back(cached_pipeline->pipeline_clone.handle);
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(cached_pipeline->pipeline_clone.handle);
+         device_data.cloned_pipelines_changed = true;
+      }
+#if DX12
+      // The clones the DX12 path keeps besides "pipeline_clone": the active one (which "pipeline_clone" can mirror) and the retired ones
+      if (const uint64_t active_clone = cached_pipeline->active_clone.exchange(0); active_clone != 0 && active_clone != cached_pipeline->pipeline_clone.handle)
+      {
+         to_release->pipelines.push_back(active_clone);
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(active_clone);
+      }
+      for (const auto& retired_clone : cached_pipeline->retired_clones)
+      {
+         to_release->pipelines.push_back(retired_clone.clone.handle);
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(retired_clone.clone.handle);
+      }
+      // The render target format variants (never in "pipeline_cache_by_pipeline_clone_handle"), the failed ones have no pipeline
+      for (const auto& variant : cached_pipeline->variants)
+      {
+         if (variant.pipeline != 0)
+         {
+            to_release->pipelines.push_back(variant.pipeline);
+         }
+      }
+      to_release->root_signatures.push_back(std::move(cached_pipeline->root_signature));
+#endif
+      delete cached_pipeline;
+   }
+
    void LoadCustomShaders(DeviceData& device_data, const std::unordered_set<uint64_t>& pipelines_filter = std::unordered_set<uint64_t>(), bool recompile_shaders = true)
    {
 #if _DEBUG && LOG_VERBOSE
@@ -3230,11 +3258,13 @@ namespace
          CompileCustomShaders(&device_data, false, pipelines_filter);
       }
 
+#if DX11 // D3D12 pins the pipelines it clones instead (see "CachedPipeline::clone_pins"): its runtime destroys pipelines inside its final release, which can't wait for a clone's creation
       // Make sure the pipelines we read below stay alive (aren't removed/destroyed), even when "s_mutex_generic" is unlocked, hence we need to keep this locked for the whole time.
       // Note: this isn't entirely safe as we still call device functions while it's being locked, however, there should hopefully be no deadlocks,
       // as this is only used in a couple rare functions. if there were, we could either swap the lock order of this with the "s_mutex_generic" (delaying this below in the function),
       // and then caching a list of recently destroyed pipelines and skip them from being cloned at the end.
       std::shared_lock lock_pipeline_destroy(device_data.pipeline_cache_destruction_mutex);
+#endif
       // We can, and should, only lock this after compiling new shaders (above).
       // We keep this locked across the function to avoid pollution in pipelines from other threads while this is running.
       std::unique_lock lock(s_mutex_generic);
@@ -3340,6 +3370,14 @@ namespace
       }
 #endif
 
+#if DX12
+      // Alive until the clones are activated below, as "s_mutex_generic" is unlocked in between
+      for (CachedPipeline* cached_pipeline : pipelines_to_clone)
+      {
+         cached_pipeline->clone_pins++;
+      }
+#endif
+
       lock.unlock(); // Calls into the device could deadlock if the game rendering is multithreaded
 
       for (auto pair : pipelines_to_destroy)
@@ -3376,9 +3414,6 @@ namespace
 
           // Reset the clone provenance: it describes the clone we are about to create.
           cached_pipeline->clone_origin = Shader::CloneOrigin::None;
-
-          // Async-race note: the worker holds raw CachedPipeline* across the
-          // clone window; a concurrent OnDestroyPipeline can free the object.
 
 #if _DEBUG && LOG_VERBOSE
           {
@@ -3496,7 +3531,7 @@ namespace
          }
          if (pipeline_clone.handle == 0)
          {
-            pipeline_clone = CreateD3D12Clone(clone_source.cached_pipeline, clone_source.replacements);
+            pipeline_clone = CreateD3D12Clone(*clone_source.cached_pipeline, clone_source.replacements);
          }
          if (pipeline_clone.handle != 0)
          {
@@ -3505,6 +3540,9 @@ namespace
       }
 #endif
 
+#if DX12
+      PipelineObjectsToRelease to_release;
+#endif
       lock.lock(); // Needed for "pipeline_cache_by_pipeline_clone_handle"
 
       for (const auto& cloned_pipeline_data : cloned_pipelines_data)
@@ -3512,7 +3550,18 @@ namespace
          CachedPipeline* cached_pipeline = std::get<0>(cloned_pipeline_data);
          reshade::api::pipeline pipeline_clone = std::get<1>(cloned_pipeline_data);
 #if DX12
-         ActivateD3D12Clone(device_data, cached_pipeline, pipeline_clone, std::get<2>(cloned_pipeline_data));
+         if (cached_pipeline->destroyed)
+         {
+            // A reused retired clone is still in "retired_clones": the free below destroys it
+            if (std::ranges::find(cached_pipeline->retired_clones, pipeline_clone, &CachedPipeline::RetiredClone::clone) == cached_pipeline->retired_clones.end())
+            {
+               to_release.pipelines.push_back(pipeline_clone.handle);
+            }
+         }
+         else
+         {
+            ActivateD3D12Clone(device_data, cached_pipeline, pipeline_clone, std::get<2>(cloned_pipeline_data));
+         }
 #else
 
          assert(!cached_pipeline->cloned && cached_pipeline->pipeline_clone.handle == 0); // We destroy the potential previous one above in "UnloadCustomShaders"
@@ -3530,6 +3579,21 @@ namespace
          device_data.cloned_pipelines_changed = true;
 #endif // DX12
       }
+
+#if DX12
+      for (CachedPipeline* cached_pipeline : pipelines_to_clone)
+      {
+         if (--cached_pipeline->clone_pins == 0 && cached_pipeline->destroyed)
+         {
+            FreeCachedPipeline(device_data, cached_pipeline, &to_release);
+         }
+      }
+      lock.unlock();
+      for (const uint64_t pipeline_to_destroy : to_release.pipelines)
+      {
+         device_data.reshade_device->destroy_pipeline(reshade::api::pipeline{pipeline_to_destroy});
+      }
+#endif
    }
 
    void OnDisplayModeChanged()
@@ -5379,13 +5443,10 @@ namespace
          {
             switch (subobject.type)
             {
-#if GEOMETRY_SHADER_SUPPORT
+#if GEOMETRY_SHADER_SUPPORT || DX12
             case reshade::api::pipeline_subobject_type::geometry_shader:
-#endif // GEOMETRY_SHADER_SUPPORT
+#endif
 #if DX12 // Hashed and dumped for the frame capture, they can't be replaced yet
-#if !GEOMETRY_SHADER_SUPPORT
-            case reshade::api::pipeline_subobject_type::geometry_shader:
-#endif // !GEOMETRY_SHADER_SUPPORT
             case reshade::api::pipeline_subobject_type::hull_shader:
             case reshade::api::pipeline_subobject_type::domain_shader:
             case reshade::api::pipeline_subobject_type::amplification_shader:
@@ -5992,6 +6053,23 @@ namespace
          }
       }
 #endif // ENABLE_MINHOOK
+
+      // A pipeline whose shaders embed their root signature has no object for it, and the replacements of its clones (compiled from HLSL) don't carry it: made here from the
+      // game's shaders, before the pipeline is shared. A serialized root signature in the stream is its own. The variants of the original keep the shaders that embed it
+#if ENABLE_MINHOOK
+      const bool needs_root_signature = (layout.handle == 0 && !(cached_pipeline->capture && cached_pipeline->capture->Find<D3D12PsoCapture::SerializedRootSignatureDesc>(D3D12PsoCapture::SERIALIZED_ROOT_SIGNATURE)));
+#else
+      const bool needs_root_signature = (layout.handle == 0);
+#endif
+      for (uint32_t i = 0; needs_root_signature && i < subobject_count && !cached_pipeline->root_signature; ++i)
+      {
+         const auto* embedding_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects_cache[i].data);
+         // The device logs an error if asked to make a root signature from a shader that doesn't embed one (a "RTS0" chunk)
+         if (ToStreamShaderType(subobjects_cache[i].type) && Shader::FindChunk(embedding_shader_desc->code, embedding_shader_desc->code_size, "RTS0") != nullptr)
+         {
+            reinterpret_cast<ID3D12Device*>(device->get_native())->CreateRootSignature(0, embedding_shader_desc->code, embedding_shader_desc->code_size, IID_PPV_ARGS(&cached_pipeline->root_signature));
+         }
+      }
       // The render target formats the pipeline declares, which its variants replace: the stream's if there is one, else the subobject ReShade reports
       bool formats_from_stream = false;
 #if ENABLE_MINHOOK
@@ -6017,11 +6095,9 @@ namespace
             }
          }
       }
-#endif // DX12
 
-#if DX12
-      // The replacements of a D3D12 pipeline are created with it, as its clones are only bound from here on, and before it's shared with the other threads.
-      // Not through "LoadCustomShaders()": it holds locks across device calls that "OnDestroyPipeline()" needs, inside the runtime's final release of a pipeline.
+      // The replacements of a D3D12 pipeline are created with it, as its clones are only bound from here on, and before it's shared with the other threads (so it needs no pin,
+      // unlike in "LoadCustomShaders()")
       reshade::api::pipeline creation_clone = {};
       uint64_t creation_clone_code_hash = 0;
       if (auto_load && !last_pressed_unload && found_custom_shader_file)
@@ -6042,7 +6118,7 @@ namespace
          {
             cached_pipeline->clone_origin = Shader::CloneOrigin::File;
             creation_clone_code_hash = HashD3D12Replacements(replacements);
-            creation_clone = CreateD3D12Clone(cached_pipeline, replacements);
+            creation_clone = CreateD3D12Clone(*cached_pipeline, replacements);
          }
       }
 #endif // DX12
@@ -6193,12 +6269,11 @@ namespace
             device_data.pipelines_to_reload.erase(pipeline.handle);
          }
          
-         std::vector<uint64_t> pipelines_to_destroy; // TODO: define a pointer size for ReShade handles, given they are just a pointer 64bit in x64 and 32bit in x32
-#if DX12
-         com_ptr<ID3D12RootSignature> root_signature; // Declared before the locks, so it's released after them
-#endif
-         
+         PipelineObjectsToRelease to_release; // Declared before the locks, so the root signatures are released after them
+
+#if DX11 // D3D12 pins the pipelines "LoadCustomShaders()" clones instead (see "CachedPipeline::clone_pins")
          std::unique_lock lock_pipeline_destroy(device_data.pipeline_cache_destruction_mutex);
+#endif
          std::unique_lock lock(s_mutex_generic);
          if (auto pipeline_cache_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); pipeline_cache_pair != device_data.pipeline_cache_by_pipeline_handle.end())
          {
@@ -6215,54 +6290,19 @@ namespace
                   }
                }
 
-               // Destroy our cloned subojects
-               DestroyPipelineSubojects(cached_pipeline->subobjects_cache, cached_pipeline->subobject_count);
-               cached_pipeline->subobjects_cache = nullptr;
-#if DX12 && 0 // Redundant
-               cached_pipeline->subobject_count = 0;
-#endif
-
-               // Destroy our cloned version of the pipeline (and leave the original intact, because the life time is not handled by us)
-               // Preserved patch clones (kept across unloads) can have "cloned == false"
-               // while still owning the object — destroy by handle presence.
-               if (cached_pipeline->cloned || cached_pipeline->pipeline_clone.handle != 0)
-               {
-                  if (cached_pipeline->cloned)
-                  {
-                     cached_pipeline->cloned = false;
-                     device_data.cloned_pipeline_count--;
-                  }
-                  assert(cached_pipeline->device == device);
-                  pipelines_to_destroy.push_back(cached_pipeline->pipeline_clone.handle);
-                  device_data.pipeline_cache_by_pipeline_clone_handle.erase(cached_pipeline->pipeline_clone.handle);
-#if 0 // Redundant
-                  cached_pipeline->pipeline_clone.handled = 0;
-#endif
-                  device_data.cloned_pipelines_changed = true;
-               }
 #if DX12
-               // The clones the DX12 path keeps besides "pipeline_clone": the active one (which "pipeline_clone" can mirror) and the retired ones
-               if (const uint64_t active_clone = cached_pipeline->active_clone.exchange(0); active_clone != 0 && active_clone != cached_pipeline->pipeline_clone.handle)
+               if (cached_pipeline->clone_pins != 0)
                {
-                  pipelines_to_destroy.push_back(active_clone);
-                  device_data.pipeline_cache_by_pipeline_clone_handle.erase(active_clone);
+                  cached_pipeline->destroyed = true; // "LoadCustomShaders()" frees it
                }
-               for (const auto& retired_clone : cached_pipeline->retired_clones)
+               else
                {
-                  pipelines_to_destroy.push_back(retired_clone.clone.handle);
-                  device_data.pipeline_cache_by_pipeline_clone_handle.erase(retired_clone.clone.handle);
+                  FreeCachedPipeline(device_data, cached_pipeline, &to_release);
                }
-               // The render target format variants (never in "pipeline_cache_by_pipeline_clone_handle"), the failed ones have no pipeline
-               for (const auto& variant : cached_pipeline->variants)
-               {
-                  if (variant.pipeline != 0)
-                  {
-                     pipelines_to_destroy.push_back(variant.pipeline);
-                  }
-               }
-               root_signature = std::move(cached_pipeline->root_signature);
+#else
+               assert(cached_pipeline->device == device);
+               FreeCachedPipeline(device_data, cached_pipeline, &to_release);
 #endif
-               delete cached_pipeline;
                cached_pipeline = nullptr;
             }
 
@@ -6279,9 +6319,11 @@ namespace
 #endif
 
          lock.unlock(); // Calls into the device could deadlock if the game rendering is multithreaded
+#if DX11
          lock_pipeline_destroy.unlock(); // Unlock these two in reverse order!
+#endif
 
-         for (auto pipeline_to_destroy : pipelines_to_destroy)
+         for (auto pipeline_to_destroy : to_release.pipelines)
          {
             // For DX11, this simply releases the reference to a shader (or whatever else the pipeline contains)
             device->destroy_pipeline(reshade::api::pipeline{pipeline_to_destroy});
@@ -6341,9 +6383,10 @@ namespace
    void OnInitPipelineLayout(reshade::api::device* device, uint32_t param_count, const reshade::api::pipeline_layout_param* params, reshade::api::pipeline_layout layout)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
-      D3D12State::AddPipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout, param_count, params);
+      auto* const pipeline_layouts = &device->get_private_data<DeviceData>()->pipeline_layouts;
+      D3D12State::AddPipelineLayout(pipeline_layouts, layout, param_count, params);
 #if ENABLE_MINHOOK
-      D3D12State::AddStaticSamplers(&device->get_private_data<DeviceData>()->pipeline_layouts, layout, D3D12RootSignatures::pending_static_samplers);
+      D3D12State::AddStaticSamplers(pipeline_layouts, layout, D3D12RootSignatures::pending_static_samplers);
 #endif
    }
 #endif // DX12 && DEVELOPMENT
@@ -7873,10 +7916,8 @@ namespace
             cmd_list_data.is_known_ui_shader_bound = false;
          }
 
-#if !DX12 // They are always set all at once in DX12
          // These only depend on pixel shaders (no vertex etc)
          if ((stages & reshade::api::pipeline_stage::pixel_shader) != 0)
-#endif
          {
             cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
             if (cmd_list_data.pipeline_state_original_pixel_shader.handle != 0)

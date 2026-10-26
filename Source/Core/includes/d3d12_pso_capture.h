@@ -30,6 +30,7 @@
 #include <source/com_ptr.hpp>
 
 #include "minhook.h"
+#include "d3d12_resource_creation.h" // The hook helpers of "D3D12ProxyHook"
 
 namespace D3D12PsoCapture
 {
@@ -245,13 +246,7 @@ namespace D3D12PsoCapture
    // "ID3D12Device2::CreatePipelineState" follows IUnknown (3 methods), ID3D12Object (4), ID3D12Device (37) and ID3D12Device1 (3)
    constexpr size_t CREATE_PIPELINE_STATE_SLOT = 47;
 
-   struct Hook
-   {
-      void* target = nullptr;
-      CreatePipelineStateFunction original = nullptr;
-      // The target's start right after our hook went in: different later means another module hooked over it
-      std::array<uint8_t, 8> hooked_prologue = {};
-   };
+   using Hook = D3D12ProxyHook::HookedFunction<CreatePipelineStateFunction>;
    // The functions the devices' vtables lead "CreatePipelineState" to, each hooked once per process. Another device class has its own
    // (a debug layer's, another D3D12Core's), and so does a module that patches the runtime's vtable after we hooked the function in it.
    // Such a patch calls the function it replaced, so its creates are captured twice, the outer capture (the stream ReShade passed) last.
@@ -303,44 +298,17 @@ namespace D3D12PsoCapture
          return true;
       }
       const auto hook = std::ranges::find(hooks.slots, nullptr, &Hook::target);
-      if (hook == hooks.slots.end() || !InitializeMinHook() || MH_CreateHook(target, reinterpret_cast<void*>(DETOURS[hook - hooks.slots.begin()]), reinterpret_cast<void**>(&hook->original)) != MH_OK)
-      {
-         return false;
-      }
-      if (MH_EnableHook(target) != MH_OK)
-      {
-         MH_RemoveHook(target);
-         return false;
-      }
-      std::memcpy(hook->hooked_prologue.data(), target, hook->hooked_prologue.size());
-      hook->target = target;
-      return true;
+      return hook != hooks.slots.end() && D3D12ProxyHook::Attach(&*hook, target, DETOURS[hook - hooks.slots.begin()]);
    }
 
-   // Only Luma's hooks (see "includes/minhook.h"). False if another module hooked over one: Luma's then stays, as the other hook's
-   // trampoline jumps to its detour, and the addon is pinned like "Reflex::SleepHook::Remove()" does (too late if "DllMain" is unloading it)
+   // False if another module hooked over one (see "D3D12ProxyHook::Detach()")
    inline bool Remove()
    {
       const std::unique_lock lock(hooks.mutex);
       bool removed_all = true;
       for (Hook& hook : hooks.slots)
       {
-         if (!hook.target)
-         {
-            continue;
-         }
-         if (std::memcmp(hook.target, hook.hooked_prologue.data(), hook.hooked_prologue.size()) != 0)
-         {
-            removed_all = false;
-            continue;
-         }
-         MH_RemoveHook(hook.target);
-         hook.target = nullptr;
-      }
-      if (!removed_all)
-      {
-         HMODULE module = nullptr;
-         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(DETOURS[0]), &module);
+         removed_all &= D3D12ProxyHook::Detach(&hook);
       }
       return removed_all;
    }

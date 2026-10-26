@@ -443,12 +443,14 @@ namespace D3D12RootSignatures
       std::vector<std::byte> rewritten;
       LumaParams params;
       uint32_t parameter_count = 0;
-      std::vector<D3D12_STATIC_SAMPLER_DESC1> static_samplers;
-      const Skip skip = Rewrite({static_cast<const std::byte*>(blob), size}, hook.settings_register, hook.data_register, &rewritten, &params, &parameter_count, &static_samplers, std::span(hook.game_parameters).first(hook.game_parameter_count));
-      const bool injecting = !rewritten.empty(); // The CBVs, the upgraded static samplers or both
+      // Only the frame capture reads the static samplers ("pending_static_samplers" is empty here: it's cleared on the way out)
 #if DEVELOPMENT
-      pending_static_samplers = std::move(static_samplers);
+      std::vector<D3D12_STATIC_SAMPLER_DESC1>* const static_samplers = &pending_static_samplers;
+#else
+      constexpr std::vector<D3D12_STATIC_SAMPLER_DESC1>* static_samplers = nullptr;
 #endif
+      const Skip skip = Rewrite({static_cast<const std::byte*>(blob), size}, hook.settings_register, hook.data_register, &rewritten, &params, &parameter_count, static_samplers, std::span(hook.game_parameters).first(hook.game_parameter_count));
+      const bool injecting = !rewritten.empty(); // The CBVs, the upgraded static samplers or both
       if (skip != Skip::None && skip_logs[static_cast<size_t>(skip)].fetch_add(1) < MAX_LOGS)
       {
          hook.log(std::format("A root signature{} is left without Luma's constant buffers: {}", (parameter_count != 0 ? std::format(" (root parameters: {})", parameter_count) : std::string()), SKIP_NAMES[static_cast<size_t>(skip)]).c_str());

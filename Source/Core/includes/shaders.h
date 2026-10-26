@@ -124,6 +124,10 @@ namespace Shader
          reshade::api::pipeline clone = {};
       };
       std::vector<RetiredClone> retired_clones;
+      // The calls of "LoadCustomShaders()" creating clones of the pipeline without "s_mutex_generic" (device calls). A destroy meanwhile only unlinks it and sets "destroyed": the
+      // last unpin frees it (see "FreeCachedPipeline()"). Both under "s_mutex_generic"
+      uint32_t clone_pins = 0;
+      bool destroyed = false;
 
       // The render target formats the pipeline declares (the stream's if it was captured, else the subobject ReShade reports): D3D12 checks them against the render targets bound when it
       // draws, which the upgrades change. Its clones declare the same
