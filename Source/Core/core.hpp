@@ -3880,7 +3880,7 @@ namespace
 #endif // DX11
 
 #if ENABLE_SR
-      com_ptr<IDXGIAdapter> native_adapter; // Unused by DLSS, which is all D3D12 has
+      com_ptr<IDXGIAdapter> native_adapter; // Only DLSS's D3D11 feature requirements read it, D3D12 leaves it null
 #if DX11
       if (SUCCEEDED(hr))
       {
@@ -4280,6 +4280,29 @@ namespace
       D3D12Clones::OnDestroyDevice(native_device);
 #endif
       device_data.upload_ring.reset(); // The command lists that outlive the device's data keep the pool through their own pointer
+#if ENABLE_MINHOOK
+      // After the last device the proxy hooks go here, outside the loader lock, where "MinHook::Detach()" can still pin the addon if another module
+      // hooked over one. The next device installs them again ("OnInitDevice()"), "DllMain" removes whatever is left.
+      const bool last_device = []
+      {
+         const std::shared_lock lock(s_mutex_device);
+         return global_devices_data.empty();
+      }();
+      if (last_device)
+      {
+         bool removed_all = D3D12PsoCapture::Remove();
+         removed_all &= D3D12RootSignatures::Remove();
+         removed_all &= D3D12ResourceCreation::Remove();
+         removed_all &= D3D12Clones::Remove();
+#if DEVELOPMENT
+         removed_all &= D3D12CommandSignatures::Remove();
+#endif
+         if (!removed_all)
+         {
+            reshade::log::message(reshade::log::level::warning, "[D3D12 hooks] Another module hooked over one of Luma's device proxy hooks, so it stays and the addon stays loaded");
+         }
+      }
+#endif
 #endif
       device->destroy_private_data<DeviceData>();
    }
