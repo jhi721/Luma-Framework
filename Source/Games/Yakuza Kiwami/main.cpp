@@ -1914,7 +1914,7 @@ public:
    {
       const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
       const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
-      SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
+      SR::InstanceData* const sr_instance_data = LockSRForDraw(device_data).instance_data;
       const SceneWriter scene = scene_writer;
       if (state.in_render_pass || scene.resource == 0 || scene.present_count != present_count || state.render_target_views.empty() || state.render_target_views[0].resource == scene.resource || game_device_data->dlaa_claimed_present.exchange(present_count, std::memory_order_relaxed) == present_count)
       {
@@ -2082,6 +2082,7 @@ public:
       cmd_list->barrier(decoded_scene, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
 
       bool sr_drawn = false;
+      bool sr_switched = false;
       if (decoded)
       {
          // The inputs stay in a shader resource state (pixel and non pixel), which DLSS and FSR read; the output is in unordered access
@@ -2105,7 +2106,12 @@ public:
             .near_plane = float(camera.near_plane),
             .far_plane = float(camera.far_plane),
          };
-         sr_drawn = sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_list, settings_data) && sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_list, draw_data);
+         {
+            const SRDrawLock sr = LockSRForDraw(device_data);
+            // A present switched the SR since "sr_instance_data" was read: nothing is drawn this frame
+            sr_switched = sr.instance_data != sr_instance_data;
+            sr_drawn = !sr_switched && sr.implementation->UpdateSettings(sr.instance_data, native_list, settings_data) && sr.implementation->Draw(sr.instance_data, native_list, draw_data);
+         }
          // DLSS and FSR bind their own descriptor heaps, root signatures and pipelines
          D3D12State::RestoreCompute(cmd_list, state, {});
          RestoreGameGraphicsD3D12(cmd_list_data);
@@ -2115,7 +2121,7 @@ public:
             const std::unique_lock lock(game_device_data->color_pass.mutex);
             game_device_data->dlaa_output_recreated = false;
          }
-         else
+         else if (!sr_switched)
          {
             device_data.sr_suppressed = true;
             reshade::log::message(reshade::log::level::error, std::format("[DLAA] {} failed, so it's off until it's picked again", SR::GetTypeName(device_data.sr_type)).c_str());
