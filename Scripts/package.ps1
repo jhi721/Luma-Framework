@@ -92,13 +92,15 @@ $vcxproj = $vcxproj.FullName
 $useLumaFastNoise = Test-PropEnabled $vcxproj "UseLumaFastNoise"
 $useLumaDXP = Test-PropEnabled $vcxproj "UseLumaDXP"
 $useLumaNGX = Test-PropEnabled $vcxproj "UseLumaNGX"
+$useLumaFSR = Test-PropEnabled $vcxproj "UseLumaFSR"
+$useLumaXeSS = Test-PropEnabled $vcxproj "UseLumaXeSS"
 $useLumaSRBridge = Test-PropEnabled $vcxproj "UseLumaSRBridge"
 $useDgVoodoo = Test-PropEnabled $vcxproj "UseDgVoodoo"
 $useDgVoodooLinux = Test-PropEnabled $vcxproj "UseDgVoodooLinux"
 $useD3D9VAFix = Test-PropEnabled $vcxproj "UseD3D9VAFix"
 $useD3D9CSMT = Test-PropEnabled $vcxproj "UseD3D9CSMT"
 $isD3D12 = (Get-Content $vcxproj -Raw) -match "<LumaGraphicsAPI>\s*D3D12\s*</LumaGraphicsAPI>"
-Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT D3D12=$isD3D12"
+Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaFSR=$useLumaFSR UseLumaXeSS=$useLumaXeSS UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT D3D12=$isD3D12"
 if (($useDgVoodooLinux -or $useD3D9VAFix) -and -not $useDgVoodoo) {
     Write-Error "UseDgVoodooLinux and UseD3D9VAFix need UseDgVoodoo"
     exit 1
@@ -185,6 +187,28 @@ try {
         $ngxSrc = Join-Path $repoRoot "Source\External\NGX\bin\dev\nvngx_dlss.dll"
         if ($Config -notlike "Development*") { $ngxSrc = Join-Path $repoRoot "Source\External\NGX\bin\rel\nvngx_dlss.dll" }
         if (Test-Path $ngxSrc) { Copy-Item $ngxSrc -Destination $tempDir -Force }
+    }
+
+    # D3D12 FSR loads AMD's signed FidelityFX API dlls from the game folder (D3D11 FSR is linked statically)
+    if ($useLumaFSR -and $isD3D12) {
+        foreach ($ffxDll in @("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll")) {
+            $ffxSrc = Join-Path $repoRoot "Source\External\FidelityFX-API\signedbin\$ffxDll"
+            if (-not (Test-Path $ffxSrc)) {
+                Write-Error "$ffxDll not found: $ffxSrc"
+                exit 1
+            }
+            Copy-Item $ffxSrc -Destination $tempDir -Force
+        }
+    }
+
+    # D3D12 XeSS loads Intel's signed libxess.dll from the game folder
+    if ($useLumaXeSS -and $isD3D12) {
+        $xessSrc = Join-Path $repoRoot "Source\External\XeSS\bin\libxess.dll"
+        if (-not (Test-Path $xessSrc)) {
+            Write-Error "libxess.dll not found: $xessSrc"
+            exit 1
+        }
+        Copy-Item $xessSrc -Destination $tempDir -Force
     }
 
     # Addon at the zip root, under the canonical Luma-<Project>.addon name

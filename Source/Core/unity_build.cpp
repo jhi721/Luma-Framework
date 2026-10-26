@@ -8,4 +8,5 @@
 
 #include "dlss/DLSS.cpp"
 #include "fsr/FSR.cpp"
+#include "xess/XeSS.cpp"
 #include "sr_bridge/SRBridge.cpp"

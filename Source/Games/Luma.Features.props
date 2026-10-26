@@ -4,6 +4,8 @@
     <UseLumaDXP Condition="'$(UseLumaDXP)'==''">false</UseLumaDXP>
     <UseLumaNGX Condition="'$(UseLumaNGX)'==''">false</UseLumaNGX>
     <UseLumaFSR Condition="'$(UseLumaFSR)'==''">false</UseLumaFSR>
+    <!-- D3D12 only: Intel's signed libxess.dll, loaded at runtime (nothing to link) -->
+    <UseLumaXeSS Condition="'$(UseLumaXeSS)'==''">false</UseLumaXeSS>
     <UseLumaFastNoise Condition="'$(UseLumaFastNoise)'==''">false</UseLumaFastNoise>
     <!-- 32-bit games: DLSS and FSR through the x64 "SR Bridge Helper" (Source/Core/sr_bridge); package.ps1 ships it and DLSS's dll. -->
     <UseLumaSRBridge Condition="'$(UseLumaSRBridge)'==''">false</UseLumaSRBridge>
@@ -34,10 +36,15 @@
     <LumaNGXRuntimePath Condition="'$(Configuration)'!='Development-Debug' and '$(Configuration)'!='Development-Release'">$(LumaNGXRoot)\bin\rel\nvngx_dlss.dll</LumaNGXRuntimePath>
   </PropertyGroup>
 
-  <PropertyGroup Condition="'$(UseLumaFSR)'=='true'">
+  <PropertyGroup Condition="'$(UseLumaFSR)'=='true' and '$(LumaGraphicsAPI)'!='D3D12'">
     <LumaFSRRoot>$(MSBuildThisFileDirectory)..\External\FidelityFX</LumaFSRRoot>
     <LumaFSRLibSuffix Condition="'$(Configuration)'=='Development-Debug'">d</LumaFSRLibSuffix>
     <LumaFSRLibSuffix Condition="'$(Configuration)'!='Development-Debug'"></LumaFSRLibSuffix>
+  </PropertyGroup>
+  <!-- D3D12: the FidelityFX API (FSR 4, and FSR 3.1 where FSR 4 isn't supported) from AMD's signed dlls, loaded at runtime (nothing to link) -->
+  <PropertyGroup Condition="'$(UseLumaFSR)'=='true' and '$(LumaGraphicsAPI)'=='D3D12'">
+    <LumaFSRRoot>$(MSBuildThisFileDirectory)..\External\FidelityFX-API</LumaFSRRoot>
+    <LumaFSRRuntimeDir>$(LumaFSRRoot)\signedbin</LumaFSRRuntimeDir>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(UseLumaNVAPI)'=='true'">
@@ -74,6 +81,10 @@
       <AdditionalIncludeDirectories>$(LumaFSRRoot);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_FIDELITY_SK=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ClCompile Condition="'$(UseLumaXeSS)'=='true' and '$(LumaGraphicsAPI)'=='D3D12'">
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\External\XeSS\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_XESS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Condition="'$(UseLumaSRBridge)'=='true'">
       <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_SR_BRIDGE=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
@@ -91,7 +102,7 @@
       <AdditionalLibraryDirectories>$(LumaNGXRoot)\libs;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>$(LumaNGXLibName);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-    <Link Condition="'$(UseLumaFSR)'=='true'">
+    <Link Condition="'$(UseLumaFSR)'=='true' and '$(LumaGraphicsAPI)'!='D3D12'">
       <AdditionalLibraryDirectories>$(LumaFSRRoot)\libs;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>ffx_backend_dx11_x64$(LumaFSRLibSuffix).lib;ffx_fsr3_x64$(LumaFSRLibSuffix).lib;ffx_frameinterpolation_x64$(LumaFSRLibSuffix).lib;ffx_fsr3upscaler_x64$(LumaFSRLibSuffix).lib;ffx_opticalflow_x64$(LumaFSRLibSuffix).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
@@ -114,6 +125,14 @@
 
   <Target Name="LumaCopyNgxRuntime" AfterTargets="Build" Condition="'$(UseLumaNGX)'=='true' and Exists('$(LumaNGXRuntimePath)') and Exists('$(TargetDir)')">
     <Copy SourceFiles="$(LumaNGXRuntimePath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="LumaCopyFsrRuntime" AfterTargets="Build" Condition="'$(LumaFSRRuntimeDir)'!='' and Exists('$(TargetDir)')">
+    <Copy SourceFiles="$(LumaFSRRuntimeDir)\amd_fidelityfx_loader_dx12.dll;$(LumaFSRRuntimeDir)\amd_fidelityfx_upscaler_dx12.dll" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="LumaCopyXeSSRuntime" AfterTargets="Build" Condition="'$(UseLumaXeSS)'=='true' and '$(LumaGraphicsAPI)'=='D3D12' and Exists('$(TargetDir)')">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\External\XeSS\bin\libxess.dll" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
 
   <Target Name="LumaCopyDxpRuntime" AfterTargets="Build" Condition="false" />

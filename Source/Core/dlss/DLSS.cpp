@@ -60,15 +60,7 @@ namespace NGX
 		// Set by a successful draw into a new output ("DrawData::output_recreated")
 		mutable bool										recreate_feature = false;
 #if DX12
-		// D3D12 command lists that evaluated a replaced feature can still be running, so it's released a few "UpdateSettings()" (frames) later.
-		// ponytail: a feature replaced right before DLSS is turned off waits for the next "UpdateSettings()" or the shutdown.
-		struct RetiredFeature
-		{
-			DLSSInternalInstance instance;
-			uint64_t settings_update = 0;
-		};
-		std::vector<RetiredFeature> retired_features;
-		uint64_t settings_updates = 0;
+		SR::DeferredReleases<DLSSInternalInstance> retired_features;
 #endif
 
 		virtual ~DLSSInstanceData()
@@ -118,28 +110,12 @@ namespace NGX
 		void ReleaseSuperSamplingFeature()
 		{
 #if DX12
-			retired_features.push_back({.instance = instance, .settings_update = settings_updates});
+			retired_features.Push(instance);
 #else
 			ReleaseFeature(instance);
 #endif
 			instance = {};
 		}
-
-#if DX12
-		void ReleaseRetiredFeatures()
-		{
-			// A swapchain has up to 3 frames in flight
-			std::erase_if(retired_features, [this](const RetiredFeature& retired)
-			{
-				if (settings_updates - retired.settings_update <= 3)
-				{
-					return false;
-				}
-				ReleaseFeature(retired.instance);
-				return true;
-			});
-		}
-#endif
 
 		// Based on "settings_data" 
 		DLSSInternalInstance CreateSuperSamplingFeature(SR::CommandList* command_list, int quality_value)
@@ -366,8 +342,7 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, SR::CommandList* command_
 		return false;
 
 #if DX12
-	custom_data->settings_updates++;
-	custom_data->ReleaseRetiredFeatures();
+	custom_data->retired_features.Release([&](DLSSInternalInstance* retired) { custom_data->ReleaseFeature(*retired); });
 	constexpr bool same_command_list = true;
 #else
 #ifndef NDEBUG

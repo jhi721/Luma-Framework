@@ -131,6 +131,10 @@ using NativeCommandList = ID3D11DeviceContext;
 #ifndef ENABLE_FIDELITY_SK
 #define ENABLE_FIDELITY_SK 0
 #endif // ENABLE_FIDELITY_SK
+// 64x D3D12 only
+#ifndef ENABLE_XESS
+#define ENABLE_XESS 0
+#endif // ENABLE_XESS
 // 32-bit only: DLSS and FSR through an x64 helper process (see "SRBridge.h")
 #ifndef ENABLE_SR_BRIDGE
 #define ENABLE_SR_BRIDGE 0
@@ -143,7 +147,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #ifdef ENABLE_SR
 #undef ENABLE_SR
 #endif // ENABLE_SR
-#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_LUMA_TAA
+#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || ENABLE_XESS || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_LUMA_TAA
 #define ENABLE_SR 1
 #else
 #define ENABLE_SR 0
@@ -205,9 +209,8 @@ using NativeCommandList = ID3D11DeviceContext;
 
 #if !DX12
 #define DX11 1
-#elif ENABLE_FIDELITY_SK || ENABLE_LUMA_TAA
-// Only DLSS (NGX) has a D3D12 path so far
-#error "FSR and Luma TAA are D3D11 only"
+#elif ENABLE_LUMA_TAA
+#error "Luma TAA is D3D11 only"
 #endif
 // Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom, the texture copy conversion) and the viewports they scale for clones of other sizes:
 // release builds track the graphics state they replace too, to bind it again after them (see "D3D12State::RestoreGraphics()"). On for every D3D12 build, as the copy conversion and
@@ -246,6 +249,7 @@ using NativeCommandList = ID3D11DeviceContext;
 
 #include "dlss/DLSS.h" // see "ENABLE_NGX"
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
+#include "xess/XeSS.h" // see "ENABLE_XESS"
 #include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
 #include "includes/reflex.h" // see "ENABLE_REFLEX"
 #if ENABLE_MINHOOK
@@ -3562,7 +3566,7 @@ namespace
       return true;
 #endif
 
-#if ENABLE_FIDELITY_SK
+#if ENABLE_FIDELITY_SK && DX11
       // Required by FSR 3 on DX11. Also goes to determine whether we have to use D3D11_1_UAV_SLOT_COUNT or (the older) D3D11_PS_CS_UAV_REGISTER_COUNT.
       // This is usually fully retro compatible with all games.
       if (api_version == D3D_FEATURE_LEVEL_11_0)
@@ -20538,6 +20542,7 @@ namespace
             const std::unique_lock lock_reshade(s_mutex_reshade); // Lock the entire scope for extra safety, though we are mainly only interested in keeping "cb_luma_global_settings" safe
 
 #if ENABLE_SR
+            std::string selected_sr_name;
             const char* selected_sr_user_type = nullptr;
             switch (sr_user_type)
             {
@@ -20547,13 +20552,22 @@ namespace
                selected_sr_user_type = "Auto"; break;
             case SR::UserType::DLSS:
                selected_sr_user_type = "DLSS"; break;
-            case SR::UserType::FSR_3:
-               selected_sr_user_type = "FSR 3"; break;
+            case SR::UserType::FSR:
+               selected_sr_user_type = "FSR"; break;
             case SR::UserType::LumaTAA:
                selected_sr_user_type = "Luma TAA"; break;
+            case SR::UserType::XeSS:
+               selected_sr_user_type = "XeSS"; break;
             }
 
             SR::Type sr_type = device_data.sr_type;
+            // The running version, when the implementation knows it (e.g. "FSR (4.1.1)": FSR 4 where the GPU supports it on D3D12, 3.1 elsewhere)
+            if (const SR::InstanceData* sr_instance_data = device_data.GetSRInstanceData();
+                sr_instance_data && sr_instance_data->version_name && sr_user_type != SR::UserType::None)
+            {
+               selected_sr_name = std::format("{} ({})", selected_sr_user_type, sr_instance_data->version_name);
+               selected_sr_user_type = selected_sr_name.c_str();
+            }
 
             const SR::Type sr_auto_type = GetSRAutoType(device_data);
 
@@ -20590,7 +20604,10 @@ namespace
                if (always_show_auto_sr || sr_auto_type != SR::Type::None)
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
-               AddComboItem("FSR 3", SR::UserType::FSR_3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+               AddComboItem("FSR", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+#if ENABLE_XESS // D3D12 only
+               AddComboItem("XeSS", SR::UserType::XeSS, SR::Type::XeSS, device_data.sr_implementations_instances.contains(SR::Type::XeSS));
+#endif
 #if ENABLE_LUMA_TAA // Only in games that enable it, rather than as an always disabled item
                AddComboItem("Luma TAA", SR::UserType::LumaTAA, SR::Type::LumaTAA, device_data.sr_implementations_instances.contains(SR::Type::LumaTAA));
 #endif
@@ -22577,6 +22594,9 @@ void Init(bool async)
 #endif
 #if ENABLE_FIDELITY_SK
    sr_implementations[SR::Type::FSR] = std::make_unique<FidelityFX::FSR>();
+#endif
+#if ENABLE_XESS
+   sr_implementations[SR::Type::XeSS] = std::make_unique<Intel::XeSS>();
 #endif
 #if ENABLE_SR_BRIDGE
    sr_implementations[SR::Type::DLSS] = std::make_unique<SRBridge::Bridge>(SR::Type::DLSS);

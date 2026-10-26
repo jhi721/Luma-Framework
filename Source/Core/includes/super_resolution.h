@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cfloat>
+#include <cstdint>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -14,7 +16,7 @@ struct IDXGIAdapter;
 
 namespace SR
 {
-	// The objects of the API the mod is built for (only DLSS has a D3D12 path so far)
+	// The objects of the API the mod is built for (DLSS, FSR and XeSS have a D3D12 path)
 #if DX12
 	using Device = ID3D12Device;
 	using CommandList = ID3D12GraphicsCommandList;
@@ -31,8 +33,9 @@ namespace SR
 		None,
 		Auto,
 		DLSS,
-		FSR_3,
+		FSR, // FSR 3 on D3D11, FSR 4 or 3.1 on D3D12
 		LumaTAA,
+		XeSS, // D3D12 only
 	};
 
 	// Put these in order of preference (most preferred first). For automatic selection.
@@ -41,6 +44,7 @@ namespace SR
 		DLSS,
 		FSR,
 		LumaTAA,
+		XeSS, // After the others, as the shaders' "SRType" (type + 1) values are fixed
 		None = -1
 	};
 
@@ -54,10 +58,12 @@ namespace SR
 			return true; // Always accept it for now, given that it's the first one we find compatible
 		case SR::UserType::DLSS:
 			return type == Type::DLSS;
-		case SR::UserType::FSR_3:
+		case SR::UserType::FSR:
 			return type == Type::FSR;
 		case SR::UserType::LumaTAA:
 			return type == Type::LumaTAA;
+		case SR::UserType::XeSS:
+			return type == Type::XeSS;
 		}
 		return false;
 	}
@@ -72,6 +78,8 @@ namespace SR
 			return "FSR";
 		case Type::LumaTAA:
 			return "Luma TAA";
+		case Type::XeSS:
+			return "XeSS";
 		case Type::None:
 			break;
 		}
@@ -152,6 +160,48 @@ namespace SR
 		return camera;
 	}
 
+	// D3D12 command lists that used a replaced upscaler object (DLSS feature, FSR context) can still be running, so it's released a few
+	// "UpdateSettings()" (frames) later.
+	// ponytail: an object replaced right before its upscaler is turned off waits for the next "UpdateSettings()" or the shutdown.
+	template <typename T>
+	struct DeferredReleases
+	{
+		struct Entry
+		{
+			T object;
+			uint64_t update = 0;
+		};
+		std::vector<Entry> entries;
+		uint64_t updates = 0;
+
+		void Push(const T& object) { entries.push_back({.object = object, .update = updates}); }
+		// Once per "UpdateSettings()": releases what the swapchain's up to 3 frames in flight can't use anymore
+		template <typename F>
+		void Release(F&& release)
+		{
+			updates++;
+			std::erase_if(entries, [&](Entry& entry)
+			{
+				if (updates - entry.update <= 3)
+				{
+					return false;
+				}
+				release(&entry.object);
+				return true;
+			});
+		}
+		// At the shutdown
+		template <typename F>
+		void ReleaseAll(F&& release)
+		{
+			for (Entry& entry : entries)
+			{
+				release(&entry.object);
+			}
+			entries.clear();
+		}
+	};
+
 	struct SettingsData
 	{
 		unsigned int output_width = 1;
@@ -214,6 +264,8 @@ namespace SR
 		bool							requires_unordered_access_output_texture = true;
 		bool							automatically_restores_pipeline_state = false;
 		unsigned int				min_resolution = 1; // Min width or height
+		// The version the runtime picked (e.g. FSR 4 or 3.1 on D3D12), for display. Owned by the implementation's dll, nullptr if unknown.
+		const char*					version_name = nullptr;
 
 		SettingsData				settings_data = {};
 
@@ -253,8 +305,8 @@ namespace SR
 			// created again after a draw (DLSS-Best-Practices OUT-4): a successful draw with this set recreates it at the next "UpdateSettings()".
 			bool output_recreated = false;
 
-			// On D3D12 the caller puts the inputs in "D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE" and the output in
-			// "D3D12_RESOURCE_STATE_UNORDERED_ACCESS" (NGX's expectation), and binds its own state back after "Draw()" (see "NeedsStateRestoration()").
+			// On D3D12 the caller puts the inputs in "D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE" and the output
+			// in "D3D12_RESOURCE_STATE_UNORDERED_ACCESS" (implementations leave them in these states), and binds its own state back after "Draw()" (see "NeedsStateRestoration()").
 			Resource* output_color = nullptr;
 			Resource* source_color = nullptr;
 			Resource* motion_vectors = nullptr;
@@ -292,8 +344,8 @@ namespace SR
 
 		// Returns the suggested mip lod bias for the current resolution scale.
 		// This assumes the jitter phases are increased with lower resolution scales.
-		// -1 at native resolution as we'd still be running TAA.
-		static float GetMipLODBias(const SR::InstanceData* data)
+		// -1 at native resolution as we'd still be running TAA (DLSS and FSR's guides).
+		virtual float GetMipLODBias(const SR::InstanceData* data) const
 		{
 			return SR::GetMipLODBias(data->settings_data.render_height, data->settings_data.output_height);
 		}

@@ -1050,7 +1050,7 @@ public:
       g_render_aa_option = render_aa_option;
       g_jitter_phases = jitter_phases;
       // SR resolves more texture detail: -1 mip bias at native resolution
-      SetTextureMipLodBias(nullptr, device_data, (sr_drew_last_frame ? SR::SuperResolutionImpl::GetMipLODBias(sr_instance_data) : 0.f));
+      SetTextureMipLodBias(nullptr, device_data, (sr_drew_last_frame ? sr_implementations[device_data.sr_type]->GetMipLODBias(sr_instance_data) : 0.f));
    }
 
    void CleanExtraSRResources(DeviceData& device_data) override
