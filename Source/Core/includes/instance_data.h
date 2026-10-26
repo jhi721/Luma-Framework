@@ -904,14 +904,20 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       DXGI_FORMAT pipeline_format = DXGI_FORMAT_UNKNOWN;
       uint32_t pipeline_generation = 0;
       bool pipeline_compute = false; // Made for a compute shader (see "PrepareD3D12NativePass()")
-      std::vector<com_ptr<IUnknown>> retired; // What it replaced, which the GPU can still use: the next frame it submits keeps it alive
-      CommandListData cmd_list_data;          // Owns the memory of its root CBVs (root parameters 0 and 1), for "SetLumaConstantBuffers()"
+      CommandListData cmd_list_data; // Owns the memory of its root CBVs (root parameters 0 and 1), for "SetLumaConstantBuffers()"
+      // Each of these failures is logged once per pass
+      std::atomic_flag logged_no_passes;
+      std::atomic_flag logged_no_frame;
+      std::atomic_flag logged_no_submit;
    };
    // The display composition (see "DrawDisplayCompositionD3D12()")
    struct DisplayCompositionD3D12 : NativePassD3D12
    {
       com_ptr<ID3D12Resource> source;    // A copy of the back buffer, which the shader reads while it writes the back buffer
       uint32_t drawn_frame = UINT32_MAX; // The "FrameIndex" of the last present it drew in, for the dev MCP
+      // The compute shader loads the back buffer it writes (a typed UAV load): the last format checked for it, and whether it supports it
+      DXGI_FORMAT typed_load_format = DXGI_FORMAT_UNKNOWN;
+      bool typed_load = false;
    } display_composition;
    // The encode of the scRGB proxy into the real back buffer (see "DrawSwapchainEncodeD3D12()")
    NativePassD3D12 swapchain_encode;
@@ -925,7 +931,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
       std::vector<reshade::api::descriptor_table> tables;                   // Of ReShade's GPU heap, by present, by draw in it and by table of the draw
       std::unordered_map<uint64_t, com_ptr<ID3D12PipelineState>> pipelines; // By pixel shader hash and render target format, of the natives of "pipelines_generation"
       uint32_t pipelines_generation = 0;
-      std::vector<com_ptr<ID3D12PipelineState>> retired; // Of older natives: a game list recorded with them may still run, so they live as long as the device
+      std::vector<std::pair<uint64_t, com_ptr<ID3D12PipelineState>>> retired; // Of older natives, with the present count they were replaced at: a game list recorded with them may still run (see "DestroyRetiredD3D12GamePassResources()")
       uint64_t frame = UINT64_MAX;                        // The present count of the last draw, and the draws since it
       uint32_t frame_draws = 0;
       bool failed = false;                                                        // ReShade refused the layout or the tables, which isn't tried again

@@ -17,7 +17,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
@@ -57,53 +56,10 @@ namespace D3D12ProxyHook
       return (proxy ? *reinterpret_cast<void***>(proxy) : nullptr);
    }
 
-   // A function of the proxy hooked with MinHook. The owner locks around "Attach()" and "Detach()", the detour reads the rest without it as it only runs between them.
-   template <typename Function>
-   struct HookedFunction
-   {
-      void* target = nullptr;      // The function the hook went on, null if there is none
-      Function original = nullptr; // The trampoline: the target as it was before the hook
-      // The target's start right after our hook went in: different later means another module hooked over it
-      std::array<uint8_t, 8> hooked_prologue = {};
-   };
-
-   // False if MinHook failed
-   template <typename Function>
-   bool Attach(HookedFunction<Function>* hooked, void* target, Function detour)
-   {
-      if (!InitializeMinHook() || MH_CreateHook(target, reinterpret_cast<void*>(detour), reinterpret_cast<void**>(&hooked->original)) != MH_OK)
-      {
-         return false;
-      }
-      if (MH_EnableHook(target) != MH_OK)
-      {
-         MH_RemoveHook(target);
-         return false;
-      }
-      std::memcpy(hooked->hooked_prologue.data(), target, hooked->hooked_prologue.size());
-      hooked->target = target;
-      return true;
-   }
-
-   // Only Luma's hook (see "includes/minhook.h"). False if another module hooked over it: Luma's then stays, as the other hook's
-   // trampoline jumps to our detour, and the addon is pinned like "Reflex::SleepHook::Remove()" does (too late if "DllMain" is unloading it)
-   template <typename Function>
-   bool Detach(HookedFunction<Function>* hooked)
-   {
-      if (!hooked->target)
-      {
-         return true;
-      }
-      if (std::memcmp(hooked->target, hooked->hooked_prologue.data(), hooked->hooked_prologue.size()) != 0)
-      {
-         HMODULE module = nullptr;
-         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&FindProxyVtable), &module);
-         return false;
-      }
-      MH_RemoveHook(hooked->target);
-      hooked->target = nullptr;
-      return true;
-   }
+   // The proxy's functions are hooked through "includes/minhook.h"
+   using MinHook::Attach;
+   using MinHook::Detach;
+   using MinHook::HookedFunction;
 } // namespace D3D12ProxyHook
 
 namespace D3D12ResourceCreation

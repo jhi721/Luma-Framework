@@ -5,11 +5,9 @@
 // The markers are only an approximation of the game's frame (simulation and render submission span the whole CPU frame),
 // so they aren't used for driver optimizations ("bUseMarkersToOptimize").
 #if ENABLE_REFLEX
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstring>
 #include <mutex>
 #include <random>
 #include <shared_mutex>
@@ -193,10 +191,7 @@ namespace Reflex
       {
          std::shared_mutex mutex;
          uint32_t users = 0;
-         void* target = nullptr;
-         SleepFunction original = nullptr;
-         // The target's start right after Luma's hook went in: different later means another module hooked over Luma's
-         std::array<uint8_t, 8> hooked_prologue = {};
+         MinHook::HookedFunction<SleepFunction> sleep;
       };
       Hook hook;
       thread_local bool luma_sleeping = false;
@@ -210,50 +205,31 @@ namespace Reflex
          {
             other_sleeps++;
          }
-         return hook.original(device);
+         return hook.sleep.original(device);
       }
 
       // True if the hook is in, the caller then being one of its users
       bool Install()
       {
          const std::lock_guard lock(hook.mutex);
-         if (!hook.target)
+         if (!hook.sleep.target)
          {
             using QueryInterfaceFunction = void*(__cdecl*)(NvU32);
             const HMODULE nvapi = GetModuleHandleW(sizeof(void*) == 8 ? L"nvapi64.dll" : L"nvapi.dll");
             const auto query_interface = nvapi ? reinterpret_cast<QueryInterfaceFunction>(GetProcAddress(nvapi, "nvapi_QueryInterface")) : nullptr;
             void* const sleep = query_interface ? query_interface(sleep_interface_id) : nullptr;
-            if (!sleep || !InitializeMinHook() || MH_CreateHook(sleep, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&hook.original)) != MH_OK)
+            if (!sleep || !MinHook::Attach(&hook.sleep, sleep, &Detour))
                return false;
-            if (MH_EnableHook(sleep) != MH_OK)
-            {
-               MH_RemoveHook(sleep);
-               return false;
-            }
-            std::memcpy(hook.hooked_prologue.data(), sleep, hook.hooked_prologue.size());
-            hook.target = sleep;
          }
          hook.users++;
          return true;
       }
 
-      // For each successful "Install()". False if the last user's hook had to stay: another module hooked over it, so its trampoline
-      // jumps to "Detour", and the addon is pinned to keep that code loaded. ponytail: a pinned addon isn't initialized again if
-      // ReShade reloads it in the same process.
+      // For each successful "Install()". False if the last user's hook had to stay (see "MinHook::Detach()").
       bool Remove()
       {
          const std::lock_guard lock(hook.mutex);
-         if (--hook.users != 0)
-            return true;
-         if (std::memcmp(hook.target, hook.hooked_prologue.data(), hook.hooked_prologue.size()) != 0)
-         {
-            HMODULE module = nullptr;
-            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&Detour), &module);
-            return false;
-         }
-         MH_RemoveHook(hook.target);
-         hook.target = nullptr;
-         return true;
+         return --hook.users != 0 || MinHook::Detach(&hook.sleep);
       }
    } // namespace SleepHook
 

@@ -16,15 +16,14 @@
 // RTV of a CPU heap, written by the caller (CreateShaderResourceView and the like) at the handles "Begin()" returns. The heap starts
 // uninitialized: write every descriptor a root signature's table declares (a null view where the pass doesn't read it). The list comes
 // with that heap set and no other state: root signature, pipeline, viewport, scissor, render target, topology and root arguments are the
-// pass's. What the commands use and the caller may release before the GPU ran them goes to "KeepAlive()".
+// pass's. What the caller replaces while the GPU may still use it goes to "Retire()".
 //
 // Threading: one present thread per context, and the caller serializes every call. The queue is the same one every time (the context's
 // fence is signaled on it, in order).
 //
-// Call order: "Create()" per device; at each present "Begin()", the recording on its list, "KeepAlive()" as needed, "Submit()";
+// Call order: "Create()" per device; at each present "Begin()", the recording on its list, "Submit()" ("Retire()" anywhere in between);
 // "Destroy()" at device teardown.
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -64,6 +63,7 @@ namespace D3D12Passes
       com_ptr<ID3D12DescriptorHeap> rtv_heap;
       uint32_t srv_increment = 0;
       uint32_t rtv_increment = 0;
+      std::vector<com_ptr<IUnknown>> retired; // See "Retire()"
    };
 
    // What "Begin()" hands out, until "Submit()"
@@ -148,11 +148,14 @@ namespace D3D12Passes
       };
    }
 
-   // The current frame holds a reference to "object" until it is reused, which is after the GPU ran its list. Between "Begin()" and "Submit()".
-   inline void KeepAlive(Context* context, IUnknown* object)
+   // "object" (if any) may still be used by the lists already submitted: the next frame "Submit()" takes holds a reference to it until it is
+   // reused, which is after the GPU ran that frame's list. After "Create()".
+   inline void Retire(Context* context, IUnknown* object)
    {
-      assert(context->current);
-      context->frames[*context->current].keep_alive.emplace_back(object);
+      if (object)
+      {
+         context->retired.emplace_back(object);
+      }
    }
 
    // Closes the recording, executes it on "queue" and signals the context's fence behind it. False if there was none or its list failed to
@@ -164,9 +167,10 @@ namespace D3D12Passes
          return false;
       }
       Frame& frame = context->frames[*std::exchange(context->current, std::nullopt)];
+      frame.keep_alive = std::exchange(context->retired, {});
       if (FAILED(context->list->Close()))
       {
-         // What it keeps alive (e.g. the objects "KeepAlive()" took from an earlier frame) may still be used by the lists already submitted
+         // What it keeps alive (what was retired from earlier frames) may still be used by the lists already submitted
          frame.fence_value = context->last_signaled;
          return false;
       }
