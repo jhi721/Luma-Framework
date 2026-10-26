@@ -153,7 +153,12 @@ public:
       int chain_upgrades = int(enable_chain_indirect_texture_format_upgrades);
       if (reshade::get_config_value(nullptr, NAME_ADVANCED_SETTINGS.c_str(), "ChainTextureUpgrades", chain_upgrades))
       {
-         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType(std::clamp(chain_upgrades, 0, int(ChainTextureFormatUpgradesType::DirectAndIndirectDependencies)));
+         // D3D12 only promotes the direct dependencies (the copy destinations of upgraded textures)
+         if (chain_upgrades > int(ChainTextureFormatUpgradesType::DirectDependencies))
+         {
+            reshade::log::message(reshade::log::level::warning, "[Texture upgrades] ChainTextureUpgrades: D3D12 only implements the direct dependencies (1), 2 is lowered to 1");
+         }
+         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType(std::clamp(chain_upgrades, 0, int(ChainTextureFormatUpgradesType::DirectDependencies)));
       }
       if (enable_indirect_texture_format_upgrades || enable_chain_indirect_texture_format_upgrades != ChainTextureFormatUpgradesType::None)
       {
@@ -298,7 +303,10 @@ public:
          com_ptr<ID3D11Resource> target_resource;
          target->GetResource(&target_resource);
          com_ptr<ID3D11Texture2D> target_texture;
-         target_resource->QueryInterface(&target_texture);
+         if (FAILED(target_resource->QueryInterface(&target_texture)))
+         {
+            return DrawOrDispatchOverrideType::None;
+         }
          D3D11_TEXTURE2D_DESC target_desc;
          target_texture->GetDesc(&target_desc);
          if (test_pass == TestPass::Bloom)
@@ -306,8 +314,16 @@ public:
             static constexpr float sigmas[] = {2.f, 2.f, 2.f};
             com_ptr<ID3D11ShaderResourceView> karis_average;
             DrawKarisAverage(native_device, native_device_context, device_data, source.get(), &karis_average);
+            if (!karis_average)
+            {
+               return DrawOrDispatchOverrideType::None;
+            }
             com_ptr<ID3D11ShaderResourceView> bloom;
             DrawBloom(native_device, native_device_context, device_data, karis_average.get(), int(std::size(sigmas)), sigmas, &bloom);
+            if (!bloom)
+            {
+               return DrawOrDispatchOverrideType::None;
+            }
             com_ptr<ID3D11Resource> bloom_resource;
             bloom->GetResource(&bloom_resource);
             native_device_context->CopySubresourceRegion(target_resource.get(), 0, 0, 0, 0, bloom_resource.get(), 0, nullptr);
@@ -378,8 +394,6 @@ public:
    {
       return test_skip_copy_width != 0 && reinterpret_cast<ID3D12Resource*>(dst_resource)->GetDesc().Width == UINT64(test_skip_copy_width);
    }
-#endif
-#if DX12 && DEVELOPMENT
    // The boot bias reaches the static samplers of the root signatures the game creates before its first present
    void OnInitDevice(NativeDevice* native_device, DeviceData& device_data) override
    {
@@ -497,8 +511,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
       swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
       swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
-      // On D3D12 the texture upgrades are direct and only for the textures the game creates committed (the placed ones are cloned in a later phase, which also adds the mirrors
-      // of the indirect and chain upgrades)
+      // On D3D12 the committed textures are upgraded in place and the placed ones through clones (see "includes/d3d12_clones.h"); its indirect and chain upgrades are opt-in
+      // ("IndirectTextureUpgrades" and "ChainTextureUpgrades" in "LoadConfigs()")
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
 #if DX11
       enable_indirect_texture_format_upgrades = true; // This is generally safer so enable it in the generic mod
