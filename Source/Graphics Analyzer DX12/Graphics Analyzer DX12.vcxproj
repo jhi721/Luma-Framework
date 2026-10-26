@@ -29,6 +29,8 @@
     <ProjectName>Graphics Analyzer DX12</ProjectName>
     <VCProjectUpgraderObjectName>NoUpgrade</VCProjectUpgraderObjectName>
     <VcpkgTriplet Condition="'$(Platform)'=='x64'">x64-windows</VcpkgTriplet>
+    <!-- Read by Scripts/package.ps1 to ship dxcompiler.dll; the build defines DX12 itself (no Luma.Features.props here) -->
+    <LumaGraphicsAPI>D3D12</LumaGraphicsAPI>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Development-Debug|x64'" Label="Configuration">

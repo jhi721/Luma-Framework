@@ -127,11 +127,11 @@
     <Copy SourceFiles="$(LumaNGXRuntimePath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
 
-  <Target Name="LumaCopyFsrRuntime" AfterTargets="Build" Condition="'$(LumaFSRRuntimeDir)'!='' and Exists('$(TargetDir)')">
+  <Target Name="LumaCopyFsrRuntime" AfterTargets="Build" Condition="'$(LumaFSRRuntimeDir)'!='' and Exists('$(LumaFSRRuntimeDir)\amd_fidelityfx_loader_dx12.dll') and Exists('$(LumaFSRRuntimeDir)\amd_fidelityfx_upscaler_dx12.dll') and Exists('$(TargetDir)')">
     <Copy SourceFiles="$(LumaFSRRuntimeDir)\amd_fidelityfx_loader_dx12.dll;$(LumaFSRRuntimeDir)\amd_fidelityfx_upscaler_dx12.dll" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
 
-  <Target Name="LumaCopyXeSSRuntime" AfterTargets="Build" Condition="'$(UseLumaXeSS)'=='true' and '$(LumaGraphicsAPI)'=='D3D12' and Exists('$(TargetDir)')">
+  <Target Name="LumaCopyXeSSRuntime" AfterTargets="Build" Condition="'$(UseLumaXeSS)'=='true' and '$(LumaGraphicsAPI)'=='D3D12' and Exists('$(MSBuildThisFileDirectory)..\External\XeSS\bin\libxess.dll') and Exists('$(TargetDir)')">
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\External\XeSS\bin\libxess.dll" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
 

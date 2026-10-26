@@ -122,7 +122,7 @@ if (-not [string]::IsNullOrEmpty($AddonPath) -and (Test-Path $AddonPath)) {
     foreach ($dir in @($projectAddonDir, (Join-Path $repoRoot "Binaries\$Platform-$Config"))) {
         if (Test-Path $dir) {
             $addonCandidates += Get-ChildItem -Path $dir -Filter "*.addon" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match [regex]::Escape($Project) }
+                Where-Object { $_.Name -match "^Luma-_?$([regex]::Escape($Project.TrimStart('_')))\.addon$" }
         }
     }
     $addonFile = $addonCandidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -189,8 +189,12 @@ try {
         if (Test-Path $ngxSrc) { Copy-Item $ngxSrc -Destination $tempDir -Force }
     }
 
-    # D3D12 FSR loads AMD's signed FidelityFX API dlls from the game folder (D3D11 FSR is linked statically)
-    if ($useLumaFSR -and $isD3D12) {
+    # D3D12 FSR loads AMD's signed FidelityFX API dlls from the game folder (D3D11 FSR is linked statically).
+    # Without the (untracked) SDK the addon was built without FSR ("__has_include" in Source/Core/fsr/FSR.h).
+    $ffxHeader = Join-Path $repoRoot "Source\External\FidelityFX-API\api\include\ffx_api.h"
+    if ($useLumaFSR -and $isD3D12 -and -not (Test-Path $ffxHeader)) {
+        Write-Warning "FidelityFX API SDK not found ($ffxHeader): the addon was built without D3D12 FSR, its dlls aren't shipped"
+    } elseif ($useLumaFSR -and $isD3D12) {
         foreach ($ffxDll in @("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll")) {
             $ffxSrc = Join-Path $repoRoot "Source\External\FidelityFX-API\signedbin\$ffxDll"
             if (-not (Test-Path $ffxSrc)) {
@@ -201,8 +205,12 @@ try {
         }
     }
 
-    # D3D12 XeSS loads Intel's signed libxess.dll from the game folder
-    if ($useLumaXeSS -and $isD3D12) {
+    # D3D12 XeSS loads Intel's signed libxess.dll from the game folder. Without the (untracked) SDK the addon was built without
+    # XeSS ("__has_include" in Source/Core/xess/XeSS.h).
+    $xessHeader = Join-Path $repoRoot "Source\External\XeSS\inc\xess\xess_d3d12.h"
+    if ($useLumaXeSS -and $isD3D12 -and -not (Test-Path $xessHeader)) {
+        Write-Warning "XeSS SDK not found ($xessHeader): the addon was built without XeSS, libxess.dll isn't shipped"
+    } elseif ($useLumaXeSS -and $isD3D12) {
         $xessSrc = Join-Path $repoRoot "Source\External\XeSS\bin\libxess.dll"
         if (-not (Test-Path $xessSrc)) {
             Write-Error "libxess.dll not found: $xessSrc"
