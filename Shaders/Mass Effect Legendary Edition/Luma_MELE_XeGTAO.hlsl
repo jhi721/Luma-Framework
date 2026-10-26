@@ -112,4 +112,17 @@ float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 }
 
 // tex0 = the output sized R24_UNORM_X8 scene depth captured at the downsample (prefilter).
-#include "../Includes/XeGTAO.hlsl"
+// GT-VBAO's main pass ("gtvbao_main_pass_cs", "GT-VBAO Enable") on top of XeGTAO's, which it includes. Steps and thickness follow
+// Yakuza Kiwami's calibration (Luma_YKR_XeGTAO.hlsl), not yet measured against MELE's HBAO+. YK's 2 slices (1 under a temporal AA)
+// don't carry over: it runs at full 4K, this AO at half the output, where XeGTAO takes 13 slices (Very High) and VBAO's slice noise
+// survives both denoise passes as visible grain. Final AO against 32 slices (ME3LE kitchen, 4K output, frozen noise), mean / p99 abs
+// error: 2 slices 0.0083 / 0.075, 4 0.0069 / 0.051, 8 0.0038 / 0.027; 8 cost ~1.7 ms over XeGTAO there (4 ~0.6 ms). main.cpp keeps
+// both denoise passes under DLSS/FSR too.
+#ifndef GTVBAO_SLICE_COUNT
+#define GTVBAO_SLICE_COUNT 8.0
+#endif
+#ifndef GTVBAO_STEP_COUNT
+#define GTVBAO_STEP_COUNT 8.0
+#endif
+#define GTVBAO_THICKNESS(effectRadius) (0.2 * (effectRadius))
+#include "../Includes/GTVBAO.hlsl"

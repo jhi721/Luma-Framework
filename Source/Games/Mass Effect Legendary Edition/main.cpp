@@ -171,6 +171,8 @@ static constexpr uint32_t kAOBlurHash = 0x06D92B08;         // Blur: replaced wi
 static constexpr uint32_t kAOApplyHash = 0x2E826C0F;        // Apply (PS, replaced): AO UV scale in LumaData.CustomData3/4.
 
 static bool g_gtao_enable = true;
+// GT-VBAO's visibility bitmask main pass instead of XeGTAO's horizons; prefilter, denoise and the b11 knobs stay XeGTAO's.
+static bool g_gtvbao_enable = false;
 static bool g_video_auto_hdr_enable = true; // Expand Bink highlights in HDR; off preserves vanilla SDR video.
 static bool g_hide_ui = false;              // Session-only HUD suppression for clean captures.
 // Runtime XeGTAO parameters in b11. HBAO+ PowExponent does not transfer numerically (different visibility
@@ -986,6 +988,7 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameBloomUpsamplePS = CompileTimeStringHash("Bloom Upsample PS");
    static constexpr uint32_t kNameGTAOPrefilterCS = CompileTimeStringHash("MELE XeGTAO Prefilter Depths CS");
    static constexpr uint32_t kNameGTAOMainPassCS = CompileTimeStringHash("MELE XeGTAO Main Pass CS");
+   static constexpr uint32_t kNameGTVBAOMainPassCS = CompileTimeStringHash("MELE GT-VBAO Main Pass CS");
    static constexpr uint32_t kNameGTAODenoise1CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 1 CS");
    static constexpr uint32_t kNameGTAODenoise2CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 2 CS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
@@ -2394,7 +2397,7 @@ public:
       Mcp::RegisterToggles({{"post_at_output_size", &EngineScale::g_post_at_output_size}, {"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter},
          {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter},
          {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}, {"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable},
-         {"hide_ui", &g_hide_ui}, { "perf_hook_timers",
+         {"gtvbao_enable", &g_gtvbao_enable}, {"hide_ui", &g_hide_ui}, { "perf_hook_timers",
             &Perf::g_hook_timers }});
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       Mcp::RegisterValues({{"render_scale", &EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, 1.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f},
@@ -2459,6 +2462,8 @@ public:
          ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
       native_shaders_definitions.emplace(kNameGTAOMainPassCS,
          ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
+      native_shaders_definitions.emplace(kNameGTVBAOMainPassCS,
+         ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs"});
       native_shaders_definitions.emplace(kNameGTAODenoise1CS,
          ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
       native_shaders_definitions.emplace(kNameGTAODenoise2CS,
@@ -2744,9 +2749,10 @@ public:
    {
       const bool render_share = IsRenderShare(device_data, *gd);
       const bool fill_target_allowed = !render_share || gd->ao_apply_replaced;
+      const uint32_t main_pass_cs = (g_gtvbao_enable ? kNameGTVBAOMainPassCS : kNameGTAOMainPassCS);
       const auto gtao_ready = [&]
       {
-         return g_gtao_enable && fill_target_allowed && HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, kNameGTAOMainPassCS, kNameGTAODenoise1CS, kNameGTAODenoise2CS);
+         return g_gtao_enable && fill_target_allowed && HasShaders(device_data.native_compute_shaders, kNameGTAOPrefilterCS, main_pass_cs, kNameGTAODenoise1CS, kNameGTAODenoise2CS);
       };
 
       // Depth and normals downsample: its sources are XeGTAO's, whose takeover leaves its half size outputs unread
@@ -2996,7 +3002,8 @@ public:
          // Main pass writes AO and edges to working0.
          dispatch(main_pass_cs, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get()}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
          // First denoiser writes working1, two horizontal pixels per thread. Skipped when temporal: the final one reads working0.
-         const bool single_denoise = IsGTAOTemporal(device_data);
+         // GT-VBAO keeps both passes even then: its bitmask noise is coarser (Luma_MELE_XeGTAO.hlsl)
+         const bool single_denoise = IsGTAOTemporal(device_data) && !g_gtvbao_enable;
          if (!single_denoise)
          {
             dispatch(kNameGTAODenoise1CS, {gd->srv_gtao_working[0].get()}, {gd->uav_gtao_working[1].get()}, (w + 15) / 16, (h + 7) / 8);
@@ -3694,6 +3701,7 @@ public:
       gs.VideoAutoHDREnable = (g_video_auto_hdr_enable ? 1.f : 0.f);
       reshade::get_config_value(nullptr, PROJECT_NAME, "VideoAutoHDRBoost", gs.VideoAutoHDRBoost);
       reshade::get_config_value(nullptr, PROJECT_NAME, "GTAOEnable", g_gtao_enable);
+      reshade::get_config_value(nullptr, PROJECT_NAME, "GTVBAOEnable", g_gtvbao_enable);
       reshade::get_config_value(nullptr, PROJECT_NAME, "GTAOFinalValuePower", g_gtao_final_value_power);
       reshade::get_config_value(nullptr, PROJECT_NAME, "GTAODepthScale", g_gtao_depth_scale);
       reshade::get_config_value(nullptr, PROJECT_NAME, "GTAORadiusOverride", g_gtao_radius_override);
@@ -3739,6 +3747,7 @@ public:
 
       ImGui::SeparatorText("Ambient Occlusion");
       DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's HBAO+ with XeGTAO (cleaner, more accurate ambient occlusion).");
+      DrawSettingCheckbox("GT-VBAO Enable", "GTVBAOEnable", &g_gtvbao_enable, false, "Replaces XeGTAO's occlusion with GT-VBAO (less dark halo around thin objects). Needs XeGTAO Enable.", !g_gtao_enable, false);
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
       DrawSettingSlider("GTAO Final Value Power", "GTAOFinalValuePower", &g_gtao_final_value_power, 1.f, 0.3f, 4.5f, "Primary darkness dial (higher = darker AO). Calibrate to match vanilla's overall darkening.", "%.2f");
@@ -3937,6 +3946,7 @@ public:
                   "\nRenoDX (HDR tonemap method)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
+                  "\nGT-VBAO (Mirko Salm)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)");
    }
