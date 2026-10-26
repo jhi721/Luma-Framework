@@ -150,14 +150,18 @@ namespace D3D12State
       uint32_t layer_count = UINT32_MAX;
    };
 
-   ViewInfo GetViewInfo(reshade::api::device* device, reshade::api::resource_view view)
+   ViewInfo GetViewInfo(reshade::api::device* device, reshade::api::resource_view view, const reshade::api::resource_view_desc& desc)
    {
       if (view.handle == 0)
          return {};
-      const reshade::api::resource_view_desc desc = device->get_resource_view_desc(view);
       const bool is_texture = desc.type != reshade::api::resource_view_type::buffer;
       // ReShade leaves the layer count at 0 for the views of textures that aren't layered: they cover their one layer
       return {.resource = device->get_resource_from_view(view).handle, .format = desc.format, .first_level = (is_texture ? desc.texture.first_level : 0), .first_layer = (is_texture ? desc.texture.first_layer : 0), .layer_count = (is_texture ? (std::max)(desc.texture.layers, 1u) : UINT32_MAX)};
+   }
+
+   ViewInfo GetViewInfo(reshade::api::device* device, reshade::api::resource_view view)
+   {
+      return (view.handle != 0 ? GetViewInfo(device, view, device->get_resource_view_desc(view)) : ViewInfo{});
    }
 
 #if DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE
@@ -195,9 +199,11 @@ namespace D3D12State
 #if DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE
       std::vector<BufferBinding> vertex_buffers; // By slot
 #endif
+#if DEVELOPMENT
       std::vector<reshade::api::resource_view> render_targets;
-      std::vector<ViewInfo> render_target_views;
       reshade::api::resource_view depth_stencil = {};
+#endif
+      std::vector<ViewInfo> render_target_views;
       ViewInfo depth_stencil_view;
       bool in_render_pass = false; // Copies and barriers are invalid between "BeginRenderPass()" and "EndRenderPass()" (of a native render pass: see "D3D12Clones::BeginRenderPassDetour()")
    };
@@ -324,32 +330,38 @@ namespace D3D12State
 
    void BindRenderTargets(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
    {
+#if DEVELOPMENT
       state->render_targets.assign(rtvs, rtvs + count);
-      state->render_target_views.resize(count);
-      for (uint32_t i = 0; i < count; i++)
-      {
-         state->render_target_views[i] = GetViewInfo(device, rtvs[i]);
-      }
       state->depth_stencil = dsv;
-      state->depth_stencil_view = GetViewInfo(device, dsv);
-#if ENABLE_D3D12_PASSES
+#endif
+      state->render_target_views.resize(count);
+#if ENABLE_D3D12_PASSES // Each view's desc is looked up once, for its "ViewInfo" and to make the view again
       state->render_target_descs.resize(count);
       for (uint32_t i = 0; i < count; i++)
       {
          state->render_target_descs[i] = (rtvs[i].handle != 0 ? device->get_resource_view_desc(rtvs[i]) : reshade::api::resource_view_desc{});
+         state->render_target_views[i] = GetViewInfo(device, rtvs[i], state->render_target_descs[i]);
       }
       state->depth_stencil_desc = (dsv.handle != 0 ? device->get_resource_view_desc(dsv) : reshade::api::resource_view_desc{});
+      state->depth_stencil_view = GetViewInfo(device, dsv, state->depth_stencil_desc);
+#else
+      for (uint32_t i = 0; i < count; i++)
+      {
+         state->render_target_views[i] = GetViewInfo(device, rtvs[i]);
+      }
+      state->depth_stencil_view = GetViewInfo(device, dsv);
 #endif
    }
 
    void BeginRenderPass(CommandListState* state, reshade::api::device* device, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds)
    {
-      std::vector<reshade::api::resource_view> rtvs(count);
-      for (uint32_t i = 0; i < count; i++)
+      const uint32_t rtv_count = (std::min)(count, uint32_t(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT));
+      reshade::api::resource_view rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+      for (uint32_t i = 0; i < rtv_count; i++)
       {
          rtvs[i] = rts[i].view;
       }
-      BindRenderTargets(state, device, count, rtvs.data(), ds ? ds->view : reshade::api::resource_view{});
+      BindRenderTargets(state, device, rtv_count, rtvs, ds ? ds->view : reshade::api::resource_view{});
       state->in_render_pass = true;
    }
 
@@ -477,8 +489,9 @@ namespace D3D12State
          cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, pipeline);
       }
 
-      std::vector<reshade::api::resource_view> render_targets(state.render_target_views.size());
-      for (size_t i = 0; i < render_targets.size(); i++)
+      const uint32_t render_target_count = uint32_t((std::min)(state.render_target_views.size(), size_t(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)));
+      reshade::api::resource_view render_targets[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      for (uint32_t i = 0; i < render_target_count; i++)
       {
          // A null resource makes a null view, as the game's was
          device->create_resource_view({state.render_target_views[i].resource}, reshade::api::resource_usage::render_target, state.render_target_descs[i], &render_targets[i]);
@@ -489,7 +502,7 @@ namespace D3D12State
          device->create_resource_view({state.depth_stencil_view.resource}, reshade::api::resource_usage::depth_stencil, state.depth_stencil_desc, &depth_stencil);
       }
       // D3D12 reads the descriptors when they are bound, so the views can go right after
-      cmd_list->bind_render_targets_and_depth_stencil(uint32_t(render_targets.size()), render_targets.data(), depth_stencil);
+      cmd_list->bind_render_targets_and_depth_stencil(render_target_count, render_targets, depth_stencil);
       for (const reshade::api::resource_view view : render_targets)
       {
          if (view.handle != 0)

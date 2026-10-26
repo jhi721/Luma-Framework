@@ -6457,25 +6457,7 @@ namespace
 
       // ReShade passes "all" stages for every PSO and a command list has one pipeline: a compute one replaces a graphics one and the other way around, so nothing stays bound.
       // That's also what handle 0 (clearing the state, a reset without an initial pipeline) and the pipelines we don't track leave.
-      cmd_list_data.pipeline_state_original_vertex_shader = {};
-      cmd_list_data.pipeline_state_original_pixel_shader = {};
-      cmd_list_data.pipeline_state_original_compute_shader = {};
-      cmd_list_data.pipeline_state_original_graphics_shader_hashes.Clear();
-      cmd_list_data.pipeline_state_original_compute_shader_hashes.Clear();
-      cmd_list_data.pipeline_state_has_custom_vertex_shader = false;
-      cmd_list_data.pipeline_state_has_custom_pixel_shader = false;
-      cmd_list_data.pipeline_state_has_custom_graphics_shader = false;
-      cmd_list_data.pipeline_state_has_custom_compute_shader = false;
-      cmd_list_data.draw_callback = nullptr;
-      cmd_list_data.dispatch_callback = nullptr;
-      cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
-      cmd_list_data.is_known_ui_shader_bound = false;
-      cmd_list_data.luma_settings_param = -1;
-      cmd_list_data.luma_data_param = -1;
-      cmd_list_data.bound_cached_pipeline = nullptr;
-      cmd_list_data.bound_base_pipeline = 0;
-      cmd_list_data.bound_current_pipeline = 0;
-      cmd_list_data.render_target_formats_dirty = false;
+      cmd_list_data.ResetBoundPipeline();
       if (pipeline.handle == 0)
       {
          return;
@@ -6570,13 +6552,13 @@ namespace
 
    void OnBindDescriptorTables(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table* tables, uint32_t dynamic_offset_count, const uint32_t* dynamic_offsets)
    {
-      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
 #if !DEVELOPMENT && !ENABLE_D3D12_PASSES
       if (count != 0) // Release builds without Luma passes only track the root signature ("Set*RootSignature()" binds no tables), not what is bound to it
       {
          return;
       }
 #endif
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
       D3D12State::BindDescriptorTables(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, first, count, tables);
    }
 
@@ -8479,26 +8461,15 @@ namespace
       cmd_list->destroy_private_data<CommandListData>();
    }
 
-   // The way we interpret this is probably DX11 specific, as in DX12 this doesn't reset the state.
-   // This is called for "D3D11DeviceContext::FinishCommandList" (depending on a flag), so exclusively on deferred contexts.
+   // D3D11: called for "D3D11DeviceContext::FinishCommandList()" (depending on a flag), so only on deferred contexts, whose state it clears.
+   // D3D12: called for "ID3D12GraphicsCommandList::Reset()", which resets all the state of the list.
    void OnResetCommandList(reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
 
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
-      cmd_list_data.pipeline_state_original_compute_shader = reshade::api::pipeline(0);
-      cmd_list_data.pipeline_state_original_vertex_shader = reshade::api::pipeline(0);
-      cmd_list_data.pipeline_state_original_pixel_shader = reshade::api::pipeline(0);
-
-      cmd_list_data.pipeline_state_original_graphics_shader_hashes.Clear();
-      cmd_list_data.pipeline_state_original_compute_shader_hashes.Clear();
-      cmd_list_data.pipeline_state_has_custom_vertex_shader = false;
-      cmd_list_data.pipeline_state_has_custom_pixel_shader = false;
-      cmd_list_data.pipeline_state_has_custom_graphics_shader = false;
-      cmd_list_data.pipeline_state_has_custom_compute_shader = false;
-
-      cmd_list_data.draw_callback = nullptr;
-      cmd_list_data.dispatch_callback = nullptr;
+      cmd_list_data.ResetBoundPipeline();
+      cmd_list_data.auto_compute_texture_format_upgrades = nullptr;
 
 #if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state
       cmd_list_data.d3d12_state = {};
@@ -8508,17 +8479,7 @@ namespace
       // The root arguments are gone, and the pages they pointed at are free once the executions of the list finished
       D3D12UploadRing::Retire(cmd_list_data.upload_ring.get(), &cmd_list_data.upload_pages);
       cmd_list_data.luma_data_address = 0;
-      cmd_list_data.luma_settings_param = -1;
-      cmd_list_data.luma_data_param = -1;
-      cmd_list_data.bound_cached_pipeline = nullptr;
-      cmd_list_data.bound_base_pipeline = 0;
-      cmd_list_data.bound_current_pipeline = 0;
-      cmd_list_data.render_target_formats_dirty = false;
 #endif
-      cmd_list_data.is_known_ui_shader_bound = false;
-
-      cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
-      cmd_list_data.auto_compute_texture_format_upgrades = nullptr;
 
       cmd_list_data.ResetUpgradedViews();
       // In DX11, ReShade only resets command lists on "FinishCommandList()", which clears the deferred context state, so there's no scaled viewports/scissors bound anymore
@@ -8734,6 +8695,8 @@ namespace
       cmd_list_data.pipeline_state_has_custom_compute_shader = bundle_data.pipeline_state_has_custom_compute_shader;
       cmd_list_data.draw_callback = bundle_data.draw_callback;
       cmd_list_data.dispatch_callback = bundle_data.dispatch_callback;
+      cmd_list_data.is_known_ui_shader_bound = bundle_data.is_known_ui_shader_bound;
+      cmd_list_data.auto_graphics_texture_format_upgrades = bundle_data.auto_graphics_texture_format_upgrades;
       cmd_list_data.luma_settings_param = bundle_data.luma_settings_param;
       cmd_list_data.luma_data_param = bundle_data.luma_data_param;
       // Its pipeline is the list's now (a bundle keeps the base, see "OnDrawOrDispatchD3D12()"), the next draw looks at the formats of the list's render targets

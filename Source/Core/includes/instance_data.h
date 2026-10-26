@@ -454,6 +454,33 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    const AutoTextureFormatUpgradeShaderHash* auto_graphics_texture_format_upgrades = nullptr;
    const AutoTextureFormatUpgradeShaderHash* auto_compute_texture_format_upgrades = nullptr;
 
+   // What a command list reset clears, and a D3D12 pipeline bind too (a D3D12 list has one pipeline, so a bind replaces all of it).
+   // The D3D12 bundle hand-over ("OnExecuteSecondaryCommandList()") must copy these same fields.
+   void ResetBoundPipeline()
+   {
+      pipeline_state_original_compute_shader = {};
+      pipeline_state_original_vertex_shader = {};
+      pipeline_state_original_pixel_shader = {};
+      pipeline_state_original_graphics_shader_hashes.Clear();
+      pipeline_state_original_compute_shader_hashes.Clear();
+      pipeline_state_has_custom_vertex_shader = false;
+      pipeline_state_has_custom_pixel_shader = false;
+      pipeline_state_has_custom_graphics_shader = false;
+      pipeline_state_has_custom_compute_shader = false;
+      draw_callback = nullptr;
+      dispatch_callback = nullptr;
+      is_known_ui_shader_bound = false;
+      auto_graphics_texture_format_upgrades = nullptr;
+#if DX12
+      luma_settings_param = -1;
+      luma_data_param = -1;
+      bound_cached_pipeline = nullptr;
+      bound_base_pipeline = 0;
+      bound_current_pipeline = 0;
+      render_target_formats_dirty = false;
+#endif
+   }
+
    // ============================================================================
    // Patch variant API (game-facing). Per-context/per-bind state.
    // ============================================================================
