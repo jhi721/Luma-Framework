@@ -1195,7 +1195,7 @@ public:
          {"object_mv.rigid", &g_object_mv_rigid}, {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, { "gtvbao_enable",
             &g_gtvbao_enable }});
       Mcp::RegisterValues({{"object_mv.match_distance", &g_object_mv_match_distance, 0.f, 10.f}, {"object_mv.max_distance", &g_object_mv_max_distance, 0.f, 100.f}, {"object_mv.rigid_match_distance", &g_object_mv_rigid_match_distance, 0.f, 10.f},
-         {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+         {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
       for (size_t i = 0; i < MV_COUNT; i++)
       {
@@ -1562,11 +1562,19 @@ public:
          const reshade::api::resource target = {state.render_target_views[0].resource};
          const reshade::api::format color_format = game_device_data.fxaa_input_format.load(std::memory_order_relaxed);
          const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
-         // DLAA antialiased the scene: the canvas goes through as it is
+         // DLAA antialiased the scene: the canvas goes through as it is, sharpened as SMAA's output is (the same gamma canvas, its alpha unused after FXAA)
          if (game_device_data.dlaa_drawn_present.load(std::memory_order_relaxed) == present_count)
          {
-            const bool copied = DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data.copy_pass, CompileTimeStringHash("YKR DLAA Copy PS"), "FXAA Bypass", "Luma FXAA Bypass", color, color_format, target, state.render_target_descs[0], {});
-            return copied ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
+            bool drawn = false;
+            if (g_rcas_sharpness > 0.f)
+            {
+               drawn = DrawRCAS(cmd_list_data, device_data, color, color_format, target, state.render_target_descs[0], g_rcas_sharpness);
+            }
+            if (!drawn)
+            {
+               drawn = DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data.copy_pass, CompileTimeStringHash("YKR DLAA Copy PS"), "FXAA Bypass", "Luma FXAA Bypass", color, color_format, target, state.render_target_descs[0], {});
+            }
+            return drawn ? DrawOrDispatchOverrideType::Replaced : DrawOrDispatchOverrideType::None;
          }
          if (!g_smaa_enable)
          {
@@ -2458,8 +2466,9 @@ public:
             camera_state.capture.reset();
          }
       }
-      // -1 at native resolution, with DLAA only (the game has no TAA: a negative bias would shimmer)
-      SetTextureMipLodBias(nullptr, device_data, ((dlaa_active && g_dlaa_mip_bias) ? SR::GetMipLODBias(1u, 1u) : 0.f));
+      // The upscaler's bias at native resolution (-1 for DLSS and FSR, 0 for XeSS), with DLAA only (the game has no TAA: a negative bias would shimmer)
+      const SR::InstanceData* const sr_instance_data = device_data.GetSRInstanceData();
+      SetTextureMipLodBias(nullptr, device_data, ((dlaa_active && g_dlaa_mip_bias && sr_instance_data) ? sr_implementations[device_data.sr_type]->GetMipLODBias(sr_instance_data) : 0.f));
 
 #if DEVELOPMENT
       for (size_t i = 0; i < MV_COUNT; i++)
@@ -2548,10 +2557,11 @@ public:
 
       // DLAA takes FXAA's place itself
       const bool sr_active = device_data.sr_type != SR::Type::None;
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (requires Anti-Aliasing enabled in the game's graphics settings; not used with DLSS).", sr_active);
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS.", sr_active || !g_smaa_enable);
-      ImGui::BeginDisabled(sr_active || !g_smaa_enable);
-      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA (0 = off).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Replaces the game's FXAA with SMAA (requires Anti-Aliasing enabled in the game's graphics settings; not used with DLSS, FSR or XeSS).", sr_active);
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS, FSR or XeSS.", sr_active || !g_smaa_enable);
+      // RCAS sharpens SMAA's, T2x's and the upscaler's output, never the game's FXAA
+      ImGui::BeginDisabled(!sr_active && !g_smaa_enable);
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA, SMAA T2x, DLSS, FSR or XeSS (0 = off; requires Anti-Aliasing enabled in the game's graphics settings).");
       ImGui::EndDisabled();
 #if DEVELOPMENT
       if (g_smaa_enable)
@@ -2662,7 +2672,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Yakuza Kiwami\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR and DLAA native anti-aliasing and replaces the game's FXAA with SMAA (with T2x), its bloom with a smoother one and its SSAO with XeGTAO, plus 16x anisotropic filtering.\n"
+         "It adds HDR and DLAA, FSR 3/4 or XeSS native anti-aliasing and replaces the game's FXAA with SMAA (with T2x), its bloom with a smoother one and its SSAO with XeGTAO, plus 16x anisotropic filtering.\n"
          "Enable Anti-Aliasing and Ambient Occlusion in the game's graphics settings for SMAA and XeGTAO to apply.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -2709,8 +2719,9 @@ public:
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
                   "\nGT-VBAO (Mirko Salm)"
-                  "\nAMD FidelityFX (RCAS)"
-                  "\nNVIDIA NGX (DLSS)");
+                  "\nAMD FidelityFX (RCAS + FSR 3/4)"
+                  "\nNVIDIA NGX (DLSS)"
+                  "\nIntel XeSS");
    }
 };
 
