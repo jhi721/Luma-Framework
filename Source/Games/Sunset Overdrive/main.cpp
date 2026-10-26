@@ -497,7 +497,9 @@ public:
          return;
       D3D11_TEXTURE2D_DESC scene_desc;
       scene->GetDesc(&scene_desc);
-      SR::InstanceData* const sr_instance_data = device_data->GetSRInstanceData();
+      // Held to the end: a present can't switch the SR meanwhile
+      const SRDrawLock sr = LockSRForDraw(*device_data);
+      SR::InstanceData* const sr_instance_data = sr.instance_data;
       const uint2 scene_size = {scene_desc.Width, scene_desc.Height};
       const bool scene_matches_motion_vectors = scene_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT && scene_size == GetViewTextureSize(game_device_data->motion_vectors.rtv.get());
       if (!sr_instance_data || !scene_matches_motion_vectors || (std::min)(scene_size.x, scene_size.y) < sr_instance_data->min_resolution)
@@ -531,11 +533,11 @@ public:
          // Render pixels, previous minus current, jitter removed (see the velocity shaders)
          .mvs_jittered = false,
          // DLSS's own (DLSS-Best-Practices EXP-4), and Luma TAA's. FSR's clips highlights, so it gets the tonemap's exposure below.
-         .auto_exposure = device_data->sr_type != SR::Type::FSR,
+         .auto_exposure = sr.type != SR::Type::FSR,
          // "Default" is K for DLAA (L and M crush hues)
          .render_preset = (dlss_render_preset != 0 ? dlss_render_preset : 11u),
       };
-      auto& sr_implementation = *sr_implementations[device_data->sr_type];
+      auto& sr_implementation = *sr.implementation;
       sr_implementation.UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
       // The jitter of the frame the render thread draws; none (still a valid input) if the hook didn't run for it
@@ -571,7 +573,7 @@ public:
          draw_data.bias_mask = game_device_data->reactive_mask.texture.get();
       }
       // FSR's exposure is the tonemap's own multiplier (FSR-Best-Practices FIN-4, see "Luma_SO_SRExposure.hlsl")
-      const bool fsr_exposure = device_data->sr_type == SR::Type::FSR && game_device_data->exposure_buffer_srv;
+      const bool fsr_exposure = sr.type == SR::Type::FSR && game_device_data->exposure_buffer_srv;
       if (fsr_exposure && EnsureTextureViews(native_device, uint2{1, 1}, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &game_device_data->sr_exposure))
       {
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
