@@ -214,18 +214,12 @@ namespace D3D12UploadRing
          const auto queue = std::ranges::find(pool->queues, wait.queue, &Queue::queue);
          return queue == pool->queues.end() || queue->completed >= wait.value;
       };
-      for (auto retired = pool->retiring.begin(); retired != pool->retiring.end();)
-      {
-         if (std::ranges::all_of(retired->waits, passed))
+      std::erase_if(pool->retiring, [pool, &passed](const Retired& retired)
          {
-            pool->free_pages.insert(pool->free_pages.end(), retired->pages.begin(), retired->pages.end());
-            retired = pool->retiring.erase(retired);
-         }
-         else
-         {
-            ++retired;
-         }
-      }
+            if (!std::ranges::all_of(retired.waits, passed))
+               return false;
+            pool->free_pages.insert(pool->free_pages.end(), retired.pages.begin(), retired.pages.end());
+            return true; });
    }
 
    // Only DIRECT and COMPUTE queues can run lists that set root CBVs: false for the others, or if the fence couldn't be made. The pool

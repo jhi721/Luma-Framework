@@ -6630,10 +6630,11 @@ namespace
 #endif
 
    // Luma's passes and readbacks record draws, copies and barriers that a render pass cannot hold, so they refuse inside one (the game's command runs as it is). Only the native ones
-   // count: the hooks emulate the others with ordinary binds and clears (see "D3D12Clones::BeginRenderPassDetour()"). Said once for each "kind" (a literal)
+   // count: the hooks emulate the others with ordinary binds and clears (see "D3D12Clones::BeginRenderPassDetour()"). A bundle holds none of them either (nor render target, viewport or
+   // descriptor heap binds). Said once for each "kind" (a literal)
    bool RefusedInRenderPass(const CommandListData& cmd_list_data, const char* kind)
    {
-      if (!cmd_list_data.d3d12_state.in_render_pass)
+      if (!cmd_list_data.d3d12_state.in_render_pass && !cmd_list_data.is_bundle)
       {
          return false;
       }
@@ -6641,7 +6642,8 @@ namespace
       static std::unordered_set<std::string_view> logged_kinds;
       if (const std::unique_lock lock(mutex); logged_kinds.emplace(kind).second)
       {
-         reshade::log::message(reshade::log::level::warning, std::format("[{}] Refused inside a render pass that stays native (see the \"[Render passes]\" warning): between BeginRenderPass() and EndRenderPass() D3D12 holds no copies or barriers, and the render targets cannot change", kind).c_str());
+         const char* const reason = (cmd_list_data.is_bundle ? "Refused in a bundle: D3D12 bundles hold no copies, barriers, render target, viewport or descriptor heap binds" : "Refused inside a render pass that stays native (see the \"[Render passes]\" warning): between BeginRenderPass() and EndRenderPass() D3D12 holds no copies or barriers, and the render targets cannot change");
+         reshade::log::message(reshade::log::level::warning, std::format("[{}] {}", kind, reason).c_str());
       }
       return true;
    }
@@ -7335,7 +7337,8 @@ namespace
       if (is_settings)
       {
          address = device_data.settings_address.load(std::memory_order_acquire);
-         if (device_data.cb_luma_global_settings_dirty.exchange(false) || address == 0)
+         // A plain load first: the exchange's locked write on every draw would bounce the flag's cache line between the recording threads
+         if ((device_data.cb_luma_global_settings_dirty.load(std::memory_order_relaxed) && device_data.cb_luma_global_settings_dirty.exchange(false)) || address == 0)
          {
             // ponytail: a thread recording while another one uploads reads the previous copy for that draw, the new one is published once it's written
             const std::unique_lock lock_settings(device_data.settings_mutex);
@@ -9020,8 +9023,7 @@ namespace
          }
          else if (!pass->pipeline)
          {
-            static std::atomic_flag no_pipeline;
-            fail(&no_pipeline, "The device refused its root signature or its pipeline (the debug layer says why), so it doesn't draw");
+            reshade::log::message(reshade::log::level::error, std::format("[{}] The device refused its root signature or its pipeline for {} (the debug layer says why), so it doesn't draw", name, GetFormatNameSafe(format)).c_str());
          }
          else
          {
@@ -9088,7 +9090,7 @@ namespace
    {
       std::erase_if(pass->retired_resources, [device, present_count](const std::pair<uint64_t, reshade::api::resource>& retired)
          {
-            if (present_count - retired.first < D3D12_GAME_PASS_FRAMES)
+            if (present_count < retired.first + D3D12_GAME_PASS_FRAMES)
                return false;
             device->destroy_resource(retired.second);
             return true; });
@@ -9106,7 +9108,7 @@ namespace
       {
          auto& smaa = device_data.smaa;
          const std::unique_lock lock(smaa.mutex);
-         if (smaa.width != 0 && smaa.frame != UINT64_MAX && present_count - smaa.frame > D3D12_GAME_PASS_IDLE_PRESENTS)
+         if (smaa.width != 0 && smaa.frame != UINT64_MAX && present_count > smaa.frame + D3D12_GAME_PASS_IDLE_PRESENTS)
          {
             for (reshade::api::resource_view* const view : {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv})
             {
@@ -9124,14 +9126,16 @@ namespace
          DestroyRetiredD3D12GamePassResources(&smaa, device, present_count);
       }
 #endif
-      std::vector<DeviceData::GamePassD3D12*> passes = {&device_data.texture_copy};
+      DeviceData::GamePassD3D12* const passes[] = {
+         &device_data.texture_copy,
 #if ENABLE_RCAS
-      passes.push_back(&device_data.rcas);
+         &device_data.rcas,
 #endif
 #if ENABLE_BLOOM
-      passes.push_back(&device_data.karis_average);
-      passes.push_back(&device_data.bloom);
+         &device_data.karis_average,
+         &device_data.bloom,
 #endif
+      };
       for (DeviceData::GamePassD3D12* const pass : passes)
       {
          const std::unique_lock lock(pass->mutex);
@@ -9178,9 +9182,10 @@ namespace
       }
 
       const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
-      DestroyRetiredD3D12GamePassResources(pass, device, present_count);
       if (pass->frame != present_count)
       {
+         // What it retired can only become destroyable at a new present
+         DestroyRetiredD3D12GamePassResources(pass, device, present_count);
          pass->frame = present_count;
          pass->frame_draws = 0;
       }
@@ -9363,11 +9368,12 @@ namespace
       cmd_list->draw(4, 1, 0, 0);
 
 #if DEVELOPMENT
-      std::vector<D3D12State::ViewInfo> trace_inputs;
-      for (const D3D12FullscreenSource& source : sources)
+      std::array<D3D12State::ViewInfo, D3D12_FULLSCREEN_MAX_SOURCES> trace_views = {};
+      for (size_t i = 0; i < sources.size(); ++i)
       {
-         trace_inputs.push_back({.resource = source.resource.handle, .format = source.format});
+         trace_views[i] = {.resource = sources[i].resource.handle, .format = sources[i].format};
       }
+      const std::span<const D3D12State::ViewInfo> trace_inputs(trace_views.data(), sources.size());
 #else
       constexpr std::span<const D3D12State::ViewInfo> trace_inputs;
 #endif

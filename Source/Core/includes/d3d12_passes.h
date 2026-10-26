@@ -156,7 +156,7 @@ namespace D3D12Passes
    }
 
    // Closes the recording, executes it on "queue" and signals the context's fence behind it. False if there was none or its list failed to
-   // close (a command was invalid): nothing runs, and the frame is free again. Never waits.
+   // close (a command was invalid): nothing runs, and the frame is free again once the GPU ran the lists submitted before it. Never waits.
    inline bool Submit(Context* context, ID3D12CommandQueue* queue)
    {
       if (!context->current)
@@ -166,6 +166,8 @@ namespace D3D12Passes
       Frame& frame = context->frames[*std::exchange(context->current, std::nullopt)];
       if (FAILED(context->list->Close()))
       {
+         // What it keeps alive (e.g. the objects "KeepAlive()" took from an earlier frame) may still be used by the lists already submitted
+         frame.fence_value = context->last_signaled;
          return false;
       }
       ID3D12CommandList* const lists[] = {context->list.get()};
