@@ -743,8 +743,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
 #if DEVELOPMENT
    // Which stage-1 permutation the game last drew, and how many stage-1 draws the frame contained. A count of two
    // can mean a mid-frame permutation switch, and so two HDR families in one frame.
-   const TonemapPermDesc* stage1_perm = nullptr;
-   int stage1_draws = 0;
+   uint32_t stage1_perm_hash = 0;
+   uint32_t stage1_draws = 0;
 #endif
 
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the draws
@@ -1167,6 +1167,60 @@ class MassEffectLE final : public Game
 #if DEVELOPMENT
       game_device_data.mv_destroyed_buffers++;
 #endif
+   }
+
+   // Copies the scene depth once, before the first clear of it inside the scene (see "mv_depth_snapshot"): from then on the fill and
+   // the upscaler read the copy. "depth" is the cleared resource; anything other than the scene depth they read is ignored.
+   static void SnapshotSceneDepth(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MassEffectGameDeviceData* gd, ID3D11Resource* depth)
+   {
+      if (!depth || depth != gd->mv_depth.get() || !gd->mv_depth_srv)
+         return;
+      com_ptr<ID3D11Resource> read_depth;
+      gd->mv_depth_srv->GetResource(&read_depth);
+      com_ptr<ID3D11Texture2D> depth_texture;
+      if (read_depth.get() != depth || FAILED(depth->QueryInterface(&depth_texture)))
+         return;
+      D3D11_TEXTURE2D_DESC depth_desc = {};
+      D3D11_TEXTURE2D_DESC snapshot_desc = {};
+      depth_texture->GetDesc(&depth_desc);
+      if (gd->mv_depth_snapshot)
+      {
+         gd->mv_depth_snapshot->GetDesc(&snapshot_desc);
+      }
+      if (!gd->mv_depth_snapshot || snapshot_desc.Width != depth_desc.Width || snapshot_desc.Height != depth_desc.Height || snapshot_desc.Format != depth_desc.Format)
+      {
+         gd->mv_depth_snapshot_srv.reset();
+         gd->mv_depth_snapshot.reset();
+         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+         gd->mv_depth_srv->GetDesc(&srv_desc);
+         if (SUCCEEDED(native_device->CreateTexture2D(&depth_desc, nullptr, &gd->mv_depth_snapshot)))
+         {
+            native_device->CreateShaderResourceView(gd->mv_depth_snapshot.get(), &srv_desc, &gd->mv_depth_snapshot_srv);
+         }
+      }
+      if (gd->mv_depth_snapshot_srv)
+      {
+         native_device_context->CopyResource(gd->mv_depth_snapshot.get(), depth_texture.get());
+         gd->mv_depth_srv = gd->mv_depth_snapshot_srv;
+      }
+      gd->mv_depth_snapshot_taken = true;
+   }
+
+   // Some scenes (ME1LE, before the foreground draws) clear the scene depth with ClearDepthStencilView instead of UE3's quad
+   static bool OnClearDepthStencilView(reshade::api::command_list* cmd_list, reshade::api::resource_view dsv, const float* depth, const uint8_t* stencil, uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      if (!depth || !ImmediateState::IsImmediate(cmd_list))
+         return false;
+      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
+      if (!device_data || !device_data->game)
+         return false;
+      auto& gd = GetGameDeviceData(*device_data);
+      if (!gd.mv_scene_open || gd.mv_depth_snapshot_taken)
+         return false;
+      com_ptr<ID3D11Resource> depth_resource;
+      reinterpret_cast<ID3D11DepthStencilView*>(dsv.handle)->GetResource(&depth_resource);
+      SnapshotSceneDepth(reinterpret_cast<ID3D11Device*>(cmd_list->get_device()->get_native()), reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()), &gd, depth_resource.get());
+      return false;
    }
 
    // The bound shader's motion vector version, patched from Core's bytecode copy on first use (a null shader if it can't be); the entry
@@ -2321,6 +2375,7 @@ public:
    {
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
       reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(ImmediateState::OnBindRenderTargetsAndDepthStencil);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(ImmediateState::OnBindPipeline);
@@ -2364,7 +2419,10 @@ public:
          MCP_GAME_TEXTURE("smaa.output", smaa_out.tex),
          MCP_GAME_TEXTURE("rcas.output", rcas_out.tex),
          MCP_GAME_TEXTURE("gtao.depth_mips", tex_gtao_depth_mips),
-         MCP_GAME_TEXTURE("mv.velocity", mv_texture)});
+         MCP_GAME_TEXTURE("gtao.working0", tex_gtao_working[0]),
+         MCP_GAME_TEXTURE("gtao.working1", tex_gtao_working[1]),
+         MCP_GAME_TEXTURE("mv.velocity", mv_texture),
+         MCP_GAME_TEXTURE("mv.depth", mv_depth_srv)});
 #endif
       // The game follows Windows HDR. Native HDR runs stage 2, so the frame reaches the swapchain linear and this
       // game owns Game Paper White; native SDR has no stage 2, so it stays gamma and Core's composition owns the
@@ -2416,6 +2474,7 @@ public:
          ShaderDefinition("Luma_MELE_ConstantsPatch", reshade::api::pipeline_subobject_type::compute_shader));
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
       reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot>);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(ImmediateState::OnBindRenderTargetsAndDepthStencil);
       reshade::register_event<reshade::addon_event::bind_pipeline>(ImmediateState::OnBindPipeline);
@@ -2463,6 +2522,13 @@ public:
       {
          Mcp::RegisterCounter(std::string("mv.rejected.") + kMotionVectorRejectNames[reject], &stats.rejected[reject], &device_data);
       }
+      // As the "Stage 1 DEV readout" and "Bloom DEV readout" (read at present before "OnPresent" resets the draw count)
+      auto& gd = GetGameDeviceData(device_data);
+      Mcp::RegisterCounters({{"stage1.perm_hash", &gd.stage1_perm_hash}, { "stage1.draws",
+                                &gd.stage1_draws }},
+         &device_data);
+      Mcp::RegisterDevValue({"bloom.scale_live", Mcp::DevValueKind::Float, &gd.bloom_scale_live, &device_data});
+      Mcp::RegisterDevValue({"bloom.threshold_live", Mcp::DevValueKind::Float, &gd.bloom_threshold_live, &device_data});
 #endif
    }
 
@@ -2590,7 +2656,7 @@ public:
          return;
 
 #if DEVELOPMENT
-      gd->stage1_perm = perm; // Recorded before the SMAA and bloom gates, so the readout reflects every stage-1 draw.
+      gd->stage1_perm_hash = perm->hash; // Recorded before the SMAA and bloom gates, so the readout reflects every stage-1 draw.
       ++gd->stage1_draws;
 #endif
 
@@ -2928,7 +2994,7 @@ public:
          // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
          dispatch(kNameGTAOPrefilterCS, {gd->srv_gtao_depth.get()}, {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(), gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()}, (w + 15) / 16, (h + 15) / 16);
          // Main pass writes AO and edges to working0.
-         dispatch(kNameGTAOMainPassCS, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get()}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
+         dispatch(main_pass_cs, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get()}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
          // First denoiser writes working1, two horizontal pixels per thread. Skipped when temporal: the final one reads working0.
          const bool single_denoise = IsGTAOTemporal(device_data);
          if (!single_denoise)
@@ -3252,40 +3318,11 @@ public:
             if (gd.mv_scene_open && scene_view && !gd.mv_depth_snapshot_taken && gd.mv_depth_srv)
             {
                CacheDepthStencilState(native_device_context, &gd);
-               com_ptr<ID3D11Resource> depth;
-               com_ptr<ID3D11Resource> read_depth;
                if (gd.depth_write && gd.depth_always)
                {
+                  com_ptr<ID3D11Resource> depth;
                   dsv->GetResource(&depth);
-                  gd.mv_depth_srv->GetResource(&read_depth);
-               }
-               com_ptr<ID3D11Texture2D> depth_texture;
-               if (depth && depth == gd.mv_depth && read_depth == depth && SUCCEEDED(depth->QueryInterface(&depth_texture)))
-               {
-                  D3D11_TEXTURE2D_DESC depth_desc = {};
-                  D3D11_TEXTURE2D_DESC snapshot_desc = {};
-                  depth_texture->GetDesc(&depth_desc);
-                  if (gd.mv_depth_snapshot)
-                  {
-                     gd.mv_depth_snapshot->GetDesc(&snapshot_desc);
-                  }
-                  if (!gd.mv_depth_snapshot || snapshot_desc.Width != depth_desc.Width || snapshot_desc.Height != depth_desc.Height || snapshot_desc.Format != depth_desc.Format)
-                  {
-                     gd.mv_depth_snapshot_srv.reset();
-                     gd.mv_depth_snapshot.reset();
-                     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-                     gd.mv_depth_srv->GetDesc(&srv_desc);
-                     if (SUCCEEDED(native_device->CreateTexture2D(&depth_desc, nullptr, &gd.mv_depth_snapshot)))
-                     {
-                        native_device->CreateShaderResourceView(gd.mv_depth_snapshot.get(), &srv_desc, &gd.mv_depth_snapshot_srv);
-                     }
-                  }
-                  if (gd.mv_depth_snapshot_srv)
-                  {
-                     native_device_context->CopyResource(gd.mv_depth_snapshot.get(), depth_texture.get());
-                     gd.mv_depth_srv = gd.mv_depth_snapshot_srv;
-                  }
-                  gd.mv_depth_snapshot_taken = true;
+                  SnapshotSceneDepth(native_device, native_device_context, &gd, depth.get());
                }
             }
             const bool motion_vectors = !mirrored && DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv);
@@ -3613,7 +3650,7 @@ public:
       gd.bloom_scale_captured_this_frame = false; // Re-arms the bright pass capture.
       gd.scene_post_done_this_frame = false;      // Set again by the FXAA resolve.
 #if DEVELOPMENT
-      gd.stage1_draws = 0; // stage1_perm deliberately survives: a paused or menu frame keeps the last answer.
+      gd.stage1_draws = 0; // stage1_perm_hash deliberately survives: a paused or menu frame keeps the last answer.
 #endif
 
       // The only runtime writer of the effective bloom values: the UI edits only the raw slider and enable, so raw and derived values
@@ -3751,9 +3788,9 @@ public:
       {
          auto& gd = GetGameDeviceData(device_data);
          ImGui::SeparatorText("Stage 1 DEV readout");
-         if (gd.stage1_perm)
+         if (gd.stage1_perm_hash)
          {
-            ImGui::Text("perm 0x%08X  (draws this frame: %d)", gd.stage1_perm->hash, gd.stage1_draws);
+            ImGui::Text("perm 0x%08X  (draws this frame: %u)", gd.stage1_perm_hash, gd.stage1_draws);
             if (ImGui::IsItemHovered())
             {
                ImGui::SetTooltip("The stage-1 permutation the game drew last; its description and HDR family are in the matching Tonemap_0x<hash> shader. A frame reporting two draws switched permutation mid-frame and may be using two families.");
