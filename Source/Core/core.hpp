@@ -9882,7 +9882,7 @@ namespace
 #endif // ENABLE_BLOOM
 
    // The texture "desc" asks for (its usage, size and format are the key) that the copy conversions go through, made on first use in "initial_usage" and kept: a game converts textures of different
-   // sizes and formats in one frame. The oldest goes (retired, see "RetireD3D12GamePassResource()") when there are too many. "device_data.texture_copy.mutex" is held. Null if the device refuses it.
+   // sizes and formats in one frame. The least recently used goes (retired, see "RetireD3D12GamePassResource()") when there are too many. "device_data.texture_copy.mutex" is held. Null if the device refuses it.
    reshade::api::resource GetD3D12CopyIntermediate(DeviceData& device_data, reshade::api::device* device, const reshade::api::resource_desc& desc, reshade::api::resource_usage initial_usage)
    {
       auto& texture_copy = device_data.texture_copy;
@@ -9891,7 +9891,8 @@ namespace
          { return intermediate.usage == desc.usage && intermediate.width == desc.texture.width && intermediate.height == desc.texture.height && intermediate.format == desc.texture.format; });
       if (found != texture_copy.intermediates.end())
       {
-         return found->resource;
+         std::rotate(found, found + 1, texture_copy.intermediates.end());
+         return texture_copy.intermediates.back().resource;
       }
       constexpr size_t MAX_INTERMEDIATES = 16;
       if (texture_copy.intermediates.size() >= MAX_INTERMEDIATES)
@@ -9910,7 +9911,7 @@ namespace
 
    // The copy of a texture Luma upgraded into one of another format family, or back (see "SkipUpgradedFormatCopy()"), which D3D12's copies can't make: "Copy PS" draws it instead, like the D3D11
    // "OnCopyResource_Internal()", and the destination keeps its own precision. Whole 2D textures of the same size with one mip, layer and sample, R16G16B16A16 FLOAT against the R8G8B8A8, B8G8R8A8,
-   // B8G8R8X8, R10G10B10A2 and R11G11B10 families. With "scaled" (one of them is a clone of another size, see "includes/d3d12_clones.h") the sizes differ and the families can be the same:
+   // B8G8R8X8, R10G10B10A2 and R11G11B10 families, and against a typed R16G16B16A16 UNORM. With "scaled" (one of them is a clone of another size, see "includes/d3d12_clones.h") the sizes differ and the families can be the same:
    // "Scale PS" stretches it bilinearly. The textures are in the states of the game's copy (copy source and copy destination): a destination that can't be a render target is drawn through an
    // intermediate of its desc that can, then copied. False, with nothing recorded, if it can't (the caller skips the copy then).
    // States ("Using Resource Barriers to Synchronize Resource States in Direct3D 12", "Implicit State Transitions"): a texture in the common state is promoted to a copy state by the copy it is the
@@ -9952,6 +9953,8 @@ namespace
             return DXGI_FORMAT_R10G10B10A2_UNORM;
          case DXGI_FORMAT_R11G11B10_FLOAT:
             return DXGI_FORMAT_R11G11B10_FLOAT;
+         case DXGI_FORMAT_R16G16B16A16_UNORM:
+            return DXGI_FORMAT_R16G16B16A16_UNORM;
          case DXGI_FORMAT_R16G16B16A16_TYPELESS:
          case DXGI_FORMAT_R16G16B16A16_FLOAT:
             return DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -10005,9 +10008,8 @@ namespace
       {
          return false;
       }
-      const bool stretched = !same_size;
-      ID3D12PipelineState* const pipeline = (stretched ? GetD3D12GamePassPipeline(&texture_copy, native_device, CompileTimeStringHash("Scale VS"), CompileTimeStringHash("Scale PS"), dest_view_format, "Texture Copy")
-                                                       : GetD3D12GamePassPipeline(&texture_copy, native_device, CompileTimeStringHash("Copy VS"), CompileTimeStringHash("Copy PS"), dest_view_format, "Texture Copy"));
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&texture_copy, native_device, (same_size ? CompileTimeStringHash("Copy VS") : CompileTimeStringHash("Scale VS")),
+         (same_size ? CompileTimeStringHash("Copy PS") : CompileTimeStringHash("Scale PS")), dest_view_format, "Texture Copy");
       if (!pipeline)
       {
          return false;
@@ -10129,11 +10131,6 @@ namespace
          return false;
       }
       DeviceData& device_data = *device->get_private_data<DeviceData>();
-      bool source_upgraded = false;
-      {
-         const std::shared_lock lock(device_data.mutex);
-         source_upgraded = IsUpgradedTexture(device_data, source);
-      }
       reshade::api::resource_desc resolved_desc = source_desc;
       resolved_desc.texture.samples = 1;
       resolved_desc.usage = reshade::api::resource_usage::copy_source | reshade::api::resource_usage::resolve_dest | reshade::api::resource_usage::shader_resource;
@@ -10141,7 +10138,7 @@ namespace
       reshade::api::resource resolved = {};
       {
          const std::unique_lock lock(device_data.texture_copy.mutex); // "ConvertTextureCopyD3D12()" takes it again
-         resolved = GetD3D12CopyIntermediate(device_data, device, resolved_desc, reshade::api::resource_usage::copy_source);
+         resolved = GetD3D12CopyIntermediate(device_data, device, resolved_desc, reshade::api::resource_usage::general);
       }
       if (resolved.handle == 0)
       {
@@ -10150,8 +10147,11 @@ namespace
       auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
       auto* const native_resolved = reinterpret_cast<ID3D12Resource*>(resolved.handle);
       auto* const native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
-      const DXGI_FORMAT resolve_format = (source_upgraded ? DXGI_FORMAT(source_desc.texture.format) : format);
-      cmd_list->barrier(resolved, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::resolve_dest);
+      // The game named the format it created the source with: an upgraded source resolves in its own (typed, of another family), a clone that only has another size (maybe typeless) in the game's
+      const DXGI_FORMAT source_format = DXGI_FORMAT(source_desc.texture.format);
+      const DXGI_FORMAT resolve_format = ((!IsTypelessFormat(source_format) && GetTypelessFormat(source_format) != GetTypelessFormat(format)) ? source_format : format);
+      // In the common state, as "ConvertTextureCopyD3D12()" leaves the texture it samples
+      cmd_list->barrier(resolved, reshade::api::resource_usage::general, reshade::api::resource_usage::resolve_dest);
       com_ptr<ID3D12GraphicsCommandList1> native_list_1;
       native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
       if (native_list_1)
@@ -10172,6 +10172,17 @@ namespace
    {
       const reshade::api::resource_desc desc = device->get_resource_desc(resource);
       return (desc.type == reshade::api::resource_type::buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(desc.texture.format));
+   }
+
+   // Whether "box" (none: all of it) is all of the first subresource of "texture": the resolves that end an emulated render pass ("D3D12Clones") always name a box
+   bool BoxCoversTexture(reshade::api::device* device, reshade::api::resource texture, const reshade::api::subresource_box* box)
+   {
+      if (!box)
+      {
+         return true;
+      }
+      const reshade::api::resource_desc desc = device->get_resource_desc(texture);
+      return (box->left == 0 && box->top == 0 && box->front == 0 && box->right == desc.texture.width && box->bottom == desc.texture.height && box->back == 1);
    }
 
    // The game's placed textures are drawn and sampled through their clones (see "includes/d3d12_clones.h"), so its copies and resolves have to use the clones too: the originals hold nothing. Replaces
@@ -10233,7 +10244,9 @@ namespace
 #else
       constexpr bool scaled = false;
 #endif
-      if (!through_buffer && !scaled && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
+      // A copy moves bytes: right within a typeless family, but for typed FLOAT and UNORM R16G16B16A16 (as on D3D11)
+      const bool float_unorm_16 = ((source_format == DXGI_FORMAT_R16G16B16A16_FLOAT && dest_format == DXGI_FORMAT_R16G16B16A16_UNORM) || (source_format == DXGI_FORMAT_R16G16B16A16_UNORM && dest_format == DXGI_FORMAT_R16G16B16A16_FLOAT));
+      if (!through_buffer && !scaled && !float_unorm_16 && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
       {
          return false;
       }
@@ -10246,7 +10259,9 @@ namespace
       }
 #endif
 #if ENABLE_D3D12_PASSES
-      const bool converted = (enable_upgraded_texture_resource_copy_redirection && ((extent == CopyExtent::Whole && ConvertTextureCopyD3D12(cmd_list, source, dest, scaled)) || (extent == CopyExtent::WholeResolve && ConvertResolveD3D12(cmd_list, source, dest, scaled, resolve_format, resolve_mode))));
+      // The conversions draw: a copy or compute list can't
+      const bool direct_list = (reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT);
+      const bool converted = (enable_upgraded_texture_resource_copy_redirection && direct_list && ((extent == CopyExtent::Whole && ConvertTextureCopyD3D12(cmd_list, source, dest, scaled)) || (extent == CopyExtent::WholeResolve && ConvertResolveD3D12(cmd_list, source, dest, scaled, resolve_format, resolve_mode))));
 #else
       constexpr bool converted = false;
 #endif
@@ -10277,17 +10292,15 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
 #endif
-      bool redirected = RedirectToClones(&source, &dest);
+      const reshade::api::resource game_source = source;
+      const reshade::api::resource game_dest = dest;
+      RedirectToClones(&source, &dest);
+      // Like D3D11, the game can make the copy itself or change what it copies (then the copy is re-issued with them)
+      if (game->OverrideCopyResource(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle))
       {
-         // Like D3D11, the game can make the copy itself or change what it copies (then the copy is re-issued with them)
-         const reshade::api::resource redirected_source = source;
-         const reshade::api::resource redirected_dest = dest;
-         if (game->OverrideCopyResource(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle))
-         {
-            return true;
-         }
-         redirected |= (source.handle != redirected_source.handle || dest.handle != redirected_dest.handle);
+         return true;
       }
+      const bool redirected = (source != game_source || dest != game_dest);
       if (SkipUpgradedFormatCopy(cmd_list, "copy_resource", source, dest, CopyExtent::Whole))
       {
          return true;
@@ -10337,18 +10350,17 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
 #endif
-      bool redirected = RedirectToClones(&source, &dest);
+      const reshade::api::resource game_source = source;
+      const reshade::api::resource game_dest = dest;
+      RedirectToClones(&source, &dest);
+      if (game->OverrideCopyTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, dest_subresource, reinterpret_cast<const D3D12_BOX*>(dest_box), source.handle,
+             source_subresource, reinterpret_cast<const D3D12_BOX*>(source_box)))
       {
-         const reshade::api::resource redirected_source = source;
-         const reshade::api::resource redirected_dest = dest;
-         if (game->OverrideCopyTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, dest_subresource, reinterpret_cast<const D3D12_BOX*>(dest_box), source.handle,
-                source_subresource, reinterpret_cast<const D3D12_BOX*>(source_box)))
-         {
-            return true;
-         }
-         redirected |= (source.handle != redirected_source.handle || dest.handle != redirected_dest.handle);
+         return true;
       }
-      const bool whole = (source_subresource == 0 && dest_subresource == 0 && !source_box && !dest_box); // The conversion checks that subresource 0 is the whole texture
+      const bool redirected = (source != game_source || dest != game_dest);
+      // The conversion checks that subresource 0 is the whole texture. The box is the game's, of its texture
+      const bool whole = (source_subresource == 0 && dest_subresource == 0 && !dest_box && BoxCoversTexture(cmd_list->get_device(), game_source, source_box));
       if (SkipUpgradedFormatCopy(cmd_list, "copy_texture_region", source, dest, (whole ? CopyExtent::Whole : CopyExtent::Part)))
       {
          return true;
@@ -10394,13 +10406,14 @@ namespace
       TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
          { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
 #endif
+      // Of the game's texture, which the box is of
+      const bool whole = (source_subresource == 0 && dest_subresource == 0 && dest_x == 0 && dest_y == 0 && dest_z == 0 && BoxCoversTexture(cmd_list->get_device(), source, source_box));
       const bool redirected = RedirectToClones(&source, &dest);
 #if ENABLE_MINHOOK
       const D3D12_RESOLVE_MODE resolve_mode = D3D12Clones::current_resolve_mode;
 #else
       constexpr D3D12_RESOLVE_MODE resolve_mode = D3D12_RESOLVE_MODE_AVERAGE;
 #endif
-      const bool whole = (source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0);
       // Like D3D11 (where it is only for the indirect upgrades' mirrors): a whole resolve between substituted resources can be made by the game
       if (redirected && whole &&
           game->OverrideResolveTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle,
@@ -10435,6 +10448,7 @@ namespace
       {
          return true;
       }
+      // False, with nothing recorded, if the list can't take it: a region or a mode needs "ID3D12GraphicsCommandList1"
       const auto resolve = [&](ID3D12GraphicsCommandList* native_list)
       {
          auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
@@ -10442,17 +10456,17 @@ namespace
          if (!source_box && dest_x == 0 && dest_y == 0 && resolve_mode == D3D12_RESOLVE_MODE_AVERAGE)
          {
             native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, resolve_format);
+            return true;
          }
-         else
+         com_ptr<ID3D12GraphicsCommandList1> native_list_1;
+         native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
+         if (!native_list_1)
          {
-            com_ptr<ID3D12GraphicsCommandList1> native_list_1;
-            native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
-            if (native_list_1)
-            {
-               D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
-               native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, resolve_mode);
-            }
+            return false;
          }
+         D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
+         native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, resolve_mode);
+         return true;
       };
 #if DEVELOPMENT
       // The readback's target is the command as the game gave it (with its format), what it re-issues is the corrected one
@@ -10463,8 +10477,7 @@ namespace
 #endif
       if (format_corrected || redirected)
       {
-         resolve(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
-         return true;
+         return resolve(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
       }
       return false;
    }
@@ -11560,7 +11573,6 @@ namespace
       constexpr Filter FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT = Filter(reshade::api::filter_mode::compare_min_mag_linear_mip_point);
       constexpr Filter FILTER_MIN_MAG_MIP_POINT = Filter(reshade::api::filter_mode::min_mag_mip_point);
       constexpr Filter FILTER_COMPARISON_MIN_MAG_MIP_POINT = Filter(reshade::api::filter_mode::compare_min_mag_mip_point);
-      constexpr auto COMPARISON_NEVER = decltype(SamplerDesc::ComparisonFunc)(reshade::api::compare_op::never);
       constexpr UINT REQ_MAXANISOTROPY = 16;
       constexpr float MIP_LOD_BIAS_MIN = -16.f; // Setting the bias out of range (~ +/- 16) will make DX11 crash
       constexpr float MIP_LOD_BIAS_MAX = 15.99f;
@@ -11655,7 +11667,9 @@ namespace
          // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
          if (samplers_upgrade_mode >= 7)
          {
-            desc.Filter = (desc.ComparisonFunc != COMPARISON_NEVER && samplers_upgrade_mode == 7) ? FILTER_COMPARISON_ANISOTROPIC : FILTER_ANISOTROPIC;
+            // A comparison sampler (SampleCmp, shadows) stays one
+            const bool comparison = (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_LINEAR || desc.Filter == FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT || desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_POINT);
+            desc.Filter = (comparison ? FILTER_COMPARISON_ANISOTROPIC : FILTER_ANISOTROPIC);
             desc.MaxAnisotropy = REQ_MAXANISOTROPY;
          }
          // Note: changing the lod bias of non anisotropic filters makes reflections (cubemap samples?) a lot more specular (shiny) in Prey (and probably does in other games too), so it's best avoided (it can look better is some screenshots, but it's likely not intended).
@@ -11704,14 +11718,12 @@ namespace
       {
          return false;
       }
-      bool upgraded = false;
       {
          const std::shared_lock lock(s_mutex_samplers);
-         upgraded = UpgradeSamplerDesc(*device_data, &native_desc);
-      }
-      if (!upgraded)
-      {
-         return false;
+         if (!UpgradeSamplerDesc(*device_data, &native_desc))
+         {
+            return false;
+         }
       }
       desc.filter = reshade::api::filter_mode(native_desc.Filter);
       desc.mip_lod_bias = native_desc.MipLODBias;
