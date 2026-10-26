@@ -156,8 +156,8 @@ using NativeCommandList = ID3D11DeviceContext;
 #define ENABLE_MINHOOK 0
 #endif // ENABLE_MINHOOK
 // NVIDIA Reflex injected at present (see "includes/reflex.h"). Needs NVAPI and MinHook; a game can define it to 0 to leave latency
-// to the game. D3D11 only for now.
-#if !ENABLE_NVAPI || !ENABLE_MINHOOK || DX12
+// to the game.
+#if !ENABLE_NVAPI || !ENABLE_MINHOOK
 #undef ENABLE_REFLEX
 #define ENABLE_REFLEX 0
 #elif !defined(ENABLE_REFLEX)
@@ -8702,7 +8702,7 @@ namespace
       if (device_data.reflex.swapchain != swapchain)
          return;
       // The UI's setting, read without the lock like the other per frame settings
-      Reflex::OnFinishPresent((ID3D11Device*)(queue->get_device()->get_native()), (HWND)swapchain->get_hwnd(), &device_data.reflex, reflex_mode);
+      Reflex::OnFinishPresent((NativeDevice*)(queue->get_device()->get_native()), (HWND)swapchain->get_hwnd(), &device_data.reflex, reflex_mode);
 #if DEVELOPMENT
       if (std::exchange(device_data.reflex.log_due, false))
       {
