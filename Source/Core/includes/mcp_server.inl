@@ -220,7 +220,7 @@ namespace Mcp
       // Readbacks, written to disk by the pipe thread before it answers, so the render thread only pays for the copy
       std::vector<std::pair<std::filesystem::path, std::vector<char>>> files;
 
-      // Multi frame state (render thread only)
+      // Multi frame state (under "s_mutex_active_job")
       DeviceData* device_data = nullptr;
       uint32_t phase = 0;
       uint32_t frames = 0; // Captures done, or frames waited for a pass
@@ -322,7 +322,10 @@ namespace Mcp
    std::vector<std::shared_ptr<Job>> pending_jobs; // Guarded by "s_mutex_jobs"
    std::string active_tool;                        // Guarded by "s_mutex_jobs", the running job's, for the status and timeout replies
    std::atomic<bool> has_pending_jobs = false;     // Set under "s_mutex_jobs", read without it
-   std::shared_ptr<Job> active_job;                // Render thread only
+   // Two swapchains can present on two threads, and "OnDestroyDevice()" ends a job on another one
+   std::mutex s_mutex_active_job;
+   std::shared_ptr<Job> active_job;            // Guarded by "s_mutex_active_job"
+   std::atomic<bool> has_active_job = false;   // Set under "s_mutex_active_job", read without it
    std::thread server_thread;
    std::atomic<bool> server_stop = false;
    std::atomic<bool> server_running = false;
@@ -1412,7 +1415,7 @@ namespace Mcp
 #else
                   // What the D3D12 "GetResourceInfo()" gives, which wants a ReShade device the tap doesn't have
                   const D3D12_RESOURCE_DESC desc = resources[i]->GetDesc();
-                  last_resources[i] = {.size = {uint32_t(desc.Width), desc.Height, desc.DepthOrArraySize, (desc.SampleDesc.Count > 1 ? desc.SampleDesc.Count : desc.MipLevels)}, .format = desc.Format, .resource = std::to_string(std::hash<void*>{}(resources[i]))};
+                  last_resources[i] = {.size = {uint32_t(desc.Width), desc.Height, desc.DepthOrArraySize, (desc.SampleDesc.Count > 1 ? desc.SampleDesc.Count : desc.MipLevels)}, .format = desc.Format, .resource = ResourceHashString(reinterpret_cast<uint64_t>(resources[i]))};
 #endif
                }
             }
@@ -2057,6 +2060,25 @@ namespace Mcp
       return producer;
    }
 
+   // The last entry before "consumer" that wrote what its SRV "slot" reads ("FindProducer()": the mip it reads, and for a depth stencil SRV
+   // the plane). Sets "target" to read it; nothing, with "error" saying why.
+   std::optional<size_t> FindSRVProducer(const std::vector<TraceDrawCallData>& entries, size_t consumer, uint32_t slot, D3D12Readback::Target* target, std::string* error)
+   {
+      const TraceDrawCallData& entry = entries[consumer];
+      if (slot >= entry.srv_count || entry.sr_hash[slot].empty())
+      {
+         *error = std::format("Trace entry {} has no bound SRV at slot {}", consumer, slot);
+         return std::nullopt;
+      }
+      std::string refusal;
+      const std::optional<size_t> producer = FindProducer(entries, consumer, entry.sr_hash[slot], entry.srv_mip[slot], entry.srv_format[slot], false, target, &refusal);
+      if (!producer)
+      {
+         *error = (refusal.empty() ? std::format("No entry before {} wrote the resource of its SRV {} as a render target, UAV or depth stencil target, or by a copy, resolve or clear (the capture misses writes from before the captured frame, CopyTiles and DiscardResource)", consumer, slot) : refusal);
+      }
+      return producer;
+   }
+
    // The target of the draw "index" of "entries" (run by "pipeline"): its pipeline, its outputs and arguments, and its place among the draws equal to it.
    // Returns the hash of the shader that writes the outputs, which names it.
    uint32_t FillDrawTarget(DeviceData& device_data, const std::vector<TraceDrawCallData>& entries, size_t index, const Shader::CachedPipeline& pipeline, D3D12Readback::Target* target)
@@ -2093,11 +2115,8 @@ namespace Mcp
       for (size_t i = 0; i < entries.size() && !consumer; i++)
       {
          const TraceDrawCallData& entry = entries[i];
-         bool runs_pipeline = false;
-         for (const Shader::CachedPipeline* pipeline : pipelines)
-         {
-            runs_pipeline |= (entry.type == TraceDrawCallData::TraceDrawCallType::Shader && pipeline->pipeline.handle == entry.pipeline_handle);
-         }
+         const bool runs_pipeline = entry.type == TraceDrawCallData::TraceDrawCallType::Shader && std::ranges::any_of(pipelines, [&](const Shader::CachedPipeline* pipeline)
+            { return pipeline->pipeline.handle == entry.pipeline_handle; });
          if (runs_pipeline && (!signature || D3D12Trace::MakeDrawSignature(device_data, entry.draw_dispatch_data, signature->compute, entry.rt_view[0].resource, entry.ds_view.resource) == *signature) && (instance < 0 || draws_found++ == instance))
          {
             consumer = i;
@@ -2108,25 +2127,10 @@ namespace Mcp
          *error = "The last capture has no such draw of the shader (its instance and signature are those of the draw when it was picked)";
          return std::nullopt;
       }
-      const TraceDrawCallData& entry = entries[*consumer];
-      if (slot >= entry.srv_count || entry.sr_hash[slot].empty())
-      {
-         *error = std::format("Trace entry {} has no bound SRV at slot {}: pick the slot", *consumer, slot);
-         return std::nullopt;
-      }
       D3D12Readback::Target target;
-      std::string refusal;
-      const std::optional<size_t> producer = FindProducer(entries, *consumer, entry.sr_hash[slot], entry.srv_mip[slot], entry.srv_format[slot], false, &target, &refusal);
-      if (!refusal.empty())
-      {
-         *error = refusal;
-         return std::nullopt;
-      }
+      const std::optional<size_t> producer = FindSRVProducer(entries, *consumer, slot, &target, error);
       if (!producer)
-      {
-         *error = std::format("No entry before {} wrote the resource of its SRV {} as a render target, UAV or depth stencil target, or by a copy, resolve or clear (the capture misses writes from before the captured frame, CopyTiles and DiscardResource)", *consumer, slot);
          return std::nullopt;
-      }
       const Shader::CachedPipeline* const pipeline = (entries[*producer].type == TraceDrawCallData::TraceDrawCallType::Shader) ? FindPipeline(device_data, entries[*producer].pipeline_handle) : nullptr;
       if (!pipeline)
       {
@@ -2220,14 +2224,16 @@ namespace Mcp
             {
                using WriteKind = D3D12Readback::WriteKind;
                using DepthStateType = TraceDrawCallData::DepthStateType;
+               if (UnreadableWrite(other))
+                  return {};
                const D3D12State::ViewInfo& written = other.rt_view[0];
-               if (other.type == TraceDrawCallData::TraceDrawCallType::ClearResource && !UnreadableWrite(other))
+               if (other.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
                {
                   const bool is_depth_clear = other.clear_kind == TraceDrawCallData::ClearKind::DepthStencil;
                   const uint8_t planes = (is_depth_clear ? ((other.depth_state == DepthStateType::WriteOnly ? 1 : 0) | (other.stencil_state == DepthStateType::WriteOnly ? 2 : 0)) : 0);
                   return {.resource = written.resource, .kind = (is_depth_clear ? WriteKind::ClearDepthStencil : WriteKind::ClearRenderTarget), .level = written.first_level, .layer = written.first_layer, .planes = planes};
                }
-               if (other.type == TraceDrawCallData::TraceDrawCallType::CopyResource && !UnreadableWrite(other))
+               if (other.type == TraceDrawCallData::TraceDrawCallType::CopyResource)
                {
                   switch (other.copy_info.kind)
                   {
@@ -2441,7 +2447,10 @@ namespace Mcp
          }
          if (!waited)
          {
-            // "D3D12Readback::CollectRetired()" frees it at a later present, once its fence passed
+            // "D3D12Readback::CollectRetired()" frees it at a later present, once its fence passed. Its list may still be pending on the queue,
+            // so the list and its allocator are leaked rather than released under it (rare: a queue that waits on the game).
+            allocator->AddRef();
+            native_list->AddRef();
             const std::unique_lock lock(device_data.readback.mutex);
             device_data.readback.retired.push_back(std::move(copy));
             job->error = "The texture copy didn't finish within 2 s: the queue is waiting on something (a fence the game signals later?)";
@@ -2522,11 +2531,7 @@ namespace Mcp
             return true;
          }
          D3D12Readback::Target target = {.kind = kind->second, .slot = uint32_t(job->IntArg("slot", 0, 0, INT32_MAX))};
-         std::optional<size_t> index;
-         if (job->Arg("index"))
-         {
-            index = size_t(job->IntArg("index", 0));
-         }
+         std::optional<size_t> index = (job->Arg("index") ? std::optional<size_t>(job->IntArg("index", 0)) : std::nullopt);
          if (kind->first == "srv")
          {
             // Its state at the draw isn't known (any read only combination): read it after the last pass of the capture that wrote it
@@ -2542,29 +2547,10 @@ namespace Mcp
                job->error = std::format("Trace index {} is out of range (captured {}), run luma_trace_capture first", *index, entries.size());
                return true;
             }
-            if (target.slot >= entries[*index].srv_count || entries[*index].sr_hash[target.slot].empty())
-            {
-               job->error = std::format("Trace entry {} has no bound SRV at slot {}", *index, target.slot);
-               return true;
-            }
-            const std::string& resource = entries[*index].sr_hash[target.slot];
             const uint32_t srv_slot = target.slot;
-            // The producer must write the mip the SRV reads, and for a depth stencil SRV the plane
-            const uint32_t srv_mip = entries[*index].srv_mip[srv_slot];
-            const DXGI_FORMAT srv_format = entries[*index].srv_format[srv_slot];
-            const bool reads_stencil = srv_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || srv_format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
-            std::string refusal;
-            const std::optional<size_t> producer = FindProducer(entries, *index, resource, srv_mip, srv_format, false, &target, &refusal);
-            if (!refusal.empty())
-            {
-               job->error = refusal;
-               return true;
-            }
+            const std::optional<size_t> producer = FindSRVProducer(entries, *index, srv_slot, &target, &job->error);
             if (!producer)
-            {
-               job->error = std::format("No entry before {} wrote its resource as a render target, UAV or {} target, or by a copy, resolve or clear (the capture misses writes from before the captured frame, CopyTiles and DiscardResource)", *index, reads_stencil ? "stencil" : "depth");
                return true;
-            }
             job->result.Field("producer_index", *producer).Field("note", std::format("SRV {} of entry {} read after entry {} wrote it (the capture misses writes from before the captured frame, CopyTiles and DiscardResource)", srv_slot, *index, *producer));
             index = producer;
          }
@@ -2638,11 +2624,7 @@ namespace Mcp
             target.cb_register = uint32_t(slot);
             target.cb_space = uint32_t(job->IntArg("space", 0, 0, INT32_MAX));
          }
-         std::optional<size_t> index;
-         if (job->Arg("index"))
-         {
-            index = size_t(job->IntArg("index", 0));
-         }
+         const std::optional<size_t> index = (job->Arg("index") ? std::optional<size_t>(job->IntArg("index", 0)) : std::nullopt);
          if (!ResolveTarget(job, device_data, cmd_list_data, index, &target))
             return true;
          job->readback_target = std::move(target);
@@ -3465,13 +3447,14 @@ namespace Mcp
          return RunWaitFrames(job);
       if (tool == "perf")
          return RunPerf(job, device_data, queue);
+      DeviceData* traced_device_data = &device_data;
+      CommandListData* traced_cmd_list_data = &cmd_list_data;
 #if DX12
       // The capture is the one of the device it records (see "trace_device_data"), whose pipelines its entries name: "device" (luma_trace_capture) picks it, for the next captures
       // too. The readbacks at its entries run on the presenting device only.
       if (tool == "trace_capture" || tool == "trace_list" || tool == "trace_get" || ((tool == "read_resource" || tool == "read_cbuffer") && job->Arg("index")))
       {
          const int64_t device_index = ((tool == "trace_capture" && job->phase == 0) ? job->IntArg("device", -1) : -1);
-         DeviceData* traced_device_data = nullptr;
          {
             const std::shared_lock lock_device(s_mutex_device);
             const std::unique_lock lock_trace(s_mutex_trace);
@@ -3484,16 +3467,14 @@ namespace Mcp
             {
                trace_device_data = global_devices_data[size_t(device_index)];
             }
-            traced_device_data = (trace_device_data ? trace_device_data : &device_data);
+            if (trace_device_data)
+            {
+               traced_device_data = trace_device_data;
+               traced_cmd_list_data = &trace_device_data->trace_command_list_data;
+            }
          }
-         if (traced_device_data != &device_data)
+         if (traced_device_data != &device_data && (tool == "read_resource" || tool == "read_cbuffer"))
          {
-            if (tool == "trace_capture")
-               return RunTraceCapture(job, *traced_device_data, traced_device_data->trace_command_list_data);
-            if (tool == "trace_list")
-               return RunTraceList(job, *traced_device_data, traced_device_data->trace_command_list_data);
-            if (tool == "trace_get")
-               return RunTraceGet(job, *traced_device_data, traced_device_data->trace_command_list_data);
             job->error = "The capture is of another device than the presenting one (luma_trace_capture device), and readbacks only run on the presenting device";
             return true;
          }
@@ -3516,11 +3497,11 @@ namespace Mcp
          return RunSrCapture(job, device_data);
 #endif
       if (tool == "trace_capture")
-         return RunTraceCapture(job, device_data, cmd_list_data);
+         return RunTraceCapture(job, *traced_device_data, *traced_cmd_list_data);
       if (tool == "trace_list")
-         return RunTraceList(job, device_data, cmd_list_data);
+         return RunTraceList(job, *traced_device_data, *traced_cmd_list_data);
       if (tool == "trace_get")
-         return RunTraceGet(job, device_data, cmd_list_data);
+         return RunTraceGet(job, *traced_device_data, *traced_cmd_list_data);
       if (tool == "shader_state")
          return RunShaderState(job, device_data);
       if (tool == "reload_shaders")
@@ -3667,21 +3648,24 @@ namespace Mcp
          constexpr std::string_view outside_root = "out_dir must be the \"root\" folder or a subfolder of it";
          std::string response = refused ? path_error(outside_root, "root", ReadbackRoot()) : finished ? std::move(job->result.out)
                                                                                                       : timeout_error();
-         // Readbacks are written here rather than on the render thread
-         for (const auto& [path, bytes] : job->files)
+         // Readbacks are written here rather than on the render thread, once the job finished: a timed out one may still add files
+         if (finished)
          {
-            if (!IsInReadbackRoot(path.parent_path()))
+            for (const auto& [path, bytes] : job->files)
             {
-               response = path_error(outside_root, "root", ReadbackRoot());
-               break;
-            }
-            std::error_code ec;
-            std::filesystem::create_directories(path.parent_path(), ec);
-            std::ofstream file(path, std::ios::binary | std::ios::trunc);
-            if (!file.write(bytes.data(), std::streamsize(bytes.size())))
-            {
-               response = path_error("Failed to write", "path", path);
-               break;
+               if (!IsInReadbackRoot(path.parent_path()))
+               {
+                  response = path_error(outside_root, "root", ReadbackRoot());
+                  break;
+               }
+               std::error_code ec;
+               std::filesystem::create_directories(path.parent_path(), ec);
+               std::ofstream file(path, std::ios::binary | std::ios::trunc);
+               if (!file.write(bytes.data(), std::streamsize(bytes.size())))
+               {
+                  response = path_error("Failed to write", "path", path);
+                  break;
+               }
             }
          }
          if (!write_response(response))
@@ -4010,42 +3994,10 @@ namespace Mcp
 
    // Called from "OnPresent" on the render thread, before display composition. "cmd_list_data" holds the frame capture.
    // D3D12: called again after the composition ("after_composition"), where only the job that reads the composed back buffer runs.
-   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, bool after_composition = false)
+   // Ends "active_job", run on "device_data": restores what it changed, completes its result and wakes its client. "s_mutex_active_job" is held.
+   void FinishActiveJob(DeviceData& device_data)
    {
-#if DX12
-      if (after_composition && (!active_job || !active_job->ReadsComposedBackBuffer()))
-         return;
-#endif
-      last_present_ms = GetTickCount64();
-      last_frame_index = cb_luma_global_settings.FrameIndex;
-#if DX12
-      D3D12Readback::CollectRetired(&device_data.readback);
-#endif
-      if (!active_job && !has_pending_jobs) // Unlocked early out, every present comes through here
-         return;
-      if (!active_job)
-      {
-         const std::lock_guard lock(s_mutex_jobs);
-         if (pending_jobs.empty())
-            return;
-         active_job = pending_jobs.front();
-         pending_jobs.erase(pending_jobs.begin());
-         has_pending_jobs = !pending_jobs.empty();
-         active_tool = active_job->tool;
-      }
-      // Multi frame jobs stay on the device they started on
-      if (active_job->device_data && active_job->device_data != &device_data)
-         return;
-      active_job->device_data = &device_data;
-#if DX12
-      // The jobs that read the composed back buffer wait for the call after the composition, the others run in the first one
-      if (active_job->ReadsComposedBackBuffer() != after_composition)
-         return;
-#endif
-
       Job& job = *active_job;
-      if (!RunJob(&job, device_data, cmd_list_data, queue, swapchain))
-         return;
 #if DX11
       if (job.saved_debug_draw)
       {
@@ -4082,10 +4034,71 @@ namespace Mcp
          job.result.EndArray();
       }
       job.result.EndObject();
-      SetEvent(active_job->done);
+      SetEvent(job.done);
       active_job.reset();
+      has_active_job = false;
       const std::lock_guard lock(s_mutex_jobs);
       active_tool.clear();
+   }
+
+   void OnPresent(DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, bool after_composition = false)
+   {
+      // D3D12: the call after the composition only runs the job that reads the composed back buffer
+      if (!after_composition)
+      {
+         last_present_ms = GetTickCount64();
+         last_frame_index = cb_luma_global_settings.FrameIndex;
+#if DX12
+         D3D12Readback::CollectRetired(&device_data.readback);
+#endif
+      }
+      if (!has_active_job && !has_pending_jobs) // Unlocked early out, every present comes through here
+         return;
+      // Another presenting thread running the job skips this present (multi frame jobs stay on the device they started on anyway). Not
+      // waited for: the job calls the game's device and queue.
+      const std::unique_lock lock_active_job(s_mutex_active_job, std::try_to_lock);
+      if (!lock_active_job.owns_lock())
+         return;
+#if DX12
+      if (after_composition && (!active_job || !active_job->ReadsComposedBackBuffer()))
+         return;
+#endif
+      if (!active_job)
+      {
+         const std::lock_guard lock(s_mutex_jobs);
+         if (pending_jobs.empty())
+            return;
+         active_job = pending_jobs.front();
+         pending_jobs.erase(pending_jobs.begin());
+         has_pending_jobs = !pending_jobs.empty();
+         has_active_job = true;
+         active_tool = active_job->tool;
+      }
+      if (active_job->device_data && active_job->device_data != &device_data)
+         return;
+      active_job->device_data = &device_data;
+#if DX12
+      // The jobs that read the composed back buffer wait for the call after the composition, the others run in the first one
+      if (active_job->ReadsComposedBackBuffer() != after_composition)
+         return;
+#endif
+      if (RunJob(active_job.get(), device_data, cmd_list_data, queue, swapchain))
+      {
+         FinishActiveJob(device_data);
+      }
+   }
+
+   // Called from Core's "OnDestroyDevice()" once "trace_device_data" no longer names the device. Fails the multi frame job that runs on it,
+   // which would otherwise wait for its presents forever, and waits for a job running on another presenting thread, which can read this
+   // device's capture.
+   void OnDestroyDevice(DeviceData& device_data)
+   {
+      const std::lock_guard lock(s_mutex_active_job);
+      if (!active_job || active_job->device_data != &device_data)
+         return;
+      active_job->perf.reset(); // Its queries and command lists are the device's
+      active_job->error = "The device the job ran on was destroyed";
+      FinishActiveJob(device_data);
    }
 
    // Called from "Uninit()", before ReShade frees the add-on: a thread holds a reference to the add-on module until it has exited, so a

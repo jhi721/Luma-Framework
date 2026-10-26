@@ -4044,6 +4044,14 @@ namespace
 #endif // DX12
    }
 
+#if DEVELOPMENT
+   namespace Mcp
+   {
+      // Declared ahead of "includes/mcp_server.inl", which is included far below, after the dev globals it drives
+      void OnDestroyDevice(DeviceData& device_data);
+   } // namespace Mcp
+#endif
+
    void OnDestroyDevice(reshade::api::device* device)
    {
       if (!IsSupportedGraphicsAPI(device->get_api())) return;
@@ -4093,6 +4101,9 @@ namespace
             trace_device_data = nullptr;
          }
       }
+#endif
+#if DEVELOPMENT
+      Mcp::OnDestroyDevice(device_data);
 #endif
       {
          const std::unique_lock lock(s_mutex_device);
