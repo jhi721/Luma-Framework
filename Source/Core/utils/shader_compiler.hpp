@@ -440,7 +440,7 @@ namespace Shader
          bool preloaded_dxil = false;
          if (std::filesystem::is_regular_file(folder / L"dxcompiler.dll"))
          {
-            preloaded_dxil = std::filesystem::is_regular_file(folder / L"dxil.dll") && LoadLibraryW((folder / L"dxil.dll").c_str()) != nullptr;
+            preloaded_dxil = LoadLibraryW((folder / L"dxil.dll").c_str()) != nullptr;
             dxc_module = LoadLibraryW((folder / L"dxcompiler.dll").c_str());
          }
          if (dxc_module == nullptr)
@@ -543,14 +543,17 @@ namespace Shader
    }
 
    // HLSL 2021 (what the decompiled DXIL targets), plus the options the shader opts into
-   void AddDxcLanguageArguments(std::vector<LPCWSTR>* arguments, const void* source, size_t source_size)
+   // Returns whether the source opted into 16 bit types
+   bool AddDxcLanguageArguments(std::vector<LPCWSTR>* arguments, const void* source, size_t source_size)
    {
       arguments->push_back(L"/HV");
       arguments->push_back(L"2021");
-      if (OptsInto16BitTypes(source, source_size))
+      const bool enable_16bit_types = OptsInto16BitTypes(source, source_size);
+      if (enable_16bit_types)
       {
          arguments->push_back(L"-enable-16bit-types");
       }
+      return enable_16bit_types;
    }
 
    // The macros as DXC takes them, pointing into "strings" (which has to outlive the result)
@@ -594,7 +597,7 @@ namespace Shader
       std::vector<std::wstring> define_strings;
       const std::vector<DxcDefine> dxc_defines = ToDxcDefines(defines, &define_strings);
       std::vector<LPCWSTR> arguments;
-      AddDxcLanguageArguments(&arguments, source->GetBufferPointer(), source->GetBufferSize());
+      const bool enable_16bit_types = AddDxcLanguageArguments(&arguments, source->GetBufferPointer(), source->GetBufferSize());
       // The target is checked against the options (16 bit types need SM6.2) and defines macros ("__SHADER_TARGET_MAJOR"...), as it does for a compile
       const CA2W shader_target_wide(shader_target, CP_UTF8);
       arguments.push_back(L"-T");
@@ -619,7 +622,7 @@ namespace Shader
       }
       const char* preprocessed_text = static_cast<const char*>(preprocessed_blob->GetBufferPointer());
       preprocessed_code.assign(preprocessed_text, strnlen(preprocessed_text, preprocessed_blob->GetBufferSize())); // The blob's size can include its null terminator
-      if (OptsInto16BitTypes(source->GetBufferPointer(), source->GetBufferSize()))
+      if (enable_16bit_types)
       {
          preprocessed_code += "\n// dxc: -enable-16bit-types\n";
       }

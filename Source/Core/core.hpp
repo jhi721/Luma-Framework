@@ -1840,7 +1840,7 @@ namespace
       const auto start = std::chrono::steady_clock::now();
       const bool is_clone = (base != cached_pipeline.pipeline.handle);
       // The code a clone was built from never changes, whereas the replacements now in the loading cache do (a reload). The locks aren't nested: "LoadCustomShaders()" and "UnloadCustomShaders()"
-      // lock "s_mutex_generic" and then "s_mutex_loading", the other way round
+      // lock "s_mutex_generic" before "s_mutex_loading", which nesting them here would invert
       std::optional<uint64_t> clone_code_hash;
       if (is_clone)
       {
@@ -2899,7 +2899,7 @@ namespace
                   }
                   // The repository's shaders are shared by every project: a D3D12 build's DXIL can't take the name of a D3D11 build's DXBC, which would
                   // load it as the cache of the same native (the config's preprocessor hash matches) and fail to create its shader
-                  if (std::string_view(local_shader_target).substr(3) >= "6_0")
+                  if (local_shader_target[3] >= '6')
                   {
                      file_name_cso += L"." + std::wstring(local_shader_target.begin(), local_shader_target.end());
                   }
@@ -3247,7 +3247,7 @@ namespace
       std::vector<CachedPipeline*> pipelines_to_clone;
       std::unordered_set<uint64_t> iterated_pipelines;
 
-      const std::shared_lock lock_loading(s_mutex_loading);
+      std::shared_lock lock_loading(s_mutex_loading);
 
       for (const auto& custom_shader_pair : custom_shaders_cache)
       {
@@ -3301,7 +3301,7 @@ namespace
          }
       }
 
-#if LUMA_PATCH_PROVIDERS != 0
+#if LUMA_PATCH_PROVIDERS != 0 // D3D11 only (see the "#error" next to the includes), so it has no D3D12 branch
       {
          const std::shared_lock lock_device(device_data.mutex);
          device_data.patch_context.ForEachPatchedShader([&](const uint32_t shader_hash, const Patch::PatchedShaderData&)
@@ -3347,10 +3347,17 @@ namespace
          pair.second->destroy_pipeline(reshade::api::pipeline{pair.first}); // TODO: verify the device is the same as the "device_data" we passed in here? Otherwise it might not properly support two devices. Theoretically we should pass in a device filter to the funcs to unload cloned pipelines
       }
 
+      std::vector<std::tuple<CachedPipeline*, reshade::api::pipeline, uint64_t>> cloned_pipelines_data; // And the hash of the code each was built from (D3D12 only)
 #if DX12
-      std::vector<std::tuple<CachedPipeline*, reshade::api::pipeline, uint64_t>> cloned_pipelines_data; // And the hash of the code each was built from
-#else
-      std::vector<std::tuple<CachedPipeline*, reshade::api::pipeline>> cloned_pipelines_data;
+      // The code is copied, so the clones are created without "s_mutex_loading" held across the device calls (as in "OnInitPipeline()")
+      struct D3D12CloneSource
+      {
+         CachedPipeline* cached_pipeline = nullptr;
+         uint64_t code_hash = 0;
+         std::vector<std::vector<uint8_t>> codes; // What "replacements" point to
+         std::vector<D3D12StageReplacement> replacements;
+      };
+      std::vector<D3D12CloneSource> d3d12_clone_sources;
 #endif
 
        // "s_mutex_loading" is expected to still be locked
@@ -3385,32 +3392,19 @@ namespace
 #endif
 
 #if DX12
-          const std::vector<D3D12StageReplacement> replacements = FindD3D12StageReplacements(*cached_pipeline);
+          std::vector<D3D12StageReplacement> replacements = FindD3D12StageReplacements(*cached_pipeline);
           if (replacements.empty())
           {
              continue;
           }
           cached_pipeline->clone_origin = Shader::CloneOrigin::File;
-
-          // A reload of the same code reuses the clone it made, which was retired above
-          const uint64_t code_hash = HashD3D12Replacements(replacements);
-          reshade::api::pipeline pipeline_clone = {};
+          D3D12CloneSource& clone_source = d3d12_clone_sources.emplace_back(D3D12CloneSource{.cached_pipeline = cached_pipeline, .code_hash = HashD3D12Replacements(replacements)});
+          clone_source.codes.reserve(replacements.size());
+          for (D3D12StageReplacement& replacement : replacements)
           {
-             const std::shared_lock lock_retired(s_mutex_generic);
-             const auto retired_clone = std::ranges::find(cached_pipeline->retired_clones, code_hash, &CachedPipeline::RetiredClone::code_hash);
-             if (retired_clone != cached_pipeline->retired_clones.end())
-             {
-                pipeline_clone = retired_clone->clone;
-             }
+             replacement.code = clone_source.codes.emplace_back(replacement.code.begin(), replacement.code.end());
           }
-          if (pipeline_clone.handle == 0)
-          {
-             pipeline_clone = CreateD3D12Clone(cached_pipeline, replacements);
-          }
-          if (pipeline_clone.handle != 0)
-          {
-             cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone, code_hash));
-          }
+          clone_source.replacements = std::move(replacements);
 #else
           auto [pipeline_clone, injected] = Patch::ClonePipelineWithPatches(
              cached_pipeline->device, cached_pipeline->layout,
@@ -3479,11 +3473,37 @@ namespace
 
           if (pipeline_clone.handle != 0)
           {
-             cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone));
+             cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone, uint64_t{0}));
           }
 #endif // DX12
 
        }
+
+      lock_loading.unlock(); // Before "s_mutex_generic" is locked again, as "UnloadCustomShaders()" locks it first
+
+#if DX12
+      for (const D3D12CloneSource& clone_source : d3d12_clone_sources)
+      {
+         // A reload of the same code reuses the clone it made, which was retired above
+         reshade::api::pipeline pipeline_clone = {};
+         {
+            const std::shared_lock lock_retired(s_mutex_generic);
+            const auto retired_clone = std::ranges::find(clone_source.cached_pipeline->retired_clones, clone_source.code_hash, &CachedPipeline::RetiredClone::code_hash);
+            if (retired_clone != clone_source.cached_pipeline->retired_clones.end())
+            {
+               pipeline_clone = retired_clone->clone;
+            }
+         }
+         if (pipeline_clone.handle == 0)
+         {
+            pipeline_clone = CreateD3D12Clone(clone_source.cached_pipeline, clone_source.replacements);
+         }
+         if (pipeline_clone.handle != 0)
+         {
+            cloned_pipelines_data.push_back(std::make_tuple(clone_source.cached_pipeline, pipeline_clone, clone_source.code_hash));
+         }
+      }
+#endif
 
       lock.lock(); // Needed for "pipeline_cache_by_pipeline_clone_handle"
 
