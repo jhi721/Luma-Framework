@@ -828,6 +828,9 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // None was applied ("ApplySRType"): a game whose draws may still use its upscaler resources until its "OnPresent" latches the
    // selection releases them there, taking this with "exchange(false)" (and can set it for its own reasons)
    std::atomic<bool> release_sr_resources = false;
+   // Exclusive for "ApplySRType()" (at present), shared by a game's SR draw ("LockSRForDraw()"): the type and its instance don't switch, nor do retired
+   // upscaler objects go, while a list records the draw
+   std::shared_mutex sr_mutex;
    std::map<SR::Type, SR::InstanceData*> sr_implementations_instances; // All implementations allowed by the current mod, might not all be compatible
    SR::InstanceData* GetSRInstanceData() const
    {

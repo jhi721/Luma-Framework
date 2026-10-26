@@ -27,18 +27,18 @@ namespace FidelityFX
    // Index in the upscaler versions the runtime lists for the device (logged at init), -1 for its default. Applies at the next context creation.
    inline int version_index_override = -1; // "core.fsr_version_index"
 #endif
-#if ENABLE_FSR_DEBUG_VIEW && DX12
-   inline bool draw_debug_view = false; // "core.fsr_debug_view"
-#elif ENABLE_FSR_DEBUG_VIEW
-   inline bool draw_debug_view = true;
+#if ENABLE_FSR_DEBUG_VIEW
+   inline bool draw_debug_view = !DX12; // "core.fsr_debug_view" on D3D12
 #endif
 
    // FSR 3 SR on D3D11, FSR 4 (or the newest version the GPU supports) on D3D12
    class FSR : public SR::SuperResolutionImpl
    {
    public:
+#if !DX12
       virtual bool HasInit(const SR::InstanceData* data) const override;
       virtual bool IsSupported(const SR::InstanceData* data) const override;
+#endif
 
       virtual bool Init(SR::InstanceData*& data, SR::Device* device, IDXGIAdapter* adapter = nullptr) override;
       virtual void Deinit(SR::InstanceData*& data, SR::Device* optional_device = nullptr) override;
@@ -48,9 +48,13 @@ namespace FidelityFX
 
       virtual bool Draw(const SR::InstanceData* data, SR::CommandList* command_list, const DrawData& draw_data) override;
 
-      virtual int GetJitterPhases(const SR::InstanceData* data) const;
+      virtual int GetJitterPhases(const SR::InstanceData* data) const override;
 
-      virtual bool NeedsStateRestoration() const
+#if DX12
+      virtual void ReleaseRetired(SR::InstanceData* data) override;
+#endif
+
+      virtual bool NeedsStateRestoration() const override
       {
          return true;
       }

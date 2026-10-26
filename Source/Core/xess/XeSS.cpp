@@ -8,7 +8,9 @@
 
 #include <include/reshade.hpp>
 
+#include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <format>
 #include <string>
@@ -33,15 +35,6 @@ namespace Intel
       xess_context_handle_t context = nullptr;
       // Reinitializing a context needs its command lists done, so a settings change creates a new one instead
       SR::DeferredReleases<xess_context_handle_t> retired_contexts;
-
-      void RetireContext()
-      {
-         if (context)
-         {
-            retired_contexts.Push(context);
-            context = nullptr;
-         }
-      }
    };
 
    bool Intel::XeSS::Init(SR::InstanceData*& data, SR::Device* device, IDXGIAdapter* adapter)
@@ -63,7 +56,6 @@ namespace Intel
       custom_data = new XeSSInstanceData();
       custom_data->module = module;
       custom_data->device = device;
-      custom_data->automatically_restores_pipeline_state = false; // It binds its own descriptor heap, root signatures and pipelines
       custom_data->min_resolution = 32;
       custom_data->create_context = reinterpret_cast<decltype(&xessD3D12CreateContext)>(GetProcAddress(module, "xessD3D12CreateContext"));
       custom_data->init = reinterpret_cast<decltype(&xessD3D12Init)>(GetProcAddress(module, "xessD3D12Init"));
@@ -84,8 +76,7 @@ namespace Intel
       custom_data->version = std::format("{}.{}.{}", version.major, version.minor, version.patch);
       custom_data->version_name = custom_data->version.c_str();
 
-      // A context is the only support check (it fails without SM 6.4). It's created here on the device's thread and destroyed right away: the ones that run are
-      // created by "UpdateSettings()", on the thread that draws with them, as XeSS calls must come from the thread that created their context.
+      // A context is the only support check (it fails without SM 6.4). It's destroyed right away: the ones that run are created by "UpdateSettings()"
       xess_context_handle_t probe_context = nullptr;
       const xess_result_t result = custom_data->create_context(device, &probe_context);
       if (result != XESS_RESULT_SUCCESS)
@@ -113,7 +104,7 @@ namespace Intel
       }
 
       // The device is going away, nothing of it runs anymore
-      custom_data->RetireContext();
+      custom_data->retired_contexts.Retire(&custom_data->context);
       custom_data->retired_contexts.ReleaseAll([&](xess_context_handle_t* retired)
          { custom_data->destroy_context(*retired); });
       HMODULE module = custom_data->module;
@@ -127,18 +118,16 @@ namespace Intel
    {
       if (data)
       {
-         static_cast<XeSSInstanceData*>(data)->RetireContext();
+         auto* const custom_data = static_cast<XeSSInstanceData*>(data);
+         custom_data->retired_contexts.Retire(&custom_data->context);
       }
    }
 
-   bool Intel::XeSS::HasInit(const SR::InstanceData* data) const
+   void Intel::XeSS::ReleaseRetired(SR::InstanceData* data)
    {
-      return data != nullptr;
-   }
-
-   bool Intel::XeSS::IsSupported(const SR::InstanceData* data) const
-   {
-      return data && data->is_supported;
+      auto* const custom_data = static_cast<XeSSInstanceData*>(data);
+      custom_data->retired_contexts.Release([&](xess_context_handle_t* retired)
+         { custom_data->destroy_context(*retired); });
    }
 
    bool Intel::XeSS::UpdateSettings(SR::InstanceData* data, SR::CommandList* command_list, const SR::SettingsData& settings_data)
@@ -147,15 +136,12 @@ namespace Intel
       if (!command_list || !custom_data || !custom_data->is_supported)
          return false;
 
-      custom_data->retired_contexts.Release([&](xess_context_handle_t* retired)
-         { custom_data->destroy_context(*retired); });
-
       if (settings_data == custom_data->settings_data && custom_data->context)
       {
          return true;
       }
 
-      custom_data->RetireContext();
+      custom_data->retired_contexts.Retire(&custom_data->context);
 
       if (custom_data->create_context(custom_data->device.Get(), &custom_data->context) != XESS_RESULT_SUCCESS)
       {
@@ -194,14 +180,15 @@ namespace Intel
          }
       }
 
-      xess_d3d12_init_params_t init_params = {};
-      init_params.outputResolution = output_resolution;
-      init_params.qualitySetting = quality;
-      init_params.initFlags = (settings_data.inverted_depth ? XESS_INIT_FLAG_INVERTED_DEPTH : 0) | (settings_data.mvs_jittered ? XESS_INIT_FLAG_JITTERED_MV : 0) | (settings_data.auto_exposure ? XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE : 0) | (settings_data.hdr ? 0 : XESS_INIT_FLAG_LDR_INPUT_COLOR);
+      const xess_d3d12_init_params_t init_params = {
+         .outputResolution = output_resolution,
+         .qualitySetting = quality,
+         .initFlags = uint32_t((settings_data.inverted_depth ? XESS_INIT_FLAG_INVERTED_DEPTH : 0) | (settings_data.mvs_jittered ? XESS_INIT_FLAG_JITTERED_MV : 0) | (settings_data.auto_exposure ? XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE : 0) | (settings_data.hdr ? 0 : XESS_INIT_FLAG_LDR_INPUT_COLOR)),
+      };
       // Compiles its pipelines synchronously (a few hundred ms, once per context)
       if (custom_data->init(custom_data->context, &init_params) != XESS_RESULT_SUCCESS)
       {
-         custom_data->RetireContext();
+         custom_data->retired_contexts.Retire(&custom_data->context);
          ASSERT_ONCE_MSG(false, "Couldn't initialize the XeSS context");
          return false;
       }
@@ -221,7 +208,8 @@ namespace Intel
    // The XeSS guide's log2(render / output), without DLSS and FSR's extra -1: 0 at native resolution
    float Intel::XeSS::GetMipLODBias(const SR::InstanceData* data) const
    {
-      return SR::GetMipLODBias(data->settings_data.render_height, data->settings_data.output_height) + 1.f;
+      const float render_height = float(data->settings_data.render_height);
+      return std::log2(render_height / (std::max)(render_height, float(data->settings_data.output_height)));
    }
 
    bool Intel::XeSS::Draw(const SR::InstanceData* data, SR::CommandList* command_list, const DrawData& draw_data)
@@ -236,19 +224,20 @@ namespace Intel
       // XeSS reads the inputs in "D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE" and writes the output in "D3D12_RESOURCE_STATE_UNORDERED_ACCESS",
       // without barriers of its own (see "DrawData")
       // ponytail: no exposure texture or responsive mask (XeSS needs their flags at the context creation), add them with a D3D12 consumer that has them.
-      xess_d3d12_execute_params_t execute_params = {};
-      execute_params.pColorTexture = draw_data.source_color;
-      execute_params.pVelocityTexture = draw_data.motion_vectors;
-      execute_params.pDepthTexture = draw_data.depth_buffer;
-      execute_params.pOutputTexture = draw_data.output_color;
-      execute_params.jitterOffsetX = draw_data.jitter_x;
-      execute_params.jitterOffsetY = draw_data.jitter_y;
-      // Applied to the input and undone on the output: a pre-exposed input gets its exposure back
-      execute_params.exposureScale = (draw_data.pre_exposure == 0.f ? 1.f : (1.f / draw_data.pre_exposure));
-      execute_params.resetHistory = draw_data.reset ? 1 : 0;
-      // 0: the settings' render size (like DLSS)
-      execute_params.inputWidth = (draw_data.render_width ? draw_data.render_width : custom_data->settings_data.render_width);
-      execute_params.inputHeight = (draw_data.render_height ? draw_data.render_height : custom_data->settings_data.render_height);
+      const xess_d3d12_execute_params_t execute_params = {
+         .pColorTexture = draw_data.source_color,
+         .pVelocityTexture = draw_data.motion_vectors,
+         .pDepthTexture = draw_data.depth_buffer,
+         .pOutputTexture = draw_data.output_color,
+         .jitterOffsetX = draw_data.jitter_x,
+         .jitterOffsetY = draw_data.jitter_y,
+         // Applied to the input and undone on the output: a pre-exposed input gets its exposure back
+         .exposureScale = (draw_data.pre_exposure == 0.f ? 1.f : (1.f / draw_data.pre_exposure)),
+         .resetHistory = uint32_t(draw_data.reset ? 1 : 0),
+         // 0: the settings' render size (like DLSS)
+         .inputWidth = (draw_data.render_width ? draw_data.render_width : custom_data->settings_data.render_width),
+         .inputHeight = (draw_data.render_height ? draw_data.render_height : custom_data->settings_data.render_height),
+      };
 
       const xess_result_t result = custom_data->execute(custom_data->context, command_list, &execute_params);
       ASSERT_ONCE_MSG(result == XESS_RESULT_SUCCESS, "XeSS execution failed");

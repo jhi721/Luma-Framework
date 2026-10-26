@@ -20,12 +20,10 @@ namespace Intel
    class XeSS : public SR::SuperResolutionImpl
    {
    public:
-      virtual bool HasInit(const SR::InstanceData* data) const override;
-      virtual bool IsSupported(const SR::InstanceData* data) const override;
-
       virtual bool Init(SR::InstanceData*& data, SR::Device* device, IDXGIAdapter* adapter = nullptr) override;
       virtual void Deinit(SR::InstanceData*& data, SR::Device* optional_device = nullptr) override;
       virtual void ReleaseResources(SR::InstanceData* data) override;
+      virtual void ReleaseRetired(SR::InstanceData* data) override;
 
       virtual bool UpdateSettings(SR::InstanceData* data, SR::CommandList* command_list, const SR::SettingsData& settings_data) override;
 

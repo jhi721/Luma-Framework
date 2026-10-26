@@ -161,8 +161,7 @@ namespace SR
 	}
 
 	// D3D12 command lists that used a replaced upscaler object (DLSS feature, FSR context) can still be running, so it's released a few
-	// "UpdateSettings()" (frames) later.
-	// ponytail: an object replaced right before its upscaler is turned off waits for the next "UpdateSettings()" or the shutdown.
+	// presents later ("SuperResolutionImpl::ReleaseRetired()"), also when its upscaler isn't picked anymore.
 	template <typename T>
 	struct DeferredReleases
 	{
@@ -175,7 +174,16 @@ namespace SR
 		uint64_t updates = 0;
 
 		void Push(const T& object) { entries.push_back({.object = object, .update = updates}); }
-		// Once per "UpdateSettings()": releases what the swapchain's up to 3 frames in flight can't use anymore
+		// Pushes "*object" (if any) and clears it
+		void Retire(T* object)
+		{
+			if (*object)
+			{
+				Push(*object);
+				*object = {};
+			}
+		}
+		// Once per present: releases what the swapchain's up to 3 frames in flight can't use anymore
 		template <typename F>
 		void Release(F&& release)
 		{
@@ -280,9 +288,9 @@ namespace SR
 		// The implementations are owned and deleted through this base.
 		// A new virtual must also be forwarded by the DEVELOPMENT MCP wrapper ("Mcp::SrTap"), or it silently gets the defaults below there.
 		virtual ~SuperResolutionImpl() = default;
-		virtual bool HasInit(const InstanceData* data) const { return false; }
+		virtual bool HasInit(const InstanceData* data) const { return data != nullptr; }
 		// Needs init to be called first
-		virtual bool IsSupported(const InstanceData* data) const { return false; }
+		virtual bool IsSupported(const InstanceData* data) const { return data && data->is_supported; }
 
 		// Must be called once before usage. Still expects Deinit() to be called even if it failed.
 		// Returns whether this SR implementation is supported by hardware and driver.
@@ -350,6 +358,10 @@ namespace SR
 			return SR::GetMipLODBias(data->settings_data.render_height, data->settings_data.output_height);
 		}
 		
+		// At every present, for every initialized implementation, with "DeviceData::sr_mutex" held exclusively (no "UpdateSettings()" or "Draw()" runs):
+		// releases what its replaced objects' frames can't use anymore (see "DeferredReleases")
+		virtual void ReleaseRetired(InstanceData* data) {}
+
 		// Whether the implementation leaves the state dirty compared to when it begun
 		virtual bool NeedsStateRestoration() const { return false; }
 	};

@@ -7368,7 +7368,7 @@ namespace
          cb_luma_instance_data.RenderResolutionScale.y = device_data.render_resolution.y / device_data.output_resolution.y;
          cb_luma_instance_data.PreviousRenderResolutionScale.x = device_data.previous_render_resolution.x / device_data.output_resolution.x;
          cb_luma_instance_data.PreviousRenderResolutionScale.y = device_data.previous_render_resolution.y / device_data.output_resolution.y;
-         // "RenderScaleActive" stays 0: there is no render scale on D3D12 until its resource upgrades are ported (phase 5), which the scale chain test of the D3D11 path needs
+         // "RenderScaleActive" stays 0: D3D12 doesn't set a render scale yet (the scale chain test of the D3D11 path needs resource upgrades it doesn't have)
 
          game->UpdateLumaInstanceDataCB(cb_luma_instance_data, cmd_list_data, device_data);
 
@@ -8746,8 +8746,25 @@ namespace
       return {SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)};
    }
 
-   // Switches the SR. Core applies the overlay's and the MCP's "sr_type_selected" at present, before the game's "OnPresent", so a frame's
-   // draws never see two types and the game can release its resources there.
+   // The SR a game's draw records with, read as one under "DeviceData::sr_mutex" (shared): until this goes out of scope "ApplySRType()" can't switch the type,
+   // its implementation and its instance, nor can retired upscaler objects go. Held over "UpdateSettings()" and "Draw()", not over calls that raise ReShade
+   // events. "implementation" and "instance_data" are null without an SR instance.
+   struct SRDrawLock
+   {
+      std::shared_lock<std::shared_mutex> lock;
+      SR::Type type = SR::Type::None;
+      SR::SuperResolutionImpl* implementation = nullptr;
+      SR::InstanceData* instance_data = nullptr;
+   };
+   SRDrawLock LockSRForDraw(DeviceData& device_data)
+   {
+      std::shared_lock lock(device_data.sr_mutex);
+      SR::InstanceData* const instance_data = device_data.GetSRInstanceData();
+      return {.lock = std::move(lock), .type = device_data.sr_type, .implementation = (instance_data ? sr_implementations[device_data.sr_type].get() : nullptr), .instance_data = instance_data};
+   }
+
+   // Switches the SR, with "device_data.sr_mutex" held exclusively. Core applies the overlay's and the MCP's "sr_type_selected" at present, before the game's
+   // "OnPresent", so a frame's draws never see two types and the game can release its resources there.
    // We wouldn't really need to do anything other than clearing "sr_output_color",
    // but to avoid wasting memory allocated by SR texture and other resources, clear it up once disabled.
    // Note that we keep these textures in memory if the user temporarily changed away from an AA method that supports SR, or if users unloaded shaders (there's no reason to, and it'd cause stutters).
@@ -8804,6 +8821,7 @@ namespace
    void SetSRType(DeviceData& device_data, SR::Type sr_type)
    {
       device_data.sr_type_selected = sr_type;
+      const std::unique_lock sr_lock(device_data.sr_mutex);
       ApplySRType(device_data, sr_type);
       device_data.sr_suppressed = false;
    }
@@ -9062,6 +9080,20 @@ namespace
       }
    }
 
+   // Destroys and clears "views" (they only hold CPU descriptors, which the tables and the bindings copied), then retires "resources" (see "RetireD3D12GamePassResource()")
+   void RetireD3D12GamePassTextures(DeviceData::GamePassD3D12* pass, reshade::api::device* device, uint64_t present_count, std::initializer_list<reshade::api::resource*> resources, std::initializer_list<reshade::api::resource_view*> views)
+   {
+      for (reshade::api::resource_view* const view : views)
+      {
+         device->destroy_resource_view(*view);
+         *view = {};
+      }
+      for (reshade::api::resource* const resource : resources)
+      {
+         RetireD3D12GamePassResource(pass, present_count, resource);
+      }
+   }
+
    // Destroys the resources "pass" retired that no list can read anymore, with "pass->mutex" held
    void DestroyRetiredD3D12GamePassResources(DeviceData::GamePassD3D12* pass, reshade::api::device* device, uint64_t present_count)
    {
@@ -9087,15 +9119,7 @@ namespace
          const std::unique_lock lock(smaa.mutex);
          if (smaa.width != 0 && smaa.frame != UINT64_MAX && present_count > smaa.frame + D3D12_GAME_PASS_IDLE_PRESENTS)
          {
-            for (reshade::api::resource_view* const view : {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv})
-            {
-               device->destroy_resource_view(*view);
-               *view = {};
-            }
-            for (reshade::api::resource* const resource : {&smaa.edges, &smaa.weights, &smaa.output})
-            {
-               RetireD3D12GamePassResource(&smaa, present_count, resource);
-            }
+            RetireD3D12GamePassTextures(&smaa, device, present_count, {&smaa.edges, &smaa.weights, &smaa.output}, {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
             smaa.width = 0;
             smaa.height = 0;
             smaa.output_format = reshade::api::format::unknown;
@@ -9476,20 +9500,7 @@ namespace
       const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
       const bool sharpen = ENABLE_RCAS && rcas_sharpness > 0.f && !t2x;
       const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
-      // The intermediates follow the target's size (and format, for the blend's). The views only hold CPU descriptors (the tables and the bindings copy them), but a game
-      // list that still runs may read the old textures
-      const auto retire = [&](std::initializer_list<reshade::api::resource*> resources, std::initializer_list<reshade::api::resource_view*> views)
-      {
-         for (reshade::api::resource_view* const view : views)
-         {
-            device->destroy_resource_view(*view);
-            *view = {};
-         }
-         for (reshade::api::resource* const resource : resources)
-         {
-            RetireD3D12GamePassResource(&smaa, present_count, resource);
-         }
-      };
+      // The intermediates follow the target's size (and format, for the blend's)
       const auto create_intermediate = [&](reshade::api::format format, reshade::api::resource* resource, reshade::api::resource_view* rtv, reshade::api::resource_view* srv)
       {
          const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
@@ -9507,7 +9518,7 @@ namespace
       };
       if (smaa.width != width || smaa.height != height)
       {
-         retire({&smaa.edges, &smaa.weights, &smaa.output}, {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
+         RetireD3D12GamePassTextures(&smaa, device, present_count, {&smaa.edges, &smaa.weights, &smaa.output}, {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
          smaa.width = width;
          smaa.height = height;
          if (!create_intermediate(reshade::api::format::r8g8_unorm, &smaa.edges, &smaa.edges_rtv, &smaa.edges_srv) || !create_intermediate(reshade::api::format::r8g8b8a8_unorm, &smaa.weights, &smaa.weights_rtv, &smaa.weights_srv))
@@ -9520,7 +9531,7 @@ namespace
       }
       if (sharpen && (smaa.output.handle == 0 || smaa.output_format != target_desc.format))
       {
-         retire({&smaa.output}, {&smaa.output_rtv, &smaa.output_srv});
+         RetireD3D12GamePassTextures(&smaa, device, present_count, {&smaa.output}, {&smaa.output_rtv, &smaa.output_srv});
          smaa.output_format = target_desc.format;
          if (!create_intermediate(target_desc.format, &smaa.output, &smaa.output_rtv, &smaa.output_srv))
          {
@@ -9646,11 +9657,7 @@ namespace
       const uint32_t height = source_desc.texture.height;
       if (karis.width != width || karis.height != height)
       {
-         device->destroy_resource_view(karis.output_srv);
-         device->destroy_resource_view(karis.output_uav);
-         karis.output_srv = {};
-         karis.output_uav = {};
-         RetireD3D12GamePassResource(&karis, device_data.present_count.load(std::memory_order_relaxed), &karis.output);
+         RetireD3D12GamePassTextures(&karis, device, device_data.present_count.load(std::memory_order_relaxed), {&karis.output}, {&karis.output_srv, &karis.output_uav});
          karis.width = width;
          karis.height = height;
          const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1);
@@ -11446,7 +11453,17 @@ namespace
 #endif // ENABLE_SR
 
 #if ENABLE_SR
-      ApplySRType(device_data, device_data.sr_type_selected);
+      {
+         const std::unique_lock sr_lock(device_data.sr_mutex);
+         ApplySRType(device_data, device_data.sr_type_selected);
+         for (const auto& [type, instance] : device_data.sr_implementations_instances)
+         {
+            if (instance)
+            {
+               sr_implementations[type]->ReleaseRetired(instance);
+            }
+         }
+      }
 #endif // ENABLE_SR
 
       // Free mirrors queued this frame: all command lists have executed by now (usually).

@@ -19,9 +19,6 @@ namespace NGX
 	class DLSS : public SR::SuperResolutionImpl
 	{
 	public:
-		virtual bool HasInit(const SR::InstanceData* data) const override;
-		virtual bool IsSupported(const SR::InstanceData* data) const override;
-
 		virtual bool Init(SR::InstanceData*& data, SR::Device* device, IDXGIAdapter* adapter = nullptr) override;
 		virtual void Deinit(SR::InstanceData*& data, SR::Device* optional_device = nullptr) override;
 		virtual void ReleaseResources(SR::InstanceData* data) override;
@@ -30,9 +27,11 @@ namespace NGX
 
 		virtual bool Draw(const SR::InstanceData* data, SR::CommandList* command_list, const DrawData& draw_data) override;
 		
-		virtual int GetJitterPhases(const SR::InstanceData* data) const;
+		virtual int GetJitterPhases(const SR::InstanceData* data) const override;
 
 #if DX12
+		virtual void ReleaseRetired(SR::InstanceData* data) override;
+
 		// The D3D12 evaluation (and creation) binds NGX's own descriptor heaps, root signature and pipeline on the command list
 		virtual bool NeedsStateRestoration() const override { return true; }
 #endif

@@ -318,20 +318,18 @@ void NGX::DLSS::ReleaseResources(SR::InstanceData* data)
 	}
 }
 
-bool NGX::DLSS::HasInit(const SR::InstanceData* data) const
-{
-	return data != nullptr;
-}
-
-bool NGX::DLSS::IsSupported(const SR::InstanceData* data) const
-{
-	return data && data->is_supported;
-}
-
 int NGX::DLSS::GetJitterPhases(const SR::InstanceData* data) const
 {
    return SR::GetDlssJitterPhases(data->settings_data.render_height, data->settings_data.output_height);
 }
+
+#if DX12
+void NGX::DLSS::ReleaseRetired(SR::InstanceData* data)
+{
+	auto* const custom_data = static_cast<DLSSInstanceData*>(data);
+	custom_data->retired_features.Release([&](DLSSInternalInstance* retired) { custom_data->ReleaseFeature(*retired); });
+}
+#endif
 
 bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, SR::CommandList* command_list, const SR::SettingsData& settings_data)
 {
@@ -342,7 +340,6 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, SR::CommandList* command_
 		return false;
 
 #if DX12
-	custom_data->retired_features.Release([&](DLSSInternalInstance* retired) { custom_data->ReleaseFeature(*retired); });
 	constexpr bool same_command_list = true;
 #else
 #ifndef NDEBUG

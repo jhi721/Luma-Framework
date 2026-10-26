@@ -64,12 +64,8 @@ namespace FidelityFX
 
       void RetireContext()
       {
-         if (context)
-         {
-            retired_contexts.Push(context);
-            context = nullptr;
-            version_name = nullptr;
-         }
+         retired_contexts.Retire(&context);
+         version_name = nullptr;
       }
    };
 
@@ -93,7 +89,6 @@ namespace FidelityFX
       custom_data = new FSRInstanceData();
       custom_data->module = module;
       custom_data->device = device;
-      custom_data->automatically_restores_pipeline_state = false; // It binds its own descriptor heaps, root signatures and pipelines
       custom_data->min_resolution = 32;
       custom_data->create_context = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(module, "ffxCreateContext"));
       custom_data->destroy_context = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(module, "ffxDestroyContext"));
@@ -163,14 +158,11 @@ namespace FidelityFX
       }
    }
 
-   bool FidelityFX::FSR::HasInit(const SR::InstanceData* data) const
+   void FidelityFX::FSR::ReleaseRetired(SR::InstanceData* data)
    {
-      return data != nullptr;
-   }
-
-   bool FidelityFX::FSR::IsSupported(const SR::InstanceData* data) const
-   {
-      return data && data->is_supported;
+      auto* const custom_data = static_cast<FSRInstanceData*>(data);
+      custom_data->retired_contexts.Release([&](ffxContext* retired)
+         { custom_data->destroy_context(retired, nullptr); });
    }
 
    bool FidelityFX::FSR::UpdateSettings(SR::InstanceData* data, SR::CommandList* command_list, const SR::SettingsData& settings_data)
@@ -178,9 +170,6 @@ namespace FidelityFX
       auto* custom_data = static_cast<FSRInstanceData*>(data);
       if (!command_list || !custom_data || !custom_data->is_supported)
          return false;
-
-      custom_data->retired_contexts.Release([&](ffxContext* retired)
-         { custom_data->destroy_context(retired, nullptr); });
 
       const int selected_version_override = ((version_index_override >= 0 && version_index_override < int(custom_data->version_ids.size())) ? version_index_override : -1);
       if (settings_data == custom_data->settings_data && custom_data->context && selected_version_override == custom_data->context_version_override)
@@ -561,11 +550,10 @@ namespace FidelityFX
 #if DEVELOPMENT
       if (true) // For now we always do this in dev mode
       {
-         auto LogCallback = [](FfxMsgType type, const wchar_t* message)
+         context_desc.fpMessage = [](FfxMsgType type, const wchar_t* message)
          {
             LogMessage(type == FFX_MESSAGE_TYPE_ERROR, message);
          };
-         context_desc.fpMessage = LogCallback;
          context_desc.flags |= FFX_FSR3UPSCALER_ENABLE_DEBUG_CHECKING;
       }
 #endif

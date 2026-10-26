@@ -1328,6 +1328,10 @@ namespace Mcp
       {
          inner->ReleaseResources(data);
       }
+      void ReleaseRetired(SR::InstanceData* data) override
+      {
+         inner->ReleaseRetired(data);
+      }
       float GetMipLODBias(const SR::InstanceData* data) const override
       {
          return inner->GetMipLODBias(data);
