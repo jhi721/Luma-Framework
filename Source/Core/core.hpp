@@ -11404,6 +11404,8 @@ namespace
             TraceDrawCallData& entry = trace_cmd_list_data.trace_draw_calls_data.emplace_back();
             entry.command_list = trace_cmd_list_data.cmd_list;
             entry.type = TraceDrawCallData::TraceDrawCallType::Present;
+            // The back buffer it shows, as the entry's source (see "D3D12Trace::FillCopy()"): the overlay highlights it, the back buffer current then has rotated
+            D3D12Trace::FillView(device_data.reshade_device, &entry, 't', 0, false, 0, {.resource = swapchain->get_current_back_buffer().handle});
          }
       }
       Mcp::OnPresent(device_data, device_data.trace_command_list_data, queue, swapchain, true);
@@ -17799,7 +17801,7 @@ namespace
                            name << "Present";
                            text_color = IM_COL32(50, 80, 190, 255); // Some Blue
 
-#if DX11
+#if DX11 // D3D12 Present entries hold the back buffer they showed as their source
                            // Highlight the resource on the swapchain too, given that "Present" traces aren't tracked the same way
                            if (!highlighted_resource.empty() && !device_data.swapchains.empty())
                            {
@@ -17810,17 +17812,6 @@ namespace
 
                               std::string backbuffer_hash = std::to_string(std::hash<void*>{}(back_buffer.get()));
                               if (highlighted_resource == backbuffer_hash)
-                              {
-                                 found_highlighted_resource_read = true;
-                              }
-                           }
-#else
-                           if (!highlighted_resource.empty() && !device_data.swapchains.empty())
-                           {
-                              // Not fully safe, but it should do for almost all cases
-                              reshade::api::swapchain* const swapchain = *device_data.swapchains.begin();
-                              const com_ptr<ID3D12Resource> back_buffer = GetGameBackBuffer(reinterpret_cast<IDXGISwapChain*>(swapchain->get_native()), swapchain->get_current_back_buffer_index());
-                              if (highlighted_resource == std::to_string(std::hash<void*>{}(back_buffer.get())))
                               {
                                  found_highlighted_resource_read = true;
                               }
@@ -20574,11 +20565,13 @@ namespace
 
             SR::Type sr_type = device_data.sr_type;
             // The running version, when the implementation knows it (e.g. "FSR (4.1.1)": FSR 4 where the GPU supports it on D3D12, 3.1 elsewhere)
-            if (const SR::InstanceData* sr_instance_data = device_data.GetSRInstanceData();
-                sr_instance_data && sr_instance_data->version_name && sr_user_type != SR::UserType::None)
+            if (const SR::InstanceData* sr_instance_data = device_data.GetSRInstanceData(); sr_instance_data && sr_user_type != SR::UserType::None)
             {
-               selected_sr_name = std::format("{} ({})", selected_sr_user_type, sr_instance_data->version_name);
-               selected_sr_user_type = selected_sr_name.c_str();
+               if (const char* const version_name = sr_instance_data->version_name.load())
+               {
+                  selected_sr_name = std::format("{} ({})", selected_sr_user_type, version_name);
+                  selected_sr_user_type = selected_sr_name.c_str();
+               }
             }
 
             const SR::Type sr_auto_type = GetSRAutoType(device_data);
@@ -20637,7 +20630,7 @@ namespace
                if (ImGui::SmallButton(ICON_FK_UNDO))
                {
                   sr_user_type = SR::UserType::Auto;
-						int sr_user_type_i = int(sr_user_type);
+                  int sr_user_type_i = int(sr_user_type);
                   reshade::set_config_value(runtime, NAME, "SRUserType", sr_user_type_i);
 
                   sr_type = sr_auto_type;
@@ -21517,12 +21510,7 @@ namespace
                      ImGui::SliderInt("Debug Draw: Pixel Shader Resource Index", &debug_draw_view_index, 0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - 1);
                   }
 #endif
-#if DX11
-                  const int max_mip = GetTextureMaxMipLevels(D3D11_REQ_TEXTURE1D_U_DIMENSION) - 1;
-#else
-                  const int max_mip = 14; // The mips of the largest 2D texture (16384)
-#endif
-                  ImGui::SliderInt("Debug Draw: Texture Mip", &debug_draw_mip, 0, max_mip);
+                  ImGui::SliderInt("Debug Draw: Texture Mip", &debug_draw_mip, 0, int(ResourceUpgradeGetTextureMaxMipLevels(LUMA_D3D(REQ_TEXTURE2D_U_OR_V_DIMENSION))) - 1);
 #if DX11
                   ImGui::Checkbox("Debug Draw: Allow Drawing Replaced Pass", &debug_draw_replaced_pass);
 #endif

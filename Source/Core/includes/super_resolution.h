@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
@@ -273,7 +274,8 @@ namespace SR
 		bool							automatically_restores_pipeline_state = false;
 		unsigned int				min_resolution = 1; // Min width or height
 		// The version the runtime picked (e.g. FSR 4 or 3.1 on D3D12), for display. Owned by the implementation's dll, nullptr if unknown.
-		const char*					version_name = nullptr;
+		// Atomic as FSR changes it on recording threads (its context recreation) while the overlay reads it: load it once.
+		std::atomic<const char*>	version_name = nullptr;
 
 		SettingsData				settings_data = {};
 

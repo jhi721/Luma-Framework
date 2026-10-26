@@ -25,6 +25,12 @@ std::optional<std::string> GetD3DNameW(ID3D12Object* obj)
    return std::string(c_name, out_size - 1); // Without the null terminator
 }
 
+// The hash the capture and the MCP identify a resource by, from its pointer like the D3D11 capture
+std::string ResourceHashString(uint64_t handle)
+{
+   return std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(handle)));
+}
+
 // Like the D3D11 "GetResourceInfo()": "size" is width, height, array size (depth for 3D) and mips (samples for MS textures), and
 // the buffer size in "x" for buffers
 void GetResourceInfo(reshade::api::device* device, reshade::api::resource resource, uint4& size, DXGI_FORMAT& format, std::string* type_name = nullptr, std::string* hash = nullptr, std::string* debug_name = nullptr, bool* render_target_flag = nullptr, bool* unordered_access_flag = nullptr)
@@ -35,7 +41,7 @@ void GetResourceInfo(reshade::api::device* device, reshade::api::resource resour
       return;
 
    if (hash)
-      *hash = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(resource.handle)));
+      *hash = ResourceHashString(resource.handle);
    if (debug_name)
       *debug_name = GetD3DNameW(reinterpret_cast<ID3D12Resource*>(resource.handle)).value_or("");
 
@@ -405,7 +411,7 @@ namespace D3D12Trace
             else if (descriptor && descriptor->handle != 0)
             {
                entry.cb_resource[table_descriptor.index] = descriptor->handle;
-               entry.cb_hash[table_descriptor.index] = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(descriptor->handle)));
+               entry.cb_hash[table_descriptor.index] = ResourceHashString(descriptor->handle);
                entry.cb_first_constant[table_descriptor.index] = UINT(descriptor->offset / 16);
                entry.cb_num_constants[table_descriptor.index] = UINT((descriptor->size + 15) / 16);
             }
@@ -524,19 +530,11 @@ namespace D3D12Trace
       // A command list has one pipeline slot, so it also tells "ExecuteIndirect()" draws and dispatches apart
       const bool is_dispatch = pipeline ? pipeline->HasComputeShader() : (draw_dispatch_data.dispatch_count.x != 0);
 
-      auto IsDeclared = [&](char type, const TraceDrawCallData::ShaderRegister& shader_register)
-      {
-         return !found_shader_bindings || std::any_of(shader_bindings.begin(), shader_bindings.end(), [&](const CachedShader::ResourceBinding& binding)
-                                             { return binding.type == type && binding.space == shader_register.space && shader_register.index >= binding.index && shader_register.index - binding.index < binding.count; });
-      };
-
       // Render targets and the depth stencil as they were bound, CPU descriptors are read at that time
       if (!is_dispatch)
       {
          trace_draw_call_data.primitive_topology = D3D_PRIMITIVE_TOPOLOGY(state.primitive_topology); // ReShade keeps the D3D values
-         auto BufferHash = [](uint64_t buffer)
-         { return std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(buffer))); };
-         trace_draw_call_data.index_buffer_hash = BufferHash(state.index_buffer.buffer);
+         trace_draw_call_data.index_buffer_hash = ResourceHashString(state.index_buffer.buffer);
          trace_draw_call_data.index_buffer_format = (state.index_buffer.stride == 2) ? DXGI_FORMAT_R16_UINT : ((state.index_buffer.stride == 4) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_UNKNOWN);
          trace_draw_call_data.index_buffer_offset = UINT(state.index_buffer.offset);
          // Like the D3D11 capture, one entry per input element, with the vertex buffer bound to its slot
@@ -549,7 +547,7 @@ namespace D3D12Trace
             {
                const uint32_t slot = elements[j].buffer_binding;
                trace_draw_call_data.input_layouts_formats.push_back(DXGI_FORMAT(elements[j].format));
-               trace_draw_call_data.vertex_buffer_hashes.push_back(BufferHash((slot < state.vertex_buffers.size()) ? state.vertex_buffers[slot].buffer : 0));
+               trace_draw_call_data.vertex_buffer_hashes.push_back(ResourceHashString((slot < state.vertex_buffers.size()) ? state.vertex_buffers[slot].buffer : 0));
             }
          }
 
@@ -558,9 +556,16 @@ namespace D3D12Trace
          FillOutputState(device, device_data, &trace_draw_call_data, state, desc);
       }
 
-      // The next packed SRV, UAV, constant buffer or sampler entry, UINT32_MAX if they are all taken (the entry is then marked "truncated")
+      // The next packed SRV, UAV, constant buffer or sampler entry. UINT32_MAX if the pipeline's shaders don't declare the register, or if the entries are all taken (then the
+      // entry is marked "truncated")
       auto AddEntry = [&](char type, const TraceDrawCallData::ShaderRegister& shader_register) -> uint32_t
       {
+         const auto declares_register = [&](const CachedShader::ResourceBinding& binding)
+         {
+            return binding.type == type && binding.space == shader_register.space && shader_register.index >= binding.index && shader_register.index - binding.index < binding.count;
+         };
+         if (found_shader_bindings && std::ranges::none_of(shader_bindings, declares_register))
+            return UINT32_MAX;
          uint32_t* count = &trace_draw_call_data.cb_count;
          TraceDrawCallData::ShaderRegister* registers = trace_draw_call_data.cb_register;
          uint32_t max_count = uint32_t(std::size(trace_draw_call_data.cbs));
@@ -666,7 +671,7 @@ namespace D3D12Trace
          for (size_t i = 0; i < parameter.ranges.size(); i++)
          {
             const TraceDrawCallData::ShaderRegister shader_register = {.index = parameter.ranges[i].dx_register_index, .space = parameter.ranges[i].dx_register_space};
-            if (const uint32_t index = IsDeclared('s', shader_register) ? AddEntry('s', shader_register) : UINT32_MAX; index != UINT32_MAX)
+            if (const uint32_t index = AddEntry('s', shader_register); index != UINT32_MAX)
             {
                FillSampler(&trace_draw_call_data, index, &parameter.static_samplers[i]);
             }
@@ -681,7 +686,7 @@ namespace D3D12Trace
          case reshade::api::pipeline_layout_param_type::push_constants:
          {
             const TraceDrawCallData::ShaderRegister shader_register = {.index = parameter.constants.dx_register_index, .space = parameter.constants.dx_register_space};
-            if (binding.constants.empty() || !IsDeclared('b', shader_register))
+            if (binding.constants.empty())
                break;
             if (const uint32_t i = AddEntry('b', shader_register); i != UINT32_MAX)
             {
@@ -700,10 +705,10 @@ namespace D3D12Trace
             const TraceDrawCallData::ShaderRegister shader_register = {.index = range.dx_register_index, .space = range.dx_register_space};
             if (range.type == reshade::api::descriptor_type::constant_buffer)
             {
-               if (const uint32_t i = IsDeclared('b', shader_register) ? AddEntry('b', shader_register) : UINT32_MAX; i != UINT32_MAX)
+               if (const uint32_t i = AddEntry('b', shader_register); i != UINT32_MAX)
                {
                   trace_draw_call_data.cb_resource[i] = binding.descriptor;
-                  trace_draw_call_data.cb_hash[i] = std::to_string(std::hash<void*>{}(reinterpret_cast<void*>(binding.descriptor)));
+                  trace_draw_call_data.cb_hash[i] = ResourceHashString(binding.descriptor);
                   trace_draw_call_data.cb_first_constant[i] = UINT(binding.descriptor_offset / 16);
                }
                break;
@@ -713,7 +718,7 @@ namespace D3D12Trace
             if (!is_srv && !IsUnorderedAccessView(range.type))
                break;
             const char type = is_srv ? 't' : 'u';
-            if (const uint32_t i = IsDeclared(type, shader_register) ? AddEntry(type, shader_register) : UINT32_MAX; i != UINT32_MAX)
+            if (const uint32_t i = AddEntry(type, shader_register); i != UINT32_MAX)
             {
                FillView(device, &trace_draw_call_data, type, i, false, 0, {.resource = D3D12State::FindBuffer(device_data->buffer_addresses, binding.descriptor).resource});
             }
@@ -737,10 +742,7 @@ namespace D3D12Trace
                trace_draw_call_data.truncated |= (range.count > count);
                for (uint32_t i = 0; i < count; i++)
                {
-                  const TraceDrawCallData::ShaderRegister shader_register = {.index = range.dx_register_index + i, .space = range.dx_register_space};
-                  if (!IsDeclared(type, shader_register))
-                     continue;
-                  if (const uint32_t index = AddEntry(type, shader_register); index != UINT32_MAX)
+                  if (const uint32_t index = AddEntry(type, {.index = range.dx_register_index + i, .space = range.dx_register_space}); index != UINT32_MAX)
                   {
                      trace_draw_call_data.table_descriptors.push_back({.table = binding.table, .binding = range.binding + i, .type = type, .index = index});
                   }
