@@ -10,6 +10,8 @@
 #define ENABLE_RCAS 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
+// Luma Bloom replaces the glow pyramid (see "DrawLumaBloom()")
+#define ENABLE_BLOOM 1
 
 // The patched prepass draws of the characters are re-issued natively (see "DrawObjectMotionVectors()"): Core keeps their arguments, and the vertex buffers they read
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
@@ -44,6 +46,30 @@ namespace
    // fx_fxaa311 q-low, q-medium, q-high, q-ultra. The "linear" permutations read a linear canvas: they stay
    const ShaderHashesList shader_hashes_fxaa = {.pixel_shaders = {0x47272CCB, 0xF1B4271C, 0xE4123563, 0x03933167}};
 
+   // XeGTAO in place of the game's SSAO (FUN_140864d90, see "DrawXeGTAO()"): it runs at fx_ssao_test, which is skipped with fx_ssao_temporal_filter
+   // and the 8 ps_ssao_blur draws; ps_ssao_upsampling writes the AO into the alpha of the screen shadow mask (the materials' t13.w, color write
+   // mask A), XeGTAO's goes there in its place
+   const ShaderHashesList shader_hashes_ssao_test = {.pixel_shaders = {0x5F373FFF}};
+   const ShaderHashesList shader_hashes_ssao_filters = {.pixel_shaders = {0xC806318D, 0x2AA0CC2B}};
+   const ShaderHashesList shader_hashes_ssao_upsampling = {.pixel_shaders = {0x18B4D161}};
+   constexpr uint16_t gtao_depth_mip_count = 5; // XE_GTAO_DEPTH_MIP_LEVELS in Includes/XeGTAO.hlsl
+   constexpr D3D12_RENDER_TARGET_BLEND_DESC alpha_only_blend = {.SrcBlend = D3D12_BLEND_ONE, .DestBlend = D3D12_BLEND_ZERO, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ZERO, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = UINT8(D3D12_COLOR_WRITE_ENABLE_ALPHA)};
+   // The glow (FUN_1402e7c70, see "DrawLumaBloom()"): glow_pass0 writes its level 0, the 8 glow_pass1 draws (the chromatic aberration variant
+   // 0x8B729110 isn't replaced) blur it down to 4 levels, which glow_pass2 sums (glow_pass2_5 0x928D48D6 isn't replaced either)
+   const ShaderHashesList shader_hashes_glow_pass0 = {.pixel_shaders = {0x88B980FC}};
+   const ShaderHashesList shader_hashes_glow_pass1 = {.pixel_shaders = {0x4050FD15}};
+   const ShaderHashesList shader_hashes_glow_pass1_ca = {.pixel_shaders = {0x8B729110}};
+   const ShaderHashesList shader_hashes_glow_pass2 = {.pixel_shaders = {0x1EE5A3E2}};
+   // The glow composite (FUN_1402dde60 -> FUN_1402e8840, after DoF): the glow target (glow_pass2's, RT 0x45) added onto the scene by ps_flickerfree_fast,
+   // a plain copy the game also draws opaque elsewhere: only this draw blends ONE/ONE. The exposure meter (copy 0x7561D004, ps_down_sample_4x4,
+   // with_glare 0x68A0C136) and the water read the glow target before it, so "Bloom Intensity" is applied here, not in the target
+   const ShaderHashesList shader_hashes_glow_composite = {.pixel_shaders = {0xBA1E66BE}};
+   constexpr D3D12_RENDER_TARGET_BLEND_DESC additive_blend = {.BlendEnable = TRUE, .SrcBlend = D3D12_BLEND_ONE, .DestBlend = D3D12_BLEND_ONE, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ONE, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = UINT8(D3D12_COLOR_WRITE_ENABLE_ALL)};
+   constexpr uint32_t bloom_mip_count = 4; // 512x256 down to 64x32, the vanilla levels
+   // c_ps_user (cb9, PS b9) in the engine's constant mirror: "FUN_1400f29c0(row, data, rows)" writes it with descriptor 0x35102002190000 | row << 4,
+   // whose bits 44+ are its base in the data area (see "GetConstantMirror()")
+   constexpr uintptr_t cb9_base_offset = 0x3510;
+
    // The color correct (ccr) permutations: every ps_ccr_* (but ps_texture_a255) and the 3 fx_ccr_*_mask. Their t0 is the fp16 scene, rt0 of
    // the draw right before them on their list (the glow composite, or a late particle): DLAA runs on it there, before the grade.
    const ShaderHashesList shader_hashes_color_correct = {.pixel_shaders = {0x6D1C9FA9, 0x58F2C4F0, 0x9DAF7DB7, 0x9ECD97D6, 0x61966971, 0xB3FB5120, 0x17B5EBE2, 0x06317C91, 0xB65DCB82, 0x610F5616, 0x5ED223C8, 0x1CA987C6, 0xFC89801D, 0xEE029834, 0x40982C7F,
@@ -55,8 +81,17 @@ namespace
    bool g_smaa_predication = true;
    // SMAA T2x without DLSS: the camera jitters by a quarter pixel in two phases and Core's SMAA blends with the previous frame along the motion vectors
    bool g_smaa_t2x = false;
-   float g_rcas_sharpness = 0.f; // RCAS on SMAA's output (after T2x's resolve), 0 = off
-   bool g_hide_ui = false;       // Session only, so a restart always has a HUD
+   float g_rcas_sharpness = 0.f;    // RCAS on SMAA's output (after T2x's resolve), 0 = off
+   bool g_hide_ui = false;          // Session only, so a restart always has a HUD
+   bool g_luma_bloom_enable = true; // Not a setting: the DEV/MCP A/B against the game's glow pyramid
+   float g_bloom_intensity = 1.f;
+   bool g_gtao_enable = true;
+   bool g_gtvbao_enable = false;         // GT-VBAO's main pass in place of XeGTAO's, on the same inputs, denoise and apply
+   float g_gtao_final_value_power = 1.f; // DEV/TEST calibration knobs, not persisted
+   float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (view units, meters)
+#if DEVELOPMENT
+   int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges
+#endif
    // The draws of the HUD phases that "Hide Gameplay UI" keeps besides the screen effects (see "screen_effect_nodes"): phase 0x19's copy of the FXAA
    // output into the output size target ("FUN_140486d50": sys_2d_no_color + ps_texture, the bytecode of ps_flickerfree_fast; ps_texture also draws
    // UI and screen noises in 0x1a), ps_render_fb and the videos (ps_sofdec, _alpha, _vp9)
@@ -116,7 +151,6 @@ namespace
    // through the projection setter, the shadow map job "FUN_140160b60" too, and nothing else writes it. The actions run in id order: 0x17 the post
    // effects with the color correct (where DLAA draws) last, 0x18 FXAA, 0x19 the world-space HUD, 0x1a the 2D (_tools/ykr/sys/sys_shaders.md)
    constexpr uintptr_t tls_frame_phase_offset = 0x3C;
-   constexpr uint32_t color_correct_phase = 0x17;
    constexpr uint32_t first_post_anti_aliasing_phase = 0x18;
    constexpr uint32_t last_post_anti_aliasing_phase = 0x1A;
 
@@ -130,6 +164,13 @@ namespace
       const auto* const tls_blocks = reinterpret_cast<const uint8_t* const*>(__readgsqword(0x58)); // "ThreadLocalStoragePointer"
       const uint8_t* const tls_block = (tls_blocks ? tls_blocks[exe_tls_index] : nullptr);
       return ((tls_block && tls_block[tls_initialized_offset] != 0) ? tls_block : nullptr);
+   }
+
+   // A pass recorded on a worker list may be recorded after the list that reads it, the GPU still runs it first (it's submitted first): last
+   // frame's stamp stands for this frame's too
+   bool IsThisOrLastFrame(uint64_t stamp, uint64_t present_count)
+   {
+      return stamp != UINT64_MAX && (stamp == present_count || stamp + 1 == present_count);
    }
 
    // See "tls_frame_phase_offset", UINT32_MAX without the TLS block
@@ -146,12 +187,8 @@ namespace
    const ShaderHashesList shader_hashes_object_prepass = {.vertex_shaders = {0x026FFF36, 0x6AE49DE2, 0xEEFE68EE, 0xDBB9339C, 0x6A6B42A3, 0x277CAA28, 0x0ED40764, 0x74E0172A, 0xC3E471F7, 0xD5A379DD}};
    // The rigid world's: matched draw by draw on their world matrix (see "rigid_draws")
    const ShaderHashesList shader_hashes_rigid_prepass = {.vertex_shaders = {0x277CAA28, 0x0ED40764}};
-   // The engine's root signature (FUN_140ba26f0): the VS' CBV b0-b13 + SRV t0-t23 table is root parameter 2, so b10 is its descriptor 10
-   constexpr uint32_t vs_descriptor_table_root_parameter = 2;
-   constexpr uint32_t bone_cbv_binding = 10;
    constexpr size_t world_matrix_floats = 12; // 3x4, row-major, translations in floats 3, 7, 11
    constexpr uint64_t world_matrix_size = world_matrix_floats * sizeof(float);
-   constexpr uint32_t cb12_binding = 12;
 
    // Whether the camera jitters and has its motion vectors made (DLAA or SMAA T2x) and the jitter of the main camera's projections (0 in a frame
    // after one they didn't draw), latched at present for the next frame, and the main camera as its passes set it
@@ -161,12 +198,15 @@ namespace
       bool motion_active = false;
       std::array<float, 2> jitter_pixels = {}; // As applied: +y down
       std::array<float, 2> jitter_ndc = {};
-      // The last unjittered view and projection of the slot DLAA reprojects with ("dlaa_camera_slot"), and the jitter they got
-      std::array<float, 16> view = {};
-      std::array<float, 16> projection = {};
-      std::array<float, 2> applied_jitter_pixels = {};
-      std::array<float, 2> applied_jitter_ndc = {};
-      bool captured = false;
+      // The last unjittered view and projection of slot 0, which DLAA reprojects with, and the jitter they got
+      struct Capture
+      {
+         std::array<float, 16> view = {};
+         std::array<float, 16> projection = {};
+         std::array<float, 2> jitter_pixels = {};
+         std::array<float, 2> jitter_ndc = {};
+      };
+      std::optional<Capture> capture;
    };
    CameraState camera_state;
 
@@ -180,28 +220,15 @@ namespace
    };
    thread_local SceneWriter scene_writer;
 
+   // glow_pass1_ca drew this glow chain's levels (one chain records on one thread, from glow_pass0): its glow_pass2 stays the game's
+   thread_local bool glow_aberration_drawn = false;
+
    // DLAA writes the scene's color back, its alpha stays (some ccr permutations read it)
    constexpr D3D12_RENDER_TARGET_BLEND_DESC rgb_only_blend = {.SrcBlend = D3D12_BLEND_ONE, .DestBlend = D3D12_BLEND_ZERO, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ZERO, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = UINT8(D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE)};
 
-   PUBLISHING_CONSTEXPR int g_dlaa_camera_slot = 0;
-   // How far DLAA goes, to isolate a pass: -1 nothing (the jitter hook and the mip bias only), 0 the depth copy and the motion vectors, 1 the
-   // decoded scene too, 2 DLSS too (its output not written back), 3 all
-   PUBLISHING_CONSTEXPR int g_dlaa_stages = 3;
    PUBLISHING_CONSTEXPR bool g_dlaa_mip_bias = true;
-   PUBLISHING_CONSTEXPR bool g_mv_force_jitter = false;   // The projection jitter without DLAA (FXAA/SMAA show it)
-   PUBLISHING_CONSTEXPR bool g_mv_disable_jitter = false; // No projection jitter under DLAA (DLSS gets zero jitter): A/B of jitter-dependent artifacts
-   PUBLISHING_CONSTEXPR bool g_smaa_t2x_flip = false;     // Swaps T2x's subsample indices (the sign of the jitter against the area texture)
-   PUBLISHING_CONSTEXPR int g_dlaa_jitter_flip = 0;       // Bit 0: x, bit 1: y, of the jitter given to DLSS
-   PUBLISHING_CONSTEXPR int g_dlaa_motion_flip = 0;       // Bit 0: x, bit 1: y, of the motion vectors
 #if DEVELOPMENT
    bool g_mv_debug_view = false;
-   // The per draw checks of the object motion vectors' assumptions (the anchor and cb12 against the bound CBVs, the views, the list stamps):
-   // they read the shadowed descriptors and the constant ring on every prepass draw
-   bool g_mv_live_checks = false;
-   // One shot: logs the next "object_mv_runs_to_log" patched skinned draws and their runs (matches, slots), then disarms
-   bool g_mv_log_runs = false;
-   constexpr uint32_t object_mv_runs_to_log = 400;
-   std::atomic<uint32_t> object_mv_runs_logged = 0;
    constexpr const char* mv_debug_view_texture = "dlaa.motion_vectors"; // Registered with the dev MCP
 #endif
 
@@ -468,151 +495,15 @@ namespace
          return false;
       }
    }
-#if DEVELOPMENT
-   // The projection setter's calls by the slot passed (4: any other matrix): being counted, and the last frame's
-   std::array<uint32_t, 5> projection_sets = {};
-   std::array<uint32_t, 5> projection_sets_frame = {};
-   uint32_t dlaa_scene_state = 0; // The scene's "reshade::api::resource_usage" at the last DLAA draw
-   // The draw world matrix reads (the anchor, see "OnDrawOrDispatch()") by outcome, being counted, and the last frame's: read, unavailable, compared with the
-   // bound CBV's first 3x4 ("checked"), and different from it. "anchor_mismatch_total" counts them all along
-   enum AnchorCount : size_t
-   {
-      ANCHOR_READS,
-      ANCHOR_UNAVAILABLE,
-      ANCHOR_CHECKED,
-      ANCHOR_MISMATCH,
-      ANCHOR_COUNT,
-   };
-   std::array<uint32_t, ANCHOR_COUNT> anchor_counts = {};
-   std::array<uint32_t, ANCHOR_COUNT> anchor_counts_frame = {};
-   uint32_t anchor_mismatch_total = 0;
-   std::atomic_flag anchor_mismatch_logged;
-
-   // The assumptions the object motion vectors (at the draws of "shader_hashes_object_prepass") and the unjittered phases after the
-   // anti-aliasing rest on (see "OnDrawOrDispatch()"), being counted, and the last frame's
-   enum LiveCheck : size_t
-   {
-      CB12_CHECKED,           // The mirror's cb12 compared with the bound VS b12
-      CB12_UNAVAILABLE,       // ... but the mirror or the bound CBV couldn't be read
-      CB12_MISMATCH,          // ... and they differ
-      VIEWS_CHECKED,          // The bound render target 0 and depth stencil handles read again now (one per view)
-      VIEWS_CHANGED,          // ... and they describe something else than at bind time
-      PREPASS_DRAWS,          // Draws of the patched pairs' vertex shaders
-      PREPASS_INSTANCED,      // ... with an instance count other than 1
-      PREPASS_RT_COUNT_NOT_1, // ... with other than one render target
-      PREPASS_OTHER_DSV,      // ... with a depth stencil that isn't the scene depth
-      EXEC_LISTS,             // Executed command lists that had such a draw (or the DLAA ccr draw)
-      EXEC_STAMP_MISMATCH,    // ... executed in another frame than they were recorded in
-      EXEC_STAMP_MIXED,       // Lists recorded across a present
-      PROJECTION_POST_AA,     // Projection setter calls left unjittered, in a phase after the anti-aliasing (see "SetProjectionDetour()")
-      POST_AA_DRAWS,          // Draws in those phases with a constant mirror
-      POST_AA_JITTERED,       // ... whose cb12 projection still has a jitter (_31 or _32 not 0: the projections are symmetric)
-      PROJECTION_MAIN_COPY,   // Setter calls with a copy of the main camera's projection, jittered as slot 0
-      CCR_OTHER_PHASE,        // Color correct draws outside the post effects phase
-      SCREEN_EFFECT_DRAWS,    // Draws inside a screen effect node's draw (see "screen_effect_nodes")
-      VP_RECOMPOSE_CHECKED,   // Frames whose cb12 VP was compared with its P x V (see "ObjectMotionState::BeginFrame()")
-      VP_RECOMPOSE_MISMATCH,  // ... and they differ
-      LIVE_CHECK_COUNT,
-   };
-   std::array<uint32_t, LIVE_CHECK_COUNT> live_checks = {};
-   std::array<uint32_t, LIVE_CHECK_COUNT> live_checks_frame = {};
-   std::atomic_flag cb12_mismatch_logged;
-   std::atomic_flag views_changed_logged;
-   std::atomic_flag stamp_mismatch_logged;
-   std::atomic_flag post_aa_jittered_logged;
-   std::atomic_flag vp_recompose_mismatch_logged;
-
-   void CountLiveCheck(LiveCheck check)
-   {
-      std::atomic_ref(live_checks[check]).fetch_add(1, std::memory_order_relaxed);
-   }
-
-   // The largest |_31| and |_32| the projection setter was given for the jittered slots since the last present, as float bits (non negative
-   // floats order like their bits), and the last frame's. Both 0 if the projections are symmetric
-   std::array<uint32_t, 2> projection_max_abs_bits = {};
-   std::array<float, 2> projection_max_abs_frame = {};
-
-   // Every command list with a patched pair's draw or the DLAA ccr draw, by the present count it was recorded in, until it runs or is reset
-   struct
-   {
-      std::shared_mutex mutex;
-      std::unordered_map<const void*, uint64_t> stamps;
-   } list_stamps;
-
-   void RecordListStamp(const CommandListData& cmd_list_data, const DeviceData& device_data)
-   {
-      constexpr size_t max_lists = 4096; // Bundles never reach the execute event: they aren't recorded
-      if (cmd_list_data.is_bundle)
-      {
-         return;
-      }
-      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
-      const std::unique_lock lock(list_stamps.mutex);
-      if (const auto it = list_stamps.stamps.find(cmd_list_data.cmd_list); it != list_stamps.stamps.end())
-      {
-         if (it->second != present_count)
-         {
-            CountLiveCheck(EXEC_STAMP_MIXED);
-            it->second = present_count;
-         }
-      }
-      else if (list_stamps.stamps.size() < max_lists)
-      {
-         list_stamps.stamps.emplace(cmd_list_data.cmd_list, present_count);
-      }
-   }
-
-   // ReShade fires it before the native "ExecuteCommandLists()", on the thread that executes
-   void OnExecuteStampedCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list)
-   {
-      uint64_t recorded_present_count = 0;
-      {
-         const std::unique_lock lock(list_stamps.mutex);
-         const auto it = list_stamps.stamps.find(cmd_list);
-         if (it == list_stamps.stamps.end())
-         {
-            return;
-         }
-         recorded_present_count = it->second;
-         list_stamps.stamps.erase(it);
-      }
-      const uint64_t present_count = cmd_list->get_device()->get_private_data<DeviceData>()->present_count.load(std::memory_order_relaxed);
-      CountLiveCheck(EXEC_LISTS);
-      if (recorded_present_count != present_count)
-      {
-         CountLiveCheck(EXEC_STAMP_MISMATCH);
-         if (!stamp_mismatch_logged.test_and_set())
-         {
-            reshade::log::message(reshade::log::level::warning, std::format("[Exec] First list executed in another frame than it was recorded in: recorded at present {}, executed at present {}", recorded_present_count, present_count).c_str());
-         }
-      }
-   }
-
-   // A list reset or destroyed before it ran never executes its recorded draws
-   void OnForgetCommandList(reshade::api::command_list* cmd_list)
-   {
-      const std::unique_lock lock(list_stamps.mutex);
-      list_stamps.stamps.erase(cmd_list);
-   }
-#endif
 
    void SetProjectionDetour(void* context, const float* projection)
    {
       const uintptr_t offset = reinterpret_cast<uintptr_t>(projection) - (game_module + camera_projections_rva);
       const uint32_t slot = (offset % camera_matrix_size == 0 && offset / camera_matrix_size < 4) ? uint32_t(offset / camera_matrix_size) : 4;
-#if DEVELOPMENT
-      std::atomic_ref(projection_sets[slot]).fetch_add(1, std::memory_order_relaxed);
-#endif
       // A draw that sets its own copy of the main camera's projection (the main menu's characters' forward pass) depth tests against the
       // prepass, which had the jitter: it needs it too, or whole triangles fail the test. ponytail: a copy read while the engine writes slot 0
       // can tear, that call then goes unjittered
       const bool main_camera_copy = (slot == 4 && std::memcmp(projection, reinterpret_cast<const void*>(game_module + camera_projections_rva), camera_matrix_size) == 0);
-#if DEVELOPMENT
-      if (main_camera_copy)
-      {
-         CountLiveCheck(PROJECTION_MAIN_COPY);
-      }
-#endif
       if (slot == 1 || (slot == 4 && !main_camera_copy))
       {
          set_projection_original(context, projection);
@@ -622,43 +513,25 @@ namespace
       // get the main camera unjittered. Only this setter call adds the jitter, so a draw setting its own projection never had it
       if (const uint32_t phase = GetFramePhase(); phase >= first_post_anti_aliasing_phase && phase <= last_post_anti_aliasing_phase)
       {
-#if DEVELOPMENT
-         CountLiveCheck(PROJECTION_POST_AA);
-#endif
          set_projection_original(context, projection);
          return;
       }
-#if DEVELOPMENT
-      // Before the jitter: is the engine's projection symmetric (_31 = _32 = 0), as unjittering from the matrix itself assumes
-      for (size_t i = 0; i < projection_max_abs_bits.size(); i++)
-      {
-         const uint32_t bits = std::bit_cast<uint32_t>(std::fabs(projection[8 + i]));
-         std::atomic_ref max_bits(projection_max_abs_bits[i]);
-         uint32_t seen = max_bits.load(std::memory_order_relaxed);
-         while (bits > seen && !max_bits.compare_exchange_weak(seen, bits, std::memory_order_relaxed))
-         {
-         }
-      }
-#endif
       std::array<float, 16> jittered;
       std::copy_n(projection, 16, jittered.data());
       bool motion_active = false;
       {
          const std::unique_lock lock(camera_state.mutex);
          motion_active = camera_state.motion_active;
-         if (motion_active && slot == uint32_t(g_dlaa_camera_slot))
+         if (motion_active && slot == 0)
          {
-            std::copy_n(reinterpret_cast<const float*>(game_module + camera_views_rva + slot * camera_matrix_size), 16, camera_state.view.data());
-            camera_state.projection = jittered;
-            camera_state.applied_jitter_pixels = camera_state.jitter_pixels;
-            camera_state.applied_jitter_ndc = camera_state.jitter_ndc;
-            camera_state.captured = true;
+            CameraState::Capture& capture = camera_state.capture.emplace(CameraState::Capture{.projection = jittered, .jitter_pixels = camera_state.jitter_pixels, .jitter_ndc = camera_state.jitter_ndc});
+            std::copy_n(reinterpret_cast<const float*>(game_module + camera_views_rva), 16, capture.view.data());
          }
          // NDC x = clip x / -view z, so _31 and _32 (view z's) move it by minus themselves
          jittered[8] -= camera_state.jitter_ndc[0];
          jittered[9] -= camera_state.jitter_ndc[1];
       }
-      set_projection_original(context, (motion_active || g_mv_force_jitter) ? jittered.data() : projection);
+      set_projection_original(context, motion_active ? jittered.data() : projection);
    }
 
    // Writes the 16 "bytes" over the 16 aligned bytes of code at "code" in one atomic operation, if they still are the 16 "expected"
@@ -806,96 +679,6 @@ namespace
       return (context ? *reinterpret_cast<const uint8_t* const*>(context + context_mirror_offset) : nullptr);
    }
 
-#if DEVELOPMENT
-   // DRED (auto breadcrumbs and page faults), enabled before the game's device is made (ReShade's "create_device" comes before it): when the
-   // GPU hangs, "LogDeviceRemoval()" logs what the unfinished command lists were doing and the faulting address. Only with "DRED=1" in the
-   // mod's ReShade.ini section: the breadcrumbs cost 2-5% of the GPU (Microsoft's "Use DRED")
-   bool EnableDred(reshade::api::device_api api, uint32_t& api_version)
-   {
-      bool dred = false;
-      reshade::get_config_value(nullptr, NAME, "DRED", dred);
-      if (!dred)
-      {
-         return false;
-      }
-      const HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
-      const auto get_debug_interface = (d3d12 ? reinterpret_cast<PFN_D3D12_GET_DEBUG_INTERFACE>(GetProcAddress(d3d12, "D3D12GetDebugInterface")) : nullptr);
-      com_ptr<ID3D12DeviceRemovedExtendedDataSettings> settings;
-      if (api == reshade::api::device_api::d3d12 && get_debug_interface && SUCCEEDED(get_debug_interface(IID_PPV_ARGS(&settings))))
-      {
-         settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-         settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-         reshade::log::message(reshade::log::level::info, "[DLAA] DRED enabled");
-      }
-      return false;
-   }
-
-   std::atomic_flag device_removal_logged;
-   void LogDeviceRemoval(ID3D12Device* device)
-   {
-      if (SUCCEEDED(device->GetDeviceRemovedReason()) || device_removal_logged.test_and_set())
-      {
-         return;
-      }
-      const auto narrow = [](const wchar_t* text)
-      {
-         std::string result;
-         for (; text && *text; text++)
-         {
-            result += (*text < 128 ? char(*text) : '?');
-         }
-         return result;
-      };
-      const auto log = [](const std::string& line)
-      {
-         reshade::log::message(reshade::log::level::error, ("[DRED] " + line).c_str());
-      };
-      log(std::format("Device removed: 0x{:08X}", uint32_t(device->GetDeviceRemovedReason())));
-      com_ptr<ID3D12DeviceRemovedExtendedData1> dred;
-      if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred))))
-      {
-         log("No DRED interface");
-         return;
-      }
-      D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs = {};
-      if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&breadcrumbs)))
-      {
-         for (const D3D12_AUTO_BREADCRUMB_NODE1* node = breadcrumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext)
-         {
-            const UINT done = (node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0);
-            if (done >= node->BreadcrumbCount)
-            {
-               continue;
-            }
-            // D3D12_AUTO_BREADCRUMB_OP values, the first one not done in brackets
-            std::string ops;
-            for (UINT i = (done > 12 ? done - 12 : 0); i < (std::min)(node->BreadcrumbCount, done + 6); i++)
-            {
-               ops += (i == done ? std::format("[{}] ", int(node->pCommandHistory[i])) : std::format("{} ", int(node->pCommandHistory[i])));
-            }
-            log(std::format("List \"{}\" {} on queue \"{}\" {}: {} of {} done, ops {}", narrow(node->pCommandListDebugNameW), static_cast<const void*>(node->pCommandList), narrow(node->pCommandQueueDebugNameW), static_cast<const void*>(node->pCommandQueue), done, node->BreadcrumbCount, ops));
-            for (UINT i = 0; i < node->BreadcrumbContextsCount; i++)
-            {
-               log(std::format("   context at {}: {}", node->pBreadcrumbContexts[i].BreadcrumbIndex, narrow(node->pBreadcrumbContexts[i].pContextString)));
-            }
-         }
-      }
-      D3D12_DRED_PAGE_FAULT_OUTPUT1 page_fault = {};
-      if (SUCCEEDED(dred->GetPageFaultAllocationOutput1(&page_fault)))
-      {
-         log(std::format("Page fault VA 0x{:X}", page_fault.PageFaultVA));
-         for (const D3D12_DRED_ALLOCATION_NODE1* node = page_fault.pHeadExistingAllocationNode; node; node = node->pNext)
-         {
-            log(std::format("   existing allocation \"{}\" type {}", narrow(node->ObjectNameW), int(node->AllocationType)));
-         }
-         for (const D3D12_DRED_ALLOCATION_NODE1* node = page_fault.pHeadRecentFreedAllocationNode; node; node = node->pNext)
-         {
-            log(std::format("   recently freed \"{}\" type {}", narrow(node->ObjectNameW), int(node->AllocationType)));
-         }
-      }
-   }
-#endif
-
    void OnBarrier(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource* resources, const reshade::api::resource_usage* old_states, const reshade::api::resource_usage* new_states)
    {
       if (scene_writer.resource == 0)
@@ -918,12 +701,46 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
    // guards the target, which is in a shader resource state between draws
    DeviceData::GamePassD3D12 predication_pass;
    reshade::api::resource predication = {};
-   uint64_t predication_present = UINT64_MAX; // The present count of its last draw: it only counts in that frame
+   uint64_t predication_present = UINT64_MAX; // The present count of its last draw: it counts in that frame and the next (see "IsThisOrLastFrame()")
    // Recorded on other threads than the post chain (see "shader_hashes_depth_prepass")
    std::atomic<uint64_t> scene_depth = 0;
    std::atomic<reshade::api::format> scene_depth_format = reshade::api::format::unknown;
    std::atomic<uint64_t> fxaa_input = 0;
    std::atomic<reshade::api::format> fxaa_input_format = reshade::api::format::unknown;
+   // The view normals the depth prepass draws write (their rt0), XeGTAO's normals
+   std::atomic<uint64_t> scene_normals = 0;
+   std::atomic<reshade::api::format> scene_normals_format = reshade::api::format::unknown;
+
+   // XeGTAO (see "DrawXeGTAO()"), at the depth's size: its inputs, copies of the depth (R32) and normals (RGBA8) the copy pass draws (it also draws the
+   // apply), the view depth mips, the AO + edges ping-pong and the final AO the compute pass writes. "gtao_pass.mutex" guards them; they rest as shader
+   // resources
+   DeviceData::GamePassD3D12 gtao_copy_pass;
+   DeviceData::GamePassD3D12 gtao_pass;
+   reshade::api::resource gtao_depth = {};
+   reshade::api::resource gtao_normals = {};
+   reshade::api::resource gtao_depth_mips = {};
+   std::array<reshade::api::resource, 2> gtao_working = {};
+   reshade::api::resource gtao_final = {};
+   std::atomic<uint64_t> gtao_present = UINT64_MAX; // The present count of XeGTAO's last draw (its textures go when it's idle)
+   // The command lists whose fx_ssao_test XeGTAO replaced: the rest of the chain on each (filters skipped, upsampling drawing XeGTAO's) follows,
+   // and the upsampling takes it out. Not the present count, which the game's worker threads can see change within one frame's recording: a chain
+   // that ran the game's filters and upsampling after a replaced test would read its stale 1080p target.
+   std::shared_mutex gtao_command_lists_mutex;
+   std::vector<reshade::api::command_list*> gtao_command_lists;
+
+   // Luma Bloom (see "DrawLumaBloom()"): glow_pass0's level 0 (its rt0), the sigma of glow_pass1's kernel and glow_pass2's target (the glow composite's
+   // source, recorded on another thread than the composite), recorded at their draws; the folded level 0 (RGBA16F, "bloom_fold_pass.mutex" guards
+   // it, at rest as a shader resource)
+   std::atomic<uint64_t> glow_level0 = 0;
+   std::atomic<reshade::api::format> glow_level0_format = reshade::api::format::unknown;
+   std::atomic<float> glow_sigma = 1.7f;
+   std::atomic<uint64_t> glow_target = 0;
+   std::atomic<reshade::api::format> glow_target_format = reshade::api::format::unknown;
+   DeviceData::GamePassD3D12 bloom_fold_pass;
+   DeviceData::GamePassD3D12 bloom_composite_pass;
+   DeviceData::GamePassD3D12 bloom_apply_pass;
+   reshade::api::resource bloom_input = {};
+   std::atomic<uint64_t> bloom_drawn_present = UINT64_MAX; // glow_pass1 is skipped the frame after it too
 
    // DLAA (see "DrawDLAA()"). Each pass' mutex also guards its targets, kept in "state" between draws: the copy pass the depth copy (R32,
    // a shader resource; it also stands in for FXAA), the motion vector pass the motion vectors (RG16F, a shader resource), the color pass
@@ -1082,35 +899,6 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
             camera_constants[cb12_view_projection + i] += previous_camera.jitter_ndc[0] * previous_camera.cb12[cb12_view + 2 * 4 + i];
             camera_constants[cb12_view_projection + 4 + i] += previous_camera.jitter_ndc[1] * previous_camera.cb12[cb12_view + 2 * 4 + i];
          }
-#if DEVELOPMENT
-         // The layout the above assumes: the mirror's VP is its P x V (both transposed)
-         if (g_mv_live_checks)
-         {
-            CountLiveCheck(VP_RECOMPOSE_CHECKED);
-            for (size_t row = 0; row < 4; row++)
-            {
-               for (size_t column = 0; column < 4; column++)
-               {
-                  double recomposed = 0.0;
-                  for (size_t k = 0; k < 4; k++)
-                  {
-                     recomposed += double(current_camera.cb12[row * 4 + k]) * double(current_camera.cb12[cb12_view + k * 4 + column]);
-                  }
-                  const double stored = current_camera.cb12[cb12_view_projection + row * 4 + column];
-                  if (std::abs(recomposed - stored) > 1e-4 * (1.0 + std::abs(stored)))
-                  {
-                     CountLiveCheck(VP_RECOMPOSE_MISMATCH);
-                     if (!vp_recompose_mismatch_logged.test_and_set())
-                     {
-                        reshade::log::message(reshade::log::level::warning, std::format("[CB12] VP isn't P x V at row {} column {}: {} recomposed, {} stored", row, column, recomposed, stored).c_str());
-                     }
-                     row = 4;
-                     break;
-                  }
-               }
-            }
-         }
-#endif
          // Rows 31 and 32: this frame's jitter and the gate, the move of c_location since last frame
          camera_constants[cb12_floats + 0] = current_camera.jitter_ndc[0];
          camera_constants[cb12_floats + 1] = current_camera.jitter_ndc[1];
@@ -1185,12 +973,6 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
          run->camera_constants = camera_constants;
          run->write_address = cache_addresses[new_stamp & 1];
          run->read_address = cache_addresses[(new_stamp & 1) ^ 1];
-#if DEVELOPMENT
-         if (g_mv_log_runs)
-         {
-            reshade::log::message(reshade::log::level::info, std::format("[ObjectMV] Run: stamp {} list {} vb {:#x}+{} first index {} vertices {} stride {} anchor ({:.3f} {:.3f} {:.3f}) match {} (distance {:.3f}, vertices {}) previous {} read {} write {} (previous objects {}, objects {})", new_stamp, cmd_list, vertex_buffer.buffer, vertex_buffer.offset, first_index, vertex_count, vertex_stride, anchor[0], anchor[1], anchor[2], match != nullptr, (match ? std::sqrt(nearest_distance_squared) : -1.f), (match ? match->vertex_count : 0u), has_previous, run->draw_constants[0], run->draw_constants[1], previous_objects.size(), objects.size()).c_str());
-         }
-#endif
          if (match)
          {
             match->claimed = true;
@@ -1310,74 +1092,9 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
       }
    } rigid_draws;
 
-#if DEVELOPMENT
-   // The engine's constant ring "<pxd:cb_pool>" (one persistently mapped upload buffer every cbuffer CBV points into), mapped on the first
-   // CBV found in it. Its mutex guards the fields, placed first
-   struct
-   {
-      std::shared_mutex mutex;
-      uint64_t resource = 0;
-      const uint8_t* mapped = nullptr;
-      uint64_t size = 0;
-   } constant_ring;
-
-   // The first "byte_count" bytes of the draw's bound VS CBV "binding" (the descriptors Core shadows -> the ring's CPU pointer): null if any
-   // of that isn't known. Mapping an upload buffer again returns the pointer it was mapped at already.
-   const uint8_t* ReadBoundConstants(const D3D12State::CommandListState& state, const DeviceData& device_data, uint32_t binding, uint64_t byte_count)
-   {
-      if (state.graphics.bindings.size() <= vs_descriptor_table_root_parameter)
-      {
-         return nullptr;
-      }
-      const reshade::api::descriptor_table table = state.graphics.bindings[vs_descriptor_table_root_parameter].table;
-      if (table.handle == 0)
-      {
-         return nullptr;
-      }
-      const D3D12State::Descriptor* const descriptor = D3D12State::FindDescriptor(device_data.descriptor_heaps, device_data.reshade_device, table, binding);
-      if (!descriptor || descriptor->type != reshade::api::descriptor_type::constant_buffer)
-      {
-         return nullptr;
-      }
-      const uint64_t buffer = descriptor->handle;
-      const uint64_t offset = descriptor->offset;
-      if (buffer == 0)
-      {
-         return nullptr;
-      }
-      const uint8_t* mapped = nullptr;
-      {
-         const std::shared_lock lock(constant_ring.mutex);
-         if (constant_ring.resource == buffer && offset + byte_count <= constant_ring.size)
-         {
-            mapped = constant_ring.mapped;
-         }
-      }
-      if (!mapped)
-      {
-         auto* const resource = reinterpret_cast<ID3D12Resource*>(buffer);
-         D3D12_HEAP_PROPERTIES heap = {};
-         resource->GetHeapProperties(&heap, nullptr);
-         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-         void* map = nullptr;
-         // No read range: the CPU reads it
-         if (heap.Type != D3D12_HEAP_TYPE_UPLOAD || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || offset + byte_count > desc.Width || FAILED(resource->Map(0, nullptr, &map)))
-         {
-            return nullptr;
-         }
-         const std::unique_lock lock(constant_ring.mutex);
-         constant_ring.resource = buffer;
-         constant_ring.mapped = static_cast<const uint8_t*>(map);
-         constant_ring.size = desc.Width;
-         mapped = constant_ring.mapped;
-      }
-      return mapped + offset;
-   }
-#endif
-
    // "*target" (a texture of "pass", in "state" between draws) at "width" x "height", made again (the old one retired) at another size. With
-   // "pass->mutex" held. "*created": whether it was made now
-   static bool EnsurePassTarget(DeviceData::GamePassD3D12* pass, reshade::api::resource* target, reshade::api::device* device, uint64_t present_count, uint32_t width, uint32_t height, reshade::api::format format, reshade::api::resource_usage usage, reshade::api::resource_usage state, const wchar_t* name, bool* created = nullptr)
+   // "pass->mutex" held. "*created": whether it was made now. "levels": its mips
+   static bool EnsurePassTarget(DeviceData::GamePassD3D12* pass, reshade::api::resource* target, reshade::api::device* device, uint64_t present_count, uint32_t width, uint32_t height, reshade::api::format format, reshade::api::resource_usage usage, reshade::api::resource_usage state, const wchar_t* name, bool* created = nullptr, uint16_t levels = 1)
    {
       if (target->handle != 0)
       {
@@ -1388,7 +1105,7 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
          }
          RetireD3D12GamePassResource(pass, present_count, target);
       }
-      const reshade::api::resource_desc desc(width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_only, usage);
+      const reshade::api::resource_desc desc(width, height, 1, levels, format, 1, reshade::api::memory_heap::gpu_only, usage);
       // Destroyed with the device otherwise
       const bool made = device->create_resource(desc, nullptr, state, target);
       if (made)
@@ -1451,71 +1168,39 @@ public:
       default_luma_global_game_settings.Saturation = cb_luma_global_settings.GameSettings.Saturation = 1.f;
       default_luma_global_game_settings.HighlightDechroma = cb_luma_global_settings.GameSettings.HighlightDechroma = 0.f;
 
-      native_shaders_definitions.emplace(CompileTimeStringHash("YKR SMAA Predication PS"), ShaderDefinition{"Luma_YKR_SMAAPredication", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR SMAA Predication PS"), ShaderDefinition{.file_name = "Luma_YKR_SMAAPredication", .type = reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR SMAA T2x Blending Weight Calculation PS"), ShaderDefinition{.file_name = "Luma_SMAA_impl", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "smaa_blending_weight_calculation_ps", .defines_data = {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR SMAA T2x Neighborhood Blending PS"), ShaderDefinition{.file_name = "Luma_SMAA_impl", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "smaa_neighborhood_blending_ps", .defines_data = {{"SMAA_T2X", "1"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("YKR SMAA T2x Resolve PS"), ShaderDefinition{"Luma_YKR_SMAAT2xResolve", reshade::api::pipeline_subobject_type::pixel_shader});
-      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Copy PS"), ShaderDefinition{"Luma_YKR_DLAA", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "copy_ps"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Motion Vectors PS"), ShaderDefinition{"Luma_YKR_DLAA", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "motion_vectors_ps"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Decode PS"), ShaderDefinition{"Luma_YKR_DLAA", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "decode_ps"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Encode PS"), ShaderDefinition{"Luma_YKR_DLAA", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "encode_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR SMAA T2x Resolve PS"), ShaderDefinition{.file_name = "Luma_YKR_SMAAT2xResolve", .type = reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Copy PS"), ShaderDefinition{.file_name = "Luma_YKR_DLAA", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "copy_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Motion Vectors PS"), ShaderDefinition{.file_name = "Luma_YKR_DLAA", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "motion_vectors_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Decode PS"), ShaderDefinition{.file_name = "Luma_YKR_DLAA", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "decode_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR DLAA Encode PS"), ShaderDefinition{.file_name = "Luma_YKR_DLAA", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "encode_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Prefilter Depths CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "prefilter_depths16x16_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Main Pass CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "main_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR GT-VBAO Main Pass CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "gtvbao_main_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR GT-VBAO Temporal Main Pass CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "gtvbao_main_pass_cs", .defines_data = {{"GTVBAO_SLICE_COUNT", "1.0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Denoise Pass 1 CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "denoise_pass_cs", .defines_data = {{"XE_GTAO_FINAL_APPLY", "0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Denoise Pass 2 CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "denoise_pass_cs", .defines_data = {{"XE_GTAO_FINAL_APPLY", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Apply PS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "apply_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR Bloom Fold PS"), ShaderDefinition{.file_name = "Luma_YKR_Bloom", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "fold_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR Bloom Composite PS"), ShaderDefinition{.file_name = "Luma_YKR_Bloom", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "composite_ps"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR Bloom Apply PS"), ShaderDefinition{.file_name = "Luma_YKR_Bloom", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "apply_ps"});
 
       sr_game_tooltip = "DLAA only (no upscaling). Characters, hair, trees and moved world objects get their own motion; particles and other effects move with the camera's and can leave trails.\n";
 
       reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
 #if DEVELOPMENT
-      reshade::register_event<reshade::addon_event::create_device>(EnableDred);
-      // Core has no game hook for the executions: the stamps of "list_stamps" are checked here (unregistered in "DllMain()")
-      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteStampedCommandList);
-      reshade::register_event<reshade::addon_event::reset_command_list>(OnForgetCommandList);
-      reshade::register_event<reshade::addon_event::destroy_command_list>(OnForgetCommandList);
-#endif
-
-#if DEVELOPMENT
-      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_t2x", &g_smaa_t2x}, {"smaa_t2x_flip", &g_smaa_t2x_flip}, {"dlaa_mip_bias", &g_dlaa_mip_bias}, {"object_motion_vectors", &g_object_motion_vectors},
-         {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_debug_view", &g_mv_debug_view}, {"mv_log_runs", &g_mv_log_runs}, {"mv_live_checks", &g_mv_live_checks}, {"object_mv.rigid", &g_object_mv_rigid}});
-      Mcp::RegisterValues({{"object_mv.match_distance", &g_object_mv_match_distance, 0.f, 10.f}, {"object_mv.max_distance", &g_object_mv_max_distance, 0.f, 100.f}, {"object_mv.rigid_match_distance", &g_object_mv_rigid_match_distance, 0.f, 10.f}});
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_t2x", &g_smaa_t2x}, {"dlaa_mip_bias", &g_dlaa_mip_bias}, {"object_motion_vectors", &g_object_motion_vectors}, {"mv_debug_view", &g_mv_debug_view},
+         {"object_mv.rigid", &g_object_mv_rigid}, {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, { "gtvbao_enable",
+            &g_gtvbao_enable }});
+      Mcp::RegisterValues({{"object_mv.match_distance", &g_object_mv_match_distance, 0.f, 10.f}, {"object_mv.max_distance", &g_object_mv_max_distance, 0.f, 100.f}, {"object_mv.rigid_match_distance", &g_object_mv_rigid_match_distance, 0.f, 10.f},
+         {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
       for (size_t i = 0; i < MV_COUNT; i++)
       {
          Mcp::RegisterCounter(object_motion_count_names[i], &object_motion_counts_frame[i]);
       }
-      Mcp::RegisterInts({{"dlaa_camera_slot", &g_dlaa_camera_slot, 0, 3}, {"dlaa_jitter_flip", &g_dlaa_jitter_flip, 0, 3}, {"dlaa_motion_flip", &g_dlaa_motion_flip, 0, 3}, {"dlaa_stages", &g_dlaa_stages, -1, 3}});
-      Mcp::RegisterCounters({
-         {"projection_sets.slot0", &projection_sets_frame[0]},
-         {"projection_sets.slot1", &projection_sets_frame[1]},
-         {"projection_sets.slot2", &projection_sets_frame[2]},
-         {"projection_sets.slot3", &projection_sets_frame[3]},
-         {"projection_sets.other", &projection_sets_frame[4]},
-         {"dlaa.scene_state", &dlaa_scene_state},
-         {"anchor.reads", &anchor_counts_frame[ANCHOR_READS]},
-         {"anchor.unavailable", &anchor_counts_frame[ANCHOR_UNAVAILABLE]},
-         {"anchor.checked", &anchor_counts_frame[ANCHOR_CHECKED]},
-         {"anchor.mismatch", &anchor_counts_frame[ANCHOR_MISMATCH]},
-         {"anchor.mismatch_total", &anchor_mismatch_total},
-         {"cb12.checked", &live_checks_frame[CB12_CHECKED]},
-         {"cb12.unavailable", &live_checks_frame[CB12_UNAVAILABLE]},
-         {"cb12.mismatch", &live_checks_frame[CB12_MISMATCH]},
-         {"views.checked", &live_checks_frame[VIEWS_CHECKED]},
-         {"views.changed", &live_checks_frame[VIEWS_CHANGED]},
-         {"prepass.draws", &live_checks_frame[PREPASS_DRAWS]},
-         {"prepass.instanced", &live_checks_frame[PREPASS_INSTANCED]},
-         {"prepass.rt_count_not_1", &live_checks_frame[PREPASS_RT_COUNT_NOT_1]},
-         {"prepass.other_dsv", &live_checks_frame[PREPASS_OTHER_DSV]},
-         {"exec.lists", &live_checks_frame[EXEC_LISTS]},
-         {"exec.stamp_mismatch", &live_checks_frame[EXEC_STAMP_MISMATCH]},
-         {"exec.stamp_mixed", &live_checks_frame[EXEC_STAMP_MIXED]},
-         {"projection_sets.post_aa", &live_checks_frame[PROJECTION_POST_AA]},
-         {"projection_sets.main_copy", &live_checks_frame[PROJECTION_MAIN_COPY]},
-         {"post_aa.draws", &live_checks_frame[POST_AA_DRAWS]},
-         {"post_aa.jittered", &live_checks_frame[POST_AA_JITTERED]},
-         {"phase.ccr_other_phase", &live_checks_frame[CCR_OTHER_PHASE]},
-         {"screen_effect.draws", &live_checks_frame[SCREEN_EFFECT_DRAWS]},
-         {"vp.recompose_checked", &live_checks_frame[VP_RECOMPOSE_CHECKED]},
-         {"vp.recompose_mismatch", &live_checks_frame[VP_RECOMPOSE_MISMATCH]},
-      });
-      // Written by the latch at present only: the last frame's maxima
-      Mcp::RegisterValues({{"projection.max_abs_31", &projection_max_abs_frame[0]}, {"projection.max_abs_32",
-                                                                                       &projection_max_abs_frame[1]}});
       Mcp::RegisterTextures({
          {"smaa.predication", [](DeviceData& device_data) -> Mcp::DevTexture
             {
@@ -1570,41 +1255,6 @@ public:
       // DLAA or SMAA T2x: the motion vectors are made
       const bool motion_active = game_device_data.dlaa_active.load(std::memory_order_relaxed) || game_device_data.t2x_active.load(std::memory_order_relaxed);
 
-#if DEVELOPMENT
-      // What "SetProjectionDetour()" leaves unjittered must be all the camera the draws after the anti-aliasing see, and DLAA must run in
-      // the phase before them
-      const uint32_t phase = GetFramePhase();
-      if (phase >= first_post_anti_aliasing_phase && phase <= last_post_anti_aliasing_phase)
-      {
-         if (const uint8_t* const mirror = GetConstantMirror())
-         {
-            const auto* const cb12 = reinterpret_cast<const float*>(mirror + mirror_data_offset + cb12_base_offset);
-            CountLiveCheck(POST_AA_DRAWS);
-            if (cb12[cb12_projection_31] != 0.f || cb12[cb12_projection_32] != 0.f)
-            {
-               CountLiveCheck(POST_AA_JITTERED);
-               if (!post_aa_jittered_logged.test_and_set())
-               {
-                  reshade::log::message(reshade::log::level::warning, std::format("[PostAA] First draw after the anti-aliasing with a jittered camera: VS {:#010X} PS {:#010X}, phase {:#x}, _31 {}, _32 {}", original_shader_hashes.vertex_shaders[0], original_shader_hashes.pixel_shaders[0], phase, cb12[cb12_projection_31], cb12[cb12_projection_32]).c_str());
-               }
-            }
-         }
-      }
-      if (original_shader_hashes.Contains(shader_hashes_color_correct) && phase != color_correct_phase)
-      {
-         CountLiveCheck(CCR_OTHER_PHASE);
-      }
-      // Which shaders the screen effects draw with (only the fade's are known offline), for their scene brightness
-      if (screen_effect_depth > 0)
-      {
-         CountLiveCheck(SCREEN_EFFECT_DRAWS);
-         static std::atomic<uint32_t> screen_effect_draws_logged = 0;
-         if (screen_effect_draws_logged.fetch_add(1, std::memory_order_relaxed) < 32)
-         {
-            reshade::log::message(reshade::log::level::info, std::format("[ScreenEffect] Draw: VS {:#010X} PS {:#010X}, phase {:#x}", original_shader_hashes.vertex_shaders[0], original_shader_hashes.pixel_shaders[0], phase).c_str());
-         }
-      }
-#endif
       // "Hide Gameplay UI": the game's draws of the phases after FXAA are skipped, 0x19 (the world-space HUD, cutscene and menu backgrounds) and
       // 0x1a (the HUD, menus, messages), but the screen effects, the copy, the output and the videos
       if (g_hide_ui && screen_effect_depth == 0 && !original_shader_hashes.Contains(shader_hashes_hud_phase_kept))
@@ -1622,15 +1272,9 @@ public:
          // The last pass of the scene's post (DLSS best practices BK-1: Core's upscaler indicator)
          device_data.has_drawn_main_post_processing = true;
       }
-      if (motion_active && g_dlaa_stages >= 0 && is_color_correct)
+      if (motion_active && is_color_correct)
       {
          DrawDLAA(cmd_list_data, device_data, &game_device_data);
-#if DEVELOPMENT
-         if (g_mv_live_checks)
-         {
-            RecordListStamp(cmd_list_data, device_data);
-         }
-#endif
       }
       // What the next draw on this list may read as the scene
       if (motion_active && !state.render_target_views.empty() && !state.render_target_descs.empty())
@@ -1652,100 +1296,6 @@ public:
             anchor_read = true;
          }
          anchor = {world[3], world[7], world[11]};
-#if DEVELOPMENT
-         if (g_mv_live_checks)
-         {
-            // Against the first 3x4 of the CBV the draw reads, which the CPU copy of the engine's mirror must have left exactly
-            if (!anchor_read)
-            {
-               std::atomic_ref(anchor_counts[ANCHOR_UNAVAILABLE]).fetch_add(1, std::memory_order_relaxed);
-            }
-            else
-            {
-               std::atomic_ref(anchor_counts[ANCHOR_READS]).fetch_add(1, std::memory_order_relaxed);
-               if (const auto* const bound_world = reinterpret_cast<const float*>(game_device_data.ReadBoundConstants(state, device_data, bone_cbv_binding, world_matrix_size)))
-               {
-                  std::atomic_ref(anchor_counts[ANCHOR_CHECKED]).fetch_add(1, std::memory_order_relaxed);
-                  if (std::memcmp(world.data(), bound_world, world_matrix_size) != 0)
-                  {
-                     std::atomic_ref(anchor_counts[ANCHOR_MISMATCH]).fetch_add(1, std::memory_order_relaxed);
-                     std::atomic_ref(anchor_mismatch_total).fetch_add(1, std::memory_order_relaxed);
-                     if (!anchor_mismatch_logged.test_and_set())
-                     {
-                        reshade::log::message(reshade::log::level::warning, std::format("[Anchor] First mismatch, VS 0x{:08X}: mirror translation ({}, {}, {}), bound CBV ({}, {}, {})", original_shader_hashes.vertex_shaders[0], anchor[0], anchor[1], anchor[2], bound_world[3], bound_world[7], bound_world[11]).c_str());
-                     }
-                  }
-               }
-            }
-
-            // The assumptions of the object motion vectors (see "LiveCheck")
-            CountLiveCheck(PREPASS_DRAWS);
-            // Valid in this build only if Core assigns it for D3D12 draws before this callback
-            if (last_draw_dispatch_data.instance_count != 1)
-            {
-               CountLiveCheck(PREPASS_INSTANCED);
-            }
-            if (state.render_target_views.size() != 1)
-            {
-               CountLiveCheck(PREPASS_RT_COUNT_NOT_1);
-            }
-            // The scene depth is stored by the depth prepass draws below: the first draws after it was made again see the old one
-            if (state.depth_stencil_view.resource != game_device_data.scene_depth.load(std::memory_order_relaxed))
-            {
-               CountLiveCheck(PREPASS_OTHER_DSV);
-            }
-
-            // The mirror's cb12 against the bound VS b12
-            const uint8_t* const mirror = GetConstantMirror();
-            const auto* const bound_cb12 = reinterpret_cast<const uint32_t*>(game_device_data.ReadBoundConstants(state, device_data, cb12_binding, cb12_size));
-            if (!mirror || !bound_cb12)
-            {
-               CountLiveCheck(CB12_UNAVAILABLE);
-            }
-            else
-            {
-               CountLiveCheck(CB12_CHECKED);
-               const auto* const mirror_cb12 = reinterpret_cast<const uint32_t*>(mirror + mirror_data_offset + cb12_base_offset);
-               const auto [mirror_word, bound_word] = std::mismatch(mirror_cb12, mirror_cb12 + cb12_size / sizeof(uint32_t), bound_cb12);
-               if (mirror_word != mirror_cb12 + cb12_size / sizeof(uint32_t))
-               {
-                  CountLiveCheck(CB12_MISMATCH);
-                  if (!cb12_mismatch_logged.test_and_set())
-                  {
-                     reshade::log::message(reshade::log::level::warning, std::format("[CB12] First mismatch, VS 0x{:08X}: float {} is {} in the mirror, {} in the bound CBV", original_shader_hashes.vertex_shaders[0], mirror_word - mirror_cb12, std::bit_cast<float>(*mirror_word), std::bit_cast<float>(*bound_word)).c_str());
-                  }
-               }
-            }
-
-            // The CPU descriptors the game bound still describe the views Core tracked at bind time (D3D12 reads them when they are bound, and
-            // games rewrite them right after), so the draw can bind them again
-            const auto check_view = [&](const char* name, reshade::api::resource_view handle, const D3D12State::ViewInfo& tracked)
-            {
-               if (handle.handle == 0)
-               {
-                  return;
-               }
-               CountLiveCheck(VIEWS_CHECKED);
-               const D3D12State::ViewInfo current = D3D12State::GetViewInfo(device_data.reshade_device, handle);
-               if (current.resource != tracked.resource || current.format != tracked.format || current.first_level != tracked.first_level || current.first_layer != tracked.first_layer || current.layer_count != tracked.layer_count)
-               {
-                  CountLiveCheck(VIEWS_CHANGED);
-                  if (!views_changed_logged.test_and_set())
-                  {
-                     reshade::log::message(reshade::log::level::warning, std::format("[Views] First change, VS 0x{:08X}, {}: tracked resource 0x{:X} format {}, now resource 0x{:X} format {}", original_shader_hashes.vertex_shaders[0], name, tracked.resource, uint32_t(tracked.format), current.resource, uint32_t(current.format)).c_str());
-                  }
-               }
-            };
-            if (!state.render_targets.empty() && state.render_target_views.size() == state.render_targets.size())
-            {
-               check_view("RT0", state.render_targets[0], state.render_target_views[0]);
-            }
-            check_view("DSV", state.depth_stencil, state.depth_stencil_view);
-
-            // Recorded in a frame, executed in the same
-            RecordListStamp(cmd_list_data, device_data);
-         }
-#endif
       }
 
       // The offline patched pair of the draw, by both of its shaders: ps_depth's bytecode is also ps_zero's and the confetti shadow's PS, and
@@ -1757,11 +1307,18 @@ public:
             { return candidate.vertex_shader_hash == original_shader_hashes.vertex_shaders[0] && candidate.pixel_shader_hash == original_shader_hashes.pixel_shaders[0]; });
          motion_vector_pair = ((pair != std::end(MotionVectorShaders::PAIRS)) ? &*pair : nullptr);
       }
-      const bool is_depth_prepass = original_shader_hashes.Contains(shader_hashes_depth_prepass) || motion_vector_pair;
-      if (is_depth_prepass)
+      const bool is_normals_prepass = original_shader_hashes.Contains(shader_hashes_depth_prepass);
+      if (is_normals_prepass || motion_vector_pair)
       {
          game_device_data.scene_depth_format.store(state.depth_stencil_view.format, std::memory_order_relaxed);
          game_device_data.scene_depth.store(state.depth_stencil_view.resource, std::memory_order_relaxed);
+         // Only the ps_normal family writes the view normals (fx_ssao_test's t1): the hair depth pair (ps_depth_pt, also a motion vector pair) draws
+         // into another target of the same size and format, on another thread, so taking its RT0 fed XeGTAO a color buffer as normals in some frames
+         if (is_normals_prepass && !state.render_target_views.empty())
+         {
+            game_device_data.scene_normals_format.store(state.render_target_views[0].format, std::memory_order_relaxed);
+            game_device_data.scene_normals.store(state.render_target_views[0].resource, std::memory_order_relaxed);
+         }
       }
       // The rigid world's parts against last frame's: a static or new one keeps the camera motion (exact for it), a moved one draws its own
       std::array<float, world_matrix_floats> previous_world = {};
@@ -1788,7 +1345,7 @@ public:
       {
          return DrawOrDispatchOverrideType::Replaced;
       }
-      if (is_depth_prepass)
+      if (is_normals_prepass || motion_vector_pair)
       {
          return DrawOrDispatchOverrideType::None;
       }
@@ -1797,8 +1354,16 @@ public:
       // Not under DLAA, where SMAA doesn't run (a frame DLAA can't draw gets SMAA without the predication)
       const bool predicate = g_smaa_enable && g_smaa_predication && !game_device_data.dlaa_active.load(std::memory_order_relaxed);
       const bool is_predication_draw = predicate && original_shader_hashes.Contains(shader_hashes_ssao);
-      const bool is_depth_copy_draw = motion_active && g_dlaa_stages >= 0 && original_shader_hashes.Contains(shader_hashes_depth_copy);
-      if (!state.in_render_pass && (is_predication_draw || is_depth_copy_draw))
+      const bool is_depth_copy_draw = motion_active && original_shader_hashes.Contains(shader_hashes_depth_copy);
+      const bool is_ssao_test = original_shader_hashes.Contains(shader_hashes_ssao_test);
+      // Every test starts a chain of its own: one XeGTAO doesn't replace (off, refused) must not inherit an older replaced test's skips
+      if (is_ssao_test)
+      {
+         const std::unique_lock lock(game_device_data.gtao_command_lists_mutex);
+         std::erase(game_device_data.gtao_command_lists, cmd_list_data.cmd_list);
+      }
+      const bool is_gtao_draw = g_gtao_enable && is_ssao_test;
+      if (!state.in_render_pass && (is_predication_draw || is_depth_copy_draw || is_gtao_draw))
       {
          const reshade::api::resource depth = {game_device_data.scene_depth.load(std::memory_order_relaxed)};
          if (depth.handle == 0)
@@ -1852,7 +1417,132 @@ public:
                }
             }
          }
+         if (is_gtao_draw)
+         {
+            if (DrawXeGTAO(cmd_list_data, device_data, &game_device_data, depth, depth_format, width, height))
+            {
+               {
+                  const std::unique_lock lock(game_device_data.gtao_command_lists_mutex);
+                  game_device_data.gtao_command_lists.push_back(cmd_list_data.cmd_list);
+               }
+               game_device_data.gtao_present.store(present_count, std::memory_order_relaxed);
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+         }
          return DrawOrDispatchOverrideType::None;
+      }
+
+      // The rest of the game's SSAO, on a list where XeGTAO replaced its test
+      const bool is_ssao_filter = original_shader_hashes.Contains(shader_hashes_ssao_filters);
+      const bool is_ssao_upsampling = original_shader_hashes.Contains(shader_hashes_ssao_upsampling);
+      bool gtao_list = false;
+      if (is_ssao_filter || is_ssao_upsampling)
+      {
+         const std::unique_lock lock(game_device_data.gtao_command_lists_mutex);
+         gtao_list = std::ranges::find(game_device_data.gtao_command_lists, cmd_list_data.cmd_list) != game_device_data.gtao_command_lists.end();
+         if (gtao_list && is_ssao_upsampling)
+         {
+            std::erase(game_device_data.gtao_command_lists, cmd_list_data.cmd_list);
+         }
+      }
+      if (gtao_list)
+      {
+         if (is_ssao_filter)
+         {
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         if (!state.render_target_views.empty() && !state.render_target_descs.empty())
+         {
+            reshade::api::resource ao = {};
+            {
+               const std::shared_lock lock(game_device_data.gtao_pass.mutex);
+               ao = game_device_data.gtao_final;
+            }
+            reshade::api::device* const device = cmd_list_data.cmd_list->get_device();
+            const reshade::api::resource target = {state.render_target_views[0].resource};
+            const reshade::api::resource_desc target_desc = device->get_resource_desc(target);
+            // "gtao_final" is the depth's size (a retired one lives on until the lists recorded with it ran)
+            const reshade::api::resource_desc ao_desc = (ao.handle != 0 ? device->get_resource_desc(ao) : reshade::api::resource_desc{});
+            if (ao.handle != 0 && ao_desc.texture.width == target_desc.texture.width && ao_desc.texture.height == target_desc.texture.height &&
+                DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data.gtao_copy_pass, CompileTimeStringHash("YKR XeGTAO Apply PS"), "XeGTAO Apply", "Luma XeGTAO Apply", ao, reshade::api::format::r8_unorm, target, state.render_target_descs[0], {}, alpha_only_blend))
+            {
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+            // ponytail: the game's upsampling then reads its blur target, which the skipped blurs left as an older frame's
+            return DrawOrDispatchOverrideType::None;
+         }
+      }
+
+      const bool is_glow_pass0 = original_shader_hashes.Contains(shader_hashes_glow_pass0);
+      if (is_glow_pass0)
+      {
+         glow_aberration_drawn = false;
+      }
+      if (g_luma_bloom_enable && is_glow_pass0 && !state.render_target_views.empty())
+      {
+         game_device_data.glow_level0_format.store(state.render_target_views[0].format, std::memory_order_relaxed);
+         game_device_data.glow_level0.store(state.render_target_views[0].resource, std::memory_order_relaxed);
+         return DrawOrDispatchOverrideType::None;
+      }
+      if (g_luma_bloom_enable && original_shader_hashes.Contains(shader_hashes_glow_pass1))
+      {
+         // Its kernel (FUN_1402e7c70, one for all 8 draws, of the stage's sigma): c_ps_user[1..3].x weigh the tap pairs at +-0.5, 1.5 and 2.5 source
+         // texels (vs_glow_pass1), all on texel centers as every draw halves one axis. The same variance is DrawBloom's sigma
+         if (const uint8_t* const mirror = GetConstantMirror())
+         {
+            const auto* const c_ps_user = reinterpret_cast<const float*>(mirror + mirror_data_offset + cb9_base_offset);
+            const float w0 = c_ps_user[4];
+            const float w1 = c_ps_user[8];
+            const float w2 = c_ps_user[12];
+            const float weight_sum = w0 + w1 + w2;
+            if (weight_sum > 0.f)
+            {
+               game_device_data.glow_sigma.store(std::sqrt((0.25f * w0 + 2.25f * w1 + 6.25f * w2) / weight_sum), std::memory_order_relaxed);
+            }
+         }
+         // The levels are Luma Bloom's while it draws (from the frame before too, so a frame it starts in keeps the game's)
+         // ponytail: a frame it then can't draw (glow_pass2_5, a shader reload) shows the levels of the last frame the game drew them
+         const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+         const uint64_t bloom_drawn_present = game_device_data.bloom_drawn_present.load(std::memory_order_relaxed);
+         if (IsThisOrLastFrame(bloom_drawn_present, present_count))
+         {
+            return DrawOrDispatchOverrideType::Replaced;
+         }
+         return DrawOrDispatchOverrideType::None;
+      }
+      if (original_shader_hashes.Contains(shader_hashes_glow_pass1_ca))
+      {
+         glow_aberration_drawn = true;
+         return DrawOrDispatchOverrideType::None;
+      }
+      const bool is_glow_pass2 = original_shader_hashes.Contains(shader_hashes_glow_pass2);
+      if (is_glow_pass2 && !state.render_target_views.empty())
+      {
+         game_device_data.glow_target_format.store(state.render_target_views[0].format, std::memory_order_relaxed);
+         game_device_data.glow_target.store(state.render_target_views[0].resource, std::memory_order_relaxed);
+      }
+      if (g_luma_bloom_enable && is_glow_pass2 && !glow_aberration_drawn && DrawLumaBloom(cmd_list_data, device_data, &game_device_data))
+      {
+         game_device_data.bloom_drawn_present.store(device_data.present_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+      if (g_luma_bloom_enable && g_bloom_intensity != 1.f && original_shader_hashes.Contains(shader_hashes_glow_composite) && !state.render_target_views.empty() && !state.render_target_descs.empty())
+      {
+         const D3D12_BLEND_DESC* const blend = ((cmd_list_data.bound_cached_pipeline && cmd_list_data.bound_cached_pipeline->capture) ? cmd_list_data.bound_cached_pipeline->capture->Find<D3D12_BLEND_DESC>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) : nullptr);
+         const reshade::api::resource glow = {game_device_data.glow_target.load(std::memory_order_relaxed)};
+         if (blend && blend->RenderTarget[0].BlendEnable && blend->RenderTarget[0].SrcBlend == D3D12_BLEND_ONE && blend->RenderTarget[0].DestBlend == D3D12_BLEND_ONE && glow.handle != 0)
+         {
+            if (g_bloom_intensity <= 0.f)
+            {
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+            // "GlowConstants" after the target's size: the weight scale (unused here), the intensity
+            const float constants[] = {1.f, g_bloom_intensity};
+            if (DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data.bloom_apply_pass, CompileTimeStringHash("YKR Bloom Apply PS"), "Bloom Apply", "Luma Bloom Apply", glow, game_device_data.glow_target_format.load(std::memory_order_relaxed), {state.render_target_views[0].resource}, state.render_target_descs[0], constants, additive_blend))
+            {
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+         }
       }
 
       if (original_shader_hashes.Contains(shader_hashes_fxaa_input) && !state.render_target_views.empty())
@@ -1893,7 +1583,7 @@ public:
             {
                predication = game_device_data.predication;
                const reshade::api::resource_desc predication_desc = device->get_resource_desc(predication);
-               predicated = g_smaa_predication && game_device_data.predication_present == present_count && predication_desc.texture.width == target_desc.texture.width && predication_desc.texture.height == target_desc.texture.height;
+               predicated = g_smaa_predication && IsThisOrLastFrame(game_device_data.predication_present, present_count) && predication_desc.texture.width == target_desc.texture.width && predication_desc.texture.height == target_desc.texture.height;
             }
          }
          if (predication.handle == 0)
@@ -1908,9 +1598,8 @@ public:
             reshade::api::resource motion_vectors = {};
             {
                const std::shared_lock lock(game_device_data.motion_vector_pass.mutex);
-               // Recorded at the ccr draw, maybe on a worker whose list is recorded after this one: the GPU still runs it first (see "DrawDLAA()")
-               const uint64_t motion_vectors_present = game_device_data.motion_vectors_present.load(std::memory_order_relaxed);
-               if (motion_vectors_present == present_count || motion_vectors_present + 1 == present_count)
+               // Recorded at the ccr draw, maybe on another worker (see "IsThisOrLastFrame()")
+               if (IsThisOrLastFrame(game_device_data.motion_vectors_present.load(std::memory_order_relaxed), present_count))
                {
                   motion_vectors = game_device_data.motion_vectors;
                }
@@ -1921,13 +1610,13 @@ public:
                float applied_jitter_x = 0.f;
                {
                   const std::shared_lock lock(camera_state.mutex);
-                  applied_jitter_x = camera_state.applied_jitter_pixels[0];
+                  applied_jitter_x = (camera_state.capture ? camera_state.capture->jitter_pixels[0] : 0.f);
                }
                // A sample offset of (+0.25, +0.25) takes the area texture's subsample 1, (-0.25, -0.25) the 2 (0: no jitter)
                float subsample_index = 0.f;
                if (applied_jitter_x != 0.f)
                {
-                  subsample_index = (((applied_jitter_x > 0.f) != g_smaa_t2x_flip) ? 1.f : 2.f);
+                  subsample_index = ((applied_jitter_x > 0.f) ? 1.f : 2.f);
                }
                const uint32_t current_frame = uint32_t(present_count & 1);
                std::array<reshade::api::resource, 3> frames = {};
@@ -1935,12 +1624,12 @@ public:
                if (motion_vectors_desc.texture.width == target_desc.texture.width && motion_vectors_desc.texture.height == target_desc.texture.height)
                {
                   const std::unique_lock lock(game_device_data.t2x_pass.mutex);
-                  bool created = false;
-                  if (game_device_data.EnsurePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[0], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 0", &created) &&
-                      game_device_data.EnsurePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[1], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 1", &created))
+                  bool created_frames[2] = {};
+                  if (game_device_data.EnsurePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[0], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 0", &created_frames[0]) &&
+                      game_device_data.EnsurePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[1], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 1", &created_frames[1]))
                   {
                      // "DrawFullscreenPassD3D12()" takes the pass' mutex. A target retired meanwhile lives on until the lists recorded with it ran.
-                     history_valid = !created && game_device_data.t2x_drawn_present.load(std::memory_order_relaxed) + 1 == present_count;
+                     history_valid = !created_frames[0] && !created_frames[1] && game_device_data.t2x_drawn_present.load(std::memory_order_relaxed) + 1 == present_count;
                      // RCAS can't read the target it writes: the resolve goes to a third frame first
                      if (g_rcas_sharpness > 0.f)
                      {
@@ -2160,7 +1849,6 @@ public:
       {
          return refuse(MV_REFUSED_NO_BUFFERS);
       }
-      [[maybe_unused]] bool continued_run = false;
       if (rigid)
       {
          if (!game_device_data->object_motion.StartRigidDraw(&run, device, present_count, *rigid_previous_world))
@@ -2171,7 +1859,6 @@ public:
       else if (run.cmd_list == cmd_list_data.cmd_list && run.stamp == present_count && run.vertex_buffer == vertex_buffer && draw.first_index > run.last_first_index)
       {
          run.last_first_index = draw.first_index;
-         continued_run = true;
          game_device_data->object_motion.AddPart(run, draw.first_index);
       }
       else
@@ -2183,26 +1870,6 @@ public:
             return refuse(MV_REFUSED_NO_BUFFERS);
          }
       }
-#if DEVELOPMENT
-      if (g_mv_log_runs && !rigid)
-      {
-         if (object_mv_runs_logged.fetch_add(1, std::memory_order_relaxed) < object_mv_runs_to_log)
-         {
-            std::string streams;
-            for (const D3D12State::BufferBinding& binding : state.vertex_buffers)
-            {
-               streams += std::format(" {:#x}+{}/{}", binding.buffer, binding.offset, binding.stride);
-            }
-            reshade::log::message(reshade::log::level::info, std::format("[ObjectMV] Draw: VS {:#010X} list {} thread {} present {} first index {} index count {} vertex offset {}{} | run: read {} write {} vertices {} previous {} | streams' vertices {}:{}", pair->vertex_shader_hash, static_cast<const void*>(cmd_list_data.cmd_list), GetCurrentThreadId(), present_count, draw.first_index, draw.index_count, draw.vertex_offset, (continued_run ? " (continues)" : ""), run.draw_constants[0], run.draw_constants[1], run.draw_constants[2], run.draw_constants[3], streams_vertex_count(), streams).c_str());
-         }
-         else
-         {
-            g_mv_log_runs = false;
-            object_mv_runs_logged.store(0, std::memory_order_relaxed);
-         }
-      }
-#endif
-
       std::memcpy(camera_upload.cpu, run.camera_constants.data(), sizeof(run.camera_constants));
 
       const YakuzaKiwamiDeviceData::ObjectMotionState& object_motion = game_device_data->object_motion;
@@ -2255,9 +1922,8 @@ public:
       reshade::api::resource depth = {};
       {
          const std::shared_lock lock(game_device_data->copy_pass.mutex);
-         // The copy is recorded at the low-res depth draw, often on another worker that records its list after this one: the GPU still runs it
-         // first (it's submitted first), so last frame's stamp stands for this frame's copy too. A copy point that stops drawing turns DLAA off a frame later
-         if (game_device_data->depth_copy_present == present_count || game_device_data->depth_copy_present + 1 == present_count)
+         // Recorded at the low-res depth draw, often on another worker (see "IsThisOrLastFrame()"). A copy point that stops drawing turns DLAA off a frame later
+         if (IsThisOrLastFrame(game_device_data->depth_copy_present, present_count))
          {
             depth = game_device_data->depth_copy;
          }
@@ -2273,21 +1939,16 @@ public:
          return;
       }
 
-      std::array<float, 16> view;
-      std::array<float, 16> projection;
-      std::array<float, 2> jitter_pixels;
-      std::array<float, 2> jitter_ndc;
+      const std::optional<CameraState::Capture> capture = []
       {
          const std::shared_lock lock(camera_state.mutex);
-         if (!camera_state.captured)
-         {
-            return;
-         }
-         view = camera_state.view;
-         projection = camera_state.projection;
-         jitter_pixels = camera_state.applied_jitter_pixels;
-         jitter_ndc = camera_state.applied_jitter_ndc;
+         return camera_state.capture;
+      }();
+      if (!capture)
+      {
+         return;
       }
+      const auto& [view, projection, jitter_pixels, jitter_ndc] = *capture;
 
       constexpr reshade::api::resource_usage render_target_and_shader_resource = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
       reshade::api::resource motion_vectors = {};
@@ -2374,7 +2035,7 @@ public:
          }
       }
       // SMAA T2x needs the motion vectors only
-      if (!dlaa_active || !sr_instance_data || !motion_vectors_drawn || g_dlaa_stages < 1)
+      if (!dlaa_active || !sr_instance_data || !motion_vectors_drawn)
       {
          return;
       }
@@ -2399,9 +2060,6 @@ public:
          reshade::log::message(reshade::log::level::error, "[DLAA] ReShade refused its textures, so it's off until it's picked again");
          return;
       }
-#if DEVELOPMENT
-      dlaa_scene_state = uint32_t(scene.state);
-#endif
 
       // The scene is in the state the game's barriers left it in since its last draw, a pixel shader resource normally (ccr reads it)
       const bool scene_readable = (scene.state & reshade::api::resource_usage::shader_resource_pixel) == reshade::api::resource_usage::shader_resource_pixel;
@@ -2415,17 +2073,15 @@ public:
       const bool decoded = DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data->color_pass, CompileTimeStringHash("YKR DLAA Decode PS"), "DLAA Decode", "Luma DLAA Decode", scene_resource, scene.desc.format, decoded_scene, color_desc, {});
       cmd_list->barrier(decoded_scene, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
 
-      bool dlss_drawn = false;
-      if (decoded && g_dlaa_stages >= 2)
+      bool sr_drawn = false;
+      if (decoded)
       {
-         const float jitter_sign_x = ((g_dlaa_jitter_flip & 1) ? -1.f : 1.f);
-         const float jitter_sign_y = ((g_dlaa_jitter_flip & 2) ? -1.f : 1.f);
-         const float motion_sign_x = ((g_dlaa_motion_flip & 1) ? -1.f : 1.f);
-         const float motion_sign_y = ((g_dlaa_motion_flip & 2) ? -1.f : 1.f);
-         // The inputs stay in a shader resource state (pixel and non pixel), which NGX reads; the output is in unordered access
+         // The inputs stay in a shader resource state (pixel and non pixel), which DLSS and FSR read; the output is in unordered access
          auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
          // UV deltas, previous minus current. Exposure 1: the scene is already exposed and tonemapped
-         const SR::SettingsData settings_data = {.output_width = width, .output_height = height, .render_width = width, .render_height = height, .hdr = true, .inverted_depth = false, .mvs_jittered = false, .mvs_x_scale = float(width) * motion_sign_x, .mvs_y_scale = float(height) * motion_sign_y, .auto_exposure = false, .render_preset = dlss_render_preset};
+         const SR::SettingsData settings_data = {.output_width = width, .output_height = height, .render_width = width, .render_height = height, .hdr = true, .inverted_depth = false, .mvs_jittered = false, .mvs_x_scale = float(width), .mvs_y_scale = float(height), .auto_exposure = false, .render_preset = dlss_render_preset};
+         // FSR's camera (DLSS ignores it), from the engine's row vector projection
+         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(projection.data(), true);
          const SR::SuperResolutionImpl::DrawData draw_data = {
             .reset = device_data.force_reset_sr,
             .output_recreated = output_recreated,
@@ -2435,15 +2091,18 @@ public:
             .depth_buffer = reinterpret_cast<ID3D12Resource*>(depth.handle),
             .render_width = width,
             .render_height = height,
-            .jitter_x = jitter_pixels[0] * jitter_sign_x,
-            .jitter_y = jitter_pixels[1] * jitter_sign_y,
+            .jitter_x = jitter_pixels[0],
+            .jitter_y = jitter_pixels[1],
+            .vert_fov = float(camera.vert_fov),
+            .near_plane = float(camera.near_plane),
+            .far_plane = float(camera.far_plane),
          };
-         dlss_drawn = sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_list, settings_data) && sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_list, draw_data);
-         // NGX binds its own descriptor heaps, root signature and pipeline
+         sr_drawn = sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_list, settings_data) && sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_list, draw_data);
+         // DLSS and FSR bind their own descriptor heaps, root signatures and pipelines
          D3D12State::RestoreCompute(cmd_list, state, {});
          RestoreGameGraphicsD3D12(cmd_list_data);
          TraceLumaPass(&cmd_list_data, device_data, "Luma DLAA", {{.resource = decoded_scene.handle, .format = reshade::api::format::r16g16b16a16_float}, {.resource = motion_vectors.handle, .format = reshade::api::format::r16g16_float}, {.resource = depth.handle, .format = reshade::api::format::r32_float}}, {{.resource = output.handle, .format = reshade::api::format::r16g16b16a16_float}}, true);
-         if (dlss_drawn)
+         if (sr_drawn)
          {
             const std::unique_lock lock(game_device_data->color_pass.mutex);
             game_device_data->dlaa_output_recreated = false;
@@ -2451,12 +2110,12 @@ public:
          else
          {
             device_data.sr_suppressed = true;
-            reshade::log::message(reshade::log::level::error, "[DLAA] DLSS failed, so it's off until it's picked again");
+            reshade::log::message(reshade::log::level::error, std::format("[DLAA] {} failed, so it's off until it's picked again", SR::GetTypeName(device_data.sr_type)).c_str());
          }
       }
 
       bool encoded = false;
-      if (dlss_drawn && g_dlaa_stages >= 3)
+      if (sr_drawn)
       {
          cmd_list->barrier(output, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
          cmd_list->barrier(scene_resource, scene_read_state, reshade::api::resource_usage::render_target);
@@ -2473,6 +2132,236 @@ public:
          device_data.has_drawn_sr = true;
          game_device_data->dlaa_drawn_present.store(present_count, std::memory_order_relaxed);
       }
+   }
+
+   // XeGTAO (Luma_YKR_XeGTAO.hlsl) at fx_ssao_test, whose t0 is the scene depth ("depth", "width" x "height") and t1 the prepass normals, both in a
+   // state pixel shaders read: copies of both, then prefilter, main pass and two denoisers into "gtao_final", recorded on the game's list. The
+   // camera is the main one's (the exe's slot 0, unjittered there). False, with the game's SSAO to run, if anything is missing.
+   static bool DrawXeGTAO(CommandListData& cmd_list_data, DeviceData& device_data, YakuzaKiwamiDeviceData* game_device_data, reshade::api::resource depth, reshade::api::format depth_format, uint32_t width, uint32_t height)
+   {
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      reshade::api::device* const device = cmd_list->get_device();
+      const reshade::api::resource normals = {game_device_data->scene_normals.load(std::memory_order_relaxed)};
+      if (game_module == 0 || normals.handle == 0)
+      {
+         return false;
+      }
+      const reshade::api::resource_desc normals_desc = device->get_resource_desc(normals);
+      if (normals_desc.texture.width != width || normals_desc.texture.height != height)
+      {
+         return false;
+      }
+      // Row vectors, right-handed, standard Z (see NOTES.md "Exe RE")
+      const auto* const projection = reinterpret_cast<const float*>(game_module + camera_projections_rva);
+      const float p11 = projection[0];
+      const float p22 = projection[5];
+      // The game's radius, as the engine wrote it into its constant mirror for this draw (FUN_140864d90, see Luma_YKR_XeGTAO.hlsl)
+      const uint8_t* const mirror = GetConstantMirror();
+      if (p11 == 0.f || p22 == 0.f || !mirror)
+      {
+         return false;
+      }
+      const auto* const c_ps_user = reinterpret_cast<const float*>(mirror + mirror_data_offset + cb9_base_offset);
+      const std::array<float, 4> vanilla_radius = {c_ps_user[8 * 4 + 2], c_ps_user[8 * 4 + 3], c_ps_user[10 * 4 + 2], c_ps_user[10 * 4 + 3]};
+#if DEVELOPMENT
+      static std::atomic_flag vanilla_radius_logged;
+      if (!vanilla_radius_logged.test_and_set())
+      {
+         reshade::log::message(reshade::log::level::info, std::format("[XeGTAO] The game's SSAO radius: max({}, {} * view z), max({}, {} * view z)", vanilla_radius[0], vanilla_radius[1], vanilla_radius[2], vanilla_radius[3]).c_str());
+      }
+      const float debug_view = float(g_gtao_debug_view);
+#else
+      const float debug_view = 0.f;
+#endif
+      // GT-VBAO under a temporal anti-aliasing (DLAA, SMAA T2x): one slice, its noise moved every frame for the anti-aliasing to average
+      const bool temporal_gtvbao = g_gtvbao_enable && (game_device_data->dlaa_active.load(std::memory_order_relaxed) || game_device_data->t2x_active.load(std::memory_order_relaxed));
+      const float noise_index = (temporal_gtvbao ? float(device_data.present_count.load(std::memory_order_relaxed) % 64) : 0.f);
+      // The power matching the game's SSAO darkening at YKR_GTAO_RADIUS_SCALE (see NOTES.md "Calibration"): XeGTAO 1.3 (an office, one scene);
+      // GT-VBAO 1, its strength is its thickness (Luma_YKR_XeGTAO.hlsl). "g_gtao_final_value_power" scales it
+      const float final_value_power = g_gtao_final_value_power * (g_gtvbao_enable ? 1.f : 1.3f);
+      // "LumaGTAO" in Luma_YKR_XeGTAO.hlsl
+      const float constants[] = {1.f / float(width), 1.f / float(height), projection[10], projection[14], 2.f / p11, -2.f / p22, (projection[8] - 1.f) / p11, (1.f + projection[9]) / p22, final_value_power, g_gtao_radius_override, debug_view, noise_index, vanilla_radius[0], vanilla_radius[1], vanilla_radius[2], vanilla_radius[3]};
+
+      auto& pass = game_device_data->gtao_pass;
+      const std::unique_lock lock(pass.mutex);
+      const reshade::api::sampler_desc point_sampler = {.filter = reshade::api::filter_mode::min_mag_mip_point};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = 1;
+      sampler_range.visibility = reshade::api::shader_stage::compute;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = &point_sampler;
+      // t0, t1, then u0-u4 (the prefilter writes the 5 depth mips, the others u0)
+      const reshade::api::descriptor_range view_ranges[] = {{.count = 2, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_shader_resource_view}, {.binding = 2, .count = gtao_depth_mip_count, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_unordered_access_view}};
+      const reshade::api::pipeline_layout_param layout_params[] = {reshade::api::constant_range{.count = uint32_t(std::size(constants)), .visibility = reshade::api::shader_stage::compute}, {uint32_t(std::size(view_ranges)), view_ranges}, {1, &sampler_range}};
+      constexpr uint32_t dispatch_count = 4;
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&pass, device_data, device, layout_params, 1, dispatch_count, "XeGTAO");
+      if (!tables)
+      {
+         return false;
+      }
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      const std::array<uint32_t, dispatch_count> shader_hashes = {CompileTimeStringHash("YKR XeGTAO Prefilter Depths CS"), temporal_gtvbao ? CompileTimeStringHash("YKR GT-VBAO Temporal Main Pass CS") : (g_gtvbao_enable ? CompileTimeStringHash("YKR GT-VBAO Main Pass CS") : CompileTimeStringHash("YKR XeGTAO Main Pass CS")), CompileTimeStringHash("YKR XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("YKR XeGTAO Denoise Pass 2 CS")};
+      std::array<ID3D12PipelineState*, dispatch_count> pipelines = {};
+      for (size_t i = 0; i < dispatch_count; i++)
+      {
+         pipelines[i] = GetD3D12GamePassPipeline(&pass, native_device, 0, shader_hashes[i], DXGI_FORMAT_UNKNOWN, "XeGTAO");
+         if (!pipelines[i])
+         {
+            return false;
+         }
+      }
+
+      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+      constexpr reshade::api::resource_usage render_target_and_shader_resource = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
+      constexpr reshade::api::resource_usage unordered_access_and_shader_resource = reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource;
+      constexpr reshade::api::resource_usage at_rest = reshade::api::resource_usage::shader_resource;
+      if (!game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_depth, device, present_count, width, height, reshade::api::format::r32_float, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth") ||
+          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_normals, device, present_count, width, height, reshade::api::format::r8g8b8a8_unorm, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Normals") ||
+          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_depth_mips, device, present_count, width, height, reshade::api::format::r32_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth Mips", nullptr, gtao_depth_mip_count) ||
+          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_working[0], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 0") ||
+          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_working[1], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 1") ||
+          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_final, device, present_count, width, height, reshade::api::format::r8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Final"))
+      {
+         static std::atomic_flag logged;
+         if (!logged.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[XeGTAO] ReShade refused its {}x{} textures, so the game's SSAO runs", width, height).c_str());
+         }
+         return false;
+      }
+
+      // The inputs, copied by pixel shaders (the game's depth and normals stay in their state)
+      const auto copy = [&](reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, reshade::api::format target_format, const char* name)
+      {
+         cmd_list->barrier(target, at_rest, reshade::api::resource_usage::render_target);
+         const bool copied = DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data->gtao_copy_pass, CompileTimeStringHash("YKR DLAA Copy PS"), name, name, source, source_format, target, reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d, target_format, 0, 1, 0, 1), {});
+         cmd_list->barrier(target, reshade::api::resource_usage::render_target, at_rest);
+         return copied;
+      };
+      if (!copy(depth, depth_format, game_device_data->gtao_depth, reshade::api::format::r32_float, "Luma XeGTAO Depth Copy") ||
+          !copy(normals, game_device_data->scene_normals_format.load(std::memory_order_relaxed), game_device_data->gtao_normals, reshade::api::format::r8g8b8a8_unorm, "Luma XeGTAO Normals Copy"))
+      {
+         return false;
+      }
+
+      // The views of every dispatch, written into its table (which keeps copies of them)
+      std::vector<reshade::api::resource_view> views;
+      const auto make_view = [&](reshade::api::resource resource, reshade::api::resource_usage usage, reshade::api::format format, uint32_t first_level, uint32_t levels)
+      {
+         reshade::api::resource_view view = {};
+         device->create_resource_view(resource, usage, reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d, format, first_level, levels, 0, 1), &view);
+         views.push_back(view);
+         return view;
+      };
+      std::array<reshade::api::resource_view, gtao_depth_mip_count> mip_uavs;
+      for (uint32_t mip = 0; mip < gtao_depth_mip_count; mip++)
+      {
+         mip_uavs[mip] = make_view(game_device_data->gtao_depth_mips, reshade::api::resource_usage::unordered_access, reshade::api::format::r32_float, mip, 1);
+      }
+      const reshade::api::resource_view depth_srv = make_view(game_device_data->gtao_depth, reshade::api::resource_usage::shader_resource, reshade::api::format::r32_float, 0, 1);
+      const reshade::api::resource_view normals_srv = make_view(game_device_data->gtao_normals, reshade::api::resource_usage::shader_resource, reshade::api::format::r8g8b8a8_unorm, 0, 1);
+      const reshade::api::resource_view depth_mips_srv = make_view(game_device_data->gtao_depth_mips, reshade::api::resource_usage::shader_resource, reshade::api::format::r32_float, 0, gtao_depth_mip_count);
+      const std::array<reshade::api::resource_view, 2> working_srvs = {make_view(game_device_data->gtao_working[0], reshade::api::resource_usage::shader_resource, reshade::api::format::r8g8_unorm, 0, 1), make_view(game_device_data->gtao_working[1], reshade::api::resource_usage::shader_resource, reshade::api::format::r8g8_unorm, 0, 1)};
+      const std::array<reshade::api::resource_view, 2> working_uavs = {make_view(game_device_data->gtao_working[0], reshade::api::resource_usage::unordered_access, reshade::api::format::r8g8_unorm, 0, 1), make_view(game_device_data->gtao_working[1], reshade::api::resource_usage::unordered_access, reshade::api::format::r8g8_unorm, 0, 1)};
+      const reshade::api::resource_view final_uav = make_view(game_device_data->gtao_final, reshade::api::resource_usage::unordered_access, reshade::api::format::r8_unorm, 0, 1);
+      const bool views_made = std::ranges::none_of(views, [](reshade::api::resource_view view)
+         { return view.handle == 0; });
+      if (views_made)
+      {
+         // Every slot of a table holds a valid view of a resource in a state it allows; the unused ones repeat the dispatch's output (UAVs) and source (SRVs)
+         const std::array<std::array<reshade::api::resource_view, 2>, dispatch_count> srvs = {{{depth_srv, depth_srv}, {depth_mips_srv, normals_srv}, {working_srvs[0], working_srvs[0]}, {working_srvs[1], working_srvs[1]}}};
+         const std::array<reshade::api::resource_view, dispatch_count> outputs = {mip_uavs[0], working_uavs[0], working_uavs[1], final_uav}; // The prefilter's are all the mips
+         for (uint32_t i = 0; i < dispatch_count; i++)
+         {
+            std::array<reshade::api::resource_view, gtao_depth_mip_count> uavs = mip_uavs;
+            if (i != 0)
+            {
+               uavs.fill(outputs[i]);
+            }
+            const reshade::api::descriptor_table_update updates[] = {{.table = tables[i], .count = 2, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = srvs[i].data()}, {.table = tables[i], .binding = 2, .count = gtao_depth_mip_count, .type = reshade::api::descriptor_type::texture_unordered_access_view, .descriptors = uavs.data()}};
+            device->update_descriptor_tables(uint32_t(std::size(updates)), updates);
+         }
+      }
+      for (const reshade::api::resource_view view : views)
+      {
+         if (view.handle != 0)
+         {
+            device->destroy_resource_view(view);
+         }
+      }
+      if (!views_made)
+      {
+         return false;
+      }
+
+      // Each output goes to unordered access around its dispatch, so the next one reads it complete
+      const std::array<reshade::api::resource, dispatch_count> outputs = {game_device_data->gtao_depth_mips, game_device_data->gtao_working[0], game_device_data->gtao_working[1], game_device_data->gtao_final};
+      // Prefilter: 16x16 pixels a group; main: 8x8; denoise: 2 pixels a thread, 16x8
+      const std::array<std::array<uint32_t, 2>, dispatch_count> groups = {{{(width + 15) / 16, (height + 15) / 16}, {(width + 7) / 8, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}}};
+      for (uint32_t i = 0; i < dispatch_count; i++)
+      {
+         cmd_list->barrier(outputs[i], at_rest, reshade::api::resource_usage::unordered_access);
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipelines[i])});
+         cmd_list->push_constants(reshade::api::shader_stage::compute, pass.layout, 0, 0, uint32_t(std::size(constants)), constants);
+         cmd_list->bind_descriptor_tables(reshade::api::shader_stage::compute, pass.layout, 1, 1, &tables[i]);
+         cmd_list->dispatch(groups[i][0], groups[i][1], 1);
+         cmd_list->barrier(outputs[i], reshade::api::resource_usage::unordered_access, at_rest);
+      }
+      TraceLumaPass(&cmd_list_data, device_data, "Luma XeGTAO", {{.resource = game_device_data->gtao_depth.handle, .format = reshade::api::format::r32_float}, {.resource = game_device_data->gtao_normals.handle, .format = reshade::api::format::r8g8b8a8_unorm}}, {{.resource = game_device_data->gtao_final.handle, .format = reshade::api::format::r8_unorm}}, true);
+      D3D12State::RestoreCompute(cmd_list, cmd_list_data.d3d12_state, {});
+      RestoreGameGraphicsD3D12(cmd_list_data);
+      return true;
+   }
+
+   // Luma Bloom (Luma_YKR_Bloom.hlsl) at glow_pass2, in its place: glow_pass0's level 0 with pass2's weights folded in, Core's DrawBloom of it at
+   // glow_pass1's sigma over the 4 vanilla levels, and the composite into pass2's target. The weights are the stage's c_ps_user[0], which the engine
+   // wrote into its constant mirror for this draw. False, with the game's draw to run, if anything is missing.
+   static bool DrawLumaBloom(CommandListData& cmd_list_data, DeviceData& device_data, YakuzaKiwamiDeviceData* game_device_data)
+   {
+      const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
+      const reshade::api::resource level0 = {game_device_data->glow_level0.load(std::memory_order_relaxed)};
+      const uint8_t* const mirror = GetConstantMirror();
+      if (state.in_render_pass || !mirror || level0.handle == 0 || state.render_target_views.empty() || state.render_target_descs.empty() || state.render_target_views[0].resource == level0.handle)
+      {
+         return false;
+      }
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      reshade::api::device* const device = cmd_list->get_device();
+      const reshade::api::resource_desc level0_desc = device->get_resource_desc(level0);
+      const auto* const weights = reinterpret_cast<const float*>(mirror + mirror_data_offset + cb9_base_offset);
+      const float weight_scale = (std::max)({weights[0], weights[1], weights[2], weights[3], 1e-4f});
+      // "GlowConstants" after the target's size
+      const float constants[] = {weight_scale, g_bloom_intensity, weights[0], weights[1], weights[2], weights[3]};
+
+      reshade::api::resource input = {};
+      {
+         const std::unique_lock lock(game_device_data->bloom_fold_pass.mutex);
+         if (game_device_data->EnsurePassTarget(&game_device_data->bloom_fold_pass, &game_device_data->bloom_input, device, device_data.present_count.load(std::memory_order_relaxed), level0_desc.texture.width, level0_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR Bloom Input"))
+         {
+            input = game_device_data->bloom_input;
+         }
+      }
+      if (input.handle == 0)
+      {
+         return false;
+      }
+      // Level 0 is a pixel shader resource at this draw: pass2 reads it
+      cmd_list->barrier(input, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+      const bool folded = DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data->bloom_fold_pass, CompileTimeStringHash("YKR Bloom Fold PS"), "Bloom Fold", "Luma Bloom Fold", level0, game_device_data->glow_level0_format.load(std::memory_order_relaxed), input, reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1), constants);
+      cmd_list->barrier(input, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+      if (!folded)
+      {
+         return false;
+      }
+      std::array<float, bloom_mip_count> sigmas;
+      sigmas.fill(game_device_data->glow_sigma.load(std::memory_order_relaxed));
+      reshade::api::resource bloom = {};
+      if (!DrawBloom(cmd_list_data, device_data, input, reshade::api::format::r16g16b16a16_float, bloom_mip_count, sigmas.data(), &bloom))
+      {
+         return false;
+      }
+      const D3D12FullscreenSource sources[] = {{.resource = input, .format = reshade::api::format::r16g16b16a16_float}, {.resource = bloom, .format = reshade::api::format::r16g16b16a16_float, .levels = bloom_mip_count}};
+      return DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data->bloom_composite_pass, CompileTimeStringHash("YKR Bloom Composite PS"), "Bloom Composite", "Luma Bloom Composite", sources, {state.render_target_views[0].resource}, state.render_target_descs[0], constants);
    }
 
    void OnPresent(NativeDevice* native_device, DeviceData& device_data) override
@@ -2525,7 +2414,22 @@ public:
             game_device_data.predication_present = UINT64_MAX;
          }
       }
-      for (DeviceData::GamePassD3D12* const pass : {&game_device_data.predication_pass, &game_device_data.copy_pass, &game_device_data.motion_vector_pass, &game_device_data.color_pass, &game_device_data.t2x_pass})
+      if (idle(game_device_data.gtao_present.load(std::memory_order_relaxed)))
+      {
+         const std::unique_lock lock(game_device_data.gtao_pass.mutex);
+         for (reshade::api::resource* const texture : {&game_device_data.gtao_depth, &game_device_data.gtao_normals, &game_device_data.gtao_depth_mips, &game_device_data.gtao_working[0], &game_device_data.gtao_working[1], &game_device_data.gtao_final})
+         {
+            RetireD3D12GamePassResource(&game_device_data.gtao_pass, present_count, texture);
+         }
+         game_device_data.gtao_present.store(UINT64_MAX, std::memory_order_relaxed);
+      }
+      if (idle(game_device_data.bloom_drawn_present.load(std::memory_order_relaxed)))
+      {
+         const std::unique_lock lock(game_device_data.bloom_fold_pass.mutex);
+         RetireD3D12GamePassResource(&game_device_data.bloom_fold_pass, present_count, &game_device_data.bloom_input);
+         game_device_data.bloom_drawn_present.store(UINT64_MAX, std::memory_order_relaxed);
+      }
+      for (DeviceData::GamePassD3D12* const pass : {&game_device_data.predication_pass, &game_device_data.copy_pass, &game_device_data.motion_vector_pass, &game_device_data.color_pass, &game_device_data.t2x_pass, &game_device_data.gtao_pass, &game_device_data.bloom_fold_pass})
       {
          const std::unique_lock lock(pass->mutex);
          DestroyRetiredD3D12GamePassResources(pass, device_data.reshade_device, present_count);
@@ -2533,7 +2437,7 @@ public:
       {
          const std::unique_lock lock(camera_state.mutex);
          camera_state.motion_active = motion_active;
-         const bool jittered = ((dlaa_active && dlaa_drawn) || (t2x_active && t2x_drawn) || g_mv_force_jitter) && !g_mv_disable_jitter;
+         const bool jittered = (dlaa_active && dlaa_drawn) || (t2x_active && t2x_drawn);
          camera_state.jitter_pixels = {};
          if (jittered && width != 0 && height != 0)
          {
@@ -2549,25 +2453,19 @@ public:
             }
          }
          camera_state.jitter_ndc = {camera_state.jitter_pixels[0] * 2.f / float((std::max)(width, 1u)), camera_state.jitter_pixels[1] * -2.f / float((std::max)(height, 1u))};
-         camera_state.captured = camera_state.captured && motion_active;
+         if (!motion_active)
+         {
+            camera_state.capture.reset();
+         }
       }
       // -1 at native resolution, with DLAA only (the game has no TAA: a negative bias would shimmer)
       SetTextureMipLodBias(nullptr, device_data, ((dlaa_active && g_dlaa_mip_bias) ? SR::GetMipLODBias(1u, 1u) : 0.f));
 
 #if DEVELOPMENT
-      LogDeviceRemoval(native_device);
-      const auto latch = [](auto* counting, auto* last_frame)
+      for (size_t i = 0; i < MV_COUNT; i++)
       {
-         for (size_t i = 0; i < counting->size(); i++)
-         {
-            (*last_frame)[i] = std::bit_cast<std::remove_reference_t<decltype((*last_frame)[i])>>(std::atomic_ref((*counting)[i]).exchange(0, std::memory_order_relaxed));
-         }
-      };
-      latch(&projection_sets, &projection_sets_frame);
-      latch(&anchor_counts, &anchor_counts_frame);
-      latch(&object_motion_counts, &object_motion_counts_frame);
-      latch(&live_checks, &live_checks_frame);
-      latch(&projection_max_abs_bits, &projection_max_abs_frame);
+         object_motion_counts_frame[i] = std::atomic_ref(object_motion_counts[i]).exchange(0, std::memory_order_relaxed);
+      }
       // "MV Debug View": Core's debug draw of the merged motion vectors (UV deltas), absolute, in pixels
       if (g_mv_debug_view)
       {
@@ -2637,6 +2535,9 @@ public:
 #endif
       reshade::get_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
+      reshade::get_config_value(nullptr, NAME, "BloomIntensity", g_bloom_intensity);
+      reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+      reshade::get_config_value(nullptr, NAME, "GTVBAOEnable", g_gtvbao_enable);
    }
 
    void DrawImGuiSettings(DeviceData& device_data) override
@@ -2673,6 +2574,37 @@ public:
          DrawSettingSlider("Highlights Desaturation", "HighlightDechroma", &gs.HighlightDechroma, default_luma_global_game_settings.HighlightDechroma, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       }
 
+      ImGui::SeparatorText("Bloom");
+
+      // Off the canon "wider, softer HDR bloom": its width follows the game's glow and it stays within its 8-bit target
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &g_bloom_intensity, 1.f, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
+
+      ImGui::SeparatorText("Ambient Occlusion");
+
+      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's graphics settings).");
+      DrawSettingCheckbox("GT-VBAO Enable", "GTVBAOEnable", &g_gtvbao_enable, false, "Replaces XeGTAO's occlusion with GT-VBAO (less dark halo around thin objects). Needs XeGTAO Enable.", !g_gtao_enable, false);
+#if DEVELOPMENT || TEST
+      ImGui::BeginDisabled(!g_gtao_enable);
+      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Primary darkness dial (higher = darker AO).");
+      }
+      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("0 = the game's own SSAO radius; > 0 overrides it, in meters.");
+      }
+#if DEVELOPMENT // the shader's debug blocks exist in DEVELOPMENT only
+      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Draws diagnostics into the AO the materials multiply their ambient light by. Depth gradient flat or blocky = wrong input;\nNormals: camera-facing surfaces bright; AO x8 = spot broad over-occlusion.");
+      }
+#endif
+      ImGui::EndDisabled();
+#endif
+
       ImGui::SeparatorText("Effects");
 
       DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &gs.VideoAutoHDREnable, default_luma_global_game_settings.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only).");
@@ -2706,16 +2638,6 @@ public:
       {
          ImGui::SetTooltip("Matches the rigid world's draws with last frame's on their world matrix: an unchanged one is static (camera motion), the\nothers moved. Not saved.");
       }
-      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Jitters the scene (Halton 2/3, 8 phases) without DLAA. The image shakes by a subpixel; nothing may flicker or lose\npixels (a draw that sets its own projection would). Not saved.");
-      }
-      ImGui::Checkbox("MV Disable Jitter", &g_mv_disable_jitter);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("No projection jitter under DLAA (DLSS gets zero jitter): isolates artifacts that come from the jitter. Not saved.");
-      }
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
       if (ImGui::IsItemHovered())
       {
@@ -2732,7 +2654,6 @@ public:
          }
       }
       ImGui::TextUnformatted(refused.c_str());
-      ImGui::Text("Projection setter calls: %u slot 0, %u slot 1, %u slot 2, %u slot 3, %u other (%u main camera copies), %u left unjittered after the anti-aliasing", projection_sets_frame[0], projection_sets_frame[1], projection_sets_frame[2], projection_sets_frame[3], projection_sets_frame[4], live_checks_frame[PROJECTION_MAIN_COPY], live_checks_frame[PROJECTION_POST_AA]);
    }
 #endif
 
@@ -2741,8 +2662,8 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Yakuza Kiwami\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR and DLAA native anti-aliasing and replaces the game's FXAA with SMAA (with T2x), plus 16x anisotropic filtering.\n"
-         "Enable Anti-Aliasing in the game's graphics settings for SMAA to apply.\n"
+         "It adds HDR and DLAA native anti-aliasing and replaces the game's FXAA with SMAA (with T2x), its bloom with a smoother one and its SSAO with XeGTAO, plus 16x anisotropic filtering.\n"
+         "Enable Anti-Aliasing and Ambient Occlusion in the game's graphics settings for SMAA and XeGTAO to apply.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
@@ -2786,6 +2707,8 @@ public:
                   "\nRenoDX (HDR tonemap method)"
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
+                  "\nXeGTAO (Intel)"
+                  "\nGT-VBAO (Mirko Salm)"
                   "\nAMD FidelityFX (RCAS)"
                   "\nNVIDIA NGX (DLSS)");
    }
@@ -2827,11 +2750,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    }
    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
    {
-#if DEVELOPMENT
-      reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteStampedCommandList);
-      reshade::unregister_event<reshade::addon_event::reset_command_list>(OnForgetCommandList);
-      reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnForgetCommandList);
-#endif
       if (set_projection_original)
       {
          // ponytail: the relay and the stub stay (a thread may still be in them), 64 bytes

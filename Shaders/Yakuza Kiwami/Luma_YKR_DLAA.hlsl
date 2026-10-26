@@ -5,6 +5,9 @@
 
 #include "../Includes/MotionVectorFill.hlsl"
 
+// For "gamma_to_linear" and "linear_to_gamma" only: Luma's cbuffers aren't in these passes' root signature, nothing here reads them
+#include "Includes/Common.hlsl"
+
 Texture2D<float4> source : register(t0);
 
 // The scene depth (D32S8, standard Z, with the hair) into an R32 copy at the low-res depth draw: the game clears it again before ccr, where DLSS reads it
@@ -44,11 +47,11 @@ float2 motion_vectors_ps(float4 position : SV_Position) : SV_Target
 float4 decode_ps(float4 position : SV_Position) : SV_Target
 {
    const float4 color = source.Load(int3(position.xy, 0));
-   return float4(min(pow(max(color.rgb, 0.0), 2.2), 65504.0), color.a);
+   return float4(min(gamma_to_linear(color.rgb, GCT_POSITIVE), 65504.0), color.a);
 }
 
 // DLSS' output back into S, drawn with an RGB write mask: some ccr permutations read S' alpha
 float4 encode_ps(float4 position : SV_Position) : SV_Target
 {
-   return float4(pow(max(source.Load(int3(position.xy, 0)).rgb, 0.0), 1.0 / 2.2), 1.0);
+   return float4(linear_to_gamma(source.Load(int3(position.xy, 0)).rgb, GCT_POSITIVE), 1.0);
 }

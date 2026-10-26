@@ -9227,11 +9227,12 @@ namespace
       cmd_list_data.scissors_scaled = false;
    }
 
-   // A texture a fullscreen pass reads, viewed as 2D "format"
+   // A texture a fullscreen pass reads, viewed as 2D "format" with its first "levels" mips
    struct D3D12FullscreenSource
    {
       reshade::api::resource resource;
       reshade::api::format format;
+      uint32_t levels = 1;
    };
    constexpr size_t D3D12_FULLSCREEN_MAX_SOURCES = 8;
 
@@ -9295,7 +9296,7 @@ namespace
       };
       for (size_t i = 0; i < sources.size(); ++i)
       {
-         if (!device->create_resource_view(sources[i].resource, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d, sources[i].format, 0, 1, 0, 1), &source_views[i]))
+         if (!device->create_resource_view(sources[i].resource, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d, sources[i].format, 0, sources[i].levels, 0, 1), &source_views[i]))
          {
             destroy_source_views();
             return false;
