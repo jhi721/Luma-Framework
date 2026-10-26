@@ -6732,6 +6732,10 @@ namespace
          {
             copy.error = "Multisampled depth can't be resolved for readback";
          }
+         else if (desc.SampleDesc.Count > 1 && (IsTypelessFormat(copy.data_format) || IsIntFormat(copy.data_format)))
+         {
+            copy.error = "Multisampled typeless and integer textures can't be resolved for readback";
+         }
          else if (copy.first_layer >= array_size || copy.mip >= desc.MipLevels)
          {
             copy.error = "The view is out of its resource's range";
@@ -6825,6 +6829,10 @@ namespace
             {
                error = "The view has no typed format to show it in";
             }
+            else if (desc.SampleDesc.Count > 1 && IsIntFormat(texture_format))
+            {
+               error = "Multisampled integer textures can't be resolved";
+            }
          }
       }
 
@@ -6846,12 +6854,9 @@ namespace
       }
       if (!error.empty() && readback.debug_copy)
       {
-         // What the target draw showed last isn't kept on screen
-         if (readback.debug_copy->status == D3D12Readback::Copy::Status::Recorded)
-         {
-            D3D12Readback::recorded_copies--;
-         }
-         readback.debug_copy->status = D3D12Readback::Copy::Status::Failed;
+         // What the target draw showed last isn't kept on screen. A list can still copy into its texture: it's retired, not dropped.
+         D3D12Readback::RetireInFlight(&readback, &*readback.debug_copy);
+         readback.debug_copy.reset();
       }
       if (error != readback.debug_error)
       {
@@ -7012,7 +7017,8 @@ namespace
          case Kind::Depth:
          case Kind::Stencil:
          {
-            // A writable depth stencil view is in DEPTH_READ when the pipeline doesn't write that plane
+            // A writable depth stencil view is in DEPTH_READ when the pipeline doesn't write that plane. The view's D3D12_DSV_FLAG_READ_ONLY_* flags
+            // aren't tracked: a pipeline that writes a plane is taken to have it writable (in DEPTH_WRITE).
             using DepthStateType = TraceDrawCallData::DepthStateType;
             const bool is_stencil = target.kind == Kind::Stencil;
             const DepthStateType plane_state = is_stencil ? entry.stencil_state : entry.depth_state;
@@ -7111,6 +7117,7 @@ namespace
             else
             {
                buffer = call->argument_buffer;
+               // Best effort for DEFAULT heaps: a buffer that decayed to COMMON or sits in a combined read state isn't in INDIRECT_ARGUMENT alone
                draw_state = (heap.Type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
                const uint64_t buffer_size = buffer->GetDesc().Width;
                copy.buffer_offset = (std::min)(call->argument_offset, buffer_size);
@@ -7126,6 +7133,10 @@ namespace
             }
             break;
          }
+#else
+         case Kind::IndirectArguments:
+            copy.error = "ExecuteIndirect() arguments need Luma's MinHook hooks (ENABLE_MINHOOK)";
+            break;
 #endif
          }
       }
@@ -7252,10 +7263,6 @@ namespace
       else if (desc.SampleDesc.Count > 1 && !is_depth && native_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
       {
          copy.error = "Multisampled textures are resolved for readback, which only graphics command lists can do";
-      }
-      else if (desc.SampleDesc.Count > 1 && !is_depth && (IsTypelessFormat(copy.data_format) || IsIntFormat(copy.data_format)))
-      {
-         copy.error = "Multisampled typeless and integer textures can't be resolved for readback";
       }
       return RecordReadback(cmd_list, std::move(copy), written, draw_state, plane, nullptr, !is_depth, [&]
          { reissue(native_list); });

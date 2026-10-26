@@ -353,7 +353,7 @@ namespace Mcp
    // A D3D12 texture of Luma's, borrowed, with the state it rests in between its passes: what a read at present copies it from
    struct DevTexture
    {
-      ID3D12Resource* resource = nullptr;
+      com_ptr<ID3D12Resource> resource; // A reference: the owner can release it once its lock is gone (the debug draw's retired copies)
       D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
    };
    using DevTextureGetter = DevTexture (*)(DeviceData& device_data);
@@ -1361,7 +1361,7 @@ namespace Mcp
                return;
             D3D12Readback::State& readback = captured.device_data->readback;
             const std::unique_lock lock(readback.mutex);
-            const D3D12_RESOURCE_STATES state = ((i + 1 == std::size(resources)) ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const D3D12_RESOURCE_STATES state = ((i + 1 == std::size(resources)) ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
             const DXGI_FORMAT format = D3D12Readback::PlaneFormat(resources[i]->GetDesc().Format, false);
             D3D12Readback::Copy& copy = readback.captures.emplace_back(D3D12Readback::Capture{.name = sr_resource_names[i], .copy = {.native_list = reinterpret_cast<uint64_t>(command_list), .data_format = format}}).copy;
             const uint32_t subresource = 0;
@@ -2407,7 +2407,8 @@ namespace Mcp
    bool RunReadResource(Job* job, DeviceData& device_data, CommandListData& cmd_list_data, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain)
    {
       // Copies mip "mip" of the first layer of "resource" (in "state") at present, on a command list of Luma's own: ReShade only flushes its queue's immediate
-      // command list when its own API recorded into it, native commands there could run any time later. Waits for the queue, then writes the file
+      // command list when its own API recorded into it, native commands there could run any time later. Waits up to 2 s for a fence signaled behind it (the
+      // queue can wait on a fence the game signals later), then writes the file. A copy that timed out is retired: its buffer can still be written.
       const auto read_now = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES state, uint32_t mip, std::string_view stem)
       {
          auto* native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
@@ -2418,18 +2419,34 @@ namespace Mcp
             job->error = "The texture is missing (the swapchain has no current back buffer), or the command list for the copy couldn't be created";
             return false;
          }
-         D3D12Readback::Copy copy = {.mip = mip, .data_format = resource->GetDesc().Format};
-         const std::unique_lock lock(device_data.readback.mutex);
-         const bool recorded = D3D12Readback::RecordTextureCopy(&device_data.readback, native_device, native_list.get(), resource, state, std::span(&mip, 1), copy.data_format, &copy, [] {});
+         D3D12Readback::Copy copy = {.status = D3D12Readback::Copy::Status::Executed, .queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), .fence_value = 1, .signals = 1, .mip = mip, .data_format = resource->GetDesc().Format};
+         bool recorded = false;
+         {
+            const std::unique_lock lock(device_data.readback.mutex);
+            recorded = D3D12Readback::RecordTextureCopy(&device_data.readback, native_device, native_list.get(), resource, state, std::span(&mip, 1), copy.data_format, &copy, [] {});
+         }
          native_list->Close();
-         if (!recorded)
+         if (!recorded || FAILED(native_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy.fence))))
          {
             job->error = "Failed to create the readback resources";
             return false;
          }
          ID3D12CommandList* const lists[] = {native_list.get()};
-         reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())->ExecuteCommandLists(1, lists);
-         queue->wait_idle();
+         copy.queue->ExecuteCommandLists(1, lists);
+         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+         const bool waited = (event && SUCCEEDED(copy.queue->Signal(copy.fence.get(), copy.fence_value)) && SUCCEEDED(copy.fence->SetEventOnCompletion(copy.fence_value, event)) && WaitForSingleObject(event, 2000) == WAIT_OBJECT_0);
+         if (event)
+         {
+            CloseHandle(event);
+         }
+         if (!waited)
+         {
+            // "D3D12Readback::CollectRetired()" frees it at a later present, once its fence passed
+            const std::unique_lock lock(device_data.readback.mutex);
+            device_data.readback.retired.push_back(std::move(copy));
+            job->error = "The texture copy didn't finish within 2 s: the queue is waiting on something (a fence the game signals later?)";
+            return false;
+         }
          std::optional<std::vector<char>> bytes = D3D12Readback::TryRead(copy);
          if (!bytes)
          {
@@ -2489,7 +2506,7 @@ namespace Mcp
                job->error = std::format("Mip {} is out of range ({} mips)", mip, texture.resource->GetDesc().MipLevels);
                return true;
             }
-            if (read_now(texture.resource, texture.state, mip, name))
+            if (read_now(texture.resource.get(), texture.state, mip, name))
             {
                job->result.Field("view", *view).Field("note", "Read at present: the texture's last content, usually this frame's");
             }
@@ -2759,7 +2776,7 @@ namespace Mcp
             const bool allocated = bool(resource);
 #else
             const DevTexture texture = dev_value.texture(device_data);
-            const bool allocated = texture.resource != nullptr;
+            const bool allocated = bool(texture.resource);
 #endif
             w.Field("allocated", allocated);
             if (allocated)
@@ -2769,7 +2786,7 @@ namespace Mcp
 #if DX11
                GetResourceInfo(resource.get(), size, format);
 #else
-               GetResourceInfo(device_data.reshade_device, {reinterpret_cast<uint64_t>(texture.resource)}, size, format);
+               GetResourceInfo(device_data.reshade_device, {reinterpret_cast<uint64_t>(texture.resource.get())}, size, format);
 #endif
                w.Format("format", format).Key("size").BeginArray().Value(size.x).Value(size.y).Value(size.z).Value(size.w).EndArray();
             }
@@ -3792,7 +3809,7 @@ namespace Mcp
       text += " Luma textures (MB):";
       for (const DevValue& dev_value : dev_values)
       {
-         const uint64_t size = (dev_value.kind == DevValueKind::Texture ? allocation_size(dev_value.texture(device_data).resource) : 0);
+         const uint64_t size = (dev_value.kind == DevValueKind::Texture ? allocation_size(dev_value.texture(device_data).resource.get()) : 0);
          if (size != 0)
          {
             textures_total += size;
