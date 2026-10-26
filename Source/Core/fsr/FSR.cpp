@@ -7,6 +7,7 @@
 #include <include/reshade.hpp>
 
 #include <cstring>
+#include <cwchar>
 #include <cassert>
 #include <format>
 #include <unordered_set>
@@ -231,6 +232,9 @@ namespace FidelityFX
       context_desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING | FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;
       context_desc.fpMessage = [](uint32_t type, const wchar_t* message)
       {
+         // Without an exposure texture and auto exposure FSR uses an exposure of 1, as DLSS and XeSS do with the same inputs: not a misconfiguration
+         if (std::wcsstr(message, L"exposure resource is null") != nullptr)
+            return;
          LogMessage(type == FFX_API_MESSAGE_TYPE_ERROR, message);
       };
 #endif
