@@ -205,7 +205,10 @@ jobs:
                    $projectName -like 'Generic' -or
                    $projectName -like '_Generic Mod' -or
                    $projectName -like 'Generic Mod' -or
-                   $projectName -like 'Graphics Analyzer'
+                   $projectName -like '_Generic Mod DX12' -or
+                   $projectName -like 'Generic Mod DX12' -or
+                   $projectName -like 'Graphics Analyzer' -or
+                   $projectName -like 'Graphics Analyzer DX12'
                  )) {
             continue
           }
@@ -217,8 +220,8 @@ jobs:
           # Package with the shared script (single source of truth with local packaging):
           # it copies only this game's shaders, Global and Includes, skipping game
           # Dump directories before traversal and excluding all .cso files. It bundles the runtime
-          # DLLs (d3dcompiler_47, ReShade as dxgi.dll, NGX DLSS), dgVoodoo2 and the D3D9 VA Fix for
-          # the games that opt in (plus a "-Linux" zip), and zips next to the addon or into -OutDir. dxcompiler.dll is intentionally not shipped (SM5-only).
+          # DLLs (d3dcompiler_47, ReShade as dxgi.dll, NGX DLSS; for D3D12 projects dxcompiler.dll and the FSR/XeSS dlls when their
+          # SDKs are present), dgVoodoo2 and the D3D9 VA Fix for the games that opt in (plus a "-Linux" zip), and zips next to the addon or into -OutDir.
           pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project $projectName -Config "${{ matrix.config }}" -Platform "${{ matrix.platform }}" -AddonPath $addonFile.FullName -OutDir "."
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning::Packaging failed for '$projectName' - it will be excluded from this release."
