@@ -123,6 +123,7 @@ struct OutputSizedAOPass
    uint8_t last_of = 0;
    UINT cb_rows = 0; // Its dcl_constantbuffer size
    bool pixel = false;
+   uint32_t runs_as = 0; // A quality permutation with the interface and constants of this pass (else its own hash)
 };
 static constexpr uint8_t kHBAOFullBit = AOModeBit(AOMode::HBAOFull);
 static constexpr uint8_t kHBAOBit = AOModeBit(AOMode::HBAO);
@@ -139,18 +140,55 @@ static constexpr OutputSizedAOPass kOutputSizedAOPasses[] = {
    {.hash = kSSAOBlurXHash, .modes = kSSAOBit, .cb_rows = 4, .pixel = true},
    {.hash = kSSAOBlurYHash, .modes = kSSAOBit, .cb_rows = 4, .pixel = true},
    {.hash = kSSAOUpsampleHash, .modes = kSSAOBit, .last_of = kSSAOBit, .cb_rows = 1},
+   // Quality permutations (shader dump census): horizons with other step and direction counts, blurs with another kernel
+   // (window 101 instead of 103), upsamples. The deinterleave lookalike 0x735582C6 (c0/c5.y read) stays native: a first pass
+   // the table doesn't know leaves the whole frame's AO at the render size.
+   {.hash = 0x8F27ABBC, .modes = kHBAOFullBit | kHBAOBit, .cb_rows = 8, .runs_as = kAOHorizonHash},
+   {.hash = 0xE6B00EB6, .modes = kHBAOFullBit | kHBAOBit, .cb_rows = 8, .runs_as = kAOHorizonHash},
+   {.hash = 0xCD9F40EA, .modes = kHBAOFullBit | kHBAOBit, .cb_rows = 8, .runs_as = kAOHorizonHash},
+   {.hash = 0x3CDF3475, .modes = kHBAOFullBit | kHBAOBit, .cb_rows = 8, .runs_as = kAOHorizonHash},
+   {.hash = 0x26724A38, .modes = kHBAOFullBit | kHBAOBit, .cb_rows = 2, .runs_as = kAOBlurXHash},
+   {.hash = 0xC161C7BF, .modes = kHBAOFullBit | kHBAOBit, .cb_rows = 2, .runs_as = kAOBlurXHash},
+   {.hash = 0x91E7D397, .modes = kHBAOFullBit | kHBAOBit, .last_of = kHBAOFullBit, .cb_rows = 2, .runs_as = kAOBlurYHash},
+   {.hash = 0xCB371E7D, .modes = kHBAOFullBit | kHBAOBit, .last_of = kHBAOFullBit, .cb_rows = 2, .runs_as = kAOBlurYHash},
+   {.hash = 0x4E82236F, .modes = kHBAOBit | kSSAOBit, .last_of = kHBAOBit | kSSAOBit, .cb_rows = 1, .runs_as = kAOUpsampleHash},
+   {.hash = 0x7DF12F5D, .modes = kHBAOBit | kSSAOBit, .last_of = kHBAOBit | kSSAOBit, .cb_rows = 1, .runs_as = kAOUpsampleHash},
 };
-// Tonemap PS (LUT 33^3, also writes the luma for FXAA): its RT0 is display-encoded and bounded, the FXAA pass' input, and only
-// UI and the final encode follow it. RCAS runs on it under DLSS/FSR; upscaling, it draws at the output size. Every permutation in
-// the shader dump (census: the PQ encode into the LUT and the luma): {luma at RT1 | in RT0's alpha} x post quality x
-// {distortion warp | chromatic aberration} x {radial lens warp} x {film grain | screen overlay}; the bloom is t2 or t3.
+// Tonemap PS (a 33^3 LUT after a PQ shaping or a 32^3 one after an SDR shaping, also writes the luma for FXAA): its RT0 is
+// display-encoded and bounded, the FXAA pass' input, and only UI and the final encode follow it. RCAS runs on it under DLSS/FSR;
+// upscaling, it draws at the output size. Every permutation in the shader dump (census: the LUT shaping and the luma): {PQ | 4
+// SDR shapings} x {luma at RT1 | in RT0's alpha} x post quality x {distortion warp | chromatic aberration} x {radial lens warp} x
+// {film grain | screen overlay}; the bloom is t2 or t3.
 static const ShaderHashesList shader_hashes_tonemap = {
    .pixel_shaders = {0xB6A91712, 0x376C116B, 0xE3D57A10, 0xEB91AB31, 0x339025EE, 0x71562FF9, 0x18AC2B1A, 0x66BE1F36, 0x18F31608, 0xF8A12BF4, 0x62D3752D, 0xA42A680A,
       0x0C6BB88C, 0x0FEEC7CA, 0x13AD94B8, 0x23293C1D, 0x312C9FC2, 0x48148C49, 0x6071CFCE, 0x71677DB7, 0x75D88114, 0x77867D5B, 0x7DF2AAD4, 0x85A01ECD,
       0x87E726AA, 0x95DED713, 0xA4484C9D, 0xAFAA1401, 0xB7063CB6, 0xD4DAE5C3, 0xE60E2385, 0xF96E5DEC, 0x07CB39D2, 0x0C1A7388, 0x16C8E34C, 0x38A6FC4F,
       0x39DAD2F8, 0x3F438316, 0x513EBF50, 0x53AE0ABA, 0x550BDE9C, 0x60876A69, 0x678EC571, 0x6E3E7622, 0x701B6924, 0x8C333515, 0x8D596A79, 0x91DD4F7C,
       0x93F57093, 0x96A4573A, 0x97AF86B4, 0x992597D0, 0xA26DC150, 0xA304AFDF, 0xA4123D0B, 0xA822C123, 0xAEBDCDE5, 0xB1530A4B, 0xC4CA5450, 0xCBD6D4ED,
-      0xD7108AE9, 0xE22BF9E4, 0xF1B20524, 0xF2CDD044},
+      0xD7108AE9, 0xE22BF9E4, 0xF1B20524, 0xF2CDD044,
+      // The same 64 with an SDR shaping into a 32^3 LUT (filmic + sRGB, gamma 2.2, two log curves) instead of the PQ one
+      0x006F5E61, 0x0072F8D2, 0x007F73D3, 0x014028A1, 0x0409DC30, 0x0448B213, 0x04960F36, 0x05DF24FA, 0x0693A91F, 0x0AE79C24, 0x0B939EF3, 0x0BAB9305,
+      0x0D7028AA, 0x0E9CB7D7, 0x0FF4B088, 0x1255DA1F, 0x1259F9C1, 0x1373156D, 0x1395D6D1, 0x163DC793, 0x163FB625, 0x164B85CB, 0x16A04764, 0x187B575F,
+      0x18FAAC0B, 0x1A18A319, 0x1AF6CAD6, 0x1B7ABE73, 0x1B7F5F65, 0x1B9502CF, 0x1CC82BE5, 0x1D04C3F5, 0x1D22B4EC, 0x1D4AA5C0, 0x1D87AD42, 0x1F2CFB3A,
+      0x20165658, 0x2112B3E5, 0x218F4E00, 0x22E3FF9F, 0x23D93C93, 0x246CBCF0, 0x25F130CC, 0x27E283A0, 0x2AC1030E, 0x2C0EF2BD, 0x2C783D46, 0x2DDD0509,
+      0x2F68CBB3, 0x2FAD5D31, 0x2FBDD104, 0x31DCCDC2, 0x3221BB38, 0x3226F201, 0x3284B166, 0x328BBB59, 0x32B001FB, 0x331BF91B, 0x33FE4872, 0x341A41EB,
+      0x35A0C016, 0x363356AF, 0x3756D9A2, 0x384B721B, 0x39AFF254, 0x3A9F303E, 0x3AD0F8E7, 0x3BCC0F88, 0x3CD6CB86, 0x3E164067, 0x3E1F14E6, 0x3E2F754B,
+      0x3E77ABE2, 0x40073197, 0x4111126F, 0x42AE611A, 0x43E36203, 0x442A9940, 0x4565FFD4, 0x45DFAC51, 0x461BDB68, 0x464E0FEE, 0x4689F332, 0x46A1FC8E,
+      0x47055661, 0x49D9C7EB, 0x49FD82E9, 0x4A2B141C, 0x4A3B3A69, 0x4B0FE250, 0x4DDCA16D, 0x4EB1F1EE, 0x4FE81586, 0x501E1E73, 0x5320F05D, 0x533CB37E,
+      0x53F6C6AD, 0x540B4A6F, 0x54304EE6, 0x5447EEEC, 0x562A2D15, 0x56F10E1A, 0x57918A44, 0x58DE7D97, 0x58F851B7, 0x593480E2, 0x59CA307B, 0x5CA9D777,
+      0x5E2E55DE, 0x5F3762CF, 0x62A7DEAA, 0x63CE07A8, 0x6500E605, 0x658741C4, 0x66616248, 0x69F90409, 0x6BC5274C, 0x6BD139DF, 0x6CCF3706, 0x6D027FAD,
+      0x6E18FA92, 0x6E401C44, 0x6F9CD761, 0x6FD4584F, 0x70103F5B, 0x714A20B2, 0x725E5ACE, 0x754E8427, 0x75556D1D, 0x774B9E93, 0x787B368E, 0x7A75D35A,
+      0x7A84A689, 0x7E291A9A, 0x86428251, 0x894220F0, 0x89993B33, 0x89AAB1DC, 0x8A1C958B, 0x8B500F0A, 0x8B674872, 0x8B8CFA8D, 0x8BFC8417, 0x8C5D3712,
+      0x8D173FA8, 0x8D24A337, 0x8E610E3C, 0x8F540120, 0x8F6BD040, 0x8F777225, 0x907173D1, 0x93C2681F, 0x970E289A, 0x977943EC, 0x97846417, 0x983FF1AF,
+      0x98A6D78D, 0x99C44C64, 0x9B851419, 0x9CB6B59B, 0x9D587860, 0x9EFB0918, 0x9F994B58, 0xA04A5313, 0xA0754060, 0xA09F94D0, 0xA11E6DB1, 0xA22B149A,
+      0xA76F5420, 0xA7B31C2A, 0xA8143FB3, 0xA8C66DC2, 0xA9E54F1B, 0xAAEB94C1, 0xABA5FE8A, 0xAC92E0FF, 0xADD03661, 0xAF8860FB, 0xB0BC18E6, 0xB0C1E8BB,
+      0xB18789C7, 0xB1F188E6, 0xB511F77D, 0xB576F538, 0xB82254E5, 0xB9C13DB0, 0xB9EB4190, 0xBA10D64E, 0xBB8080A4, 0xBC520955, 0xBC9D58A1, 0xBD5A5513,
+      0xBF36C8DD, 0xC02B7D37, 0xC0583078, 0xC1A0AAA0, 0xC260204C, 0xC2AD3993, 0xC2C2DCFD, 0xC5B31BC0, 0xC600F967, 0xC678D3B7, 0xC7F37E1E, 0xC836ED3F,
+      0xC84396A4, 0xC85C3B19, 0xC955FB2C, 0xCC4BA163, 0xCD3B5BF7, 0xCFCC047A, 0xD02F5FA7, 0xD0C112CD, 0xD187D2D0, 0xD19AEB12, 0xD241423B, 0xD49BAAAE,
+      0xD54F22CA, 0xD63AC035, 0xD83047A3, 0xD84FB858, 0xD97D0DC0, 0xDB056906, 0xDB4826F1, 0xDB952F3E, 0xDC61AD05, 0xDD6A8CDD, 0xDDF2A9DA, 0xDFCC1B96,
+      0xE0C7A8D4, 0xE2C767FB, 0xE3CBFE7C, 0xE3CEE786, 0xE534333E, 0xE5641232, 0xE740CBA8, 0xE9295138, 0xE9DA3A76, 0xEB91D898, 0xEC13C15C, 0xEC644E95,
+      0xECA15A18, 0xED829F26, 0xEE2DDF04, 0xEE5797B9, 0xEEB91C1B, 0xEFBB961B, 0xF156264A, 0xF222DD6D, 0xF286116E, 0xF6E6D93A, 0xF6F5D783, 0xF730E758,
+      0xF988DD5A, 0xFBAB6080, 0xFBB7739A, 0xFE1211CB},
 };
 // Motion blur, upscaling: the whole chain runs at the output size (see "DrawOutputSizedMotionBlurPass"). Tile max passes (a
 // column and a row pass per stage, one or two stages by resolution; the first stage reads the motion vectors), the tile
@@ -195,7 +233,7 @@ static constexpr DoFBlurPass kDoFBlurPasses[] = {
    {0x52C75ECC, true},
 };
 // The sprite build: 6 or 3 buckets, with or without the far layers' overflow bucket (u7), at full or half resolution ("half": a
-// thread per 2x2 pixels, with a depth input t1 for the 2x2 reduction)
+// thread per 2x2 pixels, with a depth input t1 for the 2x2 reduction), with or without the 2x2 sprite merge (group shared memory)
 struct DoFSpriteBuildPass
 {
    uint32_t hash;
@@ -208,13 +246,19 @@ static constexpr DoFSpriteBuildPass kDoFSpriteBuildPasses[] = {
    {0x8EB3F435, true},
    {0x5F5C22F7, true},
    {0xD9BD89E1, true},
+   {0x8ECC3E07, false},
+   {0x52FDC5EA, false},
+   {0xAB8003D0, false},
+   {0x048A6A90, true},
+   {0xEBA9BB3B, true},
+   {0x0E6B40E3, true},
 };
 static constexpr uint32_t kDoFSpriteBinHash = 0x82B58778;
 static constexpr uint32_t kDoFSpriteHash = 0xEBF62A30;
 static constexpr uint32_t kDoFLayerResampleHash = 0x30F1A5E7; // Also the bloom's 1x1: a layer resample only between the sprites and the composite
 // The composite, by the layers it reads (near t12, far array t10, the extra layers t4/t5/t7/t8)
 static const ShaderHashesList shader_hashes_dof_composite = {
-   .pixel_shaders = {0x4E197292, 0xBF21B4E5, 0x212369F4, 0xCE52ACCB, 0x69A9A8E5},
+   .pixel_shaders = {0x4E197292, 0xBF21B4E5, 0x212369F4, 0xCE52ACCB, 0x69A9A8E5, 0x45A42EF5, 0x967D9C96, 0x44AF10E2},
 };
 // Bloom, upscaling: the whole chain at the output size (see "BuildOutputSizedBloom"). The engine blurs the post chain's last target
 // into that target's own mips, each level a column pass from the previous mip into a temporary then a row pass into the mip: the
@@ -234,7 +278,8 @@ static constexpr uint32_t kBloomUpsampleHash = 0x8744747A; // mip * cb0[3] + pre
 // 128, the fill testing it; the aimed object's fill is another permutation), then their glow: a fill where the scene's stencil
 // bit 1 is set, a blur (see "kPostBlurPasses"), added back where the stencil is clear ("kDoFLayerResampleHash").
 static const ShaderHashesList shader_hashes_scanner = {
-   .pixel_shaders = {0xB73F1E71, 0x19BB0BE5, 0xC3C08F2B, 0x2EF4225E}, // Outline, fill, the aimed object's fill, glow mask
+   // Outline, fill, the aimed object's fill, glow mask, then the fills of the other highlight colors
+   .pixel_shaders = {0xB73F1E71, 0x19BB0BE5, 0xC3C08F2B, 0x2EF4225E, 0x7E05C06D, 0x91B007B8, 0xF764A98B},
 };
 // Frostbite's separable blurs (shader dump census), one axis each: c0.xy the texel size, the taps at a multiple of it or at uv
 // offsets in the .x / .z of the next rows ("offsets", a bit per row and component from c1.x: x, z, x, z...), the weights in .y /
@@ -1702,13 +1747,19 @@ class MassEffectAndromeda final : public Game
       return true;
    }
    // The header of the post passes' b0, c0 = (W u32, H u32, 1 / W, 1 / H) and c1 = (W u32, H u32, 1 / W, aspect), at the output
-   // size as the engine's at native
+   // size as the engine's at native. c1 is the pass' thread grid: half the size for the half resolution sprite builds, which
+   // place a sprite at (id + 0.5) x c1.z x 2 - 1 in NDC (a full-size c1 there squeezes the bokeh into the top left quarter).
    static void PatchPostHeader(float (*rows)[4], uint2 output_size)
    {
-      rows[0][0] = rows[1][0] = std::bit_cast<float>(output_size.x);
-      rows[0][1] = rows[1][1] = std::bit_cast<float>(output_size.y);
-      rows[0][2] = rows[1][2] = 1.f / float(output_size.x);
+      const uint32_t grid_divisor = (std::max)(uint32_t(std::lround(float(std::bit_cast<uint32_t>(rows[0][0])) / float((std::max)(std::bit_cast<uint32_t>(rows[1][0]), 1u)))), 1u);
+      const uint2 grid_size = {(output_size.x + grid_divisor - 1) / grid_divisor, (output_size.y + grid_divisor - 1) / grid_divisor};
+      rows[0][0] = std::bit_cast<float>(output_size.x);
+      rows[0][1] = std::bit_cast<float>(output_size.y);
+      rows[0][2] = 1.f / float(output_size.x);
       rows[0][3] = 1.f / float(output_size.y);
+      rows[1][0] = std::bit_cast<float>(grid_size.x);
+      rows[1][1] = std::bit_cast<float>(grid_size.y);
+      rows[1][2] = 1.f / float(grid_size.x);
    }
    static uint2 ScaleSize(uint2 size, float ratio)
    {
@@ -2340,7 +2391,15 @@ class MassEffectAndromeda final : public Game
             }
             else if (uav_desc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER && uav_desc.Format == DXGI_FORMAT_UNKNOWN) // Structured: the sprite buckets
             {
-               if (build_pass)
+               // The binning appends to the buckets that already have a twin this frame and fills the far layers' own, which the build
+               // doesn't write. A bucket without a twin must never be left to the engine: its buffer holds the sprites of the last
+               // frame the engine built natively, which its sprite draws would add again (a long gone object kept in the bokeh).
+               const auto* const twin = (build_pass ? nullptr : gd->FindOutputTwinRecord(resource.get()));
+               if (twin && twin->uav)
+               {
+                  outputs[i] = twin->uav.get();
+               }
+               else
                {
                   D3D11_BUFFER_DESC buffer_desc;
                   static_cast<ID3D11Buffer*>(resource.get())->GetDesc(&buffer_desc);
@@ -2350,15 +2409,7 @@ class MassEffectAndromeda final : public Game
                      return false;
                   gd->output_twins.push_back({.engine = resource.get(), .srv = buffer->srv.get(), .luma = buffer->buffer.get(), .uav = buffer->uav.get()});
                   outputs[i] = buffer->uav.get();
-                  initial_counts[i] = 0; // The engine's build starts every bucket empty
-               }
-               else
-               {
-                  // The binning appends to the build's buckets
-                  const auto* const twin = gd->FindOutputTwinRecord(resource.get());
-                  if (!twin || !twin->uav)
-                     return false;
-                  outputs[i] = twin->uav.get();
+                  initial_counts[i] = 0; // Every bucket starts the frame empty, as the engine's build leaves it
                }
             }
          }
@@ -3050,7 +3101,7 @@ class MassEffectAndromeda final : public Game
          }
       }
       const float scale = float(size.x) / float(render_size.x);
-      const uint32_t hash = pass.hash;
+      const uint32_t hash = (pass.runs_as != 0 ? pass.runs_as : pass.hash);
 
       constexpr UINT max_rows = 32;
       float rows[max_rows][4] = {};
@@ -3749,8 +3800,37 @@ public:
             dof_pass = (hash == kDoFSpriteHash || shader_hashes_dof_composite.Contains(hash, reshade::api::shader_stage::pixel));
             dof_pass |= (hash == kDoFLayerResampleHash && gd.dof_layers_open);
          }
-         if (dof_pass && DrawOutputSizedDoFPass(native_device, native_device_context, cmd_list_data, device_data, &gd, hash, *original_draw_dispatch_func))
-            return DrawOrDispatchOverrideType::Replaced;
+         if (dof_pass)
+         {
+            if (DrawOutputSizedDoFPass(native_device, native_device_context, cmd_list_data, device_data, &gd, hash, *original_draw_dispatch_func))
+               return DrawOrDispatchOverrideType::Replaced;
+            if (!gd.post_fallback)
+            {
+               FallBackToRenderSize(native_device, native_device_context, cmd_list_data, device_data, &gd, compute);
+            }
+         }
+      }
+      // After a fallback the engine's buckets still hold the sprites of the last frame it built natively (this frame's are in their
+      // twins, whose counts its draws copy): the binning and the sprites are skipped, the frame goes without bokeh
+      if (is_immediate && gd.post_fallback && !gd.output_twins.empty())
+      {
+         const bool compute = (stages & reshade::api::shader_stage::compute) != 0;
+         com_ptr<ID3D11ShaderResourceView> bucket_srv;
+         if (compute && original_shader_hashes.compute_shaders[0] == kDoFSpriteBinHash)
+         {
+            native_device_context->CSGetShaderResources(3, 1, &bucket_srv);
+         }
+         else if (!compute && original_shader_hashes.pixel_shaders[0] == kDoFSpriteHash)
+         {
+            native_device_context->VSGetShaderResources(3, 1, &bucket_srv);
+         }
+         if (bucket_srv)
+         {
+            com_ptr<ID3D11Resource> bucket;
+            bucket_srv->GetResource(&bucket);
+            if (gd.FindOutputTwinRecord(bucket.get()))
+               return DrawOrDispatchOverrideType::Replaced;
+         }
       }
 
       // A native dispatch between the upscaler and the tonemap reads current engine textures (as the draws below)
