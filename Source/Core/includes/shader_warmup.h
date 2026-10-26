@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <deps/imgui/imgui.h>
@@ -138,7 +139,12 @@ namespace ShaderWarmup
       if (signature.empty())
          return;
       const std::vector<uint8_t> data = SerializeLayout(signature, elements);
-      const std::filesystem::path path = dump_path / std::format("layout_{:08X}.bin", Shader::BinToHash(data.data(), data.size()));
+      const uint32_t hash = Shader::BinToHash(data.data(), data.size());
+      // Some games (UE3) create layouts every frame: the file system is asked once per layout. The caller holds the device mutex.
+      static std::unordered_set<uint32_t> dumped_hashes;
+      if (!dumped_hashes.insert(hash).second)
+         return;
+      const std::filesystem::path path = dump_path / std::format("layout_{:08X}.bin", hash);
       std::error_code error;
       if (std::filesystem::exists(path, error) || (!std::filesystem::exists(dump_path, error) && !std::filesystem::create_directories(dump_path, error)))
          return;

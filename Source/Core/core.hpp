@@ -4989,6 +4989,15 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
 
+      // "CreateInputLayout" only reads its vertex shader's input signature, there is nothing to patch. Some games (UE3) create
+      // layouts every frame, and hashing the whole shader for each cost ~2 ms of CPU per frame (MELE). "OnInitPipeline" doesn't
+      // restore an edited layout shader either.
+      for (uint32_t i = 0; i < subobject_count; ++i)
+      {
+         if (subobjects[i].type == reshade::api::pipeline_subobject_type::input_layout)
+            return false;
+      }
+
       ASSERT_ONCE(!last_live_patched_original_shader_code); // This should never happen, it means our conditions don't match, or well, that shader creation failed, which is possible, even in the original game code
       last_live_patched_original_shader_code = nullptr;
       last_live_patched_original_shader_size = 0;
