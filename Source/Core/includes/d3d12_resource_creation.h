@@ -277,6 +277,12 @@ namespace D3D12ResourceCreation
       return layout_textures.contains(texture);
    }
 
+   inline void RememberLayoutTexture(uint64_t texture)
+   {
+      const std::unique_lock lock(layout_textures_mutex);
+      layout_textures.emplace(texture);
+   }
+
    inline void ForgetLayoutTexture(uint64_t texture)
    {
       {

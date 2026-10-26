@@ -991,13 +991,10 @@ namespace
    WNDPROC game_window_custom_proc = nullptr;
 #endif
    thread_local bool last_swapchain_linear_space = false;
-   // Set by "OnCreateSwapchain()": the format the game asked for the swapchain, and the one it sees on it (equal unless upgraded)
+   // Set by "OnCreateSwapchain()": the format the game asked for the swapchain, and the one it sees on it (equal unless upgraded, "OnInitSwapchain()" sets the fp16 of the proxies).
+   // Reset when the swapchain is destroyed, not resized
    reshade::api::format last_swapchain_vanilla_format = reshade::api::format::unknown;
    reshade::api::format last_swapchain_seen_format = reshade::api::format::unknown;
-#if DX12
-   // Set by "OnCreateSwapchain()" for "OnInitSwapchain()": the swapchain upgrade changed the format family of the swapchain (the game made it with another one)
-   thread_local bool last_swapchain_format_upgraded = false;
-#endif
 #if GAME_FF7_REMAKE
    thread_local reshade::api::format last_swapchain_format = reshade::api::format::r10g10b10a2_unorm;
 #endif
@@ -4332,11 +4329,8 @@ namespace
          desc.back_buffer.texture.format = last_swapchain_vanilla_format;
          changed = true;
       }
-      last_swapchain_vanilla_format = desc.back_buffer.texture.format;
-#if DX12
       // ReShade tells the format the game asked for, also when it resized with DXGI_FORMAT_UNKNOWN (it keeps the game's description, the add-ons' changes are not in it)
-      const reshade::api::format game_back_buffer_format = desc.back_buffer.texture.format;
-#endif
+      last_swapchain_vanilla_format = desc.back_buffer.texture.format;
 
 #if DEVELOPMENT
       ASSERT_ONCE(desc.back_buffer.texture.format != reshade::api::format::unknown); // With the latest ReShade changes, this should never be set to Unknown, even if the game did a swapchain buffer resize and preserved the previous format.
@@ -4395,7 +4389,7 @@ namespace
          changed = true;
       }
 
-      last_swapchain_linear_space = desc.back_buffer.texture.format == reshade::api::format::r8g8b8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::b8g8r8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::r16g16b16a16_float;
+      last_swapchain_linear_space = last_swapchain_vanilla_format == reshade::api::format::r8g8b8a8_unorm_srgb || last_swapchain_vanilla_format == reshade::api::format::b8g8r8a8_unorm_srgb || last_swapchain_vanilla_format == reshade::api::format::r16g16b16a16_float;
 #if GAME_FF7_REMAKE
       last_swapchain_format = desc.back_buffer.texture.format;
 #endif
@@ -4408,13 +4402,8 @@ namespace
          changed = true;
       }
 
-      // The back buffers the game sees: the fp16 proxies of a proxied swapchain, whatever the real buffers are
-      const bool proxied = ENABLE_SWAPCHAIN_PROXY && swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type == SwapchainUpgradeType::scRGB;
-      const reshade::api::format seen_back_buffer_format = (proxied ? reshade::api::format::r16g16b16a16_float : desc.back_buffer.texture.format);
-#if DX12
-      last_swapchain_format_upgraded = (GetTypelessFormat(DXGI_FORMAT(game_back_buffer_format)) != GetTypelessFormat(DXGI_FORMAT(seen_back_buffer_format)));
-#endif
-      last_swapchain_seen_format = seen_back_buffer_format;
+      // The real buffers, "OnInitSwapchain()" switches it to the fp16 of the proxies if it proxies the swapchain
+      last_swapchain_seen_format = desc.back_buffer.texture.format;
       return changed;
    }
 
@@ -4481,6 +4470,14 @@ namespace
       }
 #else
       constexpr bool swapchain_proxied = false;
+#endif
+      if (swapchain_proxied)
+      {
+         last_swapchain_seen_format = reshade::api::format::r16g16b16a16_float;
+      }
+#if DX12
+      // The swapchain upgrade changed the format family of the back buffers the game sees (it made the swapchain with another one)
+      const bool format_upgraded = (GetTypelessFormat(DXGI_FORMAT(last_swapchain_vanilla_format)) != GetTypelessFormat(DXGI_FORMAT(last_swapchain_seen_format)));
 #endif
       // What the game draws into (DX10/11 have one back buffer, even if the swapchain desc says 2)
 #if DX11
@@ -4553,7 +4550,7 @@ namespace
          {
             device_data.back_buffers.emplace(handle_of(back_buffer));
 #if DX12
-            if (last_swapchain_format_upgraded)
+            if (format_upgraded)
             {
                device_data.upgraded_back_buffers.emplace(handle_of(back_buffer));
             }
@@ -4792,6 +4789,12 @@ namespace
       // Also when resizing: the real buffer can't have views left, "Register()" recreates the proxy at the new size
       SwapchainProxy::Unregister((IDXGISwapChain*)(swapchain->get_native()));
 #endif
+      // Only a resize keeps the formats of the swapchain (see "OnCreateSwapchain()")
+      if (!resize)
+      {
+         last_swapchain_vanilla_format = reshade::api::format::unknown;
+         last_swapchain_seen_format = reshade::api::format::unknown;
+      }
       {
          const std::shared_lock lock_swapchain(swapchain_data.mutex);
 
@@ -8066,18 +8069,6 @@ namespace
       //  - Seed (in_source_resource == 0): scale if the seed's scale toggle is set AND SR is active.
       //  - Chain (in_source_resource != 0): scale once SR has actually drawn this frame.
       //  - force_scale bypasses the has_drawn_sr gate for command lists recorded before SR ran (deferred contexts).
-      bool should_scale = force_scale;
-      if (in_source_resource == 0)
-      {
-#if ENABLE_SR
-         should_scale = should_scale || (allow_scale && device_data.sr_type != SR::Type::None && !device_data.sr_suppressed);
-#else
-         should_scale = should_scale || (allow_scale && false);
-#endif
-      }
-      else
-         should_scale = should_scale || device_data.has_drawn_sr;
-
       ResourceUpgradeFrameState state;
       state.render_resolution = device_data.render_resolution;
       state.output_resolution = device_data.output_resolution;
@@ -8088,6 +8079,7 @@ namespace
 #else
       state.sr_active = false;
 #endif
+      const bool should_scale = force_scale || (in_source_resource == 0 ? (allow_scale && state.sr_active) : state.has_drawn_sr);
 
       return device_data.resource_upgrades.FindOrCreateIndirectUpgradedResource(
          device, in_source_resource, in_resource, out_resource,
@@ -13848,59 +13840,69 @@ namespace
    }
 
 #if DX11
+   // The format pairs "ConvertResourceData()" converts (mapped textures only get the pitch of their original format for these)
+   bool CanConvertResourceData(reshade::api::format format, reshade::api::format new_format)
+   {
+      if (new_format != reshade::api::format::r16g16b16a16_float)
+      {
+         return false;
+      }
+      switch (format)
+      {
+      case reshade::api::format::r8g8b8a8_unorm:
+      case reshade::api::format::r8g8b8a8_unorm_srgb:
+      case reshade::api::format::r8g8b8x8_unorm:
+      case reshade::api::format::r8g8b8x8_unorm_srgb:
+      case reshade::api::format::b8g8r8a8_unorm:
+      case reshade::api::format::b8g8r8a8_unorm_srgb:
+      case reshade::api::format::b8g8r8x8_unorm:
+      case reshade::api::format::b8g8r8x8_unorm_srgb:
+      {
+         return true;
+      }
+      default:
+      {
+         return false;
+      }
+      }
+   }
+
    // Returns true if it changed the data.
    // Remember to manually de-allocate the data later.
    bool ConvertResourceData(const reshade::api::subresource_data* data, reshade::api::subresource_data& new_data, const reshade::api::resource_desc& desc, reshade::api::format new_format, bool pre_allocated = false)
    {
       ASSERT_ONCE(data->data != nullptr);
 
-      // Only supported format atm
-      if (new_format != reshade::api::format::r16g16b16a16_float)
+      if (!CanConvertResourceData(desc.texture.format, new_format))
       {
-         ASSERT_ONCE_MSG(false, "Unsupported target resource data format (due to texture upgrades)");
+         ASSERT_ONCE_MSG(desc.texture.format == new_format, "Unsupported resource data format conversion (due to texture upgrades)"); // TODO: add support for these
          return false;
       }
 
       constexpr size_t bytes_per_pixel = 8; // 4 for 8bpc, 8 for 16bpc
-      const size_t buffer_size = desc.texture.width * desc.texture.height * desc.texture.depth_or_layers * bytes_per_pixel;
-
+      if (!pre_allocated)
+      {
+         new_data.data = new uint8_t[desc.texture.width * desc.texture.height * desc.texture.depth_or_layers * bytes_per_pixel];
+      }
+      new_data.row_pitch = desc.texture.width * bytes_per_pixel;
+      new_data.slice_pitch = new_data.row_pitch * desc.texture.height;
       switch (desc.texture.format)
       {
-      case reshade::api::format::r8g8b8a8_unorm:
-      case reshade::api::format::r8g8b8a8_unorm_srgb:
-      case reshade::api::format::r8g8b8x8_unorm:
-      case reshade::api::format::r8g8b8x8_unorm_srgb:
-      {
-         if (!pre_allocated)
-            new_data.data = new uint8_t[buffer_size];
-         new_data.row_pitch = desc.texture.width * bytes_per_pixel;
-         new_data.slice_pitch = new_data.row_pitch * desc.texture.height;
-         ConvertR8G8B8A8toR16G16B16A16((R8G8B8A8_UNORM*)data->data, (R16G16B16A16_FLOAT*)new_data.data, desc.texture.width, desc.texture.height, desc.texture.depth_or_layers);
-         return true;
-      }
       case reshade::api::format::b8g8r8a8_unorm:
       case reshade::api::format::b8g8r8a8_unorm_srgb:
       case reshade::api::format::b8g8r8x8_unorm:
       case reshade::api::format::b8g8r8x8_unorm_srgb:
       {
-         if (!pre_allocated)
-            new_data.data = new uint8_t[buffer_size];
-         new_data.row_pitch = desc.texture.width * bytes_per_pixel;
-         new_data.slice_pitch = new_data.row_pitch * desc.texture.height;
          ConvertR8G8B8A8toR16G16B16A16((B8G8R8A8_UNORM*)data->data, (R16G16B16A16_FLOAT*)new_data.data, desc.texture.width, desc.texture.height, desc.texture.depth_or_layers);
-         return true;
-      }
-      case reshade::api::format::r16g16b16a16_float:
-      {
          break;
       }
       default:
       {
-         ASSERT_ONCE_MSG(false, "Unsupported source resource data format (due to texture upgrades)"); // TODO: add support for these
+         ConvertR8G8B8A8toR16G16B16A16((R8G8B8A8_UNORM*)data->data, (R16G16B16A16_FLOAT*)new_data.data, desc.texture.width, desc.texture.height, desc.texture.depth_or_layers);
          break;
       }
       }
-      return false;
+      return true;
    }
 #endif // DX11
 
@@ -13933,15 +13935,13 @@ namespace
 #if DX12 && ENABLE_MINHOOK
       if (D3D12ResourceCreation::current_creation_arguments.uses_layouts && desc.type != reshade::api::resource_type::buffer)
       {
-         const std::unique_lock lock_layouts(D3D12ResourceCreation::layout_textures_mutex);
-         D3D12ResourceCreation::layout_textures.emplace(resource.handle);
+         D3D12ResourceCreation::RememberLayoutTexture(resource.handle);
       }
       // The clone of a placed texture, or of a committed one with indirect upgrades (see "includes/d3d12_clones.h"): the original stays as the game made it, the clone is the upgraded one
       if (const PendingClone pending = std::exchange(pending_clone, {}); pending.format != DXGI_FORMAT_UNKNOWN)
       {
-         const DXGI_FORMAT clone_format = pending.format;
          // Seed mode (writer shaders listed): the clone waits for its promotion, until then the game keeps using the original
-         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), clone_format, pending.width, pending.height, D3D12ResourceCreation::current_creation_arguments, auto_texture_format_upgrade_shader_hashes.empty());
+         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), pending.format, pending.width, pending.height, D3D12ResourceCreation::current_creation_arguments, auto_texture_format_upgrade_shader_hashes.empty());
          if (clone)
          {
             const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
@@ -13952,8 +13952,7 @@ namespace
             }
             if (D3D12ResourceCreation::current_creation_arguments.uses_layouts)
             {
-               const std::unique_lock lock_layouts(D3D12ResourceCreation::layout_textures_mutex);
-               D3D12ResourceCreation::layout_textures.emplace(clone_handle);
+               D3D12ResourceCreation::RememberLayoutTexture(clone_handle);
             }
 #if DEVELOPMENT
             const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
@@ -13965,11 +13964,11 @@ namespace
          const std::unique_lock lock_logged(logged_mutex);
          const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
          const bool resized = (pending.width != desc.texture.width || pending.height != desc.texture.height);
-         if (logged_clones.emplace(clone != nullptr, creation_kind, desc.texture.format, clone_format, (resized ? pending.width : 0), (resized ? pending.height : 0)).second)
+         if (logged_clones.emplace(clone != nullptr, creation_kind, desc.texture.format, pending.format, (resized ? pending.width : 0), (resized ? pending.height : 0)).second)
          {
             const char* const original_name = GetFormatNameSafe(DXGI_FORMAT(desc.texture.format));
             const char* const kind_name = D3D12ResourceCreation::KIND_NAMES[size_t(creation_kind)];
-            const std::string clone_name = (resized ? std::format("{} at {}x{} (from {}x{})", GetFormatNameSafe(clone_format), pending.width, pending.height, desc.texture.width, desc.texture.height) : std::string(GetFormatNameSafe(clone_format)));
+            const std::string clone_name = (resized ? std::format("{} at {}x{} (from {}x{})", GetFormatNameSafe(pending.format), pending.width, pending.height, desc.texture.width, desc.texture.height) : std::string(GetFormatNameSafe(pending.format)));
             const std::string message = (clone ? std::format("[Texture upgrades] Cloned a {} {} texture as {}", kind_name, original_name, clone_name) : std::format("[Texture upgrades] The device refused the clone of a {} {} texture as {}, it stays as the game made it", kind_name, original_name, clone_name));
             reshade::log::message(clone ? reshade::log::level::info : reshade::log::level::warning, message.c_str());
          }
@@ -14147,16 +14146,18 @@ namespace
          {
             refusal = "it takes castable formats, which ReShade passes on as the game gave them and the upgraded format isn't one of";
          }
-         if (!refusal && (resized || upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples))
+         else if (upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples)
          {
-            if (upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples)
-            {
-               refusal = "its custom dimensions change its layers or samples, which the barriers of its clone couldn't follow";
-            }
-            else if (!ENABLE_D3D12_PASSES)
-            {
-               refusal = "its custom dimensions need the scaled viewports of the D3D12 passes' state tracking (\"ENABLE_D3D12_PASSES\")";
-            }
+            refusal = "its custom dimensions change its layers or samples, which the barriers of its clone couldn't follow";
+         }
+         // ponytail: width and height only, the depth of a 3D texture isn't counted in its mip chain
+         else if (resized && std::bit_width((std::max)(upgraded_desc->texture.width, upgraded_desc->texture.height)) < (desc.texture.levels != 0 ? int(desc.texture.levels) : std::bit_width((std::max)(desc.texture.width, desc.texture.height))))
+         {
+            refusal = "its custom dimensions are too small for its mip levels, which its clone keeps so its barriers can follow the original's";
+         }
+         else if (resized && !ENABLE_D3D12_PASSES)
+         {
+            refusal = "its custom dimensions need the scaled viewports of the D3D12 passes' state tracking (\"ENABLE_D3D12_PASSES\")";
          }
          if (refusal)
          {
@@ -14227,8 +14228,6 @@ namespace
          return;
       }
       DeviceData& device_data = *device->get_private_data<DeviceData>();
-      if (&device_data == nullptr)
-         return;
 #if DX12 && DEVELOPMENT
       D3D12State::RemoveBuffer(&device_data.buffer_addresses, resource);
 #if ENABLE_MINHOOK
@@ -14247,8 +14246,7 @@ namespace
          D3D12ResourceCreation::ForgetLayoutTexture(clone_handle);
          {
             const std::unique_lock lock_upgrades(device_data.mutex);
-            device_data.resource_upgrades.upgraded_resources.erase(clone_handle);
-            device_data.resource_upgrades.original_upgraded_resources_formats.erase(clone_handle);
+            device_data.resource_upgrades.OnResourceDestroyed(clone_handle);
          }
 #if DEVELOPMENT
          const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
@@ -14271,12 +14269,9 @@ namespace
       // Unlinks its mirror (and the mirror views) and defers their destruction to the next present, as they may still be in flight in hooks or bound on recorded lists
       device_data.resource_upgrades.OnResourceDestroyed(resource.handle);
 
-#if DX11
+#if DX11 && DEVELOPMENT
       // TODO: thread safe
-      int count = 0;
-#if DEVELOPMENT
-      count = device_data.cb_per_view_global_buffers.erase(reinterpret_cast<ID3D11Buffer*>(resource.handle));
-#endif
+      device_data.cb_per_view_global_buffers.erase(reinterpret_cast<ID3D11Buffer*>(resource.handle));
 #endif
    }
 
@@ -15055,30 +15050,36 @@ namespace
 #endif // DEVELOPMENT
 
       bool needs_downgrade = false;
-      bool needs_conversion = false;
+      bool has_mirror = false;
       reshade::api::format original_format = reshade::api::format::unknown;
       {
          const std::shared_lock lock(device_data.mutex);
          needs_downgrade = device_data.resource_upgrades.upgraded_resources.contains(resource.handle); // TODO: also check the swapchain for stuff like this... We should add it to this list!
-         needs_conversion = needs_downgrade || device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle);
+         has_mirror = device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle);
          if (needs_downgrade)
          {
             original_format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
             ASSERT_ONCE(original_format != reshade::api::format::unknown); // Every directly upgraded resource has its creation format
          }
       }
+      reshade::api::resource_desc desc = {};
+      bool convert_directly = false;
+      if (needs_downgrade && original_format != reshade::api::format::unknown)
+      {
+         desc = device->get_resource_desc(resource);
+         convert_directly = CanConvertResourceData(original_format, desc.texture.format);
+      }
       // If this happened, we need to upgrade the data passed in to match the new format!
       // This happens in Dishonored 2 and Thief on boot, to update videos or splash screens.
-      if (needs_conversion)
+      if (convert_directly || has_mirror)
       {
          ASSERT_ONCE(access == reshade::api::map_access::write_only || access == reshade::api::map_access::write_discard); // For now we only support write, games generally don't read back textures from the CPU if not for screenshots or for save game snapshots. Note: this happens in Shenmue 2 photo mode. It should be ok as long as we have indirect texture upgrades (the photo will be black or garbage data), otherwise we'd need to covert the data inline here!
          ASSERT_ONCE(data && data->data); // If this is nullptr, it might be a "ID3D11DeviceContext3::WriteToSubresource", which we don't support!
 
          upgraded_mapped_resources[resource.handle] = data;
 
-         if (needs_downgrade && original_format != reshade::api::format::unknown)
+         if (convert_directly)
          {
-            reshade::api::resource_desc desc = device->get_resource_desc(resource);
             // Update the stride to match the original format, we want the game to write to the resource as if it was the original format (we'll convert the data later).
             // This assumes two things:
             // -The new format is wider and thus there will be enough memory.
@@ -15133,15 +15134,20 @@ namespace
                original_desc.texture.format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
             }
 
-            const size_t buffer_size = original_desc.texture.height * original_desc.texture.depth_or_layers * data->row_pitch; // Automatic reconstruction based on what we told the game
+            // "OnMapTextureRegion()" only gave the game the pitch of the original format if it can be converted
+            if (CanConvertResourceData(original_desc.texture.format, upgraded_desc.texture.format))
+            {
+               const size_t buffer_size = original_desc.texture.height * original_desc.texture.depth_or_layers * data->row_pitch; // Automatic reconstruction based on what we told the game
 
-            // Copy aside the data the game wrote for the texture format it thought this texture would have,
-            // and then write it back in the same mapped memory, where it was originally meant to be anyway.
-            reshade::api::subresource_data old_data = *data;
-            old_data.data = new uint8_t[buffer_size];
-            bool pre_allocated = true; // The "data" was already allocated by DirectX on the direct upgraded resource, so it's of the right size already, and we couldn't replace the pointer anyway.
-            ConvertResourceData(&old_data, *data, original_desc, upgraded_desc.texture.format, pre_allocated);
-            delete[] static_cast<uint8_t*>(old_data.data);
+               // Copy aside the data the game wrote for the texture format it thought this texture would have,
+               // and then write it back in the same mapped memory, where it was originally meant to be anyway.
+               reshade::api::subresource_data old_data = *data;
+               old_data.data = new uint8_t[buffer_size];
+               std::memcpy(old_data.data, data->data, buffer_size);
+               bool pre_allocated = true; // The "data" was already allocated by DirectX on the direct upgraded resource, so it's of the right size already, and we couldn't replace the pointer anyway.
+               ConvertResourceData(&old_data, *data, original_desc, upgraded_desc.texture.format, pre_allocated);
+               delete[] static_cast<uint8_t*>(old_data.data);
+            }
          }
 
          upgraded_mapped_resources.erase(it);
@@ -15201,7 +15207,7 @@ namespace
             original_desc = upgraded_desc;
             // Note that some games might dynamically pre-convert the data to match the upgraded target format, however, that's unlikely
             original_desc.texture.format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
-            convert_data = true;
+            convert_data = original_desc.texture.format != reshade::api::format::unknown;
          }
          auto original_resource_to_mirrored_upgraded_resource = device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.find(resource.handle);
          if (!ignore_indirect_upgraded_textures && original_resource_to_mirrored_upgraded_resource != device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.end())
