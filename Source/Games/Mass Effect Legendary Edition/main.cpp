@@ -176,7 +176,7 @@ static bool g_gtvbao_enable = false;
 static bool g_video_auto_hdr_enable = true; // Expand Bink highlights in HDR; off preserves vanilla SDR video.
 static bool g_hide_ui = false;              // Session-only HUD suppression for clean captures.
 // Runtime XeGTAO parameters in b11. HBAO+ PowExponent does not transfer numerically (different visibility
-// curve), so FinalValuePower is calibrated against the native AO histogram.
+// curve), so FinalValuePower is calibrated against the native AO histogram; this DEV/TEST dial scales that calibration.
 static float g_gtao_final_value_power = 1.0f;
 // Converts UE3 view-Z units (approximately 2 cm per uu) to the scale expected by XeGTAO.
 static float g_gtao_depth_scale = 50.f;
@@ -2883,8 +2883,12 @@ public:
 #else
          const float dbg = 0.f;
 #endif
+         // The power matching the native AO's strongest darkening (top 1-5% at 0.70-0.82x, see NOTES.md "XeGTAO view space from the
+         // camera"): 0.65 for XeGTAO and GT-VBAO alike, each measured on two ME3 scenes, ME1/ME2 assumed equal.
+         // "g_gtao_final_value_power" scales it
+         const float final_value_power = g_gtao_final_value_power * 0.65f;
          // knobs[4] is the noise index (see "IsGTAOTemporal"), [5]-[6] the AO target's pixel size, [8]-[9] the depth load scale
-         const float knobs[12] = {g_gtao_final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 1.f / float(w), 1.f / float(h), 0.f, depth_load_scale_x, depth_load_scale_y};
+         const float knobs[12] = {final_value_power, g_gtao_depth_scale, g_gtao_radius_override, dbg, IsGTAOTemporal(device_data) ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 1.f / float(w), 1.f / float(h), 0.f, depth_load_scale_x, depth_load_scale_y};
          if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao), knobs, sizeof(knobs)))
             return DrawOrDispatchOverrideType::None;
 

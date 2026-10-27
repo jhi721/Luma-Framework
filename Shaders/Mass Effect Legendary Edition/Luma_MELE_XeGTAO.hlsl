@@ -36,11 +36,11 @@ cbuffer _Globals : register(b0) // NVIDIA GFSDK_SSAO $Globals.
 
 cbuffer CSOffsetConstants : register(b2)
 {
-   float4x4 ViewProjectionMatrixCS;  // Offset:   0
-   float4 CameraPositionCS;          // Offset:  64
-   float4 ScreenPositionScaleBiasCS; // Offset:  80
-   float4 MinZ_MaxZRatioCS;          // Offset:  96; viewZ = 1 / (d * z - w), non-reverse Z.
-   float4 DynamicScaleCS;            // Offset: 112
+   column_major float4x4 ViewProjectionMatrixCS; // Offset:   0; [i] = clip row i over the translated world (see "MELE_NDCToView")
+   float4 CameraPositionCS;                      // Offset:  64
+   float4 ScreenPositionScaleBiasCS;             // Offset:  80
+   float4 MinZ_MaxZRatioCS;                      // Offset:  96; viewZ = 1 / (d * z - w), non-reverse Z.
+   float4 DynamicScaleCS;                        // Offset: 112
 }
 
 // Runtime parameters uploaded by main.cpp in b11.
@@ -82,9 +82,22 @@ cbuffer LumaGTAO : register(b11)
 #define VIEWPORT_PIXEL_SIZE                PixelSizeRT
 #define XE_GTAO_DEPTH_LOAD_COORD(pixCoord) uint2(((pixCoord) + 0.5) * DepthLoadScaleRT)
 
-// GFSDK ProjInfo contains the live NDC-to-view multiply/add pair, including dialogue zoom, for UVs of the rendered area.
-#define NDC_TO_VIEW_MUL ProjInfo.xy
-#define NDC_TO_VIEW_ADD ProjInfo.zw
+// The NDC-to-view pair over the rendered area's UVs, from the camera rather than HBAO+'s ProjInfo: the exe builds that from the
+// horizontal FOV clamped to [75, 90] degrees for both axes (an integer aspect), so at 16:9 its view space is about 1.1x too wide and
+// 1.95x too tall (ME3, NOTES.md "Native AO"). Row 3 of ViewProjectionMatrixCS is the view's forward axis; rows 0/1 are
+// P11 * right + P31 * forward and P22 * up + P32 * forward, P31/P32 being the upscaler jitter.
+float4 MELE_NDCToView()
+{
+   const float3 forward = ViewProjectionMatrixCS[3].xyz;
+   const float forward_length_sq = dot(forward, forward);
+   const float p31 = dot(ViewProjectionMatrixCS[0].xyz, forward) / forward_length_sq;
+   const float p32 = dot(ViewProjectionMatrixCS[1].xyz, forward) / forward_length_sq;
+   const float p11 = length(ViewProjectionMatrixCS[0].xyz - p31 * forward);
+   const float p22 = length(ViewProjectionMatrixCS[1].xyz - p32 * forward);
+   return float4(2.0 / p11, -2.0 / p22, (-1.0 - p31) / p11, (1.0 - p32) / p22);
+}
+#define NDC_TO_VIEW_MUL MELE_NDCToView().xy
+#define NDC_TO_VIEW_ADD MELE_NDCToView().zw
 
 // Convert non-reverse D24 through native MinZ_MaxZRatioCS, then scale UE3 units into XeGTAO's expected range.
 // Without scaling, its mip and falloff assumptions cause broad over-occlusion.
