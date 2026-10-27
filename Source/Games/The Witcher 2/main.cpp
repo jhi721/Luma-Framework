@@ -401,6 +401,9 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    // view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
+   // A copy of the scene the upscaler reads, which "Luma_TW2_SanitizeScene.hlsl" draws back without NaNs and infinities
+   com_ptr<ID3D11Texture2D> sr_scene_copy;
+   com_ptr<ID3D11ShaderResourceView> sr_scene_copy_srv;
    std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler is active, or the DEV toggle (set at present)
    std::shared_mutex mv_mutex;
    // A game shader's patched version (null if refused), patched on first use, by its hash; a vertex shader's with the bytes of vc4
@@ -1758,6 +1761,36 @@ class TheWitcher2Game final : public Game
             return false;
       }
 
+      // DLSS and FSR keep a history: a NaN or an infinity in the scene would stay in it for good. The scene is copied and drawn back
+      // through "Luma_TW2_SanitizeScene.hlsl", RGB only (its alpha is game data). Skipped (unsanitized) if the copy can't be made.
+      if (auto* const sanitize_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("TW2 Sanitize Scene PS")))
+      {
+         D3D11_TEXTURE2D_DESC copy_desc = {};
+         if (gd.sr_scene_copy)
+         {
+            gd.sr_scene_copy->GetDesc(&copy_desc);
+         }
+         if (copy_desc.Width != scene_desc.Width || copy_desc.Height != scene_desc.Height || copy_desc.Format != scene_desc.Format)
+         {
+            gd.sr_scene_copy.reset();
+            gd.sr_scene_copy_srv.reset();
+            copy_desc = CD3D11_TEXTURE2D_DESC(scene_desc.Format, scene_desc.Width, scene_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE);
+            if (SUCCEEDED(native_device->CreateTexture2D(&copy_desc, nullptr, &gd.sr_scene_copy)))
+            {
+               // The scene's own texture can be typeless (dgVoodoo's targets), its view isn't
+               D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+               scene_rtv->GetDesc(&rtv_desc);
+               const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, rtv_desc.Format);
+               native_device->CreateShaderResourceView(gd.sr_scene_copy.get(), &srv_desc, &gd.sr_scene_copy_srv);
+            }
+         }
+         if (gd.sr_scene_copy_srv)
+         {
+            native_device_context->CopyResource(gd.sr_scene_copy.get(), scene.get());
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), gd.sr_rgb_blend_state.get(), nullptr, copy_vs, sanitize_ps, gd.sr_scene_copy_srv.get(), scene_rtv, scene_desc.Width, scene_desc.Height);
+         }
+      }
+
       // FSR needs the camera (WorldToScreen: column vectors)
       const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET), /* row_vectors */ false);
 
@@ -2738,6 +2771,8 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 XeGTAO Denoise Pass 2 CS"),
          ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
       // GT-VBAO: its main pass, its slice count and noise under the AO history, the history, and the final denoiser into its own R8_UNORM target
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Sanitize Scene PS"),
+         ShaderDefinition{"Luma_TW2_SanitizeScene", reshade::api::pipeline_subobject_type::pixel_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 GT-VBAO Main Pass CS"),
          ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 GT-VBAO Temporal Main Pass CS"),
@@ -3119,6 +3154,8 @@ public:
       if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          game_device_data.sr_output_srv.reset();
+         game_device_data.sr_scene_copy.reset();
+         game_device_data.sr_scene_copy_srv.reset();
          game_device_data.sr_adaptation_srv.reset();
          game_device_data.sr_exposure_constants.reset();
          game_device_data.sr_exposure.reset();

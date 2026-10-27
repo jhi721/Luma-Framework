@@ -174,7 +174,10 @@ RWTexture2D<float2> history_output : register(u1);
       const float2 bilinear = float2(((i & 1) ? f.x : (1.0 - f.x)), ((i >> 1) ? f.y : (1.0 - f.y)));
       const float2 previous = history.Load(int3(tap, 0));
       const bool inside = all(tap >= 0) && all(tap < int2(size));
-      const float weight = ((inside && abs(previous.y - expected_z) <= kTW2_HistoryDepthTolerance * expected_z) ? (bilinear.x * bilinear.y) : 0.0);
+      // A tap must hold a valid AO, [0, 1] (NaN fails the ordered compares): a bad value would stay in the history for good. A NaN view
+      // Z fails the depth test the same way.
+      const bool valid = previous.x >= 0.0 && previous.x <= 1.0 && abs(previous.y - expected_z) <= kTW2_HistoryDepthTolerance * expected_z;
+      const float weight = ((inside && valid) ? (bilinear.x * bilinear.y) : 0.0);
       history_ao += previous.x * weight;
       weight_sum += weight;
    }
