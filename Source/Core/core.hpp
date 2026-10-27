@@ -617,6 +617,7 @@ namespace
       // TODO: delete all redirectors by doing a global rename
       TextureFormatUpgradesType& texture_format_upgrades_type = ResourceUpgradeManager::texture_format_upgrades_type;
       bool& enable_indirect_texture_format_upgrades = ResourceUpgradeManager::enable_indirect_texture_format_upgrades;
+      bool& texture_format_upgrades_on_creation = ResourceUpgradeManager::texture_format_upgrades_on_creation;
       ChainTextureFormatUpgradesType& enable_chain_indirect_texture_format_upgrades = ResourceUpgradeManager::enable_chain_indirect_texture_format_upgrades;
       bool& ignore_indirect_upgraded_textures = ResourceUpgradeManager::ignore_indirect_upgraded_textures;
 #if DEVELOPMENT && 0 // WIP
@@ -14155,7 +14156,7 @@ namespace
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       std::shared_lock lock(device_data.mutex); // Note: we possibly don't even need this (or well, we might want to use a different mutex)
       
-      if (std::optional<reshade::api::resource_desc> upgraded_desc = GetOptionalResourceUpgradeDesc(desc, device_data, initial_data && initial_data->data))
+      if (std::optional<reshade::api::resource_desc> upgraded_desc = (texture_format_upgrades_on_creation ? GetOptionalResourceUpgradeDesc(desc, device_data, initial_data && initial_data->data) : std::nullopt))
       {
          lock.unlock();
 

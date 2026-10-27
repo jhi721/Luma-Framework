@@ -166,6 +166,10 @@ public:
    // These are sometimes referred to as: indirect, mirrored, proxy, redirected, cloned, ...
    // See "FindOrCreateIndirectUpgradedResource()" for the main functionality.
    static inline bool enable_indirect_texture_format_upgrades = false;
+   // False: nothing is upgraded when it's created, "texture_upgrade_formats" and the size filters only drive the writer shaders' upgrades
+   // ("auto_texture_format_upgrade_shader_hashes") and the chains from them. For a game whose wanted target shares its format and size with
+   // targets that must stay as they are (The Witcher 2: dgVoodoo's present blit target and the G-buffer).
+   static inline bool texture_format_upgrades_on_creation = true;
    // Automatically upgrade all textures that are used as target of an indirect upgraded resource, and their views.
    // Indirect texture mirrors might still be automatically created if "texture_format_upgrades_type" is enabled, in case the game tried to copy an upgraded resource into an incompatible one that wasn't upgraded etc.
    // This can work even without "enable_indirect_texture_format_upgrades", in case we upgraded textures through "auto_texture_format_upgrade_shader_hashes", or in case a texture wasn't a render target but was used as copy target of one.
