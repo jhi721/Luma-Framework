@@ -82,17 +82,29 @@ static bool g_smaa_predication = true; // SMAA depth predication (r32f depth cap
 // 0.02 = ~14 cm at the measured 7 m median depth; XeGTAO uses 0.011 and ASSAO 0.040 for the same test.
 static float g_smaa_pred_tolerance = 0.02f;
 static bool g_gtao_enable = true; // XeGTAO replaces the native SSAO generator (AO_GEN)
-static bool g_hide_ui = false;    // hide the game's HUD (for clean screenshots); session-only, never persisted
+// GT-VBAO's visibility bitmask main pass instead of XeGTAO's horizons, at one AO pixel per scene pixel into its own target, which the
+// pack reads in place of the game's half size one (see "RunXeGTAO"); prefilter, denoise and the knobs stay XeGTAO's
+static bool g_gtvbao_enable = false;
+#if DEVELOPMENT
+static float g_gtao_history_weight = 0.9f; // The AO history's weight under DLSS/FSR (see "RunXeGTAO"), 0 turns it off
+#else
+static constexpr float g_gtao_history_weight = 0.9f;
+#endif
+static bool g_hide_ui = false; // hide the game's HUD (for clean screenshots); session-only, never persisted
 
 // XeGTAO knobs CB slot, must match "register(b9)" in Luma_TW2_XeGTAO.hlsl. Not b11: core's DrawBloom owns
 // that slot for its own constants.
 static constexpr UINT GTAO_KNOBS_CB_SLOT = 9;
+static constexpr UINT GTAO_TEMPORAL_CB_SLOT = 10; // "register(b10)" of the AO history ("temporal_pass_cs")
 // XeGTAO calibration knobs (DEV sliders). DepthScale and RadiusOverride ship at their calibrated values;
 // FinalValuePower does NOT - 2.2 is a preference, while 1.0 is the value whose AO histogram matches the
 // game's own HBAO (mean 0.90 against native 0.89).
 static float g_gtao_final_value_power = 2.2f; // primary darkness dial (higher = darker)
 static float g_gtao_depth_scale = 1.f;        // viewZ divisor (game units -> ~meters); dial against broad over-occlusion
 static float g_gtao_radius_override = 0.f;    // > 0 overrides the shader's EFFECT_RADIUS (view units after DepthScale)
+// GT-VBAO's own power: matched to XeGTAO at 2.2 on its percentiles against the native HBAO (with its 0.4 radius back face, NOTES.md
+// "GT-VBAO at full resolution"; two scenes)
+static float g_gtvbao_final_value_power = 1.6f;
 #if DEVELOPMENT
 static int g_gtao_debug_view = 0; // 0=off 1=depth gradient 2=normals 3=AO x8 4=edges (the shader's debug blocks are DEVELOPMENT-only too)
 #endif
@@ -410,6 +422,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no upscaler)
+   com_ptr<ID3D11ShaderResourceView> mv_srv;  // The AO history reads it (see "RunXeGTAO")
    // The upscaler's depth, built from the G-buffer's linear depth by the fill (the game's depth has no shader resource view)
    com_ptr<ID3D11Texture2D> mv_device_depth;
    com_ptr<ID3D11UnorderedAccessView> mv_device_depth_uav;
@@ -442,6 +455,7 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       mv_texture.reset();
       mv_rtv.reset();
       mv_uav.reset();
+      mv_srv.reset();
       mv_device_depth.reset();
       mv_device_depth_uav.reset();
    }
@@ -627,14 +641,24 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_gtao_working[2]; // R8G8_UNORM AO+edges ping-pong
    ComPtr<ID3D11UnorderedAccessView> uav_gtao_working[2];
    ComPtr<ID3D11ShaderResourceView> srv_gtao_working[2];
-   ComPtr<ID3D11Texture2D> tex_gtao_final; // gtao_final_fmt, CopyResource'd into the game's AO RT
+   ComPtr<ID3D11Texture2D> tex_gtao_final; // gtao_final_fmt, CopyResource'd into the game's AO RT; GT-VBAO's own R8_UNORM target instead
    ComPtr<ID3D11UnorderedAccessView> uav_gtao_final;
+   ComPtr<ID3D11ShaderResourceView> srv_gtao_final; // GT-VBAO's: the pack reads it in place of the game's AO target
+   // The AO history, R16G16_FLOAT (AO, view Z), ping-ponged, under DLSS/FSR: written by "temporal_pass_cs" (see "RunXeGTAO")
+   ComPtr<ID3D11Texture2D> tex_gtao_history[2];
+   ComPtr<ID3D11UnorderedAccessView> uav_gtao_history[2];
+   ComPtr<ID3D11ShaderResourceView> srv_gtao_history[2];
+   uint32_t gtao_history_index = 0; // The one written last
+   uint32_t gtao_history_frame = 0; // Luma frame index of that write: the history restarts unless it was the previous frame
+   com_ptr<ID3D11Buffer> cb_gtao_temporal;
+   bool gtao_full_res_this_frame = false; // GT-VBAO wrote "tex_gtao_final" for the pack (reset at present)
    // The size and format the set was built for. Committed even when the allocation fails, so a null set under a
    // matching triple means "failed" and no per-frame retry fragments the 32-bit address space. ReleaseGTAOScratch
    // clears it.
    uint32_t gtao_w = 0, gtao_h = 0;                  // The game's AO target (the final texture's size)
    uint32_t gtao_work_w = 0, gtao_work_h = 0;        // The working textures: the whole AO target, or its scene share without the full size depth
-   DXGI_FORMAT gtao_final_fmt = DXGI_FORMAT_UNKNOWN; // actual (possibly Luma-upgraded) AO RT format
+   DXGI_FORMAT gtao_final_fmt = DXGI_FORMAT_UNKNOWN; // actual (possibly Luma-upgraded) AO RT format, R8_UNORM for GT-VBAO's own target
+   bool gtao_temporal = false;                       // The set has the AO history
    com_ptr<ID3D11Buffer> cb_gtao;                    // knobs + viewport (GTAO_KNOBS_CB_SLOT), dynamic: the noise index changes every frame
    // The replaced pack's AO UV scale (AOPack_0x953119B5): output / render size when this frame's generator filled the whole AO target,
    // else 1 (reset at present)
@@ -693,11 +717,21 @@ struct TheWitcher2GameDeviceData final : public GameDeviceData
       }
       tex_gtao_final.reset();
       uav_gtao_final.reset();
+      srv_gtao_final.reset();
+      for (int i = 0; i < 2; i++)
+      {
+         tex_gtao_history[i].reset();
+         uav_gtao_history[i].reset();
+         srv_gtao_history[i].reset();
+      }
+      gtao_history_frame = 0;
+      cb_gtao_temporal.reset();
       gtao_w = 0;
       gtao_h = 0;
       gtao_work_w = 0;
       gtao_work_h = 0;
       gtao_final_fmt = DXGI_FORMAT_UNKNOWN;
+      gtao_temporal = false;
       cb_gtao.reset(); // it holds the viewport size
    }
 
@@ -1320,6 +1354,7 @@ class TheWitcher2Game final : public Game
             {
                native_device->CreateUnorderedAccessView(gd.mv_texture.get(), nullptr, &gd.mv_uav);
             }
+            native_device->CreateShaderResourceView(gd.mv_texture.get(), nullptr, &gd.mv_srv);
             const CD3D11_TEXTURE2D_DESC depth_desc(DXGI_FORMAT_R32_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
             if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, depth_desc, &gd.mv_device_depth)))
             {
@@ -1876,6 +1911,24 @@ class TheWitcher2Game final : public Game
       }
    }
 
+   // The motion vector fill's and the AO history's camera: current clip space to the previous frame's, previous * inverse(current), column
+   // vectors as vc4 holds them, in double (absolute world translation), identity without the previous camera; and the projection's depth
+   // row (device depth = depth_a + depth_b / view depth)
+   static std::pair<Math::Matrix44D, SR::ViewProjectionCamera> GetCameraReprojection(const TheWitcher2GameDeviceData& gd)
+   {
+      const float* const view_projection = reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET);
+      Math::Matrix44D current, previous;
+      current.SetIdentity();
+      previous.SetIdentity();
+      if (gd.mv_previous_camera)
+      {
+         std::copy_n(view_projection, 16, current.GetData());
+         std::copy_n(reinterpret_cast<const float*>(gd.mv_previous_camera->data() + VIEW_PROJECTION_OFFSET), 16, previous.GetData());
+         current.Invert();
+      }
+      return {previous * current, SR::GetViewProjectionCamera(view_projection, /* row_vectors */ false)};
+   }
+
    // Ends the scene right after the exposure drew into "scene_rtv" (null: no upscaler), or under the render scale before the post
    // chain's first pass with the linear scene: the depth and camera motion fill (see "Luma_TW2_MotionVectorFill.hlsl"), then the
    // upscaler, before anything reads the scene. Under the render scale, then the linear depth stretched over its surface.
@@ -1949,20 +2002,7 @@ class TheWitcher2Game final : public Game
       bool filled = false;
       if (std::exchange(gd.mv_fill_pending, false) && fill_shader && gd.mv_camera && gd.mv_linear_depth_srv)
       {
-         // Current clip space to the previous frame's: previous * inverse(current), column vectors as vc4 holds them, in double
-         // (absolute world translation)
-         const float* const view_projection = reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET);
-         Math::Matrix44D current, previous;
-         current.SetIdentity();
-         previous.SetIdentity();
-         if (gd.mv_previous_camera)
-         {
-            std::copy_n(view_projection, 16, current.GetData());
-            std::copy_n(reinterpret_cast<const float*>(gd.mv_previous_camera->data() + VIEW_PROJECTION_OFFSET), 16, previous.GetData());
-            current.Invert();
-         }
-         const Math::Matrix44D reprojection = previous * current;
-         const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(view_projection, /* row_vectors */ false);
+         const auto [reprojection, camera] = GetCameraReprojection(gd);
          CB::MotionVectorFillConstants constants = {
             .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
             .depth_from_view = {float(camera.depth_a), float(camera.depth_b)},
@@ -2240,6 +2280,10 @@ class TheWitcher2Game final : public Game
    // Take over the AO_GEN draw: 4 XeGTAO compute passes into our scratch, then CopyResource into the game's AO
    // RT so the vanilla chain keeps working. Inputs come from the hooked draw (depth SRV t0, RTV, cb4 for the
    // NDC->view ray scale); a missing one returns None so the native HBAO runs ("RunNativeAOWholeTarget").
+   // GT-VBAO ("g_gtvbao_enable") runs from the G-buffer's full size linear depth over the rendered area instead, one AO pixel per scene
+   // pixel, into its own R8_UNORM target, which the pack reads in place of the game's half size one (the chain after the pack is
+   // full size already): at half size its slice noise stays as grain the pack's 2x upsample spreads. Under DLSS/FSR an AO history
+   // runs between its main pass and the denoise, and it takes 1 slice there instead of 2 (MELE's).
    DrawOrDispatchOverrideType RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, TheWitcher2GameDeviceData* gd, float2 area_scale)
    {
       // The four passes, null until the async loader (or a live reload) has them: the native draw runs then
@@ -2249,6 +2293,11 @@ class TheWitcher2Game final : public Game
       auto* cs_denoise_2 = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 XeGTAO Denoise Pass 2 CS"));
       if (cs_prefilter == nullptr || cs_main == nullptr || cs_denoise_1 == nullptr || cs_denoise_2 == nullptr)
          return DrawOrDispatchOverrideType::None;
+      auto* cs_gtvbao_main = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 GT-VBAO Main Pass CS"));
+      auto* cs_gtvbao_denoise_2 = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 GT-VBAO Denoise Pass 2 CS"));
+      const bool full_res = g_gtvbao_enable && gd->mv_linear_depth_srv && cs_gtvbao_main && cs_gtvbao_denoise_2;
+      // The history goes with the per frame noise (see the knobs' "noise_index")
+      const bool temporal = full_res && gd->sr_active;
 
       // Game depth (the hooked draw's t0): half-res r32_float linear view-space depth.
       ComPtr<ID3D11ShaderResourceView> srv_depth;
@@ -2276,8 +2325,9 @@ class TheWitcher2Game final : public Game
       // Typeless -> typed within the same family (so CopyResource stays legal), since our UAV-written copy source needs
       // a typed format. Typed UAV store is only guaranteed for these two, and they are the only formats the upgrade
       // list can produce; anything else would fail at CreateTexture2D.
-      const DXGI_FORMAT final_fmt = (DXGI_FORMAT)reshade::api::format_to_default_typed((reshade::api::format)rt_fmt);
-      if (final_fmt != DXGI_FORMAT_R8G8B8A8_UNORM && final_fmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
+      // GT-VBAO's own target is R8_UNORM, a format the game's never is: it keys the scratch set's full resolution mode too.
+      const DXGI_FORMAT final_fmt = (full_res ? DXGI_FORMAT_R8_UNORM : (DXGI_FORMAT)reshade::api::format_to_default_typed((reshade::api::format)rt_fmt));
+      if (final_fmt != DXGI_FORMAT_R8_UNORM && final_fmt != DXGI_FORMAT_R8G8B8A8_UNORM && final_fmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
          return DrawOrDispatchOverrideType::None;
 
       // The XeGTAO shader derives its NDC->view ray scale from the game's cb4 (bound to the PS stage at the
@@ -2301,11 +2351,22 @@ class TheWitcher2Game final : public Game
          depth_load_scale = {float(RenderArea::render_size[0]) / float(w), float(RenderArea::render_size[1]) / float(h)};
          depth = gd->mv_linear_depth_srv.get();
       }
-      const uint32_t work_w = std::clamp(uint32_t(std::ceil(float(w) * work_share.x)), 1u, w);
-      const uint32_t work_h = std::clamp(uint32_t(std::ceil(float(h) * work_share.y)), 1u, h);
+      uint32_t work_w = std::clamp(uint32_t(std::ceil(float(w) * work_share.x)), 1u, w);
+      uint32_t work_h = std::clamp(uint32_t(std::ceil(float(h) * work_share.y)), 1u, h);
+      if (full_res)
+      {
+         // The rendered area of the full size depth, one working pixel per scene pixel (work_share in working pixels per AO target pixel,
+         // for the radius cap)
+         const auto [depth_w, depth_h] = GetViewTextureSize(gd->mv_linear_depth_srv.get());
+         work_w = std::clamp(RenderArea::render_size[0], 1u, depth_w);
+         work_h = std::clamp(RenderArea::render_size[1], 1u, depth_h);
+         work_share = {float(work_w) / float(w), float(work_h) / float(h)};
+         depth_load_scale = {1.f, 1.f};
+         depth = gd->mv_linear_depth_srv.get();
+      }
 
-      // (Re)create the scratch set on first use, resolution or render scale change, or RT format change (all-or-nothing).
-      if (gd->gtao_w != w || gd->gtao_h != h || gd->gtao_work_w != work_w || gd->gtao_work_h != work_h || gd->gtao_final_fmt != final_fmt)
+      // (Re)create the scratch set on first use, resolution or render scale change, RT format or mode change (all-or-nothing).
+      if (gd->gtao_w != w || gd->gtao_h != h || gd->gtao_work_w != work_w || gd->gtao_work_h != work_h || gd->gtao_final_fmt != final_fmt || gd->gtao_temporal != temporal)
       {
          gd->ReleaseGTAOScratch();
 
@@ -2325,21 +2386,38 @@ class TheWitcher2Game final : public Game
             ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_working[i].get(), nullptr, gd->srv_gtao_working[i].put()));
          }
 
-         // Final AO in the game's channel layout (.x = AO), in the RT's ACTUAL format so CopyResource is legal.
-         // The shader writes a plain float4 UAV, valid against both unorm8 and fp16.
-         ok = ok && CreateDefaultTex(native_device, w, h, td.BindFlags, std::addressof(gd->tex_gtao_final), final_fmt);
-         ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_final.get(), nullptr, gd->uav_gtao_final.put()));
+         if (full_res)
+         {
+            // GT-VBAO's own target, at the working size, read by the pack
+            ok = ok && CreateDefaultTex(native_device, work_w, work_h, td.BindFlags, std::addressof(gd->tex_gtao_final), final_fmt);
+            ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_final.get(), nullptr, gd->uav_gtao_final.put()));
+            ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_final.get(), nullptr, gd->srv_gtao_final.put()));
+            for (int i = 0; ok && temporal && i < 2; i++)
+            {
+               ok = ok && CreateDefaultTex(native_device, work_w, work_h, td.BindFlags, std::addressof(gd->tex_gtao_history[i]), DXGI_FORMAT_R16G16_FLOAT);
+               ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_history[i].get(), nullptr, gd->uav_gtao_history[i].put()));
+               ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_history[i].get(), nullptr, gd->srv_gtao_history[i].put()));
+            }
+         }
+         else
+         {
+            // Final AO in the game's channel layout (.x = AO), in the RT's ACTUAL format so CopyResource is legal.
+            // The shader writes a plain float4 UAV, valid against both unorm8 and fp16.
+            ok = ok && CreateDefaultTex(native_device, w, h, td.BindFlags, std::addressof(gd->tex_gtao_final), final_fmt);
+            ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_final.get(), nullptr, gd->uav_gtao_final.put()));
+         }
 
          if (!ok)
          {
             gd->ReleaseGTAOScratch(); // drop the partials
          }
-         // Commit the target triple either way: a null set under it then reads as "failed", with no retry.
+         // Commit the key either way: a null set under it then reads as "failed", with no retry.
          gd->gtao_w = w;
          gd->gtao_h = h;
          gd->gtao_work_w = work_w;
          gd->gtao_work_h = work_h;
          gd->gtao_final_fmt = final_fmt;
+         gd->gtao_temporal = temporal;
       }
       if (!gd->tex_gtao_final)
          return DrawOrDispatchOverrideType::None; // the allocation failed for this size and format: the native draw runs
@@ -2351,7 +2429,7 @@ class TheWitcher2Game final : public Game
 #endif
       // Knobs + viewport CB. The viewport rides along so the shader never trusts game constants for it.
       const CB::GTAOKnobs knobs = {
-         .final_value_power = g_gtao_final_value_power,
+         .final_value_power = (full_res ? g_gtvbao_final_value_power : g_gtao_final_value_power),
          .depth_scale = g_gtao_depth_scale,
          .radius_override = g_gtao_radius_override,
          .debug_view = debug_view,
@@ -2373,49 +2451,79 @@ class TheWitcher2Game final : public Game
       native_device_context->CSSetSamplers(0, 1, &point_sampler);
 
       static constexpr std::array<ID3D11UnorderedAccessView*, 5> uav_nulls5 = {};
-      static constexpr std::array<ID3D11ShaderResourceView*, 2> srv_nulls2 = {};
-
-      // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
-      {
-         native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         ID3D11UnorderedAccessView* uavs[5] = {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(),
-            gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()};
-         native_device_context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &depth);
-         native_device_context->CSSetShader(cs_prefilter, nullptr, 0);
-         native_device_context->Dispatch((work_w + 15) / 16, (work_h + 15) / 16, 1);
-         native_device_context->CSSetUnorderedAccessViews(0, 5, uav_nulls5.data(), nullptr);
-      }
+      static constexpr std::array<ID3D11ShaderResourceView*, 5> srv_nulls5 = {};
       // Bind each destination UAV before its source SRVs: D3D11 otherwise keeps the previous UAV hazard and
       // silently nulls the conflicting SRV. Normals are generated from depth inside the shader.
+      const auto dispatch = [&](ID3D11ComputeShader* shader, std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs, UINT groups_x, UINT groups_y)
       {
-         native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         native_device_context->CSSetUnorderedAccessViews(0, 1, gd->uav_gtao_working[0].get_addressof(), nullptr);
-         native_device_context->CSSetShaderResources(0, 1, gd->srv_gtao_depth_mips.get_addressof());
-         native_device_context->CSSetShader(cs_main, nullptr, 0);
-         native_device_context->Dispatch((work_w + 7) / 8, (work_h + 7) / 8, 1);
-      }
-      // First denoiser writes working1, two horizontal pixels per thread.
+         native_device_context->CSSetShaderResources(0, UINT(srv_nulls5.size()), srv_nulls5.data());
+         native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uavs.begin(), nullptr);
+         native_device_context->CSSetShaderResources(0, UINT(srvs.size()), srvs.begin());
+         native_device_context->CSSetShader(shader, nullptr, 0);
+         native_device_context->Dispatch(groups_x, groups_y, 1);
+         native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uav_nulls5.data(), nullptr);
+      };
+
+      // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
+      dispatch(cs_prefilter, {depth}, {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(), gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()}, (work_w + 15) / 16, (work_h + 15) / 16);
+
+      // The history (Luma_TW2_XeGTAO.hlsl, "temporal_pass_cs") turns working0 into working1, only with this frame's motion vectors: their
+      // patched draws ran in the G-buffer, cleared to the fill's marker, and the camera fill hasn't yet (it runs at the scene's end)
+      auto* cs_temporal = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 XeGTAO Temporal CS"));
+      const bool history_active = temporal && g_gtao_history_weight > 0.f && cs_temporal && gd->tex_gtao_history[1] && gd->mv_srv && gd->mv_camera && gd->mv_fill_pending && gd->mv_frame_index == cb_luma_global_settings.FrameIndex;
+      // GT-VBAO takes 1 slice under it, with Core's FAST noise at t4
+      ID3D11ComputeShader* main_pass = (full_res ? cs_gtvbao_main : cs_main);
+      ID3D11ShaderResourceView* fast_noise = nullptr;
+      auto* cs_gtvbao_temporal_main = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("TW2 GT-VBAO Temporal Main Pass CS"));
+      if (const auto it = device_data.managed_resources.shader_resource_views.find("FAST Noise"_h); history_active && cs_gtvbao_temporal_main && it != device_data.managed_resources.shader_resource_views.end())
       {
-         native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         native_device_context->CSSetUnorderedAccessViews(0, 1, gd->uav_gtao_working[1].get_addressof(), nullptr);
-         native_device_context->CSSetShaderResources(0, 1, gd->srv_gtao_working[0].get_addressof());
-         native_device_context->CSSetShader(cs_denoise_1, nullptr, 0);
-         native_device_context->Dispatch((work_w + 15) / 16, (work_h + 7) / 8, 1);
+         fast_noise = it->second.get();
+         main_pass = cs_gtvbao_temporal_main;
       }
+      // Main pass writes AO and edges to working0.
+      dispatch(main_pass, {gd->srv_gtao_depth_mips.get(), nullptr, nullptr, nullptr, fast_noise}, {gd->uav_gtao_working[0].get()}, (work_w + 7) / 8, (work_h + 7) / 8);
+      int denoise_source = 0;
+      if (history_active)
       {
-         native_device_context->CSSetShaderResources(0, 2, srv_nulls2.data());
-         native_device_context->CSSetUnorderedAccessViews(0, 1, gd->uav_gtao_final.get_addressof(), nullptr);
-         native_device_context->CSSetShaderResources(0, 1, gd->srv_gtao_working[1].get_addressof());
-         native_device_context->CSSetShader(cs_denoise_2, nullptr, 0);
-         native_device_context->Dispatch((work_w + 15) / 16, (work_h + 7) / 8, 1);
-         native_device_context->CSSetUnorderedAccessViews(0, 1, uav_nulls5.data(), nullptr);
+         const bool history_valid = gd->gtao_history_frame + 1 == cb_luma_global_settings.FrameIndex && gd->mv_previous_camera && !device_data.force_reset_sr;
+         const auto [reprojection, camera] = GetCameraReprojection(*gd);
+         CB::GTAOTemporal temporal_constants = {
+            .jitter_ndc = {gd->mv_jitter_ndc[0], gd->mv_jitter_ndc[1]},
+            .depth_from_view = {float(camera.depth_a), float(camera.depth_b)},
+            .history_weight = (history_valid ? g_gtao_history_weight : 0.f),
+         };
+         for (int i = 0; i < 16; i++)
+         {
+            temporal_constants.reprojection.GetData()[i] = float(reprojection.GetData()[i]);
+         }
+         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao_temporal), &temporal_constants, sizeof(temporal_constants)))
+         {
+            ID3D11Buffer* const temporal_cb = gd->cb_gtao_temporal.get();
+            native_device_context->CSSetConstantBuffers(GTAO_TEMPORAL_CB_SLOT, 1, &temporal_cb);
+            const uint32_t previous = gd->gtao_history_index, next = previous ^ 1u;
+            dispatch(cs_temporal, {gd->srv_gtao_working[0].get(), gd->srv_gtao_history[previous].get(), gd->mv_srv.get(), depth}, {gd->uav_gtao_working[1].get(), gd->uav_gtao_history[next].get()}, (work_w + 7) / 8, (work_h + 7) / 8);
+            gd->gtao_history_index = next;
+            gd->gtao_history_frame = cb_luma_global_settings.FrameIndex;
+            denoise_source = 1;
+         }
       }
+      // First denoiser, two horizontal pixels per thread, into the other working target; the final one into "tex_gtao_final"
+      dispatch(cs_denoise_1, {gd->srv_gtao_working[denoise_source].get()}, {gd->uav_gtao_working[denoise_source ^ 1].get()}, (work_w + 15) / 16, (work_h + 7) / 8);
+      denoise_source ^= 1;
+      dispatch(full_res ? cs_gtvbao_denoise_2 : cs_denoise_2, {gd->srv_gtao_working[denoise_source].get()}, {gd->uav_gtao_final.get()}, (work_w + 15) / 16, (work_h + 7) / 8);
 
 #if DEVELOPMENT
-      QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", gd->uav_gtao_final.get());
+      QueueInjectedPassTrace(native_device_context, full_res ? "Luma GT-VBAO" : "Luma XeGTAO", gd->uav_gtao_final.get());
 #endif
       compute_state.Restore(native_device_context);
+
+      if (full_res)
+      {
+         // The pack reads it in place of the game's target (see "AO_PACK"), scaled onto the scene's UVs like the whole target's
+         gd->gtao_full_res_this_frame = true;
+         gd->ao_uv_scale = {1.f / area_scale.x, 1.f / area_scale.y};
+         return DrawOrDispatchOverrideType::Replaced;
+      }
 
       // The destination is still bound as the draw's render target, and copying into an OM-bound resource is a
       // D3D11 hazard the runtime does not resolve: unbind around the copy, then restore the game's binding.
@@ -2522,16 +2630,19 @@ public:
       RenderArea::Install();
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
-      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"gtao_enable", &g_gtao_enable}, { "hide_ui",
+      Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"gtao_enable", &g_gtao_enable}, {"gtvbao_enable", &g_gtvbao_enable}, { "hide_ui",
                                &g_hide_ui }});
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.1f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f},
-         {"gtao_depth_scale", &g_gtao_depth_scale, 0.01f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+         {"gtao_depth_scale", &g_gtao_depth_scale, 0.01f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}, {"gtao_history_weight", &g_gtao_history_weight, 0.f, 0.98f},
+         {"gtvbao_final_value_power", &g_gtvbao_final_value_power, 0.3f, 4.5f}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input", tex_input),
          MCP_GAME_TEXTURE("smaa.pred_mask", tex_pred),
          MCP_GAME_TEXTURE("smaa.output", tex_smaa_out),
          MCP_GAME_TEXTURE("gtao.depth_mips", tex_gtao_depth_mips),
-         MCP_GAME_TEXTURE("gtao.output", tex_gtao_final)});
+         MCP_GAME_TEXTURE("gtao.output", tex_gtao_final),
+         MCP_GAME_TEXTURE("gtao.history0", tex_gtao_history[0]),
+         MCP_GAME_TEXTURE("gtao.history1", tex_gtao_history[1])});
       Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_untransformed_static", &g_mv_untransformed_static},
          {"sr_reactive_enable", &g_sr_reactive_enable}, { "sr_reactive_debug_view",
             &g_sr_reactive_debug_view }});
@@ -2626,6 +2737,15 @@ public:
          ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 XeGTAO Denoise Pass 2 CS"),
          ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
+      // GT-VBAO: its main pass, its slice count and noise under the AO history, the history, and the final denoiser into its own R8_UNORM target
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 GT-VBAO Main Pass CS"),
+         ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 GT-VBAO Temporal Main Pass CS"),
+         ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs", {{"GTVBAO_SLICE_COUNT", "1.0"}, {"GTVBAO_FAST_NOISE", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 XeGTAO Temporal CS"),
+         ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "temporal_pass_cs"});
+      native_shaders_definitions.emplace(CompileTimeStringHash("TW2 GT-VBAO Denoise Pass 2 CS"),
+         ShaderDefinition{"Luma_TW2_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}, {"TW2_GTAO_OWN_TARGET", "1"}}});
 
       // DLSS/FSR: their depth and the camera motion from the G-buffer's linear depth, the CPU copies of vc4 (dgVoodoo maps it or
       // updates it), and the motion vector target written by every blend state
@@ -2936,6 +3056,17 @@ public:
             native_device_context->PSGetShaderResources(0, 1, game_device_data.srv_scene_depth.put());
          }
 #endif
+         // GT-VBAO's own target in place of the game's at t1 for this draw alone: dgVoodoo skips binds it thinks are still in place,
+         // so the game's is restored right after
+         if (game_device_data.gtao_full_res_this_frame && original_draw_dispatch_func && *original_draw_dispatch_func)
+         {
+            ComPtr<ID3D11ShaderResourceView> game_ao;
+            native_device_context->PSGetShaderResources(1, 1, game_ao.put());
+            native_device_context->PSSetShaderResources(1, 1, game_device_data.srv_gtao_final.get_addressof());
+            (*original_draw_dispatch_func)();
+            native_device_context->PSSetShaderResources(1, 1, game_ao.get_addressof());
+            return DrawOrDispatchOverrideType::Replaced;
+         }
       }
 
       return DrawOrDispatchOverrideType::None;
@@ -2950,6 +3081,7 @@ public:
 #endif
       game_device_data.final_grade_fired_this_frame = false; // re-arm the Hide UI window for the next frame
       game_device_data.ao_uv_scale = {1.f, 1.f};
+      game_device_data.gtao_full_res_this_frame = false;
 
       // DLSS/FSR: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the motion
       // vector state are fixed here for the next frame (see "sr_active")
@@ -3181,6 +3313,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
 #endif
       reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+      reshade::get_config_value(nullptr, NAME, "GTVBAOEnable", g_gtvbao_enable);
       reshade::get_config_value(nullptr, NAME, "RenderScale", g_render_scale);
       g_render_scale = std::clamp(g_render_scale, MIN_RENDER_SCALE, 1.f);
 
@@ -3259,6 +3392,17 @@ public:
 
       ImGui::SeparatorText("Ambient Occlusion");
       DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's video settings).");
+      DrawSettingCheckbox("GT-VBAO Enable", "GTVBAOEnable", &g_gtvbao_enable, false, "Replaces XeGTAO's occlusion with GT-VBAO at full resolution (less dark halo around thin objects, finer contact shadows). Needs XeGTAO Enable.", !g_gtao_enable, false);
+#if DEVELOPMENT
+      ImGui::BeginDisabled(!g_gtao_enable || !g_gtvbao_enable);
+      ImGui::SliderFloat("GT-VBAO Final Value Power", &g_gtvbao_final_value_power, 0.3f, 4.5f, "%.2f");
+      ImGui::SliderFloat("GT-VBAO History Weight", &g_gtao_history_weight, 0.f, 0.98f, "%.2f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("The AO history's blend under DLSS/FSR (0 = off).");
+      }
+      ImGui::EndDisabled();
+#endif
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
       ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.3f, 4.5f, "%.2f");
@@ -3421,6 +3565,7 @@ public:
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
+                  "\nGT-VBAO (Mirko Salm)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)"
                   "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");

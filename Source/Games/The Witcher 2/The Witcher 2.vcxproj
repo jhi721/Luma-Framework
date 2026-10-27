@@ -69,6 +69,7 @@
     <UseLumaSRBridge>true</UseLumaSRBridge>
     <UseDgVoodoo>true</UseDgVoodoo>
     <UseDgVoodooLinux>true</UseDgVoodooLinux>
+    <UseLumaFastNoise>true</UseLumaFastNoise>
   </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>

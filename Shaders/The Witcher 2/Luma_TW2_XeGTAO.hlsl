@@ -48,8 +48,11 @@ cbuffer LumaGTAO : register(b9)
 #define XE_GTAO_GENERATE_NORMALS 1 // TW2: no normal buffer captured at this point of the frame; derive from depth (a real normal source exists later in the frame — see 0x53AB3429 — but not here)
 #endif
 
+// The game's own HBAO radius, live: cb4[11] = (R, R^2, 1/R, H/W) in view units (meters), set per environment (3 m at the Flotsam gate
+// and in its tavern, 1.18 m where the first probe was taken). XeGTAO multiplies EFFECT_RADIUS by RADIUS_MULTIPLIER, so it is divided
+// out. The native kernel cap below still bounds it in pixels. RadiusOverrideRT > 0 wins.
 #ifndef EFFECT_RADIUS
-#define EFFECT_RADIUS 0.81 // anchored to the game's own HBAO radius: probed cb4[11] = (R, R^2) = (1.1835, 1.4008) view units (meters — depth p50 ~7.3); 0.81 * RADIUS_MULTIPLIER 1.457 = 1.18 matches native R. RadiusOverrideRT > 0 wins.
+#define EFFECT_RADIUS (cb4[11].x / RADIUS_MULTIPLIER)
 #endif
 
 #ifndef EFFECT_FALLOFF_RANGE
@@ -62,9 +65,9 @@ cbuffer LumaGTAO : register(b9)
 
 //
 
-// Capped at the native HBAO kernel, cb4[16].y pixels of the full size AO target: when XeGTAO works on the scene's share alone (work_share
-// < 1, see GameCBuffers.hlsl), its fewer pixels each cover more of the view and would let the radius grow by 1 / work_share (larger halos
-// at 50%). 1 on the whole target.
+// Capped at the native HBAO kernel, cb4[16].y pixels of the full size AO target, converted to working pixels by work_share (see
+// GameCBuffers.hlsl): < 1 on the scene's share alone, whose fewer pixels each cover more of the view (the radius would grow by
+// 1 / work_share, larger halos at 50%); 2 for GT-VBAO at native, one pixel per scene pixel; 1 on the whole target.
 #define NATIVE_KERNEL_PIXELS                        (cb4[16].y * gtao_knobs.work_share.x)
 #define XE_GTAO_MAIN_PASS_EFFECT_RADIUS(viewspaceZ) min(XeGTAO_EffectRadius(), NATIVE_KERNEL_PIXELS * viewspaceZ * NDC_TO_VIEW_MUL_X_PIXEL_SIZE.x)
 
@@ -88,14 +91,111 @@ float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
    return max(0.0, screenDepth) / max(1e-3, DepthScaleRT);
 }
 
-// Plain float4 (not unorm): the copy-source texture matches the game AO RT's ACTUAL format, which is
-// rgba16_float whenever Luma's swapchain-aspect r8g8b8a8 upgrade catches it (and unorm8 otherwise) —
-// float4 UAV writes are valid against both.
+#if TW2_GTAO_OWN_TARGET
+// GT-VBAO's own R8_UNORM target, one AO pixel per scene pixel, which the pack reads in place of the game's (main.cpp, "RunXeGTAO")
+#define XE_GTAO_FINAL_OUTPUT_TYPE unorm float
+#define XE_GTAO_ENCODE_FINAL(v)   (v)
+#else
+// Plain float4 (not unorm): the copy-source texture matches the game AO RT's ACTUAL format, unorm8 (or rgba16_float should an
+// upgrade ever catch it) — float4 UAV writes are valid against both.
 #define XE_GTAO_FINAL_OUTPUT_TYPE float4
 // Vanilla generator writes (AO, viewZ, 0, 0); the downstream pack pass 0x953119B5 reads only .x from
 // this target (it re-reads depth from the depth texture), so .yzw can stay 0.
-#define XE_GTAO_ENCODE_FINAL(v) float4(v, 0.0, 0.0, 0.0)
+#define XE_GTAO_ENCODE_FINAL(v)   float4(v, 0.0, 0.0, 0.0)
+#endif
 
-// tex0 = the hooked HBAO draw's t0, the game's half-res r32_float linear view-space depth (below native render scale the G-buffer's
-// full size linear depth instead, see the header)
-#include "../Includes/XeGTAO.hlsl"
+// GT-VBAO's main pass ("gtvbao_main_pass_cs", "GT-VBAO Enable") on top of XeGTAO's prefilter and denoise, from the G-buffer's full
+// size linear depth over the rendered area, one AO pixel per scene pixel (main.cpp, "RunXeGTAO"). MELE's settings: 2 slices, 1 under
+// the AO history ("temporal_pass_cs", main.cpp defines it) with Core's FAST noise, 8 steps; but a 0.4 radius back face, not MELE's 0.2:
+// against the native HBAO, 0.2 left the darkest 1% at 0.46x (XeGTAO 0.57x), 0.4 gives 0.53x with the power at 1.6 (main.cpp,
+// "g_gtvbao_final_value_power"), the same midtones as XeGTAO at 2.2.
+#ifndef GTVBAO_SLICE_COUNT
+#define GTVBAO_SLICE_COUNT 2.0
+#endif
+#ifndef GTVBAO_STEP_COUNT
+#define GTVBAO_STEP_COUNT 8.0
+#endif
+#define GTVBAO_THICKNESS(effectRadius) (0.4 * (effectRadius))
+// Core's "FAST Noise" (Shaders/Global/Textures/FAST: 64 layers of 128x128 RGBA, filter adapted spatio-temporal noise), a layer per frame
+#if GTVBAO_FAST_NOISE
+Texture2DArray<float4> fast_noise : register(t4);
+#define GTVBAO_NOISE(pixCoord) fast_noise.Load(int4((pixCoord) & 127u, uint(NoiseIndexRT) & 63u, 0)).xyz
+#endif
+
+// tex0 = the hooked HBAO draw's t0, the game's half-res r32_float linear view-space depth (below native render scale, and for GT-VBAO,
+// the G-buffer's full size linear depth instead, see the header)
+#include "../Includes/GTVBAO.hlsl"
+#include "../Includes/MotionVectorFill.hlsl"
+
+// The AO history ("temporal_pass_cs", MELE's), between the main pass and the denoise under DLSS/FSR (main.cpp, "RunXeGTAO"): the
+// previous frame's AO is reprojected with the upscaler's motion vectors (the camera's motion for the pixels no patched draw wrote: the
+// fill runs at the scene's end, after this), each bilinear tap rejected off the view depth the previous frame should see there, the
+// result clamped to this frame's 3x3 range (motion vectors miss an AO a moving occluder casts on a still surface), then blended.
+cbuffer LumaGTAOTemporal : register(b10)
+{
+   CB::GTAOTemporal gtao_temporal;
+}
+
+static const float kTW2_HistoryDepthTolerance = 0.03; // Relative view Z mismatch rejecting a history tap
+
+Texture2D<float2> history : register(t1);         // The previous frame's (AO, view Z)
+Texture2D<float2> motion_vectors : register(t2);  // Previous minus current, UV of the scene viewport, unjittered
+Texture2D<float> scene_view_depth : register(t3); // tex0 of the prefilter: the linear view depth
+RWTexture2D<float2> history_output : register(u1);
+
+[numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void temporal_pass_cs(uint2 dtid : SV_DispatchThreadID) {
+   // tex0 = the main pass's AO term (.x) and packed edges (.y); ao_term_and_edges = the same for the denoise
+   const uint2 size = uint2(round(1.0 / ViewportPixelSizeRT));
+   if (any(dtid >= size))
+      return;
+   const float2 current = tex0.Load(int3(dtid, 0)).xy;
+   const float view_z = scene_view_depth.Load(int3(XE_GTAO_DEPTH_LOAD_COORD(dtid), 0));
+   // As the motion vector fill: the cleared sky has no depth and goes to the far plane
+   const float device_depth = (view_z > 0.0 ? saturate(gtao_temporal.depth_from_view.x + gtao_temporal.depth_from_view.y / view_z) : 1.0);
+
+   // Fed (NDC, depth, 1), the clip space w of the reprojection is the previous view Z over the current one
+   const float4 current_clip = float4((dtid + 0.5) * ViewportPixelSizeRT * float2(2.0, -2.0) + float2(-1.0, 1.0) - gtao_temporal.jitter_ndc, device_depth, 1.0);
+   const float4 previous_clip = mul(gtao_temporal.reprojection, current_clip);
+   const float expected_z = view_z * previous_clip.w;
+   float2 motion = motion_vectors.Load(int3(XE_GTAO_DEPTH_LOAD_COORD(dtid), 0));
+   if (!(motion.x < MOTION_VECTOR_MARKER))
+   {
+      motion = CameraMotion(dtid, size, gtao_temporal.reprojection, gtao_temporal.jitter_ndc, device_depth);
+   }
+
+   const float2 previous_pixel = (dtid + 0.5) + motion * size - 0.5;
+   const int2 base = int2(floor(previous_pixel));
+   const float2 f = previous_pixel - base;
+   float history_ao = 0.0;
+   float weight_sum = 0.0;
+   [unroll] for (uint i = 0; i < 4; i++)
+   {
+      const int2 tap = base + int2(i & 1, i >> 1);
+      const float2 bilinear = float2(((i & 1) ? f.x : (1.0 - f.x)), ((i >> 1) ? f.y : (1.0 - f.y)));
+      const float2 previous = history.Load(int3(tap, 0));
+      const bool inside = all(tap >= 0) && all(tap < int2(size));
+      const float weight = ((inside && abs(previous.y - expected_z) <= kTW2_HistoryDepthTolerance * expected_z) ? (bilinear.x * bilinear.y) : 0.0);
+      history_ao += previous.x * weight;
+      weight_sum += weight;
+   }
+
+   float ao = current.x;
+   if (weight_sum > 0.25)
+   {
+      float neighborhood_min = current.x, neighborhood_max = current.x;
+      [unroll] for (int y = -1; y <= 1; y++)
+      {
+         [unroll] for (int x = -1; x <= 1; x++)
+         {
+            if (x == 0 && y == 0)
+               continue;
+            const float neighbor = tex0.Load(int3(clamp(int2(dtid) + int2(x, y), 0, int2(size) - 1), 0)).x;
+            neighborhood_min = min(neighborhood_min, neighbor);
+            neighborhood_max = max(neighborhood_max, neighbor);
+         }
+      }
+      ao = lerp(current.x, clamp(history_ao / weight_sum, neighborhood_min, neighborhood_max), gtao_temporal.history_weight);
+   }
+   ao_term_and_edges[dtid] = float2(ao, current.y);
+   history_output[dtid] = float2(ao, view_z);
+}

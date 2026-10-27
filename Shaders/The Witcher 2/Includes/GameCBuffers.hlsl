@@ -55,15 +55,25 @@ struct GTAOKnobs
    float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
    float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl)
    float2 viewport_pixel_size; // 1 / XeGTAO's working size
-   float2 work_share;          // The share of the AO target XeGTAO works on: the scene's under the render scale without the full size depth, else 1
+   float2 work_share;          // Working pixels per AO target pixel: the scene's share under the render scale without the full size depth, 2 for GT-VBAO at native (one per scene pixel), else 1
    float noise_index;          // XeGTAO's temporal noise: frame % 64 while DLSS/FSR accumulates the AO, else 0
    float2 depth_load_scale;    // Depth pixels per working pixel: the render size over the AO target's with the full size depth, else 1
    float padding;
 };
+
+// The AO history's constants (Luma_TW2_XeGTAO.hlsl "temporal_pass_cs", b10), written by "RunXeGTAO"
+struct GTAOTemporal
+{
+   row_major float4x4 reprojection; // As MotionVectorFillConstants'
+   float2 jitter_ndc;
+   float2 depth_from_view;
+   float history_weight; // 0 restarts the history
+   float3 padding;
+};
 } // namespace CB
 
 #ifdef __cplusplus
-static_assert(sizeof(CB::MotionVectorFillConstants) == 112 && sizeof(CB::GTAOKnobs) == 48); // The HLSL cbuffers' sizes
+static_assert(sizeof(CB::MotionVectorFillConstants) == 112 && sizeof(CB::GTAOKnobs) == 48 && sizeof(CB::GTAOTemporal) == 96); // The HLSL cbuffers' sizes
 #endif
 
 #endif // LUMA_GAME_CB_STRUCTS
