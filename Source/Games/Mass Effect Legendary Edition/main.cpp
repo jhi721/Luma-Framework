@@ -673,6 +673,188 @@ enum MotionVectorReject : int
 };
 static constexpr const char* kMotionVectorRejectNames[REJECT_COUNT] = {"extra_target", "no_scene", "other_depth_color", "format", "size", "create", "blend", "depth_test", "shaders"};
 
+#if DEVELOPMENT
+static bool g_input_layout_cache = true; // A/B of "InputLayoutCache" (off: every call reaches D3D again)
+#else
+static constexpr bool g_input_layout_cache = true;
+#endif
+
+// UE3 creates its input layouts again every frame: vanilla ME3 spent 43% of its render thread in CreateInputLayout (WPR, 4K, a CPU bound
+// spot), mostly D3D11 verifying the vertex shader's DXBC hash (DXVK doesn't, which fits the CPU bound gains reported with it). A layout made
+// before by the same device for the same elements and shader bytecode is handed back instead (D3D11 lets one layout serve every shader of an
+// identical input signature). Hooked in ReShade's proxy device, above ReShade: its create/init events and destruction callback run once per
+// layout, as do Luma's. The proxy is the pointer ReShade stores in the native device's private data ("D3D11Device", d3d11_device.cpp).
+namespace InputLayoutCache
+{
+   constexpr GUID kReShadeDeviceProxy = {0x72299288, 0x2C68, 0x4AD8, {0x94, 0x5D, 0x2B, 0xFB, 0x5A, 0xA9, 0xC6, 0x09}}; // ReShade's "D3D11Device"
+   constexpr size_t kCreateInputLayoutSlot = 11;                                                                        // ID3D11Device's vtable: IUnknown (3), CreateBuffer, CreateTexture1D/2D/3D, 4 view creations
+   constexpr size_t kMaxEntries = 4096;                                                                                 // A game making endless distinct layouts falls back to D3D
+
+   using CreateInputLayoutFunc = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_INPUT_ELEMENT_DESC*, UINT, const void*, SIZE_T, ID3D11InputLayout**);
+
+   struct Entry
+   {
+      ID3D11Device* device = nullptr;
+      std::array<uint8_t, 16> checksum = {};          // The bytecode's DXBC checksum
+      std::vector<D3D11_INPUT_ELEMENT_DESC> elements; // Without "SemanticName" (in "names")
+      std::vector<std::string> names;
+      com_ptr<ID3D11InputLayout> layout;
+   };
+
+   std::shared_mutex mutex;
+   std::unordered_multimap<uint64_t, Entry> entries;
+   CreateInputLayoutFunc original = nullptr;
+   void** patched_slot = nullptr;
+   // The proxy of each native device: at its destruction the proxy is already going (ReShade raises "destroy_device" from its destructor),
+   // so it is never called then
+   std::unordered_map<ID3D11Device*, ID3D11Device*> proxies;
+
+   bool Matches(const Entry& entry, ID3D11Device* device, const uint8_t* checksum, const D3D11_INPUT_ELEMENT_DESC* elements, UINT count)
+   {
+      if (entry.device != device || entry.elements.size() != count || std::memcmp(entry.checksum.data(), checksum, entry.checksum.size()) != 0)
+         return false;
+      for (UINT i = 0; i < count; i++)
+      {
+         const D3D11_INPUT_ELEMENT_DESC& a = entry.elements[i];
+         const D3D11_INPUT_ELEMENT_DESC& b = elements[i];
+         if (a.SemanticIndex != b.SemanticIndex || a.Format != b.Format || a.InputSlot != b.InputSlot || a.AlignedByteOffset != b.AlignedByteOffset || a.InputSlotClass != b.InputSlotClass ||
+             a.InstanceDataStepRate != b.InstanceDataStepRate || entry.names[i] != (b.SemanticName ? b.SemanticName : ""))
+            return false;
+      }
+      return true;
+   }
+
+   HRESULT STDMETHODCALLTYPE CreateInputLayout(ID3D11Device* device, const D3D11_INPUT_ELEMENT_DESC* elements, UINT count, const void* bytecode, SIZE_T bytecode_size, ID3D11InputLayout** layout)
+   {
+      // Validation only calls (no output) and anything but a DXBC container go through
+      if (!g_input_layout_cache || !layout || (!elements && count != 0) || !bytecode || bytecode_size < 20 || std::memcmp(bytecode, "DXBC", 4) != 0)
+         return original(device, elements, count, bytecode, bytecode_size, layout);
+      const uint8_t* const checksum = static_cast<const uint8_t*>(bytecode) + 4;
+      uint64_t key = 14695981039346656037ull; // FNV-1a
+      const auto mix = [&key](const void* bytes, size_t size)
+      {
+         for (size_t i = 0; i < size; i++)
+         {
+            key = (key ^ static_cast<const uint8_t*>(bytes)[i]) * 1099511628211ull;
+         }
+      };
+      mix(&device, sizeof(device));
+      mix(checksum, 16);
+      for (UINT i = 0; i < count; i++)
+      {
+         if (elements[i].SemanticName)
+         {
+            mix(elements[i].SemanticName, std::strlen(elements[i].SemanticName));
+         }
+         mix(&elements[i].SemanticIndex, sizeof(D3D11_INPUT_ELEMENT_DESC) - offsetof(D3D11_INPUT_ELEMENT_DESC, SemanticIndex));
+      }
+      {
+         const std::shared_lock lock(mutex);
+         const auto [first, last] = entries.equal_range(key);
+         for (auto it = first; it != last; ++it)
+         {
+            if (Matches(it->second, device, checksum, elements, count))
+            {
+               it->second.layout->AddRef();
+               *layout = it->second.layout.get();
+               return S_OK;
+            }
+         }
+      }
+      const HRESULT hr = original(device, elements, count, bytecode, bytecode_size, layout);
+      if (FAILED(hr) || !*layout)
+         return hr;
+      Entry entry = {.device = device, .elements = std::vector<D3D11_INPUT_ELEMENT_DESC>(elements, elements + count), .layout = *layout};
+      std::memcpy(entry.checksum.data(), checksum, entry.checksum.size());
+      for (D3D11_INPUT_ELEMENT_DESC& element : entry.elements)
+      {
+         entry.names.emplace_back(element.SemanticName ? element.SemanticName : "");
+         element.SemanticName = nullptr;
+      }
+      const std::unique_lock lock(mutex);
+      if (entries.size() < kMaxEntries)
+      {
+         entries.emplace(key, std::move(entry));
+      }
+      return hr;
+   }
+
+   // Patches ReShade's proxy vtable (shared by its proxy devices, the cache is per device), once
+   void Install(ID3D11Device* native_device)
+   {
+      void* proxy_object = nullptr;
+      UINT size = sizeof(proxy_object);
+      if (FAILED(native_device->GetPrivateData(kReShadeDeviceProxy, &size, &proxy_object)) || !proxy_object)
+         return;
+      // Its first base is ReShade's DXGI device proxy, an IUnknown whose QueryInterface is the D3D11 proxy's
+      com_ptr<ID3D11Device> proxy_device;
+      if (FAILED(static_cast<IUnknown*>(proxy_object)->QueryInterface(&proxy_device)) || proxy_device.get() == native_device) // Video devices get the native one
+         return;
+      const std::unique_lock lock(mutex);
+      proxies[native_device] = proxy_device.get();
+      if (patched_slot)
+         return;
+      void** const slot = *reinterpret_cast<void***>(proxy_device.get()) + kCreateInputLayoutSlot;
+      // Only ReShade's own vtable and function (in one module): another layer may have swapped the object's vtable for a copy
+      const auto module_name = [](const void* address)
+      {
+         HMODULE module = nullptr;
+         wchar_t name[MAX_PATH] = {};
+         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(address), &module) || !GetModuleFileNameW(module, name, MAX_PATH))
+            return std::filesystem::path();
+         return std::filesystem::path(name).filename();
+      };
+      const std::filesystem::path slot_module = module_name(slot);
+      const std::filesystem::path function_module = module_name(*slot);
+      if (slot_module.empty() || function_module.empty() || slot_module != function_module)
+         return;
+      DWORD protection = 0;
+      if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &protection))
+         return;
+      original = reinterpret_cast<CreateInputLayoutFunc>(*slot);
+      *slot = reinterpret_cast<void*>(&CreateInputLayout);
+      VirtualProtect(slot, sizeof(void*), protection, &protection);
+      patched_slot = slot;
+      reshade::log::message(reshade::log::level::info, std::format("[InputLayoutCache] Installed in '{}'", slot_module.string()).c_str());
+   }
+
+   // Releases the device's layouts, and unpatches with the last device
+   void Uninstall(ID3D11Device* native_device)
+   {
+      std::unordered_multimap<uint64_t, Entry> released;
+      {
+         const std::unique_lock lock(mutex);
+         const auto proxy = proxies.find(native_device);
+         if (proxy == proxies.end())
+            return;
+         const ID3D11Device* const proxy_device = proxy->second;
+         proxies.erase(proxy);
+         for (auto it = entries.begin(); it != entries.end();)
+         {
+            if (it->second.device == proxy_device)
+            {
+               released.insert(entries.extract(it++));
+            }
+            else
+            {
+               ++it;
+            }
+         }
+         if (proxies.empty() && patched_slot)
+         {
+            DWORD protection = 0;
+            if (VirtualProtect(patched_slot, sizeof(void*), PAGE_READWRITE, &protection))
+            {
+               *patched_slot = reinterpret_cast<void*>(original);
+               VirtualProtect(patched_slot, sizeof(void*), protection, &protection);
+               patched_slot = nullptr;
+            }
+         }
+      }
+      // "released" goes outside the lock: a layout's last release runs ReShade's destruction callback
+   }
+} // namespace InputLayoutCache
+
 // Per-device resources and per-frame state. SMAA detects edges on a gamma snapshot and blends it filtered in linear light.
 struct MassEffectGameDeviceData final : public GameDeviceData
 {
@@ -2403,7 +2585,7 @@ public:
       Mcp::RegisterToggles({{"post_at_output_size", &EngineScale::g_post_at_output_size}, {"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter},
          {"mv_disable_jitter", &g_mv_disable_jitter}, {"mv_skip_fill", &g_mv_skip_fill}, {"mv_dump", &g_mv_dump}, {"mv_probe", &g_mv_probe}, {"mv_buffer_filter", &g_mv_buffer_filter},
          {"mv_constants_pool", &g_mv_constants_pool}, {"mv_read_sizes", &g_mv_read_sizes}, {"smaa_enable", &g_smaa_enable}, {"bloom_enable", &g_bloom_enable}, {"gtao_enable", &g_gtao_enable},
-         {"gtvbao_enable", &g_gtvbao_enable}, {"hide_ui", &g_hide_ui}, { "perf_hook_timers",
+         {"gtvbao_enable", &g_gtvbao_enable}, {"hide_ui", &g_hide_ui}, {"input_layout_cache", &g_input_layout_cache}, { "perf_hook_timers",
             &Perf::g_hook_timers }});
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       Mcp::RegisterValues({{"render_scale", &EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, 1.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f},
@@ -2564,8 +2746,17 @@ public:
       return program_body;
    }
 
+   void OnInitDevice(ID3D11Device* native_device, DeviceData& device_data) override
+   {
+      InputLayoutCache::Install(native_device);
+   }
+
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
+      if (device_data.native_device)
+      {
+         InputLayoutCache::Uninstall(device_data.native_device);
+      }
 #if DEVELOPMENT
       Mcp::Unregister(&device_data);
 #endif
