@@ -197,8 +197,11 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::shared_mutex smaa_depth_mutex;
    com_ptr<ID3D11ShaderResourceView> smaa_depth_srv;
 
-   // SMAA ran after this frame's composite, or DLSS/FSR before its post: skip the vanilla FXAA
+   // SMAA ran after this frame's composite, or DLSS/FSR before its post: skip the vanilla FXAA. Reset by FXAA, which the game skips
+   // below render scale 1, so it can stay set: the composite decides on "sr_antialiased" instead.
    std::atomic<bool> scene_antialiased = false;
+   // DLSS/FSR ran on the scene: set at its split, taken by the next composite
+   std::atomic<bool> sr_antialiased = false;
    // A 3D layer outside the scene was drawn (main menu, pause screen), composed by the UI after SMAA: FXAA still runs
    std::atomic<bool> layer_drawn = false;
 
@@ -2706,7 +2709,7 @@ public:
 #endif
             game_device_data.sr_split = std::move(split);
             game_device_data.sr_split_context = reinterpret_cast<uint64_t>(native_device_context);
-            game_device_data.scene_antialiased = true;
+            game_device_data.sr_antialiased = true;
          }
          // Not split: the scene runs without the upscaler (and without the jitter, see "sr_drew"). Each reason is logged once, as it's
          // the only trace of a setup (resolution, display mode) the upscaling doesn't expect.
@@ -2756,6 +2759,11 @@ public:
       if (original_shader_hashes.Contains(composite_hash, reshade::api::shader_stage::pixel))
       {
          device_data.has_drawn_main_post_processing = true;
+         const bool sr_antialiased = game_device_data.sr_antialiased.exchange(false);
+         if (sr_antialiased)
+         {
+            game_device_data.scene_antialiased = true;
+         }
          // Here rather than at present, as the post process (the scratch's only user) records on a deferred context
          {
             const std::unique_lock lock_smaa(game_device_data.smaa_mutex);
@@ -2892,9 +2900,9 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
          }
          // SMAA not with DLSS/FSR (not even on composites they skip, like the pause screen's), RCAS after either
-         if (cb_luma_global_settings.GameSettings.SMAAEnable > 0.5f && !IsSRActive(device_data) && !game_device_data.scene_antialiased)
+         if (cb_luma_global_settings.GameSettings.SMAAEnable > 0.5f && !IsSRActive(device_data) && !sr_antialiased)
             return DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, true);
-         if (game_device_data.scene_antialiased && cb_luma_global_settings.GameSettings.RCASSharpness > 0.f)
+         if (sr_antialiased && cb_luma_global_settings.GameSettings.RCASSharpness > 0.f)
             return DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, false);
          return DrawOrDispatchOverrideType::None;
       }
