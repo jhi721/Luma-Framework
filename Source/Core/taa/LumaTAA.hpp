@@ -6,7 +6,7 @@
 #if ENABLE_LUMA_TAA
 namespace LumaTAA
 {
-   // "TAA_QUALITY" of the resolve: 0 Low, 1 Medium (adds the flickering analysis and a depth clip against the previous frame's depth),
+   // "TAA_QUALITY" of the resolve: 0 Low, 1 Medium (adds the shading change and a depth clip against the previous frame's depth),
    // 2 High (adds the 2x history), 3 Ultra (adds a depth clip with a previous depth reconstruction pass). Core's UI sets it (saved as
    // "LumaTAAQuality"); "UpdateSettings()" applies it.
    inline std::atomic<int> quality = 2;
@@ -15,8 +15,10 @@ namespace LumaTAA
    // "TAA_UPSCALE" (one thread per output pixel; the history and the per pixel states at the output resolution, so High equals Medium)
    constexpr uint32_t upscale_shader_hashes[] = {Math::CompileTimeStringHash("Luma TAA Low Upscale CS"), Math::CompileTimeStringHash("Luma TAA Medium Upscale CS"), Math::CompileTimeStringHash("Luma TAA High Upscale CS"), Math::CompileTimeStringHash("Luma TAA Ultra Upscale CS")};
    constexpr uint32_t reconstruct_depth_shader_hash = Math::CompileTimeStringHash("Luma TAA Reconstruct Depth CS");
-   // From Medium quality the resolve runs the flickering analysis ("TAA_FLICKER"), with its state texture pair
-   constexpr int flicker_quality = 1;
+   constexpr uint32_t shading_change_shader_hash = Math::CompileTimeStringHash("Luma TAA Shading Change CS");
+   // From Medium quality the resolve reads the shading change ("TAA_SHADING_CHANGE") that a pass at the render resolution writes
+   // first. The flickering analysis ("TAA_FLICKER") is off at every level, so its state textures aren't created or bound.
+   constexpr int medium_quality = 1;
    constexpr int ultra_quality = 3;
    // Halton(2, 3) phases: the history converges over ~25 frames, so 16 well spread sample positions get averaged; upscaling takes
    // more (FSR's 8 x scale^2), so every output pixel gets a sample within a cycle
@@ -37,8 +39,10 @@ namespace LumaTAA
       float padding;
       float output_resolution[2]; // "TAA_UPSCALE"
       float inv_output_resolution[2];
+      float previous_jitter[2]; // The previous frame's "jitter"
+      float padding2[2];
    };
-   static_assert(sizeof(CBData) == 64);
+   static_assert(sizeof(CBData) == 80);
    constexpr uint32_t flag_reset = 1u << 0;
    constexpr uint32_t flag_inverted_depth = 1u << 1;
    constexpr uint32_t flag_reactive_mask = 1u << 2;
@@ -61,16 +65,19 @@ namespace LumaTAA
       com_ptr<ID3D11Texture2D> reconstructed_depth; // Ultra only, R32_UINT
       com_ptr<ID3D11ShaderResourceView> reconstructed_depth_srv;
       com_ptr<ID3D11UnorderedAccessView> reconstructed_depth_uav;
-      // Thin feature lock frames left, or a moving pixel's speed for the flickering analysis (R8_UINT; R32_UINT from Medium, whose second
-      // byte holds the flickering analysis' darkest luminance average and high 16 bits the depth clip's farthest depth), alternating with
-      // the history
+      // Thin feature lock frames left, or a moving pixel's speed (R8_UINT; R32_UINT from Medium, whose high 16 bits hold the depth
+      // clip's farthest depth), alternating with the history
       com_ptr<ID3D11Texture2D> locks[2];
       com_ptr<ID3D11ShaderResourceView> lock_srvs[2];
       com_ptr<ID3D11UnorderedAccessView> lock_uavs[2];
-      // Flickering analysis state from Medium (R11G11B10_FLOAT at the output resolution), alternating with the history; cleared to 0 = no state
-      com_ptr<ID3D11Texture2D> flicker[2];
-      com_ptr<ID3D11ShaderResourceView> flicker_srvs[2];
-      com_ptr<ID3D11UnorderedAccessView> flicker_uavs[2];
+      // Shading change from Medium: the input luminance (R16_FLOAT at the render resolution, alternating with the history), and the
+      // 2x2, 4x4 and 8x8 block means of the differences (R16G16_FLOAT, mips 0-2, a 4x4 texel mip 0 block per 8x8 dispatch group)
+      com_ptr<ID3D11Texture2D> luminance[2];
+      com_ptr<ID3D11ShaderResourceView> luminance_srvs[2];
+      com_ptr<ID3D11UnorderedAccessView> luminance_uavs[2];
+      com_ptr<ID3D11Texture2D> shading_change;
+      com_ptr<ID3D11ShaderResourceView> shading_change_srv;
+      com_ptr<ID3D11UnorderedAccessView> shading_change_uavs[3];
       com_ptr<ID3D11Buffer> cbuffer;
       // The quality level the resources were created for, latched by "UpdateSettings()" so "Draw()" never runs a resolve on resources
       // of another level
@@ -79,6 +86,7 @@ namespace LumaTAA
       // Per frame state ("Draw()" takes const data). The input views are kept while the same resources come back.
       mutable uint32_t history_index = 0;
       mutable bool history_valid = false;
+      mutable float previous_jitter[2] = {};
       mutable com_ptr<ID3D11ShaderResourceView> source_color_srv;
       mutable com_ptr<ID3D11ShaderResourceView> depth_srv;
       mutable com_ptr<ID3D11ShaderResourceView> motion_vectors_srv;
@@ -133,9 +141,15 @@ namespace LumaTAA
             taa_data->locks[i].reset();
             taa_data->lock_srvs[i].reset();
             taa_data->lock_uavs[i].reset();
-            taa_data->flicker[i].reset();
-            taa_data->flicker_srvs[i].reset();
-            taa_data->flicker_uavs[i].reset();
+            taa_data->luminance[i].reset();
+            taa_data->luminance_srvs[i].reset();
+            taa_data->luminance_uavs[i].reset();
+         }
+         taa_data->shading_change.reset();
+         taa_data->shading_change_srv.reset();
+         for (auto& uav : taa_data->shading_change_uavs)
+         {
+            uav.reset();
          }
          taa_data->reconstructed_depth.reset();
          taa_data->reconstructed_depth_srv.reset();
@@ -161,8 +175,7 @@ namespace LumaTAA
          if (settings_data == taa_data->settings_data && level == taa_data->level && taa_data->history[0] && taa_data->cbuffer)
             return true;
 
-         // Each level has its own set of resources, and the lock and flickering analysis states of another level aren't valid here (Low
-         // doesn't write the latter): start over
+         // Each level has its own set of resources, and the lock state of another level isn't valid here: start over
          ReleaseResources(taa_data);
          com_ptr<ID3D11Device> device;
          command_list->GetDevice(&device);
@@ -171,8 +184,7 @@ namespace LumaTAA
          const UINT history_scale = (level >= history_2x_quality && !IsUpscaling(settings_data) ? 2 : 1);
          const CD3D11_TEXTURE2D_DESC history_desc(DXGI_FORMAT_R16G16B16A16_FLOAT, settings_data.output_width * history_scale, settings_data.output_height * history_scale, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          const CD3D11_TEXTURE2D_DESC reconstructed_depth_desc(DXGI_FORMAT_R32_UINT, settings_data.render_width, settings_data.render_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         const CD3D11_TEXTURE2D_DESC flicker_desc(DXGI_FORMAT_R11G11B10_FLOAT, settings_data.output_width, settings_data.output_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         const CD3D11_TEXTURE2D_DESC lock_desc((level >= flicker_quality ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8_UINT), settings_data.output_width, settings_data.output_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+         const CD3D11_TEXTURE2D_DESC lock_desc((level >= medium_quality ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8_UINT), settings_data.output_width, settings_data.output_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          const CD3D11_BUFFER_DESC cbuffer_desc(sizeof(CBData), D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
          bool created = SUCCEEDED(device->CreateBuffer(&cbuffer_desc, nullptr, &taa_data->cbuffer));
          for (int i = 0; i < 2 && created; i++)
@@ -184,14 +196,20 @@ namespace LumaTAA
                const UINT no_lock[4] = {};
                command_list->ClearUnorderedAccessViewUint(taa_data->lock_uavs[i].get(), no_lock);
             }
-            if (created && level >= flicker_quality)
+         }
+         if (created && level >= medium_quality)
+         {
+            const CD3D11_TEXTURE2D_DESC luminance_desc(DXGI_FORMAT_R16_FLOAT, settings_data.render_width, settings_data.render_height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+            for (int i = 0; i < 2 && created; i++)
             {
-               created = SUCCEEDED(device->CreateTexture2D(&flicker_desc, nullptr, &taa_data->flicker[i])) && SUCCEEDED(device->CreateShaderResourceView(taa_data->flicker[i].get(), nullptr, &taa_data->flicker_srvs[i])) && SUCCEEDED(device->CreateUnorderedAccessView(taa_data->flicker[i].get(), nullptr, &taa_data->flicker_uavs[i]));
-               if (created)
-               {
-                  const FLOAT no_state[4] = {};
-                  command_list->ClearUnorderedAccessViewFloat(taa_data->flicker_uavs[i].get(), no_state);
-               }
+               created = SUCCEEDED(device->CreateTexture2D(&luminance_desc, nullptr, &taa_data->luminance[i])) && SUCCEEDED(device->CreateShaderResourceView(taa_data->luminance[i].get(), nullptr, &taa_data->luminance_srvs[i])) && SUCCEEDED(device->CreateUnorderedAccessView(taa_data->luminance[i].get(), nullptr, &taa_data->luminance_uavs[i]));
+            }
+            const CD3D11_TEXTURE2D_DESC shading_change_desc(DXGI_FORMAT_R16G16_FLOAT, (settings_data.render_width + 7) / 8 * 4, (settings_data.render_height + 7) / 8 * 4, 1, UINT(std::size(taa_data->shading_change_uavs)), D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+            created = created && SUCCEEDED(device->CreateTexture2D(&shading_change_desc, nullptr, &taa_data->shading_change)) && SUCCEEDED(device->CreateShaderResourceView(taa_data->shading_change.get(), nullptr, &taa_data->shading_change_srv));
+            for (UINT mip = 0; mip < UINT(std::size(taa_data->shading_change_uavs)) && created; mip++)
+            {
+               const CD3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc(D3D11_UAV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R16G16_FLOAT, mip);
+               created = SUCCEEDED(device->CreateUnorderedAccessView(taa_data->shading_change.get(), &uav_desc, &taa_data->shading_change_uavs[mip]));
             }
          }
          if (created && level >= ultra_quality)
@@ -217,7 +235,7 @@ namespace LumaTAA
          const int level = taa_data->level;
          const auto& shaders = taa_data->device_data->native_compute_shaders;
          const uint32_t* const shader_hashes = (IsUpscaling(taa_data->settings_data) ? upscale_shader_hashes : resolve_shader_hashes);
-         return FindShader(shaders, shader_hashes[level]) && (level < ultra_quality || FindShader(shaders, reconstruct_depth_shader_hash));
+         return FindShader(shaders, shader_hashes[level]) && (level < ultra_quality || FindShader(shaders, reconstruct_depth_shader_hash)) && (level < medium_quality || FindShader(shaders, shading_change_shader_hash));
       }
 
       int GetJitterPhases(const SR::InstanceData* data) const override
@@ -254,6 +272,7 @@ namespace LumaTAA
          const uint32_t* const shader_hashes = (IsUpscaling(taa_data->settings_data) ? upscale_shader_hashes : resolve_shader_hashes);
          ID3D11ComputeShader* const resolve_shader = FindShader(shaders, shader_hashes[level]);
          ID3D11ComputeShader* const reconstruct_depth_shader = (level >= ultra_quality ? FindShader(shaders, reconstruct_depth_shader_hash) : nullptr);
+         ID3D11ComputeShader* const shading_change_shader = (level >= medium_quality ? FindShader(shaders, shading_change_shader_hash) : nullptr);
          const SR::SettingsData& settings_data = taa_data->settings_data;
 
          com_ptr<ID3D11Device> device;
@@ -307,6 +326,8 @@ namespace LumaTAA
             return false;
 
          const bool reset = draw_data.reset || !taa_data->history_valid;
+         // "DrawData" jitter offsets the projection, so the pixel center samples the scene at minus that offset
+         const float jitter[2] = {-draw_data.jitter_x, -draw_data.jitter_y};
          D3D11_MAPPED_SUBRESOURCE mapped;
          if (FAILED(command_list->Map(taa_data->cbuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
             return false;
@@ -319,10 +340,10 @@ namespace LumaTAA
             .depth_near_far = {draw_data.near_plane, draw_data.far_plane},
             .flags = (reset ? flag_reset : 0u) | (settings_data.inverted_depth ? flag_inverted_depth : 0u) |
                      (taa_data->reactive_mask_srv ? flag_reactive_mask : 0u),
-            // "DrawData" jitter offsets the projection, so the pixel center samples the scene at minus that offset
-            .jitter = {-draw_data.jitter_x, -draw_data.jitter_y},
+            .jitter = {jitter[0], jitter[1]},
             .output_resolution = {output_width, output_height},
             .inv_output_resolution = {1.f / output_width, 1.f / output_height},
+            .previous_jitter = {taa_data->previous_jitter[0], taa_data->previous_jitter[1]},
          };
          std::memcpy(mapped.pData, &cb_data, sizeof(cb_data));
          command_list->Unmap(taa_data->cbuffer.get(), 0);
@@ -338,7 +359,7 @@ namespace LumaTAA
          ID3D11SamplerState* const sampler = taa_data->device_data->sampler_state_linear.get();
          command_list->CSSetConstantBuffers(0, 1, &cbuffer);
          command_list->CSSetSamplers(0, 1, &sampler);
-         ID3D11ShaderResourceView* const null_srvs[8] = {};
+         ID3D11ShaderResourceView* const null_srvs[10] = {};
          ID3D11UnorderedAccessView* const null_uavs[5] = {};
          if (reconstruct_depth_shader)
          {
@@ -354,18 +375,30 @@ namespace LumaTAA
             command_list->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
          }
          const uint32_t write_index = taa_data->history_index;
-         ID3D11ShaderResourceView* const srvs[8] = {taa_data->source_color_srv.get(), taa_data->depth_srv.get(), taa_data->motion_vectors_srv.get(), taa_data->history_srvs[write_index ^ 1].get(), taa_data->reconstructed_depth_srv.get(), taa_data->lock_srvs[write_index ^ 1].get(), taa_data->flicker_srvs[write_index ^ 1].get(), taa_data->reactive_mask_srv.get()};
-         ID3D11UnorderedAccessView* const uavs[5] = {taa_data->history_uavs[write_index].get(), taa_data->output_uav.get(), nullptr, taa_data->lock_uavs[write_index].get(), taa_data->flicker_uavs[write_index].get()};
-         command_list->CSSetShaderResources(0, 8, srvs);
-         command_list->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
+         if (shading_change_shader)
+         {
+            ID3D11ShaderResourceView* const srvs[9] = {taa_data->source_color_srv.get(), taa_data->depth_srv.get(), taa_data->motion_vectors_srv.get(), nullptr, nullptr, nullptr, nullptr, nullptr, taa_data->luminance_srvs[write_index ^ 1].get()};
+            ID3D11UnorderedAccessView* const uavs[4] = {taa_data->luminance_uavs[write_index].get(), taa_data->shading_change_uavs[0].get(), taa_data->shading_change_uavs[1].get(), taa_data->shading_change_uavs[2].get()};
+            command_list->CSSetShaderResources(0, 9, srvs);
+            command_list->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+            command_list->CSSetShader(shading_change_shader, nullptr, 0);
+            command_list->Dispatch(render_groups_x, render_groups_y, 1);
+            command_list->CSSetUnorderedAccessViews(0, 4, null_uavs, nullptr);
+         }
+         ID3D11ShaderResourceView* const srvs[10] = {taa_data->source_color_srv.get(), taa_data->depth_srv.get(), taa_data->motion_vectors_srv.get(), taa_data->history_srvs[write_index ^ 1].get(), taa_data->reconstructed_depth_srv.get(), taa_data->lock_srvs[write_index ^ 1].get(), nullptr, taa_data->reactive_mask_srv.get(), nullptr, taa_data->shading_change_srv.get()};
+         ID3D11UnorderedAccessView* const uavs[4] = {taa_data->history_uavs[write_index].get(), taa_data->output_uav.get(), nullptr, taa_data->lock_uavs[write_index].get()};
+         command_list->CSSetShaderResources(0, 10, srvs);
+         command_list->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
          command_list->CSSetShader(resolve_shader, nullptr, 0);
          command_list->Dispatch(resolve_groups_x, resolve_groups_y, 1);
-         command_list->CSSetShaderResources(0, 8, null_srvs);
-         command_list->CSSetUnorderedAccessViews(0, 5, null_uavs, nullptr);
+         command_list->CSSetShaderResources(0, 10, null_srvs);
+         command_list->CSSetUnorderedAccessViews(0, 4, null_uavs, nullptr);
 
          compute_state.Restore(command_list);
          taa_data->history_index = write_index ^ 1;
          taa_data->history_valid = true;
+         taa_data->previous_jitter[0] = jitter[0];
+         taa_data->previous_jitter[1] = jitter[1];
          return true;
       }
    };
