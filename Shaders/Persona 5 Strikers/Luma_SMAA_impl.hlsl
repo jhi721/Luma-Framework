@@ -3,7 +3,8 @@
 // the game then stretches) before the UI, replacing the game's FXAA (which runs after the UI). main.cpp passes the
 // canvas size in LumaData.CustomData1/2.
 // The canvas is linear (1 = UI paper white, HDR above), so edge detection reads a gamma copy (Luma_P5S_SMAAEncode); neighborhood
-// blending reads the linear copy and re-encodes to gamma for Luma_P5S_SMAAFinalize (RCAS), or writes the canvas.
+// blending filters that copy in linear light (no linear copy of the canvas) and re-encodes to gamma for Luma_P5S_SMAAFinalize (RCAS),
+// or writes the canvas.
 // Predication reads the depth edge-ness of Luma_P5S_SMAAPredication; without it main.cpp passes null and scale 1 (plain ULTRA).
 // No SMAAGather: SMAA point-samples the center and its left and top neighbours.
 
@@ -19,8 +20,9 @@
 #define SMAA_PREDICATION_STRENGTH  0.5
 
 // Edge detection: tex0 = colorTexGamma (gamma copy of the canvas), tex1 = predication edge-ness (may be null)
-// Neighborhood blending: tex0 = colorTex (linear copy), tex1 = blendTex. With RCAS, gamma encoded for the finalize pass; without, this
-// writes the canvas, so it applies the finalize pass's dither.
+// Neighborhood blending: tex0 = colorTex (the same gamma copy, decoded per texel), tex1 = blendTex. With RCAS, gamma encoded for the
+// finalize pass; without, this writes the canvas, so it applies the finalize pass's dither.
+#define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR 1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position)              \
    [branch] if (LumaSettings.GameSettings.RCASSharpness > 0.0) \
        color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);     \

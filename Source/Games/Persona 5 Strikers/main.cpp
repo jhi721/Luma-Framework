@@ -169,14 +169,15 @@ namespace
 // Holds the device objects, so they are released with the device.
 struct Persona5StrikersGameDeviceData final : public GameDeviceData
 {
-   // SMAA scratch, recreated on canvas resize: a linear canvas copy (SMAA can't sample the canvas it writes), its gamma encode (edge
-   // detection input; with RCAS also SMAA's output for finalize) and the predication edge-ness. Guarded (with Core's SMAA intermediates):
-   // the main menu records its two composites on two deferred contexts, one of them may release it idle while the other draws.
+   // SMAA scratch, recreated on canvas resize: the canvas's gamma encode (SMAA's input, and RCAS's alone), a scratch only when needed
+   // (the canvas copy for the encode when the canvas has no shader resource view; SMAA's output for finalize with RCAS) and the
+   // predication edge-ness. Guarded (with Core's SMAA intermediates): the main menu records its two composites on two deferred contexts,
+   // one of them may release it idle while the other draws.
    std::shared_mutex smaa_mutex;
-   com_ptr<ID3D11Texture2D> smaa_linear_texture;
-   com_ptr<ID3D11ShaderResourceView> smaa_linear_srv;
+   com_ptr<ID3D11Texture2D> smaa_scratch_texture;
+   com_ptr<ID3D11ShaderResourceView> smaa_scratch_srv;
+   com_ptr<ID3D11RenderTargetView> smaa_scratch_rtv;
    com_ptr<ID3D11ShaderResourceView> smaa_gamma_srv;
-   com_ptr<ID3D11RenderTargetView> smaa_gamma_rtv;
    com_ptr<ID3D11UnorderedAccessView> smaa_gamma_uav;
    com_ptr<ID3D11ShaderResourceView> smaa_predication_srv;
    com_ptr<ID3D11UnorderedAccessView> smaa_predication_uav;
@@ -186,10 +187,10 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
 
    void ReleaseSMAACopies()
    {
-      smaa_linear_texture.reset();
-      smaa_linear_srv.reset();
+      smaa_scratch_texture.reset();
+      smaa_scratch_srv.reset();
+      smaa_scratch_rtv.reset();
       smaa_gamma_srv.reset();
-      smaa_gamma_rtv.reset();
       smaa_gamma_uav.reset();
    }
 
@@ -1370,7 +1371,7 @@ public:
                Perf::g_test = int(value);
                return std::string();
             } }});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.input_linear", smaa_linear_texture),
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.scratch", smaa_scratch_texture),
          MCP_GAME_TEXTURE("smaa.input", smaa_gamma_srv),
          MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv),
          MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips_srv),
@@ -1439,9 +1440,9 @@ public:
    }
 
    // Draws the composite, then SMAA on its canvas (swapchain, upscaled canvas, or without DLSS/FSR below render scale 1 its own target,
-   // which the game stretches onto the swapchain) before the UI: copy, gamma encode, predication, SMAA into the gamma copy, finalize
-   // (RCAS, decode, dither) into the canvas; without RCAS, SMAA writes the canvas. With "smaa" false (DLSS/FSR antialiased) only RCAS:
-   // copy (not of the upscaled canvas), gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
+   // which the game stretches onto the swapchain) before the UI: gamma encode of the canvas, predication, SMAA (blending the gamma copy
+   // in linear light) into the canvas; with RCAS, SMAA into the scratch and finalize (RCAS, decode, dither) into the canvas. With "smaa"
+   // false (DLSS/FSR antialiased) only RCAS: gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
    // composite is left alone and the vanilla FXAA runs (not after DLSS/FSR).
    static DrawOrDispatchOverrideType DrawCompositeWithSMAAAndRCAS(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers, const std::function<void()>& original_draw_dispatch_func, bool smaa)
    {
@@ -1475,9 +1476,22 @@ public:
       {
          game_device_data.smaa_frame = cb_luma_global_settings.FrameIndex;
       }
-      // RCAS alone on the upscaled canvas encodes straight from the canvas's view; SMAA needs the copy, as it samples it while writing the
-      // canvas, and so does RCAS on the swapchain
-      ID3D11ShaderResourceView* const canvas_srv = ((!smaa && canvas_rtv == game_device_data.sr_upscaled_canvas_rtv) ? game_device_data.sr_upscaled_canvas_srv.get() : nullptr);
+      // The encode reads the canvas through a view (the swapchain proxy and the game's targets are shader resources); else from a copy
+      // in the scratch. SMAA never samples the canvas it writes: it blends the gamma copy.
+      com_ptr<ID3D11ShaderResourceView> canvas_srv;
+      if (canvas_rtv == game_device_data.sr_upscaled_canvas_rtv)
+      {
+         canvas_srv = game_device_data.sr_upscaled_canvas_srv;
+      }
+      else if ((canvas_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0)
+      {
+         D3D11_SHADER_RESOURCE_VIEW_DESC canvas_srv_desc = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D};
+         canvas_srv_desc.Texture2D.MipLevels = 1;
+         native_device->CreateShaderResourceView(canvas_texture.get(), &canvas_srv_desc, &canvas_srv);
+      }
+      const bool sharpen = cb_luma_global_settings.GameSettings.RCASSharpness > 0.f;
+      // The canvas copy without a view, and SMAA's (gamma encoded) output for finalize with RCAS
+      const bool scratch = !canvas_srv || (smaa && sharpen);
       D3D11_TEXTURE2D_DESC scratch_desc = canvas_desc;
       scratch_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
       scratch_desc.MipLevels = 1;
@@ -1489,36 +1503,37 @@ public:
          game_device_data.ReleaseSMAACopies();
          game_device_data.smaa_predication_srv.reset();
          game_device_data.smaa_predication_uav.reset();
-         scratch_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+         scratch_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
          com_ptr<ID3D11Texture2D> gamma_texture;
-         if (FAILED(native_device->CreateTexture2D(&scratch_desc, nullptr, &gamma_texture)) || FAILED(native_device->CreateShaderResourceView(gamma_texture.get(), nullptr, &game_device_data.smaa_gamma_srv)) || FAILED(native_device->CreateRenderTargetView(gamma_texture.get(), nullptr, &game_device_data.smaa_gamma_rtv)) || FAILED(native_device->CreateUnorderedAccessView(gamma_texture.get(), nullptr, &game_device_data.smaa_gamma_uav)))
+         if (FAILED(native_device->CreateTexture2D(&scratch_desc, nullptr, &gamma_texture)) || FAILED(native_device->CreateShaderResourceView(gamma_texture.get(), nullptr, &game_device_data.smaa_gamma_srv)) || FAILED(native_device->CreateUnorderedAccessView(gamma_texture.get(), nullptr, &game_device_data.smaa_gamma_uav)))
          {
             // Retried next frame (the size check above sees no texture)
             game_device_data.ReleaseSMAACopies();
             return DrawOrDispatchOverrideType::None;
          }
       }
-      if (canvas_srv)
+      if (!scratch)
       {
-         game_device_data.smaa_linear_texture.reset();
-         game_device_data.smaa_linear_srv.reset();
+         game_device_data.smaa_scratch_texture.reset();
+         game_device_data.smaa_scratch_srv.reset();
+         game_device_data.smaa_scratch_rtv.reset();
       }
-      else if (!game_device_data.smaa_linear_texture)
+      else if (!game_device_data.smaa_scratch_texture)
       {
-         scratch_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-         if (FAILED(native_device->CreateTexture2D(&scratch_desc, nullptr, &game_device_data.smaa_linear_texture)) || FAILED(native_device->CreateShaderResourceView(game_device_data.smaa_linear_texture.get(), nullptr, &game_device_data.smaa_linear_srv)))
+         scratch_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+         if (FAILED(native_device->CreateTexture2D(&scratch_desc, nullptr, &game_device_data.smaa_scratch_texture)) || FAILED(native_device->CreateShaderResourceView(game_device_data.smaa_scratch_texture.get(), nullptr, &game_device_data.smaa_scratch_srv)) || FAILED(native_device->CreateRenderTargetView(game_device_data.smaa_scratch_texture.get(), nullptr, &game_device_data.smaa_scratch_rtv)))
          {
             // Retried next frame
-            game_device_data.smaa_linear_texture.reset();
-            game_device_data.smaa_linear_srv.reset();
+            game_device_data.smaa_scratch_texture.reset();
+            game_device_data.smaa_scratch_srv.reset();
+            game_device_data.smaa_scratch_rtv.reset();
             return DrawOrDispatchOverrideType::None;
          }
       }
       // Created on SMAA's first use after a resize or an idle release; without it SMAA simply runs unpredicated.
       if (smaa && g_smaa_predication && !game_device_data.smaa_predication_uav)
       {
-         D3D11_TEXTURE2D_DESC desc;
-         game_device_data.smaa_linear_texture->GetDesc(&desc);
+         D3D11_TEXTURE2D_DESC desc = scratch_desc;
          desc.Format = DXGI_FORMAT_R16_FLOAT;
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
          com_ptr<ID3D11Texture2D> predication_texture;
@@ -1561,14 +1576,14 @@ public:
       }
       else
       {
-         native_device_context->CopyResource(game_device_data.smaa_linear_texture.get(), canvas_resource.get());
+         native_device_context->CopyResource(game_device_data.smaa_scratch_texture.get(), canvas_resource.get());
       }
 
       {
          DrawStateStack<DrawStateStackType::Compute> compute_state;
          compute_state.Cache(native_device_context, device_data.uav_max_count);
          ID3D11UnorderedAccessView* const gamma_uav = game_device_data.smaa_gamma_uav.get();
-         ID3D11ShaderResourceView* const linear_srv = (canvas_srv ? canvas_srv : game_device_data.smaa_linear_srv.get());
+         ID3D11ShaderResourceView* const linear_srv = (canvas_srv ? canvas_srv.get() : game_device_data.smaa_scratch_srv.get());
          native_device_context->CSSetUnorderedAccessViews(0, 1, &gamma_uav, nullptr);
          native_device_context->CSSetShaderResources(0, 1, &linear_srv);
          native_device_context->CSSetShader(device_data.native_compute_shaders.at("P5S SMAA Encode CS"_h).get(), nullptr, 0);
@@ -1590,11 +1605,10 @@ public:
          native_device_context->OMSetRenderTargets(1, &rtv, canvas_dsv.get());
       }
 
-      // Without RCAS, SMAA writes (and dithers) the canvas directly, only sampling the linear copy; finalize would only decode
-      const bool sharpen = cb_luma_global_settings.GameSettings.RCASSharpness > 0.f;
+      // Without RCAS, SMAA writes (and dithers) the canvas directly; finalize would only decode
       if (smaa)
       {
-         DrawSMAA(native_device, native_device_context, device_data, sharpen ? game_device_data.smaa_gamma_rtv.get() : canvas_rtv.get(), game_device_data.smaa_linear_srv.get(), game_device_data.smaa_gamma_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+         DrawSMAA(native_device, native_device_context, device_data, sharpen ? game_device_data.smaa_scratch_rtv.get() : canvas_rtv.get(), game_device_data.smaa_gamma_srv.get(), game_device_data.smaa_gamma_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
       }
 
       // Development builds may also draw a debug view
@@ -1604,7 +1618,7 @@ public:
          finalize_state.Cache(native_device_context, device_data.uav_max_count);
          if (sharpen)
          {
-            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("P5S SMAA Finalize PS"_h).get(), game_device_data.smaa_gamma_srv.get(), canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), device_data.native_pixel_shaders.at("P5S SMAA Finalize PS"_h).get(), (smaa ? game_device_data.smaa_scratch_srv.get() : game_device_data.smaa_gamma_srv.get()), canvas_rtv.get(), canvas_desc.Width, canvas_desc.Height, false);
          }
 #if DEVELOPMENT
          // Calibration aid: SMAA's edges (red = horizontal, green = vertical) or the predication edge-ness (red) replace the frame
