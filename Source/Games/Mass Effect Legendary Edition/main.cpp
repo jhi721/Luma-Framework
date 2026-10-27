@@ -3265,8 +3265,14 @@ public:
 #endif
             ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
             ID3D11DepthStencilView* dsv;
-            com_ptr<ID3D11RenderTargetView> held_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-            com_ptr<ID3D11DepthStencilView> held_dsv;
+            // The references the queried targets hold until the draw is done, made only then: an array of com_ptr per draw showed in
+            // CPU profiles (its construction and destruction loops)
+            struct HeldTargets
+            {
+               com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+               com_ptr<ID3D11DepthStencilView> dsv;
+            };
+            std::optional<HeldTargets> held;
             if (g_opt_shadow_state && ImmediateState::targets_known && !ImmediateState::check)
             {
                std::copy(std::begin(ImmediateState::rtvs), std::end(ImmediateState::rtvs), rtvs);
@@ -3274,12 +3280,13 @@ public:
             }
             else
             {
-               native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &held_rtvs[0], &held_dsv);
+               held.emplace();
+               native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &held->rtvs[0], &held->dsv);
                for (size_t i = 0; i < std::size(rtvs); i++)
                {
-                  rtvs[i] = held_rtvs[i].get();
+                  rtvs[i] = held->rtvs[i].get();
                }
-               dsv = held_dsv.get();
+               dsv = held->dsv.get();
                if (ImmediateState::check && ImmediateState::targets_known)
                {
                   ImmediateState::checks++;
