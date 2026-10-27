@@ -4430,8 +4430,17 @@ namespace
       {
          ASSERT_ONCE(desc.back_buffer.texture.format == reshade::api::format::r10g10b10a2_unorm || desc.back_buffer.texture.format == reshade::api::format::r8g8b8a8_unorm || desc.back_buffer.texture.format == reshade::api::format::r8g8b8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::b8g8r8a8_unorm || desc.back_buffer.texture.format == reshade::api::format::b8g8r8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::r16g16b16a16_float); // Just a bunch of formats we encountered and we are sure we can upgrade (or that have already been upgraded)
          // DXGI_FORMAT_R16G16B16A16_FLOAT will automatically pick DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 on first creation.
-         // With "ENABLE_SWAPCHAIN_PROXY" scRGB games still see fp16, but through a proxy, the real buffer is HDR10 (10 bit SDR on SDR displays).
-         desc.back_buffer.texture.format = (swapchain_upgrade_type == SwapchainUpgradeType::scRGB && !ENABLE_SWAPCHAIN_PROXY) ? reshade::api::format::r16g16b16a16_float : reshade::api::format::r10g10b10a2_unorm;
+         // With "ENABLE_SWAPCHAIN_PROXY" scRGB games on HDR displays still see fp16, but through a proxy, the real buffer is HDR10.
+         // On SDR displays the real buffer stays scRGB and DWM encodes it, as our sRGB encode into 10 bit looked washed out there.
+         bool proxy_scrgb = false;
+#if ENABLE_SWAPCHAIN_PROXY
+         if (swapchain_upgrade_type == SwapchainUpgradeType::scRGB)
+         {
+            bool hdr_supported_window_display = false;
+            Display::IsHDRSupportedAndEnabled((HWND)hwnd, hdr_supported_window_display, proxy_scrgb);
+         }
+#endif
+         desc.back_buffer.texture.format = (swapchain_upgrade_type == SwapchainUpgradeType::scRGB && !proxy_scrgb) ? reshade::api::format::r16g16b16a16_float : reshade::api::format::r10g10b10a2_unorm;
          changed = true;
       }
 
@@ -4495,9 +4504,12 @@ namespace
 
       IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
 #if ENABLE_SWAPCHAIN_PROXY
-      // Before the game gets the back buffer
-      const bool swapchain_proxied = IsSwapchainProxyEnabled() && SwapchainProxy::Register(native_swapchain);
-      if (IsSwapchainProxyEnabled() && !swapchain_proxied)
+      // Before the game gets the back buffer. "OnCreateSwapchain()" only made the real buffer HDR10 for HDR displays.
+      DXGI_SWAP_CHAIN_DESC native_swapchain_desc = {};
+      native_swapchain->GetDesc(&native_swapchain_desc);
+      const bool proxy_swapchain = IsSwapchainProxyEnabled() && native_swapchain_desc.BufferDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
+      const bool swapchain_proxied = proxy_swapchain && SwapchainProxy::Register(native_swapchain);
+      if (proxy_swapchain && !swapchain_proxied)
       {
          reshade::log::message(reshade::log::level::error, "Failed to hook the swapchain, HDR will look wrong (the game is writing scRGB into a 10 bit buffer)");
       }
