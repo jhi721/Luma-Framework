@@ -13,6 +13,7 @@
 // - thin feature lock, reactive mask, deringing of the 2x2 history, and at Ultra a depth clip against the reconstructed
 //   previous depth (AMD FSR 2)
 // - flickering analysis and the 2x2 history (Unreal Engine's TSR, ideas only, no Unreal Engine code)
+// - shading change detection (AMD FSR 3.1)
 //
 // Inputs follow "SR::SuperResolutionImpl::DrawData": device depth, motion vectors that "MotionVectorScale" turns into
 // pixels (previous = current + mv), linear BT.709 color (scRGB is fine). The history is a Luma owned RGBA16F texture:
@@ -24,6 +25,8 @@
 // - the weight rcp(2 - w): Microsoft MiniEngine's "TemporalBlendCS.hlsl". Copyright (c) 2015 Microsoft
 // - "reconstruct_previous_depth_cs" and the depth clip: AMD FidelityFX FSR 2. Copyright (c) 2022-2023 Advanced Micro
 //   Devices, Inc. All rights reserved.
+// - "shading_change_cs", "SortCross", "SmallestCrossDifference" and the shading change's use: AMD FidelityFX FSR 3.1.
+//   Copyright (c) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 // documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
@@ -232,8 +235,10 @@
 // the history and decaying toward the current value by TAA_FLICKER_ENVELOPE_DECAY per frame, and the clip box is widened
 // by TAA_FLICKER_GAMMA times that range: on a static pixel that alternates between two values (a cutout appearing and
 // vanishing between jitter phases), the history average of the two stays inside the box.
+// Off at every level: the widened box kept the old history of shading that changes without motion vectors (moving shadows,
+// particles) and ghosted it in game, which the shading change detection didn't fully catch.
 #ifndef TAA_FLICKER
-#define TAA_FLICKER (TAA_QUALITY >= 1)
+#define TAA_FLICKER 0
 #endif
 #ifndef TAA_FLICKER_GAMMA
 #define TAA_FLICKER_GAMMA 1.0
@@ -301,10 +306,27 @@
 #ifndef TAA_REACTIVE_MAX
 #define TAA_REACTIVE_MAX 0.9
 #endif
+// Shading change detection (AMD FSR 3.1's shading change pass), from Medium quality: content that changes without motion
+// vectors (a shadow moving over static ground, particles without motion vectors or a reactive mask) otherwise keeps its old
+// history inside the box that the flickering analysis widened. "shading_change_cs", dispatched before the resolve, compares
+// this frame's luminance cross (5 taps) with the previous frame's around where this frame's sample was then: both sorted, the
+// smallest signed relative difference between them, 0 where the jitter only reshuffles the same values. The differences and
+// their signs are averaged over 2x2, 4x4 and 8x8 pixel blocks, and the change is the largest |mean difference * mean sign| of
+// the three: aliasing changes sign from pixel to pixel and cancels out, a shading change has one sign over its area. As in FSR
+// 3.1, the change (times "TAA_SHADING_CHANGE_SCALE", FSR's "fShadingChangeScale") narrows the box back to the unwidened one,
+// takes the history weight toward 0 and shortens locks, each in proportion.
+#ifndef TAA_SHADING_CHANGE
+#define TAA_SHADING_CHANGE (TAA_QUALITY >= 1)
+#endif
+#ifndef TAA_SHADING_CHANGE_SCALE
+#define TAA_SHADING_CHANGE_SCALE 1.0
+#endif
+// FSR 3.1's luminance floor and smallest difference (the smallest normal half)
+#define TAA_SHADING_CHANGE_EPSILON 6.10e-5
 
-#define TAA_FLAG_RESET          (1u << 0)
-#define TAA_FLAG_INVERTED_DEPTH (1u << 1)
-#define TAA_FLAG_REACTIVE_MASK  (1u << 2)
+#define TAA_FLAG_RESET             (1u << 0)
+#define TAA_FLAG_INVERTED_DEPTH    (1u << 1)
+#define TAA_FLAG_REACTIVE_MASK     (1u << 2)
 
 cbuffer LumaTAAData : register(b0)
 {
@@ -317,6 +339,8 @@ cbuffer LumaTAAData : register(b0)
    float Padding;
    float2 OutputResolution; // Only used with "TAA_UPSCALE"
    float2 InvOutputResolution;
+   float2 PreviousJitter; // The previous frame's "Jitter", for "shading_change_cs"
+   float2 Padding2;
 }
 
 Texture2D<float3> SourceColor : register(t0);
@@ -335,12 +359,22 @@ Texture2D<float3> PreviousFlicker : register(t6);
 // Optional reactive mask (AMD FSR 2's): 1 where the color has no matching motion vectors (particles, VFX). See
 // "TAA_REACTIVE".
 Texture2D<float> ReactiveMask : register(t7);
+// "TAA_SHADING_CHANGE": the previous frame's input luminance (R16_FLOAT, alternating like the history), read by
+// "shading_change_cs", and its output, the 2x2, 4x4 and 8x8 block means of the differences (x) and their signs (y) as mips
+// 0-2 of an R16G16_FLOAT texture covering the dispatch's 8x8 groups, read by the resolve
+Texture2D<float> PreviousLuminance : register(t8);
+Texture2D<float2> ShadingChangePyramid : register(t9);
 
 RWTexture2D<float4> OutputHistory : register(u0);
 RWTexture2D<float4> OutputColor : register(u1);
 RWTexture2D<uint> OutputReconstructedPreviousDepth : register(u2);
 RWTexture2D<uint> OutputLock : register(u3);
 RWTexture2D<float3> OutputFlicker : register(u4);
+// "shading_change_cs" only (its own dispatch, so the slots overlap the resolve's)
+RWTexture2D<float> OutputLuminance : register(u0);
+RWTexture2D<float2> OutputShadingChange0 : register(u1);
+RWTexture2D<float2> OutputShadingChange1 : register(u2);
+RWTexture2D<float2> OutputShadingChange2 : register(u3);
 
 SamplerState LinearClampSampler : register(s0);
 
@@ -483,6 +517,47 @@ void FindClosestDepth(int2 pixel, int2 max_pixel, bool inverted_depth, bool cros
    }
 }
 
+#if TAA_SHADING_CHANGE
+// AMD FSR 3.1's sorting network for its 5 sample sets
+void SortCross(inout float values[5])
+{
+   const uint2 pairs[9] = {uint2(0, 3), uint2(1, 4), uint2(0, 2), uint2(1, 3), uint2(0, 1), uint2(2, 4), uint2(1, 2), uint2(3, 4), uint2(2, 3)};
+   [unroll] for (uint i = 0; i < 9; i++)
+   {
+      const float low = min(values[pairs[i].x], values[pairs[i].y]);
+      values[pairs[i].y] = max(values[pairs[i].x], values[pairs[i].y]);
+      values[pairs[i].x] = low;
+   }
+}
+
+// The smallest signed relative difference (1 - min / max) between the values of two sorted luminance crosses, walked in
+// order (AMD FSR 3.1's "ComputeMinimumDifference"); 0 when any two are equal (see "TAA_SHADING_CHANGE")
+float SmallestCrossDifference(float current[5], float previous[5])
+{
+   SortCross(current);
+   SortCross(previous);
+   const float no_difference = 65504.0;
+   float smallest = no_difference - 1.0;
+   uint a = 0;
+   uint b = 0;
+   [unroll] for (uint i = 0; i < 5; i++)
+   {
+      const float difference = current[a] - previous[b];
+      if (abs(difference) <= TAA_SHADING_CHANGE_EPSILON)
+      {
+         smallest = no_difference;
+         break;
+      }
+      const float relative = sign(difference) * (1.0 - min(current[a], previous[b]) / max(current[a], previous[b]));
+      smallest = ((abs(relative) < abs(smallest)) ? relative : smallest);
+      // FSR's walk, which tests "b" against the already advanced "a"; its indices can pass the last value, so they stop there
+      a = min(a + uint(current[a] < previous[b]), 4u);
+      b = min(b + uint(current[a] >= previous[b]), 4u);
+   }
+   return ((smallest < no_difference - 1.0) ? smallest : 0.0);
+}
+#endif
+
 // Threads per group side (Core dispatches ceil(size / 8) groups per axis, see "LumaTAA.hpp")
 #define TAA_GROUP_SIZE   8
 #define RECONSTRUCT_TILE 16
@@ -580,7 +655,78 @@ float4 LoadHistory2x(bool from_tile, int2 texel, int2 tile_origin, int2 max_texe
    // clang-format off
 }
 
-// clang-format parses a second "[numthreads] void f() {}" in a file as a lambda and indents it.
+// clang-format parses a second "[numthreads] void f() {}" in a file as a lambda and indents it, hence the off region
+// around this entry and the next one's signature.
+#if TAA_SHADING_CHANGE
+groupshared float2 shading_change_tile[TAA_GROUP_SIZE * TAA_GROUP_SIZE];
+
+[numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)]
+void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_thread_id : SV_GroupThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex)
+{
+   // AMD FSR 3.1's shading change and its pyramid (see "TAA_SHADING_CHANGE"), per render pixel. Every thread reaches the
+   // barriers: threads past the edge repeat the edge pixel, as FSR's clamped loads do.
+   const int2 max_pixel = int2(RenderResolution) - 1;
+   const int2 pixel = min(int2(dispatch_thread_id.xy), max_pixel);
+   const int2 cross_offsets[5] = {int2(0, 0), int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)};
+   float current[5];
+   [unroll] for (uint tap = 0; tap < 5; tap++)
+   {
+      current[tap] = max(dot(SourceColor.Load(int3(clamp(pixel + cross_offsets[tap], 0, max_pixel), 0)), Rec709_Luminance), TAA_SHADING_CHANGE_EPSILON);
+   }
+   OutputLuminance[pixel] = current[0];
+
+   float closest_depth;
+   int2 closest_pixel;
+   float farthest_depth;
+   FindClosestDepth(pixel, max_pixel, (Flags & TAA_FLAG_INVERTED_DEPTH) != 0, false, closest_depth, closest_pixel, farthest_depth);
+   // The previous frame's sample nearest to where this frame's sample was then (both frames are jittered)
+   const float2 previous_position = pixel + 0.5 + Jitter + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale - PreviousJitter;
+   float2 change = 0.0; // The difference and its sign
+   if (!(Flags & TAA_FLAG_RESET) && all(previous_position >= 0.0) && all(previous_position < RenderResolution))
+   {
+      const int2 previous_pixel = int2(previous_position);
+      float previous[5];
+      [unroll] for (uint previous_tap = 0; previous_tap < 5; previous_tap++)
+      {
+         previous[previous_tap] = max(PreviousLuminance.Load(int3(clamp(previous_pixel + cross_offsets[previous_tap], 0, max_pixel), 0)), TAA_SHADING_CHANGE_EPSILON);
+      }
+      const float difference = SmallestCrossDifference(current, previous);
+      change = float2(difference, sign(difference));
+   }
+
+   // The 2x2, 4x4 and 8x8 block means (FSR 3.1's mips 0-2), each from the 4 means of the level below, kept in the slot of
+   // their top left pixel
+   shading_change_tile[group_index] = change;
+   GroupMemoryBarrierWithGroupSync();
+   const uint2 local = group_thread_id.xy;
+   [unroll] for (uint level = 0; level < 3; level++)
+   {
+      const uint step = 1u << level; // The level below's block size
+      if (all((local & (2u * step - 1u)) == 0u))
+      {
+         const uint slot = local.y * TAA_GROUP_SIZE + local.x;
+         const float2 mean = 0.25 * (shading_change_tile[slot] + shading_change_tile[slot + step] + shading_change_tile[slot + step * TAA_GROUP_SIZE] + shading_change_tile[slot + step * (TAA_GROUP_SIZE + 1)]);
+         shading_change_tile[slot] = mean;
+         const uint blocks_per_group = TAA_GROUP_SIZE / (2u * step);
+         const int2 texel = int2(group_id.xy * blocks_per_group + local / (2u * step));
+         if (level == 0)
+         {
+            OutputShadingChange0[texel] = mean;
+         }
+         else if (level == 1)
+         {
+            OutputShadingChange1[texel] = mean;
+         }
+         else
+         {
+            OutputShadingChange2[texel] = mean;
+         }
+      }
+      GroupMemoryBarrierWithGroupSync();
+   }
+}
+#endif
+
 [numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex)
 // clang-format on
@@ -857,6 +1003,23 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       }
    }
 #endif
+   float shading_change = 0.0;
+#if TAA_SHADING_CHANGE
+   {
+      // The pyramid's mips cover the 8x8 groups of "shading_change_cs": ceil(resolution / 8) * 8 render pixels per axis
+#if TAA_UPSCALE
+      const float2 pyramid_uv = sample_center / (ceil(RenderResolution / TAA_GROUP_SIZE) * TAA_GROUP_SIZE);
+#else
+      const float2 pyramid_uv = (pixel + 0.5) / (ceil(RenderResolution / TAA_GROUP_SIZE) * TAA_GROUP_SIZE);
+#endif
+      [unroll] for (uint mip = 0; mip < 3; mip++)
+      {
+         const float2 block = ShadingChangePyramid.SampleLevel(LinearClampSampler, pyramid_uv, mip);
+         shading_change = max(shading_change, abs(block.x * block.y));
+      }
+      shading_change = saturate(shading_change * TAA_SHADING_CHANGE_SCALE);
+   }
+#endif
    float3 box_min = 0.5 * (min_3x3 + min_cross);
    float3 box_max = 0.5 * (max_3x3 + max_cross);
    const float3 box_average = 0.5 * (sum_3x3 / 9.0 + sum_cross / 5.0);
@@ -929,11 +1092,12 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       {
          widening *= saturate(1.0 - speed / TAA_FLICKER_MAX_SPEED);
       }
+      widening *= 1.0 - shading_change;
       box_min -= widening;
       box_max += widening;
    }
 #endif
-   const float max_history_weight = TAA_MAX_HISTORY_WEIGHT * (1.0 - min(reactive, TAA_REACTIVE_MAX));
+   const float max_history_weight = TAA_MAX_HISTORY_WEIGHT * (1.0 - min(reactive, TAA_REACTIVE_MAX)) * (1.0 - shading_change);
    // Clipping into the current neighborhood also removes the bicubic's ringing.
    const float3 clip_target = clamp(box_average, box_min, box_max);
 
@@ -946,7 +1110,8 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    }
    else if (previous_lock_code > 0 && previous_lock_code <= TAA_LOCK_FRAMES)
    {
-      lock_frames = previous_lock_code - 1;
+      // A shading change shortens the lock in proportion (all of it at 1), as in AMD FSR 3.1
+      lock_frames = uint(max(int(previous_lock_code) - 1 - int(round(shading_change * TAA_LOCK_FRAMES)), 0));
    }
    const bool locked = lock_static && lock_frames > 0;
 #else
@@ -960,7 +1125,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    const float sample_rate = render_scale.x * render_scale.y;
    const float cap_samples = cap_fraction / (1.0 - cap_fraction) / pow(abs(sample_rate), lerp(1.0, moving, sparse));
    const bool keep_box = lighting_changed_or_new || reactive > 0.0;
-   const float static_box_scale = (keep_box ? 1.0 : lerp(lerp(1.0, TAA_UPSCALE_STATIC_BOX, sparse), 1.0, moving));
+   const float static_box_scale = (keep_box ? 1.0 : lerp(lerp(1.0, TAA_UPSCALE_STATIC_BOX, sparse), 1.0, max(moving, shading_change)));
    const float3 box_center = 0.5 * (box_min + box_max);
    const float3 history_box_min = box_center - (box_center - box_min) * static_box_scale;
    const float3 history_box_max = box_center + (box_max - box_center) * static_box_scale;
