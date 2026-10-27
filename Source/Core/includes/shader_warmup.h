@@ -135,12 +135,38 @@ namespace ShaderWarmup
    // "Scripts/build_warmup_pack.py". "signature_code" is the vertex shader it was created for.
    inline void DumpLayout(const std::filesystem::path& dump_path, const void* signature_code, size_t signature_code_size, const std::vector<D3D11_INPUT_ELEMENT_DESC>& elements)
    {
+      // Some games (UE3) create layouts every frame. A key from the shader's DXBC checksum (container bytes 4-19) and the elements skips
+      // parsing and serializing a layout already seen (~0.5 ms a frame on MELE); the file system is then asked once per dumped layout.
+      // The caller holds the device mutex.
+      uint64_t key = 14695981039346656037ull; // FNV-1a
+      const auto mix = [&key](const void* bytes, size_t size)
+      {
+         for (size_t i = 0; i < size; i++)
+         {
+            key = (key ^ static_cast<const uint8_t*>(bytes)[i]) * 1099511628211ull;
+         }
+      };
+      if (signature_code_size >= 20)
+      {
+         mix(static_cast<const uint8_t*>(signature_code) + 4, 16);
+      }
+      for (const D3D11_INPUT_ELEMENT_DESC& element : elements)
+      {
+         if (element.SemanticName)
+         {
+            mix(element.SemanticName, std::strlen(element.SemanticName));
+         }
+         mix(&element.SemanticIndex, sizeof(element) - offsetof(D3D11_INPUT_ELEMENT_DESC, SemanticIndex));
+      }
+      static std::unordered_set<uint64_t> seen_keys;
+      if (!seen_keys.insert(key).second)
+         return;
+
       const std::string signature = GetInputSignature(static_cast<const uint8_t*>(signature_code), signature_code_size);
       if (signature.empty())
          return;
       const std::vector<uint8_t> data = SerializeLayout(signature, elements);
       const uint32_t hash = Shader::BinToHash(data.data(), data.size());
-      // Some games (UE3) create layouts every frame: the file system is asked once per layout. The caller holds the device mutex.
       static std::unordered_set<uint32_t> dumped_hashes;
       if (!dumped_hashes.insert(hash).second)
          return;

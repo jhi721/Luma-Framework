@@ -5350,6 +5350,9 @@ namespace
             DeviceData& device_data = *device->get_private_data<DeviceData>();
             const std::unique_lock lock_device(device_data.mutex);
             std::vector<D3D11_INPUT_ELEMENT_DESC>& layout_descs = device_data.input_layouts_descs[reinterpret_cast<ID3D11InputLayout*>(pipeline.handle)];
+            // UE3 creates layouts every frame, and a destroyed layout's address comes back for a new one
+            layout_descs.clear();
+            layout_descs.reserve(subobject.count);
             for (uint32_t j = 0; j < subobject.count; ++j)
             {
                reshade::api::input_element* desc = reinterpret_cast<reshade::api::input_element*>(subobject.data) + j;
