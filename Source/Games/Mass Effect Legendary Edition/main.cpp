@@ -19,7 +19,7 @@
 #define ENABLE_RCAS 1  // optional sharpening of the SMAA output
 #define ENABLE_BLOOM 1 // fp16 pyramidal bloom replaces the game's clamped bloom
 // A third "Super Resolution" choice next to DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
-#define ENABLE_LUMA_TAA 1
+#define ENABLE_LUMA_TAA 0
 // The motion vector and jitter draws wrap the game's own draws, so they need "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")

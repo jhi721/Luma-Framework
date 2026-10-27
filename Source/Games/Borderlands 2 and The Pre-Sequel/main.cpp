@@ -22,7 +22,7 @@
 #define ENABLE_SMAA 1     // SMAA ULTRA (+RCAS) injected post-tonemap; core auto-registers the 6 "SMAA ..." passes from Luma_SMAA_impl
 #define ENABLE_RCAS 1     // core registers the "RCAS PS" pass, drawn by DrawRCAS after SMAA or the upscaler
 #define ENABLE_BLOOM 1    // core auto-registers the Bloom VS/Prefilter/Downsample/Upsample passes -> Luma_Bloom_impl
-#define ENABLE_LUMA_TAA 1 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU
+#define ENABLE_LUMA_TAA 0 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU
 // SMAA runs POST-tonemap through the post-draw callback (see RunPostTonemapSMAA); needs original_draw_dispatch_func.
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -164,7 +164,11 @@ constexpr PerfTestMode perf_test_modes[] = {
 // "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a
 // median per mode against the last one. "CPU Sweep": the CPU savings each off in turn under the current anti-aliasing (an upscaler:
 // without motion vectors the hooks return early), against "Current Settings".
-constexpr int perf_sweep_modes[] = {2, 3, 4, 5, 6, 7, 8, 9};
+constexpr int perf_sweep_modes[] = {2, 3, 4, 5,
+#if ENABLE_LUMA_TAA
+   6, 7,
+#endif
+   8, 9};
 constexpr int perf_cpu_sweep_modes[] = {10, 11, 12, 1};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
 static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[std::size(perf_cpu_sweep_modes) - 1]].name) == "Current Settings");
@@ -982,13 +986,17 @@ class Borderlands2 final : public Game
       if (!previous_mode.set_aa && mode.set_aa)
       {
          gd.perf_user_sr_type = device_data.sr_type;
+#if ENABLE_LUMA_TAA
          gd.perf_user_taa_quality = LumaTAA::quality.load();
+#endif
          gd.perf_user_smaa = g_smaa_enable;
       }
       if (mode.set_aa || previous_mode.set_aa)
       {
          SetSRType(device_data, (mode.set_aa ? mode.sr_type : gd.perf_user_sr_type));
+#if ENABLE_LUMA_TAA
          LumaTAA::quality = ((mode.set_aa && mode.luma_taa_quality >= 0) ? mode.luma_taa_quality : gd.perf_user_taa_quality);
+#endif
          device_data.sr_suppressed = false;
          g_smaa_enable = (mode.set_aa ? mode.smaa : gd.perf_user_smaa);
       }

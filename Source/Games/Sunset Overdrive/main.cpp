@@ -3,7 +3,7 @@
 #define GEOMETRY_SHADER_SUPPORT 0
 #define DISABLE_AUTO_DEBUGGER 1
 // DLSS, FSR 3 and Luma TAA run at native resolution on the pre-tonemap scene, in place of the game's SMAA (see "DrawSR")
-#define ENABLE_LUMA_TAA 1
+#define ENABLE_LUMA_TAA 0
 // The velocity passes (with the motion vector target added), the bloom's split bright passes (on the pre-SR scene) and
 // "PS_OcclCoverDropouts" (the reactive mask's copy point) draw through "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
