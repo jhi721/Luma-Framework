@@ -67,6 +67,7 @@
   <PropertyGroup>
     <UseLumaNGX>true</UseLumaNGX>
     <UseLumaFSR>true</UseLumaFSR>
+    <UseLumaFastNoise>true</UseLumaFastNoise>
   </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>

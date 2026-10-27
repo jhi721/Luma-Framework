@@ -158,10 +158,12 @@ static float g_bloom_intensity = 1.0f;
 // which, so the UI/Game ratio and Game Paper White are applied exactly once on either path.
 static constexpr uint32_t kVideoBinkHash = 0x7B5C59DF;
 
-// XeGTAO replaces the half-resolution GFSDK HBAO+ chain, writing the game's R8_UNORM AO target at the blur
-// dispatch; the apply blit (see "kAOApplyHash") composites it. Noise and denoise pass count follow "IsGTAOTemporal".
-// It fills the whole AO target (half the output) at any render scale, from the full size scene depth and view normals:
-// HBAO+'s own inputs are half the render resolution, a quarter of the output at 50%, which washed out contact AO.
+// XeGTAO replaces the half-resolution GFSDK HBAO+ chain, writing the game's R8_UNORM AO target (half the output) at the blur
+// dispatch; the apply blit (see "kAOApplyHash") composites it. Noise and denoise pass count follow "IsGTAOTemporal". Its inputs are
+// the full size scene depth and view normals: HBAO+'s own are half the render resolution, a quarter of the output at 50%, which
+// washed out contact AO. GT-VBAO writes its own target instead, one AO pixel per rendered pixel, which the apply reads in place of
+// the game's (see "RunAO"). Under DLSS/FSR an AO history runs between the main pass and the denoise, and GT-VBAO takes 1 slice
+// there instead of 2.
 // Without XeGTAO the native chain fills the whole target too under the render scale (see "RunAO"): the engine's fixed scale
 // (off on PC) never adapted HBAO+, whose radius is scaled twice and whose ProjInfo spans the whole view over the target's UVs.
 static constexpr uint32_t kAODownsampleHash = 0xA75E6C32;   // Depth and normals downsample (PS): its full size sources captured.
@@ -187,8 +189,11 @@ static int g_gtao_debug_view = 0; // 0=off, 1=depth, 2=normals, 3=AO x8, 4=edges
 #endif
 #if DEVELOPMENT
 static int g_gtao_temporal = 0; // 0 = with DLSS/FSR (see "IsGTAOTemporal"), 1 = off, 2 = on
+// The AO history's weight (see "RunAO"), 0 turns it off
+static float g_gtao_history_weight = 0.9f;
 #else
 static constexpr int g_gtao_temporal = 0;
+static constexpr float g_gtao_history_weight = 0.9f;
 #endif
 
 // Native DoF is retained: its fp16 near/far chain has no SDR clamp, and stage 1 composites those buffers.
@@ -887,6 +892,8 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> srv_gtao_normals;
    // Set only after a complete takeover at deinterleave; otherwise the native chain remains intact.
    bool gtao_active_this_frame = false;
+   // That takeover (GT-VBAO's) writes "tex_gtao_final", which the apply reads, instead of the game's AO target
+   bool gtao_full_res_this_frame = false;
    // The native chain's downsample drew over the whole AO target under the render scale (see "RunAO").
    bool hbao_stretched_this_frame = false;
    // A stretched pass after the downsample couldn't patch its constants: the blur writes neutral AO (see "RunAO").
@@ -898,10 +905,21 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_gtao_depth_mips;
    ComPtr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[5];
    ComPtr<ID3D11ShaderResourceView> srv_gtao_depth_mips;
-   // R8G8_UNORM AO/edge outputs of the main pass and first denoiser; the second denoiser writes the game's u0.
+   // R8G8_UNORM AO/edge outputs of the main pass, the history and the first denoiser; the second denoiser writes the game's u0, or
+   // GT-VBAO's own R8_UNORM target at one AO pixel per rendered pixel
    ComPtr<ID3D11Texture2D> tex_gtao_working[2];
    ComPtr<ID3D11UnorderedAccessView> uav_gtao_working[2];
    ComPtr<ID3D11ShaderResourceView> srv_gtao_working[2];
+   ComPtr<ID3D11Texture2D> tex_gtao_final;
+   ComPtr<ID3D11UnorderedAccessView> uav_gtao_final;
+   ComPtr<ID3D11ShaderResourceView> srv_gtao_final;
+   // The AO history, R16G16_FLOAT (AO, view Z), ping-ponged: written by "temporal_pass_cs" (see "RunAO")
+   ComPtr<ID3D11Texture2D> tex_gtao_history[2];
+   ComPtr<ID3D11UnorderedAccessView> uav_gtao_history[2];
+   ComPtr<ID3D11ShaderResourceView> srv_gtao_history[2];
+   uint32_t gtao_history_index = 0; // The one written last
+   uint32_t gtao_history_frame = 0; // Luma frame index of that write: the history restarts unless it was the previous frame
+   com_ptr<ID3D11Buffer> cb_gtao_temporal;
    uint32_t gtao_w = 0, gtao_h = 0;
    // Luma frame index of the last XeGTAO dispatch (see "smaa_idle_release_frames")
    uint32_t gtao_frame = 0;
@@ -976,6 +994,7 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
    com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no fill)
+   com_ptr<ID3D11ShaderResourceView> mv_srv;  // XeGTAO's history reads it (see "RunAO")
    // A frame opens at its first mesh draw into output sized depth (the depth prepass: the jitter is chosen there), starts at its
    // first motion vector draw (the target is cleared) and ends at the first post pass, once per present.
    bool mv_scene_open = false;
@@ -1171,6 +1190,8 @@ class MassEffectLE final : public Game
    static constexpr uint32_t kNameGTAOPrefilterCS = CompileTimeStringHash("MELE XeGTAO Prefilter Depths CS");
    static constexpr uint32_t kNameGTAOMainPassCS = CompileTimeStringHash("MELE XeGTAO Main Pass CS");
    static constexpr uint32_t kNameGTVBAOMainPassCS = CompileTimeStringHash("MELE GT-VBAO Main Pass CS");
+   static constexpr uint32_t kNameGTAOTemporalCS = CompileTimeStringHash("MELE XeGTAO Temporal CS");
+   static constexpr uint32_t kNameGTVBAOTemporalMainPassCS = CompileTimeStringHash("MELE GT-VBAO Temporal Main Pass CS");
    static constexpr uint32_t kNameGTAODenoise1CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 1 CS");
    static constexpr uint32_t kNameGTAODenoise2CS = CompileTimeStringHash("MELE XeGTAO Denoise Pass 2 CS");
    static constexpr uint32_t kNameMVFillCS = CompileTimeStringHash("MELE Motion Vector Fill CS");
@@ -1215,7 +1236,14 @@ class MassEffectLE final : public Game
          gd->tex_gtao_working[i].reset();
          gd->uav_gtao_working[i].reset();
          gd->srv_gtao_working[i].reset();
+         gd->tex_gtao_history[i].reset();
+         gd->uav_gtao_history[i].reset();
+         gd->srv_gtao_history[i].reset();
       }
+      gd->tex_gtao_final.reset();
+      gd->uav_gtao_final.reset();
+      gd->srv_gtao_final.reset();
+      gd->gtao_history_frame = 0;
       gd->gtao_w = gd->gtao_h = 0;
    }
 
@@ -1839,6 +1867,7 @@ class MassEffectLE final : public Game
             game_device_data.mv_texture.reset();
             game_device_data.mv_rtv.reset();
             game_device_data.mv_uav.reset();
+            game_device_data.mv_srv.reset();
             // The fill reads the target back through its UAV
             D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {format};
             const bool typed_uav_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
@@ -1853,6 +1882,7 @@ class MassEffectLE final : public Game
             {
                native_device->CreateUnorderedAccessView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_uav);
             }
+            native_device->CreateShaderResourceView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_srv);
             game_device_data.mv_frame_ended = true;
          }
          game_device_data.mv_accepted_rtv = rtvs[0];
@@ -2296,6 +2326,39 @@ class MassEffectLE final : public Game
       return true;
    }
 
+   // The motion vector fill's and XeGTAO's history's (see "RunAO") constants, a multiple of 16 bytes: [0-15] current clip space to the
+   // previous frame's, for column vectors (b1 holds row vector matrices, transposed here), in double: previous * translation(previous
+   // PreViewTranslation - current) * inverse(current), identity without both cameras; [16-17] this frame's NDC jitter; [18-19] the
+   // caller's
+   static std::array<float, 20> GetCameraReprojectionConstants(const MassEffectGameDeviceData& game_device_data)
+   {
+      Math::Matrix44D current, previous, view_translation;
+      current.SetIdentity();
+      previous.SetIdentity();
+      view_translation.SetIdentity();
+      if (game_device_data.mv_camera && game_device_data.mv_previous_camera && game_device_data.mv_camera->size() >= 16 * sizeof(float) && game_device_data.mv_previous_camera->size() >= 16 * sizeof(float))
+      {
+         std::copy_n(reinterpret_cast<const float*>(game_device_data.mv_camera->data()), 16, current.GetData());
+         std::copy_n(reinterpret_cast<const float*>(game_device_data.mv_previous_camera->data()), 16, previous.GetData());
+         current.Transpose();
+         previous.Transpose();
+         current.Invert();
+         const std::array<float, 3> current_translation = GetPreViewTranslation(*game_device_data.mv_camera), previous_translation = GetPreViewTranslation(*game_device_data.mv_previous_camera);
+         view_translation.m03 = double(previous_translation[0]) - current_translation[0];
+         view_translation.m13 = double(previous_translation[1]) - current_translation[1];
+         view_translation.m23 = double(previous_translation[2]) - current_translation[2];
+      }
+      const Math::Matrix44D reprojection = previous * view_translation * current;
+      std::array<float, 20> constants = {};
+      for (int i = 0; i < 16; i++)
+      {
+         constants[i] = float(reprojection.GetData()[i]);
+      }
+      constants[16] = game_device_data.mv_jitter_ndc[0];
+      constants[17] = game_device_data.mv_jitter_ndc[1];
+      return constants;
+   }
+
    // Ends the scene at its first post pass (immediate context): the camera motion fill for the pixels no motion vector draw wrote, then
    // DLSS / FSR ("DrawUpscaler"), both before that pass reads the scene
    static void EndScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
@@ -2321,35 +2384,10 @@ class MassEffectLE final : public Game
 #endif
       if (std::exchange(game_device_data.mv_fill_pending, false) && fill_shader)
       {
-         // Current clip space to the previous frame's, for column vectors (b1 holds row vector matrices, transposed here), in double:
-         // previous * translation(previous PreViewTranslation - current) * inverse(current)
-         Math::Matrix44D current, previous, view_translation;
-         current.SetIdentity();
-         previous.SetIdentity();
-         view_translation.SetIdentity();
-         if (game_device_data.mv_camera && game_device_data.mv_previous_camera && game_device_data.mv_camera->size() >= 16 * sizeof(float) && game_device_data.mv_previous_camera->size() >= 16 * sizeof(float))
-         {
-            std::copy_n(reinterpret_cast<const float*>(game_device_data.mv_camera->data()), 16, current.GetData());
-            std::copy_n(reinterpret_cast<const float*>(game_device_data.mv_previous_camera->data()), 16, previous.GetData());
-            current.Transpose();
-            previous.Transpose();
-            current.Invert();
-            const std::array<float, 3> current_translation = GetPreViewTranslation(*game_device_data.mv_camera), previous_translation = GetPreViewTranslation(*game_device_data.mv_previous_camera);
-            view_translation.m03 = double(previous_translation[0]) - current_translation[0];
-            view_translation.m13 = double(previous_translation[1]) - current_translation[1];
-            view_translation.m23 = double(previous_translation[2]) - current_translation[2];
-         }
-         const Math::Matrix44D reprojection = previous * view_translation * current;
-         float constants[20] = {}; // A multiple of 16 bytes
-         for (int i = 0; i < 16; i++)
-         {
-            constants[i] = float(reprojection.GetData()[i]);
-         }
-         constants[16] = game_device_data.mv_jitter_ndc[0];
-         constants[17] = game_device_data.mv_jitter_ndc[1];
+         std::array<float, 20> constants = GetCameraReprojectionConstants(game_device_data);
          constants[18] = float(game_device_data.render_size[0]);
          constants[19] = float(game_device_data.render_size[1]);
-         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants, sizeof(constants)))
+         if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_fill_buffer), constants.data(), sizeof(constants)))
          {
             // The depth may be bound as the depth target, and the motion vectors as a render target
             native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -2589,7 +2627,8 @@ public:
             &Perf::g_hook_timers }});
       Mcp::RegisterMirroredToggle("video_auto_hdr_enable", &g_video_auto_hdr_enable, &cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       Mcp::RegisterValues({{"render_scale", &EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, 1.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f},
-         {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 10.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 3.f}});
+         {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 10.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 3.f},
+         {"gtao_history_weight", &g_gtao_history_weight, 0.f, 0.98f}});
       Mcp::RegisterInts({{"opt_shadow_check", &g_opt_shadow_check, 0, 1000}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_temporal", &g_gtao_temporal, 0, 2},
          { "perf_test",
@@ -2612,6 +2651,9 @@ public:
          MCP_GAME_TEXTURE("gtao.depth_mips", tex_gtao_depth_mips),
          MCP_GAME_TEXTURE("gtao.working0", tex_gtao_working[0]),
          MCP_GAME_TEXTURE("gtao.working1", tex_gtao_working[1]),
+         MCP_GAME_TEXTURE("gtao.history0", tex_gtao_history[0]),
+         MCP_GAME_TEXTURE("gtao.history1", tex_gtao_history[1]),
+         MCP_GAME_TEXTURE("gtao.final", tex_gtao_final),
          MCP_GAME_TEXTURE("mv.velocity", mv_texture),
          MCP_GAME_TEXTURE("mv.depth", mv_depth_srv)});
 #endif
@@ -2652,6 +2694,11 @@ public:
          ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
       native_shaders_definitions.emplace(kNameGTVBAOMainPassCS,
          ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs"});
+      // The slice count and noise under the AO history (Luma_MELE_XeGTAO.hlsl)
+      native_shaders_definitions.emplace(kNameGTVBAOTemporalMainPassCS,
+         ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs", {{"GTVBAO_SLICE_COUNT", "1.0"}, {"GTVBAO_FAST_NOISE", "1"}}});
+      native_shaders_definitions.emplace(kNameGTAOTemporalCS,
+         ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "temporal_pass_cs"});
       native_shaders_definitions.emplace(kNameGTAODenoise1CS,
          ShaderDefinition{"Luma_MELE_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
       native_shaders_definitions.emplace(kNameGTAODenoise2CS,
@@ -3014,6 +3061,9 @@ public:
       // Deinterleave: prepare all scratch resources at its depth's size (the AO target's), then skip native work.
       if (original_shader_hashes.Contains(kAODeinterleaveHash, reshade::api::shader_stage::compute))
       {
+         // A view whose takeover fails keeps its native chain and the game's AO target, whatever an earlier view's did
+         gd->gtao_active_this_frame = false;
+         gd->gtao_full_res_this_frame = false;
          if (!gtao_ready() || !gd->srv_gtao_depth || !gd->srv_gtao_normals)
             return DrawOrDispatchOverrideType::None;
 
@@ -3026,15 +3076,22 @@ public:
          DXGI_FORMAT unused_format = DXGI_FORMAT_UNKNOWN;
          GetResourceInfo(ao_depth_srv.get(), ao_size, unused_format);
          GetResourceInfo(gd->srv_gtao_depth.get(), scene_depth_size, unused_format);
-         const uint32_t w = ao_size.x, h = ao_size.y;
-         if (w == 0 || h == 0 || scene_depth_size.x < w || scene_depth_size.y < h)
+         if (ao_size.x == 0 || ao_size.y == 0 || scene_depth_size.x < ao_size.x || scene_depth_size.y < ao_size.y)
             return DrawOrDispatchOverrideType::None;
-         // Scene depth and normal pixels per AO pixel: the AO target spans the rendered share of the output sized sources, so 2 at
-         // native and 1 (AO per rendered pixel) at 50% render scale
-         const float depth_load_scale_x = float(render_share ? gd->render_size[0] : scene_depth_size.x) / float(w);
-         const float depth_load_scale_y = float(render_share ? gd->render_size[1] : scene_depth_size.y) / float(h);
+         // The AO target spans the rendered share of the output sized depth and normals. GT-VBAO runs over all of that share, one AO
+         // pixel per rendered pixel in its own target: at half the output its slice noise stays as grain after the denoise and the
+         // history, which the 2x2 upsample of the apply spreads
+         const bool full_res = g_gtvbao_enable;
+         const uint32_t rendered_w = (render_share ? gd->render_size[0] : scene_depth_size.x);
+         const uint32_t rendered_h = (render_share ? gd->render_size[1] : scene_depth_size.y);
+         const uint32_t w = (full_res ? rendered_w : ao_size.x);
+         const uint32_t h = (full_res ? rendered_h : ao_size.y);
+         // Scene depth and normal pixels per AO pixel: 1 at full resolution, else 2 at native and 1 at 50% render scale
+         const float depth_load_scale_x = float(rendered_w) / float(w);
+         const float depth_load_scale_y = float(rendered_h) / float(h);
+         const bool temporal = IsGTAOTemporal(device_data);
 
-         if (gd->gtao_w != w || gd->gtao_h != h || !gd->tex_gtao_depth_mips || !gd->tex_gtao_working[1])
+         if (gd->gtao_w != w || gd->gtao_h != h || !gd->tex_gtao_depth_mips || !gd->tex_gtao_working[1] || full_res != bool(gd->tex_gtao_final) || temporal != bool(gd->tex_gtao_history[1]))
          {
             ReleaseGTAOScratch(gd);
 
@@ -3065,6 +3122,24 @@ public:
                ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_working[i].get(), nullptr, gd->uav_gtao_working[i].put()));
                ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_working[i].get(), nullptr, gd->srv_gtao_working[i].put()));
             }
+            if (full_res)
+            {
+               texture_desc.Format = DXGI_FORMAT_R8_UNORM;
+               ok = ok && SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_final.put()));
+               ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_final.get(), nullptr, gd->uav_gtao_final.put()));
+               ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_final.get(), nullptr, gd->srv_gtao_final.put()));
+            }
+            // The AO history only with the per frame noise (see "IsGTAOTemporal")
+            if (temporal)
+            {
+               texture_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+               for (int i = 0; ok && i < 2; i++)
+               {
+                  ok = ok && SUCCEEDED(native_device->CreateTexture2D(&texture_desc, nullptr, gd->tex_gtao_history[i].put()));
+                  ok = ok && SUCCEEDED(native_device->CreateUnorderedAccessView(gd->tex_gtao_history[i].get(), nullptr, gd->uav_gtao_history[i].put()));
+                  ok = ok && SUCCEEDED(native_device->CreateShaderResourceView(gd->tex_gtao_history[i].get(), nullptr, gd->srv_gtao_history[i].put()));
+               }
+            }
             if (!ok)
             {
                ReleaseGTAOScratch(gd);                  // All or nothing; retry clean next frame.
@@ -3090,6 +3165,7 @@ public:
             return DrawOrDispatchOverrideType::None;
 
          gd->gtao_active_this_frame = true;
+         gd->gtao_full_res_this_frame = full_res;
          return DrawOrDispatchOverrideType::Replaced;
       }
 
@@ -3162,7 +3238,14 @@ public:
          }
 
          ComPtr<ID3D11UnorderedAccessView> uav_final;
-         native_device_context->CSGetUnorderedAccessViews(0, 1, uav_final.put());
+         if (gd->gtao_full_res_this_frame)
+         {
+            uav_final = gd->uav_gtao_final;
+         }
+         else
+         {
+            native_device_context->CSGetUnorderedAccessViews(0, 1, uav_final.put());
+         }
          if (!uav_final)
             return DrawOrDispatchOverrideType::Replaced; // Earlier native stages were already skipped.
          if (!gd->srv_gtao_depth || !gd->srv_gtao_normals)
@@ -3189,7 +3272,7 @@ public:
          // the previous UAV hazard and silently nulls the conflicting SRV
          const auto dispatch = [&](uint32_t shader_name, std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs, UINT groups_x, UINT groups_y)
          {
-            static constexpr std::array<ID3D11ShaderResourceView*, 2> srv_nulls = {};
+            static constexpr std::array<ID3D11ShaderResourceView*, 5> srv_nulls = {};
             static constexpr std::array<ID3D11UnorderedAccessView*, 5> uav_nulls = {};
             native_device_context->CSSetShaderResources(0, UINT(srv_nulls.size()), srv_nulls.data());
             native_device_context->CSSetUnorderedAccessViews(0, UINT(uavs.size()), uavs.begin(), nullptr);
@@ -3200,17 +3283,63 @@ public:
          };
          // Prefilter game depth into the R32F mip pyramid; each thread covers 2x2 pixels.
          dispatch(kNameGTAOPrefilterCS, {gd->srv_gtao_depth.get()}, {gd->gtao_depth_mip_uavs[0].get(), gd->gtao_depth_mip_uavs[1].get(), gd->gtao_depth_mip_uavs[2].get(), gd->gtao_depth_mip_uavs[3].get(), gd->gtao_depth_mip_uavs[4].get()}, (w + 15) / 16, (h + 15) / 16);
+         // The history (Luma_MELE_XeGTAO.hlsl, "temporal_pass_cs") turns working0 into working1, only with the per frame noise and this
+         // frame's motion vectors (their patched draws ran in the base pass; the camera fill hasn't yet): a frame whose motion vector
+         // target wasn't cleared and drawn would read the last one's
+         const bool history_active = IsGTAOTemporal(device_data) && g_gtao_history_weight > 0.f && gd->mv_srv && gd->mv_camera && gd->mv_frame_index == cb_luma_global_settings.FrameIndex && gd->tex_gtao_history[1] && HasShaders(device_data.native_compute_shaders, kNameGTAOTemporalCS);
+         // GT-VBAO takes 1 slice under it, with the FAST noise at t4 (Core's "FAST Noise")
+         uint32_t frame_main_pass_cs = main_pass_cs;
+         ID3D11ShaderResourceView* fast_noise = nullptr;
+         if (const auto it = device_data.managed_resources.shader_resource_views.find("FAST Noise"_h); g_gtvbao_enable && history_active && it != device_data.managed_resources.shader_resource_views.end() && HasShaders(device_data.native_compute_shaders, kNameGTVBAOTemporalMainPassCS))
+         {
+            fast_noise = it->second.get();
+            frame_main_pass_cs = kNameGTVBAOTemporalMainPassCS;
+         }
          // Main pass writes AO and edges to working0.
-         dispatch(main_pass_cs, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get()}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
-         // First denoiser writes working1, two horizontal pixels per thread. Skipped when temporal: the final one reads working0.
-         // GT-VBAO keeps both passes even then: its bitmask noise is coarser (Luma_MELE_XeGTAO.hlsl)
+         dispatch(frame_main_pass_cs, {gd->srv_gtao_depth_mips.get(), gd->srv_gtao_normals.get(), nullptr, nullptr, fast_noise}, {gd->uav_gtao_working[0].get()}, (w + 7) / 8, (h + 7) / 8);
+         int denoise_source = 0;
+         if (history_active)
+         {
+            const bool history_valid = gd->gtao_history_frame + 1 == cb_luma_global_settings.FrameIndex && gd->mv_previous_camera && !device_data.force_reset_sr;
+            std::array<float, 20> temporal_constants = GetCameraReprojectionConstants(*gd);
+            temporal_constants[18] = (history_valid ? g_gtao_history_weight : 0.f);
+            if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_gtao_temporal), temporal_constants.data(), sizeof(temporal_constants)))
+            {
+               // A motion vector target still bound for output would null its view as an input
+               com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+               com_ptr<ID3D11DepthStencilView> dsv;
+               native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
+               ID3D11RenderTargetView* rtvs_raw[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+               std::transform(std::begin(rtvs), std::end(rtvs), rtvs_raw, [](const com_ptr<ID3D11RenderTargetView>& rtv)
+                  { return rtv.get(); });
+               const bool mv_bound = std::find(std::begin(rtvs_raw), std::end(rtvs_raw), gd->mv_rtv.get()) != std::end(rtvs_raw);
+               if (mv_bound)
+               {
+                  native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
+               }
+               ID3D11Buffer* const temporal_cb = gd->cb_gtao_temporal.get();
+               native_device_context->CSSetConstantBuffers(10, 1, &temporal_cb);
+               const uint32_t previous = gd->gtao_history_index, next = previous ^ 1u;
+               dispatch(kNameGTAOTemporalCS, {gd->srv_gtao_working[0].get(), gd->srv_gtao_history[previous].get(), gd->mv_srv.get(), gd->srv_gtao_depth.get()}, {gd->uav_gtao_working[1].get(), gd->uav_gtao_history[next].get()}, (w + 7) / 8, (h + 7) / 8);
+               if (mv_bound)
+               {
+                  native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_raw, dsv.get());
+               }
+               gd->gtao_history_index = next;
+               gd->gtao_history_frame = cb_luma_global_settings.FrameIndex;
+               denoise_source = 1;
+            }
+         }
+         // First denoiser, two horizontal pixels per thread, into the other working target. Skipped when temporal: the final one reads its
+         // source. GT-VBAO keeps both passes even then: its bitmask noise is coarser (Luma_MELE_XeGTAO.hlsl)
          const bool single_denoise = IsGTAOTemporal(device_data) && !g_gtvbao_enable;
          if (!single_denoise)
          {
-            dispatch(kNameGTAODenoise1CS, {gd->srv_gtao_working[0].get()}, {gd->uav_gtao_working[1].get()}, (w + 15) / 16, (h + 7) / 8);
+            dispatch(kNameGTAODenoise1CS, {gd->srv_gtao_working[denoise_source].get()}, {gd->uav_gtao_working[denoise_source ^ 1].get()}, (w + 15) / 16, (h + 7) / 8);
+            denoise_source ^= 1;
          }
-         // Final denoiser writes the game's R8_UNORM AO target.
-         dispatch(kNameGTAODenoise2CS, {gd->srv_gtao_working[single_denoise ? 0 : 1].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
+         // Final denoiser writes the R8_UNORM AO target.
+         dispatch(kNameGTAODenoise2CS, {gd->srv_gtao_working[denoise_source].get()}, {uav_final.get()}, (w + 15) / 16, (h + 7) / 8);
 #if DEVELOPMENT
          QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", uav_final.get());
 #endif
@@ -3588,6 +3717,13 @@ public:
             uv_scale[0] = device_data.output_resolution.x / float(gd.render_size[0]);
             uv_scale[1] = device_data.output_resolution.y / float(gd.render_size[1]);
          }
+         // GT-VBAO's own target spans the same UVs as the game's it replaces (the whole of it, the rendered share), one pixel per
+         // scene pixel; the game binds its t0 per draw
+         if (gd.gtao_full_res_this_frame)
+         {
+            ID3D11ShaderResourceView* const srv_ao = gd.srv_gtao_final.get();
+            native_device_context->PSSetShaderResources(0, 1, &srv_ao);
+         }
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, uv_scale[0], uv_scale[1]);
          updated_cbuffers = true;
@@ -3652,6 +3788,7 @@ public:
             gd.mv_texture.reset();
             gd.mv_rtv.reset();
             gd.mv_uav.reset();
+            gd.mv_srv.reset();
          }
          gd.mv_depth_srv.reset();
          gd.mv_depth.reset();
@@ -3860,6 +3997,7 @@ public:
       gd.srv_gtao_depth.reset();
       gd.srv_gtao_normals.reset();
       gd.gtao_active_this_frame = false;
+      gd.gtao_full_res_this_frame = false;
       gd.hbao_stretched_this_frame = false;
       gd.hbao_stretch_failed = false;
       gd.bloom_scale_captured_this_frame = false; // Re-arms the bright pass capture.
