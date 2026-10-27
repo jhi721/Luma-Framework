@@ -1755,8 +1755,14 @@ class MassEffectLE final : public Game
          game_device_data.mv_camera = nullptr;
          game_device_data.mv_frame_index = cb_luma_global_settings.FrameIndex;
 #if DEVELOPMENT
-         game_device_data.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_objects.Current(), [](const auto& a, const auto& b)
-            { return PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones); });
+         // Every 30th frame, the count kept in between: it sorts every draw key's objects, which showed in CPU profiles
+         static uint32_t tiebreak_collisions = 0;
+         if (cb_luma_global_settings.FrameIndex % 30 == 0)
+         {
+            tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(game_device_data.mv_objects.Current(), [](const auto& a, const auto& b)
+               { return PatchedDraws::SameBytes(a.object, b.object) && PatchedDraws::SameBytes(a.bones, b.bones); });
+         }
+         game_device_data.mv_stats.tiebreak_collisions = tiebreak_collisions;
 #endif
          game_device_data.mv_objects.EndFrame(previous_valid);
       }
