@@ -8,8 +8,8 @@
 // - tex0 = an R32 copy of the scene depth (D32S8, standard Z), t1 = an RGBA8 copy of the depth prepass' view normals (ps_normal: n * 0.498 + 0.498),
 //   both made at that draw.
 // - The view space is the main camera's projection (the exe's camera slot 0, never jittered there), right-handed: XeGTAO's looks down +z.
-// - No TAA: NoiseIndex is frozen at 0 and denoise runs twice. GT-VBAO under DLAA or SMAA T2x (which average it over frames) takes one slice
-//   whose noise moves every frame instead (main.cpp's "YKR GT-VBAO Temporal Main Pass CS").
+// - No TAA: NoiseIndex is frozen at 0 and denoise runs twice. Under DLAA or SMAA T2x (which average it over frames) the noise moves every frame
+//   and denoise runs once; GT-VBAO then takes one slice (main.cpp's "YKR GT-VBAO Temporal Main Pass CS").
 // - The radius is the game's: fx_ssao_test samples two rings in the tangent plane at view distance max(c.z * noise, c.w * view z), c_ps_user[8]
 //   and [10] (the stage's, live), noise in [0, 1] (c.x on) or 1. XeGTAO spreads its steps over its radius as the noise spreads the game's, so its
 //   radius is the outer extent of both rings (as the Remastered Collection's matches ASSAO's).

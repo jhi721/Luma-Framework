@@ -91,6 +91,9 @@ namespace
    float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (view units, meters)
 #if DEVELOPMENT
    int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges
+   int g_gtao_temporal = 0;   // 0 = under DLAA or SMAA T2x (see "DrawXeGTAO()"), 1 = off, 2 = on
+#else
+   constexpr int g_gtao_temporal = 0;
 #endif
    // The draws of the HUD phases that "Hide Gameplay UI" keeps besides the screen effects (see "screen_effect_nodes"): phase 0x19's copy of the FXAA
    // output into the output size target ("FUN_140486d50": sys_2d_no_color + ps_texture, the bytecode of ps_flickerfree_fast; ps_texture also draws
@@ -1196,7 +1199,7 @@ public:
             &g_gtvbao_enable }});
       Mcp::RegisterValues({{"object_mv.match_distance", &g_object_mv_match_distance, 0.f, 10.f}, {"object_mv.max_distance", &g_object_mv_max_distance, 0.f, 100.f}, {"object_mv.rigid_match_distance", &g_object_mv_rigid_match_distance, 0.f, 10.f},
          {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
-      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
+      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_temporal", &g_gtao_temporal, 0, 2}});
       for (size_t i = 0; i < MV_COUNT; i++)
       {
          Mcp::RegisterCounter(object_motion_count_names[i], &object_motion_counts_frame[i]);
@@ -2187,9 +2190,10 @@ public:
 #else
       const float debug_view = 0.f;
 #endif
-      // GT-VBAO under a temporal anti-aliasing (DLAA, SMAA T2x): one slice, its noise moved every frame for the anti-aliasing to average
-      const bool temporal_gtvbao = g_gtvbao_enable && (game_device_data->dlaa_active.load(std::memory_order_relaxed) || game_device_data->t2x_active.load(std::memory_order_relaxed));
-      const float noise_index = (temporal_gtvbao ? float(device_data.present_count.load(std::memory_order_relaxed) % 64) : 0.f);
+      // Under a temporal anti-aliasing (DLAA, SMAA T2x) the noise moves every frame for it to average, with one denoise pass (Intel's XeGTAO.h with
+      // TAA), and GT-VBAO takes one slice; without one a moving pattern would boil, so it stays frozen and denoises twice
+      const bool temporal = (g_gtao_temporal ? g_gtao_temporal == 2 : (game_device_data->dlaa_active.load(std::memory_order_relaxed) || game_device_data->t2x_active.load(std::memory_order_relaxed)));
+      const float noise_index = (temporal ? float(device_data.present_count.load(std::memory_order_relaxed) % 64) : 0.f);
       // The power matching the game's SSAO darkening at YKR_GTAO_RADIUS_SCALE (see NOTES.md "Calibration"): XeGTAO 1.3 (an office, one scene);
       // GT-VBAO 1, its strength is its thickness (Luma_YKR_XeGTAO.hlsl). "g_gtao_final_value_power" scales it
       const float final_value_power = g_gtao_final_value_power * (g_gtvbao_enable ? 1.f : 1.3f);
@@ -2214,7 +2218,7 @@ public:
          return false;
       }
       auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
-      const std::array<uint32_t, dispatch_count> shader_hashes = {CompileTimeStringHash("YKR XeGTAO Prefilter Depths CS"), temporal_gtvbao ? CompileTimeStringHash("YKR GT-VBAO Temporal Main Pass CS") : (g_gtvbao_enable ? CompileTimeStringHash("YKR GT-VBAO Main Pass CS") : CompileTimeStringHash("YKR XeGTAO Main Pass CS")), CompileTimeStringHash("YKR XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("YKR XeGTAO Denoise Pass 2 CS")};
+      const std::array<uint32_t, dispatch_count> shader_hashes = {CompileTimeStringHash("YKR XeGTAO Prefilter Depths CS"), (temporal && g_gtvbao_enable) ? CompileTimeStringHash("YKR GT-VBAO Temporal Main Pass CS") : (g_gtvbao_enable ? CompileTimeStringHash("YKR GT-VBAO Main Pass CS") : CompileTimeStringHash("YKR XeGTAO Main Pass CS")), CompileTimeStringHash("YKR XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("YKR XeGTAO Denoise Pass 2 CS")};
       std::array<ID3D12PipelineState*, dispatch_count> pipelines = {};
       for (size_t i = 0; i < dispatch_count; i++)
       {
@@ -2283,7 +2287,7 @@ public:
       if (views_made)
       {
          // Every slot of a table holds a valid view of a resource in a state it allows; the unused ones repeat the dispatch's output (UAVs) and source (SRVs)
-         const std::array<std::array<reshade::api::resource_view, 2>, dispatch_count> srvs = {{{depth_srv, depth_srv}, {depth_mips_srv, normals_srv}, {working_srvs[0], working_srvs[0]}, {working_srvs[1], working_srvs[1]}}};
+         const std::array<std::array<reshade::api::resource_view, 2>, dispatch_count> srvs = {{{depth_srv, depth_srv}, {depth_mips_srv, normals_srv}, {working_srvs[0], working_srvs[0]}, {working_srvs[temporal ? 0 : 1], working_srvs[temporal ? 0 : 1]}}};
          const std::array<reshade::api::resource_view, dispatch_count> outputs = {mip_uavs[0], working_uavs[0], working_uavs[1], final_uav}; // The prefilter's are all the mips
          for (uint32_t i = 0; i < dispatch_count; i++)
          {
@@ -2314,6 +2318,9 @@ public:
       const std::array<std::array<uint32_t, 2>, dispatch_count> groups = {{{(width + 15) / 16, (height + 15) / 16}, {(width + 7) / 8, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}}};
       for (uint32_t i = 0; i < dispatch_count; i++)
       {
+         // The first denoiser is skipped when temporal: the final one reads the main pass' output
+         if (temporal && i == 2)
+            continue;
          cmd_list->barrier(outputs[i], at_rest, reshade::api::resource_usage::unordered_access);
          cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipelines[i])});
          cmd_list->push_constants(reshade::api::shader_stage::compute, pass.layout, 0, 0, uint32_t(std::size(constants)), constants);
@@ -2617,6 +2624,7 @@ public:
       {
          ImGui::SetTooltip("Draws diagnostics into the AO the materials multiply their ambient light by. Depth gradient flat or blocky = wrong input;\nNormals: camera-facing surfaces bright; AO x8 = spot broad over-occlusion.");
       }
+      ImGui::Combo("GTAO Temporal Noise", &g_gtao_temporal, "Auto (DLAA/SMAA T2x)\0Off (frozen, 2 denoise passes)\0On (frame % 64, 1 denoise pass)\0");
 #endif
       ImGui::EndDisabled();
 #endif
