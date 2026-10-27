@@ -164,7 +164,7 @@ void main(
       r1.w = cmp(g_vEtcEffect.w < r1.w);
       r1.w = r1.w ? g_vEtcEffect.z : 0;
       r0.xzw = r3.xyz * r0.xzw;
-      r2.xyz = r0.xzw * r1.www * LumaSettings.GameSettings.LensFlareIntensity + r2.xyz; // Luma: flare intensity slider
+      r2.xyz = r0.xzw * r1.www + r2.xyz;
    }
    if (r0.y != 0)
    {
@@ -182,8 +182,7 @@ void main(
       r0.x = r0.x * r0.x;
       r0.x = r0.z ? r0.x : 1;
       r0.x = r0.x * r0.y;
-      // Luma: vignette intensity slider scales its blend weight
-      r0.w = g_vLimbDarkenningInfo.w * LumaSettings.GameSettings.VignetteIntensity;
+      r0.w = g_vLimbDarkenningInfo.w;
       r0.x = r0.x * r0.w + (1.0 - r0.w);
       r2.xyz = r2.xyz * r0.xxx;
    }

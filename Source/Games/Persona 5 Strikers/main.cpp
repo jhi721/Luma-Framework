@@ -1399,8 +1399,6 @@ public:
 
       default_luma_global_game_settings.Dithering = 1.f;
       default_luma_global_game_settings.SMAAEnable = 1.f;
-      default_luma_global_game_settings.VignetteIntensity = 1.f;
-      default_luma_global_game_settings.LensFlareIntensity = 1.f;
       default_luma_global_game_settings.Exposure = 1.f;
       default_luma_global_game_settings.ColorGradingIntensity = 1.f;
       default_luma_global_game_settings.Saturation = 1.f;
@@ -3361,8 +3359,6 @@ public:
       auto& settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", settings.SMAAEnable);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", settings.RCASSharpness);
-      reshade::get_config_value(nullptr, NAME, "VignetteIntensity", settings.VignetteIntensity);
-      reshade::get_config_value(nullptr, NAME, "LensFlareIntensity", settings.LensFlareIntensity);
       reshade::get_config_value(nullptr, NAME, "Exposure", settings.Exposure);
       reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", settings.ColorGradingIntensity);
       reshade::get_config_value(nullptr, NAME, "Saturation", settings.Saturation);
@@ -3435,8 +3431,6 @@ public:
 #endif
 
       ImGui::SeparatorText("Effects");
-      DrawSettingSlider("Vignette Intensity", "VignetteIntensity", &settings.VignetteIntensity, default_luma_global_game_settings.VignetteIntensity, 0.f, 1.f, "Scales the game's vignette darkening (1 = vanilla, 0 = none).");
-      DrawSettingSlider("Lens Flare Intensity", "LensFlareIntensity", &settings.LensFlareIntensity, default_luma_global_game_settings.LensFlareIntensity, 0.f, 2.f, "Lens-flare / glare strength (1 = vanilla, 0 = off).");
       DrawSettingCheckbox("Dithering", "Dithering", &settings.Dithering, default_luma_global_game_settings.Dithering, "Reduces gradient banding.");
 
       ImGui::SeparatorText("UI");

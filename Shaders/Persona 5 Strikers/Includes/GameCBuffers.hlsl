@@ -12,8 +12,6 @@ struct LumaGameSettings
    float Dithering;  // 0/1
    float SMAAEnable; // 0/1
    float RCASSharpness;
-   float VignetteIntensity;      // 1 = vanilla, 0 = none
-   float LensFlareIntensity;     // 1 = vanilla, 0 = off
    float Exposure;               // 1 = vanilla. Scene multiplier before the LUT (SDR + HDR)
    float ColorGradingIntensity;  // 1 = vanilla, 0 = the LUT's gray tone curve only, by luminance (SDR + HDR)
    float Saturation;             // 1 = vanilla. PsychoV31's purity, HDR only
