@@ -3446,14 +3446,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // The only resource still clipping the HDR signal is dgVoodoo's swapchain-resolution present-blit
       // intermediate. Upgrade it INDIRECTLY: it is wrapper-internal, and changing its creation format breaks
       // the translator's bookkeeping, giving a black screen even in menus.
-      // One format plus the size filters keeps this to a single extra fp16 mirror at 4K; a broad list hit
-      // bad_alloc in this 32-bit process. Fullscreen only: that path's intermediate is r8g8b8a8_typeless.
+      // Upgrade by writer, not by format: the G-buffer (albedo, specular, normals) and the decals are r8g8b8a8_typeless at the
+      // swapchain size too, and fp16 mirrors of them drop the UNORM clamp the material shaders rely on (albedo down to -0.95,
+      // specular above 1): characters looked oily (2026-10-27, user-confirmed with the upgrade off).
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-      enable_indirect_texture_format_upgrades = true; // creation-time mirrors, substituted at bind
+      enable_indirect_texture_format_upgrades = true; // mirrors, substituted at bind
+      texture_format_upgrades_on_creation = false;    // only the writers below (the format list and filters still gate their mirrors)
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies;
       texture_upgrade_formats = {
-         reshade::api::format::r8g8b8a8_typeless, // dgVoodoo's present-blit intermediates (narrow list: 32-bit VA budget)
+         reshade::api::format::r8g8b8a8_typeless, // dgVoodoo's present-blit intermediate
       };
+      // dgVoodoo's own present blit (a bare sample_l of the fp16 canvas): its bytecode is identical in 2.87.x and 2.81.3
+      auto_texture_format_upgrade_shader_hashes[0x2749AFD8] = {.rtv_slots = {0}};
+      // The video pass, so Video AutoHDR's range survives whatever target it draws into
+      auto_texture_format_upgrade_shader_hashes[0x30BE6D87] = {.rtv_slots = {0}};
+      auto_texture_format_upgrade_shader_hashes[0xA0C6F05C] = {.rtv_slots = {0}};
       // "No1Px" as in BL2, ME1 and MoHA: dgVoodoo fills every unused SRV slot with 1x1 placeholders (devkit: a 1x1
       // r8g8b8a8 texture and a 1x1 cube on every post draw), and a 1x1 trivially passes the aspect filter, so core would
       // mirror a typeless one too (and assert in DEVELOPMENT).
