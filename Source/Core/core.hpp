@@ -14064,6 +14064,7 @@ namespace
                lock.lock();
                ASSERT(!device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle)); // The game re-used the ptr (can rarely happen), and we haven't cleared our mirrored verson yet
                device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.emplace(resource.handle, ResourceUpgradeManager::IndirectUpgradedResource{ mirrored_upgraded_resource.handle, texture_scaled, desc.texture.width, desc.texture.height, upgraded_desc.texture.width, upgraded_desc.texture.height });
+               device_data.resource_upgrades.any_mirror.store(true, std::memory_order_release);
             }
             if (new_initial_data_ptr)
                delete[] static_cast<uint8_t*>(new_initial_data_ptr->data);
@@ -14675,7 +14676,11 @@ namespace
             break;
 
          reshade::api::descriptor_table_update replaced_update = update;
-         std::vector<reshade::api::resource_view> replaced_descriptors;
+         // On the stack: games bind views every draw, and a heap copy per replaced bind showed in CPU profiles (MELE). D3D11 binds at
+         // most 128 SRVs (or 64 UAVs) per call.
+         std::array<reshade::api::resource_view, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> replaced_descriptors;
+         if (update.count > replaced_descriptors.size())
+            break;
          bool any_replaced = false;
          bool any_upgraded = false;
 
@@ -14683,6 +14688,9 @@ namespace
 
          {
             DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+            // Only replacements to do, and nothing to replace a view with yet
+            if (enable_chain_indirect_texture_format_upgrades < ChainTextureFormatUpgradesType::DirectAndIndirectDependencies && !device_data.resource_upgrades.any_mirror.load(std::memory_order_acquire))
+               break;
             std::shared_lock lock_device_read(device_data.mutex);
 
             const reshade::api::resource_view* original_rvs = (reshade::api::resource_view*)update.descriptors;
@@ -14741,10 +14749,7 @@ namespace
                      // Copy the descriptor array before replacing any view: in DX11 the event's descriptor pointer aliases
                      // the game's own bind array (reshade reinterprets the original objects array), so writing mirror view
                      // handles through it would leak our pointers into the game's memory (stale-pointer hazards downstream).
-                     // Do this lazily because it's very expensive.
-                     replaced_descriptors = std::vector<reshade::api::resource_view>(
-                        reinterpret_cast<const reshade::api::resource_view*>(update.descriptors),
-                        reinterpret_cast<const reshade::api::resource_view*>(update.descriptors) + update.count);
+                     std::copy_n(original_rvs, update.count, replaced_descriptors.data());
                      replaced_update.descriptors = replaced_descriptors.data();
                      replaced_rvs = (reshade::api::resource_view*)replaced_update.descriptors;
                   }
@@ -14881,11 +14886,12 @@ namespace
          // Copy the sampler array before replacing any sampler: reshade
          // reinterprets the game's own bind array as the descriptor pointer (the same
          // aliasing as the SRV/UAV case above), so an in-place write would leak custom
-         // sampler handles into the game's memory.
+         // sampler handles into the game's memory. On the stack, as every sampler bind runs this.
          reshade::api::descriptor_table_update custom_update = update;
-         std::vector<reshade::api::sampler> replaced_samplers(
-            reinterpret_cast<const reshade::api::sampler*>(update.descriptors),
-            reinterpret_cast<const reshade::api::sampler*>(update.descriptors) + update.count);
+         std::array<reshade::api::sampler, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> replaced_samplers;
+         if (update.count > replaced_samplers.size())
+            break;
+         std::copy_n(static_cast<const reshade::api::sampler*>(update.descriptors), update.count, replaced_samplers.data());
          custom_update.descriptors = replaced_samplers.data();
          bool any_modified = false;
          std::shared_lock shared_lock_samplers(s_mutex_samplers);
