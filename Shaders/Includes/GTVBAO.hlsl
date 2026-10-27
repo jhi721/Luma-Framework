@@ -231,6 +231,11 @@ float3 GTVBAO_SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
    return frac(0.5 + index * float3(0.8191725133961645, 0.6710436067037893, 0.5497004779019703));
 }
 
+// A game's own per pixel noise (slice, step and sector jitter in [0, 1))
+#ifndef GTVBAO_NOISE
+#define GTVBAO_NOISE(pixCoord) GTVBAO_SpatioTemporalNoise(pixCoord, uint(NoiseIndexRT))
+#endif
+
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)] void gtvbao_main_pass_cs(uint2 dtid : SV_DispatchThreadID) {
    // tex0 = prefiltered viewspace depth MIP pyramid (our R32F)
    // smp = point-clamp
@@ -240,7 +245,7 @@ float3 GTVBAO_SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
 #else
    const float3 viewspaceNormal = XeGTAO_LoadViewspaceNormal(dtid);
 #endif
-   GTVBAO_MainPass(dtid, GTVBAO_SpatioTemporalNoise(dtid, uint(NoiseIndexRT)), viewspaceNormal, tex0, smp, ao_term_and_edges);
+   GTVBAO_MainPass(dtid, GTVBAO_NOISE(dtid), viewspaceNormal, tex0, smp, ao_term_and_edges);
 }
 
 #endif // LUMA_GTVBAO_HLSL
