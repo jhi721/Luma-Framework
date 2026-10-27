@@ -6396,7 +6396,9 @@ namespace
          bind_cache = {};
          bind_cache_generation = generation;
       }
-      BindCacheEntry& bind_cache_entry = bind_cache[(pipeline_handle >> 4) % bind_cache.size()]; // Native objects are at least 16 byte aligned
+      // A multiply spreads the handles: native objects are allocated at large alignments, so their low bits alone collided (and took the lock)
+      BindCacheEntry& bind_cache_entry = bind_cache[size_t((pipeline_handle * 0x9E3779B97F4A7C15ull) >> 56)];
+      static_assert(std::tuple_size_v<decltype(bind_cache)> == 256);
       if (bind_cache_entry.pipeline_handle == pipeline_handle)
       {
          return bind_cache_entry.cached_pipeline;
@@ -7811,6 +7813,8 @@ namespace
 
       const Shader::CachedPipeline* cached_pipeline = nullptr;
       uint64_t cached_pipeline_shader_hash = SHADER_HASH_NONE;
+      // Read before the lookup: a destruction in between makes the stored generation stale, never a stale pipeline current
+      const uint32_t lookup_generation = pipeline_cache_generation;
 
       if (pipeline.handle != 0)
       {
@@ -7843,6 +7847,8 @@ namespace
       {
          ASSERT_ONCE(stages == reshade::api::pipeline_stage::compute_shader || stages == reshade::api::pipeline_stage::all); // Make sure only one stage happens at a time (it does in DX11)
          cmd_list_data.pipeline_state_original_compute_shader = pipeline;
+         cmd_list_data.bound_compute_cached_pipeline = cached_pipeline;
+         cmd_list_data.bound_compute_cached_pipeline_generation = lookup_generation;
          compute_changed = true;
          // Expose the clone handle for this stage (0 = no clone), gated
          // by the master switches (per-hash defaults don't gate: per-draw overrides
@@ -7900,6 +7906,8 @@ namespace
       {
          ASSERT_ONCE(stages == reshade::api::pipeline_stage::pixel_shader || stages == reshade::api::pipeline_stage::all); // Make sure only one stage happens at a time (it does in DX11)
          cmd_list_data.pipeline_state_original_pixel_shader = pipeline;
+         cmd_list_data.bound_pixel_cached_pipeline = cached_pipeline;
+         cmd_list_data.bound_pixel_cached_pipeline_generation = lookup_generation;
          graphics_changed = true;
          // Expose the clone handle for this stage (0 = no clone), gated
          // by the master switches (per-hash defaults don't gate: per-draw overrides
@@ -8045,6 +8053,9 @@ namespace
             // TODO: have a high performance mode that swaps the original shader binary with the custom one on creation, so we don't have to analyze shader binding calls (probably wouldn't really speed up performance anyway).
             // This would also help save some memory in x86 games where we keep all shaders binaries in memory ("custom_shaders_cache::code").
             reshade::api::pipeline pipeline_to_bind = {};
+            // Most of a game's shaders have no clone: nothing below changes for them (the stage's "pipeline_state_has_custom_*" is already
+            // "cloned" above), and skipping it skips the lock on most binds
+            if (cached_pipeline->cloned)
             {
                std::shared_lock lock(s_mutex_generic);
                // Bind-time default: clone when cloned && custom_shaders_enabled &&
@@ -12876,19 +12887,21 @@ namespace
    bool HandlePipelineRedirections(ID3D11DeviceContext* native_device_context, const DeviceData& device_data, const CommandListData& cmd_list_data, bool is_dispatch, std::function<void()>& draw_func)
    {
       CachedPipeline::RedirectData redirect_data;
-      if (is_dispatch)
+      // The pipeline "OnBindPipeline()" found, unless one was destroyed since (then the locked lookup)
+      const CachedPipeline* const bound_pipeline = (is_dispatch ? cmd_list_data.bound_compute_cached_pipeline : cmd_list_data.bound_pixel_cached_pipeline);
+      const uint32_t bound_generation = (is_dispatch ? cmd_list_data.bound_compute_cached_pipeline_generation : cmd_list_data.bound_pixel_cached_pipeline_generation);
+      if (bound_generation == pipeline_cache_generation)
       {
-         const std::shared_lock lock(s_mutex_generic);
-         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(cmd_list_data.pipeline_state_original_compute_shader.handle);
-         if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr)
+         if (bound_pipeline)
          {
-            redirect_data = pipeline_pair->second->redirect_data;
+            redirect_data = bound_pipeline->redirect_data;
          }
       }
       else
       {
+         const uint64_t pipeline_handle = (is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader.handle : cmd_list_data.pipeline_state_original_pixel_shader.handle);
          const std::shared_lock lock(s_mutex_generic);
-         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(cmd_list_data.pipeline_state_original_pixel_shader.handle);
+         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
          if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr)
          {
             redirect_data = pipeline_pair->second->redirect_data;

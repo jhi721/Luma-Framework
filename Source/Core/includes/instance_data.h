@@ -442,6 +442,12 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    bool pipeline_state_has_custom_pixel_shader = false;
    bool pipeline_state_has_custom_graphics_shader = false;
    bool pipeline_state_has_custom_compute_shader = false;
+   // D3D11: the cached pipelines bound to the pixel and compute stages, valid while "pipeline_cache_generation" still equals the one read
+   // before each was looked up (a pipeline destruction raises it), so the draws read their redirections without "s_mutex_generic"
+   const Shader::CachedPipeline* bound_pixel_cached_pipeline = nullptr;
+   const Shader::CachedPipeline* bound_compute_cached_pipeline = nullptr;
+   uint32_t bound_pixel_cached_pipeline_generation = UINT32_MAX;
+   uint32_t bound_compute_cached_pipeline_generation = UINT32_MAX;
 
    // Determined by "draw_callbacks_by_shader_hashes" when binding shaders
    DrawOrDispatchCallback draw_callback = nullptr;
@@ -467,6 +473,10 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       pipeline_state_has_custom_pixel_shader = false;
       pipeline_state_has_custom_graphics_shader = false;
       pipeline_state_has_custom_compute_shader = false;
+      bound_pixel_cached_pipeline = nullptr;
+      bound_compute_cached_pipeline = nullptr;
+      bound_pixel_cached_pipeline_generation = UINT32_MAX;
+      bound_compute_cached_pipeline_generation = UINT32_MAX;
       draw_callback = nullptr;
       dispatch_callback = nullptr;
       is_known_ui_shader_bound = false;
