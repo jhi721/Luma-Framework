@@ -33,6 +33,8 @@ namespace
    // SMAA's scratch is freed after this many frames without SMAA (DLSS/FSR antialias), the copies after as many without SMAA or RCAS
    // (~10 s at the game's 60 fps cap)
    constexpr uint32_t smaa_idle_release_frames = 600;
+   // Presents with DLSS/FSR off before their motion vectors, upscaled output and output resolution post targets are freed
+   constexpr uint32_t sr_release_presents = 8;
    // PostEffect3 ApplyFxaa{,Repair,Console,Quality}PS: the engine's FXAA (plus radial blur), from an intermediate composite target into
    // the swapchain. Never captured yet.
    const ShaderHashesList shader_hashes_apply_fxaa = {.pixel_shaders = {0x0B6569A5, 0xC8A7BA1C, 0x95F3321A, 0xED7941FD}};
@@ -388,6 +390,9 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // The upscaler drew the last presented frame: the jitter only goes where it gets resolved (a scene the split refuses, e.g. an
    // unexpected size or format, would otherwise just shake)
    std::atomic<bool> sr_drew = false;
+   // Present thread only: presents since "sr_active" went false; the upscaler's inputs and output resolution targets are freed at
+   // "sr_release_presents" (see "OnPresent")
+   uint32_t sr_inactive_presents = 0;
    // The reasons a scene frame wasn't split for the upscaler, each logged once (bits as in the "[P5S SR]" warning's legend)
    std::atomic<uint32_t> sr_split_refusals_logged = 0;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
@@ -3184,6 +3189,49 @@ public:
       game_device_data.sr_drew = device_data.has_drawn_sr.load();
       game_device_data.sr_active = LatchSRFrame(device_data);
       game_device_data.mv_presents++;
+      // DLSS/FSR off (None, or suppressed): Core freed the upscaler and its output, ours go too, recreated by the next scene frame with
+      // them on. Not at once: the scene and post record on worker threads that read "sr_active" per draw, so a frame recorded across
+      // the latch may still use them; past a few presents none does.
+      if (game_device_data.sr_active)
+      {
+         game_device_data.sr_inactive_presents = 0;
+      }
+      else if (++game_device_data.sr_inactive_presents == sr_release_presents)
+      {
+         {
+            const std::unique_lock lock(game_device_data.mv_mutex);
+            game_device_data.mv_texture.reset();
+            game_device_data.mv_rtv.reset();
+            game_device_data.mv_uav.reset();
+         }
+         game_device_data.mv_scene_depth.reset();
+         game_device_data.mv_scene_depth_id = nullptr;
+         game_device_data.mv_scene_depth_srv.reset();
+         game_device_data.mv_frame_depth.reset();
+         game_device_data.mv_previous_resources.clear();
+         game_device_data.mv_previous_globals_buffers.clear();
+         game_device_data.mv_jitter_buffer.reset();
+         game_device_data.mv_fill_buffer.reset();
+         {
+            const std::lock_guard lock(game_device_data.sr_mutex);
+            game_device_data.sr_split = {};
+            game_device_data.sr_split_context = 0;
+            game_device_data.sr_pending_splits.clear();
+         }
+         game_device_data.sr_upscaling_context = nullptr;
+         game_device_data.sr_upscaled_output.reset();
+         game_device_data.sr_drawn_output.reset();
+         game_device_data.sr_upscaled_output_rtv.reset();
+         game_device_data.sr_upscaled_output_srv.reset();
+         game_device_data.sr_upscaled_canvas_rtv.reset();
+         game_device_data.sr_upscaled_canvas_srv.reset();
+         game_device_data.post_redirect = false;
+         game_device_data.post_scene.reset();
+         game_device_data.post_scene_rtv.reset();
+         game_device_data.post_targets.clear();
+         game_device_data.post_views.clear();
+         game_device_data.post_sizes = {};
+      }
       // A letterboxed target's aspect ratio (e.g. 2.4 at 3840x1600) isn't the swapchain's: the targets made after a rebuild are upgraded
       // at it too (the scene, for the upscaling, and the target itself, for HDR)
       {
@@ -3220,6 +3268,12 @@ public:
          };
          std::erase_if(game_device_data.layer_outputs, stale);
          std::erase_if(game_device_data.layer_composed, stale);
+         // Its only reader is a layer's exposure: freed once the menu or pause screen closes
+         if (game_device_data.layer_outputs.empty())
+         {
+            game_device_data.layer_histogram_rtv.reset();
+            game_device_data.layer_histogram_srv.reset();
+         }
       }
       {
          // The main menu after 30 presents (loading screens and fades between keep the game's scale), until the scene draws again. Scene
