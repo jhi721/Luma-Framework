@@ -728,6 +728,9 @@ namespace PatchedDraws
          {
             nearest = distance;
             match = &candidate;
+            // Nothing is nearer, and a later tie wouldn't replace it
+            if (distance == 0.f)
+               break;
          }
       }
       return match;
