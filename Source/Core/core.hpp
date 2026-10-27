@@ -12014,7 +12014,7 @@ namespace
          }
          else
          {
-            if (!cmd_list_data.any_dispatch_done)
+            if (!cmd_list_data.any_draw_done)
             {
                ASSERT_ONCE_MSG(cmd_list_data.pipeline_state_original_graphics_shader_hashes.HasAny(reshade::api::shader_stage::pixel) || cmd_list_data.pipeline_state_original_graphics_shader_hashes.HasAny(reshade::api::shader_stage::vertex),
                   "A draw was triggered on a fresh deferred device context without previously setting a vertex/pixel shader, it could be that the engine relies on whatever pipeline state will be set on the immediate device context at the time of joining the deferred context");
