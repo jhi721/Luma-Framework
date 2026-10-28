@@ -9,6 +9,9 @@
 // each successful create into a thread local. ReShade fires "init_pipeline" on the same thread right after the native call, which
 // takes the copy. The creates nobody takes (ReShade's own, the ones other add-ons rebuild, other IIDs, 9on12/11on12 devices) are
 // replaced by the next one, and "Take()" never matches them to another pipeline.
+// The pipelines a game loads from its "ID3D12PipelineLibrary" (e.g. Yakuza Kiwami R's pipeline cache from its second launch on) never
+// reach "CreatePipelineState": "Load{Graphics,Compute}Pipeline" and "LoadPipeline" are hooked the same way, ReShade fires "init_pipeline"
+// after those too.
 
 #include <algorithm>
 #include <array>
@@ -22,11 +25,13 @@
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <Windows.h>
 #include <d3d12.h>
+#include <include/reshade.hpp>
 #include <source/com_ptr.hpp>
 
 #include "minhook.h"
@@ -242,48 +247,167 @@ namespace D3D12PsoCapture
       return stream;
    }
 
+   template <typename T>
+   void Append(std::vector<std::byte>* stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const T& data)
+   {
+      const Subobject<T> subobject = {.type = type, .data = data};
+      const auto* const bytes = reinterpret_cast<const std::byte*>(&subobject);
+      stream->insert(stream->end(), bytes, bytes + sizeof(subobject));
+   }
+
+   // The stream "ID3D12Device2::CreatePipelineState" takes for a legacy graphics or compute desc, as ReShade repacks the legacy creates
+   // (the cached blob left out, as "Copy()" does). It points at what the desc points at.
+   inline std::vector<std::byte> ToStream(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc)
+   {
+      std::vector<std::byte> stream;
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, desc.pRootSignature);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, desc.PS);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, desc.DS);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, desc.HS);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, desc.GS);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, desc.StreamOutput);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, desc.BlendState);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, desc.SampleMask);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, desc.RasterizerState);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, desc.DepthStencilState);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, desc.InputLayout);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, desc.IBStripCutValue);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, desc.PrimitiveTopologyType);
+      D3D12_RT_FORMAT_ARRAY formats = {.NumRenderTargets = desc.NumRenderTargets};
+      std::copy_n(desc.RTVFormats, 8, formats.RTFormats);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, formats);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, desc.DSVFormat);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, desc.SampleDesc);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, desc.NodeMask);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, desc.Flags);
+      return stream;
+   }
+   inline std::vector<std::byte> ToStream(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc)
+   {
+      std::vector<std::byte> stream;
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, desc.pRootSignature);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, desc.CS);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, desc.NodeMask);
+      Append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, desc.Flags);
+      return stream;
+   }
+
    using CreatePipelineStateFunction = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+   using LoadGraphicsPipelineFunction = HRESULT(STDMETHODCALLTYPE*)(ID3D12PipelineLibrary*, LPCWSTR, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+   using LoadComputePipelineFunction = HRESULT(STDMETHODCALLTYPE*)(ID3D12PipelineLibrary*, LPCWSTR, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+   using LoadPipelineFunction = HRESULT(STDMETHODCALLTYPE*)(ID3D12PipelineLibrary1*, LPCWSTR, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
    // "ID3D12Device2::CreatePipelineState" follows IUnknown (3 methods), ID3D12Object (4), ID3D12Device (37) and ID3D12Device1 (3)
    constexpr size_t CREATE_PIPELINE_STATE_SLOT = 47;
+   // "ID3D12PipelineLibrary::LoadGraphicsPipeline" follows IUnknown (3), ID3D12Object (4), ID3D12DeviceChild (1) and "StorePipeline",
+   // "LoadComputePipeline" comes next; "ID3D12PipelineLibrary1::LoadPipeline" follows ID3D12PipelineLibrary's 5 methods
+   constexpr size_t LOAD_GRAPHICS_PIPELINE_SLOT = 9;
+   constexpr size_t LOAD_COMPUTE_PIPELINE_SLOT = 10;
+   constexpr size_t LOAD_PIPELINE_SLOT = 13;
 
-   using Hook = D3D12ProxyHook::HookedFunction<CreatePipelineStateFunction>;
-   // The functions the devices' vtables lead "CreatePipelineState" to, each hooked once per process. Another device class has its own
-   // (a debug layer's, another D3D12Core's), and so does a module that patches the runtime's vtable after we hooked the function in it.
-   // Such a patch calls the function it replaced, so its creates are captured twice, the outer capture (the stream ReShade passed) last.
+   // The functions the vtables lead a create or load to, each hooked once per process. Another device class has its own (a debug
+   // layer's, another D3D12Core's), and so does a module that patches the runtime's vtable after we hooked the function in it. Such a
+   // patch calls the function it replaced, so its creates are captured twice, the outer capture (the stream ReShade passed) last.
    constexpr size_t MAX_HOOKS = 4;
+   template <typename Function>
    struct Hooks
    {
       std::shared_mutex mutex;
-      std::array<Hook, MAX_HOOKS> slots;
+      std::array<D3D12ProxyHook::HookedFunction<Function>, MAX_HOOKS> slots;
    };
-   inline Hooks hooks;
-   // The last pipeline this thread created through a hook, if it could be copied
+   inline Hooks<CreatePipelineStateFunction> create_hooks;
+   inline Hooks<LoadGraphicsPipelineFunction> load_graphics_hooks;
+   inline Hooks<LoadComputePipelineFunction> load_compute_hooks;
+   inline Hooks<LoadPipelineFunction> load_hooks;
+   // The last pipeline this thread created or loaded through a hook, if it could be copied
    inline thread_local std::unique_ptr<Stream> pending;
    // Set while this thread creates a pipeline of ours, which isn't to be captured
    inline thread_local bool creating_own = false;
 
-   // One per hook, as each calls its own trampoline
-   template <size_t Index>
-   HRESULT STDMETHODCALLTYPE Detour(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pipeline)
+   inline void Capture(HRESULT result, const D3D12_PIPELINE_STATE_STREAM_DESC& desc, void** pipeline)
    {
-      const HRESULT result = hooks.slots[Index].original(device, desc, riid, pipeline);
-      if (SUCCEEDED(result) && desc && pipeline && *pipeline && !creating_own)
+      if (SUCCEEDED(result) && pipeline && *pipeline && !creating_own)
       {
-         pending = Copy(*desc);
+         pending = Copy(desc);
          if (pending)
          {
             pending->pipeline = static_cast<const ID3D12PipelineState*>(*pipeline);
          }
       }
+   }
+
+   // One per hook, as each calls its own trampoline
+   template <size_t Index>
+   HRESULT STDMETHODCALLTYPE CreateDetour(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pipeline)
+   {
+      const HRESULT result = create_hooks.slots[Index].original(device, desc, riid, pipeline);
+      if (desc)
+      {
+         Capture(result, *desc, pipeline);
+      }
       return result;
    }
-   constexpr auto DETOURS = []<size_t... Indices>(std::index_sequence<Indices...>)
+   template <size_t Index, typename Desc>
+   HRESULT STDMETHODCALLTYPE LoadLegacyDetour(ID3D12PipelineLibrary* library, LPCWSTR name, const Desc* desc, REFIID riid, void** pipeline)
    {
-      return std::array<CreatePipelineStateFunction, MAX_HOOKS>{&Detour<Indices>...};
+      HRESULT result;
+      if constexpr (std::is_same_v<Desc, D3D12_GRAPHICS_PIPELINE_STATE_DESC>)
+      {
+         result = load_graphics_hooks.slots[Index].original(library, name, desc, riid, pipeline);
+      }
+      else
+      {
+         result = load_compute_hooks.slots[Index].original(library, name, desc, riid, pipeline);
+      }
+      if (desc && SUCCEEDED(result))
+      {
+         std::vector<std::byte> stream = ToStream(*desc);
+         Capture(result, {.SizeInBytes = stream.size(), .pPipelineStateSubobjectStream = stream.data()}, pipeline);
+      }
+      return result;
+   }
+   template <size_t Index>
+   HRESULT STDMETHODCALLTYPE LoadDetour(ID3D12PipelineLibrary1* library, LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pipeline)
+   {
+      const HRESULT result = load_hooks.slots[Index].original(library, name, desc, riid, pipeline);
+      if (desc)
+      {
+         Capture(result, *desc, pipeline);
+      }
+      return result;
+   }
+   constexpr auto CREATE_DETOURS = []<size_t... Indices>(std::index_sequence<Indices...>)
+   {
+      return std::array<CreatePipelineStateFunction, MAX_HOOKS>{&CreateDetour<Indices>...};
+   }(std::make_index_sequence<MAX_HOOKS>());
+   constexpr auto LOAD_GRAPHICS_DETOURS = []<size_t... Indices>(std::index_sequence<Indices...>)
+   {
+      return std::array<LoadGraphicsPipelineFunction, MAX_HOOKS>{&LoadLegacyDetour<Indices, D3D12_GRAPHICS_PIPELINE_STATE_DESC>...};
+   }(std::make_index_sequence<MAX_HOOKS>());
+   constexpr auto LOAD_COMPUTE_DETOURS = []<size_t... Indices>(std::index_sequence<Indices...>)
+   {
+      return std::array<LoadComputePipelineFunction, MAX_HOOKS>{&LoadLegacyDetour<Indices, D3D12_COMPUTE_PIPELINE_STATE_DESC>...};
+   }(std::make_index_sequence<MAX_HOOKS>());
+   constexpr auto LOAD_DETOURS = []<size_t... Indices>(std::index_sequence<Indices...>)
+   {
+      return std::array<LoadPipelineFunction, MAX_HOOKS>{&LoadDetour<Indices>...};
    }(std::make_index_sequence<MAX_HOOKS>());
 
-   // True if the device's pipelines are captured: its function is hooked, by now or for an earlier device. False if MinHook failed or
-   // the hooks are all taken.
+   // True if "target" is hooked, by now or for an earlier device. False if MinHook failed or the hooks are all taken.
+   template <typename Function>
+   bool Hook(Hooks<Function>* hooks, void* target, const std::array<Function, MAX_HOOKS>& detours)
+   {
+      const std::unique_lock lock(hooks->mutex);
+      if (std::ranges::find(hooks->slots, target, &D3D12ProxyHook::HookedFunction<Function>::target) != hooks->slots.end())
+      {
+         return true;
+      }
+      const auto hook = std::ranges::find(hooks->slots, nullptr, &D3D12ProxyHook::HookedFunction<Function>::target);
+      return hook != hooks->slots.end() && D3D12ProxyHook::Attach(&*hook, target, detours[hook - hooks->slots.begin()]);
+   }
+
+   // True if the device's created pipelines are captured. Its loaded ones too where it makes pipeline libraries: the load functions are
+   // found in the vtable of an empty library of ours (a device or driver without them has nothing to load).
    inline bool Install(ID3D12Device* native_device)
    {
       com_ptr<ID3D12Device2> device2;
@@ -291,25 +415,46 @@ namespace D3D12PsoCapture
       {
          return false;
       }
-      void* const target = (*reinterpret_cast<void***>(device2.get()))[CREATE_PIPELINE_STATE_SLOT];
-      const std::unique_lock lock(hooks.mutex);
-      if (std::ranges::find(hooks.slots, target, &Hook::target) != hooks.slots.end())
+      if (!Hook(&create_hooks, (*reinterpret_cast<void***>(device2.get()))[CREATE_PIPELINE_STATE_SLOT], CREATE_DETOURS))
       {
-         return true;
+         return false;
       }
-      const auto hook = std::ranges::find(hooks.slots, nullptr, &Hook::target);
-      return hook != hooks.slots.end() && D3D12ProxyHook::Attach(&*hook, target, DETOURS[hook - hooks.slots.begin()]);
+      // An empty blob makes an empty library (documented). Without library support (DXGI_ERROR_NOT_SUPPORTED) the game can't load any.
+      // "ID3D12PipelineLibrary1" (LoadPipeline) is newer than the library itself, a runtime can lack it.
+      com_ptr<ID3D12PipelineLibrary> library;
+      if (SUCCEEDED(device2->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library))))
+      {
+         void** const library_vtable = *reinterpret_cast<void***>(library.get());
+         bool hooked = Hook(&load_graphics_hooks, library_vtable[LOAD_GRAPHICS_PIPELINE_SLOT], LOAD_GRAPHICS_DETOURS);
+         hooked &= Hook(&load_compute_hooks, library_vtable[LOAD_COMPUTE_PIPELINE_SLOT], LOAD_COMPUTE_DETOURS);
+         if (com_ptr<ID3D12PipelineLibrary1> library1; SUCCEEDED(library->QueryInterface(&library1)))
+         {
+            hooked &= Hook(&load_hooks, (*reinterpret_cast<void***>(library1.get()))[LOAD_PIPELINE_SLOT], LOAD_DETOURS);
+         }
+         if (!hooked)
+         {
+            reshade::log::message(reshade::log::level::warning, "[PSO capture] ID3D12PipelineLibrary's loads aren't hooked, so the shader replacements of the pipelines the game loads from a library will rebuild them through ReShade");
+         }
+      }
+      return true;
    }
 
    // False if another module hooked over one (see "D3D12ProxyHook::Detach()")
    inline bool Remove()
    {
-      const std::unique_lock lock(hooks.mutex);
       bool removed_all = true;
-      for (Hook& hook : hooks.slots)
+      const auto detach = [&removed_all](auto* hooks)
       {
-         removed_all &= D3D12ProxyHook::Detach(&hook);
-      }
+         const std::unique_lock lock(hooks->mutex);
+         for (auto& hook : hooks->slots)
+         {
+            removed_all &= D3D12ProxyHook::Detach(&hook);
+         }
+      };
+      detach(&create_hooks);
+      detach(&load_graphics_hooks);
+      detach(&load_compute_hooks);
+      detach(&load_hooks);
       return removed_all;
    }
 
