@@ -17494,8 +17494,8 @@ namespace
                      for (uint32_t index = 0; index < trace_count; index++) {
 #endif
                         auto& draw_call_data = cmd_list_data.trace_draw_calls_data.at(index);
+#if DX11 // D3D12 device level entries (present, display composition, swapchain encode) have no command list, nothing below reads it there
                         ASSERT_ONCE_MSG(draw_call_data.command_list, "The code below will probably crash if the command list isn't valid, remember to always assign it when adding a new element to the list");
-#if DX11
                         if (draw_call_data.command_list)
                         {
                            com_ptr<ID3D11DeviceContext> native_device_context;
