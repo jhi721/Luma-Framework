@@ -76,20 +76,23 @@ namespace NGX
 			{
 				if (handle != nullptr)
 				{
-					assert(NVSDK_NGX_SUCCEED(NGX_D3D(ReleaseFeature)(handle)));
+					[[maybe_unused]] const NVSDK_NGX_Result result = NGX_D3D(ReleaseFeature)(handle);
+					assert(NVSDK_NGX_SUCCEED(result));
 				}
 			}
 			for (NVSDK_NGX_Parameter* parameter : unique_parameters)
 			{
 				if (parameter != nullptr)
 				{
-					assert(NVSDK_NGX_SUCCEED(NGX_D3D(DestroyParameters)(parameter)));
+					[[maybe_unused]] const NVSDK_NGX_Result result = NGX_D3D(DestroyParameters)(parameter);
+					assert(NVSDK_NGX_SUCCEED(result));
 				}
 			}
 
 			if (capabilities_params != nullptr)
 			{
-				assert(NVSDK_NGX_SUCCEED(NGX_D3D(DestroyParameters)(capabilities_params)));
+				[[maybe_unused]] const NVSDK_NGX_Result result = NGX_D3D(DestroyParameters)(capabilities_params);
+				assert(NVSDK_NGX_SUCCEED(result));
 			}
 		}
 
@@ -305,7 +308,8 @@ void NGX::DLSS::Deinit(SR::InstanceData*& data, SR::Device* optional_device)
 		delete custom_data;
 		custom_data = nullptr;
 
-		assert(NVSDK_NGX_SUCCEED(NGX_D3D(Shutdown1)(optional_device)));
+		[[maybe_unused]] const NVSDK_NGX_Result result = NGX_D3D(Shutdown1)(optional_device);
+		assert(NVSDK_NGX_SUCCEED(result));
 	}
 }
 
