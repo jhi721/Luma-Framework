@@ -484,9 +484,10 @@ namespace D3D12State
          const float blend_factor[4] = {float(state.blend_constant & 0xFF) / 255.f, float((state.blend_constant >> 8) & 0xFF) / 255.f, float((state.blend_constant >> 16) & 0xFF) / 255.f, float((state.blend_constant >> 24) & 0xFF) / 255.f};
          native_list->OMSetBlendFactor(blend_factor);
       }
+      // "all", not "all_graphics": the latter replays the topology and blend factor ReShade stores for the pipelines it creates (clones)
       if (pipeline.handle != 0)
       {
-         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, pipeline);
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all, pipeline);
       }
 
       const uint32_t render_target_count = uint32_t((std::min)(state.render_target_views.size(), size_t(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)));
