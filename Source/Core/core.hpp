@@ -3988,7 +3988,8 @@ namespace
       {
          const int32_t data_register = (luma_data_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT ? static_cast<int32_t>(luma_data_cbuffer_index) : -1);
          if (!D3D12RootSignatures::Install(native_device, luma_settings_cbuffer_index, data_register, [](const char* message)
-                { reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] {}", message).c_str()); }, d3d12_game_root_parameters))
+                { reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] {}", message).c_str()); }, d3d12_game_root_parameters,
+                !auto_texture_format_upgrade_shader_hashes.empty() || enable_samplers_upgrade)) // The promotions and the sampler rewrites write the game's descriptors again
          {
             static std::atomic_flag logged_install_failure;
             if (!logged_install_failure.test_and_set())

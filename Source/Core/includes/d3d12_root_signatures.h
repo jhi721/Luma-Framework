@@ -134,6 +134,11 @@ namespace D3D12RootSignatures
       // ReShade doesn't pass root signature 1.2 static samplers to its "create_sampler" event, and the older versions' make it rebuild the root signature from its own
       // model when an add-on changes one, so the samplers are upgraded here, on the blob ReShade creates the root signature from. Called under the detour, any thread
       bool (*upgrade_static_sampler)(D3D12_STATIC_SAMPLER_DESC1* desc) = nullptr;
+      // Makes the descriptor tables of root signatures 1.1 and 1.2 "DESCRIPTORS_VOLATILE", the only behavior of 1.0, for Luma writing the game's descriptors again at present
+      // (the clones' promotions and the sampler rewrites, see "d3d12_clones.h"): 1.1's default static descriptors can't change from when a command list sets their table
+      // until it last executes, which the lists the game recorded and not yet submitted, or executes again, or its bundles, would break.
+      // ponytail: the root signatures embedded in shaders can't be rewritten and keep static descriptors
+      bool volatile_descriptors = false;
    };
    // Shared by the devices: ReShade's proxies all lead to one function, hooked once per process
    inline Hook hook;
@@ -327,6 +332,44 @@ namespace D3D12RootSignatures
          static_assert(offsetof(D3D12_STATIC_SAMPLER_DESC1, Flags) == sizeof(D3D12_STATIC_SAMPLER_DESC));
          std::vector<StaticSampler> upgraded_samplers;
          bool samplers_upgraded = false;
+         using Range = std::remove_cvref_t<decltype(*desc.pParameters->DescriptorTable.pDescriptorRanges)>;
+         std::vector<std::vector<Range>> volatile_ranges;
+         bool descriptors_made_volatile = false;
+         if constexpr (requires(Range range) { range.Flags; })
+         {
+            if (hook.volatile_descriptors)
+            {
+               if (parameters.empty())
+               {
+                  parameters.assign(desc.pParameters, desc.pParameters + desc.NumParameters);
+               }
+               volatile_ranges.reserve(parameters.size());
+               for (Parameter& parameter : parameters)
+               {
+                  if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                  {
+                     continue;
+                  }
+                  std::vector<Range>& ranges = volatile_ranges.emplace_back(parameter.DescriptorTable.pDescriptorRanges, parameter.DescriptorTable.pDescriptorRanges + parameter.DescriptorTable.NumDescriptorRanges);
+                  for (Range& range : ranges)
+                  {
+                     // "DATA_STATIC" can't go with volatile descriptors: the next promise down is static while set at execute. Volatile descriptors keep the
+                     // bounds checks of buffers that "DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS" asks for
+                     auto flags = range.Flags & ~D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS;
+                     if (flags & D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC)
+                     {
+                        flags = (flags & ~D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC) | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
+                     }
+                     flags |= D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+                     descriptors_made_volatile |= (flags != range.Flags);
+                     range.Flags = flags;
+                  }
+                  parameter.DescriptorTable.pDescriptorRanges = ranges.data();
+               }
+               desc.pParameters = parameters.data();
+            }
+         }
+
          if (hook.upgrade_static_sampler && desc.NumStaticSamplers != 0)
          {
             upgraded_samplers.assign(desc.pStaticSamplers, desc.pStaticSamplers + desc.NumStaticSamplers);
@@ -352,7 +395,7 @@ namespace D3D12RootSignatures
                desc.pStaticSamplers = upgraded_samplers.data();
             }
          }
-         if (skip != Skip::None && !samplers_upgraded)
+         if (skip != Skip::None && !samplers_upgraded && !descriptors_made_volatile)
          {
             return skip;
          }
@@ -493,8 +536,8 @@ namespace D3D12RootSignatures
    // device's proxy can lead elsewhere when another module patched the proxies' vtable after the first install, to a function that calls
    // ReShade's: the hook on that covers it.
    // "settings_register" and "data_register" (-1: no LumaData) are the CBVs' registers in "LUMA_CB_REGISTER_SPACE". "game_parameters" (at most
-   // "MAX_GAME_PARAMETERS") are appended after them, as the first install has them.
-   inline bool Install(ID3D12Device* native_device, uint32_t settings_register, int32_t data_register, LogFunction log, std::span<const GameParameter> game_parameters = {})
+   // "MAX_GAME_PARAMETERS") are appended after them, as the first install has them, and so is "volatile_descriptors" ("Hook::volatile_descriptors").
+   inline bool Install(ID3D12Device* native_device, uint32_t settings_register, int32_t data_register, LogFunction log, std::span<const GameParameter> game_parameters = {}, bool volatile_descriptors = false)
    {
       assert(game_parameters.size() <= MAX_GAME_PARAMETERS);
       void** const proxy_vtable = D3D12ProxyHook::FindProxyVtable(native_device);
@@ -517,6 +560,7 @@ namespace D3D12RootSignatures
       hook.settings_register = settings_register;
       hook.data_register = data_register;
       hook.log = log;
+      hook.volatile_descriptors = volatile_descriptors;
       hook.game_parameter_count = static_cast<uint32_t>((std::min)(game_parameters.size(), MAX_GAME_PARAMETERS));
       std::copy_n(game_parameters.begin(), hook.game_parameter_count, hook.game_parameters.begin());
       return hook.create_deserializer && hook.serialize && D3D12ProxyHook::Attach(&hook, proxy_vtable[CREATE_ROOT_SIGNATURE_SLOT], &Detour);
