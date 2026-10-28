@@ -1408,11 +1408,21 @@ namespace D3D12Clones
    inline std::atomic<bool> command_list_hooks_installed = false;
    inline std::mutex command_list_hooks_mutex; // Also for "Remove()"
 
-   // ReShade's command lists are objects of one final class, so the first one's vtable is every list's: the command list hooks go in when
-   // the game creates its first list.
-   inline void OnCommandListCreated(void** command_list)
+   // ReShade's command lists are objects of one final class, so the first proxy's vtable is every list's: the command list hooks go in when
+   // the game creates its first list that ReShade wraps. ReShade leaves video lists and unknown interfaces unwrapped, and their vtables
+   // aren't a graphics list's.
+   inline void OnCommandListCreated(D3D12_COMMAND_LIST_TYPE type, void** command_list)
    {
-      if (command_list_hooks_installed.load(std::memory_order_acquire) || !command_list || !*command_list)
+      if (command_list_hooks_installed.load(std::memory_order_acquire) || !command_list || !*command_list || type < D3D12_COMMAND_LIST_TYPE_DIRECT || type > D3D12_COMMAND_LIST_TYPE_COPY)
+      {
+         return;
+      }
+      // ReShade's "IID_UnwrappedObject": only its proxies answer it
+      struct __declspec(uuid("7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42")) IUnwrappedObject : IUnknown
+      {
+      };
+      com_ptr<IUnknown> unwrapped;
+      if (FAILED(static_cast<IUnknown*>(*command_list)->QueryInterface(__uuidof(IUnwrappedObject), reinterpret_cast<void**>(&unwrapped))))
       {
          return;
       }
@@ -1451,7 +1461,7 @@ namespace D3D12Clones
       const HRESULT result = CreateCommandListHook::hooked.original(device, node_mask, type, allocator, initial_state, riid, command_list);
       if (SUCCEEDED(result))
       {
-         OnCommandListCreated(command_list);
+         OnCommandListCreated(type, command_list);
       }
       return result;
    }
@@ -1461,7 +1471,7 @@ namespace D3D12Clones
       const HRESULT result = CreateCommandList1Hook::hooked.original(device, node_mask, type, flags, riid, command_list);
       if (SUCCEEDED(result))
       {
-         OnCommandListCreated(command_list);
+         OnCommandListCreated(type, command_list);
       }
       return result;
    }
