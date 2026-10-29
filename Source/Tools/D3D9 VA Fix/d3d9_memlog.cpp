@@ -29,6 +29,9 @@
 // d3d9_csmt.on next to this dll: D3D9 calls run on a worker thread (csmt.h),
 // which also makes dropping D3DCREATE_MULTITHREADED safe. With d3d9_memlog.on
 // the report adds the layer's per-frame counters.
+//
+// dgVoodoo workarounds, on whenever d3d9_chain.dll is dgVoodoo (d3d9_dgvfix.off
+// turns them off): see "dgVoodoo workarounds" below.
 #include "csmt.h"
 #include <algorithm>
 #include <atomic>
@@ -41,6 +44,7 @@
 #include <mutex>
 #include <optional>
 #include <psapi.h>
+#include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -1544,6 +1548,597 @@ namespace
       }
    }
 
+   // ---- dgVoodoo workarounds ---------------------------------------------------
+   // D3D9 behaviour dgVoodoo 2.87.6 gets wrong (docs/dgVoodoo-RE.md "Agent conformance run", repros in
+   // _tools/dgv_conformance). On whenever the chained runtime is dgVoodoo, off with d3d9_dgvfix.off next to this dll.
+   // Each is temporary: drop it once a dgVoodoo release fixes the bug. The hooks sit below the CSMT layer, so they run on
+   // its worker; calls back into the device go straight to dgVoodoo's methods ("DgvMethods"), never through the vtable
+   // top that the layer owns.
+
+   constexpr int SLOT_GET_DISPLAY_MODE = 8; // IDirect3DDevice9
+   constexpr int SLOT_GET_SWAP_CHAIN = 14;
+   constexpr int SLOT_SET_GAMMA_RAMP = 21;
+   constexpr int SLOT_GET_GAMMA_RAMP = 22;
+   constexpr int SLOT_SET_RENDER_TARGET = 37;
+   constexpr int SLOT_SET_RENDER_STATE = 57;
+   constexpr int SLOT_CREATE_STATE_BLOCK = 59;
+   constexpr int SLOT_GET_TEXTURE = 64;
+   constexpr int SLOT_SET_TEXTURE = 65;
+   constexpr int SLOT_GET_TEXTURE_STAGE_STATE = 66;
+   constexpr int SLOT_SET_TEXTURE_STAGE_STATE = 67;
+   constexpr int SLOT_GET_SAMPLER_STATE = 68;
+   constexpr int SLOT_SET_SAMPLER_STATE = 69;
+   constexpr int SLOT_DRAW_PRIMITIVE = 81; // then DrawIndexedPrimitive, DrawPrimitiveUP, DrawIndexedPrimitiveUP
+   constexpr int SLOT_CREATE_VERTEX_SHADER = 91;
+   constexpr int SLOT_GET_PRESENT_PARAMETERS = 9; // IDirect3DSwapChain9
+   constexpr int SLOT_STATE_BLOCK_CAPTURE = 4;    // IDirect3DStateBlock9
+   constexpr int SLOT_STATE_BLOCK_APPLY = 5;
+
+   constexpr DWORD PIXEL_SAMPLERS = 16;
+   constexpr DWORD VERTEX_SAMPLERS = 4; // D3DVERTEXTEXTURESAMPLER0..3
+   constexpr DWORD SAMPLER_STATES = 14; // D3DSAMP_ADDRESSU (1) .. D3DSAMP_DMAPOFFSET (13), index 0 unused
+   // What a fresh device reports per state (Windows d3d9): wrap, border 0, point min/mag, no mip, aniso 1
+   constexpr DWORD DEFAULT_SAMPLER_STATES[SAMPLER_STATES] = {0, 1, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0};
+
+   bool g_dgv_fixes_disabled = false; // d3d9_dgvfix.off present
+   bool g_dgv_fixes = false;          // on for this device (chain is dgVoodoo)
+
+   // dgVoodoo's own device methods, taken before the CSMT layer patches the vtable.
+   struct DgvMethods
+   {
+      HRESULT(STDMETHODCALLTYPE* set_render_state)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD) = nullptr;
+      HRESULT(STDMETHODCALLTYPE* get_texture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9**) = nullptr;
+      HRESULT(STDMETHODCALLTYPE* set_texture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*) = nullptr;
+      HRESULT(STDMETHODCALLTYPE* get_texture_stage_state)(IDirect3DDevice9*, DWORD, D3DTEXTURESTAGESTATETYPE, DWORD*) = nullptr;
+      HRESULT(STDMETHODCALLTYPE* set_texture_stage_state)(IDirect3DDevice9*, DWORD, D3DTEXTURESTAGESTATETYPE, DWORD) = nullptr;
+   };
+
+   // Texture stages a D3DSBT_ALL block restores: the pixel samplers, then the vertex samplers.
+   constexpr DWORD STATE_BLOCK_STAGES = PIXEL_SAMPLERS + VERTEX_SAMPLERS;
+   DWORD StateBlockStage(DWORD i)
+   {
+      return i < PIXEL_SAMPLERS ? i : D3DVERTEXTEXTURESAMPLER0 + (i - PIXEL_SAMPLERS);
+   }
+
+   struct StateBlockFix
+   {
+      D3DSTATEBLOCKTYPE type = D3DSBT_ALL;
+      IDirect3DBaseTexture9* textures[STATE_BLOCK_STAGES] = {}; // D3DSBT_ALL: referenced, as the runtime's block would
+   };
+
+   // What the game asked for in CreateDevice / Reset, as GetPresentParameters must report it.
+   struct AppPresentation
+   {
+      IDirect3DDevice9* device = nullptr;
+      UINT interval = D3DPRESENT_INTERVAL_DEFAULT;
+      bool unknown_format = false;
+      D3DFORMAT display_format = D3DFMT_UNKNOWN;
+   };
+
+   struct DgvState
+   {
+      std::shared_mutex mutex;
+      IDirect3DDevice9* device = nullptr; // one device assumed, as for the rest of this proxy
+      DgvMethods methods;
+      std::unordered_map<IDirect3DSwapChain9*, AppPresentation> swap_chains; // each device's implicit swap chain
+      IDirect3DSurface9* bound_targets[4] = {};                              // RT1..3 as the game bound them (not referenced: the device holds them)
+      std::vector<IDirect3DSurface9*> unbound_targets;                       // referenced until the next draw
+      DWORD vertex_samplers[VERTEX_SAMPLERS][SAMPLER_STATES] = {};
+      std::unordered_map<IDirect3DStateBlock9*, StateBlockFix> state_blocks;
+      std::unordered_map<UINT, D3DGAMMARAMP> gamma_ramps; // per swap chain index, as the game set them
+   };
+   DgvState g_dgv;
+   std::atomic<bool> g_dgv_unbound_pending{false};
+   std::atomic<bool> g_dgv_premultiplied_blend_set{false}; // a stage op was ever set to BLENDTEXTUREALPHAPM
+
+   void ResetVertexSamplers()
+   {
+      for (auto& sampler : g_dgv.vertex_samplers)
+      {
+         std::copy(std::begin(DEFAULT_SAMPLER_STATES), std::end(DEFAULT_SAMPLER_STATES), sampler);
+      }
+   }
+
+   // A fresh or Reset dgVoodoo device starts POINTSIZE_MIN at 0 and POINTSCALE_B/C at 1 (documented: 1, 0, 0), which
+   // shrinks scaled points that rely on the defaults.
+   void SetDocumentedPointDefaults(IDirect3DDevice9* device)
+   {
+      const float one = 1.0f, zero = 0.0f;
+      g_dgv.methods.set_render_state(device, D3DRS_POINTSIZE_MIN, *(const DWORD*)&one);
+      g_dgv.methods.set_render_state(device, D3DRS_POINTSCALE_B, *(const DWORD*)&zero);
+      g_dgv.methods.set_render_state(device, D3DRS_POINTSCALE_C, *(const DWORD*)&zero);
+   }
+
+   // Releasing a surface right after unbinding it from RT1..3, with no draw in between, crashes inside dgVoodoo (its
+   // cached render-target set still points at it until the next draw). The unbound surface is kept alive until then.
+   HRESULT STDMETHODCALLTYPE HookSetRenderTarget(IDirect3DDevice9* self, DWORD index, IDirect3DSurface9* surface)
+   {
+      const HRESULT hr = Original<decltype(&HookSetRenderTarget)>(self, SLOT_SET_RENDER_TARGET)(self, index, surface);
+      if (FAILED(hr) || index == 0 || index >= std::size(g_dgv.bound_targets))
+         return hr;
+      std::unique_lock lock(g_dgv.mutex);
+      IDirect3DSurface9*& bound = g_dgv.bound_targets[index];
+      if (bound && bound != surface)
+      {
+         bound->AddRef();
+         g_dgv.unbound_targets.push_back(bound);
+         g_dgv_unbound_pending.store(true, std::memory_order_release);
+      }
+      bound = surface;
+      return hr;
+   }
+
+   void ReleaseUnboundTargets()
+   {
+      if (!g_dgv_unbound_pending.exchange(false, std::memory_order_acq_rel))
+         return;
+      std::vector<IDirect3DSurface9*> surfaces;
+      {
+         std::unique_lock lock(g_dgv.mutex);
+         surfaces.swap(g_dgv.unbound_targets);
+      }
+      for (IDirect3DSurface9* surface : surfaces)
+      {
+         surface->Release();
+      }
+   }
+
+   // BLENDTEXTUREALPHAPM computes arg1 + arg2 * (1 + Ta) instead of arg1 + arg2 * (1 - Ta). MULTIPLYADD
+   // arg0 + arg1 * arg2 with arg2 = inverted texture alpha gives the documented result (verify_ff). Swapped in for the
+   // draw only, so getters and state blocks keep seeing the game's states.
+   struct StageOp
+   {
+      D3DTEXTURESTAGESTATETYPE op, arg0, arg1, arg2;
+   };
+   constexpr StageOp STAGE_OPS[] = {{D3DTSS_COLOROP, D3DTSS_COLORARG0, D3DTSS_COLORARG1, D3DTSS_COLORARG2},
+      {D3DTSS_ALPHAOP, D3DTSS_ALPHAARG0, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2}};
+   constexpr DWORD TEXTURE_STAGES = 8;
+
+   struct ReplacedBlend
+   {
+      DWORD stage = 0;
+      const StageOp* op = nullptr;
+      DWORD args[3] = {}; // the game's arg0..arg2
+   };
+
+   // Returns how many entries of "replaced" (TEXTURE_STAGES * 2) it filled.
+   int ReplacePremultipliedBlends(IDirect3DDevice9* device, ReplacedBlend* replaced)
+   {
+      auto get = g_dgv.methods.get_texture_stage_state;
+      auto set = g_dgv.methods.set_texture_stage_state;
+      int count = 0;
+      for (DWORD stage = 0; stage < TEXTURE_STAGES; stage++)
+      {
+         DWORD color_op = D3DTOP_DISABLE;
+         get(device, stage, D3DTSS_COLOROP, &color_op);
+         if (color_op == D3DTOP_DISABLE)
+            break;
+         for (const StageOp& op : STAGE_OPS)
+         {
+            DWORD value = D3DTOP_DISABLE;
+            get(device, stage, op.op, &value);
+            if (value != D3DTOP_BLENDTEXTUREALPHAPM)
+               continue;
+            ReplacedBlend& entry = replaced[count++];
+            entry = {.stage = stage, .op = &op};
+            get(device, stage, op.arg0, &entry.args[0]);
+            get(device, stage, op.arg1, &entry.args[1]);
+            get(device, stage, op.arg2, &entry.args[2]);
+            set(device, stage, op.op, D3DTOP_MULTIPLYADD);
+            set(device, stage, op.arg0, entry.args[1]);
+            set(device, stage, op.arg1, entry.args[2]);
+            set(device, stage, op.arg2, D3DTA_TEXTURE | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE);
+         }
+      }
+      return count;
+   }
+
+   HRESULT STDMETHODCALLTYPE HookSetTextureStageState(IDirect3DDevice9* self, DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value)
+   {
+      if (value == D3DTOP_BLENDTEXTUREALPHAPM && (type == D3DTSS_COLOROP || type == D3DTSS_ALPHAOP))
+      {
+         g_dgv_premultiplied_blend_set.store(true, std::memory_order_relaxed);
+      }
+      return Original<decltype(&HookSetTextureStageState)>(self, SLOT_SET_TEXTURE_STAGE_STATE)(self, stage, type, value);
+   }
+
+   template <int slot, typename... Args>
+   HRESULT STDMETHODCALLTYPE HookDraw(IDirect3DDevice9* self, Args... args)
+   {
+      ReplacedBlend replaced[TEXTURE_STAGES * 2];
+      const int replaced_count = g_dgv_premultiplied_blend_set.load(std::memory_order_relaxed) ? ReplacePremultipliedBlends(self, replaced) : 0;
+      const HRESULT hr = Original<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, Args...)>(self, slot)(self, args...);
+      for (int i = 0; i < replaced_count; i++)
+      {
+         const ReplacedBlend& entry = replaced[i];
+         auto set = g_dgv.methods.set_texture_stage_state;
+         set(self, entry.stage, entry.op->op, D3DTOP_BLENDTEXTUREALPHAPM);
+         set(self, entry.stage, entry.op->arg0, entry.args[0]);
+         set(self, entry.stage, entry.op->arg1, entry.args[1]);
+         set(self, entry.stage, entry.op->arg2, entry.args[2]);
+      }
+      ReleaseUnboundTargets();
+      return hr;
+   }
+
+   // vs_2_0+ "sgn dst, src0, scratch1, scratch2" returns 1 for every input (verify_sh_ops). Rewritten as
+   // "slt scratch1, -src0, src0; slt scratch2, src0, -src0; add dst, scratch1, -scratch2". Left as sgn when predicated
+   // or when a scratch register is src0 itself. Returns empty when the shader has no sgn to rewrite.
+   std::vector<DWORD> ReplaceSgn(const DWORD* function)
+   {
+      if (!function || D3DSHADER_VERSION_MAJOR(function[0]) < 2)
+         return {};
+      constexpr DWORD REGISTER_MASK = D3DSP_REGNUM_MASK | D3DSP_REGTYPE_MASK | D3DSP_REGTYPE_MASK2;
+      auto operand_length = [](const DWORD* token)
+      { return (*token & D3DSHADER_ADDRESSMODE_MASK) == D3DSHADER_ADDRMODE_RELATIVE ? 2u : 1u; };
+      std::vector<DWORD> rewritten = {function[0]};
+      bool changed = false;
+      const DWORD* token = function + 1;
+      while (*token != D3DVS_END())
+      {
+         const DWORD opcode = *token & D3DSI_OPCODE_MASK;
+         const DWORD length = opcode == D3DSIO_COMMENT ? (*token & D3DSI_COMMENTSIZE_MASK) >> D3DSI_COMMENTSIZE_SHIFT
+                                                       : (*token & D3DSI_INSTLENGTH_MASK) >> D3DSI_INSTLENGTH_SHIFT;
+         if (opcode == D3DSIO_SGN && !(*token & D3DSHADER_INSTRUCTION_PREDICATED))
+         {
+            const DWORD* dst = token + 1;
+            const DWORD dst_length = operand_length(dst);
+            const DWORD* src = dst + dst_length;
+            const DWORD src_length = operand_length(src);
+            const DWORD scratch[2] = {src[src_length] & REGISTER_MASK, src[src_length + 1] & REGISTER_MASK};
+            DWORD negated = *src & ~D3DSP_SRCMOD_MASK;
+            switch (*src & D3DSP_SRCMOD_MASK)
+            {
+            case D3DSPSM_NONE:
+               negated |= D3DSPSM_NEG;
+               break;
+            case D3DSPSM_NEG:
+               negated |= D3DSPSM_NONE;
+               break;
+            case D3DSPSM_ABS:
+               negated |= D3DSPSM_ABSNEG;
+               break;
+            case D3DSPSM_ABSNEG:
+               negated |= D3DSPSM_ABS;
+               break;
+            default:
+               negated = 0;
+               break; // not valid on a vertex shader source
+            }
+            const DWORD source_register = *src & REGISTER_MASK;
+            if (dst_length + src_length + 2 == length && negated && scratch[0] != source_register && scratch[1] != source_register)
+            {
+               const DWORD write_mask = *dst & D3DSP_WRITEMASK_ALL;
+               const DWORD slt = D3DSIO_SLT | ((1 + 2 * src_length) << D3DSI_INSTLENGTH_SHIFT);
+               auto append_source = [&](DWORD first)
+               {
+                  rewritten.push_back(first);
+                  rewritten.insert(rewritten.end(), src + 1, src + src_length);
+               };
+               rewritten.insert(rewritten.end(), {slt, 0x80000000 | scratch[0] | write_mask});
+               append_source(negated);
+               append_source(*src);
+               rewritten.insert(rewritten.end(), {slt, 0x80000000 | scratch[1] | write_mask});
+               append_source(*src);
+               append_source(negated);
+               rewritten.push_back(D3DSIO_ADD | ((dst_length + 2) << D3DSI_INSTLENGTH_SHIFT));
+               rewritten.insert(rewritten.end(), dst, dst + dst_length);
+               rewritten.insert(rewritten.end(), {0x80000000 | scratch[0] | D3DSP_NOSWIZZLE, 0x80000000 | scratch[1] | D3DSP_NOSWIZZLE | D3DSPSM_NEG});
+               changed = true;
+               token += 1 + length;
+               continue;
+            }
+         }
+         rewritten.insert(rewritten.end(), token, token + 1 + length);
+         token += 1 + length;
+      }
+      if (!changed)
+         return {};
+      rewritten.push_back(D3DVS_END());
+      return rewritten;
+   }
+
+   // The game's GetFunction then returns the rewritten code.
+   HRESULT STDMETHODCALLTYPE HookCreateVertexShader(IDirect3DDevice9* self, const DWORD* function, IDirect3DVertexShader9** shader)
+   {
+      const std::vector<DWORD> rewritten = ReplaceSgn(function);
+      return Original<decltype(&HookCreateVertexShader)>(self, SLOT_CREATE_VERTEX_SHADER)(self, rewritten.empty() ? function : rewritten.data(), shader);
+   }
+
+   // GetGammaRamp returns the ramp divided by 257 (8-bit values): answered from what was set.
+   void STDMETHODCALLTYPE HookSetGammaRamp(IDirect3DDevice9* self, UINT swap_chain, DWORD flags, const D3DGAMMARAMP* ramp)
+   {
+      Original<decltype(&HookSetGammaRamp)>(self, SLOT_SET_GAMMA_RAMP)(self, swap_chain, flags, ramp);
+      if (!ramp)
+         return;
+      std::unique_lock lock(g_dgv.mutex);
+      g_dgv.gamma_ramps[swap_chain] = *ramp;
+   }
+
+   void STDMETHODCALLTYPE HookGetGammaRamp(IDirect3DDevice9* self, UINT swap_chain, D3DGAMMARAMP* ramp)
+   {
+      Original<decltype(&HookGetGammaRamp)>(self, SLOT_GET_GAMMA_RAMP)(self, swap_chain, ramp);
+      std::shared_lock lock(g_dgv.mutex);
+      if (const auto it = g_dgv.gamma_ramps.find(swap_chain); ramp && it != g_dgv.gamma_ramps.end())
+      {
+         *ramp = it->second;
+      }
+   }
+
+   // dgVoodoo rejects GetSamplerState on D3DVERTEXTEXTURESAMPLER0..3 while accepting SetSamplerState: the getter answers
+   // from what was set.
+   bool IsVertexSampler(DWORD sampler)
+   {
+      return sampler >= D3DVERTEXTEXTURESAMPLER0 && sampler < D3DVERTEXTEXTURESAMPLER0 + VERTEX_SAMPLERS;
+   }
+
+   HRESULT STDMETHODCALLTYPE HookSetSamplerState(IDirect3DDevice9* self, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value)
+   {
+      const HRESULT hr = Original<decltype(&HookSetSamplerState)>(self, SLOT_SET_SAMPLER_STATE)(self, sampler, type, value);
+      if (SUCCEEDED(hr) && IsVertexSampler(sampler) && type >= D3DSAMP_ADDRESSU && type <= D3DSAMP_DMAPOFFSET)
+      {
+         std::unique_lock lock(g_dgv.mutex);
+         g_dgv.vertex_samplers[sampler - D3DVERTEXTEXTURESAMPLER0][type] = value;
+      }
+      return hr;
+   }
+
+   HRESULT STDMETHODCALLTYPE HookGetSamplerState(IDirect3DDevice9* self, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD* value)
+   {
+      const HRESULT hr = Original<decltype(&HookGetSamplerState)>(self, SLOT_GET_SAMPLER_STATE)(self, sampler, type, value);
+      if (SUCCEEDED(hr) || !value || !IsVertexSampler(sampler) || type < D3DSAMP_ADDRESSU || type > D3DSAMP_DMAPOFFSET)
+         return hr;
+      std::shared_lock lock(g_dgv.mutex);
+      *value = g_dgv.vertex_samplers[sampler - D3DVERTEXTEXTURESAMPLER0][type];
+      return D3D_OK;
+   }
+
+   // A windowed device reports the desktop refresh rate (must be 0, and Reset then rejects the copy), IMMEDIATE as DEFAULT,
+   // and A8R8G8B8 for a D3DFMT_UNKNOWN back buffer: the implicit swap chain reports what the game asked for.
+   HRESULT STDMETHODCALLTYPE HookGetPresentParameters(IDirect3DSwapChain9* self, D3DPRESENT_PARAMETERS* params)
+   {
+      const HRESULT hr = Original<decltype(&HookGetPresentParameters)>(self, SLOT_GET_PRESENT_PARAMETERS)(self, params);
+      std::shared_lock lock(g_dgv.mutex);
+      const auto it = g_dgv.swap_chains.find(self);
+      if (FAILED(hr) || !params || it == g_dgv.swap_chains.end())
+         return hr;
+      const AppPresentation& app = it->second;
+      params->PresentationInterval = app.interval;
+      if (params->Windowed)
+      {
+         params->FullScreen_RefreshRateInHz = 0;
+         if (app.unknown_format)
+         {
+            params->BackBufferFormat = app.display_format;
+         }
+      }
+      return hr;
+   }
+
+   // D3DSBT_ALL blocks restore no textures; D3DSBT_VERTEXSTATE Apply writes zeros into the pixel samplers' states, which
+   // that block type must not touch.
+   void CaptureTextures(IDirect3DDevice9* device, StateBlockFix* fix, std::vector<IDirect3DBaseTexture9*>* released)
+   {
+      for (DWORD i = 0; i < STATE_BLOCK_STAGES; i++)
+      {
+         released->push_back(fix->textures[i]);
+         fix->textures[i] = nullptr;
+         g_dgv.methods.get_texture(device, StateBlockStage(i), &fix->textures[i]); // referenced
+      }
+   }
+
+   void ReleaseTextures(const std::vector<IDirect3DBaseTexture9*>& textures)
+   {
+      for (IDirect3DBaseTexture9* texture : textures)
+      {
+         if (texture)
+         {
+            texture->Release();
+         }
+      }
+   }
+
+   HRESULT STDMETHODCALLTYPE HookStateBlockCapture(IDirect3DStateBlock9* self)
+   {
+      const HRESULT hr = Original<decltype(&HookStateBlockCapture)>(self, SLOT_STATE_BLOCK_CAPTURE)(self);
+      std::vector<IDirect3DBaseTexture9*> released;
+      {
+         std::unique_lock lock(g_dgv.mutex);
+         if (auto it = g_dgv.state_blocks.find(self); SUCCEEDED(hr) && it != g_dgv.state_blocks.end() && it->second.type == D3DSBT_ALL)
+         {
+            CaptureTextures(g_dgv.device, &it->second, &released);
+         }
+      }
+      ReleaseTextures(released);
+      return hr;
+   }
+
+   HRESULT STDMETHODCALLTYPE HookStateBlockApply(IDirect3DStateBlock9* self)
+   {
+      auto apply = Original<decltype(&HookStateBlockApply)>(self, SLOT_STATE_BLOCK_APPLY);
+      std::optional<StateBlockFix> fix;
+      {
+         std::shared_lock lock(g_dgv.mutex);
+         if (auto it = g_dgv.state_blocks.find(self); it != g_dgv.state_blocks.end())
+         {
+            fix = it->second; // the textures stay referenced by the block's own entry
+         }
+      }
+      if (!fix)
+         return apply(self);
+      IDirect3DDevice9* device = g_dgv.device;
+      if (fix->type == D3DSBT_VERTEXSTATE)
+      {
+         auto get = Original<decltype(&HookGetSamplerState)>(device, SLOT_GET_SAMPLER_STATE);
+         auto set = Original<decltype(&HookSetSamplerState)>(device, SLOT_SET_SAMPLER_STATE);
+         DWORD saved[PIXEL_SAMPLERS][SAMPLER_STATES] = {};
+         for (DWORD sampler = 0; sampler < PIXEL_SAMPLERS; sampler++)
+         {
+            for (DWORD type = D3DSAMP_ADDRESSU; type < D3DSAMP_DMAPOFFSET; type++) // DMAPOFFSET is vertex state
+            {
+               get(device, sampler, D3DSAMPLERSTATETYPE(type), &saved[sampler][type]);
+            }
+         }
+         const HRESULT hr = apply(self);
+         for (DWORD sampler = 0; sampler < PIXEL_SAMPLERS; sampler++)
+         {
+            for (DWORD type = D3DSAMP_ADDRESSU; type < D3DSAMP_DMAPOFFSET; type++)
+            {
+               set(device, sampler, D3DSAMPLERSTATETYPE(type), saved[sampler][type]);
+            }
+            // The Apply also drops the stage's texture binding for draws while GetTexture still reports it: rebinding
+            // through null restores it (verify_sbstate).
+            IDirect3DBaseTexture9* texture = nullptr;
+            if (SUCCEEDED(g_dgv.methods.get_texture(device, sampler, &texture)) && texture)
+            {
+               g_dgv.methods.set_texture(device, sampler, nullptr);
+               g_dgv.methods.set_texture(device, sampler, texture);
+               texture->Release();
+            }
+         }
+         return hr;
+      }
+      const HRESULT hr = apply(self);
+      for (DWORD i = 0; SUCCEEDED(hr) && i < STATE_BLOCK_STAGES; i++)
+      {
+         g_dgv.methods.set_texture(device, StateBlockStage(i), fix->textures[i]);
+      }
+      return hr;
+   }
+
+   ULONG STDMETHODCALLTYPE HookStateBlockRelease(IDirect3DStateBlock9* self)
+   {
+      const ULONG refs = Original<decltype(&HookStateBlockRelease)>(self, SLOT_RELEASE)(self);
+      if (refs != 0)
+         return refs;
+      std::vector<IDirect3DBaseTexture9*> released;
+      {
+         std::unique_lock lock(g_dgv.mutex);
+         if (auto it = g_dgv.state_blocks.find(self); it != g_dgv.state_blocks.end())
+         {
+            released.assign(std::begin(it->second.textures), std::end(it->second.textures));
+            g_dgv.state_blocks.erase(it);
+         }
+      }
+      ReleaseTextures(released);
+      return refs;
+   }
+
+   HRESULT STDMETHODCALLTYPE HookCreateStateBlock(IDirect3DDevice9* self, D3DSTATEBLOCKTYPE type, IDirect3DStateBlock9** block)
+   {
+      const HRESULT hr = Original<decltype(&HookCreateStateBlock)>(self, SLOT_CREATE_STATE_BLOCK)(self, type, block);
+      if (FAILED(hr) || !block || !*block || (type != D3DSBT_ALL && type != D3DSBT_VERTEXSTATE))
+         return hr;
+      Patch(*block, SLOT_STATE_BLOCK_CAPTURE, (void*)&HookStateBlockCapture);
+      Patch(*block, SLOT_STATE_BLOCK_APPLY, (void*)&HookStateBlockApply);
+      Patch(*block, SLOT_RELEASE, (void*)&HookStateBlockRelease);
+      std::vector<IDirect3DBaseTexture9*> released;
+      std::unique_lock lock(g_dgv.mutex);
+      StateBlockFix& fix = g_dgv.state_blocks[*block];
+      fix.type = type;
+      if (type == D3DSBT_ALL)
+      {
+         CaptureTextures(self, &fix, &released); // nothing captured before: "released" stays null
+      }
+      return hr;
+   }
+
+   // UpdateTexture skips every level where the source's level-0 size shifted by the level reaches 0 on an axis
+   // (non-square textures lose their smallest mips); those levels are copied here. 2D textures only: volumes have no
+   // UpdateSurface, cubes are square.
+   void CopySkippedLevels(IDirect3DDevice9* device, IDirect3DBaseTexture9* source, IDirect3DBaseTexture9* destination)
+   {
+      if (source->GetType() != D3DRTYPE_TEXTURE || destination->GetType() != D3DRTYPE_TEXTURE)
+         return;
+      auto* source_2d = static_cast<IDirect3DTexture9*>(source);
+      auto* destination_2d = static_cast<IDirect3DTexture9*>(destination);
+      D3DSURFACE_DESC top;
+      if (FAILED(source_2d->GetLevelDesc(0, &top)))
+         return;
+      const DWORD skipped = source_2d->GetLevelCount() - destination_2d->GetLevelCount(); // D3D9 matches the smallest levels
+      auto update_surface = Original<UpdateSurfaceFn>(device, SLOT_UPDATE_SURFACE);
+      for (DWORD level = 0; level < destination_2d->GetLevelCount(); level++)
+      {
+         const DWORD source_level = level + skipped;
+         if ((top.Width >> source_level) != 0 && (top.Height >> source_level) != 0)
+            continue;
+         IDirect3DSurface9* from = nullptr;
+         IDirect3DSurface9* to = nullptr;
+         if (SUCCEEDED(source_2d->GetSurfaceLevel(source_level, &from)) && SUCCEEDED(destination_2d->GetSurfaceLevel(level, &to)))
+         {
+            update_surface(device, from, nullptr, to, nullptr);
+         }
+         if (from)
+         {
+            from->Release();
+         }
+         if (to)
+         {
+            to->Release();
+         }
+      }
+   }
+
+   // Takes the methods, hooks the device and its implicit swap chain, sets the documented point defaults. Before the
+   // CSMT layer starts, so the vtable still holds dgVoodoo's methods. "app_params": the game's parameters as passed,
+   // before CreateDevice wrote the actual back buffer format and size into them.
+   void StartDgVoodooFixes(IDirect3DDevice9* device, const D3DPRESENT_PARAMETERS* app_params)
+   {
+      g_dgv_fixes = !g_dgv_fixes_disabled && ChainIsDgVoodoo();
+      fprintf(g_log, "dgVoodoo workarounds %s\n", g_dgv_fixes ? "on" : (g_dgv_fixes_disabled ? "off (d3d9_dgvfix.off)" : "off (not dgVoodoo)"));
+      if (!g_dgv_fixes)
+         return;
+      void** vtable = *(void***)device;
+      {
+         std::unique_lock lock(g_dgv.mutex);
+         g_dgv.device = device;
+         g_dgv.methods = {
+            .set_render_state = (decltype(DgvMethods::set_render_state))vtable[SLOT_SET_RENDER_STATE],
+            .get_texture = (decltype(DgvMethods::get_texture))vtable[SLOT_GET_TEXTURE],
+            .set_texture = (decltype(DgvMethods::set_texture))vtable[SLOT_SET_TEXTURE],
+            .get_texture_stage_state = (decltype(DgvMethods::get_texture_stage_state))vtable[SLOT_GET_TEXTURE_STAGE_STATE],
+            .set_texture_stage_state = (decltype(DgvMethods::set_texture_stage_state))vtable[SLOT_SET_TEXTURE_STAGE_STATE],
+         };
+         ResetVertexSamplers();
+         g_dgv.gamma_ramps.clear();
+      }
+      if (IDirect3DSwapChain9* swap_chain = nullptr; SUCCEEDED(device->GetSwapChain(0, &swap_chain)))
+      {
+         AppPresentation app = {
+            .device = device,
+            .interval = app_params ? app_params->PresentationInterval : D3DPRESENT_INTERVAL_DEFAULT,
+            .unknown_format = app_params && app_params->BackBufferFormat == D3DFMT_UNKNOWN,
+         };
+         if (D3DDISPLAYMODE mode; SUCCEEDED(device->GetDisplayMode(0, &mode)))
+         {
+            app.display_format = mode.Format;
+         }
+         {
+            std::unique_lock lock(g_dgv.mutex);
+            std::erase_if(g_dgv.swap_chains, [&](const auto& entry)
+               { return entry.second.device == device; });
+            g_dgv.swap_chains[swap_chain] = app; // the device keeps its swap chain alive; a freed device's entry is
+                                                 // dropped when an allocation at that address becomes a new device
+         }
+         Patch(swap_chain, SLOT_GET_PRESENT_PARAMETERS, (void*)&HookGetPresentParameters);
+         swap_chain->Release();
+      }
+      SetDocumentedPointDefaults(device);
+      Patch(device, SLOT_SET_RENDER_TARGET, (void*)&HookSetRenderTarget);
+      Patch(device, SLOT_CREATE_STATE_BLOCK, (void*)&HookCreateStateBlock);
+      Patch(device, SLOT_GET_SAMPLER_STATE, (void*)&HookGetSamplerState);
+      Patch(device, SLOT_SET_SAMPLER_STATE, (void*)&HookSetSamplerState);
+      Patch(device, SLOT_SET_TEXTURE_STAGE_STATE, (void*)&HookSetTextureStageState);
+      Patch(device, SLOT_CREATE_VERTEX_SHADER, (void*)&HookCreateVertexShader);
+      Patch(device, SLOT_SET_GAMMA_RAMP, (void*)&HookSetGammaRamp);
+      Patch(device, SLOT_GET_GAMMA_RAMP, (void*)&HookGetGammaRamp);
+      Patch(device, SLOT_DRAW_PRIMITIVE, (void*)&HookDraw<SLOT_DRAW_PRIMITIVE, D3DPRIMITIVETYPE, UINT, UINT>);
+      Patch(device, SLOT_DRAW_PRIMITIVE + 1, (void*)&HookDraw<SLOT_DRAW_PRIMITIVE + 1, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT>);
+      Patch(device, SLOT_DRAW_PRIMITIVE + 2, (void*)&HookDraw<SLOT_DRAW_PRIMITIVE + 2, D3DPRIMITIVETYPE, UINT, const void*, UINT>);
+      Patch(device, SLOT_DRAW_PRIMITIVE + 3,
+         (void*)&HookDraw<SLOT_DRAW_PRIMITIVE + 3, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT>);
+   }
+
    // ---- device hooks ----------------------------------------------------------
 
    HRESULT STDMETHODCALLTYPE HookCreateTexture(IDirect3DDevice9* self, UINT width,
@@ -1749,8 +2344,12 @@ namespace
       IDirect3DBaseTexture9* destination)
    {
       CountUpdateInto(destination);
-      return Original<decltype(&HookUpdateTexture)>(self, SLOT_UPDATE_TEXTURE)(
-         self, source, destination);
+      const HRESULT hr = Original<decltype(&HookUpdateTexture)>(self, SLOT_UPDATE_TEXTURE)(self, source, destination);
+      if (SUCCEEDED(hr) && g_dgv_fixes && source && destination)
+      {
+         CopySkippedLevels(self, source, destination);
+      }
+      return hr;
    }
 
    // Every pooled staging texture holds a device reference, so the game's last
@@ -1775,8 +2374,49 @@ namespace
    {
       g_totals.resets++;
       Report("before Reset");
-      const HRESULT hr =
-         Original<decltype(&HookReset)>(self, SLOT_RESET)(self, params);
+      D3DPRESENT_PARAMETERS fixed_params;
+      if (g_dgv_fixes && params)
+      {
+         // Reset unbinds RT1..3 and fails while the unbound surfaces we hold (DEFAULT resources) are alive.
+         {
+            std::unique_lock lock(g_dgv.mutex);
+            std::fill(std::begin(g_dgv.bound_targets), std::end(g_dgv.bound_targets), nullptr);
+         }
+         g_dgv_unbound_pending.store(true, std::memory_order_release);
+         ReleaseUnboundTargets();
+         // A copy of dgVoodoo's own GetPresentParameters carries the desktop refresh rate, which its Reset rejects.
+         fixed_params = *params;
+         if (fixed_params.Windowed)
+         {
+            fixed_params.FullScreen_RefreshRateInHz = 0;
+         }
+         std::unique_lock lock(g_dgv.mutex);
+         for (auto& [swap_chain, app] : g_dgv.swap_chains)
+         {
+            if (app.device == self)
+            {
+               app.interval = params->PresentationInterval;
+               app.unknown_format = params->BackBufferFormat == D3DFMT_UNKNOWN;
+            }
+         }
+      }
+      D3DPRESENT_PARAMETERS* reset_params = (g_dgv_fixes && params) ? &fixed_params : params;
+      const HRESULT hr = Original<decltype(&HookReset)>(self, SLOT_RESET)(self, reset_params);
+      if (g_dgv_fixes && params)
+      {
+         params->BackBufferWidth = reset_params->BackBufferWidth; // the runtime fills these in (zero size, UNKNOWN format)
+         params->BackBufferHeight = reset_params->BackBufferHeight;
+         params->BackBufferFormat = reset_params->BackBufferFormat;
+         params->BackBufferCount = reset_params->BackBufferCount;
+      }
+      if (SUCCEEDED(hr) && g_dgv_fixes)
+      {
+         {
+            std::unique_lock lock(g_dgv.mutex);
+            ResetVertexSamplers();
+         }
+         SetDocumentedPointDefaults(self);
+      }
       fprintf(g_log, "Reset -> 0x%08lX\n", hr);
       fflush(g_log);
       return hr;
@@ -1811,9 +2451,9 @@ namespace
    }
 
    // The device's hooks and the CSMT layer, after CreateDevice or CreateDeviceEx ("ex_device": a D3D9Ex device the VA fix
-   // applies to)
+   // applies to; "app_params": the game's parameters before the call filled them in)
    HRESULT OnDeviceCreated(HRESULT hr, IDirect3DDevice9** device, bool ex_device, bool csmt, DWORD behavior,
-      const D3DPRESENT_PARAMETERS* params)
+      const D3DPRESENT_PARAMETERS* params, const std::optional<D3DPRESENT_PARAMETERS>& app_params)
    {
       fprintf(g_log, "CreateDevice behavior 0x%08lX %ux%u windowed %d -> 0x%08lX\n",
          behavior, params ? params->BackBufferWidth : 0,
@@ -1849,6 +2489,7 @@ namespace
       Patch(dev, SLOT_CREATE_INDEX_BUFFER, (void*)&HookCreateIndexBuffer);
       Patch(dev, SLOT_UPDATE_SURFACE, (void*)&HookUpdateSurface);
       Patch(dev, SLOT_UPDATE_TEXTURE, (void*)&HookUpdateTexture);
+      StartDgVoodooFixes(dev, app_params ? &*app_params : nullptr);
       if (csmt)
       {
          Csmt::Start(dev, g_log); // last: it patches above the hooks above
@@ -1878,6 +2519,7 @@ namespace
       {
          behavior &= ~D3DCREATE_MULTITHREADED;
       }
+      const std::optional<D3DPRESENT_PARAMETERS> app_params = (params ? std::optional(*params) : std::nullopt);
       HRESULT hr = E_FAIL;
       bool ex_device = false;
       if (IDirect3D9Ex* ex = nullptr;
@@ -1906,7 +2548,7 @@ namespace
          hr = Original<decltype(&HookCreateDevice)>(self, SLOT_CREATE_DEVICE)(
             self, adapter, type, window, behavior, params, device);
       }
-      return OnDeviceCreated(hr, device, ex_device, csmt, behavior, params);
+      return OnDeviceCreated(hr, device, ex_device, csmt, behavior, params, app_params);
    }
 
    // A D3D9Ex game's device (Bayonetta): set up as CreateDevice's, the VA fix applying when requested
@@ -1918,10 +2560,11 @@ namespace
       {
          behavior &= ~D3DCREATE_MULTITHREADED;
       }
+      const std::optional<D3DPRESENT_PARAMETERS> app_params = (params ? std::optional(*params) : std::nullopt);
       const HRESULT hr = Original<decltype(&HookCreateDeviceEx)>(self, SLOT_CREATE_DEVICE_EX)(self, adapter, type, window, behavior,
          params, mode, device);
       fprintf(g_log, "CreateDeviceEx:\n");
-      return OnDeviceCreated(hr, (IDirect3DDevice9**)device, g_fix_requested, csmt, behavior, params);
+      return OnDeviceCreated(hr, (IDirect3DDevice9**)device, g_fix_requested, csmt, behavior, params, app_params);
    }
 
    DWORD WINAPI ReportThread(void*)
@@ -2034,6 +2677,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
       g_strip_multithreaded = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_csmt.on", g_dir);
       g_csmt_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
+      swprintf_s(flag_path, L"%sd3d9_dgvfix.off", g_dir);
+      g_dgv_fixes_disabled = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       fprintf(g_log, "---- d3d9_memlog attached, pid %lu, VA fix %s, multithreaded flag %s, CSMT %s\n",
          GetCurrentProcessId(), g_fix_requested ? "requested" : "off",
          g_strip_multithreaded ? "stripped" : (g_csmt_requested ? "stripped with CSMT" : "kept"),
