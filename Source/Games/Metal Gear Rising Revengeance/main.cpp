@@ -750,7 +750,8 @@ class MetalGearRisingRevengeance final : public Game
       // see "scene_color_hint"). The G-buffer's draws are refused (several targets). Single sample both.
       static bool AcceptSceneColor(const D3D11_RENDER_TARGET_VIEW_DESC& rtv_desc, const D3D11_TEXTURE2D_DESC& color_desc)
       {
-         return color_desc.SampleDesc.Count == 1 && (rtv_desc.Format == DXGI_FORMAT_R32_FLOAT || rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+         // The scene's fp16 mirror (bound in place of the game's R8G8B8A8 target) and the depth prepass' R32F
+         return color_desc.SampleDesc.Count == 1 && (rtv_desc.Format == DXGI_FORMAT_R32_FLOAT || rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
       }
 
       static bool MaskUnmatchedBlended(DeviceData& device_data)
