@@ -27,6 +27,8 @@ namespace MotionVectorPatches
    constexpr uint32_t previous_position_register = 31;
    // Past the game's targets (pixel shaders write o0-o2)
    constexpr uint32_t target_slot = 4;
+   // The alpha blended draws' reactive mask target (see "MotionVectorPatch::PatchPixelShaderReactive")
+   constexpr uint32_t reactive_slot = target_slot + 1;
 
    // For Core's patches ("motion_vector_patch.h")
    constexpr MotionVectorPatch::Layout layout = {
