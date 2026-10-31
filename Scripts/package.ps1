@@ -8,8 +8,8 @@
     root plus a "Luma/" folder (the shaders mount, filtered to this project),
     with the project-level (Core/Textures) folders only included when the
     project opts in via UseLumaFastNoise, plus the runtime DLLs the project
-    needs (dxcompiler.dll for DXP, d3dcompiler_47.dll, ReShade as dxgi.dll,
-    NGX DLSS and the FidelityFX DX12 dlls for FSR 4 when opted in).
+    needs (dxcompiler.dll for DXP and D3D12 projects, d3dcompiler_47.dll, ReShade as dxgi.dll,
+    NGX DLSS, the FidelityFX DX12 dlls for FSR 4 and D3D12 FSR, and XeSS on D3D12 when opted in).
 
 .EXAMPLE
     .\scripts\package.ps1 -Project "Final Fantasy XV" -Config "Development-Release" -Platform "x64"
@@ -87,8 +87,11 @@ $vcxproj = $vcxproj.FullName
 $useLumaFastNoise = Test-PropEnabled $vcxproj "UseLumaFastNoise"
 $useLumaDXP = Test-PropEnabled $vcxproj "UseLumaDXP"
 $useLumaNGX = Test-PropEnabled $vcxproj "UseLumaNGX"
-$useLumaFSR4 = (Test-PropEnabled $vcxproj "UseLumaFSR") -and (Test-PropEnabled $vcxproj "UseLumaFSR4")
-Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaFSR4=$useLumaFSR4"
+$useLumaFSR = Test-PropEnabled $vcxproj "UseLumaFSR"
+$useLumaFSR4 = $useLumaFSR -and (Test-PropEnabled $vcxproj "UseLumaFSR4")
+$useLumaXeSS = Test-PropEnabled $vcxproj "UseLumaXeSS"
+$isD3D12 = (Get-Content $vcxproj -Raw) -match "<LumaGraphicsAPI>\s*D3D12\s*</LumaGraphicsAPI>"
+Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaFSR4=$useLumaFSR4 UseLumaXeSS=$useLumaXeSS D3D12=$isD3D12"
 
 # Locate the addon. When packaging runs from the LumaPackage build target the
 # exact build output is passed in (-AddonPath = $(TargetPath)); standalone runs
@@ -138,8 +141,15 @@ try {
         }
     }
 
-    # Runtime DLLs (dxcompiler.dll is intentionally not shipped: Luma only uses the
-    #    SM5 recipe path, which is native — DXC/DXIL is only needed once SM6 is used)
+    # Runtime DLLs. D3D11 projects only use FXC (d3dcompiler_47.dll); D3D12 ones compile their SM6 shaders with DXC, from the "Luma"
+    # folder (see "GetDxcCreateInstance()"). DXC signs the DXIL itself, so dxil.dll isn't needed.
+    if ($isD3D12) {
+        $dxcSrc = Join-Path $repoRoot "Shaders\Decompiler\dxcompiler.dll"
+        if (-not (Test-Path $dxcSrc)) {
+            Write-Error "dxcompiler.dll not found: $dxcSrc"
+        }
+        Copy-Item $dxcSrc -Destination "$tempDir\Luma" -Force
+    }
     $d3dCompilerSrc = if ($Platform -eq "Win32") { Join-Path $repoRoot "Shaders\Decompiler\d3dcompiler_47_x32.dll" }
                       else { Join-Path $repoRoot "Shaders\Decompiler\d3dcompiler_47.dll" }
     if (Test-Path $d3dCompilerSrc) { Copy-Item $d3dCompilerSrc -Destination "$tempDir\Luma" -Force }
@@ -151,12 +161,20 @@ try {
         if ($Config -notlike "Development*") { $ngxSrc = Join-Path $repoRoot "Source\External\NGX\bin\rel\nvngx_dlss.dll" }
         if (Test-Path $ngxSrc) { Copy-Item $ngxSrc -Destination $tempDir -Force }
     }
-    # FSR 4 loads them from next to the addon (x64 only)
-    if ($useLumaFSR4 -and $Platform -ne "Win32") {
+    # FSR 4 (and every FSR on D3D12) loads them from next to the addon (x64 only)
+    if (($useLumaFSR4 -or ($useLumaFSR -and $isD3D12)) -and $Platform -ne "Win32") {
         $ffxDir = Join-Path $repoRoot "Source\External\FidelityFX\bin"
         Copy-Item (Join-Path $ffxDir "*.dll") -Destination $tempDir -Force
         New-Item -ItemType Directory -Path "$tempDir\Licenses" -Force | Out-Null
         Copy-Item (Join-Path $ffxDir "FidelityFX_LICENSE.md") -Destination "$tempDir\Licenses" -Force
+    }
+
+    # D3D12 XeSS loads Intel's signed libxess.dll from next to the addon
+    if ($useLumaXeSS -and $isD3D12) {
+        $xessDir = Join-Path $repoRoot "Source\External\XeSS"
+        Copy-Item (Join-Path $xessDir "bin\libxess.dll") -Destination $tempDir -Force
+        New-Item -ItemType Directory -Path "$tempDir\Licenses" -Force | Out-Null
+        Copy-Item (Join-Path $xessDir "LICENSE.txt") -Destination "$tempDir\Licenses\XeSS_LICENSE.txt" -Force
     }
 
     # Addon at the zip root, under the canonical Luma-<Project>.addon name
