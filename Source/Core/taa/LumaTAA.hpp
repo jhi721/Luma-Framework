@@ -21,9 +21,11 @@ namespace LumaTAA
    // first. The flickering analysis ("TAA_FLICKER") is off at every level, so its state textures aren't created or bound.
    constexpr int medium_quality = 1;
    constexpr int ultra_quality = 3;
-   // Halton(2, 3) phases: the history converges over ~25 frames, so 16 well spread sample positions get averaged; upscaling takes
-   // more (FSR's 8 x scale^2), so every output pixel gets a sample within a cycle
-   constexpr int jitter_phases = 16;
+   // Halton(2, 3) phases, as DLAA and FSR at native resolution. The history window (~25 frames, ~6 samples per 2x history texel)
+   // doesn't average a whole cycle of 16, which left static aliasing pulsing at the cycle's period: 8 flickered ~25% less in
+   // ME3LE and the lab (16 had 15-30% lower static error). Upscaling takes more (FSR's 8 x scale^2), so every output pixel gets
+   // a sample within a cycle
+   constexpr int jitter_phases = 8;
    // From High quality the history is kept at 2x2 the render resolution ("TAA_HISTORY_2X"): repeated reprojection then blurs far
    // less, and each history texel accumulates the samples that land in its quarter pixel
    constexpr int history_2x_quality = 2;
