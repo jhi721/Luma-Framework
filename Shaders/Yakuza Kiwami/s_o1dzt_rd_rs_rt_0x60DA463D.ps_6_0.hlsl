@@ -1,0 +1,933 @@
+// Yakuza Kiwami material s_o1dzt[rd][rs][rt] (0x60DA463D, DXIL SM 6.0), decompiled verbatim (Shaders/Decompiler/decomp.exe) with two edits,
+// applied by a script: the inline Hable tonemap's saturate goes through
+// YKR_MaterialCurve (tangent continuation in HDR), and the light pre-pass buffer t14 through YKR_LightBuffer.
+
+#include "Includes/Common.hlsl"
+
+Texture2D<float4> s0_t : register(t0);
+
+Texture2D<float4> s2_t : register(t2);
+
+Texture2D<float4> s4_t : register(t4);
+
+Texture2D<float4> s5_t : register(t5);
+
+Texture2D<float4> s6_t : register(t6);
+
+Texture2D<float4> s7_t : register(t7);
+
+Texture2D<float4> s13_t : register(t13);
+
+Texture2D<float4> s14_t : register(t14);
+
+cbuffer cb12 : register(b12)
+{
+   float4 c_matP[4] : packoffset(c000.x);
+   float4 c_matV[4] : packoffset(c004.x);
+   float4 c_matVP[4] : packoffset(c008.x);
+   float4 c_matT[4][4] : packoffset(c012.x);
+   float4 c_rvtx_param : packoffset(c028.x);
+   float4 c_rt_size : packoffset(c029.x);
+   float3 c_location : packoffset(c030.x);
+};
+
+cbuffer cb13 : register(b13)
+{
+   uint c_bool : packoffset(c000.x);
+};
+
+cbuffer cb6 : register(b6)
+{
+   float3 c_diffuse_scale : packoffset(c000.x);
+   float c_global_opacity : packoffset(c000.w);
+   float3 c_specular_scale : packoffset(c001.x);
+   float c_emissive_scale : packoffset(c001.w);
+};
+
+cbuffer cb7 : register(b7)
+{
+   float4 c_attribute_vs[4] : packoffset(c000.x);
+   float4 c_attribute_ps[4] : packoffset(c004.x);
+   float c_mat_punchthrough_ref : packoffset(c008.x);
+   float c_mat_glare_ref : packoffset(c008.y);
+   float c_mat_fresnel : packoffset(c008.z);
+   uint c_mat_custom_shader_flags : packoffset(c008.w);
+   float3 c_mat_diffuse : packoffset(c009.x);
+   float c_mat_opacity : packoffset(c009.w);
+   float3 c_mat_specular : packoffset(c010.x);
+   float c_mat_power : packoffset(c010.w);
+   float3 c_mat_emissive : packoffset(c011.x);
+   float c_mat_ambient : packoffset(c011.w);
+};
+
+cbuffer cb5 : register(b5)
+{
+   float2 c_uv0_offset : packoffset(c000.x);
+   float2 c_uv1_offset : packoffset(c000.z);
+   float2 c_uv2_offset : packoffset(c001.x);
+   float c_blend_scale : packoffset(c001.z);
+   float c_opacity_scale : packoffset(c001.w);
+};
+
+cbuffer cb_user : register(b9)
+{
+   float4 c_ps_user[16] : packoffset(c000.x);
+};
+
+cbuffer cb1 : register(b1)
+{
+   float4 c_tone_control : packoffset(c000.x);
+   float4 c_fog_param[2] : packoffset(c001.x);
+   float4 c_ps_col_scl[1] : packoffset(c003.x);
+   float4 c_ls_param[4] : packoffset(c004.x);
+   float4 c_shadowmap_offset[1] : packoffset(c008.x);
+   float4 c_sdw_param[3] : packoffset(c009.x);
+   float4 c_sdw_param_ch[1] : packoffset(c012.x);
+   float4 c_scene_ambient : packoffset(c013.x);
+};
+
+cbuffer cb2 : register(b2)
+{
+   float4 c_ps_scratch[92] : packoffset(c000.x);
+};
+
+cbuffer cb3 : register(b3)
+{
+   float4 c_light_col[6] : packoffset(c000.x);
+   float4 c_light_vec[6] : packoffset(c006.x);
+};
+
+SamplerState s0_s : register(s0);
+
+SamplerState s2_s : register(s2);
+
+SamplerState s4_s : register(s4);
+
+SamplerState s5_s : register(s5);
+
+SamplerState s6_s : register(s6);
+
+SamplerState s7_s : register(s7);
+
+SamplerState s13_s : register(s13);
+
+SamplerState s14_s : register(s14);
+
+float4 main(
+    linear float4 COLOR : COLOR,
+    linear float4 COLOR_1 : COLOR1,
+    linear float4 TEXCOORD : TEXCOORD,
+    linear float4 TEXCOORD_1 : TEXCOORD1,
+    linear float4 TEXCOORD_2 : TEXCOORD2,
+    linear float4 TEXCOORD_3 : TEXCOORD3,
+    linear float4 TEXCOORD_4 : TEXCOORD4,
+    linear float4 TEXCOORD_5 : TEXCOORD5,
+    noperspective float4 SV_Position : SV_Position) : SV_Target
+{
+   float4 SV_Target = 0;
+   float4 _60 = s2_t.Sample(s2_s, float2(TEXCOORD.x, TEXCOORD.y));
+   float4 _64 = s0_t.Sample(s0_s, float2(TEXCOORD.x, TEXCOORD.y));
+   float _69 = _64.x * _64.x;
+   float _70 = _64.y * _64.y;
+   float _71 = _64.z * _64.z;
+   float4 _72 = s5_t.Sample(s5_s, float2(TEXCOORD.x, TEXCOORD.y));
+   float4 _75 = s6_t.Sample(s6_s, float2(TEXCOORD.z, TEXCOORD.w));
+   float _78 = _75.x + -0.5f;
+   float _79 = _75.y + -0.5f;
+   float _80 = _78 * _60.z;
+   float _81 = _79 * _60.z;
+   float _82 = _80 + 0.5f;
+   float _83 = _81 + 0.5f;
+   bool _84 = (_72.x < 0.5f);
+   bool _85 = (_72.y < 0.5f);
+   float _86 = _72.x * 2.0f;
+   float _87 = _86 * _82;
+   float _88 = _72.y * 2.0f;
+   float _89 = _88 * _83;
+   float _90 = 1.0f - _72.x;
+   float _91 = 1.0f - _72.y;
+   float _92 = _90 * 2.0f;
+   float _93 = _91 * 2.0f;
+   float _94 = 0.5f - _80;
+   float _95 = 0.5f - _81;
+   float _96 = _92 * _94;
+   float _97 = _93 * _95;
+   float _98 = 1.0f - _96;
+   float _99 = 1.0f - _97;
+   float _100 = select(_84, _87, _98);
+   float _101 = select(_85, _89, _99);
+   float4 _102 = s4_t.Sample(s4_s, float2(TEXCOORD.z, TEXCOORD.w));
+   float _106 = 1.0f - _102.x;
+   float _107 = 1.0f - _102.y;
+   float _108 = 1.0f - _102.z;
+   float _109 = _106 * _60.z;
+   float _110 = _107 * _60.z;
+   float _111 = _108 * _60.z;
+   float _112 = 1.0f - _109;
+   float _113 = 1.0f - _110;
+   float _114 = 1.0f - _111;
+   float _115 = _112 * _60.x;
+   float _116 = _113 * _60.x;
+   float _117 = _114 * _60.x;
+   float _120 = _100 * 2.0f;
+   float _121 = _101 * 2.0f;
+   float _122 = _120 + -1.0f;
+   float _123 = _121 + -1.0f;
+   float _124 = dot(float2(_122, _123), float2(_122, _123));
+   float _125 = 1.0f - _124;
+   float _126 = saturate(_125);
+   float _127 = sqrt(_126);
+   float _128 = TEXCOORD_2.y * TEXCOORD_3.z;
+   float _129 = TEXCOORD_2.z * TEXCOORD_3.y;
+   float _130 = _128 - _129;
+   float _131 = TEXCOORD_2.z * TEXCOORD_3.x;
+   float _132 = TEXCOORD_2.x * TEXCOORD_3.z;
+   float _133 = _131 - _132;
+   float _134 = TEXCOORD_2.x * TEXCOORD_3.y;
+   float _135 = TEXCOORD_2.y * TEXCOORD_3.x;
+   float _136 = _134 - _135;
+   float _137 = _122 * TEXCOORD_3.x;
+   float _138 = _122 * TEXCOORD_3.y;
+   float _139 = _122 * TEXCOORD_3.z;
+   float _140 = _123 * TEXCOORD_3.w;
+   float _141 = _140 * _130;
+   float _142 = _140 * _133;
+   float _143 = _140 * _136;
+   float _144 = _141 + _137;
+   float _145 = _142 + _138;
+   float _146 = _143 + _139;
+   float _147 = _127 * TEXCOORD_2.x;
+   float _148 = _127 * TEXCOORD_2.y;
+   float _149 = _127 * TEXCOORD_2.z;
+   float _150 = _144 + _147;
+   float _151 = _145 + _148;
+   float _152 = _146 + _149;
+   float _153 = dot(float3(_150, _151, _152), float3(_150, _151, _152));
+   float _154 = rsqrt(_153);
+   float _155 = _150 * _154;
+   float _156 = _151 * _154;
+   float _157 = _152 * _154;
+   float _162 = dot(float3(TEXCOORD_1.x, TEXCOORD_1.y, TEXCOORD_1.z), float3(TEXCOORD_1.x, TEXCOORD_1.y, TEXCOORD_1.z));
+   float _163 = rsqrt(_162);
+   float _164 = _163 * TEXCOORD_1.x;
+   float _165 = _163 * TEXCOORD_1.y;
+   float _166 = _163 * TEXCOORD_1.z;
+   float _167 = _164 + (c_light_vec[0].x);
+   float _168 = _165 + (c_light_vec[0].y);
+   float _169 = _166 + (c_light_vec[0].z);
+   float _170 = dot(float3(_167, _168, _169), float3(_167, _168, _169));
+   float _171 = rsqrt(_170);
+   float _172 = _167 * _171;
+   float _173 = _168 * _171;
+   float _174 = _169 * _171;
+   float _178 = (c_attribute_ps[2].x) * TEXCOORD.x;
+   float _179 = (c_attribute_ps[2].y) * TEXCOORD.y;
+   float4 _180 = s7_t.Sample(s7_s, float2(_178, _179));
+   float _185 = _180.x * _180.x;
+   float _186 = _180.y * _180.y;
+   float _187 = _180.z * _180.z;
+   float _188 = 1.0f - _185;
+   float _189 = 1.0f - _186;
+   float _190 = 1.0f - _187;
+   float _191 = 1.0f - _60.z;
+   float _192 = 1.0f - _180.w;
+   float _193 = _192 * _191;
+   float _194 = _193 * _188;
+   float _195 = _193 * _189;
+   float _196 = _193 * _190;
+   float _197 = _194 + _185;
+   float _198 = _195 + _186;
+   float _199 = _196 + _187;
+   float _200 = _69 * _197;
+   float _201 = _70 * _198;
+   float _202 = _71 * _199;
+   float _203 = _156 + 0.10000000149011612f;
+   float _204 = saturate(_203);
+   float _207 = (c_attribute_ps[2].w) + 2.0f;
+   float _209 = (c_attribute_ps[2].z) + 2.5f;
+   float _210 = -0.0f - _164;
+   float _211 = -0.0f - _165;
+   float _212 = -0.0f - _166;
+   float _213 = dot(float3(_210, _211, _212), float3(TEXCOORD_2.x, TEXCOORD_2.y, TEXCOORD_2.z));
+   float _214 = 1.0f - _213;
+   float _215 = saturate(_214);
+   float _216 = dot(float3(_210, _211, _212), float3(_155, _156, _157));
+   float _217 = 1.0f - _216;
+   float _218 = saturate(_217);
+   float _219 = _218 * _215;
+   float _220 = log2(_219);
+   float _221 = _220 * _207;
+   float _222 = exp2(_221);
+   float _223 = _222 * _209;
+   int _226 = c_bool & 4096;
+   bool _227 = (_226 == 0);
+   float _236;
+   float _260;
+   float _261;
+   float _273;
+   float _274;
+   float _462;
+   float _463;
+   float _464;
+   float _465;
+   float _466;
+   float _467;
+   float _500;
+   float _501;
+   float _502;
+   float _503;
+   float _668;
+   float _838;
+   float _839;
+   float _840;
+   float _916;
+   float _917;
+   float _918;
+   float _934;
+   float _935;
+   float _936;
+   float _961;
+   float _962;
+   float _963;
+   if (!_227)
+   {
+      float _232 = (c_ps_user[9].w) * _220;
+      float _233 = exp2(_232);
+      float _234 = _233 * (c_ps_user[9].z);
+      _236 = _234;
+   }
+   else
+   {
+      _236 = _223;
+   }
+   float _237 = _204 * _236;
+   float _238 = _60.y * _237;
+   float _241 = _238 * (c_ps_user[2].x);
+   float _242 = _241 + 1.0f;
+   float _243 = _200 * _242;
+   float _244 = _201 * _242;
+   float _245 = _202 * _242;
+   float _249 = c_rt_size.z * SV_Position.x;
+   float _250 = c_rt_size.w * SV_Position.y;
+   int _253 = c_bool & 8;
+   bool _254 = (_253 == 0);
+   if (!_254)
+   {
+      float4 _256 = s13_t.Sample(s13_s, float2(_249, _250));
+      _260 = _256.x;
+      _261 = _256.y;
+   }
+   else
+   {
+      _260 = 1.0f;
+      _261 = 1.0f;
+   }
+   if (!_254)
+   {
+      float _266 = (c_sdw_param_ch[0].x) * _260;
+      float _267 = (c_sdw_param_ch[0].z) * _261;
+      float _270 = _266 + (c_sdw_param_ch[0].y);
+      float _271 = _267 + (c_sdw_param_ch[0].w);
+      _273 = _270;
+      _274 = _271;
+   }
+   else
+   {
+      _273 = _260;
+      _274 = _261;
+   }
+   float _275 = min(_273, _274);
+   float _284 = (c_light_vec[1].x) + _164;
+   float _285 = (c_light_vec[1].y) + _165;
+   float _286 = (c_light_vec[1].z) + _166;
+   float _287 = dot(float3(_284, _285, _286), float3(_284, _285, _286));
+   float _288 = rsqrt(_287);
+   float _289 = _284 * _288;
+   float _290 = _285 * _288;
+   float _291 = _286 * _288;
+   float _292 = -0.0f - (c_light_vec[1].x);
+   float _293 = -0.0f - (c_light_vec[1].y);
+   float _294 = -0.0f - (c_light_vec[1].z);
+   float _295 = -0.0f - (c_light_vec[0].x);
+   float _296 = -0.0f - (c_light_vec[0].y);
+   float _297 = -0.0f - (c_light_vec[0].z);
+   float _298 = dot(float3(_164, _165, _166), float3(_155, _156, _157));
+   float _299 = _298 * 2.0f;
+   float _300 = _299 * _155;
+   float _301 = _299 * _156;
+   float _302 = _299 * _157;
+   float _303 = _164 - _300;
+   float _304 = _165 - _301;
+   float _305 = _166 - _302;
+   float _306 = dot(float3(_303, _304, _305), float3(_295, _296, _297));
+   float _307 = dot(float3(_303, _304, _305), float3(_292, _293, _294));
+   float _308 = saturate(_306);
+   float _309 = saturate(_307);
+   float _310 = log2(_308);
+   float _311 = log2(_309);
+   float _312 = _310 * c_mat_power;
+   float _313 = _311 * c_mat_power;
+   float _314 = exp2(_312);
+   float _315 = exp2(_313);
+   float _320 = c_mat_fresnel * c_tone_control.w;
+   float _321 = c_mat_power * 0.03974359855055809f;
+   float _322 = _321 + 0.0856831967830658f;
+   float _323 = _315 * _322;
+   float _324 = dot(float3(_164, _165, _166), float3(_172, _173, _174));
+   float _325 = dot(float3(_164, _165, _166), float3(_289, _290, _291));
+   float _326 = 1.0f - _324;
+   float _327 = 1.0f - _325;
+   float _328 = _326 * _326;
+   float _329 = _327 * _327;
+   float _330 = 1.0f - _320;
+   float _331 = _328 * _328;
+   float _332 = _331 * _326;
+   float _333 = _332 * _330;
+   float _334 = _327 * _330;
+   float _335 = _329 * _329;
+   float _336 = _335 * _334;
+   float _337 = _333 + _320;
+   float _338 = _336 + _320;
+   float _339 = dot(float3(_155, _156, _157), float3(_295, _296, _297));
+   float _340 = saturate(_339);
+   float _341 = dot(float3(_155, _156, _157), float3(_292, _293, _294));
+   float _342 = saturate(_341);
+   float _343 = _323 * _342;
+   float _344 = _343 * _338;
+   float _353 = c_specular_scale.x * c_mat_specular.x;
+   float _354 = c_specular_scale.y * c_mat_specular.y;
+   float _355 = c_specular_scale.z * c_mat_specular.z;
+   float _360 = _275 * _322;
+   float _361 = _360 * _314;
+   float _362 = _361 * _340;
+   float _363 = _362 * _337;
+   float _364 = (c_light_col[0].x) * _363;
+   float _365 = (c_light_col[0].y) * _363;
+   float _366 = (c_light_col[0].z) * _363;
+   float _371 = (c_light_col[1].x) * _344;
+   float _372 = (c_light_col[1].y) * _344;
+   float _373 = (c_light_col[1].z) * _344;
+   float _374 = _371 + _364;
+   float _375 = _372 + _365;
+   float _376 = _373 + _366;
+   float _377 = _353 * _374;
+   float _378 = _354 * _375;
+   float _379 = _355 * _376;
+   int _383 = c_bool & 1;
+   bool _384 = (_383 == 0);
+   if (!_384)
+   {
+      float _386 = -0.0f - TEXCOORD_4.x;
+      float _387 = -0.0f - TEXCOORD_4.y;
+      float _388 = -0.0f - TEXCOORD_4.z;
+      float _389 = dot(float3(_155, _156, _157), float3(_386, _387, _388));
+      float _390 = saturate(_389);
+      float _391 = _390 * TEXCOORD_1.w;
+      float _392 = _390 * TEXCOORD_2.w;
+      float _393 = _390 * TEXCOORD_4.w;
+      float _394 = max(0.0f, _391);
+      float _395 = max(0.0f, _392);
+      float _396 = max(0.0f, _393);
+      float _397 = -0.0f - TEXCOORD_5.x;
+      float _398 = -0.0f - TEXCOORD_5.y;
+      float _399 = -0.0f - TEXCOORD_5.z;
+      float _400 = dot(float3(_155, _156, _157), float3(_397, _398, _399));
+      float _401 = saturate(_400);
+      float _402 = _401 * COLOR.w;
+      float _403 = _401 * COLOR_1.w;
+      float _404 = _401 * TEXCOORD_5.w;
+      float _405 = max(0.0f, _402);
+      float _406 = max(0.0f, _403);
+      float _407 = max(0.0f, _404);
+      float _408 = _405 + _394;
+      float _409 = _406 + _395;
+      float _410 = _407 + _396;
+      float _411 = _164 + TEXCOORD_4.x;
+      float _412 = _165 + TEXCOORD_4.y;
+      float _413 = _166 + TEXCOORD_4.z;
+      float _414 = dot(float3(_411, _412, _413), float3(_411, _412, _413));
+      float _415 = rsqrt(_414);
+      float _416 = _164 + TEXCOORD_5.x;
+      float _417 = _165 + TEXCOORD_5.y;
+      float _418 = _166 + TEXCOORD_5.z;
+      float _419 = dot(float3(_416, _417, _418), float3(_416, _417, _418));
+      float _420 = rsqrt(_419);
+      float _421 = _416 * _420;
+      float _422 = -0.0f - _421;
+      float _423 = _417 * _420;
+      float _424 = -0.0f - _423;
+      float _425 = _418 * _420;
+      float _426 = -0.0f - _425;
+      float _427 = _411 * _415;
+      float _428 = -0.0f - _427;
+      float _429 = _412 * _415;
+      float _430 = -0.0f - _429;
+      float _431 = _413 * _415;
+      float _432 = -0.0f - _431;
+      float _433 = dot(float3(_428, _430, _432), float3(_155, _156, _157));
+      float _434 = dot(float3(_422, _424, _426), float3(_155, _156, _157));
+      float _435 = saturate(_433);
+      float _436 = saturate(_434);
+      float _437 = log2(_435);
+      float _438 = log2(_436);
+      float _439 = _437 * c_mat_power;
+      float _440 = _438 * c_mat_power;
+      float _441 = exp2(_439);
+      float _442 = exp2(_440);
+      float _443 = _441 * TEXCOORD_1.w;
+      float _444 = _441 * TEXCOORD_2.w;
+      float _445 = _441 * TEXCOORD_4.w;
+      float _446 = _442 * COLOR.w;
+      float _447 = _442 * COLOR_1.w;
+      float _448 = _442 * TEXCOORD_5.w;
+      float _449 = _446 + _443;
+      float _450 = _447 + _444;
+      float _451 = _448 + _445;
+      float _452 = max(0.0f, _449);
+      float _453 = max(0.0f, _450);
+      float _454 = max(0.0f, _451);
+      float _455 = _353 * _452;
+      float _456 = _354 * _453;
+      float _457 = _355 * _454;
+      float _458 = min(_455, 1.0f);
+      float _459 = min(_456, 1.0f);
+      float _460 = min(_457, 1.0f);
+      _462 = _458;
+      _463 = _459;
+      _464 = _460;
+      _465 = _408;
+      _466 = _409;
+      _467 = _410;
+   }
+   else
+   {
+      _462 = 0.0f;
+      _463 = 0.0f;
+      _464 = 0.0f;
+      _465 = 0.0f;
+      _466 = 0.0f;
+      _467 = 0.0f;
+   }
+   float _468 = c_rt_size.z * SV_Position.x;
+   float _469 = c_rt_size.w * SV_Position.y;
+   float4 _470 = YKR_LightBuffer(s14_t.Sample(s14_s, float2(_468, _469)));
+   int _477 = c_bool & 16384;
+   bool _478 = (_477 == 0);
+   if (!_478)
+   {
+      float _480 = _470.x * 4.0f;
+      float _481 = _470.y * 4.0f;
+      float _482 = _470.z * 4.0f;
+      float _483 = _470.w * 4.0f;
+      _500 = _480;
+      _501 = _481;
+      _502 = _482;
+      _503 = _483;
+   }
+   else
+   {
+      int _485 = c_bool & 8192;
+      bool _486 = (_485 == 0);
+      if (!_486)
+      {
+         float _488 = _470.x * 2.0f;
+         float _489 = _470.y * 2.0f;
+         float _490 = _470.z * 2.0f;
+         float _491 = _470.w * 2.0f;
+         _500 = _488;
+         _501 = _489;
+         _502 = _490;
+         _503 = _491;
+      }
+      else
+      {
+         float _495 = _470.x / c_tone_control.z;
+         float _496 = _470.y / c_tone_control.z;
+         float _497 = _470.z / c_tone_control.z;
+         float _498 = _470.w / c_tone_control.z;
+         _500 = _495;
+         _501 = _496;
+         _502 = _497;
+         _503 = _498;
+      }
+   }
+   float _504 = _500 + _465;
+   float _505 = _501 + _466;
+   float _506 = _502 + _467;
+   float _507 = _503 + _462;
+   float _508 = _503 + _463;
+   float _509 = _503 + _464;
+   float _572 = dot(float3(_155, _156, _157), float3(_155, _156, _157));
+   float _573 = rsqrt(_572);
+   float _574 = _573 * _155;
+   float _575 = _573 * _156;
+   float _576 = _573 * _157;
+   float _577 = dot(float4((c_ps_scratch[80].x), (c_ps_scratch[80].y), (c_ps_scratch[80].z), (c_ps_scratch[80].w)), float4(_574, _575, _576, 1.0f));
+   float _578 = dot(float4((c_ps_scratch[81].x), (c_ps_scratch[81].y), (c_ps_scratch[81].z), (c_ps_scratch[81].w)), float4(_574, _575, _576, 1.0f));
+   float _579 = dot(float4((c_ps_scratch[82].x), (c_ps_scratch[82].y), (c_ps_scratch[82].z), (c_ps_scratch[82].w)), float4(_574, _575, _576, 1.0f));
+   float _580 = dot(float4((c_ps_scratch[83].x), (c_ps_scratch[83].y), (c_ps_scratch[83].z), (c_ps_scratch[83].w)), float4(_574, _575, _576, 1.0f));
+   float _581 = dot(float4(_574, _575, _576, 1.0f), float4(_577, _578, _579, _580));
+   float _582 = dot(float4((c_ps_scratch[84].x), (c_ps_scratch[84].y), (c_ps_scratch[84].z), (c_ps_scratch[84].w)), float4(_574, _575, _576, 1.0f));
+   float _583 = dot(float4((c_ps_scratch[85].x), (c_ps_scratch[85].y), (c_ps_scratch[85].z), (c_ps_scratch[85].w)), float4(_574, _575, _576, 1.0f));
+   float _584 = dot(float4((c_ps_scratch[86].x), (c_ps_scratch[86].y), (c_ps_scratch[86].z), (c_ps_scratch[86].w)), float4(_574, _575, _576, 1.0f));
+   float _585 = dot(float4((c_ps_scratch[87].x), (c_ps_scratch[87].y), (c_ps_scratch[87].z), (c_ps_scratch[87].w)), float4(_574, _575, _576, 1.0f));
+   float _586 = dot(float4(_574, _575, _576, 1.0f), float4(_582, _583, _584, _585));
+   float _587 = dot(float4((c_ps_scratch[88].x), (c_ps_scratch[88].y), (c_ps_scratch[88].z), (c_ps_scratch[88].w)), float4(_574, _575, _576, 1.0f));
+   float _588 = dot(float4((c_ps_scratch[89].x), (c_ps_scratch[89].y), (c_ps_scratch[89].z), (c_ps_scratch[89].w)), float4(_574, _575, _576, 1.0f));
+   float _589 = dot(float4((c_ps_scratch[90].x), (c_ps_scratch[90].y), (c_ps_scratch[90].z), (c_ps_scratch[90].w)), float4(_574, _575, _576, 1.0f));
+   float _590 = dot(float4((c_ps_scratch[91].x), (c_ps_scratch[91].y), (c_ps_scratch[91].z), (c_ps_scratch[91].w)), float4(_574, _575, _576, 1.0f));
+   float _591 = dot(float4(_574, _575, _576, 1.0f), float4(_587, _588, _589, _590));
+   float _592 = max(_581, 0.0625f);
+   float _593 = max(_586, 0.0625f);
+   float _594 = max(_591, 0.0625f);
+   float _595 = _592 * (c_ps_scratch[79].x);
+   float _596 = _593 * (c_ps_scratch[79].x);
+   float _597 = _594 * (c_ps_scratch[79].x);
+   float _602 = -0.0f - (c_light_vec[0].x);
+   float _603 = -0.0f - (c_light_vec[0].y);
+   float _604 = -0.0f - (c_light_vec[0].z);
+   float _605 = dot(float3(_155, _156, _157), float3(_602, _603, _604));
+   float _606 = -0.0f - (c_light_vec[1].x);
+   float _607 = -0.0f - (c_light_vec[1].y);
+   float _608 = -0.0f - (c_light_vec[1].z);
+   float _609 = dot(float3(_155, _156, _157), float3(_606, _607, _608));
+   float _618 = _156 * 0.5f;
+   float _619 = _618 + 0.5f;
+   float _620 = (c_light_col[4].x) - (c_light_vec[4].x);
+   float _621 = (c_light_col[4].y) - (c_light_vec[4].y);
+   float _622 = (c_light_col[4].z) - (c_light_vec[4].z);
+   float _623 = _620 * _619;
+   float _624 = _621 * _619;
+   float _625 = _622 * _619;
+   float _626 = saturate(_605);
+   float _627 = saturate(_609);
+   float _632 = (c_light_col[0].x) * _626;
+   float _633 = (c_light_col[0].y) * _626;
+   float _634 = (c_light_col[0].z) * _626;
+   float _639 = (c_light_col[1].x) * _627;
+   float _640 = (c_light_col[1].y) * _627;
+   float _641 = (c_light_col[1].z) * _627;
+   float _642 = _632 * _275;
+   float _643 = _633 * _275;
+   float _644 = _634 * _275;
+   float _645 = (c_light_vec[4].x) + _595;
+   float _646 = _645 + _623;
+   float _647 = _646 + _504;
+   float _648 = _647 + _639;
+   float _649 = _648 + _642;
+   float _650 = (c_light_vec[4].y) + _596;
+   float _651 = _650 + _624;
+   float _652 = _651 + _505;
+   float _653 = _652 + _640;
+   float _654 = _653 + _643;
+   float _655 = (c_light_vec[4].z) + _597;
+   float _656 = _655 + _625;
+   float _657 = _656 + _506;
+   float _658 = _657 + _641;
+   float _659 = _658 + _644;
+   int _660 = c_bool & 64;
+   bool _661 = (_660 == 0);
+   if (!_661)
+   {
+      float _663 = 1.0f - _60.y;
+      float _664 = _275 * _663;
+      float _665 = _664 * _626;
+      float _666 = _665 + _60.y;
+      _668 = _666;
+   }
+   else
+   {
+      _668 = _60.y;
+   }
+   float _669 = _507 + _377;
+   float _670 = _508 + _378;
+   float _671 = _509 + _379;
+   int _672 = c_bool & 32768;
+   bool _673 = (_672 == 0);
+   if (!_673)
+   {
+      float _685 = (c_ps_user[11].x) * _243;
+      float _686 = (c_ps_user[11].x) * _244;
+      float _687 = (c_ps_user[11].x) * _245;
+      float _689 = _155 + 1.0f;
+      float _690 = _156 + 1.0f;
+      float _691 = _157 + 1.0f;
+      float _692 = _689 * 0.5f;
+      float _693 = _690 * 0.5f;
+      float _694 = _691 * 0.5f;
+      float _695 = saturate(_692);
+      float _696 = saturate(_693);
+      float _697 = saturate(_694);
+      float _698 = (c_ps_user[11].y) * _695;
+      float _699 = _696 * (c_ps_user[11].y);
+      float _700 = _697 * (c_ps_user[11].y);
+      float _710 = (c_ps_user[11].z) * _115;
+      float _711 = (c_ps_user[11].z) * _116;
+      float _712 = (c_ps_user[11].z) * _117;
+      float _714 = (c_ps_user[11].w) * _669;
+      float _717 = (c_ps_user[12].x) * _275;
+      float _719 = (c_ps_user[12].y) * _60.y;
+      float _724 = _217 * _217;
+      float _725 = _217 * 0.9722222089767456f;
+      float _726 = _724 * _724;
+      float _727 = _726 * _725;
+      float _728 = _727 + 0.02777777425944805f;
+      float _729 = (c_ps_user[13].z) * _728;
+      float _731 = (c_ps_user[13].w) * _646;
+      float _732 = (c_ps_user[13].w) * _651;
+      float _733 = (c_ps_user[13].w) * _656;
+      float _736 = (c_ps_user[14].y) * _632;
+      float _737 = (c_ps_user[14].y) * _633;
+      float _738 = (c_ps_user[14].y) * _634;
+      float _740 = (c_ps_user[14].z) * _639;
+      float _741 = (c_ps_user[14].z) * _640;
+      float _742 = (c_ps_user[14].z) * _641;
+      float _744 = (c_ps_user[14].w) * _504;
+      float _745 = (c_ps_user[14].w) * _505;
+      float _746 = (c_ps_user[14].w) * _506;
+      float _751 = (c_ps_user[15].z) * _507;
+      float _752 = (c_ps_user[15].z) * _508;
+      float _753 = (c_ps_user[15].z) * _509;
+      float _754 = (c_ps_user[15].y) + (c_ps_user[15].x);
+      float _755 = c_specular_scale.x * _754;
+      float _756 = _755 * _669;
+      float _757 = _736 + (c_ps_user[13].x);
+      float _758 = _757 + _740;
+      float _759 = c_diffuse_scale.x * _758;
+      float _760 = _759 * c_mat_diffuse.x;
+      float _761 = (c_ps_user[13].y) + _710;
+      float _762 = _761 * c_specular_scale.x;
+      float _763 = _762 + _756;
+      float _764 = _763 * c_mat_specular.x;
+      float _765 = _698 + _685;
+      float _766 = _765 + _714;
+      float _767 = _766 + _717;
+      float _768 = _767 + _719;
+      float _769 = _768 + _731;
+      float _770 = _769 + _729;
+      float _771 = _770 + _744;
+      float _772 = _771 + _751;
+      float _773 = _772 + _760;
+      float _774 = _773 + _764;
+      float _775 = c_specular_scale.y * _754;
+      float _776 = _775 * _670;
+      float _777 = _737 + (c_ps_user[13].x);
+      float _778 = _777 + _741;
+      float _779 = c_diffuse_scale.y * _778;
+      float _780 = _779 * c_mat_diffuse.y;
+      float _781 = (c_ps_user[13].y) + _711;
+      float _782 = _781 * c_specular_scale.y;
+      float _783 = _782 + _776;
+      float _784 = _783 * c_mat_specular.y;
+      float _785 = _714 + _686;
+      float _786 = _785 + _699;
+      float _787 = _786 + _717;
+      float _788 = _787 + _719;
+      float _789 = _788 + _732;
+      float _790 = _789 + _729;
+      float _791 = _790 + _745;
+      float _792 = _791 + _752;
+      float _793 = _792 + _780;
+      float _794 = _793 + _784;
+      float _795 = c_specular_scale.z * _754;
+      float _796 = _795 * _671;
+      float _797 = _738 + (c_ps_user[13].x);
+      float _798 = _797 + _742;
+      float _799 = c_diffuse_scale.z * _798;
+      float _800 = _799 * c_mat_diffuse.z;
+      float _801 = (c_ps_user[13].y) + _712;
+      float _802 = _801 * c_specular_scale.z;
+      float _803 = _802 + _796;
+      float _804 = _803 * c_mat_specular.z;
+      float _805 = _714 + _687;
+      float _806 = _805 + _700;
+      float _807 = _806 + _717;
+      float _808 = _807 + _719;
+      float _809 = _808 + _733;
+      float _810 = _809 + _729;
+      float _811 = _810 + _746;
+      float _812 = _811 + _753;
+      float _813 = _812 + _800;
+      float _814 = _813 + _804;
+      float _815 = saturate(_774);
+      float _816 = saturate(_794);
+      float _817 = saturate(_814);
+      _838 = _815;
+      _839 = _816;
+      _840 = _817;
+   }
+   else
+   {
+      float _819 = c_diffuse_scale.x * c_mat_diffuse.x;
+      float _820 = _819 * _243;
+      float _821 = _820 * _649;
+      float _822 = _821 * _668;
+      float _823 = c_diffuse_scale.y * c_mat_diffuse.y;
+      float _824 = _823 * _244;
+      float _825 = _824 * _654;
+      float _826 = _825 * _668;
+      float _827 = c_diffuse_scale.z * c_mat_diffuse.z;
+      float _828 = _827 * _245;
+      float _829 = _828 * _659;
+      float _830 = _829 * _668;
+      float _831 = _669 * _115;
+      float _832 = _670 * _116;
+      float _833 = _671 * _117;
+      float _834 = _822 + _831;
+      float _835 = _826 + _832;
+      float _836 = _830 + _833;
+      _838 = _834;
+      _839 = _835;
+      _840 = _836;
+   }
+   float _845 = c_mat_opacity * _64.w;
+   float _846 = _845 * c_opacity_scale;
+   float _847 = _846 * c_global_opacity;
+   float _848 = _838 * COLOR.x;
+   float _849 = _839 * COLOR.y;
+   float _850 = _840 * COLOR.z;
+   int _851 = c_bool & 16;
+   bool _852 = (_851 == 0);
+   if (!_852)
+   {
+      float _856 = c_tone_control.x * _848;
+      float _857 = c_tone_control.x * _849;
+      float _858 = c_tone_control.x * _850;
+      float _860 = log2(_856);
+      float _861 = log2(_857);
+      float _862 = log2(_858);
+      float _863 = _860 * c_tone_control.y;
+      float _864 = _861 * c_tone_control.y;
+      float _865 = _862 * c_tone_control.y;
+      float _866 = exp2(_863);
+      float _867 = exp2(_864);
+      float _868 = exp2(_865);
+      _916 = _866;
+      _917 = _867;
+      _918 = _868;
+   }
+   else
+   {
+      if (_673)
+      {
+         float _873 = c_tone_control.x * _848;
+         float _874 = c_tone_control.x * _849;
+         float _875 = c_tone_control.x * _850;
+         float _876 = _873 * 2.0f;
+         float _877 = _874 * 2.0f;
+         float _878 = _875 * 2.0f;
+         float _879 = _873 * 0.30000001192092896f;
+         float _880 = _874 * 0.30000001192092896f;
+         float _881 = _875 * 0.30000001192092896f;
+         float _882 = _879 + 0.05000000074505806f;
+         float _883 = _880 + 0.05000000074505806f;
+         float _884 = _881 + 0.05000000074505806f;
+         float _885 = _882 * _876;
+         float _886 = _883 * _877;
+         float _887 = _884 * _878;
+         float _888 = _885 + 0.004000000189989805f;
+         float _889 = _886 + 0.004000000189989805f;
+         float _890 = _887 + 0.004000000189989805f;
+         float _891 = _879 + 0.5f;
+         float _892 = _880 + 0.5f;
+         float _893 = _881 + 0.5f;
+         float _894 = _891 * _876;
+         float _895 = _892 * _877;
+         float _896 = _893 * _878;
+         float _897 = _894 + 0.06000000238418579f;
+         float _898 = _895 + 0.06000000238418579f;
+         float _899 = _896 + 0.06000000238418579f;
+         float _900 = _888 / _897;
+         float _901 = _889 / _898;
+         float _902 = _890 / _899;
+         float _903 = _900 + -0.06666666269302368f;
+         float _904 = _901 + -0.06666666269302368f;
+         float _905 = _902 + -0.06666666269302368f;
+         float _906 = _903 * 1.3790643215179443f;
+         float _907 = _904 * 1.3790643215179443f;
+         float _908 = _905 * 1.3790643215179443f;
+         float _909 = YKR_MaterialCurve(_906, _873);
+         float _910 = YKR_MaterialCurve(_907, _874);
+         float _911 = YKR_MaterialCurve(_908, _875);
+         float _912 = sqrt(_909);
+         float _913 = sqrt(_910);
+         float _914 = sqrt(_911);
+         _916 = _912;
+         _917 = _913;
+         _918 = _914;
+      }
+      else
+      {
+         _916 = _848;
+         _917 = _849;
+         _918 = _850;
+      }
+   }
+   int _919 = c_bool & 4;
+   bool _920 = (_919 == 0);
+   if (_920)
+   {
+      float _922 = saturate(COLOR_1.x);
+      float _927 = (c_fog_param[0].x) - _916;
+      float _928 = (c_fog_param[0].y) - _917;
+      float _929 = (c_fog_param[0].z) - _918;
+      float _930 = _927 * _922;
+      float _931 = _928 * _922;
+      float _932 = _929 * _922;
+      _934 = _930;
+      _935 = _931;
+      _936 = _932;
+   }
+   else
+   {
+      _934 = COLOR_1.x;
+      _935 = COLOR_1.y;
+      _936 = COLOR_1.z;
+   }
+   float _937 = _934 + _916;
+   float _938 = _935 + _917;
+   float _939 = _936 + _918;
+   if (!_673)
+   {
+      float _947 = (c_ps_user[3].x) * (c_ps_user[12].z);
+      float _948 = (c_ps_user[3].y) * (c_ps_user[12].z);
+      float _949 = (c_ps_user[3].z) * (c_ps_user[12].z);
+      float _951 = (c_ps_user[12].w) * COLOR.x;
+      float _952 = (c_ps_user[12].w) * COLOR.y;
+      float _953 = (c_ps_user[12].w) * COLOR.z;
+      float _954 = _951 + _937;
+      float _955 = _954 + _947;
+      float _956 = _952 + _938;
+      float _957 = _956 + _948;
+      float _958 = _953 + _939;
+      float _959 = _958 + _949;
+      _961 = _955;
+      _962 = _957;
+      _963 = _959;
+   }
+   else
+   {
+      _961 = _937;
+      _962 = _938;
+      _963 = _939;
+   }
+   float _969 = (c_ps_col_scl[0].x) * _961;
+   float _970 = (c_ps_col_scl[0].y) * _962;
+   float _971 = (c_ps_col_scl[0].z) * _963;
+   float _972 = (c_ps_col_scl[0].w) * _847;
+   SV_Target.x = _969;
+   SV_Target.y = _970;
+   SV_Target.z = _971;
+   SV_Target.w = _972;
+   int _975 = c_bool & 8;
+   bool _976 = (_975 != 0);
+   float _977 = select(_976, _961, _969);
+   float _978 = select(_976, _962, _970);
+   float _979 = select(_976, _963, _971);
+   float _980 = select(_976, _847, _972);
+   SV_Target.x = _977;
+   SV_Target.y = _978;
+   SV_Target.z = _979;
+   SV_Target.w = _980;
+   return SV_Target;
+}

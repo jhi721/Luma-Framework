@@ -1,0 +1,173 @@
+// Yakuza Kiwami ps_ccr_hls_sc_______of (0x5EF619B4, DXIL SM 6.0), decompiled verbatim (Shaders/Decompiler/decomp.exe) and edited by
+// a script: it becomes YKR_ColorCorrectGrade, each scene sample through YKR_ColorCorrectScene, run per grade (vanilla, HDR) by the main at the end.
+
+#include "Includes/ColorCorrect.hlsl"
+
+Texture2D<float4> s0_t : register(t0);
+
+Texture2D<float4> s1_t : register(t1);
+
+cbuffer cb_user : register(b9)
+{
+   float4 c_ps_user[16] : packoffset(c000.x);
+};
+
+SamplerState s0_s : register(s0);
+
+SamplerState s1_s : register(s1);
+
+float4 YKR_ColorCorrectGrade(float2 TEXCOORD)
+{
+   float4 SV_Target = 0;
+   float4 _8 = YKR_ColorCorrectScene(s0_t.Sample(s0_s, float2(TEXCOORD.x, TEXCOORD.y)));
+   float _12 = dot(float3(_8.x, _8.y, _8.z), float3(0.3333333432674408f, 0.3333333432674408f, 0.3333333432674408f));
+   float _13 = 1.0f - _12;
+   float _14 = _13 * _13;
+   float _15 = _12 * _12;
+   float _16 = 1.0f - _15;
+   float _17 = _16 - _14;
+   float _18 = saturate(_14);
+   float _19 = saturate(_17);
+   float _20 = saturate(_15);
+   bool _21 = (_8.x > _8.y);
+   float _22 = select(_21, _8.x, _8.y);
+   float _23 = select(_21, _8.y, _8.x);
+   bool _24 = (_23 > _8.z);
+   float _25 = select(_24, _8.z, _23);
+   bool _26 = (_22 < _8.z);
+   float _27 = select(_26, _8.z, _22);
+   float _28 = _27 - _25;
+   float _29 = _27 + _25;
+   float _34 = dot(float3((c_ps_user[4].x), (c_ps_user[4].y), (c_ps_user[4].z)), float3(_18, _19, _20));
+   float _39 = dot(float3((c_ps_user[8].x), (c_ps_user[8].y), (c_ps_user[8].z)), float3(_18, _19, _20));
+   float _43 = (c_ps_user[0].z) + _34;
+   float _44 = (c_ps_user[0].w) + _39;
+   float _45 = _29 * 0.5f;
+   float _47 = (c_ps_user[0].y) + _45;
+   bool _48 = (_47 < 0.5f);
+   float _49 = 2.0f - _29;
+   float _50 = select(_48, _29, _49);
+   float _51 = _28 / _50;
+   float _52 = _43 * _51;
+   float _53 = _52 + _51;
+   float _54 = _8.y - _8.z;
+   float _55 = _8.z - _8.x;
+   float _56 = _8.x - _8.y;
+   float _57 = _54 / _28;
+   float _58 = _55 / _28;
+   float _59 = _56 / _28;
+   float _61 = _57 + (c_ps_user[0].x);
+   float _62 = (c_ps_user[0].x) + 2.0f;
+   float _63 = _62 + _58;
+   float _64 = (c_ps_user[0].x) + 4.0f;
+   float _65 = _64 + _59;
+   bool _66 = !(_8.y == _8.x);
+   bool _67 = !(_8.z == _8.x);
+   float _68 = float((bool)_66);
+   float _69 = float((bool)_67);
+   bool _70 = !(_8.z == _8.y);
+   float _71 = float((bool)_70);
+   bool _72 = (_8.x == _27);
+   bool _73 = (_8.y == _27);
+   bool _74 = (_8.z == _27);
+   float _75 = float((bool)_72);
+   float _76 = float((bool)_73);
+   float _77 = float((bool)_74);
+   float _78 = _76 * _68;
+   float _79 = _71 * _69;
+   float _80 = _79 * _77;
+   float _81 = dot(float3(_61, _63, _65), float3(_75, _78, _80));
+   float _82 = saturate(_47);
+   float _83 = saturate(_53);
+   float _84 = _81 * 0.1666666716337204f;
+   float4 _85 = s1_t.Sample(s1_s, float2(_84, _83));
+   bool _89 = !(_82 <= 0.5f);
+   float _112;
+   float _113;
+   float _114;
+   if (!_89)
+   {
+      float _91 = 0.5f - _82;
+      float _92 = _91 * 2.0f;
+      float _93 = _85.x * _92;
+      float _94 = _85.y * _92;
+      float _95 = _85.z * _92;
+      float _96 = _85.x - _93;
+      float _97 = _85.y - _94;
+      float _98 = _85.z - _95;
+      _112 = _96;
+      _113 = _97;
+      _114 = _98;
+   }
+   else
+   {
+      float _100 = 1.0f - _85.x;
+      float _101 = 1.0f - _85.y;
+      float _102 = 1.0f - _85.z;
+      float _103 = _82 + -0.5f;
+      float _104 = _103 * 2.0f;
+      float _105 = _100 * _104;
+      float _106 = _101 * _104;
+      float _107 = _102 * _104;
+      float _108 = _105 + _85.x;
+      float _109 = _106 + _85.y;
+      float _110 = _107 + _85.z;
+      _112 = _108;
+      _113 = _109;
+      _114 = _110;
+   }
+   float _115 = _44 * 2.0f;
+   float _116 = 1.0f - _115;
+   float _117 = 1.0f / _116;
+   float _118 = _117 * _112;
+   float _119 = _117 * _113;
+   float _120 = _117 * _114;
+   float _121 = _118 - _44;
+   float _122 = _119 - _44;
+   float _123 = _120 - _44;
+   float _124 = saturate(_121);
+   float _125 = saturate(_122);
+   float _126 = saturate(_123);
+   float _131 = (c_ps_user[7].x) * _18;
+   float _132 = (c_ps_user[7].y) * _18;
+   float _133 = (c_ps_user[7].z) * _18;
+   float _138 = (c_ps_user[11].x) * _19;
+   float _139 = (c_ps_user[11].y) * _19;
+   float _140 = (c_ps_user[11].z) * _19;
+   float _145 = (c_ps_user[15].x) * _20;
+   float _146 = (c_ps_user[15].y) * _20;
+   float _147 = (c_ps_user[15].z) * _20;
+   float _152 = _131 + _124;
+   float _153 = _152 + _138;
+   float _154 = _153 + _145;
+   float _155 = _154 + (c_ps_user[3].x);
+   float _156 = _132 + _125;
+   float _157 = _156 + _139;
+   float _158 = _157 + _146;
+   float _159 = _158 + (c_ps_user[3].y);
+   float _160 = _133 + _126;
+   float _161 = _160 + _140;
+   float _162 = _161 + _147;
+   float _163 = _162 + (c_ps_user[3].z);
+   float _164 = saturate(_155);
+   float _165 = saturate(_159);
+   float _166 = saturate(_163);
+   SV_Target.x = _164;
+   SV_Target.y = _165;
+   SV_Target.z = _166;
+   SV_Target.w = 1.0f;
+   return SV_Target;
+}
+
+float4 main(
+    linear float2 TEXCOORD : TEXCOORD) : SV_Target
+{
+   const float4 vanilla_graded = YKR_ColorCorrectGrade(TEXCOORD);
+   float4 hdr_graded = vanilla_graded;
+   [branch] if (YKR_ColorCorrectHDR())
+   {
+      ykr_color_correct_compressed = true;
+      hdr_graded = YKR_ColorCorrectGrade(TEXCOORD);
+   }
+   return YKR_ColorCorrectOutput(vanilla_graded, hdr_graded);
+}

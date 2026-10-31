@@ -1,0 +1,115 @@
+// Yakuza Kiwami material ps_diffuse_with_tonemap (0x5FC79D29, DXIL SM 6.0), decompiled verbatim (Shaders/Decompiler/decomp.exe) with two edits,
+// applied by a script: the inline Hable tonemap's saturate goes through
+// YKR_MaterialCurve (tangent continuation in HDR), and the light pre-pass buffer t14 through YKR_LightBuffer.
+
+#include "Includes/Common.hlsl"
+
+cbuffer cb13 : register(b13)
+{
+   uint c_bool : packoffset(c000.x);
+};
+
+cbuffer cb1 : register(b1)
+{
+   float4 c_tone_control : packoffset(c000.x);
+   float4 c_fog_param[2] : packoffset(c001.x);
+   float4 c_ps_col_scl[1] : packoffset(c003.x);
+   float4 c_ls_param[4] : packoffset(c004.x);
+   float4 c_shadowmap_offset[1] : packoffset(c008.x);
+   float4 c_sdw_param[3] : packoffset(c009.x);
+   float4 c_sdw_param_ch[1] : packoffset(c012.x);
+   float4 c_scene_ambient : packoffset(c013.x);
+};
+
+float4 main(
+    linear float4 COLOR : COLOR) : SV_Target
+{
+   float4 SV_Target = 0;
+   int _9 = c_bool & 16;
+   bool _10 = (_9 == 0);
+   float _76;
+   float _77;
+   float _78;
+   if (!_10)
+   {
+      float _14 = c_tone_control.x * COLOR.x;
+      float _15 = c_tone_control.x * COLOR.y;
+      float _16 = c_tone_control.x * COLOR.z;
+      float _18 = log2(_14);
+      float _19 = log2(_15);
+      float _20 = log2(_16);
+      float _21 = _18 * c_tone_control.y;
+      float _22 = _19 * c_tone_control.y;
+      float _23 = _20 * c_tone_control.y;
+      float _24 = exp2(_21);
+      float _25 = exp2(_22);
+      float _26 = exp2(_23);
+      _76 = _24;
+      _77 = _25;
+      _78 = _26;
+   }
+   else
+   {
+      int _28 = c_bool & 32768;
+      bool _29 = (_28 == 0);
+      if (_29)
+      {
+         float _33 = c_tone_control.x * COLOR.x;
+         float _34 = c_tone_control.x * COLOR.y;
+         float _35 = c_tone_control.x * COLOR.z;
+         float _36 = _33 * 2.0f;
+         float _37 = _34 * 2.0f;
+         float _38 = _35 * 2.0f;
+         float _39 = _33 * 0.30000001192092896f;
+         float _40 = _34 * 0.30000001192092896f;
+         float _41 = _35 * 0.30000001192092896f;
+         float _42 = _39 + 0.05000000074505806f;
+         float _43 = _40 + 0.05000000074505806f;
+         float _44 = _41 + 0.05000000074505806f;
+         float _45 = _42 * _36;
+         float _46 = _43 * _37;
+         float _47 = _44 * _38;
+         float _48 = _45 + 0.004000000189989805f;
+         float _49 = _46 + 0.004000000189989805f;
+         float _50 = _47 + 0.004000000189989805f;
+         float _51 = _39 + 0.5f;
+         float _52 = _40 + 0.5f;
+         float _53 = _41 + 0.5f;
+         float _54 = _51 * _36;
+         float _55 = _52 * _37;
+         float _56 = _53 * _38;
+         float _57 = _54 + 0.06000000238418579f;
+         float _58 = _55 + 0.06000000238418579f;
+         float _59 = _56 + 0.06000000238418579f;
+         float _60 = _48 / _57;
+         float _61 = _49 / _58;
+         float _62 = _50 / _59;
+         float _63 = _60 + -0.06666666269302368f;
+         float _64 = _61 + -0.06666666269302368f;
+         float _65 = _62 + -0.06666666269302368f;
+         float _66 = _63 * 1.3790643215179443f;
+         float _67 = _64 * 1.3790643215179443f;
+         float _68 = _65 * 1.3790643215179443f;
+         float _69 = YKR_MaterialCurve(_66, _33);
+         float _70 = YKR_MaterialCurve(_67, _34);
+         float _71 = YKR_MaterialCurve(_68, _35);
+         float _72 = sqrt(_69);
+         float _73 = sqrt(_70);
+         float _74 = sqrt(_71);
+         _76 = _72;
+         _77 = _73;
+         _78 = _74;
+      }
+      else
+      {
+         _76 = COLOR.x;
+         _77 = COLOR.y;
+         _78 = COLOR.z;
+      }
+   }
+   SV_Target.x = _76;
+   SV_Target.y = _77;
+   SV_Target.z = _78;
+   SV_Target.w = COLOR.w;
+   return SV_Target;
+}

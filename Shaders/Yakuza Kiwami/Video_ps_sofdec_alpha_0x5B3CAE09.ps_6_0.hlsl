@@ -1,0 +1,51 @@
+// Yakuza Kiwami ps_sofdec_alpha (0x5B3CAE09, DXIL SM 6.0), decompiled verbatim (Shaders/Decompiler/decomp.exe) and edited by
+// a script: its output goes through YKR_VideoOutput (AutoHDR, HUD-stage encoding).
+
+#include "Includes/PostOutput.hlsl"
+
+Texture2D<float4> s0_t : register(t0);
+
+Texture2D<float4> s1_t : register(t1);
+
+Texture2D<float4> s2_t : register(t2);
+
+Texture2D<float4> s3_t : register(t3);
+
+SamplerState s0_s : register(s0);
+
+SamplerState s1_s : register(s1);
+
+SamplerState s2_s : register(s2);
+
+SamplerState s3_s : register(s3);
+
+float4 main(
+    linear float4 COLOR : COLOR,
+    linear float2 TEXCOORD : TEXCOORD) : SV_Target
+{
+   float4 SV_Target = 0;
+   float4 _14 = s0_t.Sample(s0_s, float2(TEXCOORD.x, TEXCOORD.y));
+   float4 _16 = s1_t.Sample(s1_s, float2(TEXCOORD.x, TEXCOORD.y));
+   float4 _18 = s2_t.Sample(s2_s, float2(TEXCOORD.x, TEXCOORD.y));
+   float4 _20 = s3_t.Sample(s3_s, float2(TEXCOORD.x, TEXCOORD.y));
+   float _22 = _14.x + -0.062745101749897f;
+   float _23 = _22 * 1.1643835306167603f;
+   float _24 = _16.x + -0.501960813999176f;
+   float _25 = _18.x + -0.501960813999176f;
+   float _26 = _25 * 1.5959999561309814f;
+   float _27 = _26 + _23;
+   float _28 = _27 * COLOR.x;
+   float _29 = _24 * 0.39100000262260437f;
+   float _30 = _23 - _29;
+   float _31 = _25 * 0.8130000233650208f;
+   float _32 = _30 - _31;
+   float _33 = _32 * COLOR.y;
+   float _34 = _24 * 2.0179998874664307f;
+   float _35 = _34 + _23;
+   float _36 = _35 * COLOR.z;
+   SV_Target.x = _28;
+   SV_Target.y = _33;
+   SV_Target.z = _36;
+   SV_Target.w = _20.x;
+   return YKR_VideoOutput(SV_Target);
+}
