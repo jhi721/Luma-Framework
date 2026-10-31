@@ -2173,7 +2173,7 @@ public:
 
       // DLSS/FSR: their depth and the camera motion from the scene's alpha, the CPU copies of vc4 (dgVoodoo maps it or updates it),
       // and the motion vector target written by every blend state
-      sr_game_tooltip = "DLSS and FSR 3 require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
+      sr_game_tooltip = "DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Motion Vector Fill CS"),
          ShaderDefinition("Luma_BL2TPS_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Copy Back PS"),
@@ -2389,6 +2389,7 @@ public:
 
    // Re-applies the stencil test dgVoodoo drops on the item card's rolling price digits. Returns true iff it ran
    // the original draw itself (caller returns Replaced).
+
    bool RepairScaleformStencilMask(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool is_immediate, std::function<void()>* original_draw_dispatch_func)
    {
       if (!is_immediate || is_custom_pass)
@@ -3286,7 +3287,10 @@ public:
          }
 
          if (alpha_blended || on_ldr_buffer)
-            return DrawOrDispatchOverrideType::Skip;
+         {
+            if (g_hide_ui)
+               return DrawOrDispatchOverrideType::Skip;
+         }
       }
 
       // LAST on purpose: this one re-issues the draw itself, so it must yield to every hook above, or it runs
